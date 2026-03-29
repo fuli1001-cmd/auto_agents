@@ -109,6 +109,7 @@ DEFAULT_CONFIG = {
     "gates": {
         "commands": [],
         "require_clean_git_before_task": True,
+        "allow_agent_updates": True,
     },
     "git": {
         "auto_init_repo": True,

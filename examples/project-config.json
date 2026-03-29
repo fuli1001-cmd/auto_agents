@@ -24,7 +24,8 @@
     "commands": [
       "python3 -m unittest discover -s tests"
     ],
-    "require_clean_git_before_task": true
+    "require_clean_git_before_task": true,
+    "allow_agent_updates": true
   },
   "git": {
     "auto_init_repo": true,

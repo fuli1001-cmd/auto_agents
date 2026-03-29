@@ -11,6 +11,7 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 - The orchestrator owns state. Providers are stateless workers.
 - The same model can be reused across stages while effort varies by stage.
 - Invalid structured outputs are rejected quickly and retried with terse corrective feedback.
+- The plan stage defines how the project will be verified; users should not need to hand-pick test commands for common greenfield cases.
 
 ## Internal layout
 
@@ -28,10 +29,17 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 
 ## Retry strategy
 
-- `plan` retries if `task_plan.json` fails structural validation.
+- `plan` retries if `task_plan.json` fails structural validation or omits `test_strategy` and `verification_commands`.
 - `review` retries if the decision header is malformed.
 - `implement` retries if review or verification rejects the current task.
 - Retries are finite and configurable per stage.
+
+## Verification strategy
+
+- `plan` must output root-level `test_strategy` and `verification_commands` in `task_plan.json`.
+- The orchestrator copies generated verification commands into `.auto-agents/config.json` when `gates.allow_agent_updates` is enabled.
+- `implement` is responsible for creating or updating the tests needed to satisfy those commands.
+- `review` checks for missing or weak tests, and the orchestrator executes the configured commands as the final gate.
 
 ## Resume strategy
 

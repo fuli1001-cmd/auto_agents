@@ -9,6 +9,7 @@ V1 scope:
 - Stage-specific effort policy
 - File-driven context to reduce token usage
 - Strict task plan validation before execution
+- Agent-generated verification strategy and test commands during planning
 - Limited retries for planning, review formatting, and task rework
 - Automatic git commit after each verified feature slice
 
@@ -26,7 +27,7 @@ The system optimizes for quality over throughput:
 
 1. `clarify`: turn an idea into a compact project brief
 2. `design`: create a top-level architecture document
-3. `plan`: generate a JSON task plan with small verifiable feature slices
+3. `plan`: generate a JSON task plan with small verifiable feature slices plus a verification strategy
 4. `implement`: execute one feature slice at a time
 5. `review`: run an independent agent review for the current task
 6. `verify`: run local gates
@@ -54,6 +55,10 @@ python3 -m auto_agents run --project /tmp/demo --idea-file /tmp/demo/idea.md
 
 `run` performs local preflight validation before any agent call. Use `--skip-validate` only for
 manual recovery or debugging.
+
+During `plan`, the agent must write `test_strategy` and `verification_commands` into
+`.auto-agents/state/task_plan.json`. By default the orchestrator copies those verification commands
+into `.auto-agents/config.json`, so new projects do not need a hand-written `gates.commands` block.
 
 Approve a paused gate:
 
@@ -103,6 +108,14 @@ adapter can ignore the hint and still satisfy the interface.
 
 The orchestrator validates task IDs, duplicate entries, acceptance lists, and allowed statuses before
 the implementation loop starts.
+
+The plan root can also define:
+
+- `test_strategy`
+- `verification_commands`
+
+Those fields are required for completed plan output and are preserved when task status is updated
+during implementation.
 
 Interrupted implementation work is resumable:
 

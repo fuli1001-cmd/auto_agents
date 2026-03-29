@@ -13,6 +13,7 @@ from .config import (
     load_task_plan,
     review_path,
     run_artifact_paths,
+    save_project_config,
     save_run_state,
     save_task_plan,
     task_plan_path,
@@ -164,6 +165,7 @@ class Orchestrator:
         state.stage_summaries[stage] = result.summary.strip()
         state.last_error = ""
         if stage == "plan":
+            self._apply_generated_verification_config()
             state.tasks = self._load_tasks_from_plan()
         return state
 
@@ -264,15 +266,21 @@ class Orchestrator:
         return tasks
 
     def _persist_tasks(self, tasks: Iterable[TaskSpec]) -> None:
+        current_payload = load_task_plan(self.project_root)
         payload = []
         for task in tasks:
             item = task.to_dict()
             item.pop("commit_sha", None)
             payload.append(item)
-        save_task_plan(
-            self.project_root,
-            {"tasks": payload},
-        )
+        next_payload = {"tasks": payload}
+        if isinstance(current_payload.get("test_strategy"), str) and current_payload["test_strategy"].strip():
+            next_payload["test_strategy"] = current_payload["test_strategy"].strip()
+        verification_commands = current_payload.get("verification_commands")
+        if isinstance(verification_commands, list) and verification_commands:
+            next_payload["verification_commands"] = [
+                str(item).strip() for item in verification_commands if str(item).strip()
+            ]
+        save_task_plan(self.project_root, next_payload)
 
     def _stage_output_path(self, run_id: str, stage: str) -> Path:
         _, output_path = run_artifact_paths(self.project_root, run_id, stage)
@@ -314,6 +322,9 @@ class Orchestrator:
                 f"Read: {brief}",
                 f"Read: {architecture}",
                 f"Replace this JSON file with 3-10 minimal verifiable feature slices: {plan}",
+                "At the root of the JSON, also define test_strategy and verification_commands.",
+                "Choose the smallest practical automated verification strategy for this stack.",
+                "If this is a Python project and no framework is required, default to unittest with 'python3 -m unittest discover -s tests'.",
                 "Each task must contain task_id, title, description, acceptance, status, commit_message.",
                 "Keep tasks small enough to implement and verify independently.",
                 "Final response: 3 short bullets summarizing the plan.",
@@ -454,7 +465,7 @@ class Orchestrator:
 
     def _plan_validation_feedback(self, _: AgentResult) -> Optional[str]:
         payload = load_task_plan(self.project_root)
-        errors = validate_task_plan_payload(payload)
+        errors = validate_task_plan_payload(payload, require_verification=True)
         if not errors:
             return None
         bullets = "\n".join(f"- {item}" for item in errors)
@@ -495,6 +506,19 @@ class Orchestrator:
             "and preserve the exact required headings.\n"
             f"{bullets}"
         )
+
+    def _apply_generated_verification_config(self) -> None:
+        payload = load_task_plan(self.project_root)
+        commands = payload.get("verification_commands", [])
+        if not isinstance(commands, list) or not commands:
+            return
+        if not self.config.gates.allow_agent_updates:
+            return
+        normalized = [str(item) for item in commands]
+        if self.config.gates.commands == normalized:
+            return
+        self.config.gates.commands = normalized
+        save_project_config(self.project_root, self.config)
 
     @staticmethod
     def _parse_review_decision(response: str) -> Tuple[str, str]:

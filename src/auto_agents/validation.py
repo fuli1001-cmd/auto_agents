@@ -28,10 +28,33 @@ def schema_paths() -> Dict[str, str]:
     }
 
 
-def validate_task_plan_payload(payload: object) -> List[str]:
+def validate_task_plan_payload(payload: object, require_verification: bool = False) -> List[str]:
     errors: List[str] = []
     if not isinstance(payload, dict):
         return ["task plan root must be a JSON object"]
+
+    test_strategy = payload.get("test_strategy")
+    has_test_strategy = "test_strategy" in payload
+    if has_test_strategy and test_strategy in ("", None):
+        test_strategy = None
+    if test_strategy is not None and (not isinstance(test_strategy, str) or not test_strategy.strip()):
+        errors.append("task plan test_strategy must be a non-empty string when provided")
+
+    verification_commands = payload.get("verification_commands")
+    has_verification_commands = "verification_commands" in payload
+    if has_verification_commands and verification_commands == []:
+        verification_commands = None
+    if verification_commands is not None:
+        if not isinstance(verification_commands, list) or not verification_commands:
+            errors.append("task plan verification_commands must be a non-empty list when provided")
+        elif any(not isinstance(item, str) or not item.strip() for item in verification_commands):
+            errors.append("task plan verification_commands items must be non-empty strings")
+
+    if require_verification:
+        if not isinstance(test_strategy, str) or not test_strategy.strip():
+            errors.append("task plan must define a non-empty test_strategy")
+        if not isinstance(verification_commands, list) or not verification_commands:
+            errors.append("task plan must define at least one verification command")
 
     tasks = payload.get("tasks")
     if not isinstance(tasks, list):
@@ -167,6 +190,9 @@ def validate_project_config_payload(payload: object) -> List[str]:
         clean = gates.get("require_clean_git_before_task")
         if not isinstance(clean, bool):
             errors.append("gates.require_clean_git_before_task must be a boolean")
+        allow_agent_updates = gates.get("allow_agent_updates")
+        if not isinstance(allow_agent_updates, bool):
+            errors.append("gates.allow_agent_updates must be a boolean")
 
     git = payload.get("git")
     if not isinstance(git, dict):
@@ -254,6 +280,12 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
     review_file = root / ".auto-agents" / "docs" / "review.md"
     if not review_file.exists():
         warnings.append(f"review file not found yet: {review_file}")
+
+    if config_payload is not None and plan_payload is not None:
+        gate_commands = config_payload.get("gates", {}).get("commands", [])
+        plan_commands = plan_payload.get("verification_commands", [])
+        if not gate_commands and not plan_commands:
+            warnings.append("no verification commands are configured yet; verify stage will be a no-op")
 
     return {"errors": errors, "warnings": warnings}
 

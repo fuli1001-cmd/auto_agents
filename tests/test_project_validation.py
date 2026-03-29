@@ -43,6 +43,7 @@ class ProjectValidationTests(unittest.TestCase):
             "gates": {
                 "commands": [],
                 "require_clean_git_before_task": True,
+                "allow_agent_updates": True,
             },
             "git": {
                 "auto_init_repo": True,
@@ -66,6 +67,13 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(any("invalid values" in item for item in errors))
         self.assertTrue(any("default_max_attempts" in item for item in errors))
         self.assertTrue(any("unknown stage" in item for item in errors))
+
+    def test_validation_report_warns_when_no_verification_commands_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            report = validation_report(project_root)
+            self.assertTrue(any("no verification commands" in item for item in report["warnings"]))
 
     def test_validation_report_passes_for_bootstrapped_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

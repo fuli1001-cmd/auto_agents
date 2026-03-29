@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.config import load_run_state, save_project_config, task_plan_path
+from auto_agents.config import load_project_config, load_run_state, save_project_config, task_plan_path
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
@@ -26,6 +26,8 @@ class RetryingPlanAdapter:
                 write_json(
                     task_plan_path(self.project_root),
                     {
+                        "test_strategy": "python-unittest",
+                        "verification_commands": ["python3 -m unittest discover -s tests"],
                         "tasks": [
                             {
                                 "task_id": "task-001",
@@ -39,6 +41,42 @@ class RetryingPlanAdapter:
                     },
                 )
                 write_text(request.output_path, "valid plan\n")
+        else:
+            write_text(request.output_path, f"{request.stage}\n")
+
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=request.output_path.read_text(encoding="utf-8").strip(),
+            returncode=0,
+        )
+
+
+class VerificationPlanAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+
+    def run(self, request):
+        if request.stage == "plan":
+            write_json(
+                task_plan_path(self.project_root),
+                {
+                    "test_strategy": "python-unittest",
+                    "verification_commands": ["python3 -m unittest discover -s tests"],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Add CLI entrypoint",
+                            "description": "Add a runnable command line entrypoint.",
+                            "acceptance": ["`python -m demo --help` exits successfully."],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            write_text(request.output_path, "valid verification plan\n")
         else:
             write_text(request.output_path, f"{request.stage}\n")
 
@@ -153,6 +191,52 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(orchestrator.adapter.plan_calls, 2)
             self.assertEqual(state.agent_attempts["plan"], 2)
             self.assertEqual(state.tasks[0].task_id, "task-001")
+
+    def test_plan_stage_applies_generated_verification_commands_to_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = VerificationPlanAdapter(project_root)
+
+            idea_file = project_root / "idea.md"
+            idea_file.write_text("# Idea\n", encoding="utf-8")
+            state = load_run_state(project_root)
+            orchestrator._run_agent_stage("plan", state, idea_file)
+
+            config = load_project_config(project_root)
+            self.assertEqual(config.gates.commands, ["python3 -m unittest discover -s tests"])
+
+    def test_persisted_tasks_keep_generated_verification_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "test_strategy": "python-unittest",
+                    "verification_commands": ["python3 -m unittest discover -s tests"],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains good"],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+
+            tasks = orchestrator._load_tasks_from_plan()
+            tasks[0].status = "in_progress"
+            orchestrator._persist_tasks(tasks)
+
+            payload = task_plan_path(project_root).read_text(encoding="utf-8")
+            self.assertIn('"test_strategy": "python-unittest"', payload)
+            self.assertIn('"verification_commands": [', payload)
 
     def test_implement_stage_retries_after_review_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

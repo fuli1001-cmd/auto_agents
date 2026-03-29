@@ -87,7 +87,8 @@
       "type": "object",
       "required": [
         "commands",
-        "require_clean_git_before_task"
+        "require_clean_git_before_task",
+        "allow_agent_updates"
       ],
       "properties": {
         "commands": {
@@ -97,6 +98,9 @@
           }
         },
         "require_clean_git_before_task": {
+          "type": "boolean"
+        },
+        "allow_agent_updates": {
           "type": "boolean"
         }
       },
@@ -160,4 +164,3 @@
   },
   "additionalProperties": false
 }
-

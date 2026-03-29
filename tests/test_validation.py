@@ -38,6 +38,23 @@ class TaskPlanValidationTests(unittest.TestCase):
         }
         self.assertEqual(validate_task_plan_payload(payload), [])
 
+    def test_requires_verification_contract_when_requested(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Add CLI entrypoint",
+                    "description": "Add a runnable command line entrypoint.",
+                    "acceptance": ["`python -m demo --help` exits successfully."],
+                    "status": "pending",
+                    "commit_message": "feat(task-001): add CLI entrypoint",
+                }
+            ]
+        }
+        errors = validate_task_plan_payload(payload, require_verification=True)
+        self.assertTrue(any("test_strategy" in item for item in errors))
+        self.assertTrue(any("verification command" in item for item in errors))
+
     def test_rejects_duplicate_ids_and_empty_acceptance(self) -> None:
         payload = {
             "tasks": [
