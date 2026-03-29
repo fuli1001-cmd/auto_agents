@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-agents"
+version = "0.1.0"
+description = "Provider-agnostic orchestration for quality-first AI-assisted new project delivery."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+  { name = "fuli" }
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
