@@ -18,6 +18,7 @@ class BootstrapTests(unittest.TestCase):
 
             self.assertTrue(auto_dir(project_root).exists())
             self.assertTrue(config_path(project_root).exists())
+            self.assertTrue((project_root / ".gitignore").exists())
             self.assertTrue((docs_dir(project_root) / "project_brief.md").exists())
             self.assertTrue((docs_dir(project_root) / "architecture.md").exists())
             self.assertTrue(task_plan_path(project_root).exists())
@@ -27,4 +28,3 @@ class BootstrapTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

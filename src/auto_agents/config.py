@@ -10,6 +10,11 @@ from .models import ProjectConfig, RunState
 
 AUTO_DIR = ".auto-agents"
 CONFIG_FILE = "config.json"
+PROJECT_GITIGNORE = """__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+"""
 
 
 PROJECT_BRIEF_TEMPLATE = """# Project Brief
@@ -190,6 +195,7 @@ def bootstrap_project(project_root: Path, name: str, provider_kind: str) -> Path
     write_if_missing(review_path(root), "# Review\n\nNo review has been recorded yet.\n")
     write_json(task_plan_path(root), TASK_PLAN_TEMPLATE)
     write_json(run_state_path(root), RUN_STATE_TEMPLATE)
+    write_if_missing(root / ".gitignore", PROJECT_GITIGNORE)
     write_if_missing(root / "README.md", f"# {name}\n")
     return root
 

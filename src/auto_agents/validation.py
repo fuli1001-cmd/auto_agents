@@ -11,7 +11,7 @@ from .models import APPROVAL_ORDER
 
 
 TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-ALLOWED_TASK_STATUS = {"pending", "blocked", "done"}
+ALLOWED_TASK_STATUS = {"pending", "in_progress", "blocked", "done"}
 ALLOWED_EFFORTS = {"balanced", "deep"}
 REQUIRED_EFFORT_STAGES = ("clarify", "design", "plan", "implement", "review", "verify")
 REQUIRED_DOC_HEADINGS = {
@@ -249,16 +249,7 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         "architecture.md": architecture_path(root),
     }
     for name, path in docs.items():
-        if not path.exists():
-            errors.append(f"missing required document: {path}")
-            continue
-        content = read_text(path).strip()
-        if not content:
-            errors.append(f"document is empty: {path}")
-            continue
-        for heading in REQUIRED_DOC_HEADINGS[name]:
-            if heading not in content:
-                errors.append(f"{path} is missing heading '{heading}'")
+        errors.extend(validate_required_document(path, name))
 
     review_file = root / ".auto-agents" / "docs" / "review.md"
     if not review_file.exists():
@@ -275,3 +266,18 @@ def validation_report(project_root: Path) -> Dict[str, object]:
         "warnings": result["warnings"],
         "schemas": schema_paths(),
     }
+
+
+def validate_required_document(path: Path, name: str) -> List[str]:
+    errors: List[str] = []
+    if not path.exists():
+        return [f"missing required document: {path}"]
+
+    content = read_text(path).strip()
+    if not content:
+        return [f"document is empty: {path}"]
+
+    for heading in REQUIRED_DOC_HEADINGS[name]:
+        if heading not in content:
+            errors.append(f"{path} is missing heading '{heading}'")
+    return errors

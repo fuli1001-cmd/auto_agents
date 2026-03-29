@@ -31,6 +31,7 @@ from .models import (
     TaskSpec,
 )
 from .validation import validate_task_plan_payload, validation_report
+from .validation import validate_required_document
 
 
 class Orchestrator:
@@ -146,7 +147,12 @@ class Orchestrator:
 
     def _run_agent_stage(self, stage: str, state: RunState, idea_file: Path) -> RunState:
         prompt = self._build_prompt(stage=stage, idea_file=idea_file)
-        validator = self._plan_validation_feedback if stage == "plan" else None
+        validator_map = {
+            "clarify": self._clarify_validation_feedback,
+            "design": self._design_validation_feedback,
+            "plan": self._plan_validation_feedback,
+        }
+        validator = validator_map.get(stage)
         result = self._run_agent_with_retries(
             state=state,
             stage=stage,
@@ -164,7 +170,7 @@ class Orchestrator:
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
         tasks = state.tasks or self._load_tasks_from_plan()
         state.tasks = tasks
-        self._commit_planning_baseline_if_needed()
+        self._commit_planning_baseline_if_needed(tasks)
 
         processed = 0
         for task in tasks:
@@ -173,10 +179,20 @@ class Orchestrator:
             if max_tasks is not None and processed >= max_tasks:
                 break
 
-            if self.config.gates.require_clean_git_before_task:
+            resume_existing = task.status == "in_progress" or self._should_resume_task(state, task)
+            allow_dirty_retry = task.status == "blocked"
+            if (resume_existing or allow_dirty_retry) and task.status != "in_progress":
+                task.status = "in_progress"
+                self._persist_tasks(tasks)
+
+            if not (resume_existing or allow_dirty_retry) and self.config.gates.require_clean_git_before_task:
                 require_clean_tree(self.project_root)
 
-            gate_result = self._execute_task_with_retries(state, task)
+            if task.status == "pending":
+                task.status = "in_progress"
+                self._persist_tasks(tasks)
+
+            gate_result = self._execute_task_with_retries(state, task, resume_existing=resume_existing)
             if not gate_result["ok"]:
                 task.status = "blocked"
                 task.review_summary = str(gate_result["review"])
@@ -278,6 +294,7 @@ class Orchestrator:
                 f"Read the idea from: {idea_file}",
                 f"Update this file in place: {brief}",
                 "Keep the brief compact and scoped to the MVP.",
+                "Preserve the exact top-level and section headings already present in the file.",
                 "Final response: 3 short bullets summarizing the clarified scope.",
             ]
             return "\n".join(lines)
@@ -287,6 +304,7 @@ class Orchestrator:
                 f"Read the current project brief: {brief}",
                 f"Update this file in place: {architecture}",
                 "Record only top-level architecture decisions and major risks.",
+                "Preserve the exact top-level and section headings already present in the file.",
                 "Final response: 3 short bullets summarizing the design.",
             ]
             return "\n".join(lines)
@@ -337,7 +355,12 @@ class Orchestrator:
 
         raise RuntimeError(f"Unsupported task stage: {stage}")
 
-    def _execute_task_with_retries(self, state: RunState, task: TaskSpec) -> Dict[str, object]:
+    def _execute_task_with_retries(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        resume_existing: bool = False,
+    ) -> Dict[str, object]:
         max_attempts = self._max_attempts("implement")
         feedback = ""
         last_reason = "task failed without a recorded reason"
@@ -345,19 +368,22 @@ class Orchestrator:
 
         for attempt in range(1, max_attempts + 1):
             state.current_stage = "implement"
-            implement_prompt = self._build_task_prompt(task, "implement")
-            if feedback:
-                implement_prompt = f"{implement_prompt}\n\nPrevious attempt issues:\n{feedback}\n"
-            result = self._run_agent_with_retries(
-                state=state,
-                stage="implement",
-                stage_key=f"implement-{task.task_id}",
-                prompt=implement_prompt,
-            )
-            if not result.ok:
-                last_reason = result.stderr or result.summary or "implementation failed"
-                feedback = f"- Implementation command failed.\n- Details: {last_reason}"
-                continue
+            if resume_existing and attempt == 1:
+                result = None
+            else:
+                implement_prompt = self._build_task_prompt(task, "implement")
+                if feedback:
+                    implement_prompt = f"{implement_prompt}\n\nPrevious attempt issues:\n{feedback}\n"
+                result = self._run_agent_with_retries(
+                    state=state,
+                    stage="implement",
+                    stage_key=f"implement-{task.task_id}",
+                    prompt=implement_prompt,
+                )
+                if not result.ok:
+                    last_reason = result.stderr or result.summary or "implementation failed"
+                    feedback = f"- Implementation command failed.\n- Details: {last_reason}"
+                    continue
 
             gate_result = self._run_task_review_and_verify(state.run_id, task)
             if gate_result["ok"]:
@@ -446,6 +472,30 @@ class Orchestrator:
             "'DECISION: pass' or 'DECISION: fail'. Rewrite the review output."
         )
 
+    def _clarify_validation_feedback(self, _: AgentResult) -> Optional[str]:
+        path = docs_dir(self.project_root) / "project_brief.md"
+        errors = validate_required_document(path, "project_brief.md")
+        if not errors:
+            return None
+        bullets = "\n".join(f"- {item}" for item in errors)
+        return (
+            "The project brief is missing required template headings. Rewrite the file in place and "
+            "preserve the exact required headings.\n"
+            f"{bullets}"
+        )
+
+    def _design_validation_feedback(self, _: AgentResult) -> Optional[str]:
+        path = docs_dir(self.project_root) / "architecture.md"
+        errors = validate_required_document(path, "architecture.md")
+        if not errors:
+            return None
+        bullets = "\n".join(f"- {item}" for item in errors)
+        return (
+            "The architecture document is missing required template headings. Rewrite the file in place "
+            "and preserve the exact required headings.\n"
+            f"{bullets}"
+        )
+
     @staticmethod
     def _parse_review_decision(response: str) -> Tuple[str, str]:
         lines = [line.strip() for line in response.splitlines() if line.strip()]
@@ -490,7 +540,30 @@ class Orchestrator:
                 pending.append(stage)
         return pending
 
-    def _commit_planning_baseline_if_needed(self) -> None:
-        if not changed_files(self.project_root):
+    def _commit_planning_baseline_if_needed(self, tasks: Iterable[TaskSpec]) -> None:
+        changes = changed_files(self.project_root)
+        if not changes:
             return
+        if any(task.status != "pending" for task in tasks):
+            return
+
+        allowed = {".gitignore", "README.md", "idea.md"}
+        for line in changes.splitlines():
+            path = line[3:].strip()
+            if not path:
+                continue
+            if path.startswith(".auto-agents/"):
+                continue
+            if path in allowed:
+                continue
+            return
+
         commit_all(self.project_root, "docs(project): capture planning baseline")
+
+    def _should_resume_task(self, state: RunState, task: TaskSpec) -> bool:
+        if task.status != "pending":
+            return False
+        if not changed_files(self.project_root):
+            return False
+        attempt_key = f"implement-{task.task_id}"
+        return state.agent_attempts.get(attempt_key, 0) > 0

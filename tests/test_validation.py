@@ -23,6 +23,21 @@ class TaskPlanValidationTests(unittest.TestCase):
         }
         self.assertEqual(validate_task_plan_payload(payload), [])
 
+    def test_accepts_in_progress_status(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Add CLI entrypoint",
+                    "description": "Add a runnable command line entrypoint.",
+                    "acceptance": ["`python -m demo --help` exits successfully."],
+                    "status": "in_progress",
+                    "commit_message": "feat(task-001): add CLI entrypoint",
+                }
+            ]
+        }
+        self.assertEqual(validate_task_plan_payload(payload), [])
+
     def test_rejects_duplicate_ids_and_empty_acceptance(self) -> None:
         payload = {
             "tasks": [
@@ -53,4 +68,3 @@ class TaskPlanValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

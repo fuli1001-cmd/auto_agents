@@ -13,6 +13,7 @@ from auto_agents.config import config_path, load_run_state, task_plan_path
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.validation import (
+    validate_required_document,
     validate_project_config_payload,
     validation_report,
 )
@@ -86,6 +87,13 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertFalse(report["ok"])
             self.assertTrue(any("not valid JSON" in item for item in report["errors"]))
+
+    def test_validate_required_document_reports_missing_headings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "architecture.md"
+            write_text(path, "# Architecture\n\nOnly one heading\n")
+            errors = validate_required_document(path, "architecture.md")
+            self.assertTrue(any("## System Boundary" in item for item in errors))
 
     def test_cli_validate_returns_nonzero_for_invalid_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

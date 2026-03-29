@@ -73,6 +73,12 @@ Validate a target project without spending tokens:
 python3 -m auto_agents validate --project /tmp/demo
 ```
 
+Run the real Codex provider demo:
+
+```bash
+./examples/run_codex_demo.sh
+```
+
 ## Provider model
 
 The orchestrator uses its own effort labels:
@@ -97,6 +103,12 @@ adapter can ignore the hint and still satisfy the interface.
 
 The orchestrator validates task IDs, duplicate entries, acceptance lists, and allowed statuses before
 the implementation loop starts.
+
+Interrupted implementation work is resumable:
+
+- `in_progress` tasks can continue from review and verification
+- `blocked` tasks can be retried without forcing a clean tree first
+- new projects start with a minimal `.gitignore` to avoid common Python artifact noise
 
 ## Schemas
 

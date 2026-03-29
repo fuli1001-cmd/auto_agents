@@ -42,7 +42,7 @@
           },
           "status": {
             "type": "string",
-            "enum": ["pending", "blocked", "done"]
+            "enum": ["pending", "in_progress", "blocked", "done"]
           },
           "commit_message": {
             "type": "string"

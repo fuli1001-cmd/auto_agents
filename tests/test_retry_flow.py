@@ -81,6 +81,62 @@ class RetryingImplementAdapter:
         )
 
 
+class ResumeReviewAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            raise AssertionError("implement should not be called when resuming an interrupted task")
+        if request.stage == "review":
+            self.review_calls += 1
+            summary = "DECISION: pass\nresume review passed\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class BlockedRetryAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            write_text(self.project_root / "artifact.txt", "fixed\n")
+            summary = "implemented fixed\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = "DECISION: pass\nblocked task recovered\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class RetryFlowTests(unittest.TestCase):
     def test_plan_stage_retries_on_invalid_json_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -134,6 +190,84 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertEqual(state.tasks[0].status, "done")
             self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "good")
+
+    def test_resume_in_progress_task_skips_reimplementation_and_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = ResumeReviewAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains hello"],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            (project_root / "artifact.txt").write_text("hello\n", encoding="utf-8")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.agent_attempts["implement-task-001"] = 1
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 0)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertTrue(state.tasks[0].commit_sha)
+
+    def test_blocked_task_can_retry_with_dirty_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = BlockedRetryAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains fixed"],
+                            "status": "blocked",
+                            "commit_message": "",
+                            "review_summary": "previous review failure",
+                        }
+                    ]
+                },
+            )
+            (project_root / "artifact.txt").write_text("bad\n", encoding="utf-8")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "fixed")
 
 
 if __name__ == "__main__":

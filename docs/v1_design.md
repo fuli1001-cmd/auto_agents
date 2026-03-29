@@ -33,6 +33,12 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 - `implement` retries if review or verification rejects the current task.
 - Retries are finite and configurable per stage.
 
+## Resume strategy
+
+- An interrupted task can persist as `in_progress` and resume from review or verification.
+- A previously `blocked` task can be retried without first forcing a clean tree.
+- Planning baseline commits are limited to planning files so partial feature work is not committed by accident.
+
 ## Offline validation
 
 The `validate` command performs a token-free local check of:
