@@ -37,6 +37,15 @@
       "architecture",
       "release"
     ]
+  },
+  "retries": {
+    "default_max_attempts": 2,
+    "per_stage": {
+      "clarify": 2,
+      "design": 2,
+      "plan": 3,
+      "implement": 2,
+      "review": 2
+    }
   }
 }
-

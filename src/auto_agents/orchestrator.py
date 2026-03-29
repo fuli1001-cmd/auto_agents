@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from .adapters import CodexAdapter, MockAdapter, ShellAdapter
 from .config import (
@@ -10,7 +10,6 @@ from .config import (
     docs_dir,
     load_project_config,
     load_run_state,
-    load_stage_output,
     load_task_plan,
     review_path,
     run_artifact_paths,
@@ -24,12 +23,14 @@ from .git_ops import changed_files, commit_all, ensure_repo, is_repo, require_cl
 from .io_utils import write_text
 from .models import (
     APPROVAL_BY_STAGE,
+    AgentResult,
     AgentRequest,
     ProjectConfig,
     RunState,
     STAGE_ORDER,
     TaskSpec,
 )
+from .validation import validate_task_plan_payload
 
 
 class Orchestrator:
@@ -75,12 +76,18 @@ class Orchestrator:
                 return state
 
         for stage in self._pending_stages(state):
-            if stage == "implement":
-                state = self._run_implementation_loop(state, max_tasks=max_tasks)
-            elif stage == "verify":
-                state = self._run_verify(state)
-            else:
-                state = self._run_agent_stage(stage, state, idea_file)
+            try:
+                if stage == "implement":
+                    state = self._run_implementation_loop(state, max_tasks=max_tasks)
+                elif stage == "verify":
+                    state = self._run_verify(state)
+                else:
+                    state = self._run_agent_stage(stage, state, idea_file)
+            except RuntimeError as error:
+                state.status = "failed"
+                state.last_error = str(error)
+                save_run_state(self.project_root, state)
+                raise
 
             save_run_state(self.project_root, state)
             pending_gate = APPROVAL_BY_STAGE.get(stage)
@@ -109,22 +116,17 @@ class Orchestrator:
 
     def _run_agent_stage(self, stage: str, state: RunState, idea_file: Path) -> RunState:
         prompt = self._build_prompt(stage=stage, idea_file=idea_file)
-        output_path = self._stage_output_path(state.run_id, stage)
-        write_run_prompt(self.project_root, state.run_id, stage, prompt)
-        request = AgentRequest(
+        validator = self._plan_validation_feedback if stage == "plan" else None
+        result = self._run_agent_with_retries(
+            state=state,
             stage=stage,
-            effort=self.config.efforts.get(stage, "balanced"),
+            stage_key=stage,
             prompt=prompt,
-            cwd=self.project_root,
-            output_path=output_path,
+            validation_feedback=validator,
         )
-        result = self.adapter.run(request)
-        if not result.ok:
-            raise RuntimeError(
-                f"Stage {stage} failed with code {result.returncode}: {result.stderr or result.summary}"
-            )
         state.current_stage = stage
         state.stage_summaries[stage] = result.summary.strip()
+        state.last_error = ""
         if stage == "plan":
             state.tasks = self._load_tasks_from_plan()
         return state
@@ -144,32 +146,15 @@ class Orchestrator:
             if self.config.gates.require_clean_git_before_task:
                 require_clean_tree(self.project_root)
 
-            state.current_stage = "implement"
-            implement_prompt = self._build_task_prompt(task, "implement")
-            implement_output = self._stage_output_path(state.run_id, f"implement-{task.task_id}")
-            request = AgentRequest(
-                stage="implement",
-                effort=self.config.efforts.get("implement", "balanced"),
-                prompt=implement_prompt,
-                cwd=self.project_root,
-                output_path=implement_output,
-            )
-            write_run_prompt(self.project_root, state.run_id, f"implement-{task.task_id}", implement_prompt)
-            implement_result = self.adapter.run(request)
-            if not implement_result.ok:
-                raise RuntimeError(
-                    f"Task {task.task_id} implementation failed: {implement_result.stderr or implement_result.summary}"
-                )
-
-            gate_result = self._run_task_review_and_verify(state.run_id, task)
+            gate_result = self._execute_task_with_retries(state, task)
             if not gate_result["ok"]:
                 task.status = "blocked"
-                task.review_summary = gate_result["review"]
+                task.review_summary = str(gate_result["review"])
                 self._persist_tasks(tasks)
                 raise RuntimeError(f"Task {task.task_id} failed gates: {gate_result['reason']}")
 
             task.status = "done"
-            task.review_summary = gate_result["review"]
+            task.review_summary = str(gate_result["review"])
             commit_message = task.commit_message or self.config.git.commit_message_template.format(
                 task_id=task.task_id,
                 title=task.title,
@@ -182,23 +167,19 @@ class Orchestrator:
         state.tasks = tasks
         state.current_stage = "implement"
         state.stage_summaries["implement"] = f"Completed {sum(task.status == 'done' for task in tasks)} tasks."
+        state.last_error = ""
         return state
 
     def _run_task_review_and_verify(self, run_id: str, task: TaskSpec) -> Dict[str, object]:
         review_prompt = self._build_task_prompt(task, "review")
-        output_path = self._stage_output_path(run_id, f"review-{task.task_id}")
-        request = AgentRequest(
+        review_result = self._run_agent_with_retries(
+            state=None,
             stage="review",
-            effort=self.config.efforts.get("review", "deep"),
+            stage_key=f"review-{task.task_id}",
             prompt=review_prompt,
-            cwd=self.project_root,
-            output_path=output_path,
+            validation_feedback=self._review_validation_feedback,
+            run_id=run_id,
         )
-        write_run_prompt(self.project_root, run_id, f"review-{task.task_id}", review_prompt)
-        review_result = self.adapter.run(request)
-        if not review_result.ok:
-            return {"ok": False, "review": review_result.stderr or review_result.summary, "reason": "review failed"}
-
         decision, summary = self._parse_review_decision(review_result.summary)
         write_text(review_path(self.project_root), summary + "\n")
         if decision != "pass":
@@ -223,6 +204,7 @@ class Orchestrator:
         write_text(output_path, summary)
         state.current_stage = "verify"
         state.stage_summaries["verify"] = summary.strip()
+        state.last_error = ""
         if not verify_gate.ok:
             state.status = "failed"
             raise RuntimeError("verify stage failed")
@@ -325,6 +307,115 @@ class Orchestrator:
 
         raise RuntimeError(f"Unsupported task stage: {stage}")
 
+    def _execute_task_with_retries(self, state: RunState, task: TaskSpec) -> Dict[str, object]:
+        max_attempts = self._max_attempts("implement")
+        feedback = ""
+        last_reason = "task failed without a recorded reason"
+        last_review = ""
+
+        for attempt in range(1, max_attempts + 1):
+            state.current_stage = "implement"
+            implement_prompt = self._build_task_prompt(task, "implement")
+            if feedback:
+                implement_prompt = f"{implement_prompt}\n\nPrevious attempt issues:\n{feedback}\n"
+            result = self._run_agent_with_retries(
+                state=state,
+                stage="implement",
+                stage_key=f"implement-{task.task_id}",
+                prompt=implement_prompt,
+            )
+            if not result.ok:
+                last_reason = result.stderr or result.summary or "implementation failed"
+                feedback = f"- Implementation command failed.\n- Details: {last_reason}"
+                continue
+
+            gate_result = self._run_task_review_and_verify(state.run_id, task)
+            if gate_result["ok"]:
+                return gate_result
+
+            last_reason = str(gate_result["reason"])
+            last_review = str(gate_result["review"])
+            feedback = (
+                f"- Review or verification rejected the task.\n"
+                f"- Reason: {last_reason}\n"
+                f"- Review summary:\n{last_review}"
+            )
+
+        return {"ok": False, "review": last_review or feedback, "reason": last_reason}
+
+    def _run_agent_with_retries(
+        self,
+        state: Optional[RunState],
+        stage: str,
+        stage_key: str,
+        prompt: str,
+        validation_feedback: Optional[Callable[[AgentResult], Optional[str]]] = None,
+        run_id: Optional[str] = None,
+    ) -> AgentResult:
+        attempts = self._max_attempts(stage)
+        active_run_id = run_id or (state.run_id if state is not None else load_run_state(self.project_root).run_id)
+        feedback = ""
+        last_error = f"{stage_key} failed"
+
+        for attempt in range(1, attempts + 1):
+            attempt_prompt = prompt
+            if feedback:
+                attempt_prompt = f"{prompt}\n\nPrevious attempt issues:\n{feedback}\n"
+
+            artifact_stage = stage_key if attempt == 1 else f"{stage_key}-attempt-{attempt}"
+            output_path = self._stage_output_path(active_run_id, artifact_stage)
+            write_run_prompt(self.project_root, active_run_id, artifact_stage, attempt_prompt)
+            request = AgentRequest(
+                stage=stage,
+                effort=self.config.efforts.get(stage, "balanced"),
+                prompt=attempt_prompt,
+                cwd=self.project_root,
+                output_path=output_path,
+            )
+            result = self.adapter.run(request)
+            if state is not None:
+                state.agent_attempts[stage_key] = attempt
+                save_run_state(self.project_root, state)
+
+            if not result.ok:
+                last_error = result.stderr or result.summary or f"{stage_key} failed"
+                feedback = f"- The command failed.\n- Details: {last_error}"
+                continue
+
+            if validation_feedback is not None:
+                issue = validation_feedback(result)
+                if issue:
+                    last_error = issue
+                    feedback = issue
+                    continue
+
+            return result
+
+        raise RuntimeError(f"{stage_key} exhausted retries: {last_error}")
+
+    def _max_attempts(self, stage: str) -> int:
+        return max(1, self.config.retries.per_stage.get(stage, self.config.retries.default_max_attempts))
+
+    def _plan_validation_feedback(self, _: AgentResult) -> Optional[str]:
+        payload = load_task_plan(self.project_root)
+        errors = validate_task_plan_payload(payload)
+        if not errors:
+            return None
+        bullets = "\n".join(f"- {item}" for item in errors)
+        return (
+            "The task plan JSON is invalid. Rewrite the file and fix all issues exactly.\n"
+            f"{bullets}"
+        )
+
+    def _review_validation_feedback(self, result: AgentResult) -> Optional[str]:
+        decision, _ = self._parse_review_decision(result.summary)
+        if decision in {"pass", "fail"}:
+            return None
+        return (
+            "The review response is invalid. The first non-empty line must be exactly "
+            "'DECISION: pass' or 'DECISION: fail'. Rewrite the review output."
+        )
+
     @staticmethod
     def _parse_review_decision(response: str) -> Tuple[str, str]:
         lines = [line.strip() for line in response.splitlines() if line.strip()]
@@ -345,6 +436,8 @@ class Orchestrator:
             "current_stage": state.current_stage,
             "pending_approval": state.pending_approval,
             "approved_gates": state.approved_gates,
+            "agent_attempts": state.agent_attempts,
+            "last_error": state.last_error,
             "tasks": [task.to_dict() for task in state.tasks],
             "changed_files": changed_files(self.project_root) if is_repo(self.project_root) else "",
         }

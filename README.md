@@ -8,6 +8,8 @@ V1 scope:
 - Provider-agnostic orchestration
 - Stage-specific effort policy
 - File-driven context to reduce token usage
+- Strict task plan validation before execution
+- Limited retries for planning, review formatting, and task rework
 - Automatic git commit after each verified feature slice
 
 ## Why this shape
@@ -18,6 +20,7 @@ The system optimizes for quality over throughput:
 - Providers are replaceable adapters
 - LLM calls stay short and stage-specific
 - Scripts, not the model, enforce quality gates
+- Invalid plans and malformed reviews are rejected and retried with focused feedback
 
 ## Core workflow
 
@@ -72,3 +75,16 @@ Adapters map those labels to provider-specific controls. For Codex this can map 
 profiles such as `m` and `h`. If another provider does not support reasoning strength directly, the
 adapter can ignore the hint and still satisfy the interface.
 
+## Task plan contract
+
+`state/task_plan.json` is treated as an execution contract, not a loose note. Each task must contain:
+
+- `task_id`
+- `title`
+- `description`
+- `acceptance`
+- `status`
+- `commit_message`
+
+The orchestrator validates task IDs, duplicate entries, acceptance lists, and allowed statuses before
+the implementation loop starts.

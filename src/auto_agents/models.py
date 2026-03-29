@@ -125,6 +125,37 @@ class ApprovalConfig:
 
 
 @dataclass
+class RetryConfig:
+    default_max_attempts: int = 2
+    per_stage: Dict[str, int] = field(
+        default_factory=lambda: {
+            "clarify": 2,
+            "design": 2,
+            "plan": 3,
+            "implement": 2,
+            "review": 2,
+        }
+    )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "RetryConfig":
+        return cls(
+            default_max_attempts=int(data.get("default_max_attempts", 2)),
+            per_stage={str(k): int(v) for k, v in dict(data.get("per_stage", {})).items()}
+            or {
+                "clarify": 2,
+                "design": 2,
+                "plan": 3,
+                "implement": 2,
+                "review": 2,
+            },
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class ProjectConfig:
     project_name: str
     provider: ProviderConfig = field(default_factory=ProviderConfig)
@@ -141,6 +172,7 @@ class ProjectConfig:
     gates: GateConfig = field(default_factory=GateConfig)
     git: GitConfig = field(default_factory=GitConfig)
     approvals: ApprovalConfig = field(default_factory=ApprovalConfig)
+    retries: RetryConfig = field(default_factory=RetryConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProjectConfig":
@@ -166,6 +198,7 @@ class ProjectConfig:
                     )
                 )
             ),
+            retries=RetryConfig.from_dict(dict(data.get("retries", {}))),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -176,6 +209,7 @@ class ProjectConfig:
             "gates": self.gates.to_dict(),
             "git": self.git.to_dict(),
             "approvals": self.approvals.to_dict(),
+            "retries": self.retries.to_dict(),
         }
 
 
@@ -188,6 +222,8 @@ class RunState:
     approved_gates: List[str] = field(default_factory=list)
     tasks: List[TaskSpec] = field(default_factory=list)
     stage_summaries: Dict[str, str] = field(default_factory=dict)
+    agent_attempts: Dict[str, int] = field(default_factory=dict)
+    last_error: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -201,6 +237,10 @@ class RunState:
             stage_summaries={
                 str(key): str(value) for key, value in dict(data.get("stage_summaries", {})).items()
             },
+            agent_attempts={
+                str(key): int(value) for key, value in dict(data.get("agent_attempts", {})).items()
+            },
+            last_error=str(data.get("last_error", "")),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -212,6 +252,8 @@ class RunState:
             "approved_gates": list(self.approved_gates),
             "tasks": [task.to_dict() for task in self.tasks],
             "stage_summaries": dict(self.stage_summaries),
+            "agent_attempts": dict(self.agent_attempts),
+            "last_error": self.last_error,
         }
 
 

@@ -74,6 +74,8 @@ RUN_STATE_TEMPLATE = {
     "approved_gates": [],
     "tasks": [],
     "stage_summaries": {},
+    "agent_attempts": {},
+    "last_error": "",
 }
 
 
@@ -110,6 +112,16 @@ DEFAULT_CONFIG = {
     },
     "approvals": {
         "enabled": ["requirements", "architecture", "release"],
+    },
+    "retries": {
+        "default_max_attempts": 2,
+        "per_stage": {
+            "clarify": 2,
+            "design": 2,
+            "plan": 3,
+            "implement": 2,
+            "review": 2
+        }
     },
 }
 

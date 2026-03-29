@@ -10,6 +10,7 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 - Token usage is controlled by file-driven context, not by long conversational memory.
 - The orchestrator owns state. Providers are stateless workers.
 - The same model can be reused across stages while effort varies by stage.
+- Invalid structured outputs are rejected quickly and retried with terse corrective feedback.
 
 ## Internal layout
 
@@ -24,6 +25,13 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 - Pause after `design` for `architecture` approval
 - Pause after `verify` for `release` approval
 
+## Retry strategy
+
+- `plan` retries if `task_plan.json` fails structural validation.
+- `review` retries if the decision header is malformed.
+- `implement` retries if review or verification rejects the current task.
+- Retries are finite and configurable per stage.
+
 ## Git strategy
 
 Each task in `task_plan.json` is a minimal verifiable feature slice. A commit happens only after:
@@ -31,4 +39,3 @@ Each task in `task_plan.json` is a minimal verifiable feature slice. A commit ha
 1. implementation completed
 2. independent review passed
 3. verification commands passed
-
