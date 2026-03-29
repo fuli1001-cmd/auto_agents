@@ -1,0 +1,42 @@
+{
+  "project_name": "demo",
+  "provider": {
+    "kind": "codex",
+    "binary": "codex",
+    "profile_map": {
+      "balanced": "m",
+      "deep": "h"
+    },
+    "extra_args": [],
+    "cwd_flag": "-C",
+    "prompt_via_stdin": true,
+    "output_flag": "-o"
+  },
+  "efforts": {
+    "clarify": "deep",
+    "design": "deep",
+    "plan": "balanced",
+    "implement": "balanced",
+    "review": "deep",
+    "verify": "balanced"
+  },
+  "gates": {
+    "commands": [
+      "python3 -m unittest discover -s tests"
+    ],
+    "require_clean_git_before_task": true
+  },
+  "git": {
+    "auto_init_repo": true,
+    "commit_each_task": true,
+    "commit_message_template": "feat({task_id}): {title}"
+  },
+  "approvals": {
+    "enabled": [
+      "requirements",
+      "architecture",
+      "release"
+    ]
+  }
+}
+
