@@ -1,11 +1,31 @@
 from __future__ import annotations
 
 import re
+from json import JSONDecodeError
+from pathlib import Path
 from typing import Dict, List
+
+from .config import architecture_path, config_path, project_brief_path, task_plan_path
+from .io_utils import read_json, read_text
+from .models import APPROVAL_ORDER
 
 
 TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALLOWED_TASK_STATUS = {"pending", "blocked", "done"}
+ALLOWED_EFFORTS = {"balanced", "deep"}
+REQUIRED_EFFORT_STAGES = ("clarify", "design", "plan", "implement", "review", "verify")
+REQUIRED_DOC_HEADINGS = {
+    "project_brief.md": ("# Project Brief", "## Problem", "## MVP Scope", "## Non-Goals", "## Constraints"),
+    "architecture.md": ("# Architecture", "## System Boundary", "## Core Modules", "## Data Flow", "## Risks"),
+}
+
+
+def schema_paths() -> Dict[str, str]:
+    root = Path(__file__).resolve().parents[2] / "schemas"
+    return {
+        "project_config": str((root / "project_config.schema.json").resolve()),
+        "task_plan": str((root / "task_plan.schema.json").resolve()),
+    }
 
 
 def validate_task_plan_payload(payload: object) -> List[str]:
@@ -84,3 +104,174 @@ def validate_task_plan_payload(payload: object) -> List[str]:
 
     return errors
 
+
+def validate_project_config_payload(payload: object) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(payload, dict):
+        return ["project config root must be a JSON object"]
+
+    required = {"project_name", "provider", "efforts", "gates", "git", "approvals", "retries"}
+    missing = sorted(required - set(payload.keys()))
+    if missing:
+        errors.append(f"project config missing required fields: {', '.join(missing)}")
+
+    project_name = payload.get("project_name")
+    if not isinstance(project_name, str) or not project_name.strip():
+        errors.append("project_name must be a non-empty string")
+
+    provider = payload.get("provider")
+    if not isinstance(provider, dict):
+        errors.append("provider must be an object")
+    else:
+        for key in ("kind", "binary", "cwd_flag", "output_flag"):
+            value = provider.get(key)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"provider.{key} must be a non-empty string")
+
+        prompt_via_stdin = provider.get("prompt_via_stdin")
+        if not isinstance(prompt_via_stdin, bool):
+            errors.append("provider.prompt_via_stdin must be a boolean")
+
+        extra_args = provider.get("extra_args")
+        if not isinstance(extra_args, list) or any(not isinstance(item, str) for item in extra_args):
+            errors.append("provider.extra_args must be a list of strings")
+
+        profile_map = provider.get("profile_map")
+        if not isinstance(profile_map, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in profile_map.items()
+        ):
+            errors.append("provider.profile_map must be an object of string keys and string values")
+
+    efforts = payload.get("efforts")
+    if not isinstance(efforts, dict):
+        errors.append("efforts must be an object")
+    else:
+        missing_stages = [stage for stage in REQUIRED_EFFORT_STAGES if stage not in efforts]
+        if missing_stages:
+            errors.append(f"efforts missing stages: {', '.join(missing_stages)}")
+        for stage in REQUIRED_EFFORT_STAGES:
+            value = efforts.get(stage)
+            if not isinstance(value, str) or value not in ALLOWED_EFFORTS:
+                errors.append(
+                    f"efforts.{stage} must be one of: {', '.join(sorted(ALLOWED_EFFORTS))}"
+                )
+
+    gates = payload.get("gates")
+    if not isinstance(gates, dict):
+        errors.append("gates must be an object")
+    else:
+        commands = gates.get("commands")
+        if not isinstance(commands, list) or any(not isinstance(item, str) for item in commands):
+            errors.append("gates.commands must be a list of strings")
+        clean = gates.get("require_clean_git_before_task")
+        if not isinstance(clean, bool):
+            errors.append("gates.require_clean_git_before_task must be a boolean")
+
+    git = payload.get("git")
+    if not isinstance(git, dict):
+        errors.append("git must be an object")
+    else:
+        for key in ("auto_init_repo", "commit_each_task"):
+            if not isinstance(git.get(key), bool):
+                errors.append(f"git.{key} must be a boolean")
+        template = git.get("commit_message_template")
+        if not isinstance(template, str) or not template.strip():
+            errors.append("git.commit_message_template must be a non-empty string")
+        else:
+            if "{task_id}" not in template:
+                errors.append("git.commit_message_template must contain '{task_id}'")
+            if "{title}" not in template:
+                errors.append("git.commit_message_template must contain '{title}'")
+
+    approvals = payload.get("approvals")
+    if not isinstance(approvals, dict):
+        errors.append("approvals must be an object")
+    else:
+        enabled = approvals.get("enabled")
+        if not isinstance(enabled, list) or any(not isinstance(item, str) for item in enabled):
+            errors.append("approvals.enabled must be a list of strings")
+        else:
+            invalid = [item for item in enabled if item not in APPROVAL_ORDER]
+            if invalid:
+                errors.append(
+                    f"approvals.enabled contains invalid values: {', '.join(sorted(invalid))}"
+                )
+
+    retries = payload.get("retries")
+    if not isinstance(retries, dict):
+        errors.append("retries must be an object")
+    else:
+        default_max_attempts = retries.get("default_max_attempts")
+        if not isinstance(default_max_attempts, int) or default_max_attempts < 1:
+            errors.append("retries.default_max_attempts must be an integer >= 1")
+
+        per_stage = retries.get("per_stage")
+        if not isinstance(per_stage, dict):
+            errors.append("retries.per_stage must be an object")
+        else:
+            for key, value in per_stage.items():
+                if key not in ("clarify", "design", "plan", "implement", "review"):
+                    errors.append(f"retries.per_stage contains unknown stage '{key}'")
+                if not isinstance(value, int) or value < 1:
+                    errors.append(f"retries.per_stage.{key} must be an integer >= 1")
+
+    return errors
+
+
+def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
+    root = project_root.resolve()
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    try:
+        config_payload = read_json(config_path(root), default=None)
+    except JSONDecodeError as error:
+        config_payload = None
+        errors.append(f"config file is not valid JSON: {config_path(root)} ({error.msg})")
+    if config_payload is None and not errors:
+        errors.append(f"missing config file: {config_path(root)}")
+    elif config_payload is not None:
+        errors.extend(validate_project_config_payload(config_payload))
+
+    try:
+        plan_payload = read_json(task_plan_path(root), default=None)
+    except JSONDecodeError as error:
+        plan_payload = None
+        errors.append(f"task plan file is not valid JSON: {task_plan_path(root)} ({error.msg})")
+    if plan_payload is None and not any("task plan file is not valid JSON" in item for item in errors):
+        errors.append(f"missing task plan file: {task_plan_path(root)}")
+    elif plan_payload is not None:
+        errors.extend(validate_task_plan_payload(plan_payload))
+
+    docs = {
+        "project_brief.md": project_brief_path(root),
+        "architecture.md": architecture_path(root),
+    }
+    for name, path in docs.items():
+        if not path.exists():
+            errors.append(f"missing required document: {path}")
+            continue
+        content = read_text(path).strip()
+        if not content:
+            errors.append(f"document is empty: {path}")
+            continue
+        for heading in REQUIRED_DOC_HEADINGS[name]:
+            if heading not in content:
+                errors.append(f"{path} is missing heading '{heading}'")
+
+    review_file = root / ".auto-agents" / "docs" / "review.md"
+    if not review_file.exists():
+        warnings.append(f"review file not found yet: {review_file}")
+
+    return {"errors": errors, "warnings": warnings}
+
+
+def validation_report(project_root: Path) -> Dict[str, object]:
+    result = validate_project_root(project_root)
+    return {
+        "ok": not result["errors"],
+        "errors": result["errors"],
+        "warnings": result["warnings"],
+        "schemas": schema_paths(),
+    }

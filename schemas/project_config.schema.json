@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-agents.local/project_config.schema.json",
+  "title": "auto-agents project config",
+  "type": "object",
+  "required": [
+    "project_name",
+    "provider",
+    "efforts",
+    "gates",
+    "git",
+    "approvals",
+    "retries"
+  ],
+  "properties": {
+    "project_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provider": {
+      "type": "object",
+      "required": [
+        "kind",
+        "binary",
+        "profile_map",
+        "extra_args",
+        "cwd_flag",
+        "prompt_via_stdin",
+        "output_flag"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        },
+        "binary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "profile_map": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "extra_args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cwd_flag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "prompt_via_stdin": {
+          "type": "boolean"
+        },
+        "output_flag": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "efforts": {
+      "type": "object",
+      "properties": {
+        "clarify": { "type": "string" },
+        "design": { "type": "string" },
+        "plan": { "type": "string" },
+        "implement": { "type": "string" },
+        "review": { "type": "string" },
+        "verify": { "type": "string" }
+      },
+      "required": [
+        "clarify",
+        "design",
+        "plan",
+        "implement",
+        "review",
+        "verify"
+      ],
+      "additionalProperties": false
+    },
+    "gates": {
+      "type": "object",
+      "required": [
+        "commands",
+        "require_clean_git_before_task"
+      ],
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "require_clean_git_before_task": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "git": {
+      "type": "object",
+      "required": [
+        "auto_init_repo",
+        "commit_each_task",
+        "commit_message_template"
+      ],
+      "properties": {
+        "auto_init_repo": {
+          "type": "boolean"
+        },
+        "commit_each_task": {
+          "type": "boolean"
+        },
+        "commit_message_template": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "approvals": {
+      "type": "object",
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "retries": {
+      "type": "object",
+      "required": [
+        "default_max_attempts",
+        "per_stage"
+      ],
+      "properties": {
+        "default_max_attempts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "per_stage": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
+

@@ -138,6 +138,14 @@ def docs_dir(project_root: Path) -> Path:
     return auto_dir(project_root) / "docs"
 
 
+def project_brief_path(project_root: Path) -> Path:
+    return docs_dir(project_root) / "project_brief.md"
+
+
+def architecture_path(project_root: Path) -> Path:
+    return docs_dir(project_root) / "architecture.md"
+
+
 def state_dir(project_root: Path) -> Path:
     return auto_dir(project_root) / "state"
 
@@ -177,8 +185,8 @@ def bootstrap_project(project_root: Path, name: str, provider_kind: str) -> Path
         auto_dir(root) / ".gitignore",
         "runs/\nstate/run_state.json\n",
     )
-    write_if_missing(docs_dir(root) / "project_brief.md", PROJECT_BRIEF_TEMPLATE)
-    write_if_missing(docs_dir(root) / "architecture.md", ARCHITECTURE_TEMPLATE)
+    write_if_missing(project_brief_path(root), PROJECT_BRIEF_TEMPLATE)
+    write_if_missing(architecture_path(root), ARCHITECTURE_TEMPLATE)
     write_if_missing(review_path(root), "# Review\n\nNo review has been recorded yet.\n")
     write_json(task_plan_path(root), TASK_PLAN_TEMPLATE)
     write_json(run_state_path(root), RUN_STATE_TEMPLATE)

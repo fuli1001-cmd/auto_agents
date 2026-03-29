@@ -30,7 +30,7 @@ from .models import (
     STAGE_ORDER,
     TaskSpec,
 )
-from .validation import validate_task_plan_payload
+from .validation import validate_task_plan_payload, validation_report
 
 
 class Orchestrator:
@@ -441,6 +441,9 @@ class Orchestrator:
             "tasks": [task.to_dict() for task in state.tasks],
             "changed_files": changed_files(self.project_root) if is_repo(self.project_root) else "",
         }
+
+    def validate(self) -> Dict[str, object]:
+        return validation_report(self.project_root)
 
     def _pending_stages(self, state: RunState) -> List[str]:
         pending: List[str] = []

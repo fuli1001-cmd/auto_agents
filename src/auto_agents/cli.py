@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .orchestrator import Orchestrator
+from .validation import validation_report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -41,6 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Show the current orchestrator state.")
     status_parser.add_argument("--project", required=True, help="Target project directory.")
+
+    validate_parser = subparsers.add_parser("validate", help="Validate config, plan, and required docs.")
+    validate_parser.add_argument("--project", required=True, help="Target project directory.")
     return parser
 
 
@@ -73,6 +77,11 @@ def main(argv: list[str] | None = None) -> int:
         orchestrator = Orchestrator(Path(args.project))
         print(json.dumps(orchestrator.status(), indent=2, ensure_ascii=True))
         return 0
+
+    if args.command == "validate":
+        report = validation_report(Path(args.project))
+        print(json.dumps(report, indent=2, ensure_ascii=True))
+        return 0 if report["ok"] else 1
 
     parser.error(f"Unsupported command: {args.command}")
     return 2

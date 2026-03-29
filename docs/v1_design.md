@@ -18,6 +18,7 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 - `.auto-agents/docs/*.md`: compact human-readable documents
 - `.auto-agents/state/*.json`: machine-readable state
 - `.auto-agents/runs/<run_id>/`: prompts, responses, logs, summaries
+- `schemas/*.schema.json`: explicit JSON contracts for config and plan files
 
 ## Gate strategy
 
@@ -31,6 +32,14 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 - `review` retries if the decision header is malformed.
 - `implement` retries if review or verification rejects the current task.
 - Retries are finite and configurable per stage.
+
+## Offline validation
+
+The `validate` command performs a token-free local check of:
+
+- `.auto-agents/config.json`
+- `.auto-agents/state/task_plan.json`
+- required document presence and headings
 
 ## Git strategy
 

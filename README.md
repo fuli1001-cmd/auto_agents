@@ -64,6 +64,12 @@ Run tests for this repository:
 python3 -m unittest discover -s tests
 ```
 
+Validate a target project without spending tokens:
+
+```bash
+python3 -m auto_agents validate --project /tmp/demo
+```
+
 ## Provider model
 
 The orchestrator uses its own effort labels:
@@ -88,3 +94,13 @@ adapter can ignore the hint and still satisfy the interface.
 
 The orchestrator validates task IDs, duplicate entries, acceptance lists, and allowed statuses before
 the implementation loop starts.
+
+## Schemas
+
+Explicit schema files live in:
+
+- `schemas/project_config.schema.json`
+- `schemas/task_plan.schema.json`
+
+The built-in `validate` command checks project files against these contracts plus required document
+headings.
