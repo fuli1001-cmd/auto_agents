@@ -35,6 +35,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional task execution cap for the current run.",
     )
+    run_parser.add_argument(
+        "--skip-validate",
+        action="store_true",
+        help="Skip local preflight validation before agent execution.",
+    )
 
     approve_parser = subparsers.add_parser("approve", help="Approve a pending manual gate.")
     approve_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -64,14 +69,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
-        orchestrator = Orchestrator(Path(args.project))
-        state = orchestrator.run(
-            idea_file=Path(args.idea_file),
-            auto_approve=bool(args.auto_approve),
-            max_tasks=args.max_tasks,
-        )
-        print(json.dumps(state.to_dict(), indent=2, ensure_ascii=True))
-        return 0
+        try:
+            orchestrator = Orchestrator(Path(args.project))
+            state = orchestrator.run(
+                idea_file=Path(args.idea_file),
+                auto_approve=bool(args.auto_approve),
+                max_tasks=args.max_tasks,
+                skip_validate=bool(args.skip_validate),
+            )
+            print(json.dumps(state.to_dict(), indent=2, ensure_ascii=True))
+            return 0
+        except (RuntimeError, FileNotFoundError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=True))
+            return 1
 
     if args.command == "status":
         orchestrator = Orchestrator(Path(args.project))

@@ -57,9 +57,16 @@ class Orchestrator:
         save_run_state(self.project_root, state)
         return state
 
-    def run(self, idea_file: Path, auto_approve: bool = False, max_tasks: Optional[int] = None) -> RunState:
+    def run(
+        self,
+        idea_file: Path,
+        auto_approve: bool = False,
+        max_tasks: Optional[int] = None,
+        skip_validate: bool = False,
+    ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
         state = load_run_state(self.project_root)
+        self._ensure_preconditions(state, idea_file=idea_file, skip_validate=skip_validate)
 
         if state.status == "completed":
             return state
@@ -106,6 +113,29 @@ class Orchestrator:
         state.status = "completed"
         save_run_state(self.project_root, state)
         return state
+
+    def _ensure_preconditions(self, state: RunState, idea_file: Path, skip_validate: bool) -> None:
+        if not idea_file.exists():
+            state.status = "failed"
+            state.last_error = f"idea file does not exist: {idea_file}"
+            save_run_state(self.project_root, state)
+            raise RuntimeError(state.last_error)
+
+        if skip_validate:
+            return
+
+        report = validation_report(self.project_root)
+        if report["ok"]:
+            return
+
+        error_lines = [f"- {item}" for item in report["errors"]]
+        if report["warnings"]:
+            error_lines.extend(f"- warning: {item}" for item in report["warnings"])
+        message = "preflight validation failed:\n" + "\n".join(error_lines)
+        state.status = "failed"
+        state.last_error = message
+        save_run_state(self.project_root, state)
+        raise RuntimeError(message)
 
     def _build_adapter(self, config: ProjectConfig):
         if config.provider.kind == "codex":

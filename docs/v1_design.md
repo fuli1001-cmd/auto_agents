@@ -41,6 +41,9 @@ The `validate` command performs a token-free local check of:
 - `.auto-agents/state/task_plan.json`
 - required document presence and headings
 
+The `run` command invokes this preflight check before any agent stage unless explicitly bypassed with
+`--skip-validate`.
+
 ## Git strategy
 
 Each task in `task_plan.json` is a minimal verifiable feature slice. A commit happens only after:

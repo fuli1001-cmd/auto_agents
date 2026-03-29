@@ -52,6 +52,9 @@ Run the orchestrator:
 python3 -m auto_agents run --project /tmp/demo --idea-file /tmp/demo/idea.md
 ```
 
+`run` performs local preflight validation before any agent call. Use `--skip-validate` only for
+manual recovery or debugging.
+
 Approve a paused gate:
 
 ```bash
