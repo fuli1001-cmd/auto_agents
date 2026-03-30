@@ -29,8 +29,19 @@ class GateTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertEqual(len(result.commands), 2)
             self.assertEqual(result.commands[1].returncode, 3)
+            self.assertIn("command failed:", result.summary)
+            self.assertIn("python3 -c \"import sys; sys.exit(3)\"", result.summary)
+
+    def test_run_commands_includes_stderr_in_failure_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_commands(
+                ["python3 -c \"import sys; sys.stderr.write('boom\\n'); sys.exit(2)\""],
+                Path(tmp),
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("boom", result.summary)
 
 
 if __name__ == "__main__":
     unittest.main()
-
