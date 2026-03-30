@@ -12,6 +12,9 @@
     "prompt_via_stdin": true,
     "output_flag": "-o"
   },
+  "docs": {
+    "language": "en"
+  },
   "efforts": {
     "clarify": "deep",
     "design": "deep",

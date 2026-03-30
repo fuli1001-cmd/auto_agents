@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.config import auto_dir, config_path, docs_dir, run_state_path, task_plan_path
+from auto_agents.config import auto_dir, config_path, docs_dir, load_project_config, run_state_path, task_plan_path
 from auto_agents.git_ops import is_repo
 from auto_agents.orchestrator import Orchestrator
 
@@ -28,6 +28,8 @@ class BootstrapTests(unittest.TestCase):
             self.assertIn(".conda/", gitignore)
             self.assertIn(".venv/", gitignore)
             self.assertIn("node_modules/", gitignore)
+            config = load_project_config(project_root)
+            self.assertEqual(config.docs.language, "en")
 
 
 if __name__ == "__main__":

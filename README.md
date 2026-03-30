@@ -98,6 +98,7 @@ Convenience defaults:
 
 - `init --name` defaults to the final directory name from `--project`
 - `init --provider` defaults to `codex`
+- `init --doc-language` defaults to `en`
 
 Run the orchestrator:
 
@@ -109,6 +110,19 @@ python3 -m auto_agents run --project /tmp/demo --idea-file /tmp/demo/idea.md
 
 ```bash
 python3 -m auto_agents run --project /tmp/demo
+```
+
+Show each completed agent stage output on screen without breaking the final JSON response:
+
+```bash
+python3 -m auto_agents run --project /tmp/demo --print-agent-output
+```
+
+Generate persisted documents in Simplified Chinese:
+
+```bash
+python3 -m auto_agents init --project /tmp/demo --doc-language zh
+python3 -m auto_agents run --project /tmp/demo --doc-language zh
 ```
 
 `run` performs local preflight validation before any agent call. Use `--skip-validate` only for

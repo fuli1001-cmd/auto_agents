@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 STAGE_ORDER = ["clarify", "design", "plan", "implement", "verify"]
 APPROVAL_ORDER = ["requirements", "architecture", "release"]
+DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 APPROVAL_BY_STAGE = {
     "clarify": "requirements",
     "design": "architecture",
@@ -127,6 +128,18 @@ class ApprovalConfig:
 
 
 @dataclass
+class DocsConfig:
+    language: str = "en"
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "DocsConfig":
+        return cls(language=str(data.get("language", "en")))
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class RetryConfig:
     default_max_attempts: int = 2
     per_stage: Dict[str, int] = field(
@@ -161,6 +174,7 @@ class RetryConfig:
 class ProjectConfig:
     project_name: str
     provider: ProviderConfig = field(default_factory=ProviderConfig)
+    docs: DocsConfig = field(default_factory=DocsConfig)
     efforts: Dict[str, str] = field(
         default_factory=lambda: {
             "clarify": "deep",
@@ -181,6 +195,7 @@ class ProjectConfig:
         return cls(
             project_name=str(data.get("project_name", "unnamed-project")),
             provider=ProviderConfig.from_dict(dict(data.get("provider", {}))),
+            docs=DocsConfig.from_dict(dict(data.get("docs", {}))),
             efforts={str(k): str(v) for k, v in dict(data.get("efforts", {})).items()}
             or {
                 "clarify": "deep",
@@ -207,6 +222,7 @@ class ProjectConfig:
         return {
             "project_name": self.project_name,
             "provider": self.provider.to_dict(),
+            "docs": self.docs.to_dict(),
             "efforts": dict(self.efforts),
             "gates": self.gates.to_dict(),
             "git": self.git.to_dict(),

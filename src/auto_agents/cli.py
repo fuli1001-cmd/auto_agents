@@ -33,6 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="codex",
         help="Provider kind. Defaults to codex. Built-in: codex, mock, or a shell-wrapper kind.",
     )
+    init_parser.add_argument(
+        "--doc-language",
+        choices=("en", "zh"),
+        default="en",
+        help="Language for generated documents. Defaults to en.",
+    )
 
     run_parser = subparsers.add_parser("run", help="Run the orchestration pipeline.")
     run_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -61,6 +67,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print each agent stage output to stderr as it completes.",
     )
+    run_parser.add_argument(
+        "--doc-language",
+        choices=("en", "zh"),
+        help="Override and persist the language for generated documents.",
+    )
 
     approve_parser = subparsers.add_parser("approve", help="Approve a pending manual gate.")
     approve_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -84,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "init":
         project_root = Path(args.project)
         name = args.name or _default_project_name(project_root)
-        root = Orchestrator.init_project(project_root, name, args.provider)
+        root = Orchestrator.init_project(project_root, name, args.provider, doc_language=args.doc_language)
         print(root)
         return 0
 
@@ -105,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_tasks=args.max_tasks,
                 skip_validate=bool(args.skip_validate),
                 print_agent_output=bool(args.print_agent_output),
+                doc_language=args.doc_language,
             )
             print(json.dumps(state.to_dict(), indent=2, ensure_ascii=True))
             return 0

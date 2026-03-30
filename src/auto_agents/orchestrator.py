@@ -27,6 +27,7 @@ from .models import (
     APPROVAL_BY_STAGE,
     AgentResult,
     AgentRequest,
+    DOCUMENT_LANGUAGE_OPTIONS,
     ProjectConfig,
     RunState,
     STAGE_ORDER,
@@ -45,8 +46,8 @@ class Orchestrator:
         self._print_agent_output = False
 
     @staticmethod
-    def init_project(project_root: Path, name: str, provider_kind: str) -> Path:
-        root = bootstrap_project(project_root, name, provider_kind)
+    def init_project(project_root: Path, name: str, provider_kind: str, doc_language: str = "en") -> Path:
+        root = bootstrap_project(project_root, name, provider_kind, doc_language=doc_language)
         ensure_repo(root, auto_init=True)
         return root
 
@@ -82,10 +83,13 @@ class Orchestrator:
         max_tasks: Optional[int] = None,
         skip_validate: bool = False,
         print_agent_output: bool = False,
+        doc_language: Optional[str] = None,
     ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
         self._print_agent_output = print_agent_output
         try:
+            if doc_language is not None:
+                self._set_document_language(doc_language)
             state = load_run_state(self.project_root)
             self._ensure_preconditions(state, idea_file=idea_file, skip_validate=skip_validate)
 
@@ -325,6 +329,7 @@ class Orchestrator:
                 f"Update this file in place: {brief}",
                 "Keep the brief compact and scoped to the MVP.",
                 "Preserve the exact top-level and section headings already present in the file.",
+                self._document_language_instruction(),
                 "Final response: 3 short bullets summarizing the clarified scope.",
             ]
             return "\n".join(lines)
@@ -335,6 +340,7 @@ class Orchestrator:
                 f"Update this file in place: {architecture}",
                 "Record only top-level architecture decisions and major risks.",
                 "Preserve the exact top-level and section headings already present in the file.",
+                self._document_language_instruction(),
                 "Final response: 3 short bullets summarizing the design.",
             ]
             return "\n".join(lines)
@@ -349,6 +355,7 @@ class Orchestrator:
                 "If this is a Python project, require a project-local conda env at ./.conda.",
                 "For Python verification, use 'conda run -p ./.conda python -m unittest discover -s tests' unless another command is clearly better.",
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
+                self._plan_language_instruction(),
                 "Each task must contain task_id, title, description, acceptance, status, commit_message.",
                 "Keep tasks small enough to implement and verify independently.",
                 "Final response: 3 short bullets summarizing the plan.",
@@ -386,6 +393,7 @@ class Orchestrator:
                 "Review the current uncommitted changes for correctness, regressions, and missing tests.",
                 f"Write the review summary to: {review_path(self.project_root)}",
                 "Return the first line exactly as 'DECISION: pass' or 'DECISION: fail'.",
+                self._review_language_instruction(),
                 "After the first line, provide a short review summary.",
             ]
             return "\n".join(lines)
@@ -497,6 +505,35 @@ class Orchestrator:
         if result.stderr:
             sections.append(f"[stderr]\n{result.stderr.strip()}")
         print("\n\n".join(sections), file=self.agent_output_stream, flush=True)
+
+    def _set_document_language(self, language: str) -> None:
+        if language not in DOCUMENT_LANGUAGE_OPTIONS:
+            raise ValueError(f"Unsupported document language: {language}")
+        if self.config.docs.language == language:
+            return
+        self.config.docs.language = language
+        save_project_config(self.project_root, self.config)
+
+    def _document_language_instruction(self) -> str:
+        if self.config.docs.language == "zh":
+            return "Write the document content and final bullets in Simplified Chinese."
+        return "Write the document content and final bullets in English."
+
+    def _plan_language_instruction(self) -> str:
+        if self.config.docs.language == "zh":
+            return (
+                "Write all human-readable JSON fields and final bullets in Simplified Chinese. "
+                "Keep shell commands and machine-readable keys in English."
+            )
+        return (
+            "Write all human-readable JSON fields and final bullets in English. "
+            "Keep shell commands and machine-readable keys in English."
+        )
+
+    def _review_language_instruction(self) -> str:
+        if self.config.docs.language == "zh":
+            return "After the first line, write the review summary in Simplified Chinese."
+        return "After the first line, write the review summary in English."
 
     def _max_attempts(self, stage: str) -> int:
         return max(1, self.config.retries.per_stage.get(stage, self.config.retries.default_max_attempts))

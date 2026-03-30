@@ -102,6 +102,9 @@ DEFAULT_CONFIG = {
         "prompt_via_stdin": True,
         "output_flag": "-o",
     },
+    "docs": {
+        "language": "en",
+    },
     "efforts": {
         "clarify": "deep",
         "design": "deep",
@@ -180,7 +183,7 @@ def review_path(project_root: Path) -> Path:
     return docs_dir(project_root) / "review.md"
 
 
-def bootstrap_project(project_root: Path, name: str, provider_kind: str) -> Path:
+def bootstrap_project(project_root: Path, name: str, provider_kind: str, doc_language: str = "en") -> Path:
     root = project_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
 
@@ -189,6 +192,8 @@ def bootstrap_project(project_root: Path, name: str, provider_kind: str) -> Path
     config["provider"] = dict(DEFAULT_CONFIG["provider"])
     config["provider"]["kind"] = provider_kind
     config["provider"]["binary"] = "codex" if provider_kind == "codex" else provider_kind
+    config["docs"] = dict(DEFAULT_CONFIG["docs"])
+    config["docs"]["language"] = doc_language
 
     write_json(config_path(root), config)
     write_if_missing(

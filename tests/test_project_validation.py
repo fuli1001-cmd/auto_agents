@@ -34,6 +34,9 @@ class ProjectValidationTests(unittest.TestCase):
                 "prompt_via_stdin": True,
                 "output_flag": "-o",
             },
+            "docs": {
+                "language": "jp",
+            },
             "efforts": {
                 "clarify": "deep",
                 "design": "wrong",
@@ -69,6 +72,7 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(any("invalid values" in item for item in errors))
         self.assertTrue(any("default_max_attempts" in item for item in errors))
         self.assertTrue(any("unknown stage" in item for item in errors))
+        self.assertTrue(any("docs.language" in item for item in errors))
 
     def test_validate_project_config_payload_rejects_non_isolated_python_commands(self) -> None:
         payload = {
@@ -81,6 +85,9 @@ class ProjectValidationTests(unittest.TestCase):
                 "cwd_flag": "-C",
                 "prompt_via_stdin": True,
                 "output_flag": "-o",
+            },
+            "docs": {
+                "language": "en",
             },
             "efforts": {
                 "clarify": "deep",
@@ -130,6 +137,9 @@ class ProjectValidationTests(unittest.TestCase):
                 "cwd_flag": "-C",
                 "prompt_via_stdin": True,
                 "output_flag": "-o",
+            },
+            "docs": {
+                "language": "zh",
             },
             "efforts": {
                 "clarify": "deep",
@@ -269,6 +279,19 @@ class ProjectValidationTests(unittest.TestCase):
             config = load_project_config(project_root)
             self.assertEqual(config.project_name, "aa-demo")
             self.assertEqual(config.provider.kind, "codex")
+            self.assertEqual(config.docs.language, "en")
+
+    def test_cli_init_can_set_document_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "aa-demo"
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = main(["init", "--project", str(project_root), "--doc-language", "zh"])
+
+            self.assertEqual(exit_code, 0)
+            config = load_project_config(project_root)
+            self.assertEqual(config.docs.language, "zh")
 
     def test_cli_run_defaults_idea_file_to_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -357,6 +380,38 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertTrue(calls["print_agent_output"])
             self.assertTrue(calls["has_stream"])
 
+    def test_cli_run_passes_document_language_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            idea_file = project_root / "idea.md"
+            idea_file.parent.mkdir(parents=True, exist_ok=True)
+            write_text(idea_file, "# Idea\n")
+            calls = {}
+
+            class FakeState:
+                def to_dict(self):
+                    return {"status": "completed"}
+
+            class FakeOrchestrator:
+                def __init__(self, project_root, agent_output_stream=None):
+                    calls["project_root"] = str(project_root)
+
+                def run(self, **kwargs):
+                    calls.update(kwargs)
+                    return FakeState()
+
+            buffer = io.StringIO()
+            with patch("auto_agents.cli.Orchestrator", FakeOrchestrator):
+                with contextlib.redirect_stdout(buffer):
+                    exit_code = main(
+                        ["run", "--project", str(project_root), "--idea-file", str(idea_file), "--doc-language", "zh"]
+                    )
+
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["status"], "completed")
+            self.assertEqual(calls["doc_language"], "zh")
+
     def test_orchestrator_emits_agent_output_to_stderr_stream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -389,6 +444,34 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("[agent:clarify]", rendered)
             self.assertIn("stage output", rendered)
             self.assertIn("stage warning", rendered)
+
+    def test_run_can_persist_document_language_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            idea_file = project_root / "idea.md"
+            write_text(idea_file, "# Idea\n")
+            state = load_run_state(project_root)
+            state.status = "completed"
+            save_run_state(project_root, state)
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.run(idea_file=idea_file, doc_language="zh")
+
+            config = load_project_config(project_root)
+            self.assertEqual(config.docs.language, "zh")
+
+    def test_clarify_prompt_uses_selected_document_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock", doc_language="zh")
+            orchestrator = Orchestrator(project_root)
+            idea_file = project_root / "idea.md"
+            write_text(idea_file, "# Idea\n")
+
+            prompt = orchestrator._build_prompt("clarify", idea_file)
+
+            self.assertIn("Simplified Chinese", prompt)
 
 
 if __name__ == "__main__":

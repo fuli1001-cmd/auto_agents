@@ -6,6 +6,7 @@
   "required": [
     "project_name",
     "provider",
+    "docs",
     "efforts",
     "gates",
     "git",
@@ -62,6 +63,17 @@
         }
       },
       "additionalProperties": true
+    },
+    "docs": {
+      "type": "object",
+      "required": ["language"],
+      "properties": {
+        "language": {
+          "type": "string",
+          "enum": ["en", "zh"]
+        }
+      },
+      "additionalProperties": false
     },
     "efforts": {
       "type": "object",
