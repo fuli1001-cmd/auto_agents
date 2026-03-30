@@ -13,6 +13,13 @@ class ReviewParseTests(unittest.TestCase):
         self.assertEqual(decision, "pass")
         self.assertEqual(summary, "Looks good.")
 
+    def test_parse_review_pass_with_preface_before_decision(self) -> None:
+        decision, summary = Orchestrator._parse_review_decision(
+            "Wrote the review to review.md.\n\nDECISION: pass\nLooks good.\n"
+        )
+        self.assertEqual(decision, "pass")
+        self.assertEqual(summary, "Looks good.")
+
     def test_parse_review_fail_for_invalid_prefix(self) -> None:
         decision, summary = Orchestrator._parse_review_decision("Looks good.\n")
         self.assertEqual(decision, "fail")

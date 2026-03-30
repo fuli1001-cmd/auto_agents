@@ -600,11 +600,20 @@ class Orchestrator:
         lines = [line.strip() for line in response.splitlines() if line.strip()]
         if not lines:
             return "fail", "Empty review response"
-        first = lines[0].lower()
-        if first == "decision: pass":
-            return "pass", "\n".join(lines[1:]) or "Review passed."
-        if first == "decision: fail":
-            return "fail", "\n".join(lines[1:]) or "Review failed."
+        for index, line in enumerate(lines):
+            normalized = line.lower()
+            if normalized == "decision: pass":
+                summary = "\n".join(lines[index + 1 :]).strip()
+                if summary:
+                    return "pass", summary
+                fallback = "\n".join(lines[:index]).strip()
+                return "pass", fallback or "Review passed."
+            if normalized == "decision: fail":
+                summary = "\n".join(lines[index + 1 :]).strip()
+                if summary:
+                    return "fail", summary
+                fallback = "\n".join(lines[:index]).strip()
+                return "fail", fallback or "Review failed."
         return "fail", response.strip()
 
     def status(self) -> Dict[str, object]:
