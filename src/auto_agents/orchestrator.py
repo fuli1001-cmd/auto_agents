@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, TextIO, Tuple
 
 from .adapters import CodexAdapter, MockAdapter, ShellAdapter
 from .config import (
@@ -36,10 +37,12 @@ from .validation import validate_required_document
 
 
 class Orchestrator:
-    def __init__(self, project_root: Path) -> None:
+    def __init__(self, project_root: Path, agent_output_stream: Optional[TextIO] = None) -> None:
         self.project_root = project_root.resolve()
         self.config = load_project_config(self.project_root)
         self.adapter = self._build_adapter(self.config)
+        self.agent_output_stream = agent_output_stream or sys.stderr
+        self._print_agent_output = False
 
     @staticmethod
     def init_project(project_root: Path, name: str, provider_kind: str) -> Path:
@@ -78,56 +81,61 @@ class Orchestrator:
         auto_approve: bool = False,
         max_tasks: Optional[int] = None,
         skip_validate: bool = False,
+        print_agent_output: bool = False,
     ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
-        state = load_run_state(self.project_root)
-        self._ensure_preconditions(state, idea_file=idea_file, skip_validate=skip_validate)
+        self._print_agent_output = print_agent_output
+        try:
+            state = load_run_state(self.project_root)
+            self._ensure_preconditions(state, idea_file=idea_file, skip_validate=skip_validate)
 
-        if state.status == "completed":
-            return state
-
-        if state.pending_approval:
-            if auto_approve:
-                if state.pending_approval not in state.approved_gates:
-                    state.approved_gates.append(state.pending_approval)
-                state.pending_approval = ""
-                state.status = "pending"
-                save_run_state(self.project_root, state)
-            else:
-                state.status = "paused"
+            if state.status == "completed":
                 return state
 
-        for stage in self._pending_stages(state):
-            try:
-                if stage == "implement":
-                    state = self._run_implementation_loop(state, max_tasks=max_tasks)
-                elif stage == "verify":
-                    state = self._run_verify(state)
-                else:
-                    state = self._run_agent_stage(stage, state, idea_file)
-            except RuntimeError as error:
-                state.status = "failed"
-                state.last_error = str(error)
-                save_run_state(self.project_root, state)
-                raise
-
-            save_run_state(self.project_root, state)
-            pending_gate = APPROVAL_BY_STAGE.get(stage)
-            if pending_gate and pending_gate in self.config.approvals.enabled:
-                if auto_approve or pending_gate in state.approved_gates:
-                    if pending_gate not in state.approved_gates:
-                        state.approved_gates.append(pending_gate)
+            if state.pending_approval:
+                if auto_approve:
+                    if state.pending_approval not in state.approved_gates:
+                        state.approved_gates.append(state.pending_approval)
                     state.pending_approval = ""
+                    state.status = "pending"
                     save_run_state(self.project_root, state)
                 else:
-                    state.pending_approval = pending_gate
                     state.status = "paused"
-                    save_run_state(self.project_root, state)
                     return state
 
-        state.status = "completed"
-        save_run_state(self.project_root, state)
-        return state
+            for stage in self._pending_stages(state):
+                try:
+                    if stage == "implement":
+                        state = self._run_implementation_loop(state, max_tasks=max_tasks)
+                    elif stage == "verify":
+                        state = self._run_verify(state)
+                    else:
+                        state = self._run_agent_stage(stage, state, idea_file)
+                except RuntimeError as error:
+                    state.status = "failed"
+                    state.last_error = str(error)
+                    save_run_state(self.project_root, state)
+                    raise
+
+                save_run_state(self.project_root, state)
+                pending_gate = APPROVAL_BY_STAGE.get(stage)
+                if pending_gate and pending_gate in self.config.approvals.enabled:
+                    if auto_approve or pending_gate in state.approved_gates:
+                        if pending_gate not in state.approved_gates:
+                            state.approved_gates.append(pending_gate)
+                        state.pending_approval = ""
+                        save_run_state(self.project_root, state)
+                    else:
+                        state.pending_approval = pending_gate
+                        state.status = "paused"
+                        save_run_state(self.project_root, state)
+                        return state
+
+            state.status = "completed"
+            save_run_state(self.project_root, state)
+            return state
+        finally:
+            self._print_agent_output = False
 
     def _ensure_preconditions(self, state: RunState, idea_file: Path, skip_validate: bool) -> None:
         if not idea_file.exists():
@@ -458,6 +466,7 @@ class Orchestrator:
                 output_path=output_path,
             )
             result = self.adapter.run(request)
+            self._emit_agent_output(artifact_stage, result)
             if state is not None:
                 state.agent_attempts[stage_key] = attempt
                 save_run_state(self.project_root, state)
@@ -477,6 +486,17 @@ class Orchestrator:
             return result
 
         raise RuntimeError(f"{stage_key} exhausted retries: {last_error}")
+
+    def _emit_agent_output(self, stage_key: str, result: AgentResult) -> None:
+        if not self._print_agent_output:
+            return
+
+        sections = [f"[agent:{stage_key}] returncode={result.returncode} ok={str(result.ok).lower()}"]
+        if result.summary:
+            sections.append(result.summary.strip())
+        if result.stderr:
+            sections.append(f"[stderr]\n{result.stderr.strip()}")
+        print("\n\n".join(sections), file=self.agent_output_stream, flush=True)
 
     def _max_attempts(self, stage: str) -> int:
         return max(1, self.config.retries.per_stage.get(stage, self.config.retries.default_max_attempts))

@@ -5,12 +5,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.cli import main
 from auto_agents.config import config_path, load_project_config, load_run_state, save_run_state, task_plan_path
 from auto_agents.io_utils import write_json, write_text
+from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.validation import (
     validate_required_document,
@@ -320,6 +322,73 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual(payload["status"], "pending")
             self.assertIn("architecture", payload["approved_gates"])
+
+    def test_cli_run_passes_print_agent_output_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            idea_file = project_root / "idea.md"
+            idea_file.parent.mkdir(parents=True, exist_ok=True)
+            write_text(idea_file, "# Idea\n")
+            calls = {}
+
+            class FakeState:
+                def to_dict(self):
+                    return {"status": "completed"}
+
+            class FakeOrchestrator:
+                def __init__(self, project_root, agent_output_stream=None):
+                    calls["project_root"] = str(project_root)
+                    calls["has_stream"] = agent_output_stream is not None
+
+                def run(self, **kwargs):
+                    calls.update(kwargs)
+                    return FakeState()
+
+            buffer = io.StringIO()
+            with patch("auto_agents.cli.Orchestrator", FakeOrchestrator):
+                with contextlib.redirect_stdout(buffer):
+                    exit_code = main(
+                        ["run", "--project", str(project_root), "--idea-file", str(idea_file), "--print-agent-output"]
+                    )
+
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["status"], "completed")
+            self.assertTrue(calls["print_agent_output"])
+            self.assertTrue(calls["has_stream"])
+
+    def test_orchestrator_emits_agent_output_to_stderr_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            class EchoAdapter:
+                def run(self, request):
+                    return AgentResult(
+                        ok=True,
+                        command=["fake"],
+                        output_path=request.output_path,
+                        summary="stage output",
+                        stderr="stage warning",
+                        returncode=0,
+                    )
+
+            orchestrator.adapter = EchoAdapter()
+            orchestrator._print_agent_output = True
+            state = load_run_state(project_root)
+            orchestrator._run_agent_with_retries(
+                state=state,
+                stage="clarify",
+                stage_key="clarify",
+                prompt="prompt",
+            )
+
+            rendered = stream.getvalue()
+            self.assertIn("[agent:clarify]", rendered)
+            self.assertIn("stage output", rendered)
+            self.assertIn("stage warning", rendered)
 
 
 if __name__ == "__main__":

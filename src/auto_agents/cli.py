@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from .orchestrator import Orchestrator
@@ -55,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip local preflight validation before agent execution.",
     )
+    run_parser.add_argument(
+        "--print-agent-output",
+        action="store_true",
+        help="Print each agent stage output to stderr as it completes.",
+    )
 
     approve_parser = subparsers.add_parser("approve", help="Approve a pending manual gate.")
     approve_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -92,12 +98,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             project_root = Path(args.project)
             idea_file = Path(args.idea_file) if args.idea_file else _default_idea_file(project_root)
-            orchestrator = Orchestrator(project_root)
+            orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
             state = orchestrator.run(
                 idea_file=idea_file,
                 auto_approve=bool(args.auto_approve),
                 max_tasks=args.max_tasks,
                 skip_validate=bool(args.skip_validate),
+                print_agent_output=bool(args.print_agent_output),
             )
             print(json.dumps(state.to_dict(), indent=2, ensure_ascii=True))
             return 0
