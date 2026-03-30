@@ -68,6 +68,102 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(any("default_max_attempts" in item for item in errors))
         self.assertTrue(any("unknown stage" in item for item in errors))
 
+    def test_validate_project_config_payload_rejects_non_isolated_python_commands(self) -> None:
+        payload = {
+            "project_name": "demo",
+            "provider": {
+                "kind": "codex",
+                "binary": "codex",
+                "profile_map": {"balanced": "m", "deep": "h"},
+                "extra_args": [],
+                "cwd_flag": "-C",
+                "prompt_via_stdin": True,
+                "output_flag": "-o",
+            },
+            "efforts": {
+                "clarify": "deep",
+                "design": "deep",
+                "plan": "balanced",
+                "implement": "balanced",
+                "review": "deep",
+                "verify": "balanced",
+            },
+            "gates": {
+                "commands": ["python3 -m unittest discover -s tests", "python3 -m pip install requests"],
+                "require_clean_git_before_task": True,
+                "allow_agent_updates": True,
+            },
+            "git": {
+                "auto_init_repo": True,
+                "commit_each_task": True,
+                "commit_message_template": "feat({task_id}): {title}",
+            },
+            "approvals": {
+                "enabled": ["requirements", "architecture", "release"],
+            },
+            "retries": {
+                "default_max_attempts": 2,
+                "per_stage": {
+                    "clarify": 2,
+                    "design": 2,
+                    "plan": 3,
+                    "implement": 2,
+                    "review": 2,
+                },
+            },
+        }
+
+        errors = validate_project_config_payload(payload)
+        self.assertTrue(any("project-local conda env" in item for item in errors))
+        self.assertTrue(any("must not modify shared system environments" in item for item in errors))
+
+    def test_validate_project_config_payload_accepts_isolated_python_commands(self) -> None:
+        payload = {
+            "project_name": "demo",
+            "provider": {
+                "kind": "codex",
+                "binary": "codex",
+                "profile_map": {"balanced": "m", "deep": "h"},
+                "extra_args": [],
+                "cwd_flag": "-C",
+                "prompt_via_stdin": True,
+                "output_flag": "-o",
+            },
+            "efforts": {
+                "clarify": "deep",
+                "design": "deep",
+                "plan": "balanced",
+                "implement": "balanced",
+                "review": "deep",
+                "verify": "balanced",
+            },
+            "gates": {
+                "commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                "require_clean_git_before_task": True,
+                "allow_agent_updates": True,
+            },
+            "git": {
+                "auto_init_repo": True,
+                "commit_each_task": True,
+                "commit_message_template": "feat({task_id}): {title}",
+            },
+            "approvals": {
+                "enabled": ["requirements", "architecture", "release"],
+            },
+            "retries": {
+                "default_max_attempts": 2,
+                "per_stage": {
+                    "clarify": 2,
+                    "design": 2,
+                    "plan": 3,
+                    "implement": 2,
+                    "review": 2,
+                },
+            },
+        }
+
+        self.assertEqual(validate_project_config_payload(payload), [])
+
     def test_validation_report_warns_when_no_verification_commands_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

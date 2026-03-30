@@ -22,6 +22,7 @@ The system optimizes for quality over throughput:
 - LLM calls stay short and stage-specific
 - Scripts, not the model, enforce quality gates
 - Invalid plans and malformed reviews are rejected and retried with focused feedback
+- Local project isolation is preferred over changing shared system environments
 
 ## Core workflow
 
@@ -32,6 +33,23 @@ The system optimizes for quality over throughput:
 5. `review`: run an independent agent review for the current task
 6. `verify`: run local gates
 7. `commit`: auto-commit only when the task passes gates
+
+## Environment isolation policy
+
+The workflow now treats environment isolation as a hard rule rather than a suggestion.
+
+- Python projects must use a project-local conda environment at `./.conda`
+- Python package installation must run inside that conda environment
+- Python verification commands must run through that environment, for example:
+  `conda run -p ./.conda python -m unittest discover -s tests`
+- Non-Python projects must also avoid modifying shared system state; prefer repo-local dependency
+  directories, project-local toolchains, or other isolated setup that stays inside the project
+
+This policy is enforced in two places:
+
+- planner and implementation prompts explicitly instruct the agent not to use global installs
+- local validation rejects obvious global install commands and rejects Python verification commands
+  that do not run inside a project-local conda environment
 
 ## Execution details
 
@@ -100,6 +118,9 @@ During `plan`, the agent must write `test_strategy` and `verification_commands` 
 `.auto-agents/state/task_plan.json`. By default the orchestrator copies those verification commands
 into `.auto-agents/config.json`, so new projects do not need a hand-written `gates.commands` block.
 
+For Python projects, those generated verification commands must use the project-local conda env at
+`./.conda`.
+
 Inspect persisted progress:
 
 ```bash
@@ -130,6 +151,9 @@ Validate a target project without spending tokens:
 ```bash
 python3 -m auto_agents validate --project /tmp/demo
 ```
+
+If validation reports that Python commands are running outside `./.conda`, fix the commands before
+rerunning the workflow.
 
 Run the real Codex provider demo:
 

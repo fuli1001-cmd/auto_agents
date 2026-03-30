@@ -82,6 +82,43 @@ class TaskPlanValidationTests(unittest.TestCase):
         self.assertTrue(any("non-empty acceptance list" in item for item in errors))
         self.assertTrue(any("status must be one of" in item for item in errors))
 
+    def test_rejects_python_verification_outside_project_local_conda(self) -> None:
+        payload = {
+            "test_strategy": "python-unittest",
+            "verification_commands": ["python3 -m unittest discover -s tests"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Add CLI entrypoint",
+                    "description": "Add a runnable command line entrypoint.",
+                    "acceptance": ["`python -m demo --help` exits successfully."],
+                    "status": "pending",
+                    "commit_message": "feat(task-001): add CLI entrypoint",
+                }
+            ],
+        }
+
+        errors = validate_task_plan_payload(payload, require_verification=True)
+        self.assertTrue(any("project-local conda env" in item for item in errors))
+
+    def test_accepts_python_verification_inside_project_local_conda(self) -> None:
+        payload = {
+            "test_strategy": "python-unittest",
+            "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Add CLI entrypoint",
+                    "description": "Add a runnable command line entrypoint.",
+                    "acceptance": ["`python -m demo --help` exits successfully."],
+                    "status": "pending",
+                    "commit_message": "feat(task-001): add CLI entrypoint",
+                }
+            ],
+        }
+
+        self.assertEqual(validate_task_plan_payload(payload, require_verification=True), [])
+
 
 if __name__ == "__main__":
     unittest.main()

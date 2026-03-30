@@ -14,7 +14,7 @@ Run it with:
 ./examples/run_codex_demo.sh
 ```
 
-The script bootstraps a temporary project, enables the standard unittest gate, runs one task with the
+The script bootstraps a temporary project, validates the initial scaffold, runs one task with the
 real `codex` provider, and prints the resulting status and git log.
 
 If you want a slightly richer test input than the default greeter demo, try

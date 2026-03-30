@@ -13,6 +13,9 @@ CONFIG_FILE = "config.json"
 PROJECT_GITIGNORE = """__pycache__/
 *.pyc
 .pytest_cache/
+.conda/
+.venv/
+node_modules/
 .DS_Store
 """
 
@@ -34,6 +37,7 @@ PROJECT_BRIEF_TEMPLATE = """# Project Brief
 ## Constraints
 
 - Budget, stack, deployment, compliance, or integration constraints.
+- Do not modify the system-wide environment; Python projects must use a project-local conda env at `./.conda`.
 """
 
 

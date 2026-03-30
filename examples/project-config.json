@@ -22,7 +22,7 @@
   },
   "gates": {
     "commands": [
-      "python3 -m unittest discover -s tests"
+      "conda run -p ./.conda python -m unittest discover -s tests"
     ],
     "require_clean_git_before_task": true,
     "allow_agent_updates": true

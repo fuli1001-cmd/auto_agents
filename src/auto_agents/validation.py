@@ -18,6 +18,76 @@ REQUIRED_DOC_HEADINGS = {
     "project_brief.md": ("# Project Brief", "## Problem", "## MVP Scope", "## Non-Goals", "## Constraints"),
     "architecture.md": ("# Architecture", "## System Boundary", "## Core Modules", "## Data Flow", "## Risks"),
 }
+PYTHON_STRATEGY_HINTS = ("python", "pytest", "unittest")
+PYTHON_COMMAND_HINTS = ("python", "pytest", "unittest", "coverage", ".py")
+GLOBAL_INSTALL_PATTERNS = (
+    (re.compile(r"(^|[\s;&|])pip(?:3)?\s+install\b"), "use the project-local conda env instead of global pip installs"),
+    (
+        re.compile(r"(^|[\s;&|])python(?:3)?\s+-m\s+pip\s+install\b"),
+        "use 'conda run -p ./.conda python -m pip install ...' instead of system pip",
+    ),
+    (
+        re.compile(r"(^|[\s;&|])conda\s+install\b"),
+        "use a project-local conda prefix such as '.conda' instead of a shared conda environment",
+    ),
+    (re.compile(r"(^|[\s;&|])npm\s+install\s+-g\b"), "avoid global npm installs"),
+    (re.compile(r"(^|[\s;&|])pnpm\s+add\s+-g\b"), "avoid global pnpm installs"),
+    (re.compile(r"(^|[\s;&|])yarn\s+global\s+add\b"), "avoid global yarn installs"),
+    (re.compile(r"(^|[\s;&|])cargo\s+install\b"), "avoid global cargo installs"),
+    (re.compile(r"(^|[\s;&|])go\s+install\b"), "avoid global go installs"),
+)
+
+
+def _looks_like_python_workflow(test_strategy: object, commands: object) -> bool:
+    strategy = str(test_strategy or "").strip().lower()
+    if any(hint in strategy for hint in PYTHON_STRATEGY_HINTS):
+        return True
+    if not isinstance(commands, list):
+        return False
+    return any(_looks_like_python_command(str(item)) for item in commands)
+
+
+def _looks_like_python_command(command: str) -> bool:
+    lowered = command.lower()
+    return any(hint in lowered for hint in PYTHON_COMMAND_HINTS)
+
+
+def _uses_project_local_conda(command: str) -> bool:
+    lowered = command.lower()
+    if re.search(r"conda\s+run\s+(?:-p|--prefix)\s+[^\s]*\.conda(?:\s|$)", lowered):
+        return True
+    if re.search(r"(?:^|[\s'\"])(?:\./)?\.conda(?:/|\\\\).*(?:python|pytest|coverage)(?:\s|$)", lowered):
+        return True
+    return False
+
+
+def _validate_isolated_commands(commands: object, field_name: str, python_required: bool) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(commands, list):
+        return errors
+
+    for index, raw in enumerate(commands, start=1):
+        if not isinstance(raw, str):
+            continue
+        command = raw.strip()
+        lowered = command.lower()
+
+        for pattern, message in GLOBAL_INSTALL_PATTERNS:
+            if not pattern.search(lowered):
+                continue
+            if "conda install" in pattern.pattern and _uses_project_local_conda(command):
+                continue
+            if ("pip install" in pattern.pattern or "python(?:3)?\\s+-m\\s+pip\\s+install" in pattern.pattern) and _uses_project_local_conda(command):
+                continue
+            errors.append(f"{field_name}[{index}] must not modify shared system environments: {message}")
+            break
+
+        if python_required and _looks_like_python_command(command) and not _uses_project_local_conda(command):
+            errors.append(
+                f"{field_name}[{index}] must run Python verification inside a project-local conda env such as 'conda run -p ./.conda ...'"
+            )
+
+    return errors
 
 
 def schema_paths() -> Dict[str, str]:
@@ -55,6 +125,14 @@ def validate_task_plan_payload(payload: object, require_verification: bool = Fal
             errors.append("task plan must define a non-empty test_strategy")
         if not isinstance(verification_commands, list) or not verification_commands:
             errors.append("task plan must define at least one verification command")
+    python_required = _looks_like_python_workflow(test_strategy, verification_commands)
+    errors.extend(
+        _validate_isolated_commands(
+            verification_commands,
+            "task plan verification_commands",
+            python_required=python_required,
+        )
+    )
 
     tasks = payload.get("tasks")
     if not isinstance(tasks, list):
@@ -187,6 +265,15 @@ def validate_project_config_payload(payload: object) -> List[str]:
         commands = gates.get("commands")
         if not isinstance(commands, list) or any(not isinstance(item, str) for item in commands):
             errors.append("gates.commands must be a list of strings")
+        else:
+            python_required = _looks_like_python_workflow(None, commands)
+            errors.extend(
+                _validate_isolated_commands(
+                    commands,
+                    "gates.commands",
+                    python_required=python_required,
+                )
+            )
         clean = gates.get("require_clean_git_before_task")
         if not isinstance(clean, bool):
             errors.append("gates.require_clean_git_before_task must be a boolean")

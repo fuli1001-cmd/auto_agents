@@ -308,6 +308,7 @@ class Orchestrator:
             "Work only inside this repository.",
             "Keep outputs concise and file-driven.",
             "Do not restate large documents in your final response.",
+            "Do not modify the system-wide environment or install global packages.",
         ]
 
         if stage == "clarify":
@@ -337,7 +338,9 @@ class Orchestrator:
                 f"Replace this JSON file with 3-10 minimal verifiable feature slices: {plan}",
                 "At the root of the JSON, also define test_strategy and verification_commands.",
                 "Choose the smallest practical automated verification strategy for this stack.",
-                "If this is a Python project and no framework is required, default to unittest with 'python3 -m unittest discover -s tests'.",
+                "If this is a Python project, require a project-local conda env at ./.conda.",
+                "For Python verification, use 'conda run -p ./.conda python -m unittest discover -s tests' unless another command is clearly better.",
+                "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
                 "Each task must contain task_id, title, description, acceptance, status, commit_message.",
                 "Keep tasks small enough to implement and verify independently.",
                 "Final response: 3 short bullets summarizing the plan.",
@@ -363,6 +366,8 @@ class Orchestrator:
             lines = common + [
                 "Implement only this feature slice.",
                 "Add or update tests where appropriate.",
+                "If this is a Python project, create and use a project-local conda env at ./.conda and install packages only inside it.",
+                "For any other stack, keep dependencies and tool state local to the repository and never rely on global installs.",
                 "Do not modify .auto-agents state files except when explicitly requested.",
                 "Final response: 3 short bullets describing what changed.",
             ]

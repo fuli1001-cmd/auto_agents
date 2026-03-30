@@ -27,7 +27,7 @@ class RetryingPlanAdapter:
                     task_plan_path(self.project_root),
                     {
                         "test_strategy": "python-unittest",
-                        "verification_commands": ["python3 -m unittest discover -s tests"],
+                        "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
                         "tasks": [
                             {
                                 "task_id": "task-001",
@@ -63,7 +63,7 @@ class VerificationPlanAdapter:
                 task_plan_path(self.project_root),
                 {
                     "test_strategy": "python-unittest",
-                    "verification_commands": ["python3 -m unittest discover -s tests"],
+                    "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
                     "tasks": [
                         {
                             "task_id": "task-001",
@@ -205,7 +205,7 @@ class RetryFlowTests(unittest.TestCase):
             orchestrator._run_agent_stage("plan", state, idea_file)
 
             config = load_project_config(project_root)
-            self.assertEqual(config.gates.commands, ["python3 -m unittest discover -s tests"])
+            self.assertEqual(config.gates.commands, ["conda run -p ./.conda python -m unittest discover -s tests"])
 
     def test_persisted_tasks_keep_generated_verification_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -216,7 +216,7 @@ class RetryFlowTests(unittest.TestCase):
                 task_plan_path(project_root),
                 {
                     "test_strategy": "python-unittest",
-                    "verification_commands": ["python3 -m unittest discover -s tests"],
+                    "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
                     "tasks": [
                         {
                             "task_id": "task-001",
