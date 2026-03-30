@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.cli import main
-from auto_agents.config import config_path, load_run_state, task_plan_path
+from auto_agents.config import config_path, load_project_config, load_run_state, save_run_state, task_plan_path
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.validation import (
@@ -158,6 +158,72 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(exit_code, 1)
             self.assertFalse(payload["ok"])
             self.assertIn("Expecting property name enclosed in double quotes", payload["error"])
+
+    def test_cli_init_defaults_name_from_project_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "aa-demo"
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = main(["init", "--project", str(project_root)])
+
+            self.assertEqual(exit_code, 0)
+            config = load_project_config(project_root)
+            self.assertEqual(config.project_name, "aa-demo")
+            self.assertEqual(config.provider.kind, "codex")
+
+    def test_cli_run_defaults_idea_file_to_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = main(["run", "--project", str(project_root)])
+
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(exit_code, 1)
+            self.assertFalse(payload["ok"])
+            self.assertIn(str(project_root / "idea.md"), payload["error"])
+
+    def test_cli_approve_defaults_to_pending_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            state = load_run_state(project_root)
+            state.status = "paused"
+            state.current_stage = "clarify"
+            state.pending_approval = "requirements"
+            save_run_state(project_root, state)
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = main(["approve", "--project", str(project_root)])
+
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["status"], "pending")
+            self.assertEqual(payload["pending_approval"], "")
+            self.assertIn("requirements", payload["approved_gates"])
+
+    def test_cli_approve_can_infer_gate_from_paused_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            state = load_run_state(project_root)
+            state.status = "paused"
+            state.current_stage = "design"
+            state.pending_approval = ""
+            save_run_state(project_root, state)
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = main(["approve", "--project", str(project_root)])
+
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["status"], "pending")
+            self.assertIn("architecture", payload["approved_gates"])
 
 
 if __name__ == "__main__":

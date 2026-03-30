@@ -33,6 +33,35 @@ The system optimizes for quality over throughput:
 6. `verify`: run local gates
 7. `commit`: auto-commit only when the task passes gates
 
+## Execution details
+
+The automation does split the project into tasks automatically, but only after `plan` runs. The
+planner rewrites `.auto-agents/state/task_plan.json` with 3-10 small feature slices, and that file
+becomes the execution contract for the rest of the run.
+
+Task execution is sequential, not parallel:
+
+- the orchestrator walks `task_plan.json` in order
+- each task moves `pending -> in_progress -> done` or `blocked`
+- only one task is implemented at a time
+- after one task passes `implement -> review -> verify`, the orchestrator automatically starts the
+  next unfinished task in the same `run`
+- `--max-tasks N` stops the current invocation after `N` successful tasks, which is useful for demos
+  or controlled rollout
+
+For each task, the effective loop is:
+
+1. mark the task `in_progress`
+2. run the implementation agent for the current slice
+3. run an independent review for the current uncommitted changes
+4. run local verification commands
+5. if review and verification both pass, mark the task `done` and optionally commit
+6. continue to the next unfinished task
+
+If review or verification fails, the orchestrator retries the same task with focused feedback. If
+the retry budget is exhausted, that task is marked `blocked` and the run exits with failure instead
+of silently skipping ahead.
+
 Manual approvals are supported at three high-value gates:
 
 - `requirements`
@@ -47,10 +76,21 @@ Create a target project skeleton:
 python3 -m auto_agents init --project /tmp/demo --name demo --provider codex
 ```
 
+Convenience defaults:
+
+- `init --name` defaults to the final directory name from `--project`
+- `init --provider` defaults to `codex`
+
 Run the orchestrator:
 
 ```bash
 python3 -m auto_agents run --project /tmp/demo --idea-file /tmp/demo/idea.md
+```
+
+`run --idea-file` defaults to `<project>/idea.md`, so this also works:
+
+```bash
+python3 -m auto_agents run --project /tmp/demo
 ```
 
 `run` performs local preflight validation before any agent call. Use `--skip-validate` only for
@@ -60,10 +100,23 @@ During `plan`, the agent must write `test_strategy` and `verification_commands` 
 `.auto-agents/state/task_plan.json`. By default the orchestrator copies those verification commands
 into `.auto-agents/config.json`, so new projects do not need a hand-written `gates.commands` block.
 
+Inspect persisted progress:
+
+```bash
+python3 -m auto_agents status --project /tmp/demo
+```
+
 Approve a paused gate:
 
 ```bash
 python3 -m auto_agents approve --project /tmp/demo --gate requirements
+```
+
+If the run is currently paused on a manual gate, `approve` can infer the gate from the persisted run
+state, so this is usually enough:
+
+```bash
+python3 -m auto_agents approve --project /tmp/demo
 ```
 
 Run tests for this repository:
@@ -122,6 +175,58 @@ Interrupted implementation work is resumable:
 - `in_progress` tasks can continue from review and verification
 - `blocked` tasks can be retried without forcing a clean tree first
 - new projects start with a minimal `.gitignore` to avoid common Python artifact noise
+
+## Failure and resume behavior
+
+Progress is persisted in two files:
+
+- `.auto-agents/state/run_state.json`
+- `.auto-agents/state/task_plan.json`
+
+If a run fails because of a bug, provider error, network issue, or token exhaustion, the usual
+recovery path is simply to fix the underlying issue and rerun the same command:
+
+```bash
+python3 -m auto_agents run --project /tmp/demo --idea-file /tmp/demo/idea.md
+```
+
+What resumes depends on the stage:
+
+- `clarify`, `design`, `plan`, `verify`: completed stages are tracked in `run_state.json`, so a new
+  `run` continues from the first unfinished stage
+- `implement`: task status is read from `task_plan.json`, so finished tasks are skipped and the next
+  unfinished task is resumed
+- approval pauses: `approve` clears the pending gate, and the next `run` continues from there
+
+Implementation resume is task-aware rather than fully transactional:
+
+- if a task is already marked `in_progress`, the next run first tries to continue from
+  review/verification on the existing workspace state
+- if that partial work is not good enough, later retry attempts re-run implementation for the same
+  task
+- if a task is marked `blocked`, it can be retried even when the git tree is still dirty
+
+Current limitation: there is no fine-grained checkpoint inside a single agent call. So the system
+can resume from persisted stage/task boundaries, but it cannot guarantee recovery of edits that were
+still in-flight when a process was forcibly interrupted.
+
+In practice, a forced interruption can leave partial files in the workspace:
+
+- if the interruption happened during `clarify`, `design`, or `plan`, the next `run` re-executes the
+  same unfinished stage, using whatever files were already left on disk
+- if it happened during `implement`, the current task may still be `in_progress`; the next `run`
+  first tries review/verification against the existing workspace, then falls back to re-running
+  implementation for that same task if needed
+- this means rerun is usually recoverable, but the current task may consume one extra retry cycle,
+  and partial edits may influence the next attempt until they are overwritten or fixed
+
+When a forced interruption leaves suspicious partial edits behind, inspect `git status` and the
+persisted state before rerunning:
+
+```bash
+python3 -m auto_agents status --project /tmp/demo
+git -C /tmp/demo status --short
+```
 
 ## Schemas
 

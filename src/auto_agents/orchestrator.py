@@ -47,14 +47,27 @@ class Orchestrator:
         ensure_repo(root, auto_init=True)
         return root
 
-    def approve(self, gate: str) -> RunState:
+    def approve(self, gate: Optional[str] = None) -> RunState:
         state = load_run_state(self.project_root)
-        if gate not in self.config.approvals.enabled:
-            raise RuntimeError(f"Unknown approval gate: {gate}")
-        if gate not in state.approved_gates:
-            state.approved_gates.append(gate)
-        if state.pending_approval == gate:
+        inferred_gate = ""
+        if not gate:
+            if state.pending_approval:
+                inferred_gate = state.pending_approval
+            elif state.status == "paused":
+                candidate = APPROVAL_BY_STAGE.get(state.current_stage, "")
+                if candidate in self.config.approvals.enabled:
+                    inferred_gate = candidate
+        active_gate = gate or inferred_gate
+        if not active_gate:
+            raise RuntimeError("No approval gate could be inferred. Pass --gate explicitly.")
+        if active_gate not in self.config.approvals.enabled:
+            raise RuntimeError(f"Unknown approval gate: {active_gate}")
+        if active_gate not in state.approved_gates:
+            state.approved_gates.append(active_gate)
+        if state.pending_approval == active_gate:
             state.pending_approval = ""
+            state.status = "pending"
+        elif not state.pending_approval and inferred_gate == active_gate and state.status == "paused":
             state.status = "pending"
         save_run_state(self.project_root, state)
         return state
