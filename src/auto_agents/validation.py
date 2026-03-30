@@ -211,7 +211,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
     if not isinstance(payload, dict):
         return ["project config root must be a JSON object"]
 
-    required = {"project_name", "provider", "docs", "efforts", "gates", "git", "approvals", "retries"}
+    required = {"project_name", "provider", "efforts", "gates", "git", "approvals", "retries"}
     missing = sorted(required - set(payload.keys()))
     if missing:
         errors.append(f"project config missing required fields: {', '.join(missing)}")
@@ -259,14 +259,15 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 )
 
     docs = payload.get("docs")
-    if not isinstance(docs, dict):
-        errors.append("docs must be an object")
-    else:
-        language = docs.get("language")
-        if not isinstance(language, str) or language not in DOCUMENT_LANGUAGE_OPTIONS:
-            errors.append(
-                f"docs.language must be one of: {', '.join(sorted(DOCUMENT_LANGUAGE_OPTIONS))}"
-            )
+    if docs is not None:
+        if not isinstance(docs, dict):
+            errors.append("docs must be an object")
+        else:
+            language = docs.get("language")
+            if not isinstance(language, str) or language not in DOCUMENT_LANGUAGE_OPTIONS:
+                errors.append(
+                    f"docs.language must be one of: {', '.join(sorted(DOCUMENT_LANGUAGE_OPTIONS))}"
+                )
 
     gates = payload.get("gates")
     if not isinstance(gates, dict):

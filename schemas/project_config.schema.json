@@ -6,7 +6,6 @@
   "required": [
     "project_name",
     "provider",
-    "docs",
     "efforts",
     "gates",
     "git",
