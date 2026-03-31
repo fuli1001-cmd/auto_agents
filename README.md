@@ -71,12 +71,12 @@ For each task, the effective loop is:
 
 1. mark the task `in_progress`
 2. run the implementation agent for the current slice
-3. run an independent review for the current uncommitted changes
-4. run local verification commands
-5. if review and verification both pass, mark the task `done` and optionally commit
+3. run local verification commands
+4. run an independent review for the current uncommitted changes
+5. if verification and review both pass, mark the task `done` and optionally commit
 6. continue to the next unfinished task
 
-If review or verification fails, the orchestrator retries the same task with focused feedback. If
+If verification or review fails, the orchestrator retries the same task with focused feedback. If
 the retry budget is exhausted, that task is marked `blocked` and the run exits with failure instead
 of silently skipping ahead.
 

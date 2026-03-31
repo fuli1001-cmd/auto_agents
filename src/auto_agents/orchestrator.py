@@ -243,7 +243,16 @@ class Orchestrator:
         state.last_error = ""
         return state
 
-    def _run_task_review_and_verify(self, run_id: str, task: TaskSpec) -> Dict[str, object]:
+    def _run_task_verify(self) -> Dict[str, object]:
+        verify_gate = run_commands(self.config.gates.commands, self.project_root)
+        if not verify_gate.ok:
+            return {
+                "ok": False,
+                "reason": verify_gate.summary,
+            }
+        return {"ok": True, "reason": verify_gate.summary}
+
+    def _run_task_review(self, run_id: str, task: TaskSpec) -> Dict[str, object]:
         review_prompt = self._build_task_prompt(task, "review")
         review_result = self._run_agent_with_retries(
             state=None,
@@ -257,14 +266,6 @@ class Orchestrator:
         write_text(review_path(self.project_root), summary + "\n")
         if decision != "pass":
             return {"ok": False, "review": summary, "reason": "review rejected the task"}
-
-        verify_gate = run_commands(self.config.gates.commands, self.project_root)
-        if not verify_gate.ok:
-            return {
-                "ok": False,
-                "review": summary,
-                "reason": verify_gate.summary,
-            }
         return {"ok": True, "review": summary}
 
     def _run_verify(self, state: RunState) -> RunState:
@@ -431,14 +432,23 @@ class Orchestrator:
                     feedback = f"- Implementation command failed.\n- Details: {last_reason}"
                     continue
 
-            gate_result = self._run_task_review_and_verify(state.run_id, task)
+            verify_result = self._run_task_verify()
+            if not verify_result["ok"]:
+                last_reason = str(verify_result["reason"])
+                feedback = (
+                    f"- Local verification failed.\n"
+                    f"- Reason: {last_reason}"
+                )
+                continue
+
+            gate_result = self._run_task_review(state.run_id, task)
             if gate_result["ok"]:
                 return gate_result
 
             last_reason = str(gate_result["reason"])
             last_review = str(gate_result["review"])
             feedback = (
-                f"- Review or verification rejected the task.\n"
+                f"- Review rejected the task.\n"
                 f"- Reason: {last_reason}\n"
                 f"- Review summary:\n{last_review}"
             )

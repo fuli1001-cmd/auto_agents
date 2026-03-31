@@ -31,7 +31,7 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 
 - `plan` retries if `task_plan.json` fails structural validation or omits `test_strategy` and `verification_commands`.
 - `review` retries if the decision header is malformed.
-- `implement` retries if review or verification rejects the current task.
+- `implement` retries if verification or review rejects the current task.
 - Retries are finite and configurable per stage.
 
 ## Verification strategy
@@ -39,7 +39,8 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 - `plan` must output root-level `test_strategy` and `verification_commands` in `task_plan.json`.
 - The orchestrator copies generated verification commands into `.auto-agents/config.json` when `gates.allow_agent_updates` is enabled.
 - `implement` is responsible for creating or updating the tests needed to satisfy those commands.
-- `review` checks for missing or weak tests, and the orchestrator executes the configured commands as the final gate.
+- The orchestrator executes the configured commands before task review so obvious local failures do not spend review tokens.
+- `review` checks the surviving changes for correctness, regressions, and missing tests after local verification passes.
 
 ## Resume strategy
 
