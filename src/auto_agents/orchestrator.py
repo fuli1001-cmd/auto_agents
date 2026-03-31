@@ -21,7 +21,7 @@ from .config import (
     write_run_prompt,
 )
 from .gates import run_commands
-from .git_ops import changed_files, commit_all, ensure_repo, is_repo, require_clean_tree, worktree_fingerprint
+from .git_ops import changed_files, changed_paths, commit_all, ensure_repo, is_repo, require_clean_tree, worktree_fingerprint
 from .io_utils import write_text
 from .models import (
     APPROVAL_BY_STAGE,
@@ -253,6 +253,7 @@ class Orchestrator:
         return {"ok": True, "reason": verify_gate.summary}
 
     def _run_task_review(self, run_id: str, task: TaskSpec) -> Dict[str, object]:
+        review_effort = self._review_effort_for_task(task)
         review_prompt = self._build_task_prompt(task, "review")
         review_result = self._run_agent_with_retries(
             state=None,
@@ -261,12 +262,74 @@ class Orchestrator:
             prompt=review_prompt,
             validation_feedback=self._review_validation_feedback,
             run_id=run_id,
+            effort=review_effort,
         )
         decision, summary = self._parse_review_decision(review_result.summary)
         write_text(review_path(self.project_root), summary + "\n")
         if decision != "pass":
             return {"ok": False, "review": summary, "reason": "review rejected the task"}
         return {"ok": True, "review": summary}
+
+    def _review_effort_for_task(self, task: TaskSpec) -> str:
+        default_effort = self.config.efforts.get("review", "balanced")
+        if default_effort != "balanced":
+            return default_effort
+
+        if task.review_summary.strip():
+            return "deep"
+
+        paths = changed_paths(self.project_root)
+        has_test_changes = any(self._is_test_path(path) for path in paths)
+        non_test_paths = [path for path in paths if not self._is_test_path(path)]
+        if not non_test_paths:
+            return "balanced"
+        if not has_test_changes:
+            return "deep"
+        if len(non_test_paths) > 3:
+            return "deep"
+        if any(self._is_high_risk_review_path(path) for path in non_test_paths):
+            return "deep"
+
+        estimated_lines = 0
+        for path in non_test_paths:
+            file_path = self.project_root / path
+            if not file_path.is_file():
+                continue
+            try:
+                with file_path.open("r", encoding="utf-8") as handle:
+                    estimated_lines += sum(1 for _ in handle)
+            except UnicodeDecodeError:
+                return "deep"
+            if estimated_lines > 240:
+                return "deep"
+        return "balanced"
+
+    @staticmethod
+    def _is_test_path(path: str) -> bool:
+        normalized = path.replace("\\", "/").lower()
+        if normalized.startswith("tests/"):
+            return True
+        if normalized.endswith(("_test.py", ".spec.js", ".spec.ts", ".test.js", ".test.ts", ".test.tsx", ".test.jsx")):
+            return True
+        return False
+
+    @staticmethod
+    def _is_high_risk_review_path(path: str) -> bool:
+        normalized = path.replace("\\", "/").lower()
+        high_risk_names = {
+            "pyproject.toml",
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "poetry.lock",
+            "requirements.txt",
+            "dockerfile",
+            "compose.yml",
+            "docker-compose.yml",
+        }
+        if normalized in high_risk_names:
+            return True
+        return normalized.startswith(".github/")
 
     def _cached_review_result(self, state: RunState, task: TaskSpec, fingerprint: str) -> Optional[Dict[str, object]]:
         cache_entry = state.task_review_cache.get(task.task_id, {})
@@ -493,6 +556,7 @@ class Orchestrator:
         prompt: str,
         validation_feedback: Optional[Callable[[AgentResult], Optional[str]]] = None,
         run_id: Optional[str] = None,
+        effort: Optional[str] = None,
     ) -> AgentResult:
         attempts = self._max_attempts(stage)
         active_run_id = run_id or (state.run_id if state is not None else load_run_state(self.project_root).run_id)
@@ -509,7 +573,7 @@ class Orchestrator:
             write_run_prompt(self.project_root, active_run_id, artifact_stage, attempt_prompt)
             request = AgentRequest(
                 stage=stage,
-                effort=self.config.efforts.get(stage, "balanced"),
+                effort=effort or self.config.efforts.get(stage, "balanced"),
                 prompt=attempt_prompt,
                 cwd=self.project_root,
                 output_path=output_path,

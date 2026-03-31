@@ -34,6 +34,12 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 - `implement` retries if verification or review rejects the current task.
 - Retries are finite and configurable per stage.
 
+## Review effort strategy
+
+- The configured review effort is the floor, not always the final setting.
+- Small test-only resumptions can stay on `balanced`.
+- The orchestrator automatically escalates review to `deep` for higher-risk diffs such as non-test code changes, large edits, prior review failures, or dependency/config churn.
+
 ## Verification strategy
 
 - `plan` must output root-level `test_strategy` and `verification_commands` in `task_plan.json`.

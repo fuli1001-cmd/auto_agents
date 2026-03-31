@@ -181,7 +181,7 @@ class ProjectConfig:
             "design": "deep",
             "plan": "balanced",
             "implement": "balanced",
-            "review": "deep",
+            "review": "balanced",
             "verify": "balanced",
         }
     )
@@ -202,7 +202,7 @@ class ProjectConfig:
                 "design": "deep",
                 "plan": "balanced",
                 "implement": "balanced",
-                "review": "deep",
+                "review": "balanced",
                 "verify": "balanced",
             },
             gates=GateConfig.from_dict(dict(data.get("gates", {}))),

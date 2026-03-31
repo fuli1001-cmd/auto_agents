@@ -63,20 +63,26 @@ def changed_files(project_root: Path) -> str:
     return process.stdout.strip()
 
 
-def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/",)) -> str:
+def changed_paths(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/",)) -> list[str]:
     process = _git(project_root, "status", "--porcelain=v1", "-uall")
     if process.returncode != 0:
         raise RuntimeError(process.stderr.strip() or "git status failed")
 
-    hasher = hashlib.sha256()
+    paths: list[str] = []
     for raw_line in process.stdout.splitlines():
         path = raw_line[3:].strip()
         if " -> " in path:
             _, path = path.split(" -> ", 1)
         if any(path.startswith(prefix) for prefix in ignored_prefixes):
             continue
+        paths.append(path)
+    return paths
 
-        hasher.update(raw_line.encode("utf-8"))
+
+def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/",)) -> str:
+    hasher = hashlib.sha256()
+    for path in changed_paths(project_root, ignored_prefixes=ignored_prefixes):
+        hasher.update(path.encode("utf-8"))
         hasher.update(b"\0")
         file_path = project_root / path
         if file_path.is_file():

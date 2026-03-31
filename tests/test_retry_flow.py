@@ -229,6 +229,32 @@ class CachedReviewResumeAdapter:
         )
 
 
+class ReviewEffortAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_efforts = []
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            raise AssertionError("implement should not run when resuming for review effort checks")
+        if request.stage == "review":
+            self.review_efforts.append(request.effort)
+            summary = "DECISION: pass\nreview passed\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class RetryFlowTests(unittest.TestCase):
     def test_plan_stage_retries_on_invalid_json_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -485,6 +511,88 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertEqual(orchestrator.adapter.implement_calls, 0)
             self.assertEqual(orchestrator.adapter.review_calls, 0)
+            self.assertEqual(state.tasks[0].status, "done")
+
+    def test_small_test_only_review_uses_balanced_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.efforts["review"] = "balanced"
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = ReviewEffortAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Update tests",
+                            "description": "Adjust coverage.",
+                            "acceptance": ["tests updated"],
+                            "status": "in_progress",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(exist_ok=True)
+            (tests_dir / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.agent_attempts["implement-task-001"] = 1
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 0)
+            self.assertEqual(orchestrator.adapter.review_efforts, ["balanced"])
+            self.assertEqual(state.tasks[0].status, "done")
+
+    def test_code_change_without_tests_escalates_review_to_deep(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.efforts["review"] = "balanced"
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = ReviewEffortAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Update app",
+                            "description": "Adjust behavior.",
+                            "acceptance": ["app updated"],
+                            "status": "in_progress",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            src_dir = project_root / "src"
+            src_dir.mkdir(exist_ok=True)
+            (src_dir / "app.py").write_text("def run():\n    return 'ok'\n", encoding="utf-8")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.agent_attempts["implement-task-001"] = 1
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 0)
+            self.assertEqual(orchestrator.adapter.review_efforts, ["deep"])
             self.assertEqual(state.tasks[0].status, "done")
 
 
