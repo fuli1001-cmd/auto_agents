@@ -58,8 +58,12 @@ This policy is enforced in two places:
 ## Execution details
 
 The automation does split the project into tasks automatically, but only after `plan` runs. The
-planner rewrites `.auto-agents/state/task_plan.json` with 3-25 small feature slices, and that file
+planner rewrites `.auto-agents/state/task_plan.json` with as many small feature slices as the MVP
+actually needs, and that file
 becomes the execution contract for the rest of the run.
+
+There is no hard task-count cap now. Instead, validation warns when a plan looks over-fragmented so
+you can inspect whether the work was sliced too finely.
 
 Task execution is sequential, not parallel:
 

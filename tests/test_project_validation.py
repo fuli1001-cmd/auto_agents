@@ -230,6 +230,32 @@ class ProjectValidationTests(unittest.TestCase):
             report = validation_report(project_root)
             self.assertTrue(any("no verification commands" in item for item in report["warnings"]))
 
+    def test_validation_report_warns_when_task_plan_looks_oversliced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": f"task-{index:03d}",
+                            "title": f"Step {index}",
+                            "description": "Tiny change.",
+                            "acceptance": ["one check"],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                        for index in range(1, 31)
+                    ]
+                },
+            )
+
+            report = validation_report(project_root)
+
+            self.assertTrue(report["ok"])
+            self.assertTrue(any("contains 30 tasks" in item for item in report["warnings"]))
+
     def test_validation_report_passes_for_bootstrapped_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -718,8 +744,9 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(analysis["kind"], "mixed")
             self.assertIn("Detected spec profile: mixed", prompt)
             self.assertIn("Prefer the explicit design decisions in the input spec", prompt)
-            self.assertIn("3-25 minimal verifiable feature slices", prompt)
-            self.assertIn("do not merge unrelated work only to stay under 10", prompt)
+            self.assertIn("Choose the number of tasks based on project complexity", prompt)
+            self.assertIn("do not split into trivial housekeeping-only tasks", prompt)
+            self.assertIn("Avoid oversized tasks", prompt)
             self.assertIn("must run inside that env via 'conda run -p ./.conda ...'", prompt)
             self.assertIn("Do not include bare 'python', 'python3', 'pytest', 'coverage', or 'pip'", prompt)
 

@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.validation import validate_task_plan_payload
+from auto_agents.validation import task_plan_warnings, validate_task_plan_payload
 
 
 class TaskPlanValidationTests(unittest.TestCase):
@@ -118,6 +118,42 @@ class TaskPlanValidationTests(unittest.TestCase):
         }
 
         self.assertEqual(validate_task_plan_payload(payload, require_verification=True), [])
+
+    def test_allows_large_task_count_without_hard_failure(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": f"task-{index:03d}",
+                    "title": f"Feature slice {index}",
+                    "description": f"Implement verifiable slice {index} for the MVP.",
+                    "acceptance": [f"slice {index} can be verified"],
+                    "status": "pending",
+                    "commit_message": f"feat(task-{index:03d}): add slice {index}",
+                }
+                for index in range(1, 31)
+            ]
+        }
+
+        self.assertEqual(validate_task_plan_payload(payload), [])
+
+    def test_warns_when_large_plan_looks_oversliced(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": f"task-{index:03d}",
+                    "title": f"Step {index}",
+                    "description": "Tiny change.",
+                    "acceptance": ["one check"],
+                    "status": "pending",
+                    "commit_message": "",
+                }
+                for index in range(1, 31)
+            ]
+        }
+
+        warnings = task_plan_warnings(payload)
+        self.assertTrue(any("contains 30 tasks" in item for item in warnings))
+        self.assertTrue(any("over-fragmented" in item or "oversliced" in item for item in warnings))
 
 
 if __name__ == "__main__":

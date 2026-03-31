@@ -139,8 +139,6 @@ def validate_task_plan_payload(payload: object, require_verification: bool = Fal
         return ["task plan must contain a 'tasks' list"]
     if not tasks:
         return ["task plan must contain at least one task"]
-    if len(tasks) > 25:
-        errors.append("task plan may contain at most 25 tasks")
 
     seen_ids = set()
     seen_titles = set()
@@ -204,6 +202,57 @@ def validate_task_plan_payload(payload: object, require_verification: bool = Fal
             errors.append(f"{prefix} commit_message must be a string")
 
     return errors
+
+
+def task_plan_warnings(payload: object) -> List[str]:
+    warnings: List[str] = []
+    if not isinstance(payload, dict):
+        return warnings
+
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return warnings
+
+    task_count = len(tasks)
+    if task_count > 25:
+        warnings.append(
+            f"task plan contains {task_count} tasks; review whether the work is oversliced into too many tiny tasks"
+        )
+    if task_count > 60:
+        warnings.append(
+            "task plan is unusually large; confirm the project truly needs this many independently verified slices"
+        )
+
+    very_short_titles = 0
+    very_short_descriptions = 0
+    single_acceptance_tasks = 0
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        title = str(task.get("title", "")).strip()
+        description = str(task.get("description", "")).strip()
+        acceptance = task.get("acceptance")
+        if title and len(title) <= 8:
+            very_short_titles += 1
+        if description and len(description) <= 30:
+            very_short_descriptions += 1
+        if isinstance(acceptance, list) and len([item for item in acceptance if isinstance(item, str) and item.strip()]) == 1:
+            single_acceptance_tasks += 1
+
+    if task_count >= 12 and very_short_titles >= max(4, task_count // 3):
+        warnings.append(
+            "many task titles are extremely short; confirm tasks are not split into trivial bookkeeping steps"
+        )
+    if task_count >= 12 and very_short_descriptions >= max(4, task_count // 3):
+        warnings.append(
+            "many task descriptions are very short; confirm each task is still a meaningful, independently verifiable slice"
+        )
+    if task_count >= 15 and single_acceptance_tasks >= max(6, task_count // 2):
+        warnings.append(
+            "many tasks have only one acceptance criterion; confirm the plan is not over-fragmented"
+        )
+
+    return warnings
 
 
 def validate_project_config_payload(payload: object) -> List[str]:
@@ -367,6 +416,7 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         errors.append(f"missing task plan file: {task_plan_path(root)}")
     elif plan_payload is not None:
         errors.extend(validate_task_plan_payload(plan_payload))
+        warnings.extend(task_plan_warnings(plan_payload))
 
     docs = {
         "project_brief.md": project_brief_path(root),
