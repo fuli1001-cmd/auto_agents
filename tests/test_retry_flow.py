@@ -319,10 +319,10 @@ class RetryFlowTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root)
             orchestrator.adapter = RetryingPlanAdapter(project_root)
 
-            idea_file = project_root / "idea.md"
-            idea_file.write_text("# Idea\n", encoding="utf-8")
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
             state = load_run_state(project_root)
-            state = orchestrator._run_agent_stage("plan", state, idea_file)
+            state = orchestrator._run_agent_stage("plan", state, spec_file)
 
             self.assertEqual(orchestrator.adapter.plan_calls, 2)
             self.assertEqual(state.agent_attempts["plan"], 2)
@@ -335,10 +335,10 @@ class RetryFlowTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root)
             orchestrator.adapter = VerificationPlanAdapter(project_root)
 
-            idea_file = project_root / "idea.md"
-            idea_file.write_text("# Idea\n", encoding="utf-8")
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
             state = load_run_state(project_root)
-            orchestrator._run_agent_stage("plan", state, idea_file)
+            orchestrator._run_agent_stage("plan", state, spec_file)
 
             config = load_project_config(project_root)
             self.assertEqual(config.gates.commands, ["conda run -p ./.conda python -m unittest discover -s tests"])

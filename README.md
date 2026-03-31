@@ -107,14 +107,17 @@ Convenience defaults:
 Run the orchestrator:
 
 ```bash
-python3 -m auto_agents run --project /tmp/demo --idea-file /tmp/demo/idea.md
+python3 -m auto_agents run --project /tmp/demo --spec-file /tmp/demo/spec.md
 ```
 
-`run --idea-file` defaults to `<project>/idea.md`, so this also works:
+`run --spec-file` defaults to `<project>/spec.md`, so this also works:
 
 ```bash
 python3 -m auto_agents run --project /tmp/demo
 ```
+
+The input spec can be either a rough product idea or a more detailed design document. The
+orchestrator classifies it automatically and adjusts the clarify/design prompts accordingly.
 
 Stream agent stdout and stderr to the terminal while keeping the final JSON response on stdout:
 
@@ -229,7 +232,7 @@ If a run fails because of a bug, provider error, network issue, or token exhaust
 recovery path is simply to fix the underlying issue and rerun the same command:
 
 ```bash
-python3 -m auto_agents run --project /tmp/demo --idea-file /tmp/demo/idea.md
+python3 -m auto_agents run --project /tmp/demo --spec-file /tmp/demo/spec.md
 ```
 
 What resumes depends on the stage:

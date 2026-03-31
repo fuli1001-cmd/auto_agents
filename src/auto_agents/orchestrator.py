@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -47,6 +48,7 @@ class Orchestrator:
         self.adapter = self._build_adapter(self.config)
         self.agent_output_stream = agent_output_stream or sys.stderr
         self._print_agent_output = False
+        self._active_spec_file: Optional[Path] = None
 
     @staticmethod
     def init_project(project_root: Path, name: str, provider_kind: str, doc_language: str = "en") -> Path:
@@ -81,7 +83,7 @@ class Orchestrator:
 
     def run(
         self,
-        idea_file: Path,
+        spec_file: Path,
         auto_approve: bool = False,
         max_tasks: Optional[int] = None,
         skip_validate: bool = False,
@@ -94,7 +96,8 @@ class Orchestrator:
             if doc_language is not None:
                 self._set_document_language(doc_language)
             state = load_run_state(self.project_root)
-            self._ensure_preconditions(state, idea_file=idea_file, skip_validate=skip_validate)
+            self._active_spec_file = spec_file.expanduser().resolve()
+            self._ensure_preconditions(state, spec_file=spec_file, skip_validate=skip_validate)
 
             if state.status == "completed":
                 return state
@@ -117,9 +120,9 @@ class Orchestrator:
                     elif stage == "verify":
                         state = self._run_verify(state)
                     elif stage == "readme":
-                        state = self._run_readme(state, idea_file)
+                        state = self._run_readme(state, spec_file)
                     else:
-                        state = self._run_agent_stage(stage, state, idea_file)
+                        state = self._run_agent_stage(stage, state, spec_file)
                 except RuntimeError as error:
                     state.status = "failed"
                     state.last_error = str(error)
@@ -145,11 +148,12 @@ class Orchestrator:
             return state
         finally:
             self._print_agent_output = False
+            self._active_spec_file = None
 
-    def _ensure_preconditions(self, state: RunState, idea_file: Path, skip_validate: bool) -> None:
-        if not idea_file.exists():
+    def _ensure_preconditions(self, state: RunState, spec_file: Path, skip_validate: bool) -> None:
+        if not spec_file.exists():
             state.status = "failed"
-            state.last_error = f"idea file does not exist: {idea_file}"
+            state.last_error = f"spec file does not exist: {spec_file}"
             save_run_state(self.project_root, state)
             raise RuntimeError(state.last_error)
 
@@ -176,8 +180,8 @@ class Orchestrator:
             return MockAdapter()
         return ShellAdapter(config.provider)
 
-    def _run_agent_stage(self, stage: str, state: RunState, idea_file: Path) -> RunState:
-        prompt = self._build_prompt(stage=stage, idea_file=idea_file)
+    def _run_agent_stage(self, stage: str, state: RunState, spec_file: Path) -> RunState:
+        prompt = self._build_prompt(stage=stage, spec_file=spec_file)
         validator_map = {
             "clarify": self._clarify_validation_feedback,
             "design": self._design_validation_feedback,
@@ -510,8 +514,8 @@ class Orchestrator:
             raise RuntimeError(f"No tasks found in {task_plan_path(self.project_root)}")
         return tasks
 
-    def _run_readme(self, state: RunState, idea_file: Path) -> RunState:
-        prompt = self._build_prompt(stage="readme", idea_file=idea_file)
+    def _run_readme(self, state: RunState, spec_file: Path) -> RunState:
+        prompt = self._build_prompt(stage="readme", spec_file=spec_file)
         result = self._run_agent_with_retries(
             state=state,
             stage="readme",
@@ -545,24 +549,30 @@ class Orchestrator:
         _, output_path = run_artifact_paths(self.project_root, run_id, stage)
         return output_path
 
-    def _build_prompt(self, stage: str, idea_file: Path) -> str:
+    def _build_prompt(self, stage: str, spec_file: Path) -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
         plan = task_plan_path(self.project_root)
+        analysis = self._analyze_spec(spec_file)
+        spec_kind = str(analysis["kind"])
+        spec_context = self._spec_context_line(analysis)
         common = [
             f"Project root: {self.project_root}",
             "Work only inside this repository.",
             "Keep outputs concise and file-driven.",
             "Do not restate large documents in your final response.",
             "Do not modify the system-wide environment or install global packages.",
+            f"Primary input spec: {spec_file}",
+            spec_context,
         ]
 
         if stage == "clarify":
             lines = common + [
-                f"Read the idea from: {idea_file}",
+                f"Read the input spec from: {spec_file}",
                 f"Update this file in place: {brief}",
                 "Keep the brief compact and scoped to the MVP.",
                 "Preserve the exact top-level and section headings already present in the file.",
+                self._clarify_spec_instruction(spec_kind),
                 self._document_language_instruction(),
                 "Final response: 3 short bullets summarizing the clarified scope.",
             ]
@@ -570,10 +580,12 @@ class Orchestrator:
 
         if stage == "design":
             lines = common + [
+                f"Read the input spec: {spec_file}",
                 f"Read the current project brief: {brief}",
                 f"Update this file in place: {architecture}",
                 "Record only top-level architecture decisions and major risks.",
                 "Preserve the exact top-level and section headings already present in the file.",
+                self._design_spec_instruction(spec_kind),
                 self._document_language_instruction(),
                 "Final response: 3 short bullets summarizing the design.",
             ]
@@ -581,6 +593,7 @@ class Orchestrator:
 
         if stage == "plan":
             lines = common + [
+                f"Read the input spec: {spec_file}",
                 f"Read: {brief}",
                 f"Read: {architecture}",
                 f"Replace this JSON file with 3-10 minimal verifiable feature slices: {plan}",
@@ -589,6 +602,7 @@ class Orchestrator:
                 "If this is a Python project, require a project-local conda env at ./.conda.",
                 "For Python verification, prefer checking './.conda/conda-meta' and then running 'conda run -p ./.conda python -m unittest discover -s tests' unless another command is clearly better.",
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
+                self._plan_spec_instruction(spec_kind),
                 self._plan_language_instruction(),
                 "Each task must contain task_id, title, description, acceptance, status, commit_message.",
                 "Keep tasks small enough to implement and verify independently.",
@@ -599,7 +613,7 @@ class Orchestrator:
         if stage == "readme":
             readme = self.project_root / "README.md"
             lines = common + [
-                f"Read the original idea: {idea_file}",
+                f"Read the input spec: {spec_file}",
                 f"Read the project brief: {brief}",
                 f"Read the architecture doc: {architecture}",
                 f"Read the task plan and verification strategy: {plan}",
@@ -608,12 +622,162 @@ class Orchestrator:
                 "Include at minimum: project overview, architecture, repository structure, setup or prerequisites, usage, and verification.",
                 "Base commands on files and entrypoints that actually exist in the repository.",
                 "Prefer concise sections, bullets, and runnable command examples.",
+                self._readme_spec_instruction(spec_kind),
                 self._readme_language_instruction(),
                 "Final response: 3 short bullets summarizing the README update.",
             ]
             return "\n".join(lines)
 
         raise RuntimeError(f"Unsupported stage: {stage}")
+
+    def _analyze_spec(self, spec_file: Path) -> Dict[str, object]:
+        content = read_text(spec_file).strip()
+        lowered = content.lower()
+        normalized = re.sub(r"[^a-z0-9]+", " ", lowered)
+
+        def has_any(*patterns: str) -> bool:
+            return any(pattern in lowered for pattern in patterns)
+
+        def has_any_regex(*patterns: str) -> bool:
+            return any(re.search(pattern, lowered) is not None for pattern in patterns)
+
+        def count_matches(patterns: Iterable[str]) -> int:
+            return sum(1 for pattern in patterns if pattern in normalized)
+
+        has_problem = has_any("## problem", "# problem", "problem statement", "target audience", "user pain", "pain point")
+        has_scope = has_any("## mvp scope", "# mvp scope", "mvp", "scope", "requirements", "feature list", "use case")
+        has_constraints = has_any("## constraints", "# constraints", "constraints", "assumptions", "budget", "timeline", "compliance")
+        has_modules = has_any("## core modules", "# core modules", "architecture", "module", "component", "service", "layer")
+        has_data_flow = has_any("## data flow", "# data flow", "data flow", "sequence", "workflow", "request flow")
+        has_interfaces = has_any("## interfaces", "# interfaces") or has_any_regex(
+            r"\bapi\b",
+            r"\binterface\b",
+            r"\bendpoint\b",
+            r"\bschema\b",
+            r"\bcontract\b",
+        )
+        has_verification = has_any("test strategy", "verification", "acceptance criteria", "qa", "validation", "test plan")
+
+        idea_score = count_matches(
+            (
+                "problem",
+                "audience",
+                "user",
+                "mvp",
+                "scope",
+                "non goals",
+                "goal",
+                "use case",
+            )
+        )
+        design_score = count_matches(
+            (
+                "architecture",
+                "system boundary",
+                "module",
+                "component",
+                "data flow",
+                "interface",
+                "api",
+                "database",
+                "schema",
+                "deployment",
+                "risk",
+                "verification",
+                "test strategy",
+            )
+        )
+
+        if design_score >= 4 and (has_modules or has_data_flow or has_interfaces):
+            kind = "design"
+        elif idea_score >= 3 and design_score <= 2 and not (has_data_flow or has_interfaces):
+            kind = "idea"
+        else:
+            kind = "mixed"
+
+        evidence = []
+        if has_problem:
+            evidence.append("problem")
+        if has_scope:
+            evidence.append("scope")
+        if has_constraints:
+            evidence.append("constraints")
+        if has_modules:
+            evidence.append("modules")
+        if has_data_flow:
+            evidence.append("data flow")
+        if has_interfaces:
+            evidence.append("interfaces")
+        if has_verification:
+            evidence.append("verification")
+        if not evidence:
+            evidence.append("general requirements")
+
+        return {
+            "kind": kind,
+            "idea_score": idea_score,
+            "design_score": design_score,
+            "has_problem": has_problem,
+            "has_scope": has_scope,
+            "has_constraints": has_constraints,
+            "has_modules": has_modules,
+            "has_data_flow": has_data_flow,
+            "has_interfaces": has_interfaces,
+            "has_verification": has_verification,
+            "evidence": evidence,
+        }
+
+    @staticmethod
+    def _spec_context_line(analysis: Dict[str, object]) -> str:
+        evidence = ", ".join(str(item) for item in analysis.get("evidence", [])[:4])
+        return (
+            f"Detected spec profile: {analysis.get('kind', 'mixed')} "
+            f"(signals: {evidence})."
+        )
+
+    @staticmethod
+    def _clarify_spec_instruction(spec_kind: str) -> str:
+        if spec_kind == "design":
+            return (
+                "This spec is architecture-heavy. Extract only product intent, MVP scope, non-goals, and "
+                "constraints into the brief. Do not duplicate full architecture details here."
+            )
+        if spec_kind == "mixed":
+            return (
+                "This spec mixes product intent and design detail. Preserve the core requirements in the brief "
+                "and leave implementation structure for the architecture document."
+            )
+        return "Treat the spec as early product intent and turn it into a crisp MVP brief."
+
+    @staticmethod
+    def _design_spec_instruction(spec_kind: str) -> str:
+        if spec_kind == "design":
+            return (
+                "Treat the input spec as the primary architecture source. Normalize it into this template, "
+                "preserve concrete decisions, and only fill small gaps conservatively."
+            )
+        if spec_kind == "mixed":
+            return (
+                "Preserve explicit architectural decisions from the input spec and use the brief only to fill "
+                "missing context or constraints."
+            )
+        return "Use the brief as the source of truth and derive a practical MVP architecture from it."
+
+    @staticmethod
+    def _plan_spec_instruction(spec_kind: str) -> str:
+        if spec_kind == "design":
+            return "Honor the architecture decisions already present in the input spec unless they clearly conflict with the brief."
+        if spec_kind == "mixed":
+            return "Prefer the explicit design decisions in the input spec and use the brief and architecture doc to resolve gaps."
+        return "Decompose the MVP into the smallest practical feature slices implied by the brief and architecture."
+
+    @staticmethod
+    def _readme_spec_instruction(spec_kind: str) -> str:
+        if spec_kind == "design":
+            return "Use the input spec to preserve important architecture terminology and constraints in the final README."
+        if spec_kind == "mixed":
+            return "Use the input spec to preserve both the intended product scope and the key architecture choices."
+        return "Use the input spec mainly as product context and describe the implemented repository state faithfully."
 
     def _build_task_prompt(self, task: TaskSpec, stage: str, review_context: str = "") -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
@@ -985,7 +1149,12 @@ class Orchestrator:
         if any(task.status != "pending" for task in tasks):
             return
 
-        allowed = {".gitignore", "README.md", "idea.md"}
+        allowed = {".gitignore", "README.md", "spec.md"}
+        if self._active_spec_file is not None:
+            try:
+                allowed.add(str(self._active_spec_file.relative_to(self.project_root)))
+            except ValueError:
+                pass
         for line in changes.splitlines():
             path = line[3:].strip()
             if not path:

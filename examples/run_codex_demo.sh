@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_DIR="${1:-/tmp/auto-agents-codex-demo}"
-IDEA_SOURCE="$ROOT_DIR/examples/codex_demo/idea.md"
-IDEA_TARGET="$PROJECT_DIR/idea.md"
+SPEC_SOURCE="$ROOT_DIR/examples/codex_demo/spec.md"
+SPEC_TARGET="$PROJECT_DIR/spec.md"
 
 if ! command -v codex >/dev/null 2>&1; then
   echo "codex CLI was not found in PATH" >&2
@@ -13,12 +13,12 @@ fi
 
 rm -rf "$PROJECT_DIR"
 python3 -m auto_agents init --project "$PROJECT_DIR" --name codex-demo --provider codex >/dev/null
-cp "$IDEA_SOURCE" "$IDEA_TARGET"
+cp "$SPEC_SOURCE" "$SPEC_TARGET"
 
 python3 -m auto_agents validate --project "$PROJECT_DIR"
 python3 -m auto_agents run \
   --project "$PROJECT_DIR" \
-  --idea-file "$IDEA_TARGET" \
+  --spec-file "$SPEC_TARGET" \
   --auto-approve \
   --max-tasks 1
 

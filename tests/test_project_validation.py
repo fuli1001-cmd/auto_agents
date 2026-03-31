@@ -278,8 +278,8 @@ class ProjectValidationTests(unittest.TestCase):
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
             write_json(task_plan_path(project_root), {"tasks": []})
-            idea_file = project_root / "idea.md"
-            write_text(idea_file, "# Idea\n")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
 
             orchestrator = Orchestrator(project_root)
 
@@ -290,7 +290,7 @@ class ProjectValidationTests(unittest.TestCase):
             orchestrator.adapter = FailingIfCalledAdapter()
 
             with self.assertRaises(RuntimeError) as ctx:
-                orchestrator.run(idea_file=idea_file)
+                orchestrator.run(spec_file=spec_file)
 
             self.assertIn("preflight validation failed", str(ctx.exception))
             state = load_run_state(project_root)
@@ -302,12 +302,12 @@ class ProjectValidationTests(unittest.TestCase):
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
             write_text(config_path(project_root), "{broken\n")
-            idea_file = project_root / "idea.md"
-            write_text(idea_file, "# Idea\n")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
 
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
-                exit_code = main(["run", "--project", str(project_root), "--idea-file", str(idea_file)])
+                exit_code = main(["run", "--project", str(project_root), "--spec-file", str(spec_file)])
 
             payload = json.loads(buffer.getvalue())
             self.assertEqual(exit_code, 1)
@@ -340,7 +340,7 @@ class ProjectValidationTests(unittest.TestCase):
             config = load_project_config(project_root)
             self.assertEqual(config.docs.language, "zh")
 
-    def test_cli_run_defaults_idea_file_to_project_root(self) -> None:
+    def test_cli_run_defaults_spec_file_to_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -352,7 +352,7 @@ class ProjectValidationTests(unittest.TestCase):
             payload = json.loads(buffer.getvalue())
             self.assertEqual(exit_code, 1)
             self.assertFalse(payload["ok"])
-            self.assertIn(str(project_root / "idea.md"), payload["error"])
+            self.assertIn(str(project_root / "spec.md"), payload["error"])
 
     def test_cli_approve_defaults_to_pending_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -396,9 +396,9 @@ class ProjectValidationTests(unittest.TestCase):
     def test_cli_run_passes_print_agent_output_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
-            idea_file = project_root / "idea.md"
-            idea_file.parent.mkdir(parents=True, exist_ok=True)
-            write_text(idea_file, "# Idea\n")
+            spec_file = project_root / "spec.md"
+            spec_file.parent.mkdir(parents=True, exist_ok=True)
+            write_text(spec_file, "# Spec\n")
             calls = {}
 
             class FakeState:
@@ -418,7 +418,7 @@ class ProjectValidationTests(unittest.TestCase):
             with patch("auto_agents.cli.Orchestrator", FakeOrchestrator):
                 with contextlib.redirect_stdout(buffer):
                     exit_code = main(
-                        ["run", "--project", str(project_root), "--idea-file", str(idea_file), "--print-agent-output"]
+                        ["run", "--project", str(project_root), "--spec-file", str(spec_file), "--print-agent-output"]
                     )
 
             payload = json.loads(buffer.getvalue())
@@ -430,9 +430,9 @@ class ProjectValidationTests(unittest.TestCase):
     def test_cli_run_passes_document_language_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
-            idea_file = project_root / "idea.md"
-            idea_file.parent.mkdir(parents=True, exist_ok=True)
-            write_text(idea_file, "# Idea\n")
+            spec_file = project_root / "spec.md"
+            spec_file.parent.mkdir(parents=True, exist_ok=True)
+            write_text(spec_file, "# Spec\n")
             calls = {}
 
             class FakeState:
@@ -451,7 +451,7 @@ class ProjectValidationTests(unittest.TestCase):
             with patch("auto_agents.cli.Orchestrator", FakeOrchestrator):
                 with contextlib.redirect_stdout(buffer):
                     exit_code = main(
-                        ["run", "--project", str(project_root), "--idea-file", str(idea_file), "--doc-language", "zh"]
+                        ["run", "--project", str(project_root), "--spec-file", str(spec_file), "--doc-language", "zh"]
                     )
 
             payload = json.loads(buffer.getvalue())
@@ -535,14 +535,14 @@ class ProjectValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
-            idea_file = project_root / "idea.md"
-            write_text(idea_file, "# Idea\n")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
             state = load_run_state(project_root)
             state.status = "completed"
             save_run_state(project_root, state)
 
             orchestrator = Orchestrator(project_root)
-            orchestrator.run(idea_file=idea_file, doc_language="zh")
+            orchestrator.run(spec_file=spec_file, doc_language="zh")
 
             config = load_project_config(project_root)
             self.assertEqual(config.docs.language, "zh")
@@ -552,10 +552,10 @@ class ProjectValidationTests(unittest.TestCase):
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock", doc_language="zh")
             orchestrator = Orchestrator(project_root)
-            idea_file = project_root / "idea.md"
-            write_text(idea_file, "# Idea\n")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
 
-            prompt = orchestrator._build_prompt("clarify", idea_file)
+            prompt = orchestrator._build_prompt("clarify", spec_file)
 
             self.assertIn("Simplified Chinese", prompt)
 
@@ -564,24 +564,82 @@ class ProjectValidationTests(unittest.TestCase):
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock", doc_language="zh")
             orchestrator = Orchestrator(project_root)
-            idea_file = project_root / "idea.md"
-            write_text(idea_file, "# Idea\n")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
 
-            prompt = orchestrator._build_prompt("readme", idea_file)
+            prompt = orchestrator._build_prompt("readme", spec_file)
 
             self.assertIn("Simplified Chinese", prompt)
             self.assertIn(str(project_root / "README.md"), prompt)
+
+    def test_spec_analysis_classifies_idea_like_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            spec_file = project_root / "spec.md"
+            write_text(
+                spec_file,
+                "# Product Idea\n\n## Problem\nSmall teams need a lightweight release checklist.\n\n"
+                "## MVP Scope\n- Create tasks\n- Mark tasks done\n\n## Non-Goals\n- No integrations yet.\n",
+            )
+
+            analysis = orchestrator._analyze_spec(spec_file)
+            prompt = orchestrator._build_prompt("clarify", spec_file)
+
+            self.assertEqual(analysis["kind"], "idea")
+            self.assertIn("Detected spec profile: idea", prompt)
+            self.assertIn("Treat the spec as early product intent", prompt)
+
+    def test_spec_analysis_classifies_design_like_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            spec_file = project_root / "design.md"
+            write_text(
+                spec_file,
+                "# Architecture\n\n## System Boundary\nBrowser client and API service.\n\n"
+                "## Core Modules\n- API\n- Storage\n\n## Data Flow\nRequests enter the API and persist to SQLite.\n\n"
+                "## Interfaces\nREST API endpoints for tasks.\n",
+            )
+
+            analysis = orchestrator._analyze_spec(spec_file)
+            prompt = orchestrator._build_prompt("design", spec_file)
+
+            self.assertEqual(analysis["kind"], "design")
+            self.assertIn("Detected spec profile: design", prompt)
+            self.assertIn("Treat the input spec as the primary architecture source", prompt)
+
+    def test_spec_analysis_classifies_mixed_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            spec_file = project_root / "spec.md"
+            write_text(
+                spec_file,
+                "# Task App\n\n## Problem\nTrack work without spreadsheets.\n\n## MVP Scope\n- Create tasks\n\n"
+                "## Core Modules\n- Web UI\n- API\n\n## Data Flow\nThe UI sends task updates to the API.\n",
+            )
+
+            analysis = orchestrator._analyze_spec(spec_file)
+            prompt = orchestrator._build_prompt("plan", spec_file)
+
+            self.assertEqual(analysis["kind"], "mixed")
+            self.assertIn("Detected spec profile: mixed", prompt)
+            self.assertIn("Prefer the explicit design decisions in the input spec", prompt)
 
     def test_mock_readme_stage_updates_project_readme(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
             orchestrator = Orchestrator(project_root)
-            idea_file = project_root / "idea.md"
-            write_text(idea_file, "# Idea\n")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
 
             state = load_run_state(project_root)
-            state = orchestrator._run_readme(state, idea_file)
+            state = orchestrator._run_readme(state, spec_file)
 
             readme = (project_root / "README.md").read_text(encoding="utf-8")
             self.assertEqual(state.current_stage, "readme")

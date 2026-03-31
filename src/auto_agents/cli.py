@@ -14,12 +14,12 @@ def _default_project_name(project: Path) -> str:
     return candidate or "unnamed-project"
 
 
-def _default_idea_file(project: Path) -> Path:
-    return project / "idea.md"
+def _default_spec_file(project: Path) -> Path:
+    return project / "spec.md"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted new projects.")
+    parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted project delivery.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="Bootstrap a new target project.")
@@ -43,8 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run the orchestration pipeline.")
     run_parser.add_argument("--project", required=True, help="Target project directory.")
     run_parser.add_argument(
-        "--idea-file",
-        help="Path to the initial idea markdown. Defaults to <project>/idea.md.",
+        "--spec-file",
+        help="Path to the input specification markdown. Defaults to <project>/spec.md.",
     )
     run_parser.add_argument(
         "--auto-approve",
@@ -108,10 +108,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         try:
             project_root = Path(args.project)
-            idea_file = Path(args.idea_file) if args.idea_file else _default_idea_file(project_root)
+            spec_file = Path(args.spec_file) if args.spec_file else _default_spec_file(project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
             state = orchestrator.run(
-                idea_file=idea_file,
+                spec_file=spec_file,
                 auto_approve=bool(args.auto_approve),
                 max_tasks=args.max_tasks,
                 skip_validate=bool(args.skip_validate),
