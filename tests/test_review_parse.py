@@ -57,6 +57,22 @@ class ReviewParseTests(unittest.TestCase):
             self.assertIn("The first non-empty line must be exactly 'DECISION: pass' or 'DECISION: fail'.", prompt)
             self.assertNotIn("Write the review summary to:", prompt)
 
+    def test_review_prompt_can_embed_changed_file_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = orchestrator._load_tasks_from_plan()[0]
+            (project_root / "artifact.txt").write_text("hello\n", encoding="utf-8")
+
+            review_context = orchestrator._build_review_context("all commands passed")
+            prompt = orchestrator._build_task_prompt(task, "review", review_context=review_context)
+
+            self.assertIn("Use the supplied changed-file and diff context first.", prompt)
+            self.assertIn("Local verification summary:", prompt)
+            self.assertIn("Changed files:", prompt)
+            self.assertIn("artifact.txt", prompt)
+
     def test_implement_prompt_protects_conda_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

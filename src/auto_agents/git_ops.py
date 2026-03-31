@@ -63,20 +63,28 @@ def changed_files(project_root: Path) -> str:
     return process.stdout.strip()
 
 
-def changed_paths(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/",)) -> list[str]:
+def changed_entries(
+    project_root: Path,
+    ignored_prefixes: tuple[str, ...] = (".auto-agents/",),
+) -> list[tuple[str, str]]:
     process = _git(project_root, "status", "--porcelain=v1", "-uall")
     if process.returncode != 0:
         raise RuntimeError(process.stderr.strip() or "git status failed")
 
-    paths: list[str] = []
+    entries: list[tuple[str, str]] = []
     for raw_line in process.stdout.splitlines():
+        status = raw_line[:2]
         path = raw_line[3:].strip()
         if " -> " in path:
             _, path = path.split(" -> ", 1)
         if any(path.startswith(prefix) for prefix in ignored_prefixes):
             continue
-        paths.append(path)
-    return paths
+        entries.append((status, path))
+    return entries
+
+
+def changed_paths(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/",)) -> list[str]:
+    return [path for _, path in changed_entries(project_root, ignored_prefixes=ignored_prefixes)]
 
 
 def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/",)) -> str:

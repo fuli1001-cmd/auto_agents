@@ -21,6 +21,7 @@ The system optimizes for quality over throughput:
 - Providers are replaceable adapters
 - LLM calls stay short and stage-specific
 - Task review defaults to a lighter pass and escalates to deeper review only when the current diff looks risky
+- Review prompts are narrowed to the current changed files and diff so the reviewer spends less time rediscovering context
 - Scripts, not the model, enforce quality gates
 - Invalid plans and malformed reviews are rejected and retried with focused feedback
 - Local project isolation is preferred over changing shared system environments

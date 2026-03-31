@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, TextIO, Tuple
@@ -21,7 +22,7 @@ from .config import (
     write_run_prompt,
 )
 from .gates import run_commands
-from .git_ops import changed_files, changed_paths, commit_all, ensure_repo, is_repo, require_clean_tree, worktree_fingerprint
+from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, is_repo, require_clean_tree, worktree_fingerprint
 from .io_utils import write_text
 from .models import (
     APPROVAL_BY_STAGE,
@@ -252,9 +253,13 @@ class Orchestrator:
             }
         return {"ok": True, "reason": verify_gate.summary}
 
-    def _run_task_review(self, run_id: str, task: TaskSpec) -> Dict[str, object]:
+    def _run_task_review(self, run_id: str, task: TaskSpec, verify_reason: str = "") -> Dict[str, object]:
         review_effort = self._review_effort_for_task(task)
-        review_prompt = self._build_task_prompt(task, "review")
+        review_prompt = self._build_task_prompt(
+            task,
+            "review",
+            review_context=self._build_review_context(verify_reason=verify_reason),
+        )
         review_result = self._run_agent_with_retries(
             state=None,
             stage="review",
@@ -330,6 +335,62 @@ class Orchestrator:
         if normalized in high_risk_names:
             return True
         return normalized.startswith(".github/")
+
+    def _git_text(self, *args: str) -> str:
+        process = subprocess.run(
+            ["git", *args],
+            cwd=str(self.project_root),
+            text=True,
+            capture_output=True,
+        )
+        if process.returncode != 0:
+            return ""
+        return process.stdout.strip()
+
+    def _build_review_context(self, verify_reason: str = "", max_diff_chars: int = 6000) -> str:
+        entries = changed_entries(self.project_root)
+        lines = [
+            "Review the current task by prioritizing the diff context below before exploring unrelated files.",
+        ]
+        if verify_reason.strip():
+            lines.extend(["Local verification summary:", verify_reason.strip()])
+        if entries:
+            lines.append("Changed files:")
+            lines.extend(f"- {path}" for _, path in entries[:40])
+            if len(entries) > 40:
+                lines.append(f"- ... {len(entries) - 40} more files")
+
+        diff_stat = self._git_text("diff", "--stat", "--", ".", ":(exclude).auto-agents")
+        if diff_stat:
+            lines.extend(["Diff stat:", diff_stat])
+
+        diff_excerpt = self._git_text("diff", "--no-ext-diff", "--unified=3", "--", ".", ":(exclude).auto-agents")
+        if diff_excerpt:
+            if len(diff_excerpt) > max_diff_chars:
+                diff_excerpt = diff_excerpt[:max_diff_chars].rstrip() + "\n... [diff truncated]"
+            lines.extend(["Diff excerpt:", diff_excerpt])
+
+        untracked_paths = [path for status, path in entries if status == "??"]
+        if untracked_paths:
+            lines.append("Untracked file excerpts:")
+            remaining_chars = max_diff_chars
+            for path in untracked_paths[:10]:
+                file_path = self.project_root / path
+                if not file_path.is_file():
+                    continue
+                try:
+                    snippet = file_path.read_text(encoding="utf-8")[: min(800, remaining_chars)]
+                except UnicodeDecodeError:
+                    lines.append(f"```text\n# {path}\n[binary or non-utf8 file omitted]\n```")
+                    continue
+                if not snippet.strip():
+                    continue
+                lines.append(f"```text\n# {path}\n{snippet.rstrip()}\n```")
+                remaining_chars -= len(snippet)
+                if remaining_chars <= 0:
+                    lines.append("[untracked excerpts truncated]")
+                    break
+        return "\n".join(lines)
 
     def _cached_review_result(self, state: RunState, task: TaskSpec, fingerprint: str) -> Optional[Dict[str, object]]:
         cache_entry = state.task_review_cache.get(task.task_id, {})
@@ -448,7 +509,7 @@ class Orchestrator:
 
         raise RuntimeError(f"Unsupported stage: {stage}")
 
-    def _build_task_prompt(self, task: TaskSpec, stage: str) -> str:
+    def _build_task_prompt(self, task: TaskSpec, stage: str, review_context: str = "") -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
         task_json = json.dumps(task.to_dict(), indent=2, ensure_ascii=True)
@@ -476,11 +537,14 @@ class Orchestrator:
         if stage == "review":
             lines = common + [
                 "Review the current uncommitted changes for correctness, regressions, and missing tests.",
+                "Use the supplied changed-file and diff context first. Only inspect the rest of the repository when the diff is insufficient.",
                 "Return only the review result. Do not include any preamble, file path note, or tool narration.",
                 "The first non-empty line must be exactly 'DECISION: pass' or 'DECISION: fail'.",
                 self._review_language_instruction(),
                 "After the first line, provide a short review summary.",
             ]
+            if review_context.strip():
+                lines.extend(["", review_context.strip()])
             return "\n".join(lines)
 
         raise RuntimeError(f"Unsupported task stage: {stage}")
@@ -527,7 +591,7 @@ class Orchestrator:
             review_fingerprint = worktree_fingerprint(self.project_root)
             gate_result = self._cached_review_result(state, task, review_fingerprint)
             if gate_result is None:
-                gate_result = self._run_task_review(state.run_id, task)
+                gate_result = self._run_task_review(state.run_id, task, verify_reason=str(verify_result["reason"]))
                 if gate_result["ok"]:
                     self._store_task_review_cache(
                         state,

@@ -39,6 +39,7 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 - The configured review effort is the floor, not always the final setting.
 - Small test-only resumptions can stay on `balanced`.
 - The orchestrator automatically escalates review to `deep` for higher-risk diffs such as non-test code changes, large edits, prior review failures, or dependency/config churn.
+- Review prompts should prefer explicit changed-file context, diff stats, and truncated diffs over broad repo rediscovery.
 
 ## Verification strategy
 
