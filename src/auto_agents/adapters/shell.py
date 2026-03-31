@@ -49,6 +49,7 @@ class ShellAdapter(AgentAdapter):
             command=command,
             output_path=request.output_path,
             summary=summary,
+            stdout=stdout,
             stderr=stderr.strip(),
             returncode=returncode,
             streamed_stdout=streamed_stdout,

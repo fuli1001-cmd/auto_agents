@@ -58,7 +58,7 @@ This policy is enforced in two places:
 ## Execution details
 
 The automation does split the project into tasks automatically, but only after `plan` runs. The
-planner rewrites `.auto-agents/state/task_plan.json` with 3-10 small feature slices, and that file
+planner rewrites `.auto-agents/state/task_plan.json` with 3-25 small feature slices, and that file
 becomes the execution contract for the rest of the run.
 
 Task execution is sequential, not parallel:
@@ -140,7 +140,8 @@ During `plan`, the agent must write `test_strategy` and `verification_commands` 
 into `.auto-agents/config.json`, so new projects do not need a hand-written `gates.commands` block.
 
 For Python projects, those generated verification commands must use the project-local conda env at
-`./.conda`.
+`./.conda`. Every Python-oriented command in `verification_commands` must itself be prefixed with
+`conda run -p ./.conda ...`; bare `python`, `pytest`, or `coverage` commands are rejected.
 
 Inspect persisted progress:
 

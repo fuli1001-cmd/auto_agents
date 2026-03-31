@@ -596,11 +596,14 @@ class Orchestrator:
                 f"Read the input spec: {spec_file}",
                 f"Read: {brief}",
                 f"Read: {architecture}",
-                f"Replace this JSON file with 3-10 minimal verifiable feature slices: {plan}",
+                f"Replace this JSON file with 3-25 minimal verifiable feature slices: {plan}",
                 "At the root of the JSON, also define test_strategy and verification_commands.",
                 "Choose the smallest practical automated verification strategy for this stack.",
                 "If this is a Python project, require a project-local conda env at ./.conda.",
-                "For Python verification, prefer checking './.conda/conda-meta' and then running 'conda run -p ./.conda python -m unittest discover -s tests' unless another command is clearly better.",
+                "If the MVP needs more than 10 slices, keep going up to 25; do not merge unrelated work only to stay under 10.",
+                "For Python verification, every Python-oriented entry in verification_commands must run inside that env via 'conda run -p ./.conda ...'.",
+                "Do not include bare 'python', 'python3', 'pytest', 'coverage', or 'pip' commands in verification_commands for Python projects.",
+                "For Python verification, prefer checking './.conda/conda-meta' and then running 'conda run -p ./.conda python -m unittest discover -s tests' unless another repository-local command is clearly better.",
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
                 self._plan_spec_instruction(spec_kind),
                 self._plan_language_instruction(),
@@ -782,7 +785,7 @@ class Orchestrator:
     def _build_task_prompt(self, task: TaskSpec, stage: str, review_context: str = "") -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
-        task_json = json.dumps(task.to_dict(), indent=2, ensure_ascii=True)
+        task_json = json.dumps(task.to_dict(), indent=2, ensure_ascii=False)
         common = [
             f"Project root: {self.project_root}",
             f"Project brief: {brief}",
@@ -952,7 +955,10 @@ class Orchestrator:
             return
 
         sections = [f"[agent:{stage_key}] returncode={result.returncode} ok={str(result.ok).lower()}"]
-        if result.summary and not result.streamed_stdout:
+        summary_was_streamed = False
+        if result.summary and result.streamed_stdout:
+            summary_was_streamed = result.stdout.strip() == result.summary.strip()
+        if result.summary and not summary_was_streamed:
             sections.append(result.summary.strip())
         if result.stderr and not result.streamed_stderr:
             sections.append(f"[stderr]\n{result.stderr.strip()}")

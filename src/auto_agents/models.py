@@ -300,6 +300,7 @@ class AgentResult:
     command: List[str]
     output_path: Path
     summary: str = ""
+    stdout: str = ""
     stderr: str = ""
     returncode: int = 0
     streamed_stdout: bool = False

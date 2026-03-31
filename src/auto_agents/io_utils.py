@@ -15,7 +15,7 @@ def read_json(path: Path, default: Any = None) -> Any:
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, sort_keys=True)
+        json.dump(data, handle, indent=2, sort_keys=True, ensure_ascii=False)
         handle.write("\n")
 
 
@@ -33,4 +33,3 @@ def write_text(path: Path, content: str) -> None:
 def write_if_missing(path: Path, content: str) -> None:
     if not path.exists():
         write_text(path, content)
-

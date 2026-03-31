@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "approve":
         orchestrator = Orchestrator(Path(args.project))
         state = orchestrator.approve(args.gate)
-        print(json.dumps(state.to_dict(), indent=2, ensure_ascii=True))
+        print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
         return 0
 
     if args.command == "run":
@@ -118,20 +118,20 @@ def main(argv: list[str] | None = None) -> int:
                 print_agent_output=bool(args.print_agent_output),
                 doc_language=args.doc_language,
             )
-            print(json.dumps(state.to_dict(), indent=2, ensure_ascii=True))
+            print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
-            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=True))
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
 
     if args.command == "status":
         orchestrator = Orchestrator(Path(args.project))
-        print(json.dumps(orchestrator.status(), indent=2, ensure_ascii=True))
+        print(json.dumps(orchestrator.status(), indent=2, ensure_ascii=False))
         return 0
 
     if args.command == "validate":
         report = validation_report(Path(args.project))
-        print(json.dumps(report, indent=2, ensure_ascii=True))
+        print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0 if report["ok"] else 1
 
     parser.error(f"Unsupported command: {args.command}")

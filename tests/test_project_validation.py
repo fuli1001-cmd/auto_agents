@@ -459,6 +459,43 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(payload["status"], "completed")
             self.assertEqual(calls["doc_language"], "zh")
 
+    def test_cli_run_prints_utf8_json_for_chinese_stage_summaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            spec_file = project_root / "spec.md"
+            spec_file.parent.mkdir(parents=True, exist_ok=True)
+            write_text(spec_file, "# Spec\n")
+
+            class FakeState:
+                def to_dict(self):
+                    return {
+                        "status": "completed",
+                        "stage_summaries": {
+                            "clarify": "聚焦核心目标",
+                        },
+                    }
+
+            class FakeOrchestrator:
+                def __init__(self, project_root, agent_output_stream=None):
+                    pass
+
+                def run(self, **kwargs):
+                    return FakeState()
+
+            buffer = io.StringIO()
+            with patch("auto_agents.cli.Orchestrator", FakeOrchestrator):
+                with contextlib.redirect_stdout(buffer):
+                    exit_code = main(
+                        ["run", "--project", str(project_root), "--spec-file", str(spec_file), "--doc-language", "zh"]
+                    )
+
+            rendered = buffer.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("聚焦核心目标", rendered)
+            self.assertNotIn("\\u805a\\u7126", rendered)
+            payload = json.loads(rendered)
+            self.assertEqual(payload["stage_summaries"]["clarify"], "聚焦核心目标")
+
     def test_orchestrator_emits_agent_output_to_stderr_stream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -510,6 +547,7 @@ class ProjectValidationTests(unittest.TestCase):
                         command=["fake"],
                         output_path=request.output_path,
                         summary="line one",
+                        stdout="line one\n",
                         stderr="warn one",
                         returncode=0,
                         streamed_stdout=True,
@@ -531,6 +569,43 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("[agent:clarify:stderr] warn one", rendered)
             self.assertIn("[agent:clarify] returncode=0 ok=true", rendered)
 
+    def test_orchestrator_keeps_stage_summary_when_streamed_stdout_is_only_runtime_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            class StreamingLogsAdapter:
+                def run(self, request):
+                    if request.stream_output is None:
+                        raise AssertionError("expected a stream callback")
+                    request.stream_output("stdout", "progress line\n")
+                    return AgentResult(
+                        ok=True,
+                        command=["fake"],
+                        output_path=request.output_path,
+                        summary="# Clarify\n\nfinal requirements\n",
+                        stdout="progress line\n",
+                        returncode=0,
+                        streamed_stdout=True,
+                    )
+
+            orchestrator.adapter = StreamingLogsAdapter()
+            orchestrator._print_agent_output = True
+            state = load_run_state(project_root)
+            orchestrator._run_agent_with_retries(
+                state=state,
+                stage="clarify",
+                stage_key="clarify",
+                prompt="prompt",
+            )
+
+            rendered = stream.getvalue()
+            self.assertIn("[agent:clarify:stdout] progress line", rendered)
+            self.assertIn("# Clarify", rendered)
+            self.assertIn("final requirements", rendered)
+
     def test_run_can_persist_document_language_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -546,6 +621,20 @@ class ProjectValidationTests(unittest.TestCase):
 
             config = load_project_config(project_root)
             self.assertEqual(config.docs.language, "zh")
+
+    def test_save_run_state_persists_utf8_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock", doc_language="zh")
+            state = load_run_state(project_root)
+            state.stage_summaries["clarify"] = "聚焦核心目标"
+            state.stage_summaries["design"] = "架构边界清晰"
+            save_run_state(project_root, state)
+
+            payload = (project_root / ".auto-agents" / "state" / "run_state.json").read_text(encoding="utf-8")
+            self.assertIn("聚焦核心目标", payload)
+            self.assertIn("架构边界清晰", payload)
+            self.assertNotIn("\\u805a\\u7126", payload)
 
     def test_clarify_prompt_uses_selected_document_language(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -629,6 +718,10 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(analysis["kind"], "mixed")
             self.assertIn("Detected spec profile: mixed", prompt)
             self.assertIn("Prefer the explicit design decisions in the input spec", prompt)
+            self.assertIn("3-25 minimal verifiable feature slices", prompt)
+            self.assertIn("do not merge unrelated work only to stay under 10", prompt)
+            self.assertIn("must run inside that env via 'conda run -p ./.conda ...'", prompt)
+            self.assertIn("Do not include bare 'python', 'python3', 'pytest', 'coverage', or 'pip'", prompt)
 
     def test_mock_readme_stage_updates_project_readme(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

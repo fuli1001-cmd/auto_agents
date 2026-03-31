@@ -49,6 +49,7 @@ class MockAdapter(AgentAdapter):
             command=["mock"],
             output_path=request.output_path,
             summary=content.strip(),
+            stdout=content,
             returncode=0,
             streamed_stdout=streamed_stdout,
         )
