@@ -492,6 +492,45 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("stage output", rendered)
             self.assertIn("stage warning", rendered)
 
+    def test_orchestrator_streams_agent_output_chunks_when_adapter_supports_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            class StreamingAdapter:
+                def run(self, request):
+                    if request.stream_output is None:
+                        raise AssertionError("expected a stream callback")
+                    request.stream_output("stdout", "line one\n")
+                    request.stream_output("stderr", "warn one\n")
+                    return AgentResult(
+                        ok=True,
+                        command=["fake"],
+                        output_path=request.output_path,
+                        summary="line one",
+                        stderr="warn one",
+                        returncode=0,
+                        streamed_stdout=True,
+                        streamed_stderr=True,
+                    )
+
+            orchestrator.adapter = StreamingAdapter()
+            orchestrator._print_agent_output = True
+            state = load_run_state(project_root)
+            orchestrator._run_agent_with_retries(
+                state=state,
+                stage="clarify",
+                stage_key="clarify",
+                prompt="prompt",
+            )
+
+            rendered = stream.getvalue()
+            self.assertIn("[agent:clarify:stdout] line one", rendered)
+            self.assertIn("[agent:clarify:stderr] warn one", rendered)
+            self.assertIn("[agent:clarify] returncode=0 ok=true", rendered)
+
     def test_run_can_persist_document_language_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -519,6 +558,35 @@ class ProjectValidationTests(unittest.TestCase):
             prompt = orchestrator._build_prompt("clarify", idea_file)
 
             self.assertIn("Simplified Chinese", prompt)
+
+    def test_readme_prompt_uses_selected_document_language(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock", doc_language="zh")
+            orchestrator = Orchestrator(project_root)
+            idea_file = project_root / "idea.md"
+            write_text(idea_file, "# Idea\n")
+
+            prompt = orchestrator._build_prompt("readme", idea_file)
+
+            self.assertIn("Simplified Chinese", prompt)
+            self.assertIn(str(project_root / "README.md"), prompt)
+
+    def test_mock_readme_stage_updates_project_readme(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            idea_file = project_root / "idea.md"
+            write_text(idea_file, "# Idea\n")
+
+            state = load_run_state(project_root)
+            state = orchestrator._run_readme(state, idea_file)
+
+            readme = (project_root / "README.md").read_text(encoding="utf-8")
+            self.assertEqual(state.current_stage, "readme")
+            self.assertIn("## Overview", readme)
+            self.assertIn("## Usage", readme)
 
 
 if __name__ == "__main__":

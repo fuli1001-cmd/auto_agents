@@ -35,7 +35,8 @@ The system optimizes for quality over throughput:
 4. `implement`: execute one feature slice at a time
 5. `review`: run an independent agent review for the current task
 6. `verify`: run local gates
-7. `commit`: auto-commit only when the task passes gates
+7. `readme`: generate a project README from the finalized repository state
+8. `commit`: auto-commit only when the task passes gates
 
 ## Environment isolation policy
 
@@ -115,13 +116,13 @@ python3 -m auto_agents run --project /tmp/demo --idea-file /tmp/demo/idea.md
 python3 -m auto_agents run --project /tmp/demo
 ```
 
-Show each completed agent stage output on screen without breaking the final JSON response:
+Stream agent stdout and stderr to the terminal while keeping the final JSON response on stdout:
 
 ```bash
 python3 -m auto_agents run --project /tmp/demo --print-agent-output
 ```
 
-Generate persisted documents in Simplified Chinese:
+Generate persisted documents, including the final project README, in Simplified Chinese:
 
 ```bash
 python3 -m auto_agents init --project /tmp/demo --doc-language zh

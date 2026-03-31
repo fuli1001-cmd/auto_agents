@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import List
 
 from ..io_utils import read_text, write_text
 from ..models import AgentRequest, AgentResult, ProviderConfig
-from .base import AgentAdapter
+from .base import AgentAdapter, run_subprocess_with_optional_streaming
 
 
 class CodexAdapter(AgentAdapter):
@@ -39,26 +38,24 @@ class CodexAdapter(AgentAdapter):
         env = dict(os.environ)
         env["AUTO_AGENTS_STAGE"] = request.stage
         env["AUTO_AGENTS_EFFORT"] = request.effort
-        process = subprocess.run(
+        stdout, stderr, returncode, streamed_stdout, streamed_stderr = run_subprocess_with_optional_streaming(
             command,
-            input=request.prompt,
-            text=True,
-            capture_output=True,
-            cwd=str(request.cwd),
-            env=env,
+            request,
+            env,
         )
 
         summary = read_text(request.output_path).strip()
-        if not summary and process.stdout:
-            summary = process.stdout.strip()
+        if not summary and stdout:
+            summary = stdout.strip()
             write_text(request.output_path, summary + "\n")
 
         return AgentResult(
-            ok=process.returncode == 0,
+            ok=returncode == 0,
             command=command,
             output_path=request.output_path,
             summary=summary,
-            stderr=process.stderr.strip(),
-            returncode=process.returncode,
+            stderr=stderr.strip(),
+            returncode=returncode,
+            streamed_stdout=streamed_stdout,
+            streamed_stderr=streamed_stderr,
         )
-

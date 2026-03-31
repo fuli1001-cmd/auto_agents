@@ -25,7 +25,7 @@ from .config import (
 )
 from .gates import run_commands
 from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, is_repo, require_clean_tree, worktree_fingerprint
-from .io_utils import write_text
+from .io_utils import read_text, write_text
 from .models import (
     APPROVAL_BY_STAGE,
     AgentResult,
@@ -116,6 +116,8 @@ class Orchestrator:
                         state = self._run_implementation_loop(state, max_tasks=max_tasks)
                     elif stage == "verify":
                         state = self._run_verify(state)
+                    elif stage == "readme":
+                        state = self._run_readme(state, idea_file)
                     else:
                         state = self._run_agent_stage(stage, state, idea_file)
                 except RuntimeError as error:
@@ -508,6 +510,20 @@ class Orchestrator:
             raise RuntimeError(f"No tasks found in {task_plan_path(self.project_root)}")
         return tasks
 
+    def _run_readme(self, state: RunState, idea_file: Path) -> RunState:
+        prompt = self._build_prompt(stage="readme", idea_file=idea_file)
+        result = self._run_agent_with_retries(
+            state=state,
+            stage="readme",
+            stage_key="readme",
+            prompt=prompt,
+            validation_feedback=self._readme_validation_feedback,
+        )
+        state.current_stage = "readme"
+        state.stage_summaries["readme"] = result.summary.strip()
+        state.last_error = ""
+        return state
+
     def _persist_tasks(self, tasks: Iterable[TaskSpec]) -> None:
         current_payload = load_task_plan(self.project_root)
         payload = []
@@ -577,6 +593,23 @@ class Orchestrator:
                 "Each task must contain task_id, title, description, acceptance, status, commit_message.",
                 "Keep tasks small enough to implement and verify independently.",
                 "Final response: 3 short bullets summarizing the plan.",
+            ]
+            return "\n".join(lines)
+
+        if stage == "readme":
+            readme = self.project_root / "README.md"
+            lines = common + [
+                f"Read the original idea: {idea_file}",
+                f"Read the project brief: {brief}",
+                f"Read the architecture doc: {architecture}",
+                f"Read the task plan and verification strategy: {plan}",
+                f"Update this file in place: {readme}",
+                "Write a practical README for the finished project, not for auto_agents itself.",
+                "Include at minimum: project overview, architecture, repository structure, setup or prerequisites, usage, and verification.",
+                "Base commands on files and entrypoints that actually exist in the repository.",
+                "Prefer concise sections, bullets, and runnable command examples.",
+                self._readme_language_instruction(),
+                "Final response: 3 short bullets summarizing the README update.",
             ]
             return "\n".join(lines)
 
@@ -726,6 +759,7 @@ class Orchestrator:
                 prompt=attempt_prompt,
                 cwd=self.project_root,
                 output_path=output_path,
+                stream_output=self._stream_agent_output_callback(artifact_stage) if self._print_agent_output else None,
             )
             result = self.adapter.run(request)
             self._emit_agent_output(artifact_stage, result)
@@ -754,11 +788,28 @@ class Orchestrator:
             return
 
         sections = [f"[agent:{stage_key}] returncode={result.returncode} ok={str(result.ok).lower()}"]
-        if result.summary:
+        if result.summary and not result.streamed_stdout:
             sections.append(result.summary.strip())
-        if result.stderr:
+        if result.stderr and not result.streamed_stderr:
             sections.append(f"[stderr]\n{result.stderr.strip()}")
         print("\n\n".join(sections), file=self.agent_output_stream, flush=True)
+
+    def _stream_agent_output_callback(self, stage_key: str) -> Callable[[str, str], None]:
+        line_starts = {"stdout": True, "stderr": True}
+
+        def stream_output(stream_name: str, chunk: str) -> None:
+            if not chunk:
+                return
+            prefix = f"[agent:{stage_key}:{stream_name}] "
+            parts = chunk.splitlines(keepends=True)
+            for part in parts:
+                if line_starts.get(stream_name, True):
+                    self.agent_output_stream.write(prefix)
+                self.agent_output_stream.write(part)
+                line_starts[stream_name] = part.endswith("\n")
+            self.agent_output_stream.flush()
+
+        return stream_output
 
     def _set_document_language(self, language: str) -> None:
         if language not in DOCUMENT_LANGUAGE_OPTIONS:
@@ -788,6 +839,11 @@ class Orchestrator:
         if self.config.docs.language == "zh":
             return "After the first line, write the review summary in Simplified Chinese."
         return "After the first line, write the review summary in English."
+
+    def _readme_language_instruction(self) -> str:
+        if self.config.docs.language == "zh":
+            return "Write the README content and final bullets in Simplified Chinese."
+        return "Write the README content and final bullets in English."
 
     def _max_attempts(self, stage: str) -> int:
         return max(1, self.config.retries.per_stage.get(stage, self.config.retries.default_max_attempts))
@@ -834,6 +890,22 @@ class Orchestrator:
             "and preserve the exact required headings.\n"
             f"{bullets}"
         )
+
+    def _readme_validation_feedback(self, _: AgentResult) -> Optional[str]:
+        path = self.project_root / "README.md"
+        content = read_text(path).strip()
+        if not content or content == f"# {self.config.project_name}":
+            return "The README was not updated. Rewrite README.md in place with real project documentation."
+
+        headings = [line.strip() for line in content.splitlines() if line.strip().startswith("#")]
+        if len(headings) < 4:
+            return (
+                "The README is too thin. Add distinct markdown sections for overview, architecture, and usage, "
+                "plus at least one more practical section."
+            )
+        if "```" not in content:
+            return "The README must include at least one fenced code block with practical commands."
+        return None
 
     def _apply_generated_verification_config(self) -> None:
         payload = load_task_plan(self.project_root)

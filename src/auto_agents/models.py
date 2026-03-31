@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 
-STAGE_ORDER = ["clarify", "design", "plan", "implement", "verify"]
+STAGE_ORDER = ["clarify", "design", "plan", "implement", "verify", "readme"]
 APPROVAL_ORDER = ["requirements", "architecture", "release"]
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 APPROVAL_BY_STAGE = {
@@ -291,6 +291,7 @@ class AgentRequest:
     prompt: str
     cwd: Path
     output_path: Path
+    stream_output: Optional[Callable[[str, str], None]] = None
 
 
 @dataclass
@@ -301,6 +302,8 @@ class AgentResult:
     summary: str = ""
     stderr: str = ""
     returncode: int = 0
+    streamed_stdout: bool = False
+    streamed_stderr: bool = False
 
 
 @dataclass
