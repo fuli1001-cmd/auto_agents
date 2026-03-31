@@ -550,11 +550,10 @@ class Orchestrator:
         )
 
     def _review_validation_feedback(self, result: AgentResult) -> Optional[str]:
-        decision, _ = self._parse_review_decision(result.summary)
-        if decision in {"pass", "fail"}:
+        if self._has_explicit_review_decision(result.summary):
             return None
         return (
-            "The review response is invalid. The first non-empty line must be exactly "
+            "The review response is invalid. It must include a line exactly equal to "
             "'DECISION: pass' or 'DECISION: fail'. Rewrite the review output."
         )
 
@@ -615,6 +614,11 @@ class Orchestrator:
                 fallback = "\n".join(lines[:index]).strip()
                 return "fail", fallback or "Review failed."
         return "fail", response.strip()
+
+    @staticmethod
+    def _has_explicit_review_decision(response: str) -> bool:
+        lines = [line.strip().lower() for line in response.splitlines() if line.strip()]
+        return any(line in {"decision: pass", "decision: fail"} for line in lines)
 
     def status(self) -> Dict[str, object]:
         state = load_run_state(self.project_root)
