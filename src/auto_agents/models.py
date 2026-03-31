@@ -241,6 +241,7 @@ class RunState:
     tasks: List[TaskSpec] = field(default_factory=list)
     stage_summaries: Dict[str, str] = field(default_factory=dict)
     agent_attempts: Dict[str, int] = field(default_factory=dict)
+    task_review_cache: Dict[str, Dict[str, str]] = field(default_factory=dict)
     last_error: str = ""
 
     @classmethod
@@ -258,6 +259,10 @@ class RunState:
             agent_attempts={
                 str(key): int(value) for key, value in dict(data.get("agent_attempts", {})).items()
             },
+            task_review_cache={
+                str(key): {str(inner_key): str(inner_value) for inner_key, inner_value in dict(value).items()}
+                for key, value in dict(data.get("task_review_cache", {})).items()
+            },
             last_error=str(data.get("last_error", "")),
         )
 
@@ -271,6 +276,10 @@ class RunState:
             "tasks": [task.to_dict() for task in self.tasks],
             "stage_summaries": dict(self.stage_summaries),
             "agent_attempts": dict(self.agent_attempts),
+            "task_review_cache": {
+                key: {inner_key: inner_value for inner_key, inner_value in value.items()}
+                for key, value in self.task_review_cache.items()
+            },
             "last_error": self.last_error,
         }
 

@@ -239,9 +239,11 @@ What resumes depends on the stage:
 Implementation resume is task-aware rather than fully transactional:
 
 - if a task is already marked `in_progress`, the next run first tries to continue from
-  review/verification on the existing workspace state
+  verification/review on the existing workspace state
 - if that partial work is not good enough, later retry attempts re-run implementation for the same
   task
+- if verification passes and the workspace diff is unchanged, a previously passing review result can
+  be reused without spending another review call
 - if a task is marked `blocked`, it can be retried even when the git tree is still dirty
 
 Current limitation: there is no fine-grained checkpoint inside a single agent call. So the system

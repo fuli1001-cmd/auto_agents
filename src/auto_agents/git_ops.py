@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -61,3 +62,27 @@ def changed_files(project_root: Path) -> str:
         raise RuntimeError(process.stderr.strip() or "git status failed")
     return process.stdout.strip()
 
+
+def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/",)) -> str:
+    process = _git(project_root, "status", "--porcelain=v1", "-uall")
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.strip() or "git status failed")
+
+    hasher = hashlib.sha256()
+    for raw_line in process.stdout.splitlines():
+        path = raw_line[3:].strip()
+        if " -> " in path:
+            _, path = path.split(" -> ", 1)
+        if any(path.startswith(prefix) for prefix in ignored_prefixes):
+            continue
+
+        hasher.update(raw_line.encode("utf-8"))
+        hasher.update(b"\0")
+        file_path = project_root / path
+        if file_path.is_file():
+            hasher.update(file_path.read_bytes())
+        else:
+            hasher.update(b"[missing]")
+        hasher.update(b"\0")
+
+    return hasher.hexdigest()

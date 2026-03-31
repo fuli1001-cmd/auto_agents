@@ -21,7 +21,7 @@ from .config import (
     write_run_prompt,
 )
 from .gates import run_commands
-from .git_ops import changed_files, commit_all, ensure_repo, is_repo, require_clean_tree
+from .git_ops import changed_files, commit_all, ensure_repo, is_repo, require_clean_tree, worktree_fingerprint
 from .io_utils import write_text
 from .models import (
     APPROVAL_BY_STAGE,
@@ -268,6 +268,26 @@ class Orchestrator:
             return {"ok": False, "review": summary, "reason": "review rejected the task"}
         return {"ok": True, "review": summary}
 
+    def _cached_review_result(self, state: RunState, task: TaskSpec, fingerprint: str) -> Optional[Dict[str, object]]:
+        cache_entry = state.task_review_cache.get(task.task_id, {})
+        if cache_entry.get("fingerprint") != fingerprint:
+            return None
+        if cache_entry.get("decision") != "pass":
+            return None
+        summary = cache_entry.get("summary", "").strip()
+        if not summary:
+            return None
+        write_text(review_path(self.project_root), summary + "\n")
+        return {"ok": True, "review": summary}
+
+    def _store_task_review_cache(self, state: RunState, task: TaskSpec, fingerprint: str, summary: str) -> None:
+        state.task_review_cache[task.task_id] = {
+            "fingerprint": fingerprint,
+            "decision": "pass",
+            "summary": summary.strip(),
+        }
+        save_run_state(self.project_root, state)
+
     def _run_verify(self, state: RunState) -> RunState:
         verify_gate = run_commands(self.config.gates.commands, self.project_root)
         lines = ["# Verify", "", f"Result: {'pass' if verify_gate.ok else 'fail'}", ""]
@@ -441,7 +461,17 @@ class Orchestrator:
                 )
                 continue
 
-            gate_result = self._run_task_review(state.run_id, task)
+            review_fingerprint = worktree_fingerprint(self.project_root)
+            gate_result = self._cached_review_result(state, task, review_fingerprint)
+            if gate_result is None:
+                gate_result = self._run_task_review(state.run_id, task)
+                if gate_result["ok"]:
+                    self._store_task_review_cache(
+                        state,
+                        task,
+                        review_fingerprint,
+                        str(gate_result["review"]),
+                    )
             if gate_result["ok"]:
                 return gate_result
 

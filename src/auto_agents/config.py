@@ -84,6 +84,7 @@ RUN_STATE_TEMPLATE = {
     "tasks": [],
     "stage_summaries": {},
     "agent_attempts": {},
+    "task_review_cache": {},
     "last_error": "",
 }
 

@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.config import load_project_config, load_run_state, save_project_config, task_plan_path
+from auto_agents.git_ops import worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
@@ -195,6 +196,30 @@ class VerifyBeforeReviewAdapter:
             summary = f"{request.stage}\n"
             write_text(request.output_path, summary)
 
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class CachedReviewResumeAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            raise AssertionError("implement should not run when resuming cached review state")
+        if request.stage == "review":
+            self.review_calls += 1
+            raise AssertionError("review should be reused from cache when worktree is unchanged")
+        summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
         return AgentResult(
             ok=True,
             command=["fake"],
@@ -418,6 +443,49 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertEqual(orchestrator.adapter.review_calls, 0)
+
+    def test_resume_reuses_cached_pass_review_for_unchanged_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = CachedReviewResumeAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains hello"],
+                            "status": "in_progress",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            (project_root / "artifact.txt").write_text("hello\n", encoding="utf-8")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.agent_attempts["implement-task-001"] = 1
+            state.task_review_cache["task-001"] = {
+                "fingerprint": worktree_fingerprint(project_root),
+                "decision": "pass",
+                "summary": "cached review passed",
+            }
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 0)
+            self.assertEqual(orchestrator.adapter.review_calls, 0)
+            self.assertEqual(state.tasks[0].status, "done")
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 ## Resume strategy
 
 - An interrupted task can persist as `in_progress` and resume from review or verification.
+- A previously passing review can be reused when the task worktree fingerprint is unchanged.
 - A previously `blocked` task can be retried without first forcing a clean tree.
 - Planning baseline commits are limited to planning files so partial feature work is not committed by accident.
 
