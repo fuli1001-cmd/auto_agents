@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -392,6 +394,77 @@ class Orchestrator:
                     break
         return "\n".join(lines)
 
+    def _quick_verify_failure(self) -> Optional[str]:
+        conda_meta = self.project_root / ".conda" / "conda-meta"
+        shell_tokens = {"|", "||", "&&", ";", "$(", "`"}
+        shell_builtins = {
+            ":",
+            ".",
+            "alias",
+            "bg",
+            "cd",
+            "echo",
+            "eval",
+            "exec",
+            "exit",
+            "export",
+            "fg",
+            "printf",
+            "pwd",
+            "read",
+            "set",
+            "shift",
+            "test",
+            "times",
+            "trap",
+            "true",
+            "type",
+            "ulimit",
+            "umask",
+            "unalias",
+            "unset",
+            "wait",
+        }
+
+        for command in self.config.gates.commands:
+            stripped = command.strip()
+            if not stripped:
+                continue
+            if (".conda/conda-meta" in stripped or "conda run -p ./.conda" in stripped) and not conda_meta.exists():
+                return "expected a project-local conda environment at ./.conda/conda-meta before verification"
+            if any(token in stripped for token in shell_tokens):
+                continue
+            try:
+                parts = shlex.split(stripped)
+            except ValueError:
+                continue
+            if not parts:
+                continue
+            executable = parts[0]
+            if executable in shell_builtins:
+                continue
+            if "/" in executable:
+                candidate = (self.project_root / executable).resolve() if executable.startswith(".") else Path(executable)
+                if not candidate.exists():
+                    return f"verification command is not runnable: {command}"
+                continue
+            if shutil.which(executable) is None:
+                return f"verification command is not runnable: {command}"
+        return None
+
+    @staticmethod
+    def _format_retry_feedback(
+        failure_type: str,
+        reason: str = "",
+        review_summary: str = "",
+    ) -> str:
+        lines = [f"- Failure type: {failure_type}"]
+        if reason:
+            lines.append(f"- Reason: {reason}")
+        if review_summary.strip():
+            lines.extend(["- Review summary:", review_summary.strip()])
+        return "\n".join(lines)
+
     def _cached_review_result(self, state: RunState, task: TaskSpec, fingerprint: str) -> Optional[Dict[str, object]]:
         cache_entry = state.task_review_cache.get(task.task_id, {})
         if cache_entry.get("fingerprint") != fingerprint:
@@ -576,15 +649,27 @@ class Orchestrator:
                 )
                 if not result.ok:
                     last_reason = result.stderr or result.summary or "implementation failed"
-                    feedback = f"- Implementation command failed.\n- Details: {last_reason}"
+                    feedback = self._format_retry_feedback(
+                        "implementation_command",
+                        reason=last_reason,
+                    )
                     continue
+
+            quick_failure = self._quick_verify_failure()
+            if quick_failure:
+                last_reason = quick_failure
+                feedback = self._format_retry_feedback(
+                    "pre_verify_check",
+                    reason=last_reason,
+                )
+                continue
 
             verify_result = self._run_task_verify()
             if not verify_result["ok"]:
                 last_reason = str(verify_result["reason"])
-                feedback = (
-                    f"- Local verification failed.\n"
-                    f"- Reason: {last_reason}"
+                feedback = self._format_retry_feedback(
+                    "local_verification",
+                    reason=last_reason,
                 )
                 continue
 
@@ -604,10 +689,10 @@ class Orchestrator:
 
             last_reason = str(gate_result["reason"])
             last_review = str(gate_result["review"])
-            feedback = (
-                f"- Review rejected the task.\n"
-                f"- Reason: {last_reason}\n"
-                f"- Review summary:\n{last_review}"
+            feedback = self._format_retry_feedback(
+                "review_rejected",
+                reason=last_reason,
+                review_summary=last_review,
             )
 
         return {"ok": False, "review": last_review or feedback, "reason": last_reason}
