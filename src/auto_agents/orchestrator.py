@@ -391,8 +391,8 @@ class Orchestrator:
         if stage == "review":
             lines = common + [
                 "Review the current uncommitted changes for correctness, regressions, and missing tests.",
-                f"Write the review summary to: {review_path(self.project_root)}",
-                "Return the first line exactly as 'DECISION: pass' or 'DECISION: fail'.",
+                "Return only the review result. Do not include any preamble, file path note, or tool narration.",
+                "The first non-empty line must be exactly 'DECISION: pass' or 'DECISION: fail'.",
                 self._review_language_instruction(),
                 "After the first line, provide a short review summary.",
             ]

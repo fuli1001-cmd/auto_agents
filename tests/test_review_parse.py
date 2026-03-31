@@ -44,6 +44,19 @@ class ReviewParseTests(unittest.TestCase):
 
             self.assertIsNotNone(issue)
 
+    def test_review_prompt_forbids_preamble_and_file_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = orchestrator._load_tasks_from_plan()[0]
+
+            prompt = orchestrator._build_task_prompt(task, "review")
+
+            self.assertIn("Do not include any preamble, file path note, or tool narration.", prompt)
+            self.assertIn("The first non-empty line must be exactly 'DECISION: pass' or 'DECISION: fail'.", prompt)
+            self.assertNotIn("Write the review summary to:", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
