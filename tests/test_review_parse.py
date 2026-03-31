@@ -57,6 +57,18 @@ class ReviewParseTests(unittest.TestCase):
             self.assertIn("The first non-empty line must be exactly 'DECISION: pass' or 'DECISION: fail'.", prompt)
             self.assertNotIn("Write the review summary to:", prompt)
 
+    def test_implement_prompt_protects_conda_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = orchestrator._load_tasks_from_plan()[0]
+
+            prompt = orchestrator._build_task_prompt(task, "implement")
+
+            self.assertIn("It must remain a real conda prefix", prompt)
+            self.assertIn(".conda/conda-meta", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
