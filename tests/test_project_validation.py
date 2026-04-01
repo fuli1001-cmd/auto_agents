@@ -827,6 +827,14 @@ class ProjectValidationTests(unittest.TestCase):
             config = load_project_config(project_root)
             self.assertEqual(config.docs.language, "zh")
 
+    def test_init_project_defaults_to_four_implement_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+
+            config = load_project_config(project_root)
+            self.assertEqual(config.retries.per_stage["implement"], 4)
+
     def test_save_run_state_persists_utf8_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

@@ -133,7 +133,7 @@ DEFAULT_CONFIG = {
             "clarify": 2,
             "design": 2,
             "plan": 3,
-            "implement": 2,
+            "implement": 4,
             "review": 2
         }
     },

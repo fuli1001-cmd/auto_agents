@@ -523,7 +523,7 @@ class RetryFlowTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertEqual(orchestrator.adapter.implement_calls, orchestrator.config.retries.per_stage["implement"])
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
     def test_resume_reuses_cached_pass_review_for_unchanged_worktree(self) -> None:
@@ -685,7 +685,10 @@ class RetryFlowTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            self.assertEqual(len(orchestrator.adapter.implement_prompts), 2)
+            self.assertEqual(
+                len(orchestrator.adapter.implement_prompts),
+                orchestrator.config.retries.per_stage["implement"],
+            )
             self.assertIn("Failure type: local_verification", orchestrator.adapter.implement_prompts[1])
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
@@ -724,7 +727,7 @@ class RetryFlowTests(unittest.TestCase):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
             self.assertIn(".conda/conda-meta", str(raised.exception))
-            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertEqual(orchestrator.adapter.implement_calls, orchestrator.config.retries.per_stage["implement"])
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
 
