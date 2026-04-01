@@ -1,3 +1,4 @@
+import io
 import sys
 import tempfile
 import unittest
@@ -796,6 +797,47 @@ class RetryFlowTests(unittest.TestCase):
             error_text = str(raised.exception)
             self.assertIn("Task task-001 failed gates: review rejected the task", error_text)
             self.assertIn("Review: Core issue: health endpoint is not actually exercised.", error_text)
+
+    def test_review_failure_is_emitted_before_task_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.retries.per_stage["implement"] = 1
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = PermanentReviewFailureAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains good"],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            with self.assertRaises(RuntimeError):
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            rendered = stream.getvalue()
+            self.assertIn("[task:task-001] review decision=fail", rendered)
+            self.assertIn("Core issue: health endpoint is not actually exercised.", rendered)
+            self.assertIn("[task:task-001] blocked reason=review rejected the task", rendered)
 
 
 if __name__ == "__main__":

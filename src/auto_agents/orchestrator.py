@@ -289,6 +289,7 @@ class Orchestrator:
         )
         decision, summary = self._parse_review_decision(review_result.summary)
         write_text(review_path(self.project_root), summary + "\n")
+        self._emit_task_review_result(task, decision, summary)
         if decision != "pass":
             return {"ok": False, "review": summary, "reason": "review rejected the task"}
         return {"ok": True, "review": summary}
@@ -1050,6 +1051,16 @@ class Orchestrator:
     def _emit_task_blocked(self, task: TaskSpec, reason: str) -> None:
         print(
             f"[task:{task.task_id}] blocked reason={reason}",
+            file=self.agent_output_stream,
+            flush=True,
+        )
+
+    def _emit_task_review_result(self, task: TaskSpec, decision: str, summary: str) -> None:
+        sections = [f"[task:{task.task_id}] review decision={decision}"]
+        if summary.strip():
+            sections.append(summary.strip())
+        print(
+            "\n".join(sections),
             file=self.agent_output_stream,
             flush=True,
         )

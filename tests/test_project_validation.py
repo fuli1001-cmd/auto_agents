@@ -774,6 +774,8 @@ class ProjectValidationTests(unittest.TestCase):
             rendered = stream.getvalue()
             self.assertIn("[task:task-001] implement attempt=1 title=Build health endpoint", rendered)
             self.assertIn("[task:task-001] review attempt=1 title=Build health endpoint", rendered)
+            self.assertIn("[task:task-001] review decision=pass", rendered)
+            self.assertIn("looks good", rendered)
 
     def test_codex_adapter_parses_usage_from_json_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
