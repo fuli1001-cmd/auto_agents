@@ -237,7 +237,13 @@ class Orchestrator:
                 task.review_summary = str(gate_result["review"])
                 self._persist_tasks(tasks)
                 self._emit_task_blocked(task, str(gate_result["reason"]))
-                raise RuntimeError(f"Task {task.task_id} failed gates: {gate_result['reason']}")
+                raise RuntimeError(
+                    self._format_task_failure_error(
+                        task,
+                        reason=str(gate_result["reason"]),
+                        review_summary=task.review_summary,
+                    )
+                )
 
             task.status = "done"
             task.review_summary = str(gate_result["review"])
@@ -1047,6 +1053,26 @@ class Orchestrator:
             file=self.agent_output_stream,
             flush=True,
         )
+
+    def _format_task_failure_error(self, task: TaskSpec, reason: str, review_summary: str) -> str:
+        message = f"Task {task.task_id} failed gates: {reason}"
+        review_excerpt = self._review_failure_excerpt(reason, review_summary)
+        if review_excerpt:
+            return f"{message}. Review: {review_excerpt}"
+        return message
+
+    @staticmethod
+    def _review_failure_excerpt(reason: str, review_summary: str, max_chars: int = 200) -> str:
+        if reason != "review rejected the task":
+            return ""
+        for raw_line in review_summary.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if len(line) > max_chars:
+                return line[: max_chars - 3].rstrip() + "..."
+            return line
+        return ""
 
     def _stream_agent_output_callback(self, stage_key: str) -> Callable[[str, str], None]:
         line_starts = {"stdout": True, "stderr": True}

@@ -311,6 +311,34 @@ class MissingCondaFastFailAdapter:
         )
 
 
+class PermanentReviewFailureAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            summary = "implemented bad\n"
+            write_text(self.project_root / "artifact.txt", "bad\n")
+            write_text(request.output_path, summary)
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = "DECISION: fail\nCore issue: health endpoint is not actually exercised.\n- Missing request test.\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class RetryFlowTests(unittest.TestCase):
     def test_plan_stage_retries_on_invalid_json_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -729,6 +757,45 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn(".conda/conda-meta", str(raised.exception))
             self.assertEqual(orchestrator.adapter.implement_calls, orchestrator.config.retries.per_stage["implement"])
             self.assertEqual(orchestrator.adapter.review_calls, 0)
+
+    def test_review_rejection_is_included_in_final_error_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.retries.per_stage["implement"] = 1
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = PermanentReviewFailureAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains good"],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            with self.assertRaises(RuntimeError) as raised:
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            error_text = str(raised.exception)
+            self.assertIn("Task task-001 failed gates: review rejected the task", error_text)
+            self.assertIn("Review: Core issue: health endpoint is not actually exercised.", error_text)
 
 
 if __name__ == "__main__":
