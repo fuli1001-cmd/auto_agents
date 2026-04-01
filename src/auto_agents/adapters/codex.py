@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
-from pathlib import Path
-from typing import List
+import subprocess
+from typing import List, Optional
 
 from ..io_utils import read_text, write_text
-from ..models import AgentRequest, AgentResult, ProviderConfig
-from .base import AgentAdapter, run_subprocess_with_optional_streaming
+from ..models import AgentRequest, AgentResult, AgentUsage, ProviderConfig
+from .base import AgentAdapter
 
 
 class CodexAdapter(AgentAdapter):
@@ -21,6 +22,7 @@ class CodexAdapter(AgentAdapter):
         command: List[str] = [
             self.config.binary,
             "exec",
+            "--json",
             "--skip-git-repo-check",
             "--full-auto",
             self.config.cwd_flag,
@@ -38,25 +40,90 @@ class CodexAdapter(AgentAdapter):
         env = dict(os.environ)
         env["AUTO_AGENTS_STAGE"] = request.stage
         env["AUTO_AGENTS_EFFORT"] = request.effort
-        stdout, stderr, returncode, streamed_stdout, streamed_stderr = run_subprocess_with_optional_streaming(
+        process = subprocess.run(
             command,
-            request,
-            env,
+            input=request.prompt,
+            text=True,
+            capture_output=True,
+            cwd=str(request.cwd),
+            env=env,
         )
+        visible_stdout, usage = self._parse_json_stdout(process.stdout)
+        stderr = process.stderr.strip()
+
+        streamed_stdout = False
+        streamed_stderr = False
+        if request.stream_output is not None and visible_stdout:
+            request.stream_output("stdout", visible_stdout)
+            streamed_stdout = True
+        if request.stream_output is not None and stderr:
+            request.stream_output("stderr", stderr + "\n")
+            streamed_stderr = True
 
         summary = read_text(request.output_path).strip()
-        if not summary and stdout:
-            summary = stdout.strip()
+        if not summary and visible_stdout:
+            summary = visible_stdout.strip()
             write_text(request.output_path, summary + "\n")
 
         return AgentResult(
-            ok=returncode == 0,
+            ok=process.returncode == 0,
             command=command,
             output_path=request.output_path,
             summary=summary,
-            stdout=stdout,
-            stderr=stderr.strip(),
-            returncode=returncode,
+            model=self._model_label(request),
+            usage=usage,
+            stdout=visible_stdout,
+            stderr=stderr,
+            returncode=process.returncode,
             streamed_stdout=streamed_stdout,
             streamed_stderr=streamed_stderr,
         )
+
+    def _model_label(self, request: AgentRequest) -> str:
+        explicit_model = self._explicit_model_arg()
+        if explicit_model:
+            return explicit_model
+
+        profile = self.config.profile_map.get(request.effort)
+        if profile:
+            return f"profile:{profile}"
+        return "default"
+
+    def _explicit_model_arg(self) -> str:
+        extra_args = list(self.config.extra_args)
+        for index, value in enumerate(extra_args):
+            if value in {"--model", "-m"} and index + 1 < len(extra_args):
+                return extra_args[index + 1]
+        return ""
+
+    def _parse_json_stdout(self, stdout: str) -> tuple[str, Optional[AgentUsage]]:
+        visible_chunks: List[str] = []
+        usage: Optional[AgentUsage] = None
+
+        for raw_line in stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                visible_chunks.append(raw_line + "\n")
+                continue
+
+            event_type = str(event.get("type", ""))
+            if event_type == "item.completed":
+                item = event.get("item", {})
+                if isinstance(item, dict) and item.get("type") == "agent_message":
+                    text = item.get("text")
+                    if isinstance(text, str) and text:
+                        visible_chunks.append(text if text.endswith("\n") else text + "\n")
+            elif event_type == "turn.completed":
+                usage_payload = event.get("usage", {})
+                if isinstance(usage_payload, dict):
+                    usage = AgentUsage(
+                        input_tokens=int(usage_payload.get("input_tokens", 0) or 0),
+                        cached_input_tokens=int(usage_payload.get("cached_input_tokens", 0) or 0),
+                        output_tokens=int(usage_payload.get("output_tokens", 0) or 0),
+                    )
+
+        return "".join(visible_chunks), usage

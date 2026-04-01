@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,9 +11,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.cli import main
+from auto_agents.adapters.codex import CodexAdapter
 from auto_agents.config import config_path, load_project_config, load_run_state, save_run_state, task_plan_path
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentResult
+from auto_agents.models import AgentRequest, AgentResult, AgentUsage, ProviderConfig, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.validation import (
     validate_required_document,
@@ -555,6 +557,40 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("stage output", rendered)
             self.assertIn("stage warning", rendered)
 
+    def test_orchestrator_emits_agent_metrics_without_print_agent_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            class UsageAdapter:
+                def run(self, request):
+                    return AgentResult(
+                        ok=True,
+                        command=["fake"],
+                        output_path=request.output_path,
+                        summary="stage output",
+                        model="profile:h",
+                        usage=AgentUsage(input_tokens=120, cached_input_tokens=30, output_tokens=10),
+                        returncode=0,
+                    )
+
+            orchestrator.adapter = UsageAdapter()
+            state = load_run_state(project_root)
+            orchestrator._run_agent_with_retries(
+                state=state,
+                stage="clarify",
+                stage_key="clarify",
+                prompt="prompt",
+            )
+
+            rendered = stream.getvalue()
+            self.assertIn("[agent:clarify] completed", rendered)
+            self.assertIn("model=profile:h", rendered)
+            self.assertIn("tokens=input=120 cached_input=30 output=10 total=130", rendered)
+            self.assertNotIn("stage output", rendered)
+
     def test_orchestrator_streams_agent_output_chunks_when_adapter_supports_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -631,6 +667,149 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("[agent:clarify:stdout] progress line", rendered)
             self.assertIn("# Clarify", rendered)
             self.assertIn("final requirements", rendered)
+
+    def test_run_emits_top_level_stage_start_log_before_pause(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            class ClarifyOnlyAdapter:
+                def run(self, request):
+                    write_text(request.output_path, "clarified scope\n")
+                    return AgentResult(
+                        ok=True,
+                        command=["fake"],
+                        output_path=request.output_path,
+                        summary="clarified scope",
+                        returncode=0,
+                    )
+
+            orchestrator.adapter = ClarifyOnlyAdapter()
+            state = orchestrator.run(spec_file=spec_file)
+
+            self.assertEqual(state.status, "paused")
+            rendered = stream.getvalue()
+            self.assertIn("[stage:clarify] start model=mock", rendered)
+
+    def test_plan_stage_emits_task_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            class PlanAdapter:
+                def run(self, request):
+                    write_json(
+                        task_plan_path(project_root),
+                        {
+                            "test_strategy": "unittest",
+                            "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                            "tasks": [
+                                {
+                                    "task_id": "task-001",
+                                    "title": "Task one",
+                                    "description": "desc",
+                                    "acceptance": ["ok"],
+                                    "status": "pending",
+                                    "commit_message": "",
+                                }
+                            ],
+                        },
+                    )
+                    write_text(request.output_path, "valid plan\n")
+                    return AgentResult(
+                        ok=True,
+                        command=["fake"],
+                        output_path=request.output_path,
+                        summary="valid plan",
+                        returncode=0,
+                    )
+
+            orchestrator.adapter = PlanAdapter()
+            state = load_run_state(project_root)
+            orchestrator._run_agent_stage("plan", state, spec_file)
+
+            rendered = stream.getvalue()
+            self.assertIn("[stage:plan] tasks=1", rendered)
+
+    def test_execute_task_emits_implement_and_review_task_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            state = load_run_state(project_root)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build health endpoint",
+                description="desc",
+                acceptance=["ok"],
+            )
+
+            class PassingAdapter:
+                def run(self, request):
+                    if request.stage == "review":
+                        summary = "DECISION: pass\nlooks good\n"
+                    else:
+                        summary = "implemented\n"
+                    write_text(request.output_path, summary)
+                    return AgentResult(
+                        ok=True,
+                        command=["fake"],
+                        output_path=request.output_path,
+                        summary=summary.strip(),
+                        returncode=0,
+                    )
+
+            orchestrator.adapter = PassingAdapter()
+            orchestrator._execute_task_with_retries(state, task)
+
+            rendered = stream.getvalue()
+            self.assertIn("[task:task-001] implement attempt=1 title=Build health endpoint", rendered)
+            self.assertIn("[task:task-001] review attempt=1 title=Build health endpoint", rendered)
+
+    def test_codex_adapter_parses_usage_from_json_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            output_path = project_root / "agent.md"
+            write_text(output_path, "final summary\n")
+            adapter = CodexAdapter(ProviderConfig())
+            request = AgentRequest(
+                stage="clarify",
+                effort="deep",
+                prompt="prompt",
+                cwd=project_root,
+                output_path=output_path,
+            )
+
+            with patch("auto_agents.adapters.codex.subprocess.run") as run_mock:
+                run_mock.return_value = subprocess.CompletedProcess(
+                    args=["codex"],
+                    returncode=0,
+                    stdout=(
+                        '{"type":"thread.started","thread_id":"t"}\n'
+                        '{"type":"item.completed","item":{"type":"agent_message","text":"final summary"}}\n'
+                        '{"type":"turn.completed","usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":25}}\n'
+                    ),
+                    stderr="",
+                )
+                result = adapter.run(request)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.model, "profile:h")
+            self.assertIsNotNone(result.usage)
+            usage = result.usage
+            self.assertEqual(usage.input_tokens if usage else None, 200)
+            self.assertEqual(usage.cached_input_tokens if usage else None, 50)
+            self.assertEqual(usage.output_tokens if usage else None, 25)
+            self.assertEqual(usage.total_tokens if usage else None, 225)
 
     def test_run_can_persist_document_language_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

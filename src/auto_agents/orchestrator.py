@@ -31,6 +31,7 @@ from .models import (
     APPROVAL_BY_STAGE,
     AgentResult,
     AgentRequest,
+    AgentUsage,
     DOCUMENT_LANGUAGE_OPTIONS,
     ProjectConfig,
     RunState,
@@ -114,6 +115,7 @@ class Orchestrator:
                     return state
 
             for stage in self._pending_stages(state):
+                self._emit_stage_start(stage)
                 try:
                     if stage == "implement":
                         state = self._run_implementation_loop(state, max_tasks=max_tasks)
@@ -201,6 +203,7 @@ class Orchestrator:
         if stage == "plan":
             self._apply_generated_verification_config()
             state.tasks = self._load_tasks_from_plan()
+            self._emit_plan_task_count(state.tasks)
         return state
 
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
@@ -233,6 +236,7 @@ class Orchestrator:
                 task.status = "blocked"
                 task.review_summary = str(gate_result["review"])
                 self._persist_tasks(tasks)
+                self._emit_task_blocked(task, str(gate_result["reason"]))
                 raise RuntimeError(f"Task {task.task_id} failed gates: {gate_result['reason']}")
 
             task.status = "done"
@@ -841,6 +845,7 @@ class Orchestrator:
             if resume_existing and attempt == 1:
                 result = None
             else:
+                self._emit_task_activity(task, "implement", attempt)
                 implement_prompt = self._build_task_prompt(task, "implement")
                 if feedback:
                     implement_prompt = f"{implement_prompt}\n\nPrevious attempt issues:\n{feedback}\n"
@@ -879,6 +884,7 @@ class Orchestrator:
             review_fingerprint = worktree_fingerprint(self.project_root)
             gate_result = self._cached_review_result(state, task, review_fingerprint)
             if gate_result is None:
+                self._emit_task_activity(task, "review", attempt)
                 gate_result = self._run_task_review(state.run_id, task, verify_reason=str(verify_result["reason"]))
                 if gate_result["ok"]:
                     self._store_task_review_cache(
@@ -912,8 +918,11 @@ class Orchestrator:
     ) -> AgentResult:
         attempts = self._max_attempts(stage)
         active_run_id = run_id or (state.run_id if state is not None else load_run_state(self.project_root).run_id)
+        resolved_effort = effort or self.config.efforts.get(stage, "balanced")
         feedback = ""
         last_error = f"{stage_key} failed"
+        cumulative_usage: Optional[AgentUsage] = None
+        usage_available = False
 
         for attempt in range(1, attempts + 1):
             attempt_prompt = prompt
@@ -925,13 +934,16 @@ class Orchestrator:
             write_run_prompt(self.project_root, active_run_id, artifact_stage, attempt_prompt)
             request = AgentRequest(
                 stage=stage,
-                effort=effort or self.config.efforts.get(stage, "balanced"),
+                effort=resolved_effort,
                 prompt=attempt_prompt,
                 cwd=self.project_root,
                 output_path=output_path,
                 stream_output=self._stream_agent_output_callback(artifact_stage) if self._print_agent_output else None,
             )
             result = self.adapter.run(request)
+            if result.usage is not None:
+                cumulative_usage = (cumulative_usage or AgentUsage()).plus(result.usage)
+                usage_available = True
             self._emit_agent_output(artifact_stage, result)
             if state is not None:
                 state.agent_attempts[stage_key] = attempt
@@ -949,8 +961,31 @@ class Orchestrator:
                     feedback = issue
                     continue
 
+            self._emit_agent_metrics(
+                stage_key,
+                result,
+                attempts=attempt,
+                usage=(cumulative_usage if usage_available else None),
+                model=result.model or self._model_label_for_agent_stage(stage, resolved_effort),
+            )
             return result
 
+        self._emit_agent_metrics(
+            stage_key,
+            AgentResult(
+                ok=False,
+                command=[],
+                output_path=self._stage_output_path(active_run_id, stage_key),
+                summary="",
+                model=self._model_label_for_agent_stage(stage, resolved_effort),
+                usage=(cumulative_usage if usage_available else None),
+                stderr=last_error,
+                returncode=1,
+            ),
+            attempts=attempts,
+            usage=(cumulative_usage if usage_available else None),
+            model=self._model_label_for_agent_stage(stage, resolved_effort),
+        )
         raise RuntimeError(f"{stage_key} exhausted retries: {last_error}")
 
     def _emit_agent_output(self, stage_key: str, result: AgentResult) -> None:
@@ -966,6 +1001,52 @@ class Orchestrator:
         if result.stderr and not result.streamed_stderr:
             sections.append(f"[stderr]\n{result.stderr.strip()}")
         print("\n\n".join(sections), file=self.agent_output_stream, flush=True)
+
+    def _emit_stage_start(self, stage: str) -> None:
+        model = self._model_label_for_top_level_stage(stage)
+        print(f"[stage:{stage}] start model={model}", file=self.agent_output_stream, flush=True)
+
+    def _emit_plan_task_count(self, tasks: Iterable[TaskSpec]) -> None:
+        task_list = list(tasks)
+        print(f"[stage:plan] tasks={len(task_list)}", file=self.agent_output_stream, flush=True)
+
+    def _emit_agent_metrics(
+        self,
+        stage_key: str,
+        result: AgentResult,
+        attempts: int,
+        usage: Optional[AgentUsage],
+        model: str,
+    ) -> None:
+        usage_text = "unknown"
+        if usage is not None:
+            usage_text = (
+                f"input={usage.input_tokens} cached_input={usage.cached_input_tokens} "
+                f"output={usage.output_tokens} total={usage.total_tokens}"
+            )
+        print(
+            (
+                f"[agent:{stage_key}] completed ok={str(result.ok).lower()} "
+                f"returncode={result.returncode} attempts={attempts} model={model or 'unknown'} "
+                f"tokens={usage_text}"
+            ),
+            file=self.agent_output_stream,
+            flush=True,
+        )
+
+    def _emit_task_activity(self, task: TaskSpec, action: str, attempt: int) -> None:
+        print(
+            f"[task:{task.task_id}] {action} attempt={attempt} title={task.title}",
+            file=self.agent_output_stream,
+            flush=True,
+        )
+
+    def _emit_task_blocked(self, task: TaskSpec, reason: str) -> None:
+        print(
+            f"[task:{task.task_id}] blocked reason={reason}",
+            file=self.agent_output_stream,
+            flush=True,
+        )
 
     def _stream_agent_output_callback(self, stage_key: str) -> Callable[[str, str], None]:
         line_starts = {"stdout": True, "stderr": True}
@@ -983,6 +1064,41 @@ class Orchestrator:
             self.agent_output_stream.flush()
 
         return stream_output
+
+    def _model_label_for_top_level_stage(self, stage: str) -> str:
+        if stage == "verify":
+            return "n/a"
+        if stage == "implement":
+            implement_model = self._model_label_for_agent_stage("implement", self.config.efforts.get("implement", "balanced"))
+            review_effort = self.config.efforts.get("review", "balanced")
+            review_model = "task-dependent" if review_effort == "balanced" else self._model_label_for_agent_stage("review", review_effort)
+            return f"implement={implement_model} review={review_model}"
+        return self._model_label_for_agent_stage(stage, self.config.efforts.get(stage, "balanced"))
+
+    def _model_label_for_agent_stage(self, stage: str, effort: str) -> str:
+        provider_kind = self.config.provider.kind
+        if provider_kind == "mock":
+            return "mock"
+        if provider_kind != "codex":
+            return self.config.provider.binary
+
+        explicit_model = self._configured_explicit_model()
+        if explicit_model:
+            return explicit_model
+
+        profile = self.config.provider.profile_map.get(effort)
+        if profile:
+            return f"profile:{profile}"
+        if stage == "review":
+            return "default"
+        return "default"
+
+    def _configured_explicit_model(self) -> str:
+        extra_args = list(self.config.provider.extra_args)
+        for index, value in enumerate(extra_args):
+            if value in {"--model", "-m"} and index + 1 < len(extra_args):
+                return extra_args[index + 1]
+        return ""
 
     def _set_document_language(self, language: str) -> None:
         if language not in DOCUMENT_LANGUAGE_OPTIONS:
