@@ -51,6 +51,7 @@ class ProviderConfig:
         default_factory=lambda: {
             "balanced": "m",
             "deep": "h",
+            "max": "xh",
         }
     )
     extra_args: List[str] = field(default_factory=list)
@@ -179,9 +180,9 @@ class ProjectConfig:
         default_factory=lambda: {
             "clarify": "deep",
             "design": "deep",
-            "plan": "balanced",
-            "implement": "balanced",
-            "review": "balanced",
+            "plan": "deep",
+            "implement": "deep",
+            "review": "deep",
             "verify": "balanced",
         }
     )

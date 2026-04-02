@@ -193,10 +193,24 @@ The orchestrator uses its own effort labels:
 
 - `balanced`
 - `deep`
+- `max`
 
-Adapters map those labels to provider-specific controls. For Codex this can map to local config
-profiles such as `m` and `h`. If another provider does not support reasoning strength directly, the
-adapter can ignore the hint and still satisfy the interface.
+Adapters map those labels to provider-specific controls. For Codex this maps to local config
+profiles: `balanced` → `m` (medium), `deep` → `h` (high), `max` → `xh` (extra-high). If another
+provider does not support reasoning strength directly, the adapter can ignore the hint and still
+satisfy the interface.
+
+Each stage in the `efforts` config block can be set to any of these labels. The default
+configuration balances quality and token usage:
+
+| Stage | Default | Rationale |
+|-------|---------|-----------|
+| clarify | `deep` | Turning a rough idea into clear requirements needs careful reasoning |
+| design | `deep` | Architecture decisions need careful reasoning |
+| plan | `deep` | Task decomposition affects the whole run |
+| implement | `deep` | Stronger reasoning reduces review rejections |
+| review | `deep` | Thorough review catches more issues on first pass |
+| verify | `balanced` | Runs local commands, no LLM reasoning needed |
 
 ## Task plan contract
 

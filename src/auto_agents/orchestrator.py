@@ -844,6 +844,12 @@ class Orchestrator:
     ) -> Dict[str, object]:
         max_attempts = self._max_attempts("implement")
         feedback = ""
+        if task.review_summary.strip():
+            feedback = self._format_retry_feedback(
+                "review_rejected",
+                reason="review rejected the task",
+                review_summary=task.review_summary,
+            )
         last_reason = "task failed without a recorded reason"
         last_review = ""
 

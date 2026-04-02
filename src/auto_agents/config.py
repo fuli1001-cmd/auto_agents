@@ -97,6 +97,7 @@ DEFAULT_CONFIG = {
         "profile_map": {
             "balanced": "m",
             "deep": "h",
+            "max": "xh",
         },
         "extra_args": [],
         "cwd_flag": "-C",
@@ -109,9 +110,9 @@ DEFAULT_CONFIG = {
     "efforts": {
         "clarify": "deep",
         "design": "deep",
-        "plan": "balanced",
-        "implement": "balanced",
-        "review": "balanced",
+        "plan": "deep",
+        "implement": "deep",
+        "review": "deep",
         "verify": "balanced",
     },
     "gates": {
