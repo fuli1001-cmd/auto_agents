@@ -279,7 +279,7 @@ class Orchestrator:
             state.rejected_stage = ""
             state.rejection_reason = ""
             
-        print("Entering interactive clarify session. Type your response and press Enter (or leave empty to proceed/skip).", file=sys.stderr)
+        print("Entering interactive clarify session, please wait for the agent to analyze the spec...", file=sys.stderr, flush=True)
         
         max_rounds = 15
         rounds = 0
@@ -342,12 +342,14 @@ class Orchestrator:
             
             if user_reply.strip():
                 history.append({"role": "user", "content": user_reply})
-                write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
             else:
                 history.append({"role": "user", "content": "I have nothing to add. Please proceed to generate if you are ready."})
-                write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+            
+            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+            print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
                 
         # Generate the actual project brief
+        print("\nGenerating project_brief.md, please wait...", file=sys.stderr, flush=True)
         generate_prompt = self._build_prompt(stage="clarify", spec_file=spec_file)
         if history:
             generate_prompt += "\n\n--- Conversation History ---\n"
@@ -393,7 +395,7 @@ class Orchestrator:
             return default
         if sys.stdin.isatty():
             if multiline:
-                print(prompt + " (Press Ctrl+D or Ctrl+Z on an empty line to submit):", file=sys.stderr)
+                print(prompt + " (Press Ctrl+D or Ctrl+Z to submit):", file=sys.stderr)
                 try:
                     return sys.stdin.read()
                 except EOFError:
