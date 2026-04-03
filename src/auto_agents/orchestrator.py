@@ -293,6 +293,7 @@ class Orchestrator:
                 "Your goal is to extract the MVP scope, requirements, constraints, and non-goals.",
                 "Ask the user questions to clarify the requirements if needed.",
                 "If the spec is already well-defined, ask for confirmation.",
+                self._document_language_instruction(),
                 "When you have no more questions and are ready, output 'READY_TO_GENERATE' on a line by itself at the very end.",
                 "\n--- Conversation History ---",
             ]
@@ -328,7 +329,7 @@ class Orchestrator:
                 if user_conf.strip().lower() not in ("n", "no"):
                     break
                 else:
-                    user_reply = self._prompt_user("Please provide your thoughts: ")
+                    user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
                     if user_reply.strip():
                         history.append({"role": "user", "content": user_reply})
                         write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
@@ -337,7 +338,7 @@ class Orchestrator:
             print("\nAgent:", file=sys.stderr)
             print(reply, file=sys.stderr)
             
-            user_reply = self._prompt_user("\nYour reply: ")
+            user_reply = self._prompt_user("\nYour reply: ", multiline=True)
             
             if user_reply.strip():
                 history.append({"role": "user", "content": user_reply})
@@ -385,13 +386,20 @@ class Orchestrator:
             return "balanced"
         return "deep"
 
-    def _prompt_user(self, prompt: str, default: str = "") -> str:
+    def _prompt_user(self, prompt: str, default: str = "", multiline: bool = False) -> str:
         if self._user_input_fn:
             return self._user_input_fn(prompt)
         if "unittest" in sys.modules:
             return default
         if sys.stdin.isatty():
-            return input(prompt)
+            if multiline:
+                print(prompt + " (Press Ctrl+D or Ctrl+Z on an empty line to submit):", file=sys.stderr)
+                try:
+                    return sys.stdin.read()
+                except EOFError:
+                    return ""
+            else:
+                return input(prompt)
         return default
 
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
