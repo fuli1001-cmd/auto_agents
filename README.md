@@ -203,14 +203,25 @@ satisfy the interface.
 Each stage in the `efforts` config block can be set to any of these labels. The default
 configuration balances quality and token usage:
 
-| Stage | Default | Rationale |
-|-------|---------|-----------|
-| clarify | `deep` | Turning a rough idea into clear requirements needs careful reasoning |
-| design | `deep` | Architecture decisions need careful reasoning |
-| plan | `deep` | Task decomposition affects the whole run |
-| implement | `deep` | Stronger reasoning reduces review rejections |
-| review | `deep` | Thorough review catches more issues on first pass |
-| verify | `balanced` | Runs local commands, no LLM reasoning needed |
+| Stage | Default | Effective | Rationale |
+|-------|---------|-----------|-----------|
+| clarify | `deep` | dynamic | Downgraded to `balanced` when spec is already a design doc |
+| design | `deep` | dynamic | Downgraded to `balanced` when spec is already a design doc |
+| plan | `deep` | `deep` | Task decomposition affects the whole run |
+| implement | `deep` | `deep` | Stronger reasoning reduces review rejections |
+| review | `balanced` | auto-escalated | Automatically escalated to `deep` for risky diffs |
+| verify | `balanced` | `balanced` | Runs local commands, no LLM reasoning needed |
+
+Review auto-escalation triggers (when configured as `balanced`):
+
+- Prior review failure on the same task → `deep`
+- Code changes without corresponding test changes → `deep`
+- More than 3 non-test files changed → `deep`
+- High-risk files changed (pyproject.toml, Dockerfile, CI configs) → `deep`
+- Large diffs (>240 lines of non-test code) → `deep`
+- Only test files changed in a small diff → stays `balanced`
+
+Setting review to `deep` or `max` overrides auto-escalation and uses that effort for every review.
 
 ## Task plan contract
 

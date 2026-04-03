@@ -112,7 +112,7 @@ DEFAULT_CONFIG = {
         "design": "deep",
         "plan": "deep",
         "implement": "deep",
-        "review": "deep",
+        "review": "balanced",
         "verify": "balanced",
     },
     "gates": {

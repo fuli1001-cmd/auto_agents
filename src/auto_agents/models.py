@@ -182,7 +182,7 @@ class ProjectConfig:
             "design": "deep",
             "plan": "deep",
             "implement": "deep",
-            "review": "deep",
+            "review": "balanced",
             "verify": "balanced",
         }
     )

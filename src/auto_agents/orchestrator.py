@@ -190,12 +190,17 @@ class Orchestrator:
             "plan": self._plan_validation_feedback,
         }
         validator = validator_map.get(stage)
+        effort = None
+        if stage in ("clarify", "design"):
+            analysis = self._analyze_spec(spec_file)
+            effort = self._effort_for_spec_stage(stage, str(analysis["kind"]))
         result = self._run_agent_with_retries(
             state=state,
             stage=stage,
             stage_key=stage,
             prompt=prompt,
             validation_feedback=validator,
+            effort=effort,
         )
         state.current_stage = stage
         state.stage_summaries[stage] = result.summary.strip()
@@ -205,6 +210,21 @@ class Orchestrator:
             state.tasks = self._load_tasks_from_plan()
             self._emit_plan_task_count(state.tasks)
         return state
+
+    def _effort_for_spec_stage(self, stage: str, spec_kind: str) -> str:
+        """Choose effort for clarify/design based on spec type.
+
+        When the input spec is already a detailed design document, clarify and
+        design are mostly extraction/normalization work and can use the cheaper
+        balanced effort.  When the spec is a rough idea, deeper reasoning is
+        needed to synthesize requirements and architecture from scratch.
+        """
+        configured = self.config.efforts.get(stage, "deep")
+        if configured not in ("deep", "balanced"):
+            return configured
+        if spec_kind == "design":
+            return "balanced"
+        return "deep"
 
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
         tasks = state.tasks or self._load_tasks_from_plan()
