@@ -1076,7 +1076,12 @@ class Orchestrator:
                 self._emit_task_activity(task, "implement", attempt)
                 implement_prompt = self._build_task_prompt(task, "implement")
                 if feedback:
-                    implement_prompt = f"{implement_prompt}\n\nPrevious attempt issues:\n{feedback}\n"
+                    implement_prompt = (
+                        f"{implement_prompt}\n\nPrevious attempt issues:\n{feedback}\n\n"
+                        "CRITICAL: Before writing or modifying any code, you MUST first output a step-by-step "
+                        "'Fix Plan' in Markdown detailing how you will address all the issues above. "
+                        "Then, proceed to implement the plan."
+                    )
                 result = self._run_agent_with_retries(
                     state=state,
                     stage="implement",
@@ -1131,6 +1136,12 @@ class Orchestrator:
 
             last_reason = str(gate_result["reason"])
             last_review = str(gate_result["review"])
+            
+            # Synchronize the task's review_summary so that the next iteration's 
+            # built-in Task JSON context exactly matches the newly generated rejection context,
+            # avoiding the "Split Brain" issue.
+            task.review_summary = last_review
+            
             feedback = self._format_retry_feedback(
                 "review_rejected",
                 reason=last_reason,
