@@ -244,6 +244,8 @@ class RunState:
     agent_attempts: Dict[str, int] = field(default_factory=dict)
     task_review_cache: Dict[str, Dict[str, str]] = field(default_factory=dict)
     last_error: str = ""
+    rejection_reason: str = ""
+    rejected_stage: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -265,6 +267,8 @@ class RunState:
                 for key, value in dict(data.get("task_review_cache", {})).items()
             },
             last_error=str(data.get("last_error", "")),
+            rejection_reason=str(data.get("rejection_reason", "")),
+            rejected_stage=str(data.get("rejected_stage", "")),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -282,6 +286,8 @@ class RunState:
                 for key, value in self.task_review_cache.items()
             },
             "last_error": self.last_error,
+            "rejection_reason": self.rejection_reason,
+            "rejected_stage": self.rejected_stage,
         }
 
 

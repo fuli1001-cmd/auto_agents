@@ -80,6 +80,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Gate name to approve. Defaults to the current pending gate inferred from run state.",
     )
 
+    reject_parser = subparsers.add_parser("reject", help="Reject a pending manual gate and provide feedback.")
+    reject_parser.add_argument("--project", required=True, help="Target project directory.")
+    reject_parser.add_argument(
+        "--gate",
+        help="Gate name to reject. Defaults to the current pending gate inferred from run state.",
+    )
+    reject_parser.add_argument(
+        "--reason",
+        default="",
+        help="Reason for rejection. This feedback will be provided to the agent on the next run.",
+    )
+
     status_parser = subparsers.add_parser("status", help="Show the current orchestrator state.")
     status_parser.add_argument("--project", required=True, help="Target project directory.")
 
@@ -102,6 +114,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "approve":
         orchestrator = Orchestrator(Path(args.project))
         state = orchestrator.approve(args.gate)
+        print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "reject":
+        orchestrator = Orchestrator(Path(args.project))
+        state = orchestrator.reject(args.gate, args.reason)
         print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
         return 0
 

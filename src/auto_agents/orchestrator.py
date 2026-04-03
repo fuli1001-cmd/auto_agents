@@ -43,13 +43,19 @@ from .validation import validate_required_document
 
 
 class Orchestrator:
-    def __init__(self, project_root: Path, agent_output_stream: Optional[TextIO] = None) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        agent_output_stream: Optional[TextIO] = None,
+        user_input_fn: Optional[Callable[[str], str]] = None,
+    ) -> None:
         self.project_root = project_root.resolve()
         self.config = load_project_config(self.project_root)
         self.adapter = self._build_adapter(self.config)
         self.agent_output_stream = agent_output_stream or sys.stderr
         self._print_agent_output = False
         self._active_spec_file: Optional[Path] = None
+        self._user_input_fn = user_input_fn
 
     @staticmethod
     def init_project(project_root: Path, name: str, provider_kind: str, doc_language: str = "en") -> Path:
@@ -79,6 +85,36 @@ class Orchestrator:
             state.status = "pending"
         elif not state.pending_approval and inferred_gate == active_gate and state.status == "paused":
             state.status = "pending"
+        save_run_state(self.project_root, state)
+        return state
+
+    def reject(self, gate: Optional[str] = None, reason: str = "") -> RunState:
+        state = load_run_state(self.project_root)
+        inferred_gate = ""
+        if not gate:
+            if state.pending_approval:
+                inferred_gate = state.pending_approval
+            elif state.status == "paused":
+                candidate = APPROVAL_BY_STAGE.get(state.current_stage, "")
+                if candidate in self.config.approvals.enabled:
+                    inferred_gate = candidate
+        active_gate = gate or inferred_gate
+        if not active_gate:
+            raise RuntimeError("No pending gate to reject. Pass --gate explicitly.")
+
+        stage_by_approval = {v: k for k, v in APPROVAL_BY_STAGE.items()}
+        target_stage = stage_by_approval.get(active_gate)
+        if not target_stage:
+            raise RuntimeError(f"Cannot determine stage for gate: {active_gate}")
+
+        if target_stage in state.stage_summaries:
+            del state.stage_summaries[target_stage]
+        if active_gate in state.approved_gates:
+            state.approved_gates.remove(active_gate)
+        state.pending_approval = ""
+        state.status = "pending"
+        state.rejection_reason = reason
+        state.rejected_stage = target_stage
         save_run_state(self.project_root, state)
         return state
 
@@ -124,7 +160,7 @@ class Orchestrator:
                     elif stage == "readme":
                         state = self._run_readme(state, spec_file)
                     else:
-                        state = self._run_agent_stage(stage, state, spec_file)
+                        state = self._run_agent_stage(stage, state, spec_file, auto_approve=auto_approve)
                 except RuntimeError as error:
                     state.status = "failed"
                     state.last_error = str(error)
@@ -182,16 +218,28 @@ class Orchestrator:
             return MockAdapter()
         return ShellAdapter(config.provider)
 
-    def _run_agent_stage(self, stage: str, state: RunState, spec_file: Path) -> RunState:
+    def _run_agent_stage(self, stage: str, state: RunState, spec_file: Path, auto_approve: bool = False) -> RunState:
+        if stage == "clarify":
+            if auto_approve:
+                # If auto_approve is on, skip conversation and just do a single-shot generation
+                pass
+            else:
+                return self._run_interactive_clarify(state, spec_file)
+
         prompt = self._build_prompt(stage=stage, spec_file=spec_file)
+
+        if state.rejected_stage == stage and state.rejection_reason:
+            prompt += f"\n\nThe previous output was rejected. Please address this feedback:\n{state.rejection_reason}\n"
+            state.rejected_stage = ""
+            state.rejection_reason = ""
+
         validator_map = {
-            "clarify": self._clarify_validation_feedback,
             "design": self._design_validation_feedback,
             "plan": self._plan_validation_feedback,
         }
         validator = validator_map.get(stage)
         effort = None
-        if stage in ("clarify", "design"):
+        if stage == "design":
             analysis = self._analyze_spec(spec_file)
             effort = self._effort_for_spec_stage(stage, str(analysis["kind"]))
         result = self._run_agent_with_retries(
@@ -211,6 +259,117 @@ class Orchestrator:
             self._emit_plan_task_count(state.tasks)
         return state
 
+    def _run_interactive_clarify(self, state: RunState, spec_file: Path) -> RunState:
+        from .config import conversation_history_path
+        import json
+        
+        history_path = conversation_history_path(self.project_root, state.run_id)
+        history = []
+        if history_path.exists():
+            try:
+                history = json.loads(read_text(history_path))
+            except Exception:
+                pass
+                
+        if state.rejected_stage == "clarify" and state.rejection_reason:
+            history.append({
+                "role": "user",
+                "content": f"The previous output was rejected. Please address this feedback:\n{state.rejection_reason}"
+            })
+            state.rejected_stage = ""
+            state.rejection_reason = ""
+            
+        print("Entering interactive clarify session. Type your response and press Enter (or leave empty to proceed/skip).", file=sys.stderr)
+        
+        max_rounds = 15
+        rounds = 0
+        
+        while rounds < max_rounds:
+            rounds += 1
+            prompt_lines = [
+                f"Project root: {self.project_root}",
+                "Read the input spec from: " + str(spec_file),
+                "You are an expert product manager analyzing the spec.",
+                "Your goal is to extract the MVP scope, requirements, constraints, and non-goals.",
+                "Ask the user questions to clarify the requirements if needed.",
+                "If the spec is already well-defined, ask for confirmation.",
+                "When you have no more questions and are ready, output 'READY_TO_GENERATE' on a line by itself at the very end.",
+                "\n--- Conversation History ---",
+            ]
+            
+            for msg in history:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                prompt_lines.append(f"\n[{role.upper()}]:\n{content}")
+                
+            prompt = "\n".join(prompt_lines)
+            
+            effort = self._effort_for_spec_stage("clarify", str(self._analyze_spec(spec_file)["kind"]))
+            
+            result = self._run_agent_with_retries(
+                state=state,
+                stage="clarify",
+                stage_key=f"clarify-conv-{len(history)}",
+                prompt=prompt,
+                effort=effort,
+            )
+            
+            reply = result.summary.strip()
+            if not reply:
+                reply = result.stdout.strip()
+                
+            history.append({"role": "agent", "content": reply})
+            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+            
+            if "READY_TO_GENERATE" in reply:
+                print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
+                user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
+                
+                if user_conf.strip().lower() not in ("n", "no"):
+                    break
+                else:
+                    user_reply = self._prompt_user("Please provide your thoughts: ")
+                    if user_reply.strip():
+                        history.append({"role": "user", "content": user_reply})
+                        write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+                    continue
+
+            print("\nAgent:", file=sys.stderr)
+            print(reply, file=sys.stderr)
+            
+            user_reply = self._prompt_user("\nYour reply: ")
+            
+            if user_reply.strip():
+                history.append({"role": "user", "content": user_reply})
+                write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+            else:
+                history.append({"role": "user", "content": "I have nothing to add. Please proceed to generate if you are ready."})
+                write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+                
+        # Generate the actual project brief
+        generate_prompt = self._build_prompt(stage="clarify", spec_file=spec_file)
+        if history:
+            generate_prompt += "\n\n--- Conversation History ---\n"
+            for msg in history:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                generate_prompt += f"\n[{role.upper()}]:\n{content}"
+            generate_prompt += "\n\nBased on the spec and conversation above, output the required project brief."
+        
+        effort = self._effort_for_spec_stage("clarify", str(self._analyze_spec(spec_file)["kind"]))
+        result = self._run_agent_with_retries(
+            state=state,
+            stage="clarify",
+            stage_key="clarify-generate",
+            prompt=generate_prompt,
+            validation_feedback=self._clarify_validation_feedback,
+            effort=effort,
+        )
+        state.current_stage = "clarify"
+        state.stage_summaries["clarify"] = result.summary.strip()
+        state.last_error = ""
+        return state
+
     def _effort_for_spec_stage(self, stage: str, spec_kind: str) -> str:
         """Choose effort for clarify/design based on spec type.
 
@@ -226,8 +385,34 @@ class Orchestrator:
             return "balanced"
         return "deep"
 
+    def _prompt_user(self, prompt: str, default: str = "") -> str:
+        if self._user_input_fn:
+            return self._user_input_fn(prompt)
+        if "unittest" in sys.modules:
+            return default
+        if sys.stdin.isatty():
+            return input(prompt)
+        return default
+
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
         tasks = state.tasks or self._load_tasks_from_plan()
+        
+        if state.rejected_stage == "implement" and state.rejection_reason:
+            import time
+            tasks.append(
+                TaskSpec(
+                    task_id=f"fix-rejection-{int(time.time()*1000)}",
+                    title="Fix issues after release rejection",
+                    description=f"The release was rejected with the following feedback:\n{state.rejection_reason}\n\nPlease fix these issues.",
+                    acceptance_criteria=[
+                        "Feedback is fully addressed",
+                        "Tests pass"
+                    ]
+                )
+            )
+            state.rejected_stage = ""
+            state.rejection_reason = ""
+            
         state.tasks = tasks
         self._commit_planning_baseline_if_needed(tasks)
 

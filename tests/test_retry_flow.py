@@ -840,5 +840,47 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("[task:task-001] blocked reason=review rejected the task", rendered)
 
 
+    def test_reject_resets_stage_and_injects_feedback(self):
+        with tempfile.TemporaryDirectory() as td:
+            project_root = Path(td)
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Idea\nWe need a mock project.", encoding="utf-8")
+            
+            state = orchestrator.run(spec_file=spec_file)
+            self.assertEqual(state.status, "paused")
+            self.assertEqual(state.pending_approval, "requirements")
+            
+            state = orchestrator.reject("requirements", "Please add a database.")
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.pending_approval, "")
+            self.assertEqual(state.rejection_reason, "Please add a database.")
+            self.assertEqual(state.rejected_stage, "clarify")
+            
+            from unittest.mock import patch
+            with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+                from auto_agents.models import AgentResult
+                mock_run.return_value = AgentResult(
+                    ok=True,
+                    command=[],
+                    output_path=Path("."),
+                    summary="READY_TO_GENERATE",
+                    stdout=""
+                )
+                state = orchestrator.run(spec_file=spec_file)
+                
+                found = False
+                for call in mock_run.call_args_list:
+                    if "clarify" in call.kwargs.get("stage", ""):
+                        prompt = call.kwargs.get("prompt", "")
+                        if "Please add a database." in prompt:
+                            found = True
+                
+                self.assertTrue(found, "Rejection reason should be injected into clarify prompt")
+
+
 if __name__ == "__main__":
     unittest.main()
+

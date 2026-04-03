@@ -11,7 +11,9 @@ class MockAdapter(AgentAdapter):
 
     def run(self, request: AgentRequest) -> AgentResult:
         content = f"MOCK stage={request.stage} effort={request.effort}\n"
-        if request.stage == "review":
+        if request.stage == "clarify":
+            content += "READY_TO_GENERATE\n"
+        elif request.stage == "review":
             content = "DECISION: pass\nMock review passed.\n"
         elif request.stage == "readme":
             use_chinese = "Simplified Chinese" in request.prompt

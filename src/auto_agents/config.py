@@ -86,6 +86,8 @@ RUN_STATE_TEMPLATE = {
     "agent_attempts": {},
     "task_review_cache": {},
     "last_error": "",
+    "rejection_reason": "",
+    "rejected_stage": "",
 }
 
 
@@ -269,3 +271,7 @@ def write_run_prompt(project_root: Path, run_id: str, stage: str, prompt: str) -
 def load_stage_output(project_root: Path, run_id: str, stage: str) -> str:
     _, output_path = run_artifact_paths(project_root, run_id, stage)
     return read_text(output_path)
+
+
+def conversation_history_path(project_root: Path, run_id: str) -> Path:
+    return run_path(project_root, run_id) / "clarify_conversation.json"

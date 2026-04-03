@@ -29,7 +29,7 @@ The system optimizes for quality over throughput:
 
 ## Core workflow
 
-1. `clarify`: turn an idea into a compact project brief
+1. `clarify`: interactively refine an idea into a project brief, or extract it automatically if the spec is a detailed design
 2. `design`: create a top-level architecture document
 3. `plan`: generate a JSON task plan with small verifiable feature slices plus a verification strategy
 4. `implement`: execute one feature slice at a time
@@ -159,11 +159,18 @@ Approve a paused gate:
 python3 -m auto_agents approve --project /tmp/demo --gate requirements
 ```
 
-If the run is currently paused on a manual gate, `approve` can infer the gate from the persisted run
+Reject a paused gate and provide explicit unstructured feedback for the agent:
+
+```bash
+python3 -m auto_agents reject --project /tmp/demo --gate requirements --reason "Add a PostgreSQL database."
+```
+
+If the run is currently paused on a manual gate, `approve` and `reject` can infer the gate from the persisted run
 state, so this is usually enough:
 
 ```bash
 python3 -m auto_agents approve --project /tmp/demo
+python3 -m auto_agents reject --project /tmp/demo --reason "Add a PostgreSQL database."
 ```
 
 Run tests for this repository:
