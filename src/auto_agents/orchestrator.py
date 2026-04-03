@@ -1091,6 +1091,7 @@ class Orchestrator:
                     )
                     continue
 
+            self._emit_task_activity(task, "verify", attempt)
             quick_failure = self._quick_verify_failure()
             if quick_failure:
                 last_reason = quick_failure
@@ -1098,6 +1099,7 @@ class Orchestrator:
                     "pre_verify_check",
                     reason=last_reason,
                 )
+                self._emit_task_verify_result(task, "fail", last_reason)
                 continue
 
             verify_result = self._run_task_verify()
@@ -1107,7 +1109,10 @@ class Orchestrator:
                     "local_verification",
                     reason=last_reason,
                 )
+                self._emit_task_verify_result(task, "fail", last_reason)
                 continue
+
+            self._emit_task_verify_result(task, "pass", str(verify_result["reason"]))
 
             review_fingerprint = worktree_fingerprint(self.project_root)
             gate_result = self._cached_review_result(state, task, review_fingerprint)
@@ -1278,6 +1283,16 @@ class Orchestrator:
 
     def _emit_task_review_result(self, task: TaskSpec, decision: str, summary: str) -> None:
         sections = [f"[task:{task.task_id}] review decision={decision}"]
+        if summary.strip():
+            sections.append(summary.strip())
+        print(
+            "\n".join(sections),
+            file=self.agent_output_stream,
+            flush=True,
+        )
+
+    def _emit_task_verify_result(self, task: TaskSpec, decision: str, summary: str) -> None:
+        sections = [f"[task:{task.task_id}] verify decision={decision}"]
         if summary.strip():
             sections.append(summary.strip())
         print(
