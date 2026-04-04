@@ -291,6 +291,7 @@ class Orchestrator:
             except Exception:
                 pass
                 
+        post_rejection = False
         if state.rejected_stage == "clarify" and state.rejection_reason:
             history.append({
                 "role": "user",
@@ -298,6 +299,7 @@ class Orchestrator:
             })
             state.rejected_stage = ""
             state.rejection_reason = ""
+            post_rejection = True
 
         def _history_role(msg: object) -> str:
             if not isinstance(msg, dict):
@@ -383,7 +385,7 @@ class Orchestrator:
             history.append({"role": "agent", "content": reply})
             write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
 
-            if "READY_TO_GENERATE" in reply:
+            if "READY_TO_GENERATE" in reply and not post_rejection:
                 print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
                 user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
 
@@ -396,8 +398,14 @@ class Orchestrator:
                         write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
                     continue
 
+            # After rejection, show the agent's response (stripping the
+            # READY_TO_GENERATE marker) and force user interaction so the
+            # user can review how the agent addressed the feedback.
+            display_reply = reply.replace("READY_TO_GENERATE", "").strip() if post_rejection else reply
+            post_rejection = False
+
             print("\nAgent:", file=sys.stderr)
-            print(reply, file=sys.stderr)
+            print(display_reply, file=sys.stderr)
             
             user_reply = self._prompt_user("\nYour reply: ", multiline=True)
             
