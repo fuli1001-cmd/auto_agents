@@ -297,19 +297,29 @@ class Orchestrator:
             state.rejected_stage = ""
             state.rejection_reason = ""
 
-        # Resume interrupted conversation: if the last message is from the agent
-        # (e.g. process crashed before user reply was saved), strip trailing
-        # agent messages (which include spurious READY_TO_GENERATE from broken
-        # reruns) and replay the last substantive agent message to the user.
-        if history and history[-1].get("role") == "agent":
+        def _history_role(msg: object) -> str:
+            if not isinstance(msg, dict):
+                return ""
+            role = str(msg.get("role", "")).strip().lower()
+            if role == "assistant":
+                return "agent"
+            return role
+
+        # Resume interrupted conversation: if trailing history entries are from
+        # the agent (e.g. process crashed before user reply was saved), strip
+        # those tails (including spurious READY_TO_GENERATE reruns), replay the
+        # last substantive agent message, and collect a fresh user reply.
+        if history and _history_role(history[-1]) == "agent":
             trailing = []
-            while history and history[-1].get("role") == "agent":
+            while history and _history_role(history[-1]) == "agent":
                 trailing.insert(0, history.pop())
-            # Find the first substantive agent message to replay
             replay_msg = None
             for msg in trailing:
-                if "READY_TO_GENERATE" not in msg.get("content", ""):
-                    replay_msg = msg
+                if not isinstance(msg, dict):
+                    continue
+                content = str(msg.get("content", ""))
+                if "READY_TO_GENERATE" not in content:
+                    replay_msg = {"role": "agent", "content": content}
                     break
             if replay_msg:
                 history.append(replay_msg)
@@ -321,7 +331,6 @@ class Orchestrator:
                     history.append({"role": "user", "content": user_reply})
                 else:
                     history.append({"role": "user", "content": "I have nothing to add. Please proceed to generate if you are ready."})
-            # Save cleaned-up history regardless
             write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
 
         print("Entering interactive clarify session, please wait for the agent to analyze the spec...", file=sys.stderr, flush=True)
