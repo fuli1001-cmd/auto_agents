@@ -117,6 +117,11 @@ class Orchestrator:
         state.status = "pending"
         state.rejection_reason = reason
         state.rejected_stage = target_stage
+        if target_stage == "clarify":
+            from .config import conversation_history_path
+            hist_path = conversation_history_path(self.project_root, state.run_id)
+            if hist_path.exists():
+                hist_path.unlink()
         save_run_state(self.project_root, state)
         return state
 
@@ -290,7 +295,21 @@ class Orchestrator:
                 history = json.loads(read_text(history_path))
             except Exception:
                 pass
-                
+
+        # If a previous clarify run already reached READY_TO_GENERATE but
+        # we are re-entering clarify (stage_summaries has no "clarify"),
+        # the old conversation is stale.  Clear it so the agent starts a
+        # fresh conversation for the new scope.
+        if history and any(
+            isinstance(msg, dict)
+            and str(msg.get("role", "")).lower() in ("agent", "assistant")
+            and "READY_TO_GENERATE" in str(msg.get("content", ""))
+            for msg in history
+        ):
+            print("[clarify] Previous conversation completed; starting fresh.", file=sys.stderr)
+            history = []
+            write_text(history_path, "[]")
+
         post_rejection = False
         if state.rejected_stage == "clarify" and state.rejection_reason:
             history.append({
