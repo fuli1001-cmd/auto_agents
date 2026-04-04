@@ -936,8 +936,8 @@ class Orchestrator:
                 lines.extend([
                     f"This is an ITERATION run. The project already has completed work and an existing brief at {brief}.",
                     "IMPORTANT: Do NOT discard or rewrite the existing content of the brief.",
-                    "APPEND a new section for the iteration scope below the existing content.",
-                    "Preserve all previously documented scope, requirements, and constraints.",
+                    "ADD or UPDATE sections relevant to the new iteration scope while preserving existing content.",
+                    "Extend existing sections in place rather than appending a separate duplicate block at the end.",
                     f"Review the existing task plan at {task_plan_path(self.project_root)} to understand what has already been completed.",
                 ])
             lines.append("Final response: 3 short bullets summarizing the clarified scope.")
@@ -983,6 +983,7 @@ class Orchestrator:
                 self._plan_spec_instruction(spec_kind),
                 self._plan_language_instruction(),
                 "Review .auto-agents/state/task_plan.json if it exists. DO NOT overwrite or delete existing completed tasks. APPEND new tasks to the end of the JSON array for the new features.",
+                "When existing completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create tasks for capabilities already delivered by completed tasks.",
                 "Each task must contain task_id, title, description, acceptance, status, commit_message.",
                 "A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined.",
                 "Final response: 3 short bullets summarizing the plan.",
