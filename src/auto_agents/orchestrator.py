@@ -1750,7 +1750,10 @@ class Orchestrator:
         changes = changed_files(self.project_root)
         if not changes:
             return
-        if any(task.status != "pending" for task in tasks):
+        # Skip if any task is already in progress (mid-execution resume).
+        # Done tasks from previous iterations are fine — we still want to
+        # commit the planning baseline for the new pending tasks.
+        if any(task.status not in ("pending", "done") for task in tasks):
             return
 
         allowed = {".gitignore", "README.md", "spec.md"}
