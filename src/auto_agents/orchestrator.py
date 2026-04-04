@@ -245,7 +245,8 @@ class Orchestrator:
             else:
                 return self._run_interactive_clarify(state, spec_file)
 
-        prompt = self._build_prompt(stage=stage, spec_file=spec_file)
+        is_iteration = any(t.status == "done" for t in state.tasks)
+        prompt = self._build_prompt(stage=stage, spec_file=spec_file, is_iteration=is_iteration)
 
         if state.rejected_stage == stage and state.rejection_reason:
             prompt += f"\n\nThe previous output was rejected. Please address this feedback:\n{state.rejection_reason}\n"
@@ -410,7 +411,8 @@ class Orchestrator:
                 
         # Generate the actual project brief
         print("\nGenerating project_brief.md, please wait...", file=sys.stderr, flush=True)
-        generate_prompt = self._build_prompt(stage="clarify", spec_file=spec_file)
+        is_iteration = any(t.status == "done" for t in state.tasks)
+        generate_prompt = self._build_prompt(stage="clarify", spec_file=spec_file, is_iteration=is_iteration)
         if history:
             generate_prompt += "\n\n--- Conversation History ---\n"
             for msg in history:
@@ -877,7 +879,7 @@ class Orchestrator:
         _, output_path = run_artifact_paths(self.project_root, run_id, stage)
         return output_path
 
-    def _build_prompt(self, stage: str, spec_file: Path) -> str:
+    def _build_prompt(self, stage: str, spec_file: Path, is_iteration: bool = False) -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
         plan = task_plan_path(self.project_root)
@@ -902,8 +904,16 @@ class Orchestrator:
                 "Preserve the exact top-level and section headings already present in the file.",
                 self._clarify_spec_instruction(spec_kind),
                 self._document_language_instruction(),
-                "Final response: 3 short bullets summarizing the clarified scope.",
             ]
+            if is_iteration:
+                lines.extend([
+                    f"This is an ITERATION run. The project already has completed work and an existing brief at {brief}.",
+                    "IMPORTANT: Do NOT discard or rewrite the existing content of the brief.",
+                    "APPEND a new section for the iteration scope below the existing content.",
+                    "Preserve all previously documented scope, requirements, and constraints.",
+                    f"Review the existing task plan at {task_plan_path(self.project_root)} to understand what has already been completed.",
+                ])
+            lines.append("Final response: 3 short bullets summarizing the clarified scope.")
             return "\n".join(lines)
 
         if stage == "design":
@@ -915,8 +925,15 @@ class Orchestrator:
                 "Preserve the exact top-level and section headings already present in the file.",
                 self._design_spec_instruction(spec_kind),
                 self._document_language_instruction(),
-                "Final response: 3 short bullets summarizing the design.",
             ]
+            if is_iteration:
+                lines.extend([
+                    f"This is an ITERATION run. The project already has completed work and an existing architecture at {architecture}.",
+                    "IMPORTANT: Do NOT discard or rewrite the existing architecture decisions.",
+                    "ADD or UPDATE sections relevant to the new iteration scope while preserving existing content.",
+                    f"Review the existing task plan at {task_plan_path(self.project_root)} to understand what has already been completed.",
+                ])
+            lines.append("Final response: 3 short bullets summarizing the design.")
             return "\n".join(lines)
 
         if stage == "plan":
