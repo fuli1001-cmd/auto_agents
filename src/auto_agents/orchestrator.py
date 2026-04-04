@@ -137,7 +137,16 @@ class Orchestrator:
             self._ensure_preconditions(state, spec_file=spec_file, skip_validate=skip_validate)
 
             if state.status == "completed":
-                return state
+                print("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]", file=sys.stderr)
+                user_conf = self._prompt_user("").strip().lower()
+                if user_conf in ("y", "yes"):
+                    state.status = "pending"
+                    state.current_stage = "clarify"
+                    for s in ["clarify", "design", "plan", "verify", "readme"]:
+                        state.stage_summaries.pop(s, None)
+                    save_run_state(self.project_root, state)
+                else:
+                    return state
 
             if state.pending_approval:
                 if auto_approve:
@@ -289,8 +298,9 @@ class Orchestrator:
             prompt_lines = [
                 f"Project root: {self.project_root}",
                 "Read the input spec from: " + str(spec_file),
+                "If the project repository already contains an active codebase and a history of completed tasks, please review them to understand the current progress before discussing the next features.",
                 "You are an expert product manager analyzing the spec.",
-                "Your goal is to extract the MVP scope, requirements, constraints, and non-goals.",
+                "Your goal is to extract the target scope, requirements, constraints, and non-goals.",
                 "Ask the user questions to clarify the requirements if needed.",
                 "If the spec is already well-defined, ask for confirmation.",
                 self._document_language_instruction(),
@@ -796,7 +806,7 @@ class Orchestrator:
             lines = common + [
                 f"Read the input spec from: {spec_file}",
                 f"Update this file in place: {brief}",
-                "Keep the brief compact and scoped to the MVP.",
+                "Keep the brief compact and focused on the target scope.",
                 "Preserve the exact top-level and section headings already present in the file.",
                 self._clarify_spec_instruction(spec_kind),
                 self._document_language_instruction(),
@@ -836,8 +846,9 @@ class Orchestrator:
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
                 self._plan_spec_instruction(spec_kind),
                 self._plan_language_instruction(),
+                "Review .auto-agents/state/task_plan.json if it exists. DO NOT overwrite or delete existing completed tasks. APPEND new tasks to the end of the JSON array for the new features.",
                 "Each task must contain task_id, title, description, acceptance, status, commit_message.",
-                "A good plan may contain only a few tasks for a small MVP or many tasks for a broad MVP, as long as the slicing remains disciplined.",
+                "A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined.",
                 "Final response: 3 short bullets summarizing the plan.",
             ]
             return "\n".join(lines)
@@ -971,7 +982,7 @@ class Orchestrator:
     def _clarify_spec_instruction(spec_kind: str) -> str:
         if spec_kind == "design":
             return (
-                "This spec is architecture-heavy. Extract only product intent, MVP scope, non-goals, and "
+                "This spec is architecture-heavy. Extract only product intent, target scope, non-goals, and "
                 "constraints into the brief. Do not duplicate full architecture details here."
             )
         if spec_kind == "mixed":
@@ -979,7 +990,7 @@ class Orchestrator:
                 "This spec mixes product intent and design detail. Preserve the core requirements in the brief "
                 "and leave implementation structure for the architecture document."
             )
-        return "Treat the spec as early product intent and turn it into a crisp MVP brief."
+        return "Treat the spec as early product intent and turn it into a crisp project brief."
 
     @staticmethod
     def _design_spec_instruction(spec_kind: str) -> str:
@@ -993,7 +1004,7 @@ class Orchestrator:
                 "Preserve explicit architectural decisions from the input spec and use the brief only to fill "
                 "missing context or constraints."
             )
-        return "Use the brief as the source of truth and derive a practical MVP architecture from it."
+        return "Use the brief as the source of truth and derive a practical architecture from it."
 
     @staticmethod
     def _plan_spec_instruction(spec_kind: str) -> str:
@@ -1001,7 +1012,7 @@ class Orchestrator:
             return "Honor the architecture decisions already present in the input spec unless they clearly conflict with the brief."
         if spec_kind == "mixed":
             return "Prefer the explicit design decisions in the input spec and use the brief and architecture doc to resolve gaps."
-        return "Decompose the MVP into the smallest practical feature slices implied by the brief and architecture."
+        return "Decompose the target scope into the smallest practical feature slices implied by the brief and architecture."
 
     @staticmethod
     def _readme_spec_instruction(spec_kind: str) -> str:

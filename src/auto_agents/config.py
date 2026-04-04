@@ -189,6 +189,18 @@ def review_path(project_root: Path) -> Path:
 
 def bootstrap_project(project_root: Path, name: str, provider_kind: str, doc_language: str = "en") -> Path:
     root = project_root.resolve()
+    
+    if auto_dir(root).is_dir():
+        print(f"Project already initialized at {root}", file=import_sys().stderr)
+        return root
+        
+    has_existing_content = False
+    if root.exists():
+        for child in root.iterdir():
+            if child.name not in (".git", "spec.md", AUTO_DIR) and not child.name.startswith("."):
+                has_existing_content = True
+                break
+                
     root.mkdir(parents=True, exist_ok=True)
 
     config = dict(DEFAULT_CONFIG)
@@ -208,10 +220,21 @@ def bootstrap_project(project_root: Path, name: str, provider_kind: str, doc_lan
     write_if_missing(architecture_path(root), ARCHITECTURE_TEMPLATE)
     write_if_missing(review_path(root), "# Review\n\nNo review has been recorded yet.\n")
     write_json(task_plan_path(root), TASK_PLAN_TEMPLATE)
-    write_json(run_state_path(root), RUN_STATE_TEMPLATE)
+    
+    run_state = dict(RUN_STATE_TEMPLATE)
+    if has_existing_content:
+        run_state["status"] = "completed"
+        run_state["current_stage"] = "readme"
+    write_json(run_state_path(root), run_state)
+    
     write_if_missing(root / ".gitignore", PROJECT_GITIGNORE)
     write_if_missing(root / "README.md", f"# {name}\n")
     return root
+
+
+def import_sys():
+    import sys
+    return sys
 
 
 def load_project_config(project_root: Path) -> ProjectConfig:
