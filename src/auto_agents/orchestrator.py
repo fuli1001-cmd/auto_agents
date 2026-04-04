@@ -416,9 +416,11 @@ class Orchestrator:
             if multiline:
                 print(prompt + " (Press Ctrl+D or Ctrl+Z to submit):", file=sys.stderr)
                 try:
-                    return sys.stdin.read()
+                    text = sys.stdin.read()
                 except EOFError:
                     return ""
+                # Fix surrogate escapes from Windows console encoding mismatches
+                return text.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
             else:
                 return input(prompt)
         return default
