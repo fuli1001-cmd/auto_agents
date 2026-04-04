@@ -382,38 +382,17 @@ class Orchestrator:
             write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
 
             if "READY_TO_GENERATE" in reply:
-                # Guard: if the user's previous message contained an unanswered question,
-                # don't let the agent declare readiness prematurely — force another round.
-                last_user_content = ""
-                for msg in reversed(history[:-1]):
-                    if _history_role(msg) == "user":
-                        last_user_content = msg.get("content", "")
-                        break
-                has_open_question = "?" in last_user_content or "\uff1f" in last_user_content
-                if has_open_question:
-                    # Show the agent reply (minus the READY_TO_GENERATE token) so the
-                    # user can see whatever partial answer the agent gave.
-                    clean_reply = reply.replace("READY_TO_GENERATE", "").strip()
-                    if clean_reply:
-                        print("\nAgent:", file=sys.stderr)
-                        print(clean_reply, file=sys.stderr)
-                    # Replace the saved agent message with the clean version so the
-                    # next loop iteration sends history without READY_TO_GENERATE.
-                    history[-1]["content"] = clean_reply or reply
-                    write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-                    # Fall through to the normal user-reply prompt below
-                else:
-                    print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
-                    user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
+                print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
+                user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
 
-                    if user_conf.strip().lower() not in ("n", "no"):
-                        break
-                    else:
-                        user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
-                        if user_reply.strip():
-                            history.append({"role": "user", "content": user_reply})
-                            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-                        continue
+                if user_conf.strip().lower() not in ("n", "no"):
+                    break
+                else:
+                    user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
+                    if user_reply.strip():
+                        history.append({"role": "user", "content": user_reply})
+                        write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+                    continue
 
             print("\nAgent:", file=sys.stderr)
             print(reply, file=sys.stderr)
@@ -483,7 +462,10 @@ class Orchestrator:
                 # Fix surrogate escapes from Windows console encoding mismatches
                 return text.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
             else:
-                return input(prompt)
+                try:
+                    return input(prompt)
+                except EOFError:
+                    return default
         return default
 
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
