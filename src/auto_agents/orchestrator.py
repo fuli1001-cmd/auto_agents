@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import shutil
@@ -458,14 +459,17 @@ class Orchestrator:
                 try:
                     text = sys.stdin.read()
                 except EOFError:
-                    return ""
+                    text = ""
+                # Reopen stdin from the terminal so subsequent reads work.
+                try:
+                    tty = "/dev/tty" if os.path.exists("/dev/tty") else "CON"
+                    sys.stdin = open(tty, "r")
+                except OSError:
+                    pass
                 # Fix surrogate escapes from Windows console encoding mismatches
                 return text.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
             else:
-                try:
-                    return input(prompt)
-                except EOFError:
-                    return default
+                return input(prompt)
         return default
 
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
