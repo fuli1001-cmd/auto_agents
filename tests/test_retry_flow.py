@@ -893,6 +893,208 @@ class RetryFlowTests(unittest.TestCase):
                 self.assertTrue(found, "Rejection reason should be injected into clarify prompt")
 
 
+class IterationAdapter:
+    """Adapter that tracks stage calls for iteration testing.
+
+    On the plan stage it writes a task_plan.json that preserves existing
+    done tasks and appends new pending ones.
+    """
+
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.stage_calls: list[str] = []
+
+    def run(self, request):
+        self.stage_calls.append(request.stage)
+        if request.stage == "plan":
+            # Read existing plan so we can preserve done tasks
+            import json
+            existing = {"tasks": []}
+            tp = task_plan_path(self.project_root)
+            if tp.exists():
+                existing = json.loads(tp.read_text(encoding="utf-8"))
+
+            done_tasks = [t for t in existing.get("tasks", []) if t.get("status") == "done"]
+            new_task = {
+                "task_id": f"task-{len(done_tasks) + 1:03d}",
+                "title": "New iteration task",
+                "description": "Task added in iteration.",
+                "acceptance": ["new feature works"],
+                "status": "pending",
+                "commit_message": "",
+                "test_generated": True,
+            }
+            write_json(tp, {
+                "test_strategy": "python-unittest",
+                "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                "tasks": done_tasks + [new_task],
+            })
+            write_text(request.output_path, "iteration plan\n")
+        elif request.stage == "implement":
+            write_text(self.project_root / "iter_artifact.txt", "done\n")
+            write_text(request.output_path, "implemented iteration task\n")
+        elif request.stage == "review":
+            summary = "DECISION: pass\niteration review passed\n"
+            write_text(request.output_path, summary)
+            return AgentResult(
+                ok=True, command=["fake"], output_path=request.output_path,
+                summary=summary.strip(), returncode=0,
+            )
+        elif request.stage == "readme":
+            readme_content = (
+                "# Demo\n## Overview\nA demo project.\n"
+                "## Architecture\nSimple layout.\n"
+                "## Usage\n```bash\npython main.py\n```\n"
+                "## Development\nRun tests.\n"
+            )
+            write_text(self.project_root / "README.md", readme_content)
+            write_text(request.output_path, "readme updated\n")
+        else:
+            write_text(request.output_path, f"{request.stage}\n")
+
+        return AgentResult(
+            ok=True, command=["fake"], output_path=request.output_path,
+            summary=request.output_path.read_text(encoding="utf-8").strip(),
+            returncode=0,
+        )
+
+
+class IterationFlowTests(unittest.TestCase):
+    """Tests for starting a new iteration from a completed project."""
+
+    def _make_completed_project(self, tmp):
+        """Create a project with status=completed and one done task."""
+        project_root = Path(tmp) / "demo"
+        Orchestrator.init_project(project_root, "demo", "mock")
+
+        # Disable approval gates so run completes without pausing
+        config = load_project_config(project_root)
+        config.approvals.enabled = []
+        config.gates.commands = []
+        config.gates.require_clean_git_before_task = False
+        config.gates.allow_agent_updates = False
+        save_project_config(project_root, config)
+
+        # Seed a completed run state with one done task
+        from auto_agents.config import save_run_state as _save
+        from auto_agents.models import RunState, TaskSpec
+        state = load_run_state(project_root)
+        state.status = "completed"
+        state.current_stage = "readme"
+        state.stage_summaries = {
+            "clarify": "done", "design": "done", "plan": "done",
+            "implement": "done", "verify": "done", "readme": "done",
+        }
+        state.approved_gates = ["requirements", "architecture", "release"]
+        state.agent_attempts = {"clarify": 1, "design": 1, "plan": 1}
+        state.task_review_cache = {"task-001": {"decision": "pass"}}
+        state.tasks = [
+            TaskSpec(
+                task_id="task-001", title="Phase 1 task",
+                description="Already done.", acceptance=["done"],
+                status="done", commit_message="feat: phase1",
+                test_generated=True,
+            )
+        ]
+        _save(project_root, state)
+
+        # Persist the done task into task_plan.json too
+        write_json(task_plan_path(project_root), {
+            "tasks": [state.tasks[0].to_dict()]
+        })
+
+        spec_file = project_root / "spec.md"
+        spec_file.write_text("# Spec\nPhase 2 features.", encoding="utf-8")
+
+        # Create a fake conda env so verification fast-fail check passes
+        (project_root / ".conda" / "conda-meta").mkdir(parents=True, exist_ok=True)
+
+        return project_root, spec_file
+
+    def test_iteration_resets_state_fields(self):
+        """approved_gates, agent_attempts and task_review_cache must be
+        cleared when a new iteration starts."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, spec_file = self._make_completed_project(tmp)
+
+            # Add a distinctive old agent_attempts key that won't recur
+            from auto_agents.config import save_run_state as _save
+            state = load_run_state(project_root)
+            state.agent_attempts["implement-task-001"] = 3
+            _save(project_root, state)
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = IterationAdapter(project_root)
+
+            old_run_id = state.run_id
+
+            # Simulate user answering "y" to the iteration prompt
+            orchestrator._user_input_fn = lambda _prompt: "y"
+            state = orchestrator.run(spec_file=spec_file, auto_approve=True)
+
+            self.assertNotEqual(state.run_id, old_run_id, "New run_id should be generated")
+            self.assertEqual(state.status, "completed")
+            # Old implement-task-001 attempt count should be gone
+            self.assertNotIn("implement-task-001", state.agent_attempts,
+                             "Old agent_attempts should have been cleared at iteration start")
+            # Old task_review_cache should be gone
+            self.assertNotIn("task-001", state.task_review_cache,
+                             "Old task_review_cache should have been cleared")
+
+    def test_iteration_runs_implement_for_new_tasks(self):
+        """After plan appends new pending tasks during iteration, the
+        implement stage must execute them (dynamic pending-stages loop)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, spec_file = self._make_completed_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            adapter = IterationAdapter(project_root)
+            orchestrator.adapter = adapter
+
+            orchestrator._user_input_fn = lambda _prompt: "y"
+            state = orchestrator.run(spec_file=spec_file, auto_approve=True)
+
+            self.assertEqual(state.status, "completed")
+            # The old done task should be preserved
+            done_tasks = [t for t in state.tasks if t.status == "done"]
+            self.assertGreaterEqual(len(done_tasks), 2,
+                                    "Both old and new tasks should be done")
+            # implement must have been called
+            self.assertIn("implement", adapter.stage_calls,
+                          "Implement stage should run for new pending tasks")
+
+    def test_iteration_without_auto_approve_pauses_at_gate(self):
+        """Without --auto-approve the iteration should pause at the first
+        approval gate (requirements) after clarify."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, spec_file = self._make_completed_project(tmp)
+
+            # Re-enable the requirements gate
+            config = load_project_config(project_root)
+            config.approvals.enabled = ["requirements"]
+            save_project_config(project_root, config)
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = IterationAdapter(project_root)
+
+            # First call returns "y" for iteration prompt; subsequent
+            # calls return default (empty) which the interactive clarify
+            # path interprets as "nothing to add, proceed".
+            call_count = [0]
+            def mock_input(prompt):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    return "y"
+                return ""
+            orchestrator._user_input_fn = mock_input
+
+            state = orchestrator.run(spec_file=spec_file, auto_approve=False)
+
+            self.assertEqual(state.status, "paused")
+            self.assertEqual(state.pending_approval, "requirements")
+            # approved_gates should be empty (cleared at iteration start)
+            self.assertEqual(state.approved_gates, [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

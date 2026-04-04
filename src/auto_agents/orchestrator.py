@@ -146,6 +146,9 @@ class Orchestrator:
                     state.current_stage = "clarify"
                     for s in ["clarify", "design", "plan", "verify", "readme"]:
                         state.stage_summaries.pop(s, None)
+                    state.approved_gates = []
+                    state.agent_attempts = {}
+                    state.task_review_cache = {}
                     save_run_state(self.project_root, state)
                 else:
                     return state
@@ -161,7 +164,11 @@ class Orchestrator:
                     state.status = "paused"
                     return state
 
-            for stage in self._pending_stages(state):
+            while True:
+                pending = self._pending_stages(state)
+                if not pending:
+                    break
+                stage = pending[0]
                 self._emit_stage_start(stage)
                 try:
                     if stage == "implement":
