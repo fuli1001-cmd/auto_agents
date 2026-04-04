@@ -6,6 +6,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, TextIO, Tuple
 
@@ -140,6 +141,7 @@ class Orchestrator:
                 print("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]", file=sys.stderr)
                 user_conf = self._prompt_user("").strip().lower()
                 if user_conf in ("y", "yes"):
+                    state.run_id = uuid.uuid4().hex[:12]
                     state.status = "pending"
                     state.current_stage = "clarify"
                     for s in ["clarify", "design", "plan", "verify", "readme"]:
