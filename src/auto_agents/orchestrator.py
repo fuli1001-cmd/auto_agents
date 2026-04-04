@@ -1753,8 +1753,11 @@ class Orchestrator:
         # Skip if any task is already in progress (mid-execution resume).
         # Done tasks from previous iterations are fine — we still want to
         # commit the planning baseline for the new pending tasks.
-        if any(task.status not in ("pending", "done") for task in tasks):
+        task_list = list(tasks)
+        if any(task.status not in ("pending", "done") for task in task_list):
             return
+
+        is_iteration = any(task.status == "done" for task in task_list)
 
         allowed = {".gitignore", "README.md", "spec.md"}
         if self._active_spec_file is not None:
@@ -1762,6 +1765,8 @@ class Orchestrator:
                 allowed.add(str(self._active_spec_file.relative_to(self.project_root)))
             except ValueError:
                 pass
+
+        only_known = True
         for line in changes.splitlines():
             path = line[3:].strip()
             if not path:
@@ -1770,9 +1775,23 @@ class Orchestrator:
                 continue
             if path in allowed:
                 continue
-            return
+            only_known = False
+            break
 
-        commit_all(self.project_root, "docs(project): capture planning baseline")
+        if only_known:
+            # All changes are planning artifacts — commit everything.
+            commit_all(self.project_root, "docs(project): capture planning baseline")
+        elif is_iteration:
+            # Iteration: repo has non-planning changes (e.g. from agents
+            # touching project files).  Stage and commit only .auto-agents/
+            # so that implement's clean-tree check can pass.
+            from .git_ops import _git
+            _git(self.project_root, "add", ".auto-agents/")
+            for extra in allowed:
+                extra_path = self.project_root / extra
+                if extra_path.exists():
+                    _git(self.project_root, "add", extra)
+            _git(self.project_root, "commit", "-m", "docs(project): capture iteration planning baseline")
 
     def _should_resume_task(self, state: RunState, task: TaskSpec) -> bool:
         if task.status != "pending":
