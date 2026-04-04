@@ -390,6 +390,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["artifact.txt contains good"],
                             "status": "pending",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ],
                 },
@@ -429,6 +430,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["artifact.txt contains good"],
                             "status": "pending",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ]
                 },
@@ -463,6 +465,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["artifact.txt contains hello"],
                             "status": "pending",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ]
                 },
@@ -503,6 +506,7 @@ class RetryFlowTests(unittest.TestCase):
                             "status": "blocked",
                             "commit_message": "",
                             "review_summary": "previous review failure",
+                            "test_generated": True,
                         }
                     ]
                 },
@@ -541,6 +545,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["artifact.txt contains good"],
                             "status": "pending",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ]
                 },
@@ -578,6 +583,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["artifact.txt contains hello"],
                             "status": "in_progress",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ]
                 },
@@ -622,6 +628,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["tests updated"],
                             "status": "in_progress",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ]
                 },
@@ -663,6 +670,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["app updated"],
                             "status": "in_progress",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ]
                 },
@@ -703,6 +711,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["artifact.txt contains good"],
                             "status": "pending",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ]
                 },
@@ -744,6 +753,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["artifact.txt contains hello"],
                             "status": "pending",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ]
                 },
@@ -783,6 +793,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["artifact.txt contains good"],
                             "status": "pending",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ]
                 },
@@ -823,6 +834,7 @@ class RetryFlowTests(unittest.TestCase):
                             "acceptance": ["artifact.txt contains good"],
                             "status": "pending",
                             "commit_message": "",
+                            "test_generated": True,
                         }
                     ]
                 },

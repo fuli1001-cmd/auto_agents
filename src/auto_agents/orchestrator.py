@@ -458,6 +458,9 @@ class Orchestrator:
                 task.status = "in_progress"
                 self._persist_tasks(tasks)
 
+            if not task.test_generated:
+                self._run_task_test_writer(state, task)
+
             gate_result = self._execute_task_with_retries(state, task, resume_existing=resume_existing)
             if not gate_result["ok"]:
                 task.status = "blocked"
@@ -488,6 +491,37 @@ class Orchestrator:
         state.stage_summaries["implement"] = f"Completed {sum(task.status == 'done' for task in tasks)} tasks."
         state.last_error = ""
         return state
+
+    def _run_task_test_writer(self, state: RunState, task: TaskSpec) -> None:
+        """Generate TDD contract tests for a task before implementation."""
+        prompt = self._build_task_prompt(task, "test_writer")
+        self._emit_task_activity(task, "test_writer", 1)
+        result = self._run_agent_with_retries(
+            state=state,
+            stage="implement",
+            stage_key=f"test_writer-{task.task_id}",
+            prompt=prompt,
+        )
+        if not result.ok:
+            raise RuntimeError(
+                f"Test writer for {task.task_id} failed: {result.stderr or result.summary}"
+            )
+
+        # Capture newly created/modified files as contract files
+        diff_output = self._git_text("diff", "--name-only", "HEAD")
+        untracked = self._git_text("ls-files", "--others", "--exclude-standard")
+        all_new = set()
+        for line in (diff_output + "\n" + untracked).splitlines():
+            stripped = line.strip()
+            if stripped:
+                all_new.add(stripped)
+        task.contract_files = sorted(all_new)
+        task.test_generated = True
+        self._persist_tasks(state.tasks)
+
+        if task.contract_files:
+            commit_msg = f"test: Add TDD acceptance contract for {task.task_id}"
+            commit_all(self.project_root, commit_msg)
 
     def _run_task_verify(self) -> Dict[str, object]:
         verify_gate = run_commands(self.config.gates.commands, self.project_root)
@@ -1062,6 +1096,20 @@ class Orchestrator:
                 lines.extend(["", review_context.strip()])
             return "\n".join(lines)
 
+        if stage == "test_writer":
+            lines = common + [
+                "You are a Test-Writer agent. Your ONLY job is to generate black-box acceptance tests for this task.",
+                "Generate test cases that verify the acceptance criteria defined in the Task JSON above.",
+                "Do NOT implement any business logic, production code, or feature code.",
+                "Only create or modify test files (e.g. files under tests/ or with test_ prefix).",
+                "The tests should be runnable but are expected to FAIL until the feature is implemented.",
+                "Write tests that are concise, deterministic, and cover edge cases implied by the acceptance criteria.",
+                "If this is a Python project, use unittest or pytest conventions.",
+                "Do not modify .auto-agents state files.",
+                "Final response: 3 short bullets describing the test files created.",
+            ]
+            return "\n".join(lines)
+
         raise RuntimeError(f"Unsupported task stage: {stage}")
 
     def _execute_task_with_retries(
@@ -1108,6 +1156,39 @@ class Orchestrator:
                         reason=last_reason,
                     )
                     continue
+
+                # Contract file audit: reject if implement agent tampered with TDD test files
+                if task.contract_files:
+                    diff_output = self._git_text("diff", "HEAD", "--name-only")
+                    untracked = self._git_text("ls-files", "--others", "--exclude-standard")
+                    modified = set()
+                    for line in (diff_output + "\n" + untracked).splitlines():
+                        stripped = line.strip()
+                        if stripped:
+                            modified.add(stripped)
+                    tampered = modified & set(task.contract_files)
+                    if tampered:
+                        for path in sorted(tampered):
+                            subprocess.run(
+                                ["git", "restore", "--staged", path],
+                                cwd=str(self.project_root),
+                                capture_output=True,
+                            )
+                            subprocess.run(
+                                ["git", "restore", path],
+                                cwd=str(self.project_root),
+                                capture_output=True,
+                            )
+                        last_reason = (
+                            f"Permission Denied: the implement agent modified TDD contract files: "
+                            f"{', '.join(sorted(tampered))}. These files are immutable test contracts. "
+                            f"Changes have been reverted."
+                        )
+                        feedback = self._format_retry_feedback(
+                            "contract_file_tampering",
+                            reason=last_reason,
+                        )
+                        continue
 
             self._emit_task_activity(task, "verify", attempt)
             quick_failure = self._quick_verify_failure()
