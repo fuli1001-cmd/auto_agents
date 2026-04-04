@@ -296,7 +296,24 @@ class Orchestrator:
             })
             state.rejected_stage = ""
             state.rejection_reason = ""
-            
+
+        # Resume interrupted conversation: if the last message is from the agent
+        # (e.g. process crashed before user reply was saved), replay it to the user
+        # so they can respond, instead of feeding it back to the agent which would
+        # cause it to skip the conversation.
+        if history and history[-1].get("role") == "agent":
+            last_agent_msg = history[-1]["content"]
+            if "READY_TO_GENERATE" not in last_agent_msg:
+                print("\n[Resuming previous conversation]", file=sys.stderr)
+                print("\nAgent:", file=sys.stderr)
+                print(last_agent_msg, file=sys.stderr)
+                user_reply = self._prompt_user("\nYour reply: ", multiline=True)
+                if user_reply.strip():
+                    history.append({"role": "user", "content": user_reply})
+                else:
+                    history.append({"role": "user", "content": "I have nothing to add. Please proceed to generate if you are ready."})
+                write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+
         print("Entering interactive clarify session, please wait for the agent to analyze the spec...", file=sys.stderr, flush=True)
         
         max_rounds = 15
