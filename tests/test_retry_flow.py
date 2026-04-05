@@ -993,7 +993,6 @@ class IterationFlowTests(unittest.TestCase):
                 task_id="task-001", title="Phase 1 task",
                 description="Already done.", acceptance=["done"],
                 status="done", commit_message="feat: phase1",
-                test_generated=True,
             )
         ]
         _save(project_root, state)

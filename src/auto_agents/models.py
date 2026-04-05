@@ -25,8 +25,6 @@ class TaskSpec:
     commit_message: str = ""
     commit_sha: str = ""
     review_summary: str = ""
-    test_generated: bool = False
-    contract_files: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -39,8 +37,6 @@ class TaskSpec:
             commit_message=str(data.get("commit_message", "")),
             commit_sha=str(data.get("commit_sha", "")),
             review_summary=str(data.get("review_summary", "")),
-            test_generated=bool(data.get("test_generated", False)),
-            contract_files=[str(f) for f in data.get("contract_files", [])],
         )
 
     def to_dict(self) -> Dict[str, object]:
