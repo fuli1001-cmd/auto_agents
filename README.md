@@ -198,74 +198,14 @@ Run the real Codex provider demo:
 
 The orchestrator uses its own effort labels:
 
+- `balanced`
+- `deep`
+- `max`
 
 Adapters map those labels to provider-specific controls. For Codex this maps to local config
 profiles: `balanced` → `m` (medium), `deep` → `h` (high), `max` → `xh` (extra-high). If another
 provider does not support reasoning strength directly, the adapter can ignore the hint and still
 satisfy the interface.
-
-To keep Codex and Copilot CLI equally configurable, effort labels can map to named provider profiles
-rather than hardcoded model choices. Configure effort in `efforts`, map effort to profile IDs in
-`provider.profile_map`, and define profile details in `provider.profiles`.
-
-Codex example:
-
-```json
-{
-  "provider": {
-    "kind": "codex",
-    "binary": "codex",
-    "profile_map": {
-      "balanced": "fast",
-      "deep": "quality",
-      "max": "quality-max"
-    },
-    "profiles": {
-      "fast": {"codex": {"codex_profile": "m"}},
-      "quality": {"codex": {"codex_profile": "h", "model": "gpt-5.3-codex"}},
-      "quality-max": {"codex": {"codex_profile": "xh", "model": "gpt-5.3-codex"}}
-    }
-  }
-}
-```
-
-Copilot CLI example:
-
-```json
-{
-  "provider": {
-    "kind": "copilot-cli",
-    "binary": "copilot",
-    "profile_map": {
-      "balanced": "copilot-balanced",
-      "deep": "copilot-deep",
-      "max": "copilot-max"
-    },
-    "profiles": {
-      "copilot-balanced": {
-        "copilot-cli": {
-          "model": "claude-sonnet-4.5",
-          "effort_level": "medium"
-        }
-      },
-      "copilot-deep": {
-        "copilot-cli": {
-          "model": "claude-opus-4.5",
-          "effort_level": "high",
-          "allow_tools": ["shell(git:*)"],
-          "deny_tools": ["shell(git push)"]
-        }
-      },
-      "copilot-max": {
-        "copilot-cli": {
-          "model": "claude-opus-4.6",
-          "effort_level": "xhigh"
-        }
-      }
-    }
-  }
-}
-```
 
 Each stage in the `efforts` config block can be set to any of these labels. The default
 configuration balances quality and token usage:

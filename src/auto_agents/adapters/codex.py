@@ -19,7 +19,6 @@ class CodexAdapter(AgentAdapter):
         return shutil.which(self.config.binary) is not None
 
     def run(self, request: AgentRequest) -> AgentResult:
-        _, settings, legacy_profile = self.config.profile_settings_for(request.effort, "codex")
         command: List[str] = [
             self.config.binary,
             "exec",
@@ -32,19 +31,9 @@ class CodexAdapter(AgentAdapter):
             str(request.output_path),
         ]
 
-        profile = self._string_setting(settings.get("codex_profile")) or self._string_setting(settings.get("profile"))
-        if not profile:
-            profile = legacy_profile
+        profile = self.config.profile_map.get(request.effort)
         if profile:
             command.extend(["--profile", profile])
-
-        model = self._string_setting(settings.get("model"))
-        if model:
-            command.extend(["--model", model])
-
-        profile_args = settings.get("args")
-        if isinstance(profile_args, list):
-            command.extend(str(item) for item in profile_args)
 
         command.extend(self.config.extra_args)
 
@@ -81,7 +70,7 @@ class CodexAdapter(AgentAdapter):
             command=command,
             output_path=request.output_path,
             summary=summary,
-            model=self.config.model_label_for_effort(request.effort),
+            model=self._model_label(request),
             usage=usage,
             stdout=visible_stdout,
             stderr=stderr,
@@ -90,9 +79,21 @@ class CodexAdapter(AgentAdapter):
             streamed_stderr=streamed_stderr,
         )
 
-    def _string_setting(self, value: object) -> str:
-        if isinstance(value, str):
-            return value.strip()
+    def _model_label(self, request: AgentRequest) -> str:
+        explicit_model = self._explicit_model_arg()
+        if explicit_model:
+            return explicit_model
+
+        profile = self.config.profile_map.get(request.effort)
+        if profile:
+            return f"profile:{profile}"
+        return "default"
+
+    def _explicit_model_arg(self) -> str:
+        extra_args = list(self.config.extra_args)
+        for index, value in enumerate(extra_args):
+            if value in {"--model", "-m"} and index + 1 < len(extra_args):
+                return extra_args[index + 1]
         return ""
 
     def _parse_json_stdout(self, stdout: str) -> tuple[str, Optional[AgentUsage]]:

@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, TextIO, Tuple
 
-from .adapters import CodexAdapter, CopilotCliAdapter, MockAdapter, ShellAdapter
+from .adapters import CodexAdapter, MockAdapter, ShellAdapter
 from .config import (
     bootstrap_project,
     docs_dir,
@@ -238,8 +238,6 @@ class Orchestrator:
     def _build_adapter(self, config: ProjectConfig):
         if config.provider.kind == "codex":
             return CodexAdapter(config.provider)
-        if config.provider.kind == "copilot-cli":
-            return CopilotCliAdapter(config.provider)
         if config.provider.kind == "mock":
             return MockAdapter()
         return ShellAdapter(config.provider)
@@ -1531,7 +1529,26 @@ class Orchestrator:
         provider_kind = self.config.provider.kind
         if provider_kind == "mock":
             return "mock"
-        return self.config.provider.model_label_for_effort(effort)
+        if provider_kind != "codex":
+            return self.config.provider.binary
+
+        explicit_model = self._configured_explicit_model()
+        if explicit_model:
+            return explicit_model
+
+        profile = self.config.provider.profile_map.get(effort)
+        if profile:
+            return f"profile:{profile}"
+        if stage == "review":
+            return "default"
+        return "default"
+
+    def _configured_explicit_model(self) -> str:
+        extra_args = list(self.config.provider.extra_args)
+        for index, value in enumerate(extra_args):
+            if value in {"--model", "-m"} and index + 1 < len(extra_args):
+                return extra_args[index + 1]
+        return ""
 
     def _set_document_language(self, language: str) -> None:
         if language not in DOCUMENT_LANGUAGE_OPTIONS:

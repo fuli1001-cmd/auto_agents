@@ -314,17 +314,6 @@ def validate_project_config_payload(payload: object) -> List[str]:
         ):
             errors.append("provider.profile_map must be an object of string keys and string values")
 
-        profiles = provider.get("profiles")
-        if profiles is not None:
-            if not isinstance(profiles, dict):
-                errors.append("provider.profiles must be an object when provided")
-            else:
-                for key, value in profiles.items():
-                    if not isinstance(key, str) or not key.strip():
-                        errors.append("provider.profiles keys must be non-empty strings")
-                    if not isinstance(value, dict):
-                        errors.append(f"provider.profiles.{key} must be an object")
-
     efforts = payload.get("efforts")
     if not isinstance(efforts, dict):
         errors.append("efforts must be an object")
@@ -438,14 +427,6 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         errors.append(f"missing config file: {config_path(root)}")
     elif config_payload is not None:
         errors.extend(validate_project_config_payload(config_payload))
-        provider = config_payload.get("provider", {}) if isinstance(config_payload, dict) else {}
-        if isinstance(provider, dict):
-            profile_map = provider.get("profile_map")
-            profiles = provider.get("profiles")
-            if isinstance(profile_map, dict) and profile_map and not isinstance(profiles, dict):
-                warnings.append(
-                    "provider.profile_map is using legacy flat mapping without provider.profiles; consider migrating to named structured profiles for unified Codex/Copilot configuration"
-                )
 
     try:
         plan_payload = read_json(task_plan_path(root), default=None)
