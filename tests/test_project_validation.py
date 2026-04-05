@@ -837,6 +837,126 @@ class ProjectValidationTests(unittest.TestCase):
             config = load_project_config(project_root)
             self.assertEqual(config.retries.per_stage["implement"], 4)
 
+    def test_copilot_cli_adapter_builds_command_with_profile_config_dir(self) -> None:
+        from auto_agents.adapters.copilot_cli import CopilotCliAdapter, DEFAULT_PROFILES_ROOT
+
+        config = ProviderConfig(
+            kind="copilot-cli",
+            binary="copilot-cli",
+            profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
+        )
+        adapter = CopilotCliAdapter(config)
+        request = AgentRequest(
+            stage="implement",
+            effort="deep",
+            prompt="do something",
+            cwd=Path("/tmp/test"),
+            output_path=Path("/tmp/test/out.md"),
+        )
+        cmd = adapter._build_command(request)
+        self.assertEqual(cmd[0], "copilot-cli")
+        self.assertIn("--config-dir", cmd)
+        config_dir_index = cmd.index("--config-dir")
+        resolved = cmd[config_dir_index + 1]
+        self.assertEqual(resolved, str(DEFAULT_PROFILES_ROOT / "deep"))
+        self.assertIn("--allow-all-tools", cmd)
+
+    def test_copilot_cli_adapter_skips_allow_all_tools_when_explicit(self) -> None:
+        from auto_agents.adapters.copilot_cli import CopilotCliAdapter
+
+        config = ProviderConfig(
+            kind="copilot-cli",
+            binary="copilot-cli",
+            profile_map={"balanced": "balanced"},
+            extra_args=["--deny-tools", "dangerous-tool"],
+        )
+        adapter = CopilotCliAdapter(config)
+        request = AgentRequest(
+            stage="implement",
+            effort="balanced",
+            prompt="do something",
+            cwd=Path("/tmp/test"),
+            output_path=Path("/tmp/test/out.md"),
+        )
+        cmd = adapter._build_command(request)
+        self.assertNotIn("--allow-all-tools", cmd)
+        self.assertIn("--deny-tools", cmd)
+
+    def test_copilot_cli_adapter_model_label_uses_profile(self) -> None:
+        from auto_agents.adapters.copilot_cli import CopilotCliAdapter
+
+        config = ProviderConfig(
+            kind="copilot-cli",
+            binary="copilot-cli",
+            profile_map={"deep": "deep"},
+        )
+        adapter = CopilotCliAdapter(config)
+        request = AgentRequest(
+            stage="implement",
+            effort="deep",
+            prompt="do something",
+            cwd=Path("/tmp/test"),
+            output_path=Path("/tmp/test/out.md"),
+        )
+        self.assertEqual(adapter._model_label(request), "profile:deep")
+
+    def test_copilot_cli_adapter_model_label_explicit_model(self) -> None:
+        from auto_agents.adapters.copilot_cli import CopilotCliAdapter
+
+        config = ProviderConfig(
+            kind="copilot-cli",
+            binary="copilot-cli",
+            profile_map={"deep": "deep"},
+            extra_args=["--model", "gpt-4o"],
+        )
+        adapter = CopilotCliAdapter(config)
+        request = AgentRequest(
+            stage="implement",
+            effort="deep",
+            prompt="do something",
+            cwd=Path("/tmp/test"),
+            output_path=Path("/tmp/test/out.md"),
+        )
+        self.assertEqual(adapter._model_label(request), "gpt-4o")
+
+    def test_copilot_cli_adapter_no_config_dir_for_unmapped_effort(self) -> None:
+        from auto_agents.adapters.copilot_cli import CopilotCliAdapter
+
+        config = ProviderConfig(
+            kind="copilot-cli",
+            binary="copilot-cli",
+            profile_map={},
+        )
+        adapter = CopilotCliAdapter(config)
+        request = AgentRequest(
+            stage="implement",
+            effort="balanced",
+            prompt="do something",
+            cwd=Path("/tmp/test"),
+            output_path=Path("/tmp/test/out.md"),
+        )
+        cmd = adapter._build_command(request)
+        self.assertNotIn("--config-dir", cmd)
+
+    def test_orchestrator_routes_copilot_cli_to_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "copilot-cli")
+
+            from auto_agents.adapters.copilot_cli import CopilotCliAdapter
+
+            orchestrator = Orchestrator(project_root)
+            self.assertIsInstance(orchestrator.adapter, CopilotCliAdapter)
+
+    def test_orchestrator_model_label_for_copilot_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "copilot-cli")
+
+            orchestrator = Orchestrator(project_root)
+            label = orchestrator._model_label_for_agent_stage("implement", "deep")
+            self.assertEqual(label, "profile:deep")
+
     def test_save_run_state_persists_utf8_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

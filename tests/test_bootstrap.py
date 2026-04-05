@@ -31,6 +31,20 @@ class BootstrapTests(unittest.TestCase):
             config = load_project_config(project_root)
             self.assertEqual(config.docs.language, "en")
 
+    def test_init_project_with_copilot_cli_bootstraps_profile_map(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "copilot-cli")
+
+            self.assertTrue(auto_dir(project_root).exists())
+            self.assertTrue(config_path(project_root).exists())
+            config = load_project_config(project_root)
+            self.assertEqual(config.provider.kind, "copilot-cli")
+            self.assertEqual(config.provider.binary, "copilot-cli")
+            self.assertEqual(config.provider.profile_map["balanced"], "balanced")
+            self.assertEqual(config.provider.profile_map["deep"], "deep")
+            self.assertEqual(config.provider.profile_map["max"], "max")
+
 
 if __name__ == "__main__":
     unittest.main()

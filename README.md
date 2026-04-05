@@ -102,6 +102,12 @@ Create a target project skeleton:
 python3 -m auto_agents init --project /tmp/demo --name demo --provider codex
 ```
 
+Or use Copilot CLI as the provider:
+
+```bash
+python3 -m auto_agents init --project /tmp/demo --name demo --provider copilot-cli
+```
+
 Convenience defaults:
 
 - `init --name` defaults to the final directory name from `--project`
@@ -202,10 +208,57 @@ The orchestrator uses its own effort labels:
 - `deep`
 - `max`
 
-Adapters map those labels to provider-specific controls. For Codex this maps to local config
-profiles: `balanced` → `m` (medium), `deep` → `h` (high), `max` → `xh` (extra-high). If another
-provider does not support reasoning strength directly, the adapter can ignore the hint and still
-satisfy the interface.
+Adapters map those labels to provider-specific controls through the `profile_map` in project config.
+
+### Codex
+
+For Codex this maps to native config profiles: `balanced` → `m` (medium), `deep` → `h` (high),
+`max` → `xh` (extra-high). All model configuration lives in Codex's own config files — the project
+config only carries the profile name mapping.
+
+### Copilot CLI
+
+Copilot CLI uses the same minimal-config pattern. Each profile name in `profile_map` corresponds to
+a native config directory at `~/.copilot/profiles/<name>/`. The adapter passes
+`--config-dir <path>` so all model, tool-permission, and effort settings are managed in the
+provider's own config files, not in the project config.
+
+By default, the adapter adds `--allow-all-tools` for headless automation. To override this, pass
+explicit tool-permission flags in `extra_args`.
+
+Example copilot-cli project config (`provider` section only):
+
+```json
+{
+  "kind": "copilot-cli",
+  "binary": "copilot-cli",
+  "profile_map": {
+    "balanced": "balanced",
+    "deep": "deep",
+    "max": "max"
+  },
+  "extra_args": [],
+  "cwd_flag": "-C",
+  "prompt_via_stdin": true,
+  "output_flag": "-o"
+}
+```
+
+To use an absolute path instead of the conventional `~/.copilot/profiles/` location, set the
+profile_map value to the full path:
+
+```json
+{
+  "profile_map": {
+    "deep": "/home/user/my-copilot-configs/deep"
+  }
+}
+```
+
+### Generic shell adapter
+
+If another provider does not support reasoning strength directly, the adapter can ignore the hint
+and still satisfy the interface.
 
 Each stage in the `efforts` config block can be set to any of these labels. The default
 configuration balances quality and token usage:

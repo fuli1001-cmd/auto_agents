@@ -187,6 +187,28 @@ def review_path(project_root: Path) -> Path:
     return docs_dir(project_root) / "review.md"
 
 
+def _default_provider_config(provider_kind: str) -> dict:
+    """Return provider config defaults for the given kind."""
+    if provider_kind == "copilot-cli":
+        return {
+            "kind": "copilot-cli",
+            "binary": "copilot-cli",
+            "profile_map": {
+                "balanced": "balanced",
+                "deep": "deep",
+                "max": "max",
+            },
+            "extra_args": [],
+            "cwd_flag": "-C",
+            "prompt_via_stdin": True,
+            "output_flag": "-o",
+        }
+    base = dict(DEFAULT_CONFIG["provider"])
+    base["kind"] = provider_kind
+    base["binary"] = "codex" if provider_kind == "codex" else provider_kind
+    return base
+
+
 def bootstrap_project(project_root: Path, name: str, provider_kind: str, doc_language: str = "en") -> Path:
     root = project_root.resolve()
     
@@ -205,9 +227,7 @@ def bootstrap_project(project_root: Path, name: str, provider_kind: str, doc_lan
 
     config = dict(DEFAULT_CONFIG)
     config["project_name"] = name
-    config["provider"] = dict(DEFAULT_CONFIG["provider"])
-    config["provider"]["kind"] = provider_kind
-    config["provider"]["binary"] = "codex" if provider_kind == "codex" else provider_kind
+    config["provider"] = _default_provider_config(provider_kind)
     config["docs"] = dict(DEFAULT_CONFIG["docs"])
     config["docs"]["language"] = doc_language
 

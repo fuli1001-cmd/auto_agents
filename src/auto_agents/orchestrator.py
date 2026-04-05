@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, TextIO, Tuple
 
-from .adapters import CodexAdapter, MockAdapter, ShellAdapter
+from .adapters import CodexAdapter, CopilotCliAdapter, MockAdapter, ShellAdapter
 from .config import (
     bootstrap_project,
     docs_dir,
@@ -238,6 +238,8 @@ class Orchestrator:
     def _build_adapter(self, config: ProjectConfig):
         if config.provider.kind == "codex":
             return CodexAdapter(config.provider)
+        if config.provider.kind == "copilot-cli":
+            return CopilotCliAdapter(config.provider)
         if config.provider.kind == "mock":
             return MockAdapter()
         return ShellAdapter(config.provider)
@@ -1529,7 +1531,7 @@ class Orchestrator:
         provider_kind = self.config.provider.kind
         if provider_kind == "mock":
             return "mock"
-        if provider_kind != "codex":
+        if provider_kind not in ("codex", "copilot-cli"):
             return self.config.provider.binary
 
         explicit_model = self._configured_explicit_model()
@@ -1539,8 +1541,6 @@ class Orchestrator:
         profile = self.config.provider.profile_map.get(effort)
         if profile:
             return f"profile:{profile}"
-        if stage == "review":
-            return "default"
         return "default"
 
     def _configured_explicit_model(self) -> str:
