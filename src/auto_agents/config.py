@@ -143,6 +143,46 @@ DEFAULT_CONFIG = {
 }
 
 
+def _default_provider_config(provider_kind: str) -> dict:
+    provider = dict(DEFAULT_CONFIG["provider"])
+    provider["kind"] = provider_kind
+    if provider_kind == "codex":
+        provider["binary"] = "codex"
+        return provider
+
+    if provider_kind == "copilot-cli":
+        provider["binary"] = "copilot"
+        provider["profile_map"] = {
+            "balanced": "copilot-balanced",
+            "deep": "copilot-deep",
+            "max": "copilot-max",
+        }
+        provider["profiles"] = {
+            "copilot-balanced": {
+                "copilot-cli": {
+                    "model": "claude-sonnet-4.5",
+                    "effort_level": "medium",
+                }
+            },
+            "copilot-deep": {
+                "copilot-cli": {
+                    "model": "claude-opus-4.5",
+                    "effort_level": "high",
+                }
+            },
+            "copilot-max": {
+                "copilot-cli": {
+                    "model": "claude-opus-4.6",
+                    "effort_level": "xhigh",
+                }
+            },
+        }
+        return provider
+
+    provider["binary"] = provider_kind
+    return provider
+
+
 def auto_dir(project_root: Path) -> Path:
     return project_root / AUTO_DIR
 
@@ -205,9 +245,7 @@ def bootstrap_project(project_root: Path, name: str, provider_kind: str, doc_lan
 
     config = dict(DEFAULT_CONFIG)
     config["project_name"] = name
-    config["provider"] = dict(DEFAULT_CONFIG["provider"])
-    config["provider"]["kind"] = provider_kind
-    config["provider"]["binary"] = "codex" if provider_kind == "codex" else provider_kind
+    config["provider"] = _default_provider_config(provider_kind)
     config["docs"] = dict(DEFAULT_CONFIG["docs"])
     config["docs"]["language"] = doc_language
 

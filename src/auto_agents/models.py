@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 STAGE_ORDER = ["clarify", "design", "plan", "implement", "verify", "readme"]
@@ -64,6 +64,7 @@ class ProviderConfig:
             "max": "xh",
         }
     )
+    profiles: Dict[str, Dict[str, object]] = field(default_factory=dict)
     extra_args: List[str] = field(default_factory=list)
     cwd_flag: str = "-C"
     prompt_via_stdin: bool = True
@@ -71,11 +72,19 @@ class ProviderConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProviderConfig":
+        raw_profiles = data.get("profiles", {})
+        profiles: Dict[str, Dict[str, object]] = {}
+        if isinstance(raw_profiles, dict):
+            for key, value in raw_profiles.items():
+                if isinstance(value, dict):
+                    profiles[str(key)] = {str(k): v for k, v in value.items()}
+
         return cls(
             kind=str(data.get("kind", "codex")),
             binary=str(data.get("binary", "codex")),
             profile_map={str(k): str(v) for k, v in dict(data.get("profile_map", {})).items()}
             or {"balanced": "m", "deep": "h"},
+            profiles=profiles,
             extra_args=[str(item) for item in data.get("extra_args", [])],
             cwd_flag=str(data.get("cwd_flag", "-C")),
             prompt_via_stdin=bool(data.get("prompt_via_stdin", True)),
@@ -84,6 +93,80 @@ class ProviderConfig:
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
+
+    def resolve_profile(self, effort: str) -> Tuple[str, Dict[str, object], str]:
+        """Resolve an effort to (profile_id, settings, legacy_value).
+
+        - profile_id/settings are used for new structured profile configs.
+        - legacy_value keeps backward compatibility with string-only profile_map values.
+        """
+        reference = self.profile_map.get(effort, "")
+        if reference in self.profiles:
+            return reference, dict(self.profiles[reference]), ""
+
+        if effort in self.profiles:
+            return effort, dict(self.profiles[effort]), ""
+
+        if reference:
+            return "", {}, reference
+        return "", {}, ""
+
+    def profile_settings_for(self, effort: str, provider_kind: Optional[str] = None) -> Tuple[str, Dict[str, object], str]:
+        profile_id, settings, legacy_value = self.resolve_profile(effort)
+        if not settings:
+            return profile_id, settings, legacy_value
+
+        merged: Dict[str, object] = dict(settings)
+        if provider_kind:
+            provider_value = settings.get(provider_kind)
+            if isinstance(provider_value, dict):
+                for key, value in provider_value.items():
+                    merged[str(key)] = value
+
+        return profile_id, merged, legacy_value
+
+    def configured_model_arg(self) -> str:
+        for index, value in enumerate(self.extra_args):
+            if value in {"--model", "-m"} and index + 1 < len(self.extra_args):
+                return self.extra_args[index + 1]
+        return ""
+
+    def model_label_for_effort(self, effort: str) -> str:
+        explicit_model = self.configured_model_arg()
+        if explicit_model:
+            return explicit_model
+
+        profile_id, settings, legacy_value = self.profile_settings_for(effort, self.kind)
+        model = _string_setting(settings.get("model"))
+        if model:
+            return model
+
+        if self.kind == "codex":
+            codex_profile = _string_setting(settings.get("codex_profile")) or _string_setting(settings.get("profile"))
+            if codex_profile:
+                return f"profile:{codex_profile}"
+            if legacy_value:
+                return f"profile:{legacy_value}"
+            return "default"
+
+        if self.kind == "copilot-cli":
+            if profile_id:
+                return f"profile:{profile_id}"
+            if legacy_value:
+                return legacy_value
+            return "default"
+
+        if profile_id:
+            return f"profile:{profile_id}"
+        if legacy_value:
+            return legacy_value
+        return self.binary
+
+
+def _string_setting(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return ""
 
 
 @dataclass

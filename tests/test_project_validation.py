@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.cli import main
+from auto_agents.adapters.copilot_cli import CopilotCliAdapter
 from auto_agents.adapters.codex import CodexAdapter
 from auto_agents.config import config_path, load_project_config, load_run_state, save_run_state, task_plan_path
 from auto_agents.io_utils import write_json, write_text
@@ -225,12 +226,99 @@ class ProjectValidationTests(unittest.TestCase):
 
         self.assertEqual(validate_project_config_payload(payload), [])
 
+    def test_validate_project_config_payload_accepts_structured_provider_profiles(self) -> None:
+        payload = {
+            "project_name": "demo",
+            "provider": {
+                "kind": "copilot-cli",
+                "binary": "copilot",
+                "profile_map": {"balanced": "fast", "deep": "quality", "max": "quality"},
+                "profiles": {
+                    "fast": {
+                        "copilot-cli": {
+                            "model": "claude-sonnet-4.5",
+                            "effort_level": "medium",
+                        }
+                    },
+                    "quality": {
+                        "copilot-cli": {
+                            "model": "claude-opus-4.5",
+                            "effort_level": "high",
+                            "allow_all_tools": True,
+                        }
+                    },
+                },
+                "extra_args": [],
+                "cwd_flag": "-C",
+                "prompt_via_stdin": True,
+                "output_flag": "-o",
+            },
+            "docs": {
+                "language": "en",
+            },
+            "efforts": {
+                "clarify": "deep",
+                "design": "deep",
+                "plan": "balanced",
+                "implement": "balanced",
+                "review": "deep",
+                "verify": "balanced",
+            },
+            "gates": {
+                "commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                "require_clean_git_before_task": True,
+                "allow_agent_updates": True,
+            },
+            "git": {
+                "auto_init_repo": True,
+                "commit_each_task": True,
+                "commit_message_template": "feat({task_id}): {title}",
+            },
+            "approvals": {
+                "enabled": ["requirements", "architecture", "release"],
+            },
+            "retries": {
+                "default_max_attempts": 2,
+                "per_stage": {
+                    "clarify": 2,
+                    "design": 2,
+                    "plan": 3,
+                    "implement": 2,
+                    "review": 2,
+                },
+            },
+        }
+
+        self.assertEqual(validate_project_config_payload(payload), [])
+
     def test_validation_report_warns_when_no_verification_commands_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
             report = validation_report(project_root)
             self.assertTrue(any("no verification commands" in item for item in report["warnings"]))
+
+    def test_validation_report_warns_for_legacy_flat_provider_profile_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+
+            payload = load_project_config(project_root).to_dict()
+            payload["provider"]["kind"] = "copilot-cli"
+            payload["provider"]["binary"] = "copilot"
+            payload["provider"]["profile_map"] = {
+                "balanced": "claude-sonnet-4.5",
+                "deep": "claude-opus-4.5",
+                "max": "claude-opus-4.6",
+            }
+            if "profiles" in payload["provider"]:
+                del payload["provider"]["profiles"]
+            write_json(config_path(project_root), payload)
+
+            report = validation_report(project_root)
+
+            self.assertTrue(report["ok"])
+            self.assertTrue(any("legacy flat mapping" in item for item in report["warnings"]))
 
     def test_validation_report_warns_when_task_plan_looks_oversliced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -812,6 +900,99 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(usage.cached_input_tokens if usage else None, 50)
             self.assertEqual(usage.output_tokens if usage else None, 25)
             self.assertEqual(usage.total_tokens if usage else None, 225)
+
+    def test_codex_adapter_supports_structured_profile_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            output_path = project_root / "agent.md"
+            provider = ProviderConfig(
+                kind="codex",
+                binary="codex",
+                profile_map={"deep": "quality"},
+                profiles={
+                    "quality": {
+                        "codex": {
+                            "codex_profile": "xh",
+                            "model": "gpt-5.3-codex",
+                            "args": ["--sandbox", "workspace-write"],
+                        }
+                    }
+                },
+                extra_args=[],
+            )
+            adapter = CodexAdapter(provider)
+            request = AgentRequest(
+                stage="clarify",
+                effort="deep",
+                prompt="prompt",
+                cwd=project_root,
+                output_path=output_path,
+            )
+
+            with patch("auto_agents.adapters.codex.subprocess.run") as run_mock:
+                run_mock.return_value = subprocess.CompletedProcess(
+                    args=["codex"],
+                    returncode=0,
+                    stdout='{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n',
+                    stderr="",
+                )
+                result = adapter.run(request)
+
+            called_command = run_mock.call_args.kwargs["args"] if "args" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
+            self.assertIn("--profile", called_command)
+            self.assertIn("xh", called_command)
+            self.assertIn("--model", called_command)
+            self.assertIn("gpt-5.3-codex", called_command)
+            self.assertIn("--sandbox", called_command)
+            self.assertEqual(result.model, "gpt-5.3-codex")
+
+    def test_copilot_cli_adapter_uses_structured_profile_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            output_path = project_root / "agent.md"
+            provider = ProviderConfig(
+                kind="copilot-cli",
+                binary="copilot",
+                profile_map={"deep": "quality"},
+                profiles={
+                    "quality": {
+                        "copilot-cli": {
+                            "model": "claude-opus-4.5",
+                            "effort_level": "high",
+                            "allow_tools": ["shell(git:*)"],
+                            "deny_tools": ["shell(git push)"],
+                            "args": ["--stream=off"],
+                        }
+                    }
+                },
+                extra_args=[],
+            )
+            adapter = CopilotCliAdapter(provider)
+            request = AgentRequest(
+                stage="plan",
+                effort="deep",
+                prompt="generate plan",
+                cwd=project_root,
+                output_path=output_path,
+            )
+
+            with patch("auto_agents.adapters.copilot_cli.subprocess.run") as run_mock:
+                run_mock.return_value = subprocess.CompletedProcess(
+                    args=["copilot"],
+                    returncode=0,
+                    stdout="copilot output\n",
+                    stderr="",
+                )
+                result = adapter.run(request)
+
+            called_command = run_mock.call_args.kwargs["args"] if "args" in run_mock.call_args.kwargs else run_mock.call_args.args[0]
+            self.assertIn("--model", called_command)
+            self.assertIn("claude-opus-4.5", called_command)
+            self.assertTrue(any(item.startswith("--allow-tool=shell(git:*)") for item in called_command))
+            self.assertTrue(any(item.startswith("--deny-tool=shell(git push)") for item in called_command))
+            self.assertIn("--stream=off", called_command)
+            self.assertTrue(any(item.startswith("--config-dir=") for item in called_command))
+            self.assertEqual(result.summary, "copilot output")
 
     def test_run_can_persist_document_language_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

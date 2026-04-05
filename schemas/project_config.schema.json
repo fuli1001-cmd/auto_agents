@@ -43,6 +43,13 @@
             "type": "string"
           }
         },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
         "extra_args": {
           "type": "array",
           "items": {
