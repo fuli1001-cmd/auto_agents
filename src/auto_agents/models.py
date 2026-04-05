@@ -25,9 +25,17 @@ class TaskSpec:
     commit_message: str = ""
     commit_sha: str = ""
     review_summary: str = ""
+    scope_boundaries: str = ""
+    review_history: List[Dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
+        raw_history = data.get("review_history", [])
+        history = []
+        if isinstance(raw_history, list):
+            for entry in raw_history:
+                if isinstance(entry, dict):
+                    history.append(entry)
         return cls(
             task_id=str(data["task_id"]),
             title=str(data["title"]),
@@ -37,6 +45,8 @@ class TaskSpec:
             commit_message=str(data.get("commit_message", "")),
             commit_sha=str(data.get("commit_sha", "")),
             review_summary=str(data.get("review_summary", "")),
+            scope_boundaries=str(data.get("scope_boundaries", "")),
+            review_history=history,
         )
 
     def to_dict(self) -> Dict[str, object]:

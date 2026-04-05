@@ -252,6 +252,27 @@ def task_plan_warnings(payload: object) -> List[str]:
             "many tasks have only one acceptance criterion; confirm the plan is not over-fragmented"
         )
 
+    oversized_tasks = []
+    verbose_tasks = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        tid = str(task.get("task_id", "?"))
+        acceptance = task.get("acceptance")
+        description = str(task.get("description", ""))
+        if isinstance(acceptance, list) and len(acceptance) > 5:
+            oversized_tasks.append(f"{tid} ({len(acceptance)} criteria)")
+        if len(description) > 500:
+            verbose_tasks.append(f"{tid} ({len(description)} chars)")
+    if oversized_tasks:
+        warnings.append(
+            f"tasks with >5 acceptance criteria (consider splitting): {', '.join(oversized_tasks)}"
+        )
+    if verbose_tasks:
+        warnings.append(
+            f"tasks with very long descriptions >500 chars (may be too broad): {', '.join(verbose_tasks)}"
+        )
+
     return warnings
 
 

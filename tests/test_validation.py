@@ -155,6 +155,42 @@ class TaskPlanValidationTests(unittest.TestCase):
         self.assertTrue(any("contains 30 tasks" in item for item in warnings))
         self.assertTrue(any("over-fragmented" in item or "oversliced" in item for item in warnings))
 
+    def test_warns_when_task_has_too_many_acceptance_criteria(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "God task",
+                    "description": "Does everything.",
+                    "acceptance": [f"criterion {i}" for i in range(8)],
+                    "status": "pending",
+                    "commit_message": "",
+                }
+            ]
+        }
+
+        warnings = task_plan_warnings(payload)
+        self.assertTrue(any(">5 acceptance criteria" in item for item in warnings))
+        self.assertIn("task-001", " ".join(warnings))
+
+    def test_warns_when_task_description_is_very_long(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Broad task",
+                    "description": "x" * 600,
+                    "acceptance": ["something"],
+                    "status": "pending",
+                    "commit_message": "",
+                }
+            ]
+        }
+
+        warnings = task_plan_warnings(payload)
+        self.assertTrue(any(">500 chars" in item for item in warnings))
+        self.assertIn("task-001", " ".join(warnings))
+
 
 if __name__ == "__main__":
     unittest.main()

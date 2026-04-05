@@ -678,7 +678,7 @@ class Orchestrator:
             return ""
         return process.stdout.strip()
 
-    def _build_review_context(self, verify_reason: str = "", max_diff_chars: int = 6000) -> str:
+    def _build_review_context(self, verify_reason: str = "", max_diff_chars: int = 20000) -> str:
         entries = changed_entries(self.project_root)
         lines = [
             "Review the current task by prioritizing the diff context below before exploring unrelated files.",
@@ -786,11 +786,19 @@ class Orchestrator:
         failure_type: str,
         reason: str = "",
         review_summary: str = "",
+        review_history: Optional[List[Dict[str, object]]] = None,
     ) -> str:
         lines = [f"- Failure type: {failure_type}"]
         if reason:
             lines.append(f"- Reason: {reason}")
-        if review_summary.strip():
+        if review_history and len(review_history) > 1:
+            lines.append("- Review history (oldest first):")
+            for i, entry in enumerate(review_history):
+                is_latest = i == len(review_history) - 1
+                status = "[CURRENT - must fix]" if is_latest else "[ADDRESSED in later attempt]"
+                lines.append(f"  --- Attempt {entry.get('attempt', '?')} {status} ---")
+                lines.append(f"  {entry.get('summary', '').strip()}")
+        elif review_summary.strip():
             lines.extend(["- Review summary:", review_summary.strip()])
         return "\n".join(lines)
 
@@ -952,6 +960,19 @@ class Orchestrator:
                 "When existing completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create tasks for capabilities already delivered by completed tasks.",
                 "Each task must contain task_id, title, description, acceptance, status, commit_message.",
                 "A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined.",
+                "",
+                "TASK SPLITTING — ANTI-PATTERNS (avoid these):",
+                "1. God Task: a single task with >5 acceptance criteria or a description exceeding ~500 characters. Split by feature slice.",
+                "2. Cross-cutting Bundle: acceptance criteria that span multiple unrelated subsystems (e.g. 'set up DB schema AND implement API AND write CLI'). Each subsystem should be its own task.",
+                "3. Infra + Feature Combo: mixing infrastructure setup (dependencies, CI, env config) with business logic in one task. Split infra into a prerequisite task.",
+                "4. Vague Acceptance: criteria like 'code is clean' or 'follows best practices'. Every criterion must be objectively verifiable by a test or a command.",
+                "",
+                "TASK SPLITTING — STRATEGIES:",
+                "1. Vertical Slice: each task delivers one user-facing or API-facing capability end-to-end (route, logic, test).",
+                "2. Dependency-first: extract shared setup (DB schema, env, config) into an early task, then layer feature tasks on top.",
+                "3. Test-boundary: if a single task would require tests in 3+ unrelated test files, it likely needs splitting.",
+                "4. Acceptance count rule of thumb: aim for 2-4 acceptance criteria per task. >5 is a strong signal to split.",
+                "",
                 "Final response: 3 short bullets summarizing the plan.",
             ]
             return "\n".join(lines)
@@ -1159,12 +1180,34 @@ class Orchestrator:
                 "input/output, side-effects) rather than internal implementation details. "
                 "If the tests only pass by mocking/faking internal state instead of exercising real "
                 "public interfaces, that is a 'DECISION: fail' issue.",
+                "SCOPE RULE: Your review scope is strictly bounded by the acceptance criteria in the Task JSON. "
+                "A 'DECISION: fail' is warranted ONLY when the implementation does not satisfy one or more "
+                "acceptance criteria, introduces a regression in existing tests, or leaves the codebase in a "
+                "non-buildable state. Architectural concerns, future robustness improvements, and suggestions "
+                "beyond the stated acceptance criteria should be noted as '[NON-BLOCKING]' advisory notes, "
+                "NOT as failure reasons.",
+                "When issuing 'DECISION: fail', you MUST cite the specific acceptance criterion (by index or text) "
+                "that is not satisfied. If no acceptance criterion is violated but you have advisory concerns, "
+                "issue 'DECISION: pass' with those concerns listed as '[NON-BLOCKING]' notes.",
                 "Use the supplied changed-file and diff context first. Only inspect the rest of the repository when the diff is insufficient.",
                 "Return only the review result. Do not include any preamble, file path note, or tool narration.",
                 "The first non-empty line must be exactly 'DECISION: pass' or 'DECISION: fail'.",
                 self._review_language_instruction(),
                 "After the first line, provide a short review summary.",
             ]
+            if task.scope_boundaries.strip():
+                lines.append(
+                    f"SCOPE BOUNDARIES (explicitly out-of-scope for this task, do NOT fail for these): "
+                    f"{task.scope_boundaries.strip()}"
+                )
+            if task.review_history:
+                lines.append(
+                    "This is a RETRY review. Your PRIMARY job is to verify that the issues from the previous "
+                    "review have been addressed. You may note newly discovered issues, but 'DECISION: fail' "
+                    "should only be issued if (a) previous issues remain unresolved, or (b) the fix introduced "
+                    "a clear regression. Do NOT fail for newly-discovered scope-expansion concerns that were "
+                    "not raised in the previous review."
+                )
             if review_context.strip():
                 lines.extend(["", review_context.strip()])
             return "\n".join(lines)
@@ -1183,6 +1226,7 @@ class Orchestrator:
             feedback = self._format_retry_feedback(
                 "review_rejected",
                 reason="review rejected the task",
+                review_history=task.review_history,
                 review_summary=task.review_summary,
             )
         last_reason = "task failed without a recorded reason"
@@ -1257,14 +1301,16 @@ class Orchestrator:
             last_reason = str(gate_result["reason"])
             last_review = str(gate_result["review"])
             
-            # Synchronize the task's review_summary so that the next iteration's 
-            # built-in Task JSON context exactly matches the newly generated rejection context,
-            # avoiding the "Split Brain" issue.
             task.review_summary = last_review
+            task.review_history.append({
+                "attempt": attempt,
+                "summary": last_review,
+            })
             
             feedback = self._format_retry_feedback(
                 "review_rejected",
                 reason=last_reason,
+                review_history=task.review_history,
                 review_summary=last_review,
             )
 

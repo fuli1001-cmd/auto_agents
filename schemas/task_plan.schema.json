@@ -56,6 +56,10 @@
           },
           "commit_message": {
             "type": "string"
+          },
+          "scope_boundaries": {
+            "type": "string",
+            "description": "Explicitly out-of-scope concerns for this task, guiding review boundaries."
           }
         },
         "additionalProperties": true
