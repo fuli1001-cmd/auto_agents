@@ -44,6 +44,7 @@ class CodexAdapter(AgentAdapter):
             command,
             input=request.prompt,
             text=True,
+            encoding="utf-8",
             capture_output=True,
             cwd=str(request.cwd),
             env=env,

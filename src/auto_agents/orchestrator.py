@@ -530,7 +530,7 @@ class Orchestrator:
                 # Reopen stdin from the terminal so subsequent reads work.
                 try:
                     tty = "/dev/tty" if os.path.exists("/dev/tty") else "CON"
-                    sys.stdin = open(tty, "r")
+                    sys.stdin = open(tty, "r", encoding="utf-8")
                 except OSError:
                     pass
                 # Fix surrogate escapes from Windows console encoding mismatches
@@ -710,6 +710,7 @@ class Orchestrator:
             ["git", *args],
             cwd=str(self.project_root),
             text=True,
+            encoding="utf-8",
             capture_output=True,
         )
         if process.returncode != 0:

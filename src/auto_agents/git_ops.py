@@ -10,6 +10,7 @@ def _git(project_root: Path, *args: str) -> subprocess.CompletedProcess:
         ["git", *args],
         cwd=str(project_root),
         text=True,
+        encoding="utf-8",
         capture_output=True,
     )
 
