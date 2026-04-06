@@ -532,16 +532,31 @@ class Orchestrator:
                     # the underlying binary buffer with lossy UTF-8 decoding.
                     text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
                 # Reopen stdin from the terminal so subsequent reads work.
-                try:
-                    tty = "/dev/tty" if os.path.exists("/dev/tty") else "CON"
-                    sys.stdin = open(tty, "r", encoding="utf-8", errors="surrogateescape")
-                except OSError:
-                    pass
+                self._reopen_stdin_from_tty()
                 # Fix surrogate escapes from Windows console encoding mismatches
                 return text.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
             else:
-                return input(prompt)
+                return self._read_single_line_input(prompt, default)
         return default
+
+    def _reopen_stdin_from_tty(self) -> bool:
+        try:
+            tty = "/dev/tty" if os.path.exists("/dev/tty") else "CON"
+            sys.stdin = open(tty, "r", encoding="utf-8", errors="surrogateescape")
+            return True
+        except OSError:
+            return False
+
+    def _read_single_line_input(self, prompt: str, default: str) -> str:
+        try:
+            return input(prompt)
+        except EOFError:
+            if self._reopen_stdin_from_tty():
+                try:
+                    return input(prompt)
+                except EOFError:
+                    return default
+            return default
 
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
         tasks = state.tasks or self._load_tasks_from_plan()
