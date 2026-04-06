@@ -99,20 +99,20 @@ Manual approvals are supported at three high-value gates:
 Create a target project skeleton:
 
 ```bash
-python3 -m auto_agents init --project /tmp/demo --name demo --provider codex
+python3 -m auto_agents init --project /tmp/demo --name demo
 ```
 
-Or use Copilot CLI as the provider:
+Switch provider at run time and persist the new default provider:
 
 ```bash
-python3 -m auto_agents init --project /tmp/demo --name demo --provider copilot-cli
+python3 -m auto_agents run --project /tmp/demo --provider copilot-cli
 ```
 
 Convenience defaults:
 
 - `init --name` defaults to the final directory name from `--project`
-- `init --provider` defaults to `codex`
 - `init --doc-language` defaults to `en`
+- `run --provider` is optional; if omitted, the orchestrator uses the persisted default provider
 
 Run the orchestrator:
 
@@ -226,26 +226,44 @@ provider's own config files, not in the project config.
 By default, the adapter adds `--allow-all-tools` for headless automation. To override this, pass
 explicit tool-permission flags in `extra_args`.
 
-Example copilot-cli project config (`provider` section only):
+Example project config (`providers` and `active_provider` only):
 
 ```json
 {
-  "kind": "copilot-cli",
-  "binary": "copilot-cli",
-  "profile_map": {
-    "balanced": "balanced",
-    "deep": "deep",
-    "max": "max"
+  "providers": {
+    "codex": {
+      "kind": "codex",
+      "binary": "codex",
+      "profile_map": {
+        "balanced": "m",
+        "deep": "h",
+        "max": "xh"
+      },
+      "extra_args": [],
+      "cwd_flag": "-C",
+      "prompt_via_stdin": true,
+      "output_flag": "-o"
+    },
+    "copilot-cli": {
+      "kind": "copilot-cli",
+      "binary": "copilot-cli",
+      "profile_map": {
+        "balanced": "balanced",
+        "deep": "deep",
+        "max": "max"
+      },
+      "extra_args": [],
+      "cwd_flag": "-C",
+      "prompt_via_stdin": true,
+      "output_flag": "-o"
+    }
   },
-  "extra_args": [],
-  "cwd_flag": "-C",
-  "prompt_via_stdin": true,
-  "output_flag": "-o"
+  "active_provider": "codex"
 }
 ```
 
 To use an absolute path instead of the conventional `~/.copilot/profiles/` location, set the
-profile_map value to the full path:
+`providers.copilot-cli.profile_map` value to the full path:
 
 ```json
 {

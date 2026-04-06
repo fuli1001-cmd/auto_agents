@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Tuple
 from uuid import uuid4
 
 from .io_utils import read_json, read_text, write_if_missing, write_json, write_text
-from .models import ProjectConfig, RunState
+from .models import ProjectConfig, RunState, SUPPORTED_PROVIDER_KINDS
 
 
 AUTO_DIR = ".auto-agents"
@@ -93,19 +94,35 @@ RUN_STATE_TEMPLATE = {
 
 DEFAULT_CONFIG = {
     "project_name": "unnamed-project",
-    "provider": {
-        "kind": "codex",
-        "binary": "codex",
-        "profile_map": {
-            "balanced": "m",
-            "deep": "h",
-            "max": "xh",
+    "providers": {
+        "codex": {
+            "kind": "codex",
+            "binary": "codex",
+            "profile_map": {
+                "balanced": "m",
+                "deep": "h",
+                "max": "xh",
+            },
+            "extra_args": [],
+            "cwd_flag": "-C",
+            "prompt_via_stdin": True,
+            "output_flag": "-o",
         },
-        "extra_args": [],
-        "cwd_flag": "-C",
-        "prompt_via_stdin": True,
-        "output_flag": "-o",
+        "copilot-cli": {
+            "kind": "copilot-cli",
+            "binary": "copilot-cli",
+            "profile_map": {
+                "balanced": "balanced",
+                "deep": "deep",
+                "max": "max",
+            },
+            "extra_args": [],
+            "cwd_flag": "-C",
+            "prompt_via_stdin": True,
+            "output_flag": "-o",
+        },
     },
+    "active_provider": "codex",
     "docs": {
         "language": "en",
     },
@@ -187,29 +204,11 @@ def review_path(project_root: Path) -> Path:
     return docs_dir(project_root) / "review.md"
 
 
-def _default_provider_config(provider_kind: str) -> dict:
-    """Return provider config defaults for the given kind."""
-    if provider_kind == "copilot-cli":
-        return {
-            "kind": "copilot-cli",
-            "binary": "copilot-cli",
-            "profile_map": {
-                "balanced": "balanced",
-                "deep": "deep",
-                "max": "max",
-            },
-            "extra_args": [],
-            "cwd_flag": "-C",
-            "prompt_via_stdin": True,
-            "output_flag": "-o",
-        }
-    base = dict(DEFAULT_CONFIG["provider"])
-    base["kind"] = provider_kind
-    base["binary"] = "codex" if provider_kind == "codex" else provider_kind
-    return base
+def supported_provider_kinds() -> Tuple[str, ...]:
+    return SUPPORTED_PROVIDER_KINDS
 
 
-def bootstrap_project(project_root: Path, name: str, provider_kind: str, doc_language: str = "en") -> Path:
+def bootstrap_project(project_root: Path, name: str, doc_language: str = "en") -> Path:
     root = project_root.resolve()
     
     if auto_dir(root).is_dir():
@@ -227,7 +226,8 @@ def bootstrap_project(project_root: Path, name: str, provider_kind: str, doc_lan
 
     config = dict(DEFAULT_CONFIG)
     config["project_name"] = name
-    config["provider"] = _default_provider_config(provider_kind)
+    config["providers"] = copy.deepcopy(DEFAULT_CONFIG["providers"])
+    config["active_provider"] = "codex"
     config["docs"] = dict(DEFAULT_CONFIG["docs"])
     config["docs"]["language"] = doc_language
 

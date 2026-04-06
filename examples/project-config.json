@@ -1,18 +1,34 @@
 {
   "project_name": "demo",
-  "provider": {
-    "kind": "codex",
-    "binary": "codex",
-    "profile_map": {
-      "balanced": "m",
-      "deep": "h",
-      "max": "xh"
+  "providers": {
+    "codex": {
+      "kind": "codex",
+      "binary": "codex",
+      "profile_map": {
+        "balanced": "m",
+        "deep": "h",
+        "max": "xh"
+      },
+      "extra_args": [],
+      "cwd_flag": "-C",
+      "prompt_via_stdin": true,
+      "output_flag": "-o"
     },
-    "extra_args": [],
-    "cwd_flag": "-C",
-    "prompt_via_stdin": true,
-    "output_flag": "-o"
+    "copilot-cli": {
+      "kind": "copilot-cli",
+      "binary": "copilot-cli",
+      "profile_map": {
+        "balanced": "balanced",
+        "deep": "deep",
+        "max": "max"
+      },
+      "extra_args": [],
+      "cwd_flag": "-C",
+      "prompt_via_stdin": true,
+      "output_flag": "-o"
+    }
   },
+  "active_provider": "codex",
   "docs": {
     "language": "en"
   },

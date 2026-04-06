@@ -281,7 +281,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
     if not isinstance(payload, dict):
         return ["project config root must be a JSON object"]
 
-    required = {"project_name", "provider", "efforts", "gates", "git", "approvals", "retries"}
+    required = {"project_name", "providers", "active_provider", "efforts", "gates", "git", "approvals", "retries"}
     missing = sorted(required - set(payload.keys()))
     if missing:
         errors.append(f"project config missing required fields: {', '.join(missing)}")
@@ -290,29 +290,45 @@ def validate_project_config_payload(payload: object) -> List[str]:
     if not isinstance(project_name, str) or not project_name.strip():
         errors.append("project_name must be a non-empty string")
 
-    provider = payload.get("provider")
-    if not isinstance(provider, dict):
-        errors.append("provider must be an object")
+    providers = payload.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        errors.append("providers must be a non-empty object")
     else:
-        for key in ("kind", "binary", "cwd_flag", "output_flag"):
-            value = provider.get(key)
-            if not isinstance(value, str) or not value.strip():
-                errors.append(f"provider.{key} must be a non-empty string")
+        for provider_name, provider in providers.items():
+            if not isinstance(provider_name, str) or not provider_name.strip():
+                errors.append("providers keys must be non-empty strings")
+                continue
+            if not isinstance(provider, dict):
+                errors.append(f"providers.{provider_name} must be an object")
+                continue
 
-        prompt_via_stdin = provider.get("prompt_via_stdin")
-        if not isinstance(prompt_via_stdin, bool):
-            errors.append("provider.prompt_via_stdin must be a boolean")
+            for key in ("kind", "binary", "cwd_flag", "output_flag"):
+                value = provider.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(f"providers.{provider_name}.{key} must be a non-empty string")
 
-        extra_args = provider.get("extra_args")
-        if not isinstance(extra_args, list) or any(not isinstance(item, str) for item in extra_args):
-            errors.append("provider.extra_args must be a list of strings")
+            prompt_via_stdin = provider.get("prompt_via_stdin")
+            if not isinstance(prompt_via_stdin, bool):
+                errors.append(f"providers.{provider_name}.prompt_via_stdin must be a boolean")
 
-        profile_map = provider.get("profile_map")
-        if not isinstance(profile_map, dict) or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in profile_map.items()
-        ):
-            errors.append("provider.profile_map must be an object of string keys and string values")
+            extra_args = provider.get("extra_args")
+            if not isinstance(extra_args, list) or any(not isinstance(item, str) for item in extra_args):
+                errors.append(f"providers.{provider_name}.extra_args must be a list of strings")
+
+            profile_map = provider.get("profile_map")
+            if not isinstance(profile_map, dict) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in profile_map.items()
+            ):
+                errors.append(
+                    f"providers.{provider_name}.profile_map must be an object of string keys and string values"
+                )
+
+    active_provider = payload.get("active_provider")
+    if not isinstance(active_provider, str) or not active_provider.strip():
+        errors.append("active_provider must be a non-empty string")
+    elif isinstance(providers, dict) and active_provider not in providers:
+        errors.append("active_provider must be one of providers keys")
 
     efforts = payload.get("efforts")
     if not isinstance(efforts, dict):

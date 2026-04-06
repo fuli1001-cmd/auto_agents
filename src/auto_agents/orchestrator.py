@@ -35,6 +35,7 @@ from .models import (
     AgentRequest,
     AgentUsage,
     DOCUMENT_LANGUAGE_OPTIONS,
+    ProviderConfig,
     ProjectConfig,
     RunState,
     STAGE_ORDER,
@@ -60,8 +61,40 @@ class Orchestrator:
         self._user_input_fn = user_input_fn
 
     @staticmethod
-    def init_project(project_root: Path, name: str, provider_kind: str, doc_language: str = "en") -> Path:
-        root = bootstrap_project(project_root, name, provider_kind, doc_language=doc_language)
+    def init_project(
+        project_root: Path,
+        name: str,
+        provider_kind: Optional[str] = None,
+        doc_language: str = "en",
+    ) -> Path:
+        root = bootstrap_project(project_root, name, doc_language=doc_language)
+        # Keep backward compatibility for API callers still passing provider_kind,
+        # while CLI-level provider selection now happens at run time.
+        if provider_kind:
+            config = load_project_config(root)
+            if provider_kind not in config.providers:
+                if provider_kind == "mock":
+                    config.providers[provider_kind] = ProviderConfig(
+                        kind="mock",
+                        binary="mock",
+                        profile_map={"balanced": "mock", "deep": "mock", "max": "mock"},
+                        extra_args=[],
+                        cwd_flag="-C",
+                        prompt_via_stdin=True,
+                        output_flag="-o",
+                    )
+                else:
+                    config.providers[provider_kind] = ProviderConfig(
+                        kind=provider_kind,
+                        binary=provider_kind,
+                        profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
+                        extra_args=[],
+                        cwd_flag="-C",
+                        prompt_via_stdin=True,
+                        output_flag="-o",
+                    )
+            config.active_provider = provider_kind
+            save_project_config(root, config)
         ensure_repo(root, auto_init=True)
         return root
 
@@ -133,10 +166,13 @@ class Orchestrator:
         skip_validate: bool = False,
         print_agent_output: bool = False,
         doc_language: Optional[str] = None,
+        provider_kind: Optional[str] = None,
     ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
         self._print_agent_output = print_agent_output
         try:
+            if provider_kind is not None:
+                self._set_active_provider(provider_kind)
             if doc_language is not None:
                 self._set_document_language(doc_language)
             state = load_run_state(self.project_root)
@@ -1557,6 +1593,13 @@ class Orchestrator:
             return
         self.config.docs.language = language
         save_project_config(self.project_root, self.config)
+
+    def _set_active_provider(self, provider_kind: str) -> None:
+        if self.config.active_provider == provider_kind:
+            return
+        self.config.set_active_provider(provider_kind)
+        save_project_config(self.project_root, self.config)
+        self.adapter = self._build_adapter(self.config)
 
     def _document_language_instruction(self) -> str:
         if self.config.docs.language == "zh":

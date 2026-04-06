@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from .config import supported_provider_kinds
 from .orchestrator import Orchestrator
 from .validation import validation_report
 
@@ -27,11 +28,6 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument(
         "--name",
         help="Project name. Defaults to the final directory name from --project.",
-    )
-    init_parser.add_argument(
-        "--provider",
-        default="codex",
-        help="Provider kind. Defaults to codex. Built-in: codex, mock, or a shell-wrapper kind.",
     )
     init_parser.add_argument(
         "--doc-language",
@@ -66,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--print-agent-output",
         action="store_true",
         help="Print each agent stage output to stderr as it completes.",
+    )
+    run_parser.add_argument(
+        "--provider",
+        choices=supported_provider_kinds(),
+        help="Override provider for this run and persist it as the new default provider.",
     )
     run_parser.add_argument(
         "--doc-language",
@@ -107,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "init":
         project_root = Path(args.project)
         name = args.name or _default_project_name(project_root)
-        root = Orchestrator.init_project(project_root, name, args.provider, doc_language=args.doc_language)
+        root = Orchestrator.init_project(project_root, name, doc_language=args.doc_language)
         print(root)
         return 0
 
@@ -135,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
                 skip_validate=bool(args.skip_validate),
                 print_agent_output=bool(args.print_agent_output),
                 doc_language=args.doc_language,
+                provider_kind=args.provider,
             )
             print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
             return 0

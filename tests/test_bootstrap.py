@@ -30,20 +30,25 @@ class BootstrapTests(unittest.TestCase):
             self.assertIn("node_modules/", gitignore)
             config = load_project_config(project_root)
             self.assertEqual(config.docs.language, "en")
+            self.assertEqual(config.active_provider, "mock")
+            self.assertIn("codex", config.providers)
+            self.assertIn("copilot-cli", config.providers)
+            self.assertIn("mock", config.providers)
 
-    def test_init_project_with_copilot_cli_bootstraps_profile_map(self) -> None:
+    def test_init_project_bootstraps_copilot_cli_profile_map(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
-            Orchestrator.init_project(project_root, "demo", "copilot-cli")
+            Orchestrator.init_project(project_root, "demo")
 
             self.assertTrue(auto_dir(project_root).exists())
             self.assertTrue(config_path(project_root).exists())
             config = load_project_config(project_root)
-            self.assertEqual(config.provider.kind, "copilot-cli")
-            self.assertEqual(config.provider.binary, "copilot-cli")
-            self.assertEqual(config.provider.profile_map["balanced"], "balanced")
-            self.assertEqual(config.provider.profile_map["deep"], "deep")
-            self.assertEqual(config.provider.profile_map["max"], "max")
+            copilot = config.providers["copilot-cli"]
+            self.assertEqual(copilot.kind, "copilot-cli")
+            self.assertEqual(copilot.binary, "copilot-cli")
+            self.assertEqual(copilot.profile_map["balanced"], "balanced")
+            self.assertEqual(copilot.profile_map["deep"], "deep")
+            self.assertEqual(copilot.profile_map["max"], "max")
 
 
 if __name__ == "__main__":

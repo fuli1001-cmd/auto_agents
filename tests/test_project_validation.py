@@ -27,15 +27,27 @@ class ProjectValidationTests(unittest.TestCase):
     def test_validate_project_config_payload_rejects_bad_effort_and_template(self) -> None:
         payload = {
             "project_name": "demo",
-            "provider": {
-                "kind": "codex",
-                "binary": "codex",
-                "profile_map": {},
-                "extra_args": [],
-                "cwd_flag": "-C",
-                "prompt_via_stdin": True,
-                "output_flag": "-o",
+            "providers": {
+                "codex": {
+                    "kind": "codex",
+                    "binary": "codex",
+                    "profile_map": {},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
+                "copilot-cli": {
+                    "kind": "copilot-cli",
+                    "binary": "copilot-cli",
+                    "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
             },
+            "active_provider": "codex",
             "docs": {
                 "language": "jp",
             },
@@ -79,15 +91,27 @@ class ProjectValidationTests(unittest.TestCase):
     def test_validate_project_config_payload_rejects_non_isolated_python_commands(self) -> None:
         payload = {
             "project_name": "demo",
-            "provider": {
-                "kind": "codex",
-                "binary": "codex",
-                "profile_map": {"balanced": "m", "deep": "h"},
-                "extra_args": [],
-                "cwd_flag": "-C",
-                "prompt_via_stdin": True,
-                "output_flag": "-o",
+            "providers": {
+                "codex": {
+                    "kind": "codex",
+                    "binary": "codex",
+                    "profile_map": {"balanced": "m", "deep": "h", "max": "xh"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
+                "copilot-cli": {
+                    "kind": "copilot-cli",
+                    "binary": "copilot-cli",
+                    "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
             },
+            "active_provider": "codex",
             "docs": {
                 "language": "en",
             },
@@ -131,15 +155,27 @@ class ProjectValidationTests(unittest.TestCase):
     def test_validate_project_config_payload_accepts_isolated_python_commands(self) -> None:
         payload = {
             "project_name": "demo",
-            "provider": {
-                "kind": "codex",
-                "binary": "codex",
-                "profile_map": {"balanced": "m", "deep": "h"},
-                "extra_args": [],
-                "cwd_flag": "-C",
-                "prompt_via_stdin": True,
-                "output_flag": "-o",
+            "providers": {
+                "codex": {
+                    "kind": "codex",
+                    "binary": "codex",
+                    "profile_map": {"balanced": "m", "deep": "h", "max": "xh"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
+                "copilot-cli": {
+                    "kind": "copilot-cli",
+                    "binary": "copilot-cli",
+                    "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
             },
+            "active_provider": "codex",
             "docs": {
                 "language": "zh",
             },
@@ -178,18 +214,30 @@ class ProjectValidationTests(unittest.TestCase):
 
         self.assertEqual(validate_project_config_payload(payload), [])
 
-    def test_validate_project_config_payload_accepts_legacy_config_without_docs(self) -> None:
+    def test_validate_project_config_payload_accepts_config_without_docs(self) -> None:
         payload = {
             "project_name": "demo",
-            "provider": {
-                "kind": "codex",
-                "binary": "codex",
-                "profile_map": {"balanced": "m", "deep": "h"},
-                "extra_args": [],
-                "cwd_flag": "-C",
-                "prompt_via_stdin": True,
-                "output_flag": "-o",
+            "providers": {
+                "codex": {
+                    "kind": "codex",
+                    "binary": "codex",
+                    "profile_map": {"balanced": "m", "deep": "h", "max": "xh"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
+                "copilot-cli": {
+                    "kind": "copilot-cli",
+                    "binary": "copilot-cli",
+                    "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
             },
+            "active_provider": "codex",
             "efforts": {
                 "clarify": "deep",
                 "design": "deep",
@@ -381,6 +429,31 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(exit_code, 1)
             self.assertFalse(payload["ok"])
             self.assertIn(str(project_root / "spec.md"), payload["error"])
+
+    def test_cli_run_provider_override_persists_as_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = main(
+                    [
+                        "run",
+                        "--project",
+                        str(project_root),
+                        "--spec-file",
+                        str(spec_file),
+                        "--provider",
+                        "copilot-cli",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            config = load_project_config(project_root)
+            self.assertEqual(config.active_provider, "copilot-cli")
 
     def test_cli_approve_defaults_to_pending_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

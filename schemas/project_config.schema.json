@@ -5,7 +5,8 @@
   "type": "object",
   "required": [
     "project_name",
-    "provider",
+    "providers",
+    "active_provider",
     "efforts",
     "gates",
     "git",
@@ -17,51 +18,108 @@
       "type": "string",
       "minLength": 1
     },
-    "provider": {
+    "providers": {
       "type": "object",
-      "required": [
-        "kind",
-        "binary",
-        "profile_map",
-        "extra_args",
-        "cwd_flag",
-        "prompt_via_stdin",
-        "output_flag"
-      ],
+      "required": ["codex", "copilot-cli"],
       "properties": {
-        "kind": {
-          "type": "string",
-          "minLength": 1
-        },
-        "binary": {
-          "type": "string",
-          "minLength": 1
-        },
-        "profile_map": {
+        "codex": {
           "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
+          "required": [
+            "kind",
+            "binary",
+            "profile_map",
+            "extra_args",
+            "cwd_flag",
+            "prompt_via_stdin",
+            "output_flag"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "codex"
+            },
+            "binary": {
+              "type": "string",
+              "minLength": 1
+            },
+            "profile_map": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "extra_args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "cwd_flag": {
+              "type": "string",
+              "minLength": 1
+            },
+            "prompt_via_stdin": {
+              "type": "boolean"
+            },
+            "output_flag": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": true
         },
-        "extra_args": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "cwd_flag": {
-          "type": "string",
-          "minLength": 1
-        },
-        "prompt_via_stdin": {
-          "type": "boolean"
-        },
-        "output_flag": {
-          "type": "string",
-          "minLength": 1
+        "copilot-cli": {
+          "type": "object",
+          "required": [
+            "kind",
+            "binary",
+            "profile_map",
+            "extra_args",
+            "cwd_flag",
+            "prompt_via_stdin",
+            "output_flag"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "copilot-cli"
+            },
+            "binary": {
+              "type": "string",
+              "minLength": 1
+            },
+            "profile_map": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "extra_args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "cwd_flag": {
+              "type": "string",
+              "minLength": 1
+            },
+            "prompt_via_stdin": {
+              "type": "boolean"
+            },
+            "output_flag": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": true
         }
       },
-      "additionalProperties": true
+      "additionalProperties": false
+    },
+    "active_provider": {
+      "type": "string",
+      "enum": ["codex", "copilot-cli"]
     },
     "docs": {
       "type": "object",

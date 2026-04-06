@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 STAGE_ORDER = ["clarify", "design", "plan", "implement", "verify", "readme"]
 APPROVAL_ORDER = ["requirements", "architecture", "release"]
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
+SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli")
 APPROVAL_BY_STAGE = {
     "clarify": "requirements",
     "design": "architecture",
@@ -75,7 +76,7 @@ class ProviderConfig:
             kind=str(data.get("kind", "codex")),
             binary=str(data.get("binary", "codex")),
             profile_map={str(k): str(v) for k, v in dict(data.get("profile_map", {})).items()}
-            or {"balanced": "m", "deep": "h"},
+            or {"balanced": "m", "deep": "h", "max": "xh"},
             extra_args=[str(item) for item in data.get("extra_args", [])],
             cwd_flag=str(data.get("cwd_flag", "-C")),
             prompt_via_stdin=bool(data.get("prompt_via_stdin", True)),
@@ -184,7 +185,29 @@ class RetryConfig:
 @dataclass
 class ProjectConfig:
     project_name: str
-    provider: ProviderConfig = field(default_factory=ProviderConfig)
+    providers: Dict[str, ProviderConfig] = field(
+        default_factory=lambda: {
+            "codex": ProviderConfig(
+                kind="codex",
+                binary="codex",
+                profile_map={"balanced": "m", "deep": "h", "max": "xh"},
+                extra_args=[],
+                cwd_flag="-C",
+                prompt_via_stdin=True,
+                output_flag="-o",
+            ),
+            "copilot-cli": ProviderConfig(
+                kind="copilot-cli",
+                binary="copilot-cli",
+                profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
+                extra_args=[],
+                cwd_flag="-C",
+                prompt_via_stdin=True,
+                output_flag="-o",
+            ),
+        }
+    )
+    active_provider: str = "codex"
     docs: DocsConfig = field(default_factory=DocsConfig)
     efforts: Dict[str, str] = field(
         default_factory=lambda: {
@@ -203,9 +226,29 @@ class ProjectConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProjectConfig":
+        providers_payload = data.get("providers")
+        active_provider = str(data.get("active_provider", "")).strip()
+        if not isinstance(providers_payload, dict) or not active_provider:
+            raise ValueError(
+                "Invalid config format: expected 'providers' and 'active_provider'. "
+                "Re-run 'auto_agents init' to regenerate the config."
+            )
+
+        providers = {
+            str(kind): ProviderConfig.from_dict(dict(raw))
+            for kind, raw in providers_payload.items()
+            if isinstance(raw, dict)
+        }
+        if active_provider not in providers:
+            raise ValueError(
+                f"Invalid config format: active_provider '{active_provider}' is not defined in providers. "
+                "Re-run 'auto_agents init' to regenerate the config."
+            )
+
         return cls(
             project_name=str(data.get("project_name", "unnamed-project")),
-            provider=ProviderConfig.from_dict(dict(data.get("provider", {}))),
+            providers=providers,
+            active_provider=active_provider,
             docs=DocsConfig.from_dict(dict(data.get("docs", {}))),
             efforts={str(k): str(v) for k, v in dict(data.get("efforts", {})).items()}
             or {
@@ -232,7 +275,8 @@ class ProjectConfig:
     def to_dict(self) -> Dict[str, object]:
         return {
             "project_name": self.project_name,
-            "provider": self.provider.to_dict(),
+            "providers": {kind: provider.to_dict() for kind, provider in self.providers.items()},
+            "active_provider": self.active_provider,
             "docs": self.docs.to_dict(),
             "efforts": dict(self.efforts),
             "gates": self.gates.to_dict(),
@@ -240,6 +284,21 @@ class ProjectConfig:
             "approvals": self.approvals.to_dict(),
             "retries": self.retries.to_dict(),
         }
+
+    @property
+    def provider(self) -> ProviderConfig:
+        provider = self.providers.get(self.active_provider)
+        if provider is None:
+            raise ValueError(
+                f"Configured active_provider '{self.active_provider}' is missing from providers."
+            )
+        return provider
+
+    def set_active_provider(self, provider_kind: str) -> None:
+        if provider_kind not in self.providers:
+            supported = ", ".join(sorted(self.providers.keys()))
+            raise ValueError(f"Unsupported provider '{provider_kind}'. Supported providers: {supported}")
+        self.active_provider = provider_kind
 
 
 @dataclass

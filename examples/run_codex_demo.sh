@@ -12,13 +12,14 @@ if ! command -v codex >/dev/null 2>&1; then
 fi
 
 rm -rf "$PROJECT_DIR"
-python3 -m auto_agents init --project "$PROJECT_DIR" --name codex-demo --provider codex >/dev/null
+python3 -m auto_agents init --project "$PROJECT_DIR" --name codex-demo >/dev/null
 cp "$SPEC_SOURCE" "$SPEC_TARGET"
 
 python3 -m auto_agents validate --project "$PROJECT_DIR"
 python3 -m auto_agents run \
   --project "$PROJECT_DIR" \
   --spec-file "$SPEC_TARGET" \
+  --provider codex \
   --auto-approve \
   --max-tasks 1
 
