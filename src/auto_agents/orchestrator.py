@@ -527,10 +527,14 @@ class Orchestrator:
                     text = sys.stdin.read()
                 except EOFError:
                     text = ""
+                except UnicodeDecodeError:
+                    # stdin encoding doesn't match actual bytes; re-read from
+                    # the underlying binary buffer with lossy UTF-8 decoding.
+                    text = sys.stdin.buffer.read().decode("utf-8", errors="replace")
                 # Reopen stdin from the terminal so subsequent reads work.
                 try:
                     tty = "/dev/tty" if os.path.exists("/dev/tty") else "CON"
-                    sys.stdin = open(tty, "r", encoding="utf-8")
+                    sys.stdin = open(tty, "r", encoding="utf-8", errors="surrogateescape")
                 except OSError:
                     pass
                 # Fix surrogate escapes from Windows console encoding mismatches
