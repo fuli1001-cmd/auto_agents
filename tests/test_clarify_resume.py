@@ -1,0 +1,181 @@
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from auto_agents.config import conversation_history_path, load_run_state, save_run_state
+from auto_agents.io_utils import write_text
+from auto_agents.models import AgentResult
+from auto_agents.orchestrator import Orchestrator
+
+
+class ClarifyResumeTests(unittest.TestCase):
+    """Test that crash-resume during clarify preserves conversation history."""
+
+    def _setup_project(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        project_root = Path(td.name) / "demo"
+        Orchestrator.init_project(project_root, "demo", "mock")
+        spec_file = project_root / "spec.md"
+        spec_file.write_text("# Idea\nBuild something.", encoding="utf-8")
+        return project_root, spec_file
+
+    def test_crash_resume_with_ready_to_generate_confirms_generation(self):
+        """When history ends with READY_TO_GENERATE, the next run should
+        resume to confirmation (not start fresh) and generate the brief."""
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+
+        state = load_run_state(project_root)
+
+        # Simulate a previous run that reached READY_TO_GENERATE but crashed
+        history = [
+            {"role": "user", "content": "I want feature X"},
+            {"role": "agent", "content": "Got it. Any constraints?"},
+            {"role": "user", "content": "No constraints."},
+            {"role": "agent", "content": "Summary of requirements.\nREADY_TO_GENERATE"},
+        ]
+        history_path = conversation_history_path(project_root, state.run_id)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(history_path, json.dumps(history, ensure_ascii=False))
+
+        # User confirms generation on resume
+        orchestrator._user_input_fn = lambda prompt: "y"
+
+        with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+            mock_run.return_value = AgentResult(
+                ok=True, command=[], output_path=Path("."),
+                summary="Generated brief.", stdout="",
+            )
+            state = orchestrator._run_interactive_clarify(state, spec_file)
+
+            # Should have called the generate step, not a conversation round
+            self.assertEqual(mock_run.call_count, 1)
+            call_kwargs = mock_run.call_args.kwargs
+            self.assertEqual(call_kwargs["stage_key"], "clarify-generate")
+
+        # History should still have all 4 original messages
+        saved_history = json.loads(history_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(saved_history), 4)
+
+    def test_crash_resume_with_ready_to_generate_user_rejects(self):
+        """When user rejects at resumed confirmation, the conversation
+        loop should start with the user's feedback appended."""
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+
+        state = load_run_state(project_root)
+
+        history = [
+            {"role": "user", "content": "Build a CLI tool."},
+            {"role": "agent", "content": "Understood.\nREADY_TO_GENERATE"},
+        ]
+        history_path = conversation_history_path(project_root, state.run_id)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(history_path, json.dumps(history, ensure_ascii=False))
+
+        # First call: reject. Second call: provide feedback.
+        call_count = [0]
+        def mock_input(prompt):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return "n"
+            if call_count[0] == 2:
+                return "Add database support."
+            return ""
+        orchestrator._user_input_fn = mock_input
+
+        with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+            mock_run.return_value = AgentResult(
+                ok=True, command=[], output_path=Path("."),
+                summary="READY_TO_GENERATE", stdout="",
+            )
+            state = orchestrator._run_interactive_clarify(state, spec_file)
+
+        # History should have the original 2 messages + user feedback + new agent + generate
+        saved_history = json.loads(history_path.read_text(encoding="utf-8"))
+        user_msgs = [m for m in saved_history if m.get("role") == "user"]
+        self.assertTrue(
+            any("Add database support." in m.get("content", "") for m in user_msgs),
+            "User's rejection feedback should be in the history"
+        )
+
+    def test_rejection_reentry_clears_history_with_rtg(self):
+        """When re-entering clarify after rejection, history with
+        READY_TO_GENERATE should be cleared (starting fresh)."""
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+
+        state = load_run_state(project_root)
+        state.rejected_stage = "clarify"
+        state.rejection_reason = "Please add auth."
+
+        history = [
+            {"role": "user", "content": "Original discussion."},
+            {"role": "agent", "content": "Plan.\nREADY_TO_GENERATE"},
+        ]
+        history_path = conversation_history_path(project_root, state.run_id)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(history_path, json.dumps(history, ensure_ascii=False))
+
+        orchestrator._user_input_fn = lambda prompt: ""
+
+        with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+            mock_run.return_value = AgentResult(
+                ok=True, command=[], output_path=Path("."),
+                summary="READY_TO_GENERATE", stdout="",
+            )
+            state = orchestrator._run_interactive_clarify(state, spec_file)
+
+        # The old conversation should have been cleared; history should
+        # start with the rejection feedback, not old messages.
+        saved_history = json.loads(history_path.read_text(encoding="utf-8"))
+        old_msgs = [m for m in saved_history if m.get("content") == "Original discussion."]
+        self.assertEqual(len(old_msgs), 0, "Old history should be cleared on rejection re-entry")
+
+    def test_non_rtg_trailing_agent_resumes_normally(self):
+        """When last agent message does NOT have READY_TO_GENERATE,
+        the normal trailing-agent resume logic should apply."""
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+
+        state = load_run_state(project_root)
+
+        history = [
+            {"role": "user", "content": "Build a web app."},
+            {"role": "agent", "content": "What framework?"},
+        ]
+        history_path = conversation_history_path(project_root, state.run_id)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(history_path, json.dumps(history, ensure_ascii=False))
+
+        call_count = [0]
+        def mock_input(prompt):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return "Use Flask."
+            return ""
+        orchestrator._user_input_fn = mock_input
+
+        with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+            mock_run.return_value = AgentResult(
+                ok=True, command=[], output_path=Path("."),
+                summary="READY_TO_GENERATE", stdout="",
+            )
+            state = orchestrator._run_interactive_clarify(state, spec_file)
+
+        saved_history = json.loads(history_path.read_text(encoding="utf-8"))
+        user_msgs = [m for m in saved_history if m.get("role") == "user"]
+        self.assertTrue(
+            any("Use Flask." in m.get("content", "") for m in user_msgs),
+            "User's reply to resumed non-RTG agent message should be in history"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

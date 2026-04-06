@@ -334,22 +334,20 @@ class Orchestrator:
             except Exception:
                 pass
 
-        # If a previous clarify run already reached READY_TO_GENERATE but
-        # we are re-entering clarify (stage_summaries has no "clarify"),
-        # the old conversation is stale.  Clear it so the agent starts a
-        # fresh conversation for the new scope.
-        if history and any(
-            isinstance(msg, dict)
-            and str(msg.get("role", "")).lower() in ("agent", "assistant")
-            and "READY_TO_GENERATE" in str(msg.get("content", ""))
-            for msg in history
-        ):
-            print("[clarify] Previous conversation completed; starting fresh.", file=sys.stderr)
-            history = []
-            write_text(history_path, "[]")
-
         post_rejection = False
         if state.rejected_stage == "clarify" and state.rejection_reason:
+            # Rejection re-entry: the old conversation (which may have
+            # reached READY_TO_GENERATE) is stale.  Clear it so the agent
+            # starts a fresh conversation for the new scope.
+            if history and any(
+                isinstance(msg, dict)
+                and str(msg.get("role", "")).lower() in ("agent", "assistant")
+                and "READY_TO_GENERATE" in str(msg.get("content", ""))
+                for msg in history
+            ):
+                print("[clarify] Previous conversation completed; starting fresh.", file=sys.stderr)
+                history = []
+                write_text(history_path, "[]")
             history.append({
                 "role": "user",
                 "content": f"The previous output was rejected. Please address this feedback:\n{state.rejection_reason}"
@@ -366,113 +364,152 @@ class Orchestrator:
                 return "agent"
             return role
 
-        # Resume interrupted conversation: if trailing history entries are from
-        # the agent (e.g. process crashed before user reply was saved), strip
-        # those tails (including spurious READY_TO_GENERATE reruns), replay the
-        # last substantive agent message, and collect a fresh user reply.
-        if history and _history_role(history[-1]) == "agent":
-            trailing = []
-            while history and _history_role(history[-1]) == "agent":
-                trailing.insert(0, history.pop())
-            replay_msg = None
-            for msg in trailing:
+        # Detect crash-resume: the last agent message has READY_TO_GENERATE
+        # but the brief was never generated (we wouldn't be here otherwise).
+        # Instead of discarding the conversation, re-prompt the user.
+        resume_to_confirm = False
+        if not post_rejection and history:
+            for msg in reversed(history):
                 if not isinstance(msg, dict):
                     continue
-                content = str(msg.get("content", ""))
-                if "READY_TO_GENERATE" not in content:
-                    replay_msg = {"role": "agent", "content": content}
+                role = str(msg.get("role", "")).lower()
+                if role in ("agent", "assistant"):
+                    if "READY_TO_GENERATE" in str(msg.get("content", "")):
+                        resume_to_confirm = True
                     break
-            if replay_msg:
-                history.append(replay_msg)
+
+        skip_to_generation = False
+
+        if resume_to_confirm:
+            # Show the agent's last reply (minus the marker) and re-ask.
+            last_agent_content = ""
+            for msg in reversed(history):
+                if isinstance(msg, dict) and str(msg.get("role", "")).lower() in ("agent", "assistant"):
+                    last_agent_content = str(msg.get("content", ""))
+                    break
+            display = last_agent_content.replace("READY_TO_GENERATE", "").strip()
+            if display:
                 print("\n[Resuming previous conversation]", file=sys.stderr)
                 print("\nAgent:", file=sys.stderr)
-                print(replay_msg["content"], file=sys.stderr)
+                print(display, file=sys.stderr)
+            print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
+            user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
+            if user_conf.strip().lower() not in ("n", "no"):
+                skip_to_generation = True
+            else:
+                user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
+                if user_reply.strip():
+                    history.append({"role": "user", "content": user_reply})
+                    write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+        else:
+            # Resume interrupted conversation: if trailing history entries
+            # are from the agent (e.g. process crashed before user reply was
+            # saved), replay the last substantive agent message and collect
+            # a fresh user reply.
+            if history and _history_role(history[-1]) == "agent":
+                trailing = []
+                while history and _history_role(history[-1]) == "agent":
+                    trailing.insert(0, history.pop())
+                replay_msg = None
+                for msg in trailing:
+                    if not isinstance(msg, dict):
+                        continue
+                    content = str(msg.get("content", ""))
+                    if "READY_TO_GENERATE" not in content:
+                        replay_msg = {"role": "agent", "content": content}
+                        break
+                if replay_msg:
+                    history.append(replay_msg)
+                    print("\n[Resuming previous conversation]", file=sys.stderr)
+                    print("\nAgent:", file=sys.stderr)
+                    print(replay_msg["content"], file=sys.stderr)
+                    user_reply = self._prompt_user("\nYour reply: ", multiline=True)
+                    if user_reply.strip():
+                        history.append({"role": "user", "content": user_reply})
+                    else:
+                        history.append({"role": "user", "content": "I have nothing to add. Please proceed to generate if you are ready."})
+                write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+
+        if not skip_to_generation:
+            print("Entering interactive clarify session, please wait for the agent to analyze the spec...", file=sys.stderr, flush=True)
+
+            max_rounds = 15
+            rounds = 0
+
+            while rounds < max_rounds:
+                rounds += 1
+                prompt_lines = [
+                    f"Project root: {self.project_root}",
+                    "Read the input spec from: " + str(spec_file),
+                    "If the project repository already contains an active codebase and a history of completed tasks, please review them to understand the current progress before discussing the next features.",
+                    "You are an expert product manager analyzing the spec.",
+                    "Your goal is to extract the target scope, requirements, constraints, and non-goals.",
+                    "Ask the user questions to clarify the requirements if needed.",
+                    "If the spec is already well-defined, ask for confirmation.",
+                    self._document_language_instruction(),
+                    "Only output 'READY_TO_GENERATE' on a line by itself at the very end when ALL of the following are true: "
+                    "(1) you have explicitly answered every question in the user's most recent message, "
+                    "(2) the user's last reply does not contain any unanswered questions or requests for clarification, and "
+                    "(3) you have gathered sufficient information to write the project brief. "
+                    "Do NOT output 'READY_TO_GENERATE' if the user asked anything that you have not yet fully answered.",
+                    "\n--- Conversation History ---",
+                ]
+
+                for msg in history:
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                    prompt_lines.append(f"\n[{role.upper()}]:\n{content}")
+
+                prompt = "\n".join(prompt_lines)
+
+                effort = self._effort_for_spec_stage("clarify", str(self._analyze_spec(spec_file)["kind"]))
+
+                result = self._run_agent_with_retries(
+                    state=state,
+                    stage="clarify",
+                    stage_key=f"clarify-conv-{len(history)}",
+                    prompt=prompt,
+                    effort=effort,
+                )
+
+                reply = result.summary.strip()
+                if not reply:
+                    reply = result.stdout.strip()
+
+                history.append({"role": "agent", "content": reply})
+                write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+
+                if "READY_TO_GENERATE" in reply and not post_rejection:
+                    print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
+                    user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
+
+                    if user_conf.strip().lower() not in ("n", "no"):
+                        break
+                    else:
+                        user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
+                        if user_reply.strip():
+                            history.append({"role": "user", "content": user_reply})
+                            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+                        continue
+
+                # After rejection, show the agent's response (stripping the
+                # READY_TO_GENERATE marker) and force user interaction so the
+                # user can review how the agent addressed the feedback.
+                display_reply = reply.replace("READY_TO_GENERATE", "").strip() if post_rejection else reply
+                post_rejection = False
+
+                print("\nAgent:", file=sys.stderr)
+                print(display_reply, file=sys.stderr)
+
                 user_reply = self._prompt_user("\nYour reply: ", multiline=True)
+
                 if user_reply.strip():
                     history.append({"role": "user", "content": user_reply})
                 else:
                     history.append({"role": "user", "content": "I have nothing to add. Please proceed to generate if you are ready."})
-            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
 
-        print("Entering interactive clarify session, please wait for the agent to analyze the spec...", file=sys.stderr, flush=True)
-        
-        max_rounds = 15
-        rounds = 0
-        
-        while rounds < max_rounds:
-            rounds += 1
-            prompt_lines = [
-                f"Project root: {self.project_root}",
-                "Read the input spec from: " + str(spec_file),
-                "If the project repository already contains an active codebase and a history of completed tasks, please review them to understand the current progress before discussing the next features.",
-                "You are an expert product manager analyzing the spec.",
-                "Your goal is to extract the target scope, requirements, constraints, and non-goals.",
-                "Ask the user questions to clarify the requirements if needed.",
-                "If the spec is already well-defined, ask for confirmation.",
-                self._document_language_instruction(),
-                "Only output 'READY_TO_GENERATE' on a line by itself at the very end when ALL of the following are true: "
-                "(1) you have explicitly answered every question in the user's most recent message, "
-                "(2) the user's last reply does not contain any unanswered questions or requests for clarification, and "
-                "(3) you have gathered sufficient information to write the project brief. "
-                "Do NOT output 'READY_TO_GENERATE' if the user asked anything that you have not yet fully answered.",
-                "\n--- Conversation History ---",
-            ]
-            
-            for msg in history:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                prompt_lines.append(f"\n[{role.upper()}]:\n{content}")
-                
-            prompt = "\n".join(prompt_lines)
-            
-            effort = self._effort_for_spec_stage("clarify", str(self._analyze_spec(spec_file)["kind"]))
-            
-            result = self._run_agent_with_retries(
-                state=state,
-                stage="clarify",
-                stage_key=f"clarify-conv-{len(history)}",
-                prompt=prompt,
-                effort=effort,
-            )
-            
-            reply = result.summary.strip()
-            if not reply:
-                reply = result.stdout.strip()
-                
-            history.append({"role": "agent", "content": reply})
-            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-
-            if "READY_TO_GENERATE" in reply and not post_rejection:
-                print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
-                user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
-
-                if user_conf.strip().lower() not in ("n", "no"):
-                    break
-                else:
-                    user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
-                    if user_reply.strip():
-                        history.append({"role": "user", "content": user_reply})
-                        write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-                    continue
-
-            # After rejection, show the agent's response (stripping the
-            # READY_TO_GENERATE marker) and force user interaction so the
-            # user can review how the agent addressed the feedback.
-            display_reply = reply.replace("READY_TO_GENERATE", "").strip() if post_rejection else reply
-            post_rejection = False
-
-            print("\nAgent:", file=sys.stderr)
-            print(display_reply, file=sys.stderr)
-            
-            user_reply = self._prompt_user("\nYour reply: ", multiline=True)
-            
-            if user_reply.strip():
-                history.append({"role": "user", "content": user_reply})
-            else:
-                history.append({"role": "user", "content": "I have nothing to add. Please proceed to generate if you are ready."})
-            
-            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-            print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
+                write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+                print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
                 
         # Generate the actual project brief
         print("\nGenerating project_brief.md, please wait...", file=sys.stderr, flush=True)
