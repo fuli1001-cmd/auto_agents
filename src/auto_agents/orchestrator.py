@@ -962,7 +962,85 @@ class Orchestrator:
         return tasks
 
     def _run_readme(self, state: RunState, spec_file: Path) -> RunState:
+        import json as _json
+        from .config import run_path as _run_path
+
+        history_file = _run_path(self.project_root, state.run_id) / "readme_conversation.json"
+        history: List[Dict[str, str]] = []
+        if history_file.exists():
+            try:
+                history = _json.loads(read_text(history_file))
+            except Exception:
+                pass
+
+        # --- conversation loop: propose topics, collect feedback, repeat ---
+        max_rounds = 10
+        round_num = 0
+
+        # First round (or resume): generate initial proposal if no history yet
+        if not history:
+            print("Entering README preparation, please wait for the agent to analyze the project...", file=sys.stderr, flush=True)
+
+            proposal_prompt = self._build_readme_proposal_prompt(spec_file, history)
+            result = self._run_agent_with_retries(
+                state=state,
+                stage="readme",
+                stage_key="readme-propose",
+                prompt=proposal_prompt,
+            )
+            reply = (result.summary or result.stdout).strip()
+            history.append({"role": "agent", "content": reply})
+            write_text(history_file, _json.dumps(history, indent=2, ensure_ascii=False))
+        elif history[-1].get("role") == "user":
+            # Resuming after crash: user gave feedback but agent hasn't replied yet.
+            # Fall through to the loop which will send a new proposal round.
+            pass
+
+        while round_num < max_rounds:
+            round_num += 1
+            # Show the latest agent message
+            last_agent_msg = ""
+            for msg in reversed(history):
+                if msg.get("role") == "agent":
+                    last_agent_msg = msg.get("content", "")
+                    break
+
+            print("\nAgent:", file=sys.stderr)
+            print(last_agent_msg, file=sys.stderr)
+
+            answer = self._prompt_user(
+                "\nDo you have anything to add or modify? (y/n) [n]: ", default="n"
+            ).strip().lower()
+            if answer not in ("y", "yes"):
+                break
+
+            user_input = self._prompt_user("Please describe what to add or change: ", multiline=True).strip()
+            if not user_input:
+                break
+            history.append({"role": "user", "content": user_input})
+            write_text(history_file, _json.dumps(history, indent=2, ensure_ascii=False))
+
+            print("\nAgent is updating the plan, please wait...", file=sys.stderr, flush=True)
+            proposal_prompt = self._build_readme_proposal_prompt(spec_file, history)
+            result = self._run_agent_with_retries(
+                state=state,
+                stage="readme",
+                stage_key=f"readme-propose-{round_num}",
+                prompt=proposal_prompt,
+            )
+            reply = (result.summary or result.stdout).strip()
+            history.append({"role": "agent", "content": reply})
+            write_text(history_file, _json.dumps(history, indent=2, ensure_ascii=False))
+
+        # Collect all user messages as extra instructions for generation
+        user_extras = [msg["content"] for msg in history if msg.get("role") == "user"]
+
+        # --- generation phase ---
+        print("\nGenerating README.md, please wait...", file=sys.stderr, flush=True)
         prompt = self._build_prompt(stage="readme", spec_file=spec_file)
+        if user_extras:
+            prompt += "\n\nAdditional user instructions for the README:\n" + "\n".join(user_extras)
+
         result = self._run_agent_with_retries(
             state=state,
             stage="readme",
@@ -976,6 +1054,31 @@ class Orchestrator:
         if is_repo(self.project_root):
             commit_all(self.project_root, "docs: update README")
         return state
+
+    def _build_readme_proposal_prompt(self, spec_file: Path, history: List[Dict[str, str]] = None) -> str:
+        brief = docs_dir(self.project_root) / "project_brief.md"
+        architecture = docs_dir(self.project_root) / "architecture.md"
+        plan = task_plan_path(self.project_root)
+        lang_instruction = self._readme_language_instruction()
+        lines = [
+            f"Project root: {self.project_root}",
+            f"Read the input spec: {spec_file}",
+            f"Read the project brief: {brief}",
+            f"Read the architecture doc: {architecture}",
+            f"Read the task plan: {plan}",
+            "You are about to write a README for this project.",
+            "List the topics / sections you plan to include in the README, with a short description of each.",
+            "Do NOT write the README yet. Only outline the planned sections.",
+            lang_instruction,
+        ]
+        if history:
+            lines.append("\n--- Conversation History ---")
+            for msg in history:
+                role = msg.get("role", "user").upper()
+                content = msg.get("content", "")
+                lines.append(f"\n[{role}]:\n{content}")
+            lines.append("\nBased on the conversation above, present the UPDATED list of planned README sections.")
+        return "\n".join(lines)
 
     def _persist_tasks(self, tasks: Iterable[TaskSpec]) -> None:
         current_payload = load_task_plan(self.project_root)
@@ -1111,11 +1214,6 @@ class Orchestrator:
                 "  4. Configuration",
                 "  5. Usage",
                 "  6. Architecture",
-                "  7. Step-by-step manual testing guide: walk the reader through testing the main workflow",
-                "     with the features that are ALREADY implemented. Use numbered steps with runnable commands.",
-                "     If the currently implemented features are insufficient to complete the main workflow,",
-                "     do NOT omit this section — instead include it with a short explanation of what is missing",
-                "     and what partial steps can still be tested.",
                 "Base commands on files and entrypoints that actually exist in the repository.",
                 "Prefer concise sections, bullets, and runnable command examples.",
                 self._readme_spec_instruction(spec_kind),
