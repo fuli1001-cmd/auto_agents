@@ -88,12 +88,9 @@ class CopilotCliAdapter(AgentAdapter):
     def _build_command(self, request: AgentRequest) -> List[str]:
         command: List[str] = [self.config.binary]
 
-        # NOTE: copilot CLI does not support a -C / cwd flag.
+        # NOTE: copilot CLI does not support -C or -o flags.
         # Working directory is passed via subprocess.run(cwd=...).
-
-        # Output file
-        if self.config.output_flag:
-            command.extend([self.config.output_flag, str(request.output_path)])
+        # Output is captured from stdout and written to output_path by run().
 
         # Resolve profile → config-dir
         config_dir = self._resolve_config_dir(request.effort)

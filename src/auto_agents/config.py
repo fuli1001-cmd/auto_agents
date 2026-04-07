@@ -119,7 +119,7 @@ DEFAULT_CONFIG = {
             "extra_args": [],
             "cwd_flag": "",
             "prompt_via_stdin": True,
-            "output_flag": "-o",
+            "output_flag": "",
         },
     },
     "active_provider": "codex",

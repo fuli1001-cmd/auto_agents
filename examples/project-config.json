@@ -25,7 +25,7 @@
       "extra_args": [],
       "cwd_flag": "",
       "prompt_via_stdin": true,
-      "output_flag": "-o"
+      "output_flag": ""
     }
   },
   "active_provider": "codex",

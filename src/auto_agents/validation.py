@@ -302,14 +302,15 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 errors.append(f"providers.{provider_name} must be an object")
                 continue
 
-            for key in ("kind", "binary", "output_flag"):
+            for key in ("kind", "binary"):
                 value = provider.get(key)
                 if not isinstance(value, str) or not value.strip():
                     errors.append(f"providers.{provider_name}.{key} must be a non-empty string")
 
-            cwd_flag = provider.get("cwd_flag")
-            if not isinstance(cwd_flag, str):
-                errors.append(f"providers.{provider_name}.cwd_flag must be a string")
+            for key in ("cwd_flag", "output_flag"):
+                value = provider.get(key)
+                if not isinstance(value, str):
+                    errors.append(f"providers.{provider_name}.{key} must be a string")
 
             prompt_via_stdin = provider.get("prompt_via_stdin")
             if not isinstance(prompt_via_stdin, bool):
