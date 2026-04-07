@@ -1,10 +1,10 @@
 # auto-agents
 
-`auto-agents` is a quality-first local orchestrator for AI-assisted new project delivery.
+`auto-agents` is a quality-first local orchestrator for AI-assisted project delivery.
 
 V1 scope:
 
-- New projects only
+- New and existing projects
 - Provider-agnostic orchestration
 - Stage-specific effort policy
 - File-driven context to reduce token usage
@@ -32,11 +32,11 @@ The system optimizes for quality over throughput:
 1. `clarify`: interactively refine an idea into a project brief, or extract it automatically if the spec is a detailed design
 2. `design`: create a top-level architecture document
 3. `plan`: generate a JSON task plan with small verifiable feature slices plus a verification strategy
-4. `implement`: execute one feature slice at a time
-5. `review`: run an independent agent review for the current task
-6. `verify`: run local gates
-7. `readme`: generate a project README from the finalized repository state
-8. `commit`: auto-commit only when the task passes gates
+4. `implement`: execute one feature slice at a time, with per-task verification and independent agent review
+5. `verify`: run a final local gate pass across the full project
+6. `readme`: interactively generate a project README from the finalized repository state
+
+Review and commit happen inside the `implement` loop for each task, not as separate top-level stages.
 
 ## Environment isolation policy
 
@@ -70,7 +70,7 @@ Task execution is sequential, not parallel:
 - the orchestrator walks `task_plan.json` in order
 - each task moves `pending -> in_progress -> done` or `blocked`
 - only one task is implemented at a time
-- after one task passes `implement -> review -> verify`, the orchestrator automatically starts the
+- after one task passes `implement -> verify -> review`, the orchestrator automatically starts the
   next unfinished task in the same `run`
 - `--max-tasks N` stops the current invocation after `N` successful tasks, which is useful for demos
   or controlled rollout
@@ -258,9 +258,9 @@ Example project config (`providers` and `active_provider` only):
         "max": "max"
       },
       "extra_args": [],
-      "cwd_flag": "-C",
+      "cwd_flag": "",
       "prompt_via_stdin": true,
-      "output_flag": "-o"
+      "output_flag": ""
     }
   },
   "active_provider": "codex"
@@ -294,6 +294,7 @@ configuration balances quality and token usage:
 | implement | `deep` | `deep` | Stronger reasoning reduces review rejections |
 | review | `balanced` | auto-escalated | Automatically escalated to `deep` for risky diffs |
 | verify | `balanced` | `balanced` | Runs local commands, no LLM reasoning needed |
+| readme | `balanced` | `balanced` | Interactive README generation from finalized repo |
 
 Review auto-escalation triggers (when configured as `balanced`):
 
