@@ -99,6 +99,7 @@ def _stub_orchestrator(providers_dict, active_provider, adapters_map):
     stub.agent_output_stream = io.StringIO()
     stub._last_successful_provider = None
     stub._failed_providers = set()
+    stub._current_provider = active_provider
     stub._adapters_map = adapters_map
 
     # Override _build_adapter_for_provider to use the test adapters_map
@@ -154,6 +155,18 @@ class TestIsFailoverError(unittest.TestCase):
     def test_empty_stderr_not_failover(self):
         r = _make_result(ok=False, returncode=1, stderr="")
         self.assertFalse(Orchestrator._is_failover_error(r))
+
+    def test_no_last_agent_message(self):
+        r = _make_result(ok=False, returncode=1, stderr="Warning: no last agent message; wrote empty content to output.md")
+        self.assertTrue(Orchestrator._is_failover_error(r))
+
+    def test_wrote_empty_content(self):
+        r = _make_result(ok=False, returncode=1, stderr="wrote empty content to /tmp/out.md")
+        self.assertTrue(Orchestrator._is_failover_error(r))
+
+    def test_empty_response(self):
+        r = _make_result(ok=False, returncode=1, stderr="empty response from server")
+        self.assertTrue(Orchestrator._is_failover_error(r))
 
 
 class TestFailoverProviderOrder(unittest.TestCase):

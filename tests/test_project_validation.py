@@ -766,7 +766,7 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertEqual(state.status, "paused")
             rendered = stream.getvalue()
-            self.assertIn("[stage:clarify] start model=mock", rendered)
+            self.assertIn("[stage:clarify] start provider=mock model=mock", rendered)
 
     def test_plan_stage_emits_task_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

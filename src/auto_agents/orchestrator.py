@@ -46,7 +46,8 @@ from .validation import validate_required_document
 
 _FAILOVER_PATTERN = re.compile(
     r"rate.limit|\b429\b|quota|too many requests|capacity|unavailable"
-    r"|service.unavailable|not.found|No such file|ENOENT",
+    r"|service.unavailable|not.found|No such file|ENOENT"
+    r"|no.last.agent.message|wrote.empty.content|empty.response",
     re.IGNORECASE,
 )
 
@@ -68,6 +69,7 @@ class Orchestrator:
         # Run-level failover memory (in-memory only, never persisted)
         self._last_successful_provider: Optional[str] = None
         self._failed_providers: Set[str] = set()
+        self._current_provider: str = self.config.active_provider
 
     @staticmethod
     def init_project(
@@ -1518,7 +1520,7 @@ class Orchestrator:
 
     def _emit_stage_start(self, stage: str) -> None:
         model = self._model_label_for_top_level_stage(stage)
-        print(f"[stage:{stage}] start model={model}", file=self.agent_output_stream, flush=True)
+        print(f"[stage:{stage}] start provider={self._current_provider} model={model}", file=self.agent_output_stream, flush=True)
 
     def _emit_plan_task_count(self, tasks: Iterable[TaskSpec]) -> None:
         task_list = list(tasks)
@@ -1541,7 +1543,8 @@ class Orchestrator:
         print(
             (
                 f"[agent:{stage_key}] completed ok={str(result.ok).lower()} "
-                f"returncode={result.returncode} attempts={attempts} model={model or 'unknown'} "
+                f"returncode={result.returncode} attempts={attempts} "
+                f"provider={self._current_provider} model={model or 'unknown'} "
                 f"tokens={usage_text}"
             ),
             file=self.agent_output_stream,
@@ -1698,6 +1701,7 @@ class Orchestrator:
                 tried.append(kind)
                 continue
 
+            self._current_provider = kind
             result = adapter.run(request)
             tried.append(kind)
 
