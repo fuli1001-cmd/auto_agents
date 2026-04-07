@@ -101,8 +101,7 @@
               }
             },
             "cwd_flag": {
-              "type": "string",
-              "minLength": 1
+              "type": "string"
             },
             "prompt_via_stdin": {
               "type": "boolean"

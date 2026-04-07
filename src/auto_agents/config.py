@@ -117,7 +117,7 @@ DEFAULT_CONFIG = {
                 "max": "max",
             },
             "extra_args": [],
-            "cwd_flag": "-C",
+            "cwd_flag": "",
             "prompt_via_stdin": True,
             "output_flag": "-o",
         },

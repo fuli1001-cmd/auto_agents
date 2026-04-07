@@ -201,7 +201,7 @@ class ProjectConfig:
                 binary="copilot",
                 profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
                 extra_args=[],
-                cwd_flag="-C",
+                cwd_flag="",
                 prompt_via_stdin=True,
                 output_flag="-o",
             ),

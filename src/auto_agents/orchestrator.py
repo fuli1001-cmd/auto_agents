@@ -90,6 +90,16 @@ class Orchestrator:
                         binary="mock",
                         profile_map={"balanced": "mock", "deep": "mock", "max": "mock"},
                         extra_args=[],
+                        cwd_flag="",
+                        prompt_via_stdin=True,
+                        output_flag="-o",
+                    )
+                elif provider_kind == "codex":
+                    config.providers[provider_kind] = ProviderConfig(
+                        kind="codex",
+                        binary="codex",
+                        profile_map={"balanced": "m", "deep": "h", "max": "xh"},
+                        extra_args=[],
                         cwd_flag="-C",
                         prompt_via_stdin=True,
                         output_flag="-o",
@@ -100,7 +110,7 @@ class Orchestrator:
                         binary=provider_kind,
                         profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
                         extra_args=[],
-                        cwd_flag="-C",
+                        cwd_flag="",
                         prompt_via_stdin=True,
                         output_flag="-o",
                     )
