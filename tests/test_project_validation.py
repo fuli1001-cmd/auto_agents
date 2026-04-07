@@ -39,7 +39,7 @@ class ProjectValidationTests(unittest.TestCase):
                 },
                 "copilot-cli": {
                     "kind": "copilot-cli",
-                    "binary": "copilot-cli",
+                    "binary": "copilot",
                     "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
                     "extra_args": [],
                     "cwd_flag": "-C",
@@ -103,7 +103,7 @@ class ProjectValidationTests(unittest.TestCase):
                 },
                 "copilot-cli": {
                     "kind": "copilot-cli",
-                    "binary": "copilot-cli",
+                    "binary": "copilot",
                     "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
                     "extra_args": [],
                     "cwd_flag": "-C",
@@ -167,7 +167,7 @@ class ProjectValidationTests(unittest.TestCase):
                 },
                 "copilot-cli": {
                     "kind": "copilot-cli",
-                    "binary": "copilot-cli",
+                    "binary": "copilot",
                     "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
                     "extra_args": [],
                     "cwd_flag": "-C",
@@ -229,7 +229,7 @@ class ProjectValidationTests(unittest.TestCase):
                 },
                 "copilot-cli": {
                     "kind": "copilot-cli",
-                    "binary": "copilot-cli",
+                    "binary": "copilot",
                     "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
                     "extra_args": [],
                     "cwd_flag": "-C",
@@ -915,7 +915,7 @@ class ProjectValidationTests(unittest.TestCase):
 
         config = ProviderConfig(
             kind="copilot-cli",
-            binary="copilot-cli",
+            binary="copilot",
             profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
         )
         adapter = CopilotCliAdapter(config)
@@ -927,19 +927,46 @@ class ProjectValidationTests(unittest.TestCase):
             output_path=Path("/tmp/test/out.md"),
         )
         cmd = adapter._build_command(request)
-        self.assertEqual(cmd[0], "copilot-cli")
+        self.assertEqual(cmd[0], "copilot")
         self.assertIn("--config-dir", cmd)
         config_dir_index = cmd.index("--config-dir")
         resolved = cmd[config_dir_index + 1]
         self.assertEqual(resolved, str(DEFAULT_PROFILES_ROOT / "deep"))
         self.assertIn("--allow-all-tools", cmd)
 
+    def test_copilot_cli_adapter_forwards_model_from_profile_config(self) -> None:
+        from auto_agents.adapters.copilot_cli import CopilotCliAdapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            profile_dir = Path(tmp) / "deep-profile"
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            write_text(profile_dir / "config.json", '{"model": "gpt-4.1"}\n')
+
+            config = ProviderConfig(
+                kind="copilot-cli",
+                binary="copilot",
+                profile_map={"deep": str(profile_dir)},
+            )
+            adapter = CopilotCliAdapter(config)
+            request = AgentRequest(
+                stage="implement",
+                effort="deep",
+                prompt="do something",
+                cwd=Path("/tmp/test"),
+                output_path=Path("/tmp/test/out.md"),
+            )
+
+            cmd = adapter._build_command(request)
+            self.assertIn("--model", cmd)
+            model_index = cmd.index("--model")
+            self.assertEqual(cmd[model_index + 1], "gpt-4.1")
+
     def test_copilot_cli_adapter_skips_allow_all_tools_when_explicit(self) -> None:
         from auto_agents.adapters.copilot_cli import CopilotCliAdapter
 
         config = ProviderConfig(
             kind="copilot-cli",
-            binary="copilot-cli",
+            binary="copilot",
             profile_map={"balanced": "balanced"},
             extra_args=["--deny-tools", "dangerous-tool"],
         )
@@ -960,7 +987,7 @@ class ProjectValidationTests(unittest.TestCase):
 
         config = ProviderConfig(
             kind="copilot-cli",
-            binary="copilot-cli",
+            binary="copilot",
             profile_map={"deep": "deep"},
         )
         adapter = CopilotCliAdapter(config)
@@ -978,7 +1005,7 @@ class ProjectValidationTests(unittest.TestCase):
 
         config = ProviderConfig(
             kind="copilot-cli",
-            binary="copilot-cli",
+            binary="copilot",
             profile_map={"deep": "deep"},
             extra_args=["--model", "gpt-4o"],
         )
@@ -997,7 +1024,7 @@ class ProjectValidationTests(unittest.TestCase):
 
         config = ProviderConfig(
             kind="copilot-cli",
-            binary="copilot-cli",
+            binary="copilot",
             profile_map={},
         )
         adapter = CopilotCliAdapter(config)

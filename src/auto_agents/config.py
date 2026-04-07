@@ -110,7 +110,7 @@ DEFAULT_CONFIG = {
         },
         "copilot-cli": {
             "kind": "copilot-cli",
-            "binary": "copilot-cli",
+            "binary": "copilot",
             "profile_map": {
                 "balanced": "balanced",
                 "deep": "deep",

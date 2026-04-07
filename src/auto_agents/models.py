@@ -198,7 +198,7 @@ class ProjectConfig:
             ),
             "copilot-cli": ProviderConfig(
                 kind="copilot-cli",
-                binary="copilot-cli",
+                binary="copilot",
                 profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
                 extra_args=[],
                 cwd_flag="-C",

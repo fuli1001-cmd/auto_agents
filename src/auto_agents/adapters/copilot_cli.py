@@ -13,7 +13,7 @@ from .base import AgentAdapter
 
 # Default directory for Copilot CLI profile config dirs.
 # Each profile is a subdirectory containing settings that
-# ``copilot-cli --config-dir`` understands.
+# ``copilot --config-dir`` understands.
 DEFAULT_PROFILES_ROOT = Path.home() / ".copilot" / "profiles"
 
 
@@ -100,6 +100,12 @@ class CopilotCliAdapter(AgentAdapter):
         config_dir = self._resolve_config_dir(request.effort)
         if config_dir:
             command.extend(["--config-dir", str(config_dir)])
+            # Copilot currently ignores model in profile config for --config-dir.
+            # Inject the profile model explicitly unless caller already provided one.
+            if not self._has_model_flag():
+                profile_model = self._load_model_from_config_dir(config_dir)
+                if profile_model:
+                    command.extend(["--model", profile_model])
 
         # Default to allow-all-tools for headless automation unless the
         # caller explicitly passed tool-permission flags in extra_args.
@@ -138,12 +144,39 @@ class CopilotCliAdapter(AgentAdapter):
         }
         return any(arg in permission_flags for arg in self.config.extra_args)
 
+    def _has_model_flag(self) -> bool:
+        for arg in self.config.extra_args:
+            if arg in {"--model", "-m"}:
+                return True
+        return False
+
+    def _load_model_from_config_dir(self, config_dir: Path) -> Optional[str]:
+        config_file = config_dir / "config.json"
+        if not config_file.is_file():
+            return None
+        try:
+            payload = json.loads(read_text(config_file))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        model = payload.get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+        return None
+
     def _model_label(self, request: AgentRequest) -> str:
         # Check for explicit --model in extra_args
         extra = list(self.config.extra_args)
         for i, val in enumerate(extra):
             if val in {"--model", "-m"} and i + 1 < len(extra):
                 return extra[i + 1]
+
+        config_dir = self._resolve_config_dir(request.effort)
+        if config_dir is not None:
+            profile_model = self._load_model_from_config_dir(config_dir)
+            if profile_model:
+                return profile_model
 
         profile = self.config.profile_map.get(request.effort)
         if profile:

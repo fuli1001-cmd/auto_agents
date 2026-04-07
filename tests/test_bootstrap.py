@@ -45,7 +45,7 @@ class BootstrapTests(unittest.TestCase):
             config = load_project_config(project_root)
             copilot = config.providers["copilot-cli"]
             self.assertEqual(copilot.kind, "copilot-cli")
-            self.assertEqual(copilot.binary, "copilot-cli")
+            self.assertEqual(copilot.binary, "copilot")
             self.assertEqual(copilot.profile_map["balanced"], "balanced")
             self.assertEqual(copilot.profile_map["deep"], "deep")
             self.assertEqual(copilot.profile_map["max"], "max")

@@ -223,6 +223,11 @@ a native config directory at `~/.copilot/profiles/<name>/`. The adapter passes
 `--config-dir <path>` so all model, tool-permission, and effort settings are managed in the
 provider's own config files, not in the project config.
 
+Because of a current Copilot CLI issue, model declared in `<config-dir>/config.json` may be ignored
+when `--config-dir` is provided. The adapter works around this by reading `model` from that
+`config.json` and forwarding it as `--model <value>` unless you already set `--model` in
+`extra_args`.
+
 By default, the adapter adds `--allow-all-tools` for headless automation. To override this, pass
 explicit tool-permission flags in `extra_args`.
 
@@ -246,7 +251,7 @@ Example project config (`providers` and `active_provider` only):
     },
     "copilot-cli": {
       "kind": "copilot-cli",
-      "binary": "copilot-cli",
+      "binary": "copilot",
       "profile_map": {
         "balanced": "balanced",
         "deep": "deep",
