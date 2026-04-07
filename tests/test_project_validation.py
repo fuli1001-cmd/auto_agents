@@ -186,6 +186,7 @@ class ProjectValidationTests(unittest.TestCase):
                 "implement": "balanced",
                 "review": "deep",
                 "verify": "balanced",
+                "readme": "balanced",
             },
             "gates": {
                 "commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
@@ -245,6 +246,7 @@ class ProjectValidationTests(unittest.TestCase):
                 "implement": "balanced",
                 "review": "deep",
                 "verify": "balanced",
+                "readme": "balanced",
             },
             "gates": {
                 "commands": ["conda run -p ./.conda python -m unittest discover -s tests"],

@@ -13,7 +13,7 @@ from .models import APPROVAL_ORDER, DOCUMENT_LANGUAGE_OPTIONS
 TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALLOWED_TASK_STATUS = {"pending", "in_progress", "blocked", "done"}
 ALLOWED_EFFORTS = {"balanced", "deep", "max"}
-REQUIRED_EFFORT_STAGES = ("clarify", "design", "plan", "implement", "review", "verify")
+REQUIRED_EFFORT_STAGES = ("clarify", "design", "plan", "implement", "review", "verify", "readme")
 REQUIRED_DOC_HEADINGS = {
     "project_brief.md": ("# Project Brief", "## Problem", "## MVP Scope", "## Non-Goals", "## Constraints"),
     "architecture.md": ("# Architecture", "## System Boundary", "## Core Modules", "## Data Flow", "## Risks"),

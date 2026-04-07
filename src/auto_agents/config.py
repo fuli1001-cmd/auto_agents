@@ -133,6 +133,7 @@ DEFAULT_CONFIG = {
         "implement": "deep",
         "review": "balanced",
         "verify": "balanced",
+        "readme": "balanced",
     },
     "gates": {
         "commands": [],

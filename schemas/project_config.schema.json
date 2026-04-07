@@ -139,7 +139,8 @@
         "plan": { "type": "string" },
         "implement": { "type": "string" },
         "review": { "type": "string" },
-        "verify": { "type": "string" }
+        "verify": { "type": "string" },
+        "readme": { "type": "string" }
       },
       "required": [
         "clarify",
@@ -147,7 +148,8 @@
         "plan",
         "implement",
         "review",
-        "verify"
+        "verify",
+        "readme"
       ],
       "additionalProperties": false
     },

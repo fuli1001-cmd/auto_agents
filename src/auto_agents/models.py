@@ -217,6 +217,7 @@ class ProjectConfig:
             "implement": "deep",
             "review": "balanced",
             "verify": "balanced",
+            "readme": "balanced",
         }
     )
     gates: GateConfig = field(default_factory=GateConfig)
@@ -258,6 +259,7 @@ class ProjectConfig:
                 "implement": "balanced",
                 "review": "balanced",
                 "verify": "balanced",
+                "readme": "balanced",
             },
             gates=GateConfig.from_dict(dict(data.get("gates", {}))),
             git=GitConfig.from_dict(dict(data.get("git", {}))),

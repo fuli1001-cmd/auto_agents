@@ -38,7 +38,8 @@
     "plan": "deep",
     "implement": "deep",
     "review": "balanced",
-    "verify": "balanced"
+    "verify": "balanced",
+    "readme": "balanced"
   },
   "gates": {
     "commands": [
