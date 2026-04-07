@@ -37,6 +37,9 @@ class CopilotCliAdapter(AgentAdapter):
     def run(self, request: AgentRequest) -> AgentResult:
         command = self._build_command(request)
 
+        # Clear stale output so a reused output_path doesn't mask fresh results.
+        write_text(request.output_path, "")
+
         env = dict(os.environ)
         env["AUTO_AGENTS_STAGE"] = request.stage
         env["AUTO_AGENTS_EFFORT"] = request.effort
