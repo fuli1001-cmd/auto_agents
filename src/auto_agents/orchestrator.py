@@ -9,7 +9,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, TextIO, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, TextIO, Tuple
 
 from .adapters import CodexAdapter, CopilotCliAdapter, MockAdapter, ShellAdapter
 from .config import (
@@ -44,6 +44,12 @@ from .models import (
 from .validation import validate_task_plan_payload, validation_report
 from .validation import validate_required_document
 
+_FAILOVER_PATTERN = re.compile(
+    r"rate.limit|\b429\b|quota|too many requests|capacity|unavailable"
+    r"|service.unavailable|not.found|No such file|ENOENT",
+    re.IGNORECASE,
+)
+
 
 class Orchestrator:
     def __init__(
@@ -59,6 +65,9 @@ class Orchestrator:
         self._print_agent_output = False
         self._active_spec_file: Optional[Path] = None
         self._user_input_fn = user_input_fn
+        # Run-level failover memory (in-memory only, never persisted)
+        self._last_successful_provider: Optional[str] = None
+        self._failed_providers: Set[str] = set()
 
     @staticmethod
     def init_project(
@@ -1445,7 +1454,7 @@ class Orchestrator:
                 output_path=output_path,
                 stream_output=self._stream_agent_output_callback(artifact_stage) if self._print_agent_output else None,
             )
-            result = self.adapter.run(request)
+            result = self._call_with_failover(request)
             if result.usage is not None:
                 cumulative_usage = (cumulative_usage or AgentUsage()).plus(result.usage)
                 usage_available = True
@@ -1642,6 +1651,80 @@ class Orchestrator:
             if value in {"--model", "-m"} and index + 1 < len(extra_args):
                 return extra_args[index + 1]
         return ""
+
+    # -- provider failover ------------------------------------------------
+
+    @staticmethod
+    def _is_failover_error(result: AgentResult) -> bool:
+        if result.ok:
+            return False
+        text = result.stderr or ""
+        return _FAILOVER_PATTERN.search(text) is not None
+
+    def _failover_provider_order(self) -> List[str]:
+        active = self.config.active_provider
+        return [active] + [k for k in self.config.providers if k != active]
+
+    def _build_adapter_for_provider(self, provider_kind: str):
+        prov = self.config.providers[provider_kind]
+        if prov.kind == "codex":
+            return CodexAdapter(prov)
+        if prov.kind == "copilot-cli":
+            return CopilotCliAdapter(prov)
+        if prov.kind == "mock":
+            return MockAdapter()
+        return ShellAdapter(prov)
+
+    def _call_with_failover(self, request: AgentRequest) -> AgentResult:
+        # Build provider order: [last_successful or active] + untried + previously_failed
+        base_order = self._failover_provider_order()
+        first = self._last_successful_provider if self._last_successful_provider else self.config.active_provider
+        rest = [k for k in base_order if k != first]
+        untried = [k for k in rest if k not in self._failed_providers]
+        retryable = [k for k in rest if k in self._failed_providers]
+        order = [first] + untried + retryable
+
+        tried: List[str] = []
+        last_error = ""
+        for kind in order:
+            adapter = self.adapter if kind == self.config.active_provider else self._build_adapter_for_provider(kind)
+            available_fn = getattr(adapter, "available", None)
+            if available_fn is not None and not available_fn():
+                self._failed_providers.add(kind)
+                print(
+                    f"[failover] provider={kind} binary not found, skipping",
+                    file=self.agent_output_stream, flush=True,
+                )
+                tried.append(kind)
+                continue
+
+            result = adapter.run(request)
+            tried.append(kind)
+
+            if result.ok:
+                self._last_successful_provider = kind
+                self._failed_providers.discard(kind)
+                if kind != self.config.active_provider:
+                    print(
+                        f"[failover] using provider={kind}",
+                        file=self.agent_output_stream, flush=True,
+                    )
+                return result
+
+            if not self._is_failover_error(result):
+                return result
+
+            self._failed_providers.add(kind)
+            snippet = (result.stderr or "")[:120]
+            print(
+                f"[failover] provider={kind} quota/rate error ({snippet}), trying next...",
+                file=self.agent_output_stream, flush=True,
+            )
+            last_error = result.stderr or result.summary or "unknown error"
+
+        raise RuntimeError(
+            f"All providers exhausted. Tried: {tried}. Last error: {last_error}"
+        )
 
     def _set_document_language(self, language: str) -> None:
         if language not in DOCUMENT_LANGUAGE_OPTIONS:

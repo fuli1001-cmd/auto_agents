@@ -306,6 +306,40 @@ Review auto-escalation triggers (when configured as `balanced`):
 
 Setting review to `deep` or `max` overrides auto-escalation and uses that effort for every review.
 
+### Provider auto-failover
+
+When multiple providers are configured, the orchestrator automatically switches to the
+next available provider if the current one returns a **qualifying error** — rate-limit
+(429), quota exhaustion, service unavailable, or binary not found.
+
+**How it works**
+
+1. Each agent call tries providers in a prioritized order.
+2. On the first call, `active_provider` goes first, followed by the others.
+3. When a provider succeeds via failover its identity is remembered **for the
+   duration of the run** (in-memory, never persisted).  Subsequent calls start
+   with **the last successful provider**, then untried providers, then
+   previously-failed providers (lowest priority, but still attempted in case
+   the limit resets).
+4. `active_provider` in `config.json` is **never modified** by failover — a
+   restart always begins with the user's original preference.
+5. Only qualifying infrastructure errors trigger a switch; ordinary failures
+   (bad code, validation issues) are handled by the normal retry logic.
+6. If **all** providers return qualifying errors for a single agent call, the
+   stage fails immediately and the run aborts.
+
+**Qualifying error patterns** (matched case-insensitively against stderr):
+
+`rate limit`, `429`, `quota`, `too many requests`, `capacity`, `unavailable`,
+`service unavailable`, `not found`, `No such file`, `ENOENT`
+
+**Log output**
+
+```
+[failover] provider=codex quota/rate error (429 Too Many Requests), trying next...
+[failover] using provider=copilot-cli
+```
+
 ## Task plan contract
 
 `state/task_plan.json` is treated as an execution contract, not a loose note. Each task must contain:
