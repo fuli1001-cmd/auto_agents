@@ -626,7 +626,7 @@ class Orchestrator:
                     task_id=f"fix-rejection-{int(time.time()*1000)}",
                     title="Fix issues after release rejection",
                     description=f"The release was rejected with the following feedback:\n{state.rejection_reason}\n\nPlease fix these issues.",
-                    acceptance_criteria=[
+                    acceptance=[
                         "Feedback is fully addressed",
                         "Tests pass"
                     ]
