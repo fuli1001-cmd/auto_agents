@@ -973,6 +973,8 @@ class Orchestrator:
         state.current_stage = "readme"
         state.stage_summaries["readme"] = result.summary.strip()
         state.last_error = ""
+        if is_repo(self.project_root):
+            commit_all(self.project_root, "docs: update README")
         return state
 
     def _persist_tasks(self, tasks: Iterable[TaskSpec]) -> None:
@@ -1102,7 +1104,18 @@ class Orchestrator:
                 f"Read the task plan and verification strategy: {plan}",
                 f"Update this file in place: {readme}",
                 "Write a practical README for the finished project, not for auto_agents itself.",
-                "Include at minimum: project overview, architecture, repository structure, setup or prerequisites, usage, and verification.",
+                "The README MUST include ALL of the following sections (in any order, using appropriate headings):",
+                "  1. Project overview / introduction",
+                "  2. Currently implemented features (list what has actually been built so far)",
+                "  3. Installation / prerequisites",
+                "  4. Configuration",
+                "  5. Usage",
+                "  6. Architecture",
+                "  7. Step-by-step manual testing guide: walk the reader through testing the main workflow",
+                "     with the features that are ALREADY implemented. Use numbered steps with runnable commands.",
+                "     If the currently implemented features are insufficient to complete the main workflow,",
+                "     do NOT omit this section — instead include it with a short explanation of what is missing",
+                "     and what partial steps can still be tested.",
                 "Base commands on files and entrypoints that actually exist in the repository.",
                 "Prefer concise sections, bullets, and runnable command examples.",
                 self._readme_spec_instruction(spec_kind),
