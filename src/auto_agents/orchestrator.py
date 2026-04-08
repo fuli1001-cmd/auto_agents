@@ -1158,6 +1158,9 @@ class Orchestrator:
                     "IMPORTANT: Do NOT discard or rewrite the existing architecture decisions.",
                     "ADD or UPDATE sections relevant to the new iteration scope while preserving existing content.",
                     f"Review the existing task plan at {task_plan_path(self.project_root)} to understand what has already been completed.",
+                    "Compare the brief's current iteration requirements against the existing architecture content.",
+                    "If the architecture describes a capability as already implemented but the brief's iteration scope explicitly asks for it as new or upgraded scope, ADD a subsection or bullet under the relevant heading that describes the GAP between what exists and what the new iteration requires.",
+                    "Do NOT assume that existing architecture descriptions are accurate for the new iteration — the brief's iteration scope takes precedence over existing architecture claims about what is already real or complete.",
                 ])
             lines.append("Final response: 3 short bullets summarizing the design.")
             return "\n".join(lines)
@@ -1183,6 +1186,9 @@ class Orchestrator:
                 self._plan_language_instruction(),
                 "Review .auto-agents/state/task_plan.json if it exists. DO NOT overwrite or delete existing completed tasks. APPEND new tasks to the end of the JSON array for the new features.",
                 "When existing completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create tasks for capabilities already delivered by completed tasks.",
+                "CRITICAL — COVERAGE VERIFICATION: when determining whether a done task covers a brief requirement, you MUST compare the requirement against the task's ACCEPTANCE CRITERIA and REVIEW SUMMARY, not its title or description alone. A task titled 'Real X Integration' does NOT cover a requirement for actual real-model output if its acceptance criteria only verify adapter switching, infrastructure patterns, or fixture/stub results rather than actual external API calls producing real output.",
+                "If the brief explicitly states that a capability must be 'real' / 'production' / '真实' / '公网', verify that the done task's acceptance criteria confirm actual external API calls producing real output — not just adapter infrastructure or fixture-based testing.",
+                "Before generating the task list, produce a COVERAGE ANALYSIS in your final summary response (NOT in the JSON file): for each key requirement in the brief's current iteration scope, state which done task covers it (citing the specific acceptance criterion that proves delivery) or mark it as UNCOVERED. Any UNCOVERED requirement MUST result in a new task.",
                 "Each task must contain task_id, title, description, acceptance, status, commit_message.",
                 "A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined.",
                 "",
@@ -1191,6 +1197,7 @@ class Orchestrator:
                 "2. Cross-cutting Bundle: acceptance criteria that span multiple unrelated subsystems (e.g. 'set up DB schema AND implement API AND write CLI'). Each subsystem should be its own task.",
                 "3. Infra + Feature Combo: mixing infrastructure setup (dependencies, CI, env config) with business logic in one task. Split infra into a prerequisite task.",
                 "4. Vague Acceptance: criteria like 'code is clean' or 'follows best practices'. Every criterion must be objectively verifiable by a test or a command.",
+                "5. False Coverage: concluding a done task covers a new requirement based on its title, while its acceptance criteria only verify infrastructure, adapters, or fixture results — not the actual capability the brief demands. Always verify coverage by reading acceptance criteria, not titles. Especially dangerous when the brief uses terms like 'real' / 'production' / '真实' / '公网' — these signal that adapter-level or fixture-level delivery is insufficient.",
                 "",
                 "TASK SPLITTING — STRATEGIES:",
                 "1. Vertical Slice: each task delivers one user-facing or API-facing capability end-to-end (route, logic, test).",
@@ -1903,6 +1910,23 @@ class Orchestrator:
         payload = load_task_plan(self.project_root)
         errors = validate_task_plan_payload(payload, require_verification=True)
         if not errors:
+            # Soft warning: if this is an iteration with no new pending tasks, nudge the agent.
+            is_iteration = any(
+                isinstance(t, dict) and t.get("status") == "done"
+                for t in payload.get("tasks", [])
+            )
+            has_new = any(
+                isinstance(t, dict) and t.get("status") != "done"
+                for t in payload.get("tasks", [])
+            )
+            if is_iteration and not has_new:
+                return (
+                    "WARNING: This is an iteration run but the task plan contains NO new pending tasks. "
+                    "All tasks are marked 'done'. Re-examine whether the done tasks' ACCEPTANCE CRITERIA "
+                    "truly cover every requirement in the brief's current iteration scope. "
+                    "If they do, add a brief justification to your summary. "
+                    "If not, append new tasks for the uncovered scope."
+                )
             return None
         bullets = "\n".join(f"- {item}" for item in errors)
         return (
