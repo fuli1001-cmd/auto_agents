@@ -1093,6 +1093,32 @@ class IterationFlowTests(unittest.TestCase):
             # approved_gates should be empty (cleared at iteration start)
             self.assertEqual(state.approved_gates, [])
 
+    def test_reject_architecture_clears_downstream_state(self):
+        """Rejecting architecture should clear design+ downstream summaries
+        and remove architecture/release approvals."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, _spec_file = self._make_completed_project(tmp)
+
+            orchestrator = Orchestrator(project_root)
+            state = orchestrator.reject("architecture", "Need to redesign iteration scope")
+
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.rejected_stage, "design")
+            self.assertEqual(state.rejection_reason, "Need to redesign iteration scope")
+
+            # clarify should remain; design and downstream must be removed.
+            self.assertIn("clarify", state.stage_summaries)
+            self.assertNotIn("design", state.stage_summaries)
+            self.assertNotIn("plan", state.stage_summaries)
+            self.assertNotIn("implement", state.stage_summaries)
+            self.assertNotIn("verify", state.stage_summaries)
+            self.assertNotIn("readme", state.stage_summaries)
+
+            # requirements can remain approved; architecture/release must reset.
+            self.assertIn("requirements", state.approved_gates)
+            self.assertNotIn("architecture", state.approved_gates)
+            self.assertNotIn("release", state.approved_gates)
+
 
 if __name__ == "__main__":
     unittest.main()

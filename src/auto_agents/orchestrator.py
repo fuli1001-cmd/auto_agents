@@ -30,6 +30,7 @@ from .gates import run_commands
 from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, is_repo, require_clean_tree, worktree_fingerprint
 from .io_utils import read_text, write_text
 from .models import (
+    APPROVAL_ORDER,
     APPROVAL_BY_STAGE,
     AgentResult,
     AgentRequest,
@@ -163,10 +164,17 @@ class Orchestrator:
         if not target_stage:
             raise RuntimeError(f"Cannot determine stage for gate: {active_gate}")
 
-        if target_stage in state.stage_summaries:
-            del state.stage_summaries[target_stage]
-        if active_gate in state.approved_gates:
-            state.approved_gates.remove(active_gate)
+        # Reset the rejected stage and all downstream stage outputs so run()
+        # can rebuild the pipeline from the right point.
+        target_index = STAGE_ORDER.index(target_stage)
+        for stage in STAGE_ORDER[target_index:]:
+            state.stage_summaries.pop(stage, None)
+
+        # Remove the rejected approval and any downstream approvals
+        # (e.g. reject architecture should also drop release).
+        approval_index = APPROVAL_ORDER.index(active_gate)
+        downstream_approvals = set(APPROVAL_ORDER[approval_index:])
+        state.approved_gates = [g for g in state.approved_gates if g not in downstream_approvals]
         state.pending_approval = ""
         state.status = "pending"
         state.rejection_reason = reason
