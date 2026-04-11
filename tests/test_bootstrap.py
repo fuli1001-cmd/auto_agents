@@ -5,7 +5,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.config import auto_dir, config_path, docs_dir, load_project_config, run_state_path, task_plan_path
+from auto_agents.config import (
+    auto_dir,
+    config_path,
+    docs_dir,
+    load_project_config,
+    provider_references_dir,
+    provider_references_lock_path,
+    requirements_trace_path,
+    run_state_path,
+    task_plan_path,
+)
 from auto_agents.git_ops import is_repo
 from auto_agents.orchestrator import Orchestrator
 
@@ -21,6 +31,9 @@ class BootstrapTests(unittest.TestCase):
             self.assertTrue((project_root / ".gitignore").exists())
             self.assertTrue((docs_dir(project_root) / "project_brief.md").exists())
             self.assertTrue((docs_dir(project_root) / "architecture.md").exists())
+            self.assertTrue(provider_references_dir(project_root).exists())
+            self.assertTrue(requirements_trace_path(project_root).exists())
+            self.assertTrue(provider_references_lock_path(project_root).exists())
             self.assertTrue(task_plan_path(project_root).exists())
             self.assertTrue(run_state_path(project_root).exists())
             self.assertTrue(is_repo(project_root))

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 
-STAGE_ORDER = ["clarify", "design", "plan", "implement", "verify", "readme"]
+STAGE_ORDER = ["clarify", "design", "plan", "provider_research", "implement", "verify", "readme"]
 APPROVAL_ORDER = ["requirements", "architecture", "release"]
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli")
@@ -22,6 +22,7 @@ class TaskSpec:
     title: str
     description: str
     acceptance: List[str]
+    requirement_ids: List[str] = field(default_factory=list)
     status: str = "pending"
     commit_message: str = ""
     commit_sha: str = ""
@@ -42,6 +43,7 @@ class TaskSpec:
             title=str(data["title"]),
             description=str(data.get("description", "")),
             acceptance=[str(item) for item in data.get("acceptance", [])],
+            requirement_ids=[str(item) for item in data.get("requirement_ids", [])],
             status=str(data.get("status", "pending")),
             commit_message=str(data.get("commit_message", "")),
             commit_sha=str(data.get("commit_sha", "")),
@@ -159,6 +161,7 @@ class RetryConfig:
             "clarify": 2,
             "design": 2,
             "plan": 3,
+            "provider_research": 2,
             "implement": 4,
             "review": 2,
         }
@@ -173,6 +176,7 @@ class RetryConfig:
                 "clarify": 2,
                 "design": 2,
                 "plan": 3,
+                "provider_research": 2,
                 "implement": 4,
                 "review": 2,
             },
@@ -214,6 +218,7 @@ class ProjectConfig:
             "clarify": "deep",
             "design": "deep",
             "plan": "deep",
+            "provider_research": "deep",
             "implement": "deep",
             "review": "balanced",
             "verify": "balanced",
@@ -255,8 +260,9 @@ class ProjectConfig:
             or {
                 "clarify": "deep",
                 "design": "deep",
-                "plan": "balanced",
-                "implement": "balanced",
+                "plan": "deep",
+                "provider_research": "deep",
+                "implement": "deep",
                 "review": "balanced",
                 "verify": "balanced",
                 "readme": "balanced",

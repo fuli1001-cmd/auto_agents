@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-agents.local/requirements_trace.schema.json",
+  "title": "auto-agents requirements trace",
+  "type": "object",
+  "required": ["version", "requirements"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "text",
+          "source",
+          "status",
+          "priority",
+          "acceptance_oracles",
+          "forbidden_patterns",
+          "external_docs_required",
+          "provider_reference",
+          "notes"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["active", "deferred", "superseded"]
+          },
+          "priority": {
+            "type": "string",
+            "enum": ["mandatory", "optional"]
+          },
+          "acceptance_oracles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "forbidden_patterns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "external_docs_required": {
+            "type": "boolean"
+          },
+          "provider_reference": {
+            "type": "string"
+          },
+          "notes": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

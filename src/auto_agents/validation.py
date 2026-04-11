@@ -5,15 +5,25 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Dict, List
 
-from .config import architecture_path, config_path, project_brief_path, task_plan_path
+from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, task_plan_path
 from .io_utils import read_json, read_text
 from .models import APPROVAL_ORDER, DOCUMENT_LANGUAGE_OPTIONS
+from .requirements import validate_requirements_trace_payload, validate_task_requirement_coverage
 
 
 TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALLOWED_TASK_STATUS = {"pending", "in_progress", "blocked", "done"}
 ALLOWED_EFFORTS = {"balanced", "deep", "max"}
-REQUIRED_EFFORT_STAGES = ("clarify", "design", "plan", "implement", "review", "verify", "readme")
+REQUIRED_EFFORT_STAGES = (
+    "clarify",
+    "design",
+    "plan",
+    "provider_research",
+    "implement",
+    "review",
+    "verify",
+    "readme",
+)
 REQUIRED_DOC_HEADINGS = {
     "project_brief.md": ("# Project Brief", "## Problem", "## MVP Scope", "## Non-Goals", "## Constraints"),
     "architecture.md": ("# Architecture", "## System Boundary", "## Core Modules", "## Data Flow", "## Risks"),
@@ -95,6 +105,7 @@ def schema_paths() -> Dict[str, str]:
     return {
         "project_config": str((root / "project_config.schema.json").resolve()),
         "task_plan": str((root / "task_plan.schema.json").resolve()),
+        "requirements_trace": str((root / "requirements_trace.schema.json").resolve()),
     }
 
 
@@ -201,6 +212,23 @@ def validate_task_plan_payload(payload: object, require_verification: bool = Fal
         if not isinstance(commit_message, str):
             errors.append(f"{prefix} commit_message must be a string")
 
+        requirement_ids = task.get("requirement_ids", [])
+        if requirement_ids is not None and (
+            not isinstance(requirement_ids, list)
+            or any(not isinstance(item, str) or not item.strip() for item in requirement_ids)
+        ):
+            errors.append(f"{prefix} requirement_ids must be a list of non-empty strings")
+
+    return errors
+
+
+def validate_task_plan_with_requirements(plan_payload: object, trace_payload: object) -> List[str]:
+    errors = validate_task_plan_payload(plan_payload, require_verification=True)
+    if isinstance(trace_payload, dict):
+        trace_errors = validate_requirements_trace_payload(trace_payload)
+        errors.extend(trace_errors)
+        if not trace_errors:
+            errors.extend(validate_task_requirement_coverage(plan_payload, trace_payload))
     return errors
 
 
@@ -426,7 +454,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
             errors.append("retries.per_stage must be an object")
         else:
             for key, value in per_stage.items():
-                if key not in ("clarify", "design", "plan", "implement", "review"):
+                if key not in ("clarify", "design", "plan", "provider_research", "implement", "review"):
                     errors.append(f"retries.per_stage contains unknown stage '{key}'")
                 if not isinstance(value, int) or value < 1:
                     errors.append(f"retries.per_stage.{key} must be an integer >= 1")
@@ -459,6 +487,15 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
     elif plan_payload is not None:
         errors.extend(validate_task_plan_payload(plan_payload))
         warnings.extend(task_plan_warnings(plan_payload))
+
+    try:
+        trace_payload = read_json(requirements_trace_path(root), default=None)
+    except JSONDecodeError as error:
+        trace_payload = None
+        errors.append(f"requirements trace file is not valid JSON: {requirements_trace_path(root)} ({error.msg})")
+    if trace_payload is not None:
+        trace_errors = validate_requirements_trace_payload(trace_payload)
+        errors.extend(trace_errors)
 
     docs = {
         "project_brief.md": project_brief_path(root),

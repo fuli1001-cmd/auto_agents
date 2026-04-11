@@ -98,6 +98,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_parser = subparsers.add_parser("validate", help="Validate config, plan, and required docs.")
     validate_parser.add_argument("--project", required=True, help="Target project directory.")
+
+    research_parser = subparsers.add_parser("provider-research", help="Run centralized provider documentation research.")
+    research_parser.add_argument("--project", required=True, help="Target project directory.")
+    research_parser.add_argument(
+        "--spec-file",
+        help="Path to the input specification markdown. Defaults to <project>/spec.md.",
+    )
+
+    audit_parser = subparsers.add_parser("audit-requirements", help="Run the requirements trace audit.")
+    audit_parser.add_argument("--project", required=True, help="Target project directory.")
     return parser
 
 
@@ -153,6 +163,28 @@ def main(argv: list[str] | None = None) -> int:
         report = validation_report(Path(args.project))
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0 if report["ok"] else 1
+
+    if args.command == "provider-research":
+        try:
+            project_root = Path(args.project)
+            spec_file = Path(args.spec_file) if args.spec_file else _default_spec_file(project_root)
+            orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            state = orchestrator.run_provider_research(spec_file=spec_file)
+            print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
+            return 0
+        except (RuntimeError, FileNotFoundError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
+
+    if args.command == "audit-requirements":
+        try:
+            orchestrator = Orchestrator(Path(args.project), agent_output_stream=sys.stderr)
+            result = orchestrator.audit_requirements()
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0 if result["ok"] else 1
+        except (RuntimeError, FileNotFoundError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
 
     parser.error(f"Unsupported command: {args.command}")
     return 2

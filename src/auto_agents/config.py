@@ -68,11 +68,22 @@ TASK_PLAN_TEMPLATE = {
             "task_id": "task-001",
             "title": "replace-me",
             "description": "Describe one minimal verifiable feature slice.",
+            "requirement_ids": [],
             "acceptance": ["State one concrete acceptance criterion."],
             "status": "pending",
             "commit_message": ""
         }
     ]
+}
+
+REQUIREMENTS_TRACE_TEMPLATE = {
+    "version": 1,
+    "requirements": [],
+}
+
+PROVIDER_REFERENCES_LOCK_TEMPLATE = {
+    "version": 1,
+    "references": {},
 }
 
 
@@ -130,6 +141,7 @@ DEFAULT_CONFIG = {
         "clarify": "deep",
         "design": "deep",
         "plan": "deep",
+        "provider_research": "deep",
         "implement": "deep",
         "review": "balanced",
         "verify": "balanced",
@@ -154,6 +166,7 @@ DEFAULT_CONFIG = {
             "clarify": 2,
             "design": 2,
             "plan": 3,
+            "provider_research": 2,
             "implement": 4,
             "review": 2
         }
@@ -181,6 +194,14 @@ def architecture_path(project_root: Path) -> Path:
     return docs_dir(project_root) / "architecture.md"
 
 
+def provider_references_dir(project_root: Path) -> Path:
+    return docs_dir(project_root) / "provider_references"
+
+
+def requirements_audit_path(project_root: Path) -> Path:
+    return docs_dir(project_root) / "requirements_audit.md"
+
+
 def state_dir(project_root: Path) -> Path:
     return auto_dir(project_root) / "state"
 
@@ -199,6 +220,14 @@ def run_state_path(project_root: Path) -> Path:
 
 def task_plan_path(project_root: Path) -> Path:
     return state_dir(project_root) / "task_plan.json"
+
+
+def requirements_trace_path(project_root: Path) -> Path:
+    return state_dir(project_root) / "requirements_trace.json"
+
+
+def provider_references_lock_path(project_root: Path) -> Path:
+    return state_dir(project_root) / "provider_references.lock.json"
 
 
 def review_path(project_root: Path) -> Path:
@@ -240,6 +269,9 @@ def bootstrap_project(project_root: Path, name: str, doc_language: str = "en") -
     write_if_missing(project_brief_path(root), PROJECT_BRIEF_TEMPLATE)
     write_if_missing(architecture_path(root), ARCHITECTURE_TEMPLATE)
     write_if_missing(review_path(root), "# Review\n\nNo review has been recorded yet.\n")
+    provider_references_dir(root).mkdir(parents=True, exist_ok=True)
+    write_json(requirements_trace_path(root), REQUIREMENTS_TRACE_TEMPLATE)
+    write_json(provider_references_lock_path(root), PROVIDER_REFERENCES_LOCK_TEMPLATE)
     write_json(task_plan_path(root), TASK_PLAN_TEMPLATE)
     
     run_state = dict(RUN_STATE_TEMPLATE)

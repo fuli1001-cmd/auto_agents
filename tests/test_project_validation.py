@@ -119,9 +119,11 @@ class ProjectValidationTests(unittest.TestCase):
                 "clarify": "deep",
                 "design": "deep",
                 "plan": "balanced",
+                "provider_research": "deep",
                 "implement": "balanced",
                 "review": "deep",
                 "verify": "balanced",
+                "readme": "balanced",
             },
             "gates": {
                 "commands": ["python3 -m unittest discover -s tests", "python3 -m pip install requests"],
@@ -142,6 +144,7 @@ class ProjectValidationTests(unittest.TestCase):
                     "clarify": 2,
                     "design": 2,
                     "plan": 3,
+                    "provider_research": 2,
                     "implement": 2,
                     "review": 2,
                 },
@@ -183,6 +186,7 @@ class ProjectValidationTests(unittest.TestCase):
                 "clarify": "deep",
                 "design": "deep",
                 "plan": "balanced",
+                "provider_research": "deep",
                 "implement": "balanced",
                 "review": "deep",
                 "verify": "balanced",
@@ -207,6 +211,7 @@ class ProjectValidationTests(unittest.TestCase):
                     "clarify": 2,
                     "design": 2,
                     "plan": 3,
+                    "provider_research": 2,
                     "implement": 2,
                     "review": 2,
                 },
@@ -243,6 +248,7 @@ class ProjectValidationTests(unittest.TestCase):
                 "clarify": "deep",
                 "design": "deep",
                 "plan": "balanced",
+                "provider_research": "deep",
                 "implement": "balanced",
                 "review": "deep",
                 "verify": "balanced",
@@ -267,6 +273,7 @@ class ProjectValidationTests(unittest.TestCase):
                     "clarify": 2,
                     "design": 2,
                     "plan": 3,
+                    "provider_research": 2,
                     "implement": 2,
                     "review": 2,
                 },
@@ -990,7 +997,7 @@ class ProjectValidationTests(unittest.TestCase):
         config = ProviderConfig(
             kind="copilot-cli",
             binary="copilot",
-            profile_map={"deep": "deep"},
+            profile_map={"deep": "unit-test-profile-without-config"},
         )
         adapter = CopilotCliAdapter(config)
         request = AgentRequest(
@@ -1000,7 +1007,7 @@ class ProjectValidationTests(unittest.TestCase):
             cwd=Path("/tmp/test"),
             output_path=Path("/tmp/test/out.md"),
         )
-        self.assertEqual(adapter._model_label(request), "profile:deep")
+        self.assertEqual(adapter._model_label(request), "profile:unit-test-profile-without-config")
 
     def test_copilot_cli_adapter_model_label_explicit_model(self) -> None:
         from auto_agents.adapters.copilot_cli import CopilotCliAdapter

@@ -18,6 +18,10 @@ from .config import (
     load_project_config,
     load_run_state,
     load_task_plan,
+    provider_references_dir,
+    provider_references_lock_path,
+    requirements_audit_path,
+    requirements_trace_path,
     review_path,
     run_artifact_paths,
     save_project_config,
@@ -42,7 +46,17 @@ from .models import (
     STAGE_ORDER,
     TaskSpec,
 )
-from .validation import validate_task_plan_payload, validation_report
+from .requirements import (
+    audit_requirements,
+    external_doc_requirements,
+    format_requirement_context,
+    load_provider_references_lock,
+    load_requirements_trace,
+    provider_reference_status,
+    requirements_for_task,
+    validate_requirements_trace_payload,
+)
+from .validation import validate_task_plan_with_requirements, validation_report
 from .validation import validate_required_document
 
 _FAILOVER_PATTERN = re.compile(
@@ -215,7 +229,7 @@ class Orchestrator:
                     state.run_id = uuid.uuid4().hex[:12]
                     state.status = "pending"
                     state.current_stage = "clarify"
-                    for s in ["clarify", "design", "plan", "verify", "readme"]:
+                    for s in ["clarify", "design", "plan", "provider_research", "implement", "verify", "readme"]:
                         state.stage_summaries.pop(s, None)
                     state.approved_gates = []
                     state.agent_attempts = {}
@@ -244,6 +258,8 @@ class Orchestrator:
                 try:
                     if stage == "implement":
                         state = self._run_implementation_loop(state, max_tasks=max_tasks)
+                    elif stage == "provider_research":
+                        state = self._run_provider_research(state, spec_file)
                     elif stage == "verify":
                         state = self._run_verify(state)
                     elif stage == "readme":
@@ -470,6 +486,8 @@ class Orchestrator:
                 prompt_lines = [
                     f"Project root: {self.project_root}",
                     "Read the input spec from: " + str(spec_file),
+                    "Clarify will later generate both project_brief.md and .auto-agents/state/requirements_trace.json.",
+                    "As you discuss requirements, identify concrete mandatory requirements, non-goals, acceptance oracles, forbidden patterns, and any external provider docs needed.",
                     "If the project repository already contains an active codebase and a history of completed tasks, please review them to understand the current progress before discussing the next features.",
                     "You are an expert product manager analyzing the spec.",
                     "Your goal is to extract the target scope, requirements, constraints, and non-goals.",
@@ -709,6 +727,62 @@ class Orchestrator:
                 "reason": verify_gate.summary,
             }
         return {"ok": True, "reason": verify_gate.summary}
+
+    def _run_provider_research(self, state: RunState, spec_file: Path) -> RunState:
+        del spec_file
+        trace = load_requirements_trace(self.project_root)
+        docs_required = external_doc_requirements(trace)
+        if not docs_required:
+            summary = "No provider research required by active requirements."
+            write_text(self._stage_output_path(state.run_id, "provider_research"), summary + "\n")
+            state.current_stage = "provider_research"
+            state.stage_summaries["provider_research"] = summary
+            state.last_error = ""
+            return state
+
+        lock = load_provider_references_lock(self.project_root)
+        unresolved = []
+        for requirement in docs_required:
+            reference = str(requirement.get("provider_reference", "")).strip()
+            status = provider_reference_status(lock, reference)
+            if status not in {"verified", "assumption_approved", "deferred"}:
+                unresolved.append(requirement)
+        if not unresolved:
+            summary = "Provider references already verified; research reused from local lock."
+            write_text(self._stage_output_path(state.run_id, "provider_research"), summary + "\n")
+            state.current_stage = "provider_research"
+            state.stage_summaries["provider_research"] = summary
+            state.last_error = ""
+            return state
+
+        provider_references_dir(self.project_root).mkdir(parents=True, exist_ok=True)
+        prompt = self._build_provider_research_prompt(unresolved)
+        result = self._run_agent_with_retries(
+            state=state,
+            stage="provider_research",
+            stage_key="provider_research",
+            prompt=prompt,
+            validation_feedback=self._provider_research_validation_feedback,
+            effort=self.config.efforts.get("provider_research", "deep"),
+        )
+        lock = load_provider_references_lock(self.project_root)
+        still_blocked = []
+        for requirement in docs_required:
+            reference = str(requirement.get("provider_reference", "")).strip()
+            status = provider_reference_status(lock, reference)
+            if status in {"blocked", "needs_user_input", "ambiguous", "missing"}:
+                still_blocked.append(f"{requirement.get('id')}: {reference or '(missing)'} is {status}")
+        if still_blocked:
+            detail = "\n".join(f"- {item}" for item in still_blocked)
+            raise RuntimeError(
+                "provider research is blocked; provide official docs, defer the requirement, "
+                "choose another provider, or explicitly approve assumptions before resuming.\n"
+                f"{detail}"
+            )
+        state.current_stage = "provider_research"
+        state.stage_summaries["provider_research"] = result.summary.strip()
+        state.last_error = ""
+        return state
 
     def _run_task_review(self, run_id: str, task: TaskSpec, verify_reason: str = "") -> Dict[str, object]:
         review_effort = self._review_effort_for_task(task)
@@ -964,6 +1038,14 @@ class Orchestrator:
         if not verify_gate.ok:
             state.status = "failed"
             raise RuntimeError("verify stage failed")
+        tasks = state.tasks or self._load_tasks_from_plan()
+        audit_ok, audit_report = audit_requirements(self.project_root, tasks)
+        if not audit_ok:
+            state.status = "failed"
+            state.last_error = f"requirements audit failed: {requirements_audit_path(self.project_root)}"
+            raise RuntimeError(state.last_error)
+        if "No requirements are currently tracked." not in audit_report:
+            state.stage_summaries["requirements_audit"] = audit_report.strip()
         return state
 
     def _load_tasks_from_plan(self) -> List[TaskSpec]:
@@ -1092,6 +1174,32 @@ class Orchestrator:
             lines.append("\nBased on the conversation above, present the UPDATED list of planned README sections.")
         return "\n".join(lines)
 
+    def _build_provider_research_prompt(self, requirements: List[dict]) -> str:
+        trace_path = requirements_trace_path(self.project_root)
+        lock_path = provider_references_lock_path(self.project_root)
+        references_dir = provider_references_dir(self.project_root)
+        req_context = format_requirement_context(requirements)
+        lines = [
+            f"Project root: {self.project_root}",
+            f"Requirements trace: {trace_path}",
+            f"Provider reference directory: {references_dir}",
+            f"Provider reference lock: {lock_path}",
+            "This stage researches external provider protocols once, before implementation tasks run.",
+            "Use available browsing or network tools when local notes are insufficient, but restrict sources to official provider documentation.",
+            "Only use official provider documentation or user-provided protocol notes already in the repository.",
+            "Do not use blogs, forum answers, random SDK examples, or unofficial mirrors as source of truth.",
+            "Do not implement product code in this stage.",
+            "For each requirement below, create or update the provider_reference markdown file named in the trace.",
+            "Each reference must include: Status, Retrieved at, Official sources, Authentication, Request, Response, Errors, Contract Test Requirements, Unknowns / Ambiguities.",
+            "If official docs are unavailable or ambiguous, write a blocked/needs_user_input reference with the exact missing information and recovery options.",
+            "Update provider_references.lock.json with one entry per provider reference. Each entry must include path, status, retrieved_at, source_urls, and notes.",
+            "Allowed lock statuses: verified, blocked, needs_user_input, ambiguous, deferred, temporary_stub, assumption_approved.",
+            "Final response: 3 short bullets summarizing references created or blockers found.",
+            "",
+            req_context,
+        ]
+        return "\n".join(lines)
+
     def _persist_tasks(self, tasks: Iterable[TaskSpec]) -> None:
         current_payload = load_task_plan(self.project_root)
         payload = []
@@ -1117,6 +1225,7 @@ class Orchestrator:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
         plan = task_plan_path(self.project_root)
+        requirements_trace = requirements_trace_path(self.project_root)
         analysis = self._analyze_spec(spec_file)
         spec_kind = str(analysis["kind"])
         spec_context = self._spec_context_line(analysis)
@@ -1134,8 +1243,13 @@ class Orchestrator:
             lines = common + [
                 f"Read the input spec from: {spec_file}",
                 f"Update this file in place: {brief}",
+                f"Generate or update the requirements trace in place: {requirements_trace}",
                 "Keep the brief compact and focused on the target scope.",
                 "Preserve the exact top-level and section headings already present in the file.",
+                "The requirements trace is the downstream execution contract. It must be valid JSON with version=1 and a requirements list.",
+                "Every active requirement must have id, text, source, status, priority, acceptance_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields.",
+                "Use stable IDs like REQ-001. Mark hard requirements as priority='mandatory'. Use status='active', 'deferred', or 'superseded'.",
+                "If a requirement needs an external provider protocol or official API docs, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/.",
                 self._clarify_spec_instruction(spec_kind),
                 self._document_language_instruction(),
             ]
@@ -1178,8 +1292,13 @@ class Orchestrator:
                 f"Read the input spec: {spec_file}",
                 f"Read: {brief}",
                 f"Read: {architecture}",
+                f"Read the requirements trace: {requirements_trace}",
                 f"Replace this JSON file with a task plan of minimal verifiable feature slices: {plan}",
                 "At the root of the JSON, also define test_strategy and verification_commands.",
+                "Every new non-done task must include requirement_ids listing the requirements it covers.",
+                "All active mandatory requirements in requirements_trace.json must be covered by at least one task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
+                "Task acceptance criteria must preserve the bound requirement's concrete acceptance_oracles; do not weaken direct/API/protocol requirements into naming or configuration-only checks.",
+                "If a requirement has external_docs_required=true, create at least one implementation task that consumes its provider_reference and tests against that protocol reference.",
                 "Choose the smallest practical automated verification strategy for this stack.",
                 "If this is a Python project, require a project-local conda env at ./.conda.",
                 "Choose the number of tasks based on project complexity rather than an arbitrary cap.",
@@ -1396,20 +1515,28 @@ class Orchestrator:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
         task_json = json.dumps(task.to_dict(), indent=2, ensure_ascii=False)
+        requirement_context = format_requirement_context(requirements_for_task(self.project_root, task))
         common = [
             f"Project root: {self.project_root}",
             f"Project brief: {brief}",
             f"Architecture: {architecture}",
+            f"Requirements trace: {requirements_trace_path(self.project_root)}",
             "Work only on the current task.",
             "Keep changes scoped and testable.",
             f"Task JSON:\n{task_json}",
         ]
+        if requirement_context:
+            common.extend(["", requirement_context])
 
         if stage == "implement":
             lines = common + [
                 "Implement only this feature slice.",
+                "The bound requirements and acceptance oracles above are hard requirements, not optional background.",
+                "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
                 "Tests should validate observable behavior (API contracts, input/output, side-effects), not internal implementation details.",
+                "For external provider integrations, use the listed provider_reference files as the source of truth. Do not search for alternate docs or invent protocol details unless the reference is marked insufficient; stop and report missing documentation instead.",
+                "For protocol/direct-integration tasks, add contract tests that verify outbound request shape, auth/header behavior, response normalization, and forbidden legacy payloads where applicable.",
                 "If this is a Python project, create and use a project-local conda env at ./.conda and install packages only inside it.",
                 "Do not use '.conda' as a generic directory, pip target, virtualenv, or venv path. It must remain a real conda prefix created with 'conda create -p ./.conda ...', including '.conda/conda-meta'.",
                 "For any other stack, keep dependencies and tool state local to the repository and never rely on global installs.",
@@ -1421,20 +1548,22 @@ class Orchestrator:
         if stage == "review":
             lines = common + [
                 "Review the current uncommitted changes for correctness, regressions, and missing tests.",
+                "The bound requirements and acceptance oracles above are in scope. A task passes only if both Task JSON and the bound requirement oracles are satisfied.",
                 "TEST AUDIT: Separately evaluate whether the tests truly cover the acceptance criteria "
                 "from the Task JSON. Check that tests validate observable behavior (API contracts, "
                 "input/output, side-effects) rather than internal implementation details. "
                 "If the tests only pass by mocking/faking internal state instead of exercising real "
                 "public interfaces, that is a 'DECISION: fail' issue.",
-                "SCOPE RULE: Your review scope is strictly bounded by the acceptance criteria in the Task JSON. "
+                "SCOPE RULE: Your review scope is bounded by the acceptance criteria in the Task JSON plus the bound requirements and acceptance oracles above. "
                 "A 'DECISION: fail' is warranted ONLY when the implementation does not satisfy one or more "
-                "acceptance criteria, introduces a regression in existing tests, or leaves the codebase in a "
+                "task acceptance criteria, bound requirement oracles, introduces a regression in existing tests, or leaves the codebase in a "
                 "non-buildable state. Architectural concerns, future robustness improvements, and suggestions "
-                "beyond the stated acceptance criteria should be noted as '[NON-BLOCKING]' advisory notes, "
+                "beyond the stated acceptance criteria and bound requirements should be noted as '[NON-BLOCKING]' advisory notes, "
                 "NOT as failure reasons.",
                 "When issuing 'DECISION: fail', you MUST cite the specific acceptance criterion (by index or text) "
-                "that is not satisfied. If no acceptance criterion is violated but you have advisory concerns, "
+                "or requirement ID/oracle that is not satisfied. If no acceptance criterion or requirement oracle is violated but you have advisory concerns, "
                 "issue 'DECISION: pass' with those concerns listed as '[NON-BLOCKING]' notes.",
+                "For external provider integrations, verify the code and tests against the provider_reference file. Fail if the implementation invents protocol fields, reuses a legacy private gateway payload, or tests only mock an internal gateway contract.",
                 "Use the supplied changed-file and diff context first. Only inspect the rest of the repository when the diff is insufficient.",
                 "Return only the review result. Do not include any preamble, file path note, or tool narration.",
                 "The first non-empty line must be exactly 'DECISION: pass' or 'DECISION: fail'.",
@@ -1916,7 +2045,8 @@ class Orchestrator:
 
     def _plan_validation_feedback(self, _: AgentResult) -> Optional[str]:
         payload = load_task_plan(self.project_root)
-        errors = validate_task_plan_payload(payload, require_verification=True)
+        trace = load_requirements_trace(self.project_root)
+        errors = validate_task_plan_with_requirements(payload, trace)
         if not errors:
             # Soft warning: if this is an iteration with no new pending tasks, nudge the agent.
             is_iteration = any(
@@ -1942,6 +2072,32 @@ class Orchestrator:
             f"{bullets}"
         )
 
+    def _provider_research_validation_feedback(self, _: AgentResult) -> Optional[str]:
+        trace = load_requirements_trace(self.project_root)
+        lock = load_provider_references_lock(self.project_root)
+        missing = []
+        refs = lock.get("references", {}) if isinstance(lock, dict) else {}
+        if not isinstance(refs, dict):
+            return "provider_references.lock.json must contain a 'references' object"
+        for requirement in external_doc_requirements(trace):
+            reference = str(requirement.get("provider_reference", "")).strip()
+            if not reference:
+                missing.append(f"{requirement.get('id')}: missing provider_reference")
+                continue
+            status = provider_reference_status(lock, reference)
+            if status == "missing":
+                missing.append(f"{requirement.get('id')}: no lock entry for {reference}")
+            ref_path = self.project_root / reference
+            if not ref_path.exists():
+                missing.append(f"{requirement.get('id')}: missing provider reference file {reference}")
+        if missing:
+            bullets = "\n".join(f"- {item}" for item in missing)
+            return (
+                "Provider research output is incomplete. Update the local provider references and lock file.\n"
+                f"{bullets}"
+            )
+        return None
+
     def _review_validation_feedback(self, result: AgentResult) -> Optional[str]:
         if self._has_explicit_review_decision(result.summary):
             return None
@@ -1953,12 +2109,14 @@ class Orchestrator:
     def _clarify_validation_feedback(self, _: AgentResult) -> Optional[str]:
         path = docs_dir(self.project_root) / "project_brief.md"
         errors = validate_required_document(path, "project_brief.md")
+        trace = load_requirements_trace(self.project_root)
+        errors.extend(validate_requirements_trace_payload(trace))
         if not errors:
             return None
         bullets = "\n".join(f"- {item}" for item in errors)
         return (
-            "The project brief is missing required template headings. Rewrite the file in place and "
-            "preserve the exact required headings.\n"
+            "The clarify output is incomplete. Rewrite the project brief and requirements trace in place, "
+            "preserving required brief headings and valid requirements_trace.json shape.\n"
             f"{bullets}"
         )
 
@@ -2045,6 +2203,22 @@ class Orchestrator:
 
     def validate(self) -> Dict[str, object]:
         return validation_report(self.project_root)
+
+    def run_provider_research(self, spec_file: Path) -> RunState:
+        state = load_run_state(self.project_root)
+        state = self._run_provider_research(state, spec_file)
+        save_run_state(self.project_root, state)
+        return state
+
+    def audit_requirements(self) -> Dict[str, object]:
+        state = load_run_state(self.project_root)
+        tasks = state.tasks or self._load_tasks_from_plan()
+        ok, report = audit_requirements(self.project_root, tasks)
+        return {
+            "ok": ok,
+            "path": str(requirements_audit_path(self.project_root)),
+            "summary": report,
+        }
 
     def _pending_stages(self, state: RunState) -> List[str]:
         pending: List[str] = []

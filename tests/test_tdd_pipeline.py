@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.config import load_run_state, save_project_config, task_plan_path
+from auto_agents.config import load_run_state, requirements_trace_path, save_project_config, task_plan_path
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, TaskSpec
 from auto_agents.orchestrator import Orchestrator
@@ -61,6 +61,47 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("MUST also write or update tests", prompt)
             self.assertIn("observable behavior", prompt)
 
+    def test_implement_prompt_includes_bound_requirements_and_provider_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Use the official direct TTS endpoint.",
+                            "source": "user conversation",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["Outbound requests use the direct endpoint path."],
+                            "forbidden_patterns": ["legacy_gateway"],
+                            "external_docs_required": True,
+                            "provider_reference": ".auto-agents/docs/provider_references/doubao_tts.md",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-001",
+                title="Write direct TTS backend",
+                description="Implement the backend.",
+                acceptance=["direct backend works"],
+                requirement_ids=["REQ-001"],
+            )
+
+            prompt = orchestrator._build_task_prompt(task, "implement")
+            self.assertIn("REQ-001", prompt)
+            self.assertIn("Use the official direct TTS endpoint.", prompt)
+            self.assertIn("Outbound requests use the direct endpoint path.", prompt)
+            self.assertIn(".auto-agents/docs/provider_references/doubao_tts.md", prompt)
+            self.assertIn("Do not search for alternate docs", prompt)
+
     def test_review_prompt_includes_test_audit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -77,6 +118,44 @@ class ImplementPipelineTests(unittest.TestCase):
             prompt = orchestrator._build_task_prompt(task, "review")
             self.assertIn("TEST AUDIT", prompt)
             self.assertIn("observable behavior", prompt)
+
+    def test_review_prompt_checks_bound_requirement_oracles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-002",
+                            "text": "Reject legacy payloads.",
+                            "source": "requirements document",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["Tests fail if the gateway payload shape is used."],
+                            "forbidden_patterns": ["GatewayPayload"],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-002",
+                title="Reject gateway payloads",
+                description="Add validation.",
+                acceptance=["legacy payloads are rejected"],
+                requirement_ids=["REQ-002"],
+            )
+
+            prompt = orchestrator._build_task_prompt(task, "review")
+            self.assertIn("REQ-002", prompt)
+            self.assertIn("bound requirement oracles", prompt)
+            self.assertIn("GatewayPayload", prompt)
 
     def test_implement_runs_without_test_writer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
