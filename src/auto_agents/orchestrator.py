@@ -629,6 +629,8 @@ class Orchestrator:
                 return text.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
             else:
                 return self._read_single_line_input(prompt, default)
+        if not multiline and self._reopen_stdin_from_tty():
+            return self._read_single_line_input(prompt, default)
         return default
 
     def _reopen_stdin_from_tty(self) -> bool:

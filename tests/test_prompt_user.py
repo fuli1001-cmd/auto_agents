@@ -36,6 +36,22 @@ class PromptUserTests(unittest.TestCase):
         self.assertEqual(result, "n")
         self.assertEqual(reopen.call_count, 1)
 
+    def test_prompt_reopens_tty_when_stdin_is_not_tty(self) -> None:
+        orchestrator = self._make_orchestrator()
+        fake_stdin = mock.Mock()
+        fake_stdin.isatty.return_value = False
+
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("unittest", None)
+            with mock.patch.object(sys, "stdin", fake_stdin):
+                with mock.patch.object(orchestrator, "_reopen_stdin_from_tty", return_value=True) as reopen:
+                    with mock.patch.object(orchestrator, "_read_single_line_input", return_value="y") as read:
+                        result = orchestrator._prompt_user("Confirm? ", default="n")
+
+        self.assertEqual(result, "y")
+        self.assertEqual(reopen.call_count, 1)
+        read.assert_called_once_with("Confirm? ", "n")
+
 
 if __name__ == "__main__":
     unittest.main()
