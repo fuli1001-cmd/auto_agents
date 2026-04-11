@@ -9,6 +9,24 @@ STAGE_ORDER = ["clarify", "design", "plan", "provider_research", "implement", "v
 APPROVAL_ORDER = ["requirements", "architecture", "release"]
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli")
+DEFAULT_EFFORTS = {
+    "clarify": "deep",
+    "design": "deep",
+    "plan": "deep",
+    "provider_research": "deep",
+    "implement": "deep",
+    "review": "balanced",
+    "verify": "balanced",
+    "readme": "balanced",
+}
+DEFAULT_RETRY_PER_STAGE = {
+    "clarify": 2,
+    "design": 2,
+    "plan": 3,
+    "provider_research": 2,
+    "implement": 4,
+    "review": 2,
+}
 APPROVAL_BY_STAGE = {
     "clarify": "requirements",
     "design": "architecture",
@@ -156,30 +174,14 @@ class DocsConfig:
 @dataclass
 class RetryConfig:
     default_max_attempts: int = 2
-    per_stage: Dict[str, int] = field(
-        default_factory=lambda: {
-            "clarify": 2,
-            "design": 2,
-            "plan": 3,
-            "provider_research": 2,
-            "implement": 4,
-            "review": 2,
-        }
-    )
+    per_stage: Dict[str, int] = field(default_factory=lambda: dict(DEFAULT_RETRY_PER_STAGE))
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RetryConfig":
+        configured = {str(k): int(v) for k, v in dict(data.get("per_stage", {})).items()}
         return cls(
             default_max_attempts=int(data.get("default_max_attempts", 2)),
-            per_stage={str(k): int(v) for k, v in dict(data.get("per_stage", {})).items()}
-            or {
-                "clarify": 2,
-                "design": 2,
-                "plan": 3,
-                "provider_research": 2,
-                "implement": 4,
-                "review": 2,
-            },
+            per_stage={**DEFAULT_RETRY_PER_STAGE, **configured},
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -213,18 +215,7 @@ class ProjectConfig:
     )
     active_provider: str = "codex"
     docs: DocsConfig = field(default_factory=DocsConfig)
-    efforts: Dict[str, str] = field(
-        default_factory=lambda: {
-            "clarify": "deep",
-            "design": "deep",
-            "plan": "deep",
-            "provider_research": "deep",
-            "implement": "deep",
-            "review": "balanced",
-            "verify": "balanced",
-            "readme": "balanced",
-        }
-    )
+    efforts: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_EFFORTS))
     gates: GateConfig = field(default_factory=GateConfig)
     git: GitConfig = field(default_factory=GitConfig)
     approvals: ApprovalConfig = field(default_factory=ApprovalConfig)
@@ -256,16 +247,9 @@ class ProjectConfig:
             providers=providers,
             active_provider=active_provider,
             docs=DocsConfig.from_dict(dict(data.get("docs", {}))),
-            efforts={str(k): str(v) for k, v in dict(data.get("efforts", {})).items()}
-            or {
-                "clarify": "deep",
-                "design": "deep",
-                "plan": "deep",
-                "provider_research": "deep",
-                "implement": "deep",
-                "review": "balanced",
-                "verify": "balanced",
-                "readme": "balanced",
+            efforts={
+                **DEFAULT_EFFORTS,
+                **{str(k): str(v) for k, v in dict(data.get("efforts", {})).items()},
             },
             gates=GateConfig.from_dict(dict(data.get("gates", {}))),
             git=GitConfig.from_dict(dict(data.get("git", {}))),

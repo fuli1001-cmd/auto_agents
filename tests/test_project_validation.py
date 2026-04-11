@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import json
 import subprocess
@@ -12,9 +13,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.cli import main
 from auto_agents.adapters.codex import CodexAdapter
-from auto_agents.config import config_path, load_project_config, load_run_state, save_run_state, task_plan_path
+from auto_agents.config import DEFAULT_CONFIG, config_path, load_project_config, load_run_state, save_run_state, task_plan_path
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentRequest, AgentResult, AgentUsage, ProviderConfig, TaskSpec
+from auto_agents.models import AgentRequest, AgentResult, AgentUsage, ProjectConfig, ProviderConfig, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.validation import (
     validate_required_document,
@@ -282,6 +283,23 @@ class ProjectValidationTests(unittest.TestCase):
 
         self.assertEqual(validate_project_config_payload(payload), [])
 
+    def test_legacy_efforts_missing_defaulted_stages_are_accepted(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        del payload["efforts"]["provider_research"]
+
+        self.assertEqual(validate_project_config_payload(payload), [])
+
+        config = ProjectConfig.from_dict(payload)
+        self.assertEqual(config.efforts["provider_research"], "deep")
+
+    def test_validate_project_config_payload_still_requires_other_effort_stages(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        del payload["efforts"]["readme"]
+
+        errors = validate_project_config_payload(payload)
+
+        self.assertTrue(any("efforts missing stages: readme" in item for item in errors))
+
     def test_validation_report_warns_when_no_verification_commands_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -536,6 +554,38 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(payload["status"], "completed")
             self.assertTrue(calls["print_agent_output"])
             self.assertTrue(calls["has_stream"])
+
+    def test_cli_run_passes_allow_dirty_tree_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            spec_file = project_root / "spec.md"
+            spec_file.parent.mkdir(parents=True, exist_ok=True)
+            write_text(spec_file, "# Spec\n")
+            calls = {}
+
+            class FakeState:
+                def to_dict(self):
+                    return {"status": "completed"}
+
+            class FakeOrchestrator:
+                def __init__(self, project_root, agent_output_stream=None):
+                    calls["project_root"] = str(project_root)
+
+                def run(self, **kwargs):
+                    calls.update(kwargs)
+                    return FakeState()
+
+            buffer = io.StringIO()
+            with patch("auto_agents.cli.Orchestrator", FakeOrchestrator):
+                with contextlib.redirect_stdout(buffer):
+                    exit_code = main(
+                        ["run", "--project", str(project_root), "--spec-file", str(spec_file), "--allow-dirty-tree"]
+                    )
+
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["status"], "completed")
+            self.assertTrue(calls["allow_dirty_tree"])
 
     def test_cli_run_passes_document_language_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

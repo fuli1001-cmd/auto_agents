@@ -7,23 +7,15 @@ from typing import Dict, List
 
 from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, task_plan_path
 from .io_utils import read_json, read_text
-from .models import APPROVAL_ORDER, DOCUMENT_LANGUAGE_OPTIONS
+from .models import APPROVAL_ORDER, DEFAULT_EFFORTS, DOCUMENT_LANGUAGE_OPTIONS
 from .requirements import validate_requirements_trace_payload, validate_task_requirement_coverage
 
 
 TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALLOWED_TASK_STATUS = {"pending", "in_progress", "blocked", "done"}
 ALLOWED_EFFORTS = {"balanced", "deep", "max"}
-REQUIRED_EFFORT_STAGES = (
-    "clarify",
-    "design",
-    "plan",
-    "provider_research",
-    "implement",
-    "review",
-    "verify",
-    "readme",
-)
+REQUIRED_EFFORT_STAGES = tuple(DEFAULT_EFFORTS)
+DEFAULTED_EFFORT_STAGES = {"provider_research"}
 REQUIRED_DOC_HEADINGS = {
     "project_brief.md": ("# Project Brief", "## Problem", "## MVP Scope", "## Non-Goals", "## Constraints"),
     "architecture.md": ("# Architecture", "## System Boundary", "## Core Modules", "## Data Flow", "## Risks"),
@@ -367,11 +359,14 @@ def validate_project_config_payload(payload: object) -> List[str]:
     if not isinstance(efforts, dict):
         errors.append("efforts must be an object")
     else:
-        missing_stages = [stage for stage in REQUIRED_EFFORT_STAGES if stage not in efforts]
+        missing_stages = [
+            stage
+            for stage in REQUIRED_EFFORT_STAGES
+            if stage not in efforts and stage not in DEFAULTED_EFFORT_STAGES
+        ]
         if missing_stages:
             errors.append(f"efforts missing stages: {', '.join(missing_stages)}")
-        for stage in REQUIRED_EFFORT_STAGES:
-            value = efforts.get(stage)
+        for stage, value in {**DEFAULT_EFFORTS, **efforts}.items():
             if not isinstance(value, str) or value not in ALLOWED_EFFORTS:
                 errors.append(
                     f"efforts.{stage} must be one of: {', '.join(sorted(ALLOWED_EFFORTS))}"

@@ -81,6 +81,7 @@ class Orchestrator:
         self._print_agent_output = False
         self._active_spec_file: Optional[Path] = None
         self._user_input_fn = user_input_fn
+        self._allow_dirty_tree = False
         # Run-level failover memory (in-memory only, never persisted)
         self._last_successful_provider: Optional[str] = None
         self._failed_providers: Set[str] = set()
@@ -205,6 +206,7 @@ class Orchestrator:
         self,
         spec_file: Path,
         auto_approve: bool = False,
+        allow_dirty_tree: bool = False,
         max_tasks: Optional[int] = None,
         skip_validate: bool = False,
         print_agent_output: bool = False,
@@ -213,6 +215,7 @@ class Orchestrator:
     ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
         self._print_agent_output = print_agent_output
+        self._allow_dirty_tree = allow_dirty_tree
         try:
             if provider_kind is not None:
                 self._set_active_provider(provider_kind)
@@ -292,6 +295,7 @@ class Orchestrator:
         finally:
             self._print_agent_output = False
             self._active_spec_file = None
+            self._allow_dirty_tree = False
 
     def _ensure_preconditions(self, state: RunState, spec_file: Path, skip_validate: bool) -> None:
         if not spec_file.exists():
@@ -681,8 +685,11 @@ class Orchestrator:
                 task.status = "in_progress"
                 self._persist_tasks(tasks)
 
-            if not (resume_existing or allow_dirty_retry) and self.config.gates.require_clean_git_before_task:
-                require_clean_tree(self.project_root)
+            if (
+                not (resume_existing or allow_dirty_retry or self._allow_dirty_tree)
+                and self.config.gates.require_clean_git_before_task
+            ):
+                self._require_clean_tree_for_task(task)
 
             if task.status == "pending":
                 task.status = "in_progress"
@@ -718,6 +725,27 @@ class Orchestrator:
         state.stage_summaries["implement"] = f"Completed {sum(task.status == 'done' for task in tasks)} tasks."
         state.last_error = ""
         return state
+
+    def _require_clean_tree_for_task(self, task: TaskSpec) -> None:
+        try:
+            require_clean_tree(self.project_root)
+        except RuntimeError as error:
+            if str(error) != "working tree is not clean":
+                raise
+
+            changed = changed_paths(self.project_root)
+            preview = ", ".join(changed[:5])
+            if len(changed) > 5:
+                preview += f", +{len(changed) - 5} more"
+            if not preview:
+                preview = "(unable to determine changed paths)"
+
+            raise RuntimeError(
+                "working tree is not clean before "
+                f"task {task.task_id}. Changed paths: {preview}. "
+                "Commit or stash those changes first, disable "
+                "gates.require_clean_git_before_task, or rerun with --allow-dirty-tree."
+            ) from error
 
     def _run_task_verify(self) -> Dict[str, object]:
         verify_gate = run_commands(self.config.gates.commands, self.project_root)

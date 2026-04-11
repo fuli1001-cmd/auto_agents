@@ -522,6 +522,86 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.tasks[0].status, "done")
             self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "fixed")
 
+    def test_pending_task_reports_changed_paths_when_clean_tree_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains fixed"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+            (project_root / "notes.txt").write_text("dirty\n", encoding="utf-8")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            message = str(ctx.exception)
+            self.assertIn("task task-001", message)
+            self.assertIn("notes.txt", message)
+            self.assertIn("--allow-dirty-tree", message)
+
+    def test_pending_task_can_run_with_allow_dirty_tree_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = BlockedRetryAdapter(project_root)
+            orchestrator._allow_dirty_tree = True
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains fixed"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+            (project_root / "notes.txt").write_text("dirty\n", encoding="utf-8")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "fixed")
+
     def test_verify_failure_skips_review_and_retries_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -1122,4 +1202,3 @@ class IterationFlowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

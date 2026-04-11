@@ -145,6 +145,10 @@ python3 -m auto_agents run --project /tmp/demo --doc-language zh
 `run` performs local preflight validation before any agent call. Use `--skip-validate` only for
 manual recovery or debugging.
 
+By default, implementation refuses to start if the target repository already has local changes.
+Use `--allow-dirty-tree` only when you explicitly want task work to proceed on top of an existing
+dirty workspace.
+
 During `plan`, the agent must write `test_strategy` and `verification_commands` into
 `.auto-agents/state/task_plan.json`. By default the orchestrator copies those verification commands
 into `.auto-agents/config.json`, so new projects do not need a hand-written `gates.commands` block.
@@ -291,6 +295,7 @@ configuration balances quality and token usage:
 | clarify | `deep` | dynamic | Downgraded to `balanced` when spec is already a design doc |
 | design | `deep` | dynamic | Downgraded to `balanced` when spec is already a design doc |
 | plan | `deep` | `deep` | Task decomposition affects the whole run |
+| provider_research | `deep` | `deep` | Resolves provider-specific requirement references before implementation |
 | implement | `deep` | `deep` | Stronger reasoning reduces review rejections |
 | review | `balanced` | auto-escalated | Automatically escalated to `deep` for risky diffs |
 | verify | `balanced` | `balanced` | Runs local commands, no LLM reasoning needed |

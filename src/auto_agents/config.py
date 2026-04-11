@@ -6,7 +6,13 @@ from typing import Tuple
 from uuid import uuid4
 
 from .io_utils import read_json, read_text, write_if_missing, write_json, write_text
-from .models import ProjectConfig, RunState, SUPPORTED_PROVIDER_KINDS
+from .models import (
+    DEFAULT_EFFORTS,
+    DEFAULT_RETRY_PER_STAGE,
+    ProjectConfig,
+    RunState,
+    SUPPORTED_PROVIDER_KINDS,
+)
 
 
 AUTO_DIR = ".auto-agents"
@@ -137,16 +143,7 @@ DEFAULT_CONFIG = {
     "docs": {
         "language": "en",
     },
-    "efforts": {
-        "clarify": "deep",
-        "design": "deep",
-        "plan": "deep",
-        "provider_research": "deep",
-        "implement": "deep",
-        "review": "balanced",
-        "verify": "balanced",
-        "readme": "balanced",
-    },
+    "efforts": dict(DEFAULT_EFFORTS),
     "gates": {
         "commands": [],
         "require_clean_git_before_task": True,
@@ -162,14 +159,7 @@ DEFAULT_CONFIG = {
     },
     "retries": {
         "default_max_attempts": 2,
-        "per_stage": {
-            "clarify": 2,
-            "design": 2,
-            "plan": 3,
-            "provider_research": 2,
-            "implement": 4,
-            "review": 2
-        }
+        "per_stage": dict(DEFAULT_RETRY_PER_STAGE),
     },
 }
 

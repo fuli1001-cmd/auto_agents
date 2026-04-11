@@ -48,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Automatically pass all manual approval gates.",
     )
     run_parser.add_argument(
+        "--allow-dirty-tree",
+        action="store_true",
+        help="Allow implementation to start even when the project git tree already has local changes.",
+    )
+    run_parser.add_argument(
         "--max-tasks",
         type=int,
         default=None,
@@ -142,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             state = orchestrator.run(
                 spec_file=spec_file,
                 auto_approve=bool(args.auto_approve),
+                allow_dirty_tree=bool(args.allow_dirty_tree),
                 max_tasks=args.max_tasks,
                 skip_validate=bool(args.skip_validate),
                 print_agent_output=bool(args.print_agent_output),

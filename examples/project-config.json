@@ -36,6 +36,7 @@
     "clarify": "deep",
     "design": "deep",
     "plan": "deep",
+    "provider_research": "deep",
     "implement": "deep",
     "review": "balanced",
     "verify": "balanced",
@@ -66,6 +67,7 @@
       "clarify": 2,
       "design": 2,
       "plan": 3,
+      "provider_research": 2,
       "implement": 4,
       "review": 2
     }
