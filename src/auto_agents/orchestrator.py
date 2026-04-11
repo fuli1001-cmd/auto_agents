@@ -194,11 +194,6 @@ class Orchestrator:
         state.status = "pending"
         state.rejection_reason = reason
         state.rejected_stage = target_stage
-        if target_stage == "clarify":
-            from .config import conversation_history_path
-            hist_path = conversation_history_path(self.project_root, state.run_id)
-            if hist_path.exists():
-                hist_path.unlink()
         save_run_state(self.project_root, state)
         return state
 
@@ -385,21 +380,13 @@ class Orchestrator:
 
         post_rejection = False
         if state.rejected_stage == "clarify" and state.rejection_reason:
-            # Rejection re-entry: the old conversation (which may have
-            # reached READY_TO_GENERATE) is stale.  Clear it so the agent
-            # starts a fresh conversation for the new scope.
-            if history and any(
-                isinstance(msg, dict)
-                and str(msg.get("role", "")).lower() in ("agent", "assistant")
-                and "READY_TO_GENERATE" in str(msg.get("content", ""))
-                for msg in history
-            ):
-                print("[clarify] Previous conversation completed; starting fresh.", file=sys.stderr)
-                history = []
-                write_text(history_path, "[]")
             history.append({
                 "role": "user",
-                "content": f"The previous output was rejected. Please address this feedback:\n{state.rejection_reason}"
+                "content": (
+                    "The previous requirements output was rejected. Treat this as additional user feedback.\n"
+                    "Use the existing conversation and generated files as context, and revise only the affected requirements.\n"
+                    f"Feedback:\n{state.rejection_reason}"
+                )
             })
             state.rejected_stage = ""
             state.rejection_reason = ""
@@ -505,6 +492,14 @@ class Orchestrator:
                     "Do NOT output 'READY_TO_GENERATE' if the user asked anything that you have not yet fully answered.",
                     "\n--- Conversation History ---",
                 ]
+                if post_rejection:
+                    prompt_lines.extend([
+                        "This is a revision pass after a requirements rejection.",
+                        "Do not restart discovery unless the rejection feedback requires it.",
+                        "Use the existing conversation and generated artifacts as context, and focus on correcting the rejected parts.",
+                        f"Review the existing project brief if present: {docs_dir(self.project_root) / 'project_brief.md'}",
+                        f"Review the existing requirements trace if present: {requirements_trace_path(self.project_root)}",
+                    ])
 
                 for msg in history:
                     role = msg.get("role", "user")

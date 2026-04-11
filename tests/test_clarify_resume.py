@@ -105,9 +105,9 @@ class ClarifyResumeTests(unittest.TestCase):
             "User's rejection feedback should be in the history"
         )
 
-    def test_rejection_reentry_clears_history_with_rtg(self):
-        """When re-entering clarify after rejection, history with
-        READY_TO_GENERATE should be cleared (starting fresh)."""
+    def test_rejection_reentry_preserves_history_and_appends_feedback(self):
+        """Requirements rejection should preserve prior clarify context and
+        append the rejection reason as new user feedback."""
         project_root, spec_file = self._setup_project()
         orchestrator = Orchestrator(project_root)
 
@@ -132,11 +132,40 @@ class ClarifyResumeTests(unittest.TestCase):
             )
             state = orchestrator._run_interactive_clarify(state, spec_file)
 
-        # The old conversation should have been cleared; history should
-        # start with the rejection feedback, not old messages.
         saved_history = json.loads(history_path.read_text(encoding="utf-8"))
-        old_msgs = [m for m in saved_history if m.get("content") == "Original discussion."]
-        self.assertEqual(len(old_msgs), 0, "Old history should be cleared on rejection re-entry")
+        self.assertTrue(
+            any(m.get("content") == "Original discussion." for m in saved_history),
+            "Old clarify history should be preserved on rejection re-entry",
+        )
+        self.assertTrue(
+            any("Please add auth." in m.get("content", "") for m in saved_history if m.get("role") == "user"),
+            "Rejection reason should be appended as user feedback",
+        )
+
+        clarify_calls = [
+            call for call in mock_run.call_args_list
+            if call.kwargs.get("stage_key", "").startswith("clarify-conv")
+        ]
+        self.assertTrue(clarify_calls, "Rejecting requirements should run a new clarify conversation turn")
+        prompt = clarify_calls[0].kwargs.get("prompt", "")
+        self.assertIn("Original discussion.", prompt)
+        self.assertIn("Please add auth.", prompt)
+        self.assertIn("revision pass after a requirements rejection", prompt)
+
+    def test_reject_requirements_keeps_clarify_history_file(self):
+        project_root, _spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+
+        state = load_run_state(project_root)
+        history_path = conversation_history_path(project_root, state.run_id)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(history_path, json.dumps([{"role": "user", "content": "Keep me."}], ensure_ascii=False))
+
+        orchestrator.reject("requirements", "Revise the brief.")
+
+        self.assertTrue(history_path.exists())
+        saved_history = json.loads(history_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_history[0]["content"], "Keep me.")
 
     def test_non_rtg_trailing_agent_resumes_normally(self):
         """When last agent message does NOT have READY_TO_GENERATE,
