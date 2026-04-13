@@ -40,7 +40,7 @@
     "implement": "deep",
     "review": "balanced",
     "verify": "balanced",
-    "readme": "balanced"
+    "readme": "deep"
   },
   "gates": {
     "commands": [
