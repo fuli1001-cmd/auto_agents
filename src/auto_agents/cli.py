@@ -148,6 +148,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print each agent output to stderr as it completes.",
     )
 
+    # ── sessions (list) ──────────────────────────────────────────
+    sessions_parser = subparsers.add_parser("sessions", help="List sessions for a completed project.")
+    sessions_parser.add_argument("--project", required=True, help="Target project directory.")
+    sessions_parser.add_argument(
+        "--mode",
+        choices=["fix", "collab"],
+        help="Filter by session mode.",
+    )
+    sessions_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Include completed and failed sessions (default: active only).",
+    )
+
     return parser
 
 
@@ -223,6 +237,23 @@ def main(argv: list[str] | None = None) -> int:
             result = orchestrator.audit_requirements()
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0 if result["ok"] else 1
+        except (RuntimeError, FileNotFoundError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
+
+    if args.command == "sessions":
+        try:
+            from .config import list_sessions
+
+            project_root = Path(args.project)
+            sessions = list_sessions(project_root)
+            if getattr(args, "mode", None):
+                sessions = [s for s in sessions if s.mode == args.mode]
+            if not getattr(args, "all", False):
+                sessions = [s for s in sessions if s.status not in ("completed", "failed")]
+            rows = [s.to_dict() for s in sessions]
+            print(json.dumps(rows, indent=2, ensure_ascii=False))
+            return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1

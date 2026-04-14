@@ -398,6 +398,126 @@ class SessionCLITests(unittest.TestCase):
         args = parser.parse_args(["collab", "--project", "/tmp/test", "--print-agent-output"])
         self.assertTrue(args.print_agent_output)
 
+    def test_sessions_parser(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["sessions", "--project", "/tmp/test"])
+        self.assertEqual(args.command, "sessions")
+        self.assertEqual(args.project, "/tmp/test")
+        self.assertFalse(getattr(args, "all", False))
+
+    def test_sessions_parser_with_mode_filter(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["sessions", "--project", "/tmp/test", "--mode", "fix", "--all"])
+        self.assertEqual(args.mode, "fix")
+        self.assertTrue(args.all)
+
+
+class SessionListCommandTests(unittest.TestCase):
+    """Test the sessions list command end-to-end."""
+
+    def setUp(self) -> None:
+        self.tmpdir = Path(tempfile.mkdtemp())
+        state_dir = self.tmpdir / ".auto-agents" / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "run_state.json").write_text(json.dumps({"status": "completed"}))
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self.tmpdir)
+
+    def test_sessions_list_empty(self) -> None:
+        from auto_agents.cli import main
+        import io
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            rc = main(["sessions", "--project", str(self.tmpdir)])
+        finally:
+            sys.stdout = old_stdout
+        self.assertEqual(rc, 0)
+        data = json.loads(captured.getvalue())
+        self.assertEqual(data, [])
+
+    def test_sessions_list_with_active_session(self) -> None:
+        from auto_agents.config import create_session
+        state = create_session(self.tmpdir, "fix")
+        sid = state.session_id
+
+        from auto_agents.cli import main
+        import io
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            rc = main(["sessions", "--project", str(self.tmpdir)])
+        finally:
+            sys.stdout = old_stdout
+        self.assertEqual(rc, 0)
+        data = json.loads(captured.getvalue())
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["session_id"], sid)
+
+    def test_sessions_list_mode_filter(self) -> None:
+        from auto_agents.config import create_session, save_session_state
+        fix_state = create_session(self.tmpdir, "fix")
+        collab_state = create_session(self.tmpdir, "collab")
+
+        from auto_agents.cli import main
+        import io
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            rc = main(["sessions", "--project", str(self.tmpdir), "--mode", "collab"])
+        finally:
+            sys.stdout = old_stdout
+        self.assertEqual(rc, 0)
+        data = json.loads(captured.getvalue())
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["mode"], "collab")
+
+    def test_sessions_list_excludes_completed_by_default(self) -> None:
+        from auto_agents.config import create_session, save_session_state
+        state = create_session(self.tmpdir, "fix")
+        state.status = "completed"
+        save_session_state(self.tmpdir, state)
+
+        from auto_agents.cli import main
+        import io
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            rc = main(["sessions", "--project", str(self.tmpdir)])
+        finally:
+            sys.stdout = old_stdout
+        self.assertEqual(rc, 0)
+        data = json.loads(captured.getvalue())
+        self.assertEqual(data, [])
+
+    def test_sessions_list_all_includes_completed(self) -> None:
+        from auto_agents.config import create_session, save_session_state
+        state = create_session(self.tmpdir, "fix")
+        state.status = "completed"
+        save_session_state(self.tmpdir, state)
+
+        from auto_agents.cli import main
+        import io
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            rc = main(["sessions", "--project", str(self.tmpdir), "--all"])
+        finally:
+            sys.stdout = old_stdout
+        self.assertEqual(rc, 0)
+        data = json.loads(captured.getvalue())
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["status"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

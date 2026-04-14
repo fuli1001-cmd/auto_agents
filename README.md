@@ -457,12 +457,6 @@ Interactive bug-fix loop:
 python3 -m auto_agents fix --project /tmp/demo
 ```
 
-Resume an interrupted session:
-
-```bash
-python3 -m auto_agents fix --project /tmp/demo --session <session_id>
-```
-
 ### Collaborative debugging (`collab`)
 
 Interactive debug loop for goals that need user–agent collaboration (e.g. "test the video player in
@@ -478,6 +472,28 @@ the browser"):
 python3 -m auto_agents collab --project /tmp/demo
 ```
 
-Both commands accept `--provider` and `--print-agent-output`. Session state is persisted
+Resume an interrupted session (works for both fix and collab):
+
+```bash
+python3 -m auto_agents collab --project /tmp/demo --session <session_id>
+```
+
+If `--session` is omitted, the CLI automatically detects unfinished sessions of the same mode and
+offers to resume the most recent one.
+
+### Listing sessions
+
+```bash
+# Active sessions only (default)
+python3 -m auto_agents sessions --project /tmp/demo
+
+# Filter by mode
+python3 -m auto_agents sessions --project /tmp/demo --mode fix
+
+# Include completed and failed sessions
+python3 -m auto_agents sessions --project /tmp/demo --all
+```
+
+Both `fix` and `collab` accept `--provider` and `--print-agent-output`. Session state is persisted
 independently at `.auto-agents/state/sessions/<session_id>/` and does not interfere with the main
 `run_state.json`.
