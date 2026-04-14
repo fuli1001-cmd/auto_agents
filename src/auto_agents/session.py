@@ -124,6 +124,7 @@ class Session:
             state.goal = user_input.strip()
             state.conversation.append({"role": "user", "content": state.goal})
             self._save(state)
+            self._print_agent_thinking()
 
         max_converse_rounds = 15
         rounds = 0
@@ -151,7 +152,7 @@ class Session:
                 user_reply = "No additional information. Please proceed if you are ready."
             state.conversation.append({"role": "user", "content": user_reply})
             self._save(state)
-            self._print("\nAgent is thinking, please wait...", flush=True)
+            self._print_agent_thinking()
 
         # Max rounds reached – force proceed
         self._print("Max clarification rounds reached. Proceeding with current understanding.")
@@ -250,6 +251,7 @@ class Session:
                 state.conversation.append({"role": "user", "content": user_reply.strip() or "Done."})
                 state.status = "executing"
                 self._save(state)
+                self._print_agent_thinking()
                 feedback = ""
                 continue
 
@@ -290,6 +292,7 @@ class Session:
                 user_feedback = self._prompt_user("What still needs to be done? ", multiline=True)
                 state.conversation.append({"role": "user", "content": user_feedback.strip() or "Not yet done."})
                 self._save(state)
+                self._print_agent_thinking()
                 feedback = ""
                 continue
 
@@ -333,6 +336,7 @@ class Session:
                 user_feedback = self._prompt_user("What still needs to be done? ", multiline=True)
                 state.conversation.append({"role": "user", "content": user_feedback.strip() or "Not yet done."})
                 self._save(state)
+                self._print_agent_thinking()
                 feedback = ""
             else:
                 feedback = self.orch._format_retry_feedback("local_verification", reason=str(verify["reason"]))
@@ -526,6 +530,9 @@ class Session:
 
     def _print(self, msg: str, flush: bool = False) -> None:
         print(msg, file=sys.stderr, flush=flush)
+
+    def _print_agent_thinking(self) -> None:
+        self._print("\nAgent is thinking, please wait...", flush=True)
 
     @staticmethod
     def _now() -> str:

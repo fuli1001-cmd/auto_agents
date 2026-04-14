@@ -1,9 +1,11 @@
 """Tests for the lightweight Session (fix / collab) workflows."""
 
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from typing import List
 from unittest.mock import patch
@@ -219,6 +221,41 @@ class SessionFixFlowTests(unittest.TestCase):
             # Should have user, agent, user, agent(GOAL_CLEAR) in conversation
             self.assertGreaterEqual(len(state.conversation), 3)
 
+    def test_fix_flow_prints_thinking_after_multiline_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            user_inputs = [
+                "The login page is broken",
+                "It happens on Chrome only",
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "What browser does this happen in?\n"
+                elif call_count["n"] == 2:
+                    content = "Got it, Chrome-specific CSS issue.\nGOAL_CLEAR\n"
+                else:
+                    content = "Fixed Chrome CSS issue.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(captured.getvalue().count("Agent is thinking, please wait..."), 2)
+
 
 class SessionCollabFlowTests(unittest.TestCase):
     """Test the collab mode workflow with mock adapter."""
@@ -306,6 +343,43 @@ class SessionCollabFlowTests(unittest.TestCase):
             # Check that NEED_USER_ASSIST triggered waiting_user
             assist_entries = [e for e in state.execution_log if e.get("action") == "collab"]
             self.assertGreater(len(assist_entries), 0)
+
+    def test_collab_prints_thinking_after_user_assist_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = [
+                "Test the video player in browser",
+                "I opened the browser and see the player",
+                "y",
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I'll help test the video player.\nGOAL_CLEAR\n"
+                elif call_count["n"] == 2:
+                    content = "I've set up the test server.\nNEED_USER_ASSIST: Please open http://localhost:3000 and check the player\n"
+                else:
+                    content = "Based on your feedback, everything works.\nGOAL_ACHIEVED: Video player verified working in browser\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="collab")
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(captured.getvalue().count("Agent is thinking, please wait..."), 2)
 
 
 class SessionResumeTests(unittest.TestCase):
