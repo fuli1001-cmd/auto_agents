@@ -1,7 +1,9 @@
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -95,7 +97,9 @@ class ClarifyResumeTests(unittest.TestCase):
                 ok=True, command=[], output_path=Path("."),
                 summary="READY_TO_GENERATE", stdout="",
             )
-            state = orchestrator._run_interactive_clarify(state, spec_file)
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                state = orchestrator._run_interactive_clarify(state, spec_file)
 
         # History should have the original 2 messages + user feedback + new agent + generate
         saved_history = json.loads(history_path.read_text(encoding="utf-8"))
@@ -104,6 +108,45 @@ class ClarifyResumeTests(unittest.TestCase):
             any("Add database support." in m.get("content", "") for m in user_msgs),
             "User's rejection feedback should be in the history"
         )
+        self.assertIn("Agent is thinking, please wait...", captured.getvalue())
+
+    def test_ready_to_generate_rejection_prints_thinking_indicator(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+
+        state = load_run_state(project_root)
+
+        user_inputs = iter([
+            "n",
+            "Also support database-backed state.",
+            "y",
+        ])
+        orchestrator._user_input_fn = lambda _prompt: next(user_inputs)
+
+        clarify_result = AgentResult(
+            ok=True,
+            command=[],
+            output_path=Path("."),
+            summary="Summary updated.\nREADY_TO_GENERATE",
+            stdout="",
+        )
+        generate_result = AgentResult(
+            ok=True,
+            command=[],
+            output_path=Path("."),
+            summary="Generated brief.",
+            stdout="",
+        )
+
+        with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+            mock_run.side_effect = [clarify_result, clarify_result, generate_result]
+            captured = io.StringIO()
+            with redirect_stderr(captured):
+                orchestrator._run_interactive_clarify(state, spec_file)
+
+        output = captured.getvalue()
+        self.assertIn("Agent is thinking, please wait...", output)
+        self.assertIn("Also support database-backed state.", conversation_history_path(project_root, state.run_id).read_text(encoding="utf-8"))
 
     def test_rejection_reentry_preserves_history_and_appends_feedback(self):
         """Requirements rejection should preserve prior clarify context and

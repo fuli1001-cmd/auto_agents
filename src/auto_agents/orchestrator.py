@@ -437,6 +437,7 @@ class Orchestrator:
                 if user_reply.strip():
                     history.append({"role": "user", "content": user_reply})
                     write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+                print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
         else:
             # Resume interrupted conversation: if trailing history entries
             # are from the agent (e.g. process crashed before user reply was
@@ -540,6 +541,7 @@ class Orchestrator:
                         if user_reply.strip():
                             history.append({"role": "user", "content": user_reply})
                             write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+                        print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
                         continue
 
                 # After rejection, show the agent's response (stripping the

@@ -472,6 +472,9 @@ the browser"):
 python3 -m auto_agents collab --project /tmp/demo
 ```
 
+Both `fix` and `collab` call the agent with the `implement`-stage effort from
+`config.efforts["implement"]` (default: `deep`).
+
 Resume an interrupted session (works for both fix and collab):
 
 ```bash
