@@ -2,6 +2,7 @@
 
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from auto_agents.config import (
     save_session_state,
     session_state_path,
 )
+from auto_agents.git_ops import working_tree_clean
 from auto_agents.io_utils import write_text
 from auto_agents.models import AgentResult, SessionState, DEFAULT_SESSION_MAX_ATTEMPTS
 from auto_agents.orchestrator import Orchestrator
@@ -34,6 +36,23 @@ def _make_project(tmp: str, name: str = "demo") -> Path:
     state.status = "completed"
     save_run_state(project_root, state)
     return project_root
+
+
+def _configure_git_identity(project_root: Path) -> None:
+    subprocess.run(
+        ["git", "config", "user.name", "test"],
+        cwd=str(project_root),
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=str(project_root),
+        check=True,
+        text=True,
+        capture_output=True,
+    )
 
 
 class SessionStateModelTests(unittest.TestCase):
@@ -256,6 +275,48 @@ class SessionFixFlowTests(unittest.TestCase):
             self.assertEqual(state.status, "completed")
             self.assertEqual(captured.getvalue().count("Agent is thinking, please wait..."), 2)
 
+    def test_fix_flow_commits_completed_session_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            user_inputs = [
+                "The submit button crashes the app",
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I understand the bug. The submit button crash is likely in handlers.py.\nGOAL_CLEAR\n"
+                else:
+                    content = "Fixed the crash by adding null check.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            self.assertTrue(working_tree_clean(project_root))
+
+            state_path = session_state_path(project_root, state.session_id)
+            show = subprocess.run(
+                ["git", "show", f"HEAD:{state_path.relative_to(project_root).as_posix()}"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            committed = json.loads(show.stdout)
+            self.assertEqual(committed["status"], "completed")
+
 
 class SessionCollabFlowTests(unittest.TestCase):
     """Test the collab mode workflow with mock adapter."""
@@ -380,6 +441,50 @@ class SessionCollabFlowTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
             self.assertEqual(captured.getvalue().count("Agent is thinking, please wait..."), 2)
+
+    def test_collab_flow_commits_completed_session_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+
+            user_inputs = [
+                "Generate a test video using the frontend",
+                "y",
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I understand, you want to test video generation.\nGOAL_CLEAR\n"
+                else:
+                    content = "Set up test harness and generated video.\nGOAL_ACHIEVED: Test video generated successfully at output/test.mp4\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="collab")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            self.assertTrue(working_tree_clean(project_root))
+
+            state_path = session_state_path(project_root, state.session_id)
+            show = subprocess.run(
+                ["git", "show", f"HEAD:{state_path.relative_to(project_root).as_posix()}"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            committed = json.loads(show.stdout)
+            self.assertEqual(committed["status"], "completed")
 
 
 class SessionResumeTests(unittest.TestCase):

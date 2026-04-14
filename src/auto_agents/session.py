@@ -205,9 +205,8 @@ class Session:
 
             if verify["ok"]:
                 self._print("Verification passed!")
-                self._git_commit(state, "fix")
                 state.status = "completed"
-                self._save(state)
+                self._git_commit(state, "fix")
                 self._print(f"Bug fix completed in session {state.session_id}.")
                 return state
 
@@ -283,9 +282,8 @@ class Session:
                 self._print("Verification passed!")
                 answer = self._prompt_user("Do you confirm the goal is achieved? (y/n) [y]: ", default="y")
                 if answer.strip().lower() not in ("n", "no"):
-                    self._git_commit(state, "collab")
                     state.status = "completed"
-                    self._save(state)
+                    self._git_commit(state, "collab")
                     self._print(f"Collaborative session {state.session_id} completed successfully.")
                     return state
 
@@ -328,9 +326,8 @@ class Session:
                 self._print("Verification passed after agent's changes!")
                 answer = self._prompt_user("Goal achieved? (y/n) [y]: ", default="y")
                 if answer.strip().lower() not in ("n", "no"):
-                    self._git_commit(state, "collab")
                     state.status = "completed"
-                    self._save(state)
+                    self._git_commit(state, "collab")
                     self._print(f"Collaborative session {state.session_id} completed successfully.")
                     return state
                 user_feedback = self._prompt_user("What still needs to be done? ", multiline=True)
@@ -495,22 +492,29 @@ class Session:
         return self.orch._run_task_verify()
 
     def _git_commit(self, state: SessionState, prefix: str) -> None:
-        """Commit current changes if git auto-commit is enabled."""
+        """Persist current state, then commit current changes if auto-commit is enabled."""
         if not self.config.git.commit_each_task:
+            self._save(state)
             return
         summary = state.goal[:60].replace("\n", " ")
         message = f"{prefix}: {summary}"
+        state.execution_log.append({
+            "attempt": state.current_attempt,
+            "action": "commit",
+            "result": message,
+            "timestamp": self._now(),
+        })
+        self._save(state)
         try:
-            sha = commit_all(self.project_root, message)
-            if sha:
-                state.execution_log.append({
-                    "attempt": state.current_attempt,
-                    "action": "commit",
-                    "result": sha,
-                    "timestamp": self._now(),
-                })
-        except Exception:
-            pass
+            commit_all(self.project_root, message)
+        except RuntimeError as exc:
+            state.execution_log.append({
+                "attempt": state.current_attempt,
+                "action": "commit_failed",
+                "result": str(exc),
+                "timestamp": self._now(),
+            })
+            self._save(state)
 
     def _consolidate_goal(self, state: SessionState) -> str:
         """Build a consolidated goal description from the conversation."""
