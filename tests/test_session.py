@@ -1,0 +1,403 @@
+"""Tests for the lightweight Session (fix / collab) workflows."""
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from typing import List
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from auto_agents.config import (
+    create_session,
+    list_sessions,
+    load_session_state,
+    save_session_state,
+    session_state_path,
+)
+from auto_agents.io_utils import write_text
+from auto_agents.models import AgentResult, SessionState, DEFAULT_SESSION_MAX_ATTEMPTS
+from auto_agents.orchestrator import Orchestrator
+from auto_agents.session import Session
+
+
+def _make_project(tmp: str, name: str = "demo") -> Path:
+    project_root = Path(tmp) / name
+    Orchestrator.init_project(project_root, name, "mock")
+    # Mark as completed so session workflows can operate
+    from auto_agents.config import load_run_state, save_run_state
+    state = load_run_state(project_root)
+    state.status = "completed"
+    save_run_state(project_root, state)
+    return project_root
+
+
+class SessionStateModelTests(unittest.TestCase):
+    """Test SessionState serialization round-trip."""
+
+    def test_round_trip(self) -> None:
+        state = SessionState(
+            session_id="abc123",
+            mode="fix",
+            status="conversing",
+            goal="Button does not work",
+            conversation=[{"role": "user", "content": "hello"}],
+            execution_log=[{"attempt": 1, "action": "fix", "result": "ok", "timestamp": "t"}],
+            current_attempt=1,
+            max_attempts=4,
+            created_at="2026-01-01T00:00:00Z",
+            updated_at="2026-01-01T00:00:01Z",
+        )
+        data = state.to_dict()
+        restored = SessionState.from_dict(data)
+        self.assertEqual(restored.session_id, "abc123")
+        self.assertEqual(restored.mode, "fix")
+        self.assertEqual(restored.goal, "Button does not work")
+        self.assertEqual(len(restored.conversation), 1)
+        self.assertEqual(len(restored.execution_log), 1)
+        self.assertEqual(restored.current_attempt, 1)
+        self.assertEqual(restored.max_attempts, 4)
+
+    def test_defaults(self) -> None:
+        state = SessionState(session_id="x")
+        self.assertEqual(state.mode, "fix")
+        self.assertEqual(state.status, "conversing")
+        self.assertEqual(state.conversation, [])
+        self.assertEqual(state.max_attempts, 4)
+
+    def test_json_round_trip(self) -> None:
+        state = SessionState(session_id="j1", mode="collab", goal="test")
+        blob = json.dumps(state.to_dict())
+        restored = SessionState.from_dict(json.loads(blob))
+        self.assertEqual(restored.session_id, "j1")
+        self.assertEqual(restored.mode, "collab")
+
+
+class SessionConfigTests(unittest.TestCase):
+    """Test session config helpers (create, load, save, list)."""
+
+    def test_create_and_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "fix")
+            self.assertEqual(state.mode, "fix")
+            self.assertEqual(state.status, "conversing")
+            self.assertEqual(state.max_attempts, DEFAULT_SESSION_MAX_ATTEMPTS["fix"])
+            self.assertTrue(len(state.session_id) > 0)
+
+            loaded = load_session_state(project_root, state.session_id)
+            self.assertEqual(loaded.session_id, state.session_id)
+
+    def test_save_and_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "collab")
+            state.goal = "Test video generation"
+            state.status = "executing"
+            save_session_state(project_root, state)
+
+            loaded = load_session_state(project_root, state.session_id)
+            self.assertEqual(loaded.goal, "Test video generation")
+            self.assertEqual(loaded.status, "executing")
+
+    def test_list_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            create_session(project_root, "fix")
+            create_session(project_root, "collab")
+            sessions = list_sessions(project_root)
+            self.assertEqual(len(sessions), 2)
+            modes = {s.mode for s in sessions}
+            self.assertEqual(modes, {"fix", "collab"})
+
+    def test_load_nonexistent_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            with self.assertRaises(FileNotFoundError):
+                load_session_state(project_root, "nonexistent")
+
+
+class SessionFixFlowTests(unittest.TestCase):
+    """Test the fix mode workflow with mock adapter."""
+
+    def _make_session(self, project_root: Path, user_inputs: List[str]) -> Session:
+        inputs = iter(user_inputs)
+        orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+        return Session(orchestrator, mode="fix")
+
+    def test_fix_flow_goal_clear_immediate(self) -> None:
+        """Agent says GOAL_CLEAR on first round, then fix executes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            # User inputs: bug description, then nothing needed after GOAL_CLEAR
+            user_inputs = [
+                "The submit button crashes the app",  # initial bug description
+            ]
+            inputs = iter(user_inputs)
+
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            # Patch the mock adapter to return GOAL_CLEAR on converse, and success on fix
+            original_run = orchestrator.adapter.run
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                result = original_run(request)
+                # First call is converse - return GOAL_CLEAR
+                if call_count["n"] == 1:
+                    content = "I understand the bug. The submit button crash is likely in handlers.py.\nGOAL_CLEAR\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                # Subsequent calls are fix execution
+                content = "Fixed the crash by adding null check.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+
+            session = Session(orchestrator, mode="fix")
+            state = session.start()
+
+            # With no gate commands configured, verification passes immediately
+            self.assertEqual(state.status, "completed")
+            self.assertGreater(len(state.conversation), 0)
+            self.assertEqual(state.mode, "fix")
+
+    def test_fix_flow_multi_round_converse(self) -> None:
+        """Agent asks a question, user answers, then GOAL_CLEAR."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = [
+                "The login page is broken",    # initial description
+                "It happens on Chrome only",   # answer to agent question
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            original_run = orchestrator.adapter.run
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "What browser does this happen in?\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                if call_count["n"] == 2:
+                    content = "Got it, Chrome-specific CSS issue.\nGOAL_CLEAR\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                content = "Fixed Chrome CSS issue.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            # Should have user, agent, user, agent(GOAL_CLEAR) in conversation
+            self.assertGreaterEqual(len(state.conversation), 3)
+
+
+class SessionCollabFlowTests(unittest.TestCase):
+    """Test the collab mode workflow with mock adapter."""
+
+    def test_collab_goal_achieved(self) -> None:
+        """Agent achieves goal, user confirms."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = [
+                "Generate a test video using the frontend",  # initial goal
+                "y",  # confirm goal achieved
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            original_run = orchestrator.adapter.run
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I understand, you want to test video generation.\nGOAL_CLEAR\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                content = "Set up test harness and generated video.\nGOAL_ACHIEVED: Test video generated successfully at output/test.mp4\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="collab")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+
+    def test_collab_need_user_assist(self) -> None:
+        """Agent requests user assistance, then achieves goal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = [
+                "Test the video player in browser",          # initial goal
+                "I opened the browser and see the player",   # user assist response
+                "y",                                          # confirm goal achieved
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I'll help test the video player.\nGOAL_CLEAR\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                if call_count["n"] == 2:
+                    content = "I've set up the test server.\nNEED_USER_ASSIST: Please open http://localhost:3000 and check the player\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                content = "Based on your feedback, everything works.\nGOAL_ACHIEVED: Video player verified working in browser\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="collab")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            # Check that NEED_USER_ASSIST triggered waiting_user
+            assist_entries = [e for e in state.execution_log if e.get("action") == "collab"]
+            self.assertGreater(len(assist_entries), 0)
+
+
+class SessionResumeTests(unittest.TestCase):
+    """Test session resume and persistence."""
+
+    def test_resume_conversing_session(self) -> None:
+        """Resume a session that was interrupted during conversation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            # Create and save a partially-completed session
+            state = create_session(project_root, "fix")
+            state.goal = "Button crash"
+            state.conversation = [
+                {"role": "user", "content": "Button crash"},
+                {"role": "agent", "content": "Which button?"},
+            ]
+            save_session_state(project_root, state)
+
+            user_inputs = [
+                "The submit button on the form page",  # answer to agent question
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "Got it, submit button on form page.\nGOAL_CLEAR\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                content = "Fixed the submit handler.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.resume(state.session_id)
+
+            self.assertEqual(result.status, "completed")
+            self.assertGreater(len(result.conversation), 2)
+
+    def test_resume_completed_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "fix")
+            state.status = "completed"
+            save_session_state(project_root, state)
+
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _: "")
+            session = Session(orchestrator, mode="fix")
+            result = session.resume(state.session_id)
+            self.assertEqual(result.status, "completed")
+
+
+class SessionCLITests(unittest.TestCase):
+    """Test that CLI properly parses fix/collab commands."""
+
+    def test_fix_parser(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["fix", "--project", "/tmp/test"])
+        self.assertEqual(args.command, "fix")
+        self.assertEqual(args.project, "/tmp/test")
+
+    def test_collab_parser(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["collab", "--project", "/tmp/test", "--session", "abc123"])
+        self.assertEqual(args.command, "collab")
+        self.assertEqual(args.session, "abc123")
+
+    def test_fix_parser_with_provider(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["fix", "--project", "/tmp/test", "--provider", "codex"])
+        self.assertEqual(args.provider, "codex")
+
+    def test_collab_parser_print_output(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["collab", "--project", "/tmp/test", "--print-agent-output"])
+        self.assertTrue(args.print_agent_output)
+
+
+if __name__ == "__main__":
+    unittest.main()

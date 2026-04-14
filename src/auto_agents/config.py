@@ -9,8 +9,10 @@ from .io_utils import read_json, read_text, write_if_missing, write_json, write_
 from .models import (
     DEFAULT_EFFORTS,
     DEFAULT_RETRY_PER_STAGE,
+    DEFAULT_SESSION_MAX_ATTEMPTS,
     ProjectConfig,
     RunState,
+    SessionState,
     SUPPORTED_PROVIDER_KINDS,
 )
 
@@ -341,3 +343,76 @@ def load_stage_output(project_root: Path, run_id: str, stage: str) -> str:
 
 def conversation_history_path(project_root: Path, run_id: str) -> Path:
     return run_path(project_root, run_id) / "clarify_conversation.json"
+
+
+# ── Session helpers ──────────────────────────────────────────────
+
+
+def sessions_dir(project_root: Path) -> Path:
+    return state_dir(project_root) / "sessions"
+
+
+def session_dir(project_root: Path, session_id: str) -> Path:
+    return sessions_dir(project_root) / session_id
+
+
+def session_state_path(project_root: Path, session_id: str) -> Path:
+    return session_dir(project_root, session_id) / "session_state.json"
+
+
+def session_artifact_paths(
+    project_root: Path, session_id: str, label: str,
+) -> Tuple[Path, Path]:
+    root = session_dir(project_root, session_id)
+    prompt_path = root / "prompts" / f"{label}.txt"
+    output_path = root / "outputs" / f"{label}.md"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return prompt_path, output_path
+
+
+def create_session(project_root: Path, mode: str) -> SessionState:
+    session_id = uuid4().hex[:12]
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    state = SessionState(
+        session_id=session_id,
+        mode=mode,
+        max_attempts=DEFAULT_SESSION_MAX_ATTEMPTS.get(mode, 4),
+        created_at=now,
+        updated_at=now,
+    )
+    save_session_state(project_root, state)
+    return state
+
+
+def load_session_state(project_root: Path, session_id: str) -> SessionState:
+    data = read_json(session_state_path(project_root, session_id), default=None)
+    if data is None:
+        raise FileNotFoundError(
+            f"Session not found: {session_state_path(project_root, session_id)}"
+        )
+    return SessionState.from_dict(data)
+
+
+def save_session_state(project_root: Path, state: SessionState) -> None:
+    path = session_state_path(project_root, state.session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, state.to_dict())
+
+
+def list_sessions(project_root: Path) -> list:
+    root = sessions_dir(project_root)
+    if not root.is_dir():
+        return []
+    result = []
+    for child in sorted(root.iterdir()):
+        state_file = child / "session_state.json"
+        if state_file.is_file():
+            try:
+                data = read_json(state_file, default=None)
+                if data:
+                    result.append(SessionState.from_dict(data))
+            except Exception:
+                pass
+    return result

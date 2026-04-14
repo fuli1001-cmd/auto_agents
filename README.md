@@ -437,3 +437,47 @@ Explicit schema files live in:
 
 The built-in `validate` command checks project files against these contracts plus required document
 headings.
+
+## Lightweight session workflows
+
+For completed projects, `auto-agents` provides two conversational session modes that bypass the full
+seven-stage pipeline. These are designed for quick, iterative work where the full orchestration flow
+would be too heavyweight.
+
+### Bug fix (`fix`)
+
+Interactive bug-fix loop:
+
+1. **Converse** — describe the bug; the agent asks clarifying questions until the problem is clear
+2. **Execute** — the agent applies a targeted fix with automatic retries
+3. **Verify** — configured gate commands are run to confirm the fix
+4. **Commit** — changes are committed on success
+
+```bash
+python3 -m auto_agents fix --project /tmp/demo
+```
+
+Resume an interrupted session:
+
+```bash
+python3 -m auto_agents fix --project /tmp/demo --session <session_id>
+```
+
+### Collaborative debugging (`collab`)
+
+Interactive debug loop for goals that need user–agent collaboration (e.g. "test the video player in
+the browser"):
+
+1. **Converse** — describe the goal; the agent clarifies
+2. **Iterate** — the agent works toward the goal autonomously; when it needs user action (e.g. "open
+   the browser and check the result"), it pauses with `NEED_USER_ASSIST`; when it discovers a bug it
+   fixes and verifies; when it believes the goal is achieved it asks for your confirmation
+3. **Complete** — you confirm success and changes are committed
+
+```bash
+python3 -m auto_agents collab --project /tmp/demo
+```
+
+Both commands accept `--provider` and `--print-agent-output`. Session state is persisted
+independently at `.auto-agents/state/sessions/<session_id>/` and does not interfere with the main
+`run_state.json`.

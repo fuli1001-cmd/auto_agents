@@ -7,6 +7,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 STAGE_ORDER = ["clarify", "design", "plan", "provider_research", "implement", "verify", "readme"]
 APPROVAL_ORDER = ["requirements", "architecture", "release"]
+SESSION_MODES = ("fix", "collab")
+SESSION_STATUSES = ("conversing", "executing", "verifying", "waiting_user", "completed", "failed")
+DEFAULT_SESSION_MAX_ATTEMPTS = {"fix": 4, "collab": 10}
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli")
 DEFAULT_EFFORTS = {
@@ -349,6 +352,53 @@ class RunState:
             "last_error": self.last_error,
             "rejection_reason": self.rejection_reason,
             "rejected_stage": self.rejected_stage,
+        }
+
+
+@dataclass
+class SessionState:
+    session_id: str
+    mode: str = "fix"
+    status: str = "conversing"
+    goal: str = ""
+    conversation: List[Dict[str, str]] = field(default_factory=list)
+    execution_log: List[Dict[str, object]] = field(default_factory=list)
+    current_attempt: int = 0
+    max_attempts: int = 4
+    created_at: str = ""
+    updated_at: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "SessionState":
+        return cls(
+            session_id=str(data["session_id"]),
+            mode=str(data.get("mode", "fix")),
+            status=str(data.get("status", "conversing")),
+            goal=str(data.get("goal", "")),
+            conversation=[
+                {str(k): str(v) for k, v in dict(item).items()}
+                for item in data.get("conversation", [])
+                if isinstance(item, dict)
+            ],
+            execution_log=list(data.get("execution_log", [])),
+            current_attempt=int(data.get("current_attempt", 0)),
+            max_attempts=int(data.get("max_attempts", 4)),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "mode": self.mode,
+            "status": self.status,
+            "goal": self.goal,
+            "conversation": list(self.conversation),
+            "execution_log": list(self.execution_log),
+            "current_attempt": self.current_attempt,
+            "max_attempts": self.max_attempts,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }
 
 

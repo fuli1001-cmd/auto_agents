@@ -113,6 +113,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit_parser = subparsers.add_parser("audit-requirements", help="Run the requirements trace audit.")
     audit_parser.add_argument("--project", required=True, help="Target project directory.")
+
+    fix_parser = subparsers.add_parser("fix", help="Conversational bug fix for a completed project.")
+    fix_parser.add_argument("--project", required=True, help="Target project directory.")
+    fix_parser.add_argument(
+        "--session",
+        help="Resume an existing fix session by ID.",
+    )
+    fix_parser.add_argument(
+        "--provider",
+        choices=supported_provider_kinds(),
+        help="Override provider for this session.",
+    )
+    fix_parser.add_argument(
+        "--print-agent-output",
+        action="store_true",
+        help="Print each agent output to stderr as it completes.",
+    )
+
+    collab_parser = subparsers.add_parser("collab", help="User-agent collaborative debugging session.")
+    collab_parser.add_argument("--project", required=True, help="Target project directory.")
+    collab_parser.add_argument(
+        "--session",
+        help="Resume an existing collab session by ID.",
+    )
+    collab_parser.add_argument(
+        "--provider",
+        choices=supported_provider_kinds(),
+        help="Override provider for this session.",
+    )
+    collab_parser.add_argument(
+        "--print-agent-output",
+        action="store_true",
+        help="Print each agent output to stderr as it completes.",
+    )
+
     return parser
 
 
@@ -188,6 +223,30 @@ def main(argv: list[str] | None = None) -> int:
             result = orchestrator.audit_requirements()
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0 if result["ok"] else 1
+        except (RuntimeError, FileNotFoundError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
+
+    if args.command in ("fix", "collab"):
+        try:
+            from .session import Session
+
+            project_root = Path(args.project)
+            orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            if getattr(args, "provider", None):
+                orchestrator._set_active_provider(args.provider)
+            orchestrator._print_agent_output = bool(args.print_agent_output)
+            session = Session(
+                orchestrator,
+                mode=args.command,
+                print_agent_output=bool(args.print_agent_output),
+            )
+            if args.session:
+                state = session.resume(args.session)
+            else:
+                state = session.offer_resume_or_new()
+            print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
+            return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
