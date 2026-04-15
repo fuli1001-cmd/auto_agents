@@ -40,15 +40,29 @@ class CodexAdapter(AgentAdapter):
         env = dict(os.environ)
         env["AUTO_AGENTS_STAGE"] = request.stage
         env["AUTO_AGENTS_EFFORT"] = request.effort
-        process = subprocess.run(
-            command,
-            input=request.prompt,
-            text=True,
-            encoding="utf-8",
-            capture_output=True,
-            cwd=str(request.cwd),
-            env=env,
-        )
+        timeout = self.config.timeout_seconds or None
+        try:
+            process = subprocess.run(
+                command,
+                input=request.prompt,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                cwd=str(request.cwd),
+                env=env,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return AgentResult(
+                ok=False,
+                command=command,
+                output_path=request.output_path,
+                summary="",
+                model=self._model_label(request),
+                stdout="",
+                stderr=f"timed out after {timeout}s",
+                returncode=-1,
+            )
         visible_stdout, usage, error_messages = self._parse_json_stdout(process.stdout)
         stderr = process.stderr.strip()
         if error_messages:

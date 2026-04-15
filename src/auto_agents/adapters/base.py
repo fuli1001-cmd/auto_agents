@@ -22,17 +22,22 @@ def run_subprocess_with_optional_streaming(
     command: List[str],
     request: AgentRequest,
     env: Dict[str, str],
+    timeout: int | None = None,
 ) -> Tuple[str, str, int, bool, bool]:
     if request.stream_output is None:
-        process = subprocess.run(
-            command,
-            input=request.prompt,
-            text=True,
-            encoding="utf-8",
-            capture_output=True,
-            cwd=str(request.cwd),
-            env=env,
-        )
+        try:
+            process = subprocess.run(
+                command,
+                input=request.prompt,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                cwd=str(request.cwd),
+                env=env,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return "", f"timed out after {timeout}s", -1, False, False
         return process.stdout, process.stderr, process.returncode, False, False
 
     process = subprocess.Popen(
@@ -73,8 +78,18 @@ def run_subprocess_with_optional_streaming(
     process.stdin.write(request.prompt)
     process.stdin.close()
 
-    stdout_thread.join()
-    stderr_thread.join()
+    stdout_thread.join(timeout=timeout)
+    stderr_thread.join(timeout=timeout)
+    if process.poll() is None:
+        process.kill()
+        process.wait()
+        return (
+            "".join(stdout_chunks),
+            "".join(stderr_chunks) + f"\ntimed out after {timeout}s",
+            -1,
+            streamed["stdout"],
+            streamed["stderr"],
+        )
     returncode = process.wait()
     return (
         "".join(stdout_chunks),

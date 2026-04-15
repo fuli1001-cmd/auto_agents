@@ -54,15 +54,29 @@ class CopilotCliAdapter(AgentAdapter):
         else:
             command.extend(["-p", request.prompt])
 
-        process = subprocess.run(
-            command,
-            input=stdin_input,
-            text=True,
-            encoding="utf-8",
-            capture_output=True,
-            cwd=str(request.cwd),
-            env=env,
-        )
+        timeout = self.config.timeout_seconds or None
+        try:
+            process = subprocess.run(
+                command,
+                input=stdin_input,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                cwd=str(request.cwd),
+                env=env,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return AgentResult(
+                ok=False,
+                command=command,
+                output_path=request.output_path,
+                summary="",
+                model=self._model_label(request),
+                stdout="",
+                stderr=f"timed out after {timeout}s",
+                returncode=-1,
+            )
 
         stdout = process.stdout or ""
         stderr = (process.stderr or "").strip()

@@ -92,6 +92,7 @@ class ProviderConfig:
     cwd_flag: str = "-C"
     prompt_via_stdin: bool = True
     output_flag: str = "-o"
+    timeout_seconds: int = 1800
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProviderConfig":
@@ -104,6 +105,7 @@ class ProviderConfig:
             cwd_flag=str(data.get("cwd_flag", "-C")),
             prompt_via_stdin=bool(data.get("prompt_via_stdin", True)),
             output_flag=str(data.get("output_flag", "-o")),
+            timeout_seconds=int(data.get("timeout_seconds", 1800)),
         )
 
     def to_dict(self) -> Dict[str, object]:
