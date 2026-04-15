@@ -482,7 +482,15 @@ class Session:
         result: AgentResult = self.orch._call_with_failover(request)
         self.orch._emit_agent_output(label, result)
         if not result.ok:
-            raise RuntimeError(f"Agent call failed ({label}): {result.stderr or result.summary}")
+            parts = []
+            if result.stderr:
+                parts.append(f"stderr={result.stderr}")
+            if result.stdout:
+                parts.append(f"stdout={result.stdout[:500]}")
+            if result.summary and result.summary != result.stdout:
+                parts.append(f"summary={result.summary[:500]}")
+            detail = "; ".join(parts) if parts else "no output"
+            raise RuntimeError(f"Agent call failed ({label}): {detail}")
         return (result.summary or result.stdout).strip()
 
     def _run_verify(self) -> Dict[str, object]:

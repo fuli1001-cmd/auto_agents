@@ -232,7 +232,7 @@ when `--config-dir` is provided. The adapter works around this by reading `model
 `config.json` and forwarding it as `--model <value>` unless you already set `--model` in
 `extra_args`.
 
-By default, the adapter adds `--allow-all-tools` for headless automation. To override this, pass
+By default, the adapter adds `--allow-all` for headless automation. To override this, pass
 explicit tool-permission flags in `extra_args`.
 
 Example project config (`providers` and `active_provider` only):

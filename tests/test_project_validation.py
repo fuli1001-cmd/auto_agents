@@ -991,7 +991,10 @@ class ProjectValidationTests(unittest.TestCase):
         config_dir_index = cmd.index("--config-dir")
         resolved = cmd[config_dir_index + 1]
         self.assertEqual(resolved, str(DEFAULT_PROFILES_ROOT / "deep"))
-        self.assertIn("--allow-all-tools", cmd)
+        self.assertIn("--allow-all", cmd)
+        self.assertIn("--no-ask-user", cmd)
+        self.assertIn("--no-color", cmd)
+        self.assertIn("-s", cmd)
 
     def test_copilot_cli_adapter_forwards_model_from_profile_config(self) -> None:
         from auto_agents.adapters.copilot_cli import CopilotCliAdapter
@@ -1020,14 +1023,14 @@ class ProjectValidationTests(unittest.TestCase):
             model_index = cmd.index("--model")
             self.assertEqual(cmd[model_index + 1], "gpt-4.1")
 
-    def test_copilot_cli_adapter_skips_allow_all_tools_when_explicit(self) -> None:
+    def test_copilot_cli_adapter_skips_allow_all_when_explicit(self) -> None:
         from auto_agents.adapters.copilot_cli import CopilotCliAdapter
 
         config = ProviderConfig(
             kind="copilot-cli",
             binary="copilot",
             profile_map={"balanced": "balanced"},
-            extra_args=["--deny-tools", "dangerous-tool"],
+            extra_args=["--deny-tool", "dangerous-tool"],
         )
         adapter = CopilotCliAdapter(config)
         request = AgentRequest(
@@ -1038,8 +1041,8 @@ class ProjectValidationTests(unittest.TestCase):
             output_path=Path("/tmp/test/out.md"),
         )
         cmd = adapter._build_command(request)
-        self.assertNotIn("--allow-all-tools", cmd)
-        self.assertIn("--deny-tools", cmd)
+        self.assertNotIn("--allow-all", cmd)
+        self.assertIn("--deny-tool", cmd)
 
     def test_copilot_cli_adapter_model_label_uses_profile(self) -> None:
         from auto_agents.adapters.copilot_cli import CopilotCliAdapter

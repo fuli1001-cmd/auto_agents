@@ -46,9 +46,17 @@ class CopilotCliAdapter(AgentAdapter):
 
         import subprocess
 
+        # When prompt_via_stdin is True, pipe the prompt through stdin.
+        # Otherwise, append it to the command via -p (non-interactive mode).
+        stdin_input: Optional[str] = None
+        if self.config.prompt_via_stdin:
+            stdin_input = request.prompt
+        else:
+            command.extend(["-p", request.prompt])
+
         process = subprocess.run(
             command,
-            input=request.prompt,
+            input=stdin_input,
             text=True,
             encoding="utf-8",
             capture_output=True,
@@ -91,6 +99,9 @@ class CopilotCliAdapter(AgentAdapter):
     def _build_command(self, request: AgentRequest) -> List[str]:
         command: List[str] = [self.config.binary]
 
+        # Non-interactive flags for clean scripting output.
+        command.extend(["--no-color", "-s"])
+
         # NOTE: copilot CLI does not support -C or -o flags.
         # Working directory is passed via subprocess.run(cwd=...).
         # Output is captured from stdout and written to output_path by run().
@@ -106,10 +117,13 @@ class CopilotCliAdapter(AgentAdapter):
                 if profile_model:
                     command.extend(["--model", profile_model])
 
-        # Default to allow-all-tools for headless automation unless the
+        # Default to allow-all for headless automation unless the
         # caller explicitly passed tool-permission flags in extra_args.
         if not self._has_tool_permission_flag():
-            command.append("--allow-all-tools")
+            command.append("--allow-all")
+
+        # Ensure the agent works fully autonomously.
+        command.append("--no-ask-user")
 
         # Passthrough extra arguments
         command.extend(self.config.extra_args)
@@ -137,9 +151,11 @@ class CopilotCliAdapter(AgentAdapter):
 
     def _has_tool_permission_flag(self) -> bool:
         permission_flags = {
+            "--allow-all",
             "--allow-all-tools",
-            "--allow-tools",
-            "--deny-tools",
+            "--allow-tool",
+            "--deny-tool",
+            "--yolo",
         }
         return any(arg in permission_flags for arg in self.config.extra_args)
 
