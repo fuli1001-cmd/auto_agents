@@ -63,7 +63,7 @@ _FAILOVER_PATTERN = re.compile(
     r"rate.limit|usage.limit|\b429\b|quota|too many requests|capacity|unavailable"
     r"|service.unavailable|not.found|No such file|ENOENT"
     r"|no.last.agent.message|wrote.empty.content|empty.response"
-    r"|connection.error|connect.error|timed?\s*out",
+    r"|connection.error|connect.error|timed?\s*out|stalled",
     re.IGNORECASE,
 )
 

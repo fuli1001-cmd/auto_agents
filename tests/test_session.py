@@ -698,5 +698,170 @@ class SessionListCommandTests(unittest.TestCase):
         self.assertEqual(data[0]["status"], "completed")
 
 
+class ErrorFeedbackTests(unittest.TestCase):
+    """Test _build_error_feedback for stall/timeout/transient classification."""
+
+    def _make_session(self, tmp: str) -> Session:
+        project_root = _make_project(tmp)
+        orchestrator = Orchestrator(project_root)
+        return Session(orchestrator, mode="collab")
+
+    def test_stall_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_session(tmp)
+            err = "stderr=stalled (no output) after 300s\n--- last output ---\nPolling render status..."
+            fb = sess._build_error_feedback(err)
+            self.assertIn("STALLED", fb)
+            self.assertIn("bounded retries", fb)
+            self.assertIn("Polling render status", fb)
+
+    def test_timeout_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_session(tmp)
+            err = "stderr=timed out after 1800s\n--- last output ---\nWaiting for server..."
+            fb = sess._build_error_feedback(err)
+            self.assertIn("TIMED OUT", fb)
+            self.assertIn("Waiting for server", fb)
+
+    def test_transient_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = self._make_session(tmp)
+            err = "stderr=Connection refused"
+            fb = sess._build_error_feedback(err)
+            self.assertIn("transient error", fb)
+
+
+class CollabAlwaysStreamTests(unittest.TestCase):
+    """Test that collab/fix modes always provide a stream_output callback."""
+
+    def test_collab_always_streams(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = ["Test goal", "y"]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            stream_was_set = {"value": False}
+            original_failover = orchestrator._call_with_failover
+
+            def capture_failover(request):
+                stream_was_set["value"] = request.stream_output is not None
+                # Return a successful result with GOAL_CLEAR then GOAL_ACHIEVED
+                content = "Understood.\nGOAL_CLEAR\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator._call_with_failover = capture_failover
+            session = Session(orchestrator, mode="collab", print_agent_output=False)
+            # Just run converse phase to check stream_output is set
+            state = session.start()
+            self.assertTrue(stream_was_set["value"], "stream_output should be set in collab mode even without print_agent_output flag")
+
+
+class CollabStallRetryTests(unittest.TestCase):
+    """Test that a stalled agent triggers retry with diagnostic feedback."""
+
+    def test_stall_triggers_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = [
+                "Generate a test video",  # initial goal
+                "y",  # confirm goal achieved
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_failover(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "Understood.\nGOAL_CLEAR\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                if call_count["n"] == 2:
+                    # Simulate a stall — agent returns failure with stall indicator
+                    return AgentResult(
+                        ok=False, command=["mock"], output_path=request.output_path,
+                        summary="", stdout="Starting server...\nPolling render...\n",
+                        stderr="stalled (no output) after 300s\n--- last output ---\nPolling render...",
+                        returncode=-1,
+                    )
+                # Third call succeeds after retry
+                content = "Fixed the issue by using bounded retries.\nGOAL_ACHIEVED: Video generated successfully\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator._call_with_failover = mock_failover
+            session = Session(orchestrator, mode="collab")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            # Verify that the stall was logged
+            stall_entries = [e for e in state.execution_log if e.get("action") == "agent_error"]
+            self.assertEqual(len(stall_entries), 1)
+            self.assertIn("stalled", stall_entries[0]["result"])
+
+
+class TailLinesTests(unittest.TestCase):
+    """Test the _tail_lines helper from base.py."""
+
+    def test_tail_lines_basic(self) -> None:
+        from auto_agents.adapters.base import _tail_lines
+        chunks = ["line1\n", "line2\n", "line3\n", "line4\n", "line5\n"]
+        result = _tail_lines(chunks, 3)
+        self.assertEqual(result, "line3\nline4\nline5")
+
+    def test_tail_lines_fewer_than_n(self) -> None:
+        from auto_agents.adapters.base import _tail_lines
+        chunks = ["line1\n", "line2\n"]
+        result = _tail_lines(chunks, 5)
+        self.assertEqual(result, "line1\nline2")
+
+    def test_tail_lines_empty(self) -> None:
+        from auto_agents.adapters.base import _tail_lines
+        result = _tail_lines([], 5)
+        self.assertEqual(result, "")
+
+
+class ProcessGroupKillTests(unittest.TestCase):
+    """Test _kill_process_group handles various process states."""
+
+    def test_kill_already_exited(self) -> None:
+        from auto_agents.adapters.base import _kill_process_group
+        # Start a process that exits immediately
+        process = subprocess.Popen(
+            ["true"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        process.wait()
+        # Should not raise even if process already exited
+        _kill_process_group(process)
+
+    def test_kill_running_process(self) -> None:
+        from auto_agents.adapters.base import _kill_process_group
+        process = subprocess.Popen(
+            ["sleep", "60"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        _kill_process_group(process)
+        self.assertIsNotNone(process.returncode)
+
+
 if __name__ == "__main__":
     unittest.main()

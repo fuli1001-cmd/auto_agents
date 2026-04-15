@@ -8,7 +8,7 @@ from typing import List, Optional
 
 from ..io_utils import read_text, write_text
 from ..models import AgentRequest, AgentResult, AgentUsage, ProviderConfig
-from .base import AgentAdapter
+from .base import AgentAdapter, run_subprocess_with_optional_streaming
 
 
 # Default directory for Copilot CLI profile config dirs.
@@ -44,51 +44,26 @@ class CopilotCliAdapter(AgentAdapter):
         env["AUTO_AGENTS_STAGE"] = request.stage
         env["AUTO_AGENTS_EFFORT"] = request.effort
 
-        import subprocess
-
         # When prompt_via_stdin is True, pipe the prompt through stdin.
         # Otherwise, append it to the command via -p (non-interactive mode).
-        stdin_input: Optional[str] = None
         if self.config.prompt_via_stdin:
             stdin_input = request.prompt
         else:
             command.extend(["-p", request.prompt])
+            stdin_input = ""
 
         timeout = self.config.timeout_seconds or None
-        try:
-            process = subprocess.run(
-                command,
-                input=stdin_input,
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-                cwd=str(request.cwd),
-                env=env,
+
+        stdout, stderr, returncode, streamed_stdout, streamed_stderr = (
+            run_subprocess_with_optional_streaming(
+                command, request, env,
                 timeout=timeout,
+                stdin_input=stdin_input,
+                idle_timeout=self.config.idle_timeout_seconds or None,
             )
-        except subprocess.TimeoutExpired:
-            return AgentResult(
-                ok=False,
-                command=command,
-                output_path=request.output_path,
-                summary="",
-                model=self._model_label(request),
-                stdout="",
-                stderr=f"timed out after {timeout}s",
-                returncode=-1,
-            )
+        )
 
-        stdout = process.stdout or ""
-        stderr = (process.stderr or "").strip()
-
-        streamed_stdout = False
-        streamed_stderr = False
-        if request.stream_output is not None and stdout.strip():
-            request.stream_output("stdout", stdout)
-            streamed_stdout = True
-        if request.stream_output is not None and stderr:
-            request.stream_output("stderr", stderr + "\n")
-            streamed_stderr = True
+        stderr = stderr.strip()
 
         summary = read_text(request.output_path).strip()
         if not summary and stdout:
@@ -96,14 +71,14 @@ class CopilotCliAdapter(AgentAdapter):
             write_text(request.output_path, summary + "\n")
 
         return AgentResult(
-            ok=process.returncode == 0,
+            ok=returncode == 0,
             command=command,
             output_path=request.output_path,
             summary=summary,
             model=self._model_label(request),
             stdout=stdout,
             stderr=stderr,
-            returncode=process.returncode,
+            returncode=returncode,
             streamed_stdout=streamed_stdout,
             streamed_stderr=streamed_stderr,
         )

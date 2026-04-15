@@ -38,6 +38,7 @@ class ShellAdapter(AgentAdapter):
             request,
             env,
             timeout=self.config.timeout_seconds or None,
+            idle_timeout=self.config.idle_timeout_seconds or None,
         )
 
         summary = read_text(request.output_path).strip()

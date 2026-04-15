@@ -193,9 +193,8 @@ class Session:
                     "timestamp": self._now(),
                 })
                 self._save(state)
-                self._print(f"Agent call failed (transient): {err_msg[:200]}")
+                feedback = self._build_error_feedback(err_msg)
                 self._print("Will retry on next attempt.")
-                feedback = f"Previous attempt failed with a transient error: {err_msg[:300]}"
                 continue
 
             state.execution_log.append({
@@ -265,9 +264,8 @@ class Session:
                     "timestamp": self._now(),
                 })
                 self._save(state)
-                self._print(f"Agent call failed (transient): {err_msg[:200]}")
+                feedback = self._build_error_feedback(err_msg)
                 self._print("Will retry on next iteration.")
-                feedback = f"Previous attempt failed with a transient error: {err_msg[:300]}"
                 continue
 
             state.conversation.append({"role": "agent", "content": reply})
@@ -494,6 +492,17 @@ class Session:
             "4. If you discover a bug, output 'BUG_FOUND: <description>' and fix it",
             "5. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",
             "6. Provide a brief status update of what you did",
+            "",
+            "EXECUTION SAFETY RULES (critical — follow strictly):",
+            "- Set a timeout for EVERY HTTP request or polling loop (max 60s per request, 5 min total for repeated polling).",
+            "- If a subprocess or external command fails, report the failure immediately — do NOT retry indefinitely.",
+            "- Use bounded retries: max 3 retries for any single operation, then stop and report the error.",
+            "- Do NOT start infinite watch/poll/retry loops. Always use explicit exit conditions.",
+            "- Prefer small incremental steps: start a service, verify it works, then proceed to the next step.",
+            "- If you start background servers, verify they are healthy (e.g., curl health-check) before using them.",
+            "- Report progress after each significant action so progress is visible.",
+            "- If an operation is taking too long or keeps failing, stop and output BUG_FOUND with the error details.",
+            "",
             "If this is a Python project, use the project-local conda env at ./.conda and install packages only inside it.",
             "Do not modify .auto-agents state files.",
         ])
@@ -508,6 +517,9 @@ class Session:
         )
         write_text(prompt_path, prompt)
         effort = self.config.efforts.get("implement", "deep")
+        # Always stream in collab/fix mode so the user sees real-time progress.
+        # The --print-agent-output flag is not required.
+        should_stream = self._print_agent_output or self.mode in ("collab", "fix")
         request = AgentRequest(
             stage="implement",
             effort=effort,
@@ -516,7 +528,7 @@ class Session:
             output_path=output_path,
             stream_output=(
                 self.orch._stream_agent_output_callback(label)
-                if self._print_agent_output
+                if should_stream
                 else None
             ),
         )
@@ -539,6 +551,40 @@ class Session:
         if not self.config.gates.commands:
             return {"ok": True, "reason": "no verification commands configured"}
         return self.orch._run_task_verify()
+
+    def _build_error_feedback(self, err_msg: str) -> str:
+        """Build feedback string from an agent error, with stall/timeout diagnostics."""
+        tail_section = ""
+        if "--- last output ---" in err_msg:
+            tail_section = err_msg.split("--- last output ---", 1)[1].strip()
+
+        if "stalled" in err_msg.lower():
+            self._print("Agent stalled (no output for extended period).")
+            if tail_section:
+                self._print(f"Last output before stall:\n{tail_section[:300]}")
+            feedback = (
+                "CRITICAL: The previous attempt STALLED — the agent produced no output "
+                "for an extended period and was terminated. This usually means a subprocess "
+                "or polling loop ran indefinitely.\n"
+                "You MUST use a different approach: use bounded retries, set explicit timeouts, "
+                "and break the work into smaller verifiable steps.\n"
+            )
+            if tail_section:
+                feedback += f"Last output before the stall:\n{tail_section[:500]}\n"
+            return feedback
+
+        if "timed out" in err_msg.lower():
+            self._print("Agent timed out.")
+            feedback = (
+                "The previous attempt TIMED OUT. The agent ran for too long without completing.\n"
+                "Try a more focused approach: break the task into smaller steps.\n"
+            )
+            if tail_section:
+                feedback += f"Last output before timeout:\n{tail_section[:500]}\n"
+            return feedback
+
+        self._print(f"Agent call failed (transient): {err_msg[:200]}")
+        return f"Previous attempt failed with a transient error: {err_msg[:300]}"
 
     def _git_commit(self, state: SessionState, prefix: str) -> None:
         """Persist current state, then commit current changes if auto-commit is enabled."""
