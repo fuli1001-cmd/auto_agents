@@ -60,7 +60,7 @@ from .validation import validate_task_plan_with_requirements, validation_report
 from .validation import validate_required_document
 
 _FAILOVER_PATTERN = re.compile(
-    r"rate.limit|\b429\b|quota|too many requests|capacity|unavailable"
+    r"rate.limit|usage.limit|\b429\b|quota|too many requests|capacity|unavailable"
     r"|service.unavailable|not.found|No such file|ENOENT"
     r"|no.last.agent.message|wrote.empty.content|empty.response",
     re.IGNORECASE,

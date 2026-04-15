@@ -49,8 +49,11 @@ class CodexAdapter(AgentAdapter):
             cwd=str(request.cwd),
             env=env,
         )
-        visible_stdout, usage = self._parse_json_stdout(process.stdout)
+        visible_stdout, usage, error_messages = self._parse_json_stdout(process.stdout)
         stderr = process.stderr.strip()
+        if error_messages:
+            err_text = "\n".join(error_messages)
+            stderr = f"{stderr}\n{err_text}".strip() if stderr else err_text
 
         streamed_stdout = False
         streamed_stderr = False
@@ -97,8 +100,13 @@ class CodexAdapter(AgentAdapter):
                 return extra_args[index + 1]
         return ""
 
-    def _parse_json_stdout(self, stdout: str) -> tuple[str, Optional[AgentUsage]]:
+    def _parse_json_stdout(self, stdout: str) -> tuple[str, Optional[AgentUsage], List[str]]:
+        """Parse codex JSON-line stdout.
+
+        Returns (visible_text, usage, error_messages).
+        """
         visible_chunks: List[str] = []
+        error_messages: List[str] = []
         usage: Optional[AgentUsage] = None
 
         for raw_line in stdout.splitlines():
@@ -126,5 +134,11 @@ class CodexAdapter(AgentAdapter):
                         cached_input_tokens=int(usage_payload.get("cached_input_tokens", 0) or 0),
                         output_tokens=int(usage_payload.get("output_tokens", 0) or 0),
                     )
+            elif event_type in ("error", "turn.failed"):
+                msg = event.get("message") or ""
+                if not msg and isinstance(event.get("error"), dict):
+                    msg = event["error"].get("message", "")
+                if msg:
+                    error_messages.append(msg)
 
-        return "".join(visible_chunks), usage
+        return "".join(visible_chunks), usage, error_messages
