@@ -132,7 +132,20 @@ class Session:
         while rounds < max_converse_rounds:
             rounds += 1
             prompt = self._build_converse_prompt(state)
-            reply = self._call_agent(state, f"converse-{rounds}", prompt)
+            try:
+                reply = self._call_agent(state, f"converse-{rounds}", prompt)
+            except RuntimeError as exc:
+                err_msg = str(exc)
+                state.execution_log.append({
+                    "attempt": rounds,
+                    "action": "converse_error",
+                    "result": err_msg[:500],
+                    "timestamp": self._now(),
+                })
+                self._save(state)
+                self._print(f"Agent call failed (transient): {err_msg[:200]}")
+                self._print("Retrying clarification...")
+                continue
 
             state.conversation.append({"role": "agent", "content": reply})
             self._save(state)
@@ -169,7 +182,21 @@ class Session:
             self._print(f"\n--- Fix attempt {state.current_attempt}/{state.max_attempts} ---")
 
             prompt = self._build_fix_prompt(state, feedback)
-            reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
+            try:
+                reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
+            except RuntimeError as exc:
+                err_msg = str(exc)
+                state.execution_log.append({
+                    "attempt": state.current_attempt,
+                    "action": "agent_error",
+                    "result": err_msg[:500],
+                    "timestamp": self._now(),
+                })
+                self._save(state)
+                self._print(f"Agent call failed (transient): {err_msg[:200]}")
+                self._print("Will retry on next attempt.")
+                feedback = f"Previous attempt failed with a transient error: {err_msg[:300]}"
+                continue
 
             state.execution_log.append({
                 "attempt": state.current_attempt,
@@ -227,7 +254,21 @@ class Session:
             self._print(f"\n--- Collab iteration {state.current_attempt}/{state.max_attempts} ---")
 
             prompt = self._build_collab_prompt(state, feedback)
-            reply = self._call_agent(state, f"collab-{state.current_attempt}", prompt)
+            try:
+                reply = self._call_agent(state, f"collab-{state.current_attempt}", prompt)
+            except RuntimeError as exc:
+                err_msg = str(exc)
+                state.execution_log.append({
+                    "attempt": state.current_attempt,
+                    "action": "agent_error",
+                    "result": err_msg[:500],
+                    "timestamp": self._now(),
+                })
+                self._save(state)
+                self._print(f"Agent call failed (transient): {err_msg[:200]}")
+                self._print("Will retry on next iteration.")
+                feedback = f"Previous attempt failed with a transient error: {err_msg[:300]}"
+                continue
 
             state.conversation.append({"role": "agent", "content": reply})
             state.execution_log.append({
