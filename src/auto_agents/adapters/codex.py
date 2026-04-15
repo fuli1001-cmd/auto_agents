@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
-from typing import List, Optional
+from dataclasses import replace
+from typing import Callable, List, Optional, Tuple
 
 from ..io_utils import read_text, write_text
 from ..models import AgentRequest, AgentResult, AgentUsage, ProviderConfig
-from .base import AgentAdapter
+from .base import AgentAdapter, run_subprocess_with_optional_streaming
 
 
 class CodexAdapter(AgentAdapter):
@@ -41,42 +41,29 @@ class CodexAdapter(AgentAdapter):
         env["AUTO_AGENTS_STAGE"] = request.stage
         env["AUTO_AGENTS_EFFORT"] = request.effort
         timeout = self.config.timeout_seconds or None
-        try:
-            process = subprocess.run(
-                command,
-                input=request.prompt,
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-                cwd=str(request.cwd),
-                env=env,
+
+        # Wrap the stream callback to parse codex JSON lines in real-time,
+        # forwarding only visible agent messages (not raw JSON).
+        filtered_request = request
+        if request.stream_output is not None:
+            filtered_request = replace(
+                request,
+                stream_output=self._make_json_stream_filter(request.stream_output),
+            )
+
+        stdout_raw, stderr, returncode, streamed_stdout, streamed_stderr = (
+            run_subprocess_with_optional_streaming(
+                command, filtered_request, env,
                 timeout=timeout,
+                idle_timeout=self.config.idle_timeout_seconds or None,
             )
-        except subprocess.TimeoutExpired:
-            return AgentResult(
-                ok=False,
-                command=command,
-                output_path=request.output_path,
-                summary="",
-                model=self._model_label(request),
-                stdout="",
-                stderr=f"timed out after {timeout}s",
-                returncode=-1,
-            )
-        visible_stdout, usage, error_messages = self._parse_json_stdout(process.stdout)
-        stderr = process.stderr.strip()
+        )
+
+        visible_stdout, usage, error_messages = self._parse_json_stdout(stdout_raw)
+        stderr = stderr.strip()
         if error_messages:
             err_text = "\n".join(error_messages)
             stderr = f"{stderr}\n{err_text}".strip() if stderr else err_text
-
-        streamed_stdout = False
-        streamed_stderr = False
-        if request.stream_output is not None and visible_stdout:
-            request.stream_output("stdout", visible_stdout)
-            streamed_stdout = True
-        if request.stream_output is not None and stderr:
-            request.stream_output("stderr", stderr + "\n")
-            streamed_stderr = True
 
         summary = read_text(request.output_path).strip()
         if not summary and visible_stdout:
@@ -84,7 +71,7 @@ class CodexAdapter(AgentAdapter):
             write_text(request.output_path, summary + "\n")
 
         return AgentResult(
-            ok=process.returncode == 0,
+            ok=returncode == 0,
             command=command,
             output_path=request.output_path,
             summary=summary,
@@ -92,7 +79,7 @@ class CodexAdapter(AgentAdapter):
             usage=usage,
             stdout=visible_stdout,
             stderr=stderr,
-            returncode=process.returncode,
+            returncode=returncode,
             streamed_stdout=streamed_stdout,
             streamed_stderr=streamed_stderr,
         )
@@ -113,6 +100,42 @@ class CodexAdapter(AgentAdapter):
             if value in {"--model", "-m"} and index + 1 < len(extra_args):
                 return extra_args[index + 1]
         return ""
+
+    @staticmethod
+    def _make_json_stream_filter(
+        callback: Callable[[str, str], None],
+    ) -> Callable[[str, str], None]:
+        """Wrap a stream callback to parse codex JSON lines in real-time.
+
+        Only visible agent messages and errors are forwarded; raw JSON
+        protocol lines are silently consumed.
+        """
+        def filtered(stream_name: str, chunk: str) -> None:
+            if stream_name != "stdout":
+                callback(stream_name, chunk)
+                return
+            line = chunk.strip()
+            if not line:
+                return
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                callback(stream_name, chunk)
+                return
+            event_type = str(event.get("type", ""))
+            if event_type == "item.completed":
+                item = event.get("item", {})
+                if isinstance(item, dict) and item.get("type") == "agent_message":
+                    text = item.get("text")
+                    if isinstance(text, str) and text:
+                        callback(stream_name, text if text.endswith("\n") else text + "\n")
+            elif event_type in ("error", "turn.failed"):
+                msg = event.get("message") or ""
+                if not msg and isinstance(event.get("error"), dict):
+                    msg = event["error"].get("message", "")
+                if msg:
+                    callback("stderr", msg + "\n")
+        return filtered
 
     def _parse_json_stdout(self, stdout: str) -> tuple[str, Optional[AgentUsage], List[str]]:
         """Parse codex JSON-line stdout.

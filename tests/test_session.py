@@ -863,5 +863,46 @@ class ProcessGroupKillTests(unittest.TestCase):
         self.assertIsNotNone(process.returncode)
 
 
+class CodexJsonStreamFilterTests(unittest.TestCase):
+    """Test that CodexAdapter._make_json_stream_filter parses JSON lines correctly."""
+
+    def test_agent_message_forwarded(self) -> None:
+        from auto_agents.adapters.codex import CodexAdapter
+        received = []
+        cb = CodexAdapter._make_json_stream_filter(lambda s, c: received.append((s, c)))
+        line = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Hello world"}})
+        cb("stdout", line + "\n")
+        self.assertEqual(received, [("stdout", "Hello world\n")])
+
+    def test_non_message_events_suppressed(self) -> None:
+        from auto_agents.adapters.codex import CodexAdapter
+        received = []
+        cb = CodexAdapter._make_json_stream_filter(lambda s, c: received.append((s, c)))
+        cb("stdout", json.dumps({"type": "turn.started"}) + "\n")
+        cb("stdout", json.dumps({"type": "turn.completed", "usage": {}}) + "\n")
+        self.assertEqual(received, [])
+
+    def test_error_events_forwarded_as_stderr(self) -> None:
+        from auto_agents.adapters.codex import CodexAdapter
+        received = []
+        cb = CodexAdapter._make_json_stream_filter(lambda s, c: received.append((s, c)))
+        cb("stdout", json.dumps({"type": "error", "message": "quota exceeded"}) + "\n")
+        self.assertEqual(received, [("stderr", "quota exceeded\n")])
+
+    def test_stderr_passthrough(self) -> None:
+        from auto_agents.adapters.codex import CodexAdapter
+        received = []
+        cb = CodexAdapter._make_json_stream_filter(lambda s, c: received.append((s, c)))
+        cb("stderr", "Reading prompt from stdin...\n")
+        self.assertEqual(received, [("stderr", "Reading prompt from stdin...\n")])
+
+    def test_non_json_forwarded_as_is(self) -> None:
+        from auto_agents.adapters.codex import CodexAdapter
+        received = []
+        cb = CodexAdapter._make_json_stream_filter(lambda s, c: received.append((s, c)))
+        cb("stdout", "plain text output\n")
+        self.assertEqual(received, [("stdout", "plain text output\n")])
+
+
 if __name__ == "__main__":
     unittest.main()
