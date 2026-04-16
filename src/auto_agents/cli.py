@@ -245,13 +245,23 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from .config import list_sessions
 
+            _SESSIONS_OMIT = {
+                "conversation", "execution_log", "current_attempt",
+                "max_attempts", "updated_at", "stall_count", "last_diff_hash",
+                "last_verify_sig", "consecutive_agent_errors", "hard_ceiling",
+            }
             project_root = Path(args.project)
             sessions = list_sessions(project_root)
             if getattr(args, "mode", None):
                 sessions = [s for s in sessions if s.mode == args.mode]
             if not getattr(args, "all", False):
                 sessions = [s for s in sessions if s.status not in ("completed", "failed")]
-            rows = [s.to_dict() for s in sessions]
+            rows = []
+            for s in sessions:
+                d = {k: v for k, v in s.to_dict().items() if k not in _SESSIONS_OMIT}
+                if isinstance(d.get("goal"), str) and len(d["goal"]) > 80:
+                    d["goal"] = d["goal"][:80] + "…"
+                rows.append(d)
             print(json.dumps(rows, indent=2, ensure_ascii=False))
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:

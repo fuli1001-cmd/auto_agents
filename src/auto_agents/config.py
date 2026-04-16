@@ -12,6 +12,7 @@ from .models import (
     DEFAULT_SESSION_MAX_ATTEMPTS,
     ProjectConfig,
     RunState,
+    SESSION_HARD_CEILING,
     SessionState,
     SUPPORTED_PROVIDER_KINDS,
 )
@@ -379,6 +380,7 @@ def create_session(project_root: Path, mode: str) -> SessionState:
         session_id=session_id,
         mode=mode,
         max_attempts=DEFAULT_SESSION_MAX_ATTEMPTS.get(mode, 4),
+        hard_ceiling=SESSION_HARD_CEILING.get(mode, 15),
         created_at=now,
         updated_at=now,
     )

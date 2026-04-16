@@ -10,6 +10,9 @@ APPROVAL_ORDER = ["requirements", "architecture", "release"]
 SESSION_MODES = ("fix", "collab")
 SESSION_STATUSES = ("conversing", "executing", "verifying", "waiting_user", "completed", "failed")
 DEFAULT_SESSION_MAX_ATTEMPTS = {"fix": 4, "collab": 10}
+SESSION_STALL_THRESHOLD = 3
+SESSION_AGENT_ERROR_THRESHOLD = 5
+SESSION_HARD_CEILING = {"fix": 15, "collab": 25}
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli")
 DEFAULT_EFFORTS = {
@@ -372,6 +375,11 @@ class SessionState:
     resolution: str = ""
     created_at: str = ""
     updated_at: str = ""
+    stall_count: int = 0
+    last_diff_hash: str = ""
+    last_verify_sig: str = ""
+    consecutive_agent_errors: int = 0
+    hard_ceiling: int = 15
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "SessionState":
@@ -391,6 +399,13 @@ class SessionState:
             resolution=str(data.get("resolution", "")),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
+            stall_count=int(data.get("stall_count", 0)),
+            last_diff_hash=str(data.get("last_diff_hash", "")),
+            last_verify_sig=str(data.get("last_verify_sig", "")),
+            consecutive_agent_errors=int(data.get("consecutive_agent_errors", 0)),
+            hard_ceiling=int(data.get("hard_ceiling", SESSION_HARD_CEILING.get(
+                str(data.get("mode", "fix")), 15,
+            ))),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -406,6 +421,11 @@ class SessionState:
             "resolution": self.resolution,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "stall_count": self.stall_count,
+            "last_diff_hash": self.last_diff_hash,
+            "last_verify_sig": self.last_verify_sig,
+            "consecutive_agent_errors": self.consecutive_agent_errors,
+            "hard_ceiling": self.hard_ceiling,
         }
 
 

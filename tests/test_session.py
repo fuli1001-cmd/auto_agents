@@ -1056,5 +1056,350 @@ class CodexJsonStreamFilterTests(unittest.TestCase):
         self.assertEqual(received, [("stdout", "plain text output\n")])
 
 
+# ── New convergence / resume / slim tests ────────────────────
+
+
+class SessionStateNewFieldsTests(unittest.TestCase):
+    """Test new convergence-related fields on SessionState."""
+
+    def test_new_fields_defaults(self) -> None:
+        state = SessionState(session_id="x")
+        self.assertEqual(state.stall_count, 0)
+        self.assertEqual(state.last_diff_hash, "")
+        self.assertEqual(state.last_verify_sig, "")
+        self.assertEqual(state.consecutive_agent_errors, 0)
+        self.assertEqual(state.hard_ceiling, 15)
+
+    def test_new_fields_round_trip(self) -> None:
+        state = SessionState(
+            session_id="rt1",
+            stall_count=2,
+            last_diff_hash="abc",
+            last_verify_sig="def",
+            consecutive_agent_errors=3,
+            hard_ceiling=20,
+        )
+        restored = SessionState.from_dict(state.to_dict())
+        self.assertEqual(restored.stall_count, 2)
+        self.assertEqual(restored.last_diff_hash, "abc")
+        self.assertEqual(restored.last_verify_sig, "def")
+        self.assertEqual(restored.consecutive_agent_errors, 3)
+        self.assertEqual(restored.hard_ceiling, 20)
+
+    def test_backward_compat_missing_new_fields(self) -> None:
+        """Old session_state.json without new fields should deserialize with defaults."""
+        old_data = {
+            "session_id": "old1",
+            "mode": "fix",
+            "status": "executing",
+            "goal": "some bug",
+            "conversation": [],
+            "execution_log": [],
+            "current_attempt": 2,
+            "max_attempts": 4,
+            "resolution": "",
+            "created_at": "t",
+            "updated_at": "t",
+        }
+        restored = SessionState.from_dict(old_data)
+        self.assertEqual(restored.stall_count, 0)
+        self.assertEqual(restored.last_diff_hash, "")
+        self.assertEqual(restored.consecutive_agent_errors, 0)
+        self.assertEqual(restored.hard_ceiling, 15)  # default for fix mode
+
+
+class ResumeFailedSessionTests(unittest.TestCase):
+    """Test that a failed session can be resumed via --session."""
+
+    def test_resume_failed_resets_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "fix")
+            state.status = "failed"
+            state.goal = "Button crash"
+            state.current_attempt = 4
+            state.conversation = [
+                {"role": "user", "content": "Button crash"},
+                {"role": "agent", "content": "I see the crash.\nGOAL_CLEAR\n"},
+            ]
+            save_session_state(project_root, state)
+
+            user_inputs: list = []
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                content = "Fixed the crash.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.resume(state.session_id)
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.resolution, "fixed")
+            # current_attempt should have been reset and incremented
+            self.assertEqual(result.current_attempt, 1)
+
+    def test_resume_completed_still_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "fix")
+            state.status = "completed"
+            save_session_state(project_root, state)
+
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _: "")
+            session = Session(orchestrator, mode="fix")
+            result = session.resume(state.session_id)
+            self.assertEqual(result.status, "completed")
+
+    def test_offer_resume_includes_failed(self) -> None:
+        """offer_resume_or_new should offer to resume a failed session."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "fix")
+            state.status = "failed"
+            state.goal = "some bug"
+            state.conversation = [
+                {"role": "user", "content": "some bug"},
+                {"role": "agent", "content": "OK\nGOAL_CLEAR\n"},
+            ]
+            save_session_state(project_root, state)
+
+            # User says "y" to resume, then agent fixes
+            user_inputs = ["y"]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            def mock_run(request):
+                content = "Fixed.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.offer_resume_or_new()
+
+            self.assertEqual(result.session_id, state.session_id)
+            self.assertEqual(result.status, "completed")
+
+
+class FixConvergenceTests(unittest.TestCase):
+    """Test convergence-based stopping for fix mode."""
+
+    def test_stall_stops_after_threshold(self) -> None:
+        """Fix loop should stop when diff and verify error are unchanged."""
+        from auto_agents.models import SESSION_STALL_THRESHOLD
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = ["The test fails"]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            # Configure a gate command that always fails with the same output
+            orchestrator.config.gates.commands = ["exit 1"]
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I see the test issue.\nGOAL_CLEAR\n"
+                else:
+                    # Always produce the same fix — no progress
+                    content = "Applied same fix attempt.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.start()
+
+            self.assertEqual(result.status, "failed")
+            self.assertGreaterEqual(result.stall_count, SESSION_STALL_THRESHOLD)
+
+    def test_agent_errors_independent_counter(self) -> None:
+        """Consecutive agent errors should use independent counter."""
+        from auto_agents.models import SESSION_AGENT_ERROR_THRESHOLD
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = ["The test fails"]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I see.\nGOAL_CLEAR\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                # All subsequent calls fail
+                write_text(request.output_path, "")
+                return AgentResult(
+                    ok=False, command=["mock"], output_path=request.output_path,
+                    summary="", stdout="", returncode=1,
+                    stderr="network error",
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.start()
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.consecutive_agent_errors, SESSION_AGENT_ERROR_THRESHOLD)
+            # stall_count should NOT have been bumped by agent errors
+            self.assertEqual(result.stall_count, 0)
+
+
+class ConvergenceHelperTests(unittest.TestCase):
+    """Test convergence detection helper methods."""
+
+    def test_normalize_verify_reason(self) -> None:
+        raw = "Error at 2026-04-15T10:30:00Z pid=12345 addr 0xDEADBEEF"
+        cleaned = Session._normalize_verify_reason(raw)
+        self.assertNotIn("2026", cleaned)
+        self.assertNotIn("12345", cleaned)
+        self.assertNotIn("DEADBEEF", cleaned)
+        self.assertIn("<TS>", cleaned)
+        self.assertIn("pid=<PID>", cleaned)
+        self.assertIn("<HEX>", cleaned)
+
+    def test_update_stall_state_no_change(self) -> None:
+        state = SessionState(session_id="x", last_diff_hash="aaa", last_verify_sig="bbb")
+        session = self._make_stub_session()
+        session._update_stall_state(state, "aaa", "bbb")
+        self.assertEqual(state.stall_count, 1)
+        session._update_stall_state(state, "aaa", "bbb")
+        self.assertEqual(state.stall_count, 2)
+
+    def test_update_stall_state_resets_on_change(self) -> None:
+        state = SessionState(session_id="x", last_diff_hash="aaa", last_verify_sig="bbb", stall_count=2)
+        session = self._make_stub_session()
+        session._update_stall_state(state, "ccc", "bbb")  # diff changed
+        self.assertEqual(state.stall_count, 0)
+
+    def test_should_stop_on_stall(self) -> None:
+        from auto_agents.models import SESSION_STALL_THRESHOLD
+        state = SessionState(session_id="x", stall_count=SESSION_STALL_THRESHOLD)
+        session = self._make_stub_session()
+        result = session._should_stop(state, "some error")
+        self.assertIsNotNone(result)
+        self.assertIn("No progress", result)
+
+    def test_should_stop_on_agent_errors(self) -> None:
+        from auto_agents.models import SESSION_AGENT_ERROR_THRESHOLD
+        state = SessionState(session_id="x", consecutive_agent_errors=SESSION_AGENT_ERROR_THRESHOLD)
+        session = self._make_stub_session()
+        result = session._should_stop(state, "agent_error")
+        self.assertIsNotNone(result)
+        self.assertIn("transient errors", result)
+
+    def test_should_stop_on_hard_ceiling(self) -> None:
+        state = SessionState(session_id="x", current_attempt=15, hard_ceiling=15)
+        session = self._make_stub_session()
+        result = session._should_stop(state, "still failing")
+        self.assertIsNotNone(result)
+        self.assertIn("Hard attempt ceiling", result)
+
+    def test_should_not_stop_when_progressing(self) -> None:
+        state = SessionState(session_id="x", current_attempt=5, stall_count=1)
+        session = self._make_stub_session()
+        result = session._should_stop(state, "some error")
+        self.assertIsNone(result)
+
+    @staticmethod
+    def _make_stub_session():
+        """Build a minimal Session with a stub orchestrator."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _: "")
+            return Session(orchestrator, mode="fix")
+
+
+class SessionsListSlimTests(unittest.TestCase):
+    """Test that the sessions command omits verbose fields."""
+
+    def setUp(self) -> None:
+        self.tmpdir = Path(tempfile.mkdtemp())
+        state_dir = self.tmpdir / ".auto-agents" / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "run_state.json").write_text(json.dumps({"status": "completed"}))
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self.tmpdir)
+
+    def test_omits_verbose_fields(self) -> None:
+        from auto_agents.cli import main
+        state = create_session(self.tmpdir, "fix")
+        state.conversation = [{"role": "user", "content": "hello"}]
+        state.execution_log = [{"attempt": 1, "action": "fix", "result": "ok"}]
+        save_session_state(self.tmpdir, state)
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            rc = main(["sessions", "--project", str(self.tmpdir)])
+        finally:
+            sys.stdout = old_stdout
+
+        self.assertEqual(rc, 0)
+        data = json.loads(captured.getvalue())
+        self.assertEqual(len(data), 1)
+        row = data[0]
+        self.assertIn("session_id", row)
+        self.assertIn("mode", row)
+        self.assertIn("status", row)
+        self.assertIn("goal", row)
+        self.assertNotIn("conversation", row)
+        self.assertNotIn("execution_log", row)
+        self.assertNotIn("current_attempt", row)
+        self.assertNotIn("max_attempts", row)
+        self.assertNotIn("updated_at", row)
+
+    def test_goal_truncated(self) -> None:
+        from auto_agents.cli import main
+        state = create_session(self.tmpdir, "fix")
+        state.goal = "A" * 200
+        save_session_state(self.tmpdir, state)
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            rc = main(["sessions", "--project", str(self.tmpdir)])
+        finally:
+            sys.stdout = old_stdout
+
+        self.assertEqual(rc, 0)
+        data = json.loads(captured.getvalue())
+        goal = data[0]["goal"]
+        self.assertLessEqual(len(goal), 81 + len("…"))
+        self.assertTrue(goal.endswith("…"))
+
+
 if __name__ == "__main__":
     unittest.main()

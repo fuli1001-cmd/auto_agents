@@ -452,7 +452,7 @@ Interactive bug-fix loop:
    questions until the problem is clear. If the agent determines the reported issue is
    **not actually a bug** (e.g., expected behavior, configuration issue), it will explain
    its reasoning and ask for your confirmation before closing the session
-2. **Execute** — the agent applies a targeted fix with automatic retries
+2. **Execute** — the agent applies a targeted fix with convergence-based retry (see below)
 3. **Verify** — configured gate commands are run to confirm the fix
 4. **Commit** — changes are committed on success
 
@@ -475,17 +475,38 @@ the browser"):
 python3 -m auto_agents collab --project /tmp/demo
 ```
 
-Both `fix` and `collab` call the agent with the `implement`-stage effort from
-`config.efforts["implement"]` (default: `deep`).
+### Convergence-based stopping
 
-Resume an interrupted session (works for both fix and collab):
+Both `fix` and `collab` use **convergence detection** instead of a fixed attempt limit. The loop
+continues as long as the agent is making progress, and stops automatically when it stalls:
+
+- **Progress signal** — after each attempt, the tool computes a hash of `git diff` and of the
+  normalized verification error output (zero token cost, purely local). If either hash changed
+  compared to the previous attempt, the agent is making progress and the stall counter resets.
+- **Stall threshold** — if neither hash changes for **3 consecutive attempts**, the session stops
+  with a "no progress" message (`SESSION_STALL_THRESHOLD`).
+- **Agent error threshold** — transient agent errors (network timeouts, API failures) are tracked
+  independently. **5 consecutive agent errors** trigger a stop (`SESSION_AGENT_ERROR_THRESHOLD`).
+- **Hard ceiling** — a safety net prevents runaway loops: **15 attempts** for fix, **25** for collab
+  (`SESSION_HARD_CEILING`). These are deliberately generous; convergence detection is the primary
+  stop mechanism.
+
+### Resuming sessions
+
+Resume an interrupted **or failed** session (works for both fix and collab):
 
 ```bash
 python3 -m auto_agents collab --project /tmp/demo --session <session_id>
 ```
 
-If `--session` is omitted, the CLI automatically detects unfinished sessions of the same mode and
-offers to resume the most recent one.
+If `--session` is omitted, the CLI automatically detects resumable sessions (including failed ones)
+of the same mode and offers to resume the most recent one.
+
+When a **failed** session is resumed, the stall counter and agent-error counter are reset to zero,
+but the conversation history and execution log are preserved so the agent retains full context.
+
+Both `fix` and `collab` call the agent with the `implement`-stage effort from
+`config.efforts["implement"]` (default: `deep`).
 
 ### Listing sessions
 
@@ -499,6 +520,10 @@ python3 -m auto_agents sessions --project /tmp/demo --mode fix
 # Include completed and failed sessions
 python3 -m auto_agents sessions --project /tmp/demo --all
 ```
+
+The sessions list shows a compact summary per session (`session_id`, `mode`, `status`, `goal`,
+`resolution`, `created_at`). Verbose fields like conversation history and execution logs are omitted
+for readability; use `--session <id>` to inspect a specific session in detail.
 
 Both `fix` and `collab` accept `--provider` and `--print-agent-output`. Session state is persisted
 independently at `.auto-agents/state/sessions/<session_id>/` and does not interfere with the main

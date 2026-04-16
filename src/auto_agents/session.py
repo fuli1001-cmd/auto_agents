@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -22,6 +24,8 @@ from .io_utils import read_text, write_text
 from .models import (
     AgentRequest,
     AgentResult,
+    SESSION_AGENT_ERROR_THRESHOLD,
+    SESSION_STALL_THRESHOLD,
     SessionState,
 )
 
@@ -62,23 +66,39 @@ class Session:
         return self._drive(state)
 
     def resume(self, session_id: str) -> SessionState:
-        """Resume an existing session."""
+        """Resume an existing session.
+
+        Completed sessions are returned as-is.  Failed sessions are reset to
+        ``executing`` with a fresh attempt counter so the user can continue
+        where the previous run left off while preserving all prior context.
+        """
         state = load_session_state(self.project_root, session_id)
-        if state.status in ("completed", "failed"):
-            self._print(f"Session {session_id} is already {state.status}.")
+        if state.status == "completed":
+            self._print(f"Session {session_id} is already completed.")
             return state
+        if state.status == "failed":
+            self._print(
+                f"Resuming failed session {session_id} — resetting attempt counter "
+                f"and continuing from execution phase."
+            )
+            state.status = "executing"
+            state.current_attempt = 0
+            state.stall_count = 0
+            state.consecutive_agent_errors = 0
+            self._save(state)
+            return self._drive(state)
         self._print(f"Resuming session {session_id} ({state.mode} mode, status={state.status}).")
         return self._drive(state)
 
     def offer_resume_or_new(self) -> SessionState:
-        """If there are active sessions for this mode, offer to resume; else start new."""
-        active = [
+        """If there are active or failed sessions for this mode, offer to resume; else start new."""
+        resumable = [
             s for s in list_sessions(self.project_root)
-            if s.mode == self.mode and s.status not in ("completed", "failed")
+            if s.mode == self.mode and s.status != "completed"
         ]
-        if active:
-            latest = active[-1]
-            self._print(f"Found active {self.mode} session: {latest.session_id} (status={latest.status})")
+        if resumable:
+            latest = resumable[-1]
+            self._print(f"Found resumable {self.mode} session: {latest.session_id} (status={latest.status})")
             answer = self._prompt_user("Resume this session? (y/n) [y]: ", default="y")
             if answer.strip().lower() not in ("n", "no"):
                 return self.resume(latest.session_id)
@@ -214,15 +234,16 @@ class Session:
 
     def _phase_fix_execute(self, state: SessionState) -> SessionState:
         feedback = ""
-        while state.current_attempt < state.max_attempts:
+        while True:
             state.current_attempt += 1
-            self._print(f"\n--- Fix attempt {state.current_attempt}/{state.max_attempts} ---")
+            self._print(f"\n--- Fix attempt {state.current_attempt} ---")
 
             prompt = self._build_fix_prompt(state, feedback)
             try:
                 reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
             except RuntimeError as exc:
                 err_msg = str(exc)
+                state.consecutive_agent_errors += 1
                 state.execution_log.append({
                     "attempt": state.current_attempt,
                     "action": "agent_error",
@@ -230,9 +251,16 @@ class Session:
                     "timestamp": self._now(),
                 })
                 self._save(state)
+                stop = self._should_stop(state, "agent_error")
+                if stop:
+                    self._print(stop)
+                    break
                 feedback = self._build_error_feedback(err_msg)
                 self._print("Will retry on next attempt.")
                 continue
+
+            # Successful agent call resets transient error counter
+            state.consecutive_agent_errors = 0
 
             state.execution_log.append({
                 "attempt": state.current_attempt,
@@ -253,15 +281,23 @@ class Session:
                     "result": quick_fail,
                     "timestamp": self._now(),
                 })
+                diff_hash = self._compute_diff_hash()
+                verify_sig = self._compute_verify_sig(quick_fail)
+                self._update_stall_state(state, diff_hash, verify_sig)
                 self._save(state)
+                stop = self._should_stop(state, quick_fail)
+                if stop:
+                    self._print(stop)
+                    break
                 continue
 
             # Gate verify
             verify = self._run_verify()
+            verify_reason = "" if verify["ok"] else str(verify["reason"])
             state.execution_log.append({
                 "attempt": state.current_attempt,
                 "action": "verify",
-                "result": "pass" if verify["ok"] else str(verify["reason"]),
+                "result": "pass" if verify["ok"] else verify_reason,
                 "timestamp": self._now(),
             })
             self._save(state)
@@ -274,27 +310,36 @@ class Session:
                 self._print(f"Bug fix completed in session {state.session_id}.")
                 return state
 
-            self._print(f"Verification failed: {verify['reason']}")
-            feedback = self.orch._format_retry_feedback("local_verification", reason=str(verify["reason"]))
+            self._print(f"Verification failed: {verify_reason}")
+            diff_hash = self._compute_diff_hash()
+            verify_sig = self._compute_verify_sig(verify_reason)
+            self._update_stall_state(state, diff_hash, verify_sig)
+            self._save(state)
+            stop = self._should_stop(state, verify_reason)
+            if stop:
+                self._print(stop)
+                break
+            feedback = self.orch._format_retry_feedback("local_verification", reason=verify_reason)
 
         state.status = "failed"
         self._save(state)
-        self._print("Max fix attempts exhausted. Session marked as failed.")
+        self._print("Fix session stopped (no further progress). Session marked as failed.")
         return state
 
     # ── Phase 2b: Collab mode loop ───────────────────────────────
 
     def _phase_collab_loop(self, state: SessionState) -> SessionState:
         feedback = ""
-        while state.current_attempt < state.max_attempts:
+        while True:
             state.current_attempt += 1
-            self._print(f"\n--- Collab iteration {state.current_attempt}/{state.max_attempts} ---")
+            self._print(f"\n--- Collab iteration {state.current_attempt} ---")
 
             prompt = self._build_collab_prompt(state, feedback)
             try:
                 reply = self._call_agent(state, f"collab-{state.current_attempt}", prompt)
             except RuntimeError as exc:
                 err_msg = str(exc)
+                state.consecutive_agent_errors += 1
                 state.execution_log.append({
                     "attempt": state.current_attempt,
                     "action": "agent_error",
@@ -302,9 +347,16 @@ class Session:
                     "timestamp": self._now(),
                 })
                 self._save(state)
+                stop = self._should_stop(state, "agent_error")
+                if stop:
+                    self._print(stop)
+                    break
                 feedback = self._build_error_feedback(err_msg)
                 self._print("Will retry on next iteration.")
                 continue
+
+            # Successful agent call resets transient error counter
+            state.consecutive_agent_errors = 0
 
             state.conversation.append({"role": "agent", "content": reply})
             state.execution_log.append({
@@ -315,9 +367,10 @@ class Session:
             })
             self._save(state)
 
-            # Check for NEED_USER_ASSIST
+            # Check for NEED_USER_ASSIST — counts as progress
             assist_match = _NEED_USER_ASSIST.search(reply)
             if assist_match:
+                state.stall_count = 0
                 display = reply.strip()
                 self._print(f"\nAgent:\n{display}")
                 self._print(f"\nAgent needs your assistance: {assist_match.group(1)}")
@@ -331,9 +384,10 @@ class Session:
                 feedback = ""
                 continue
 
-            # Check for GOAL_ACHIEVED
+            # Check for GOAL_ACHIEVED — counts as progress
             achieved_match = _GOAL_ACHIEVED.search(reply)
             if achieved_match:
+                state.stall_count = 0
                 display = _GOAL_ACHIEVED.sub("", reply).strip()
                 if display:
                     self._print(f"\nAgent:\n{display}")
@@ -351,9 +405,10 @@ class Session:
                 self._save(state)
 
                 if not verify["ok"]:
-                    self._print(f"Verification failed: {verify['reason']}")
+                    verify_reason = str(verify["reason"])
+                    self._print(f"Verification failed: {verify_reason}")
                     self._print("Continuing the loop to fix verification issues.")
-                    feedback = self.orch._format_retry_feedback("local_verification", reason=str(verify["reason"]))
+                    feedback = self.orch._format_retry_feedback("local_verification", reason=verify_reason)
                     continue
 
                 self._print("Verification passed!")
@@ -374,9 +429,10 @@ class Session:
                 feedback = ""
                 continue
 
-            # Check for BUG_FOUND – agent found & fixed a bug inline
+            # Check for BUG_FOUND – agent found & fixed a bug inline — counts as progress
             bug_match = _BUG_FOUND.search(reply)
             if bug_match:
+                state.stall_count = 0
                 self._print(f"\nAgent found a bug: {bug_match.group(1)}")
                 self._print(f"\nAgent:\n{reply.strip()}")
 
@@ -406,6 +462,7 @@ class Session:
             # Run verify to check progress
             verify = self._run_verify()
             if verify["ok"]:
+                state.stall_count = 0
                 self._print("Verification passed after agent's changes!")
                 answer = self._prompt_user("Goal achieved? (y/n) [y]: ", default="y")
                 if answer.strip().lower() not in ("n", "no"):
@@ -422,11 +479,20 @@ class Session:
                 self._print_agent_thinking()
                 feedback = ""
             else:
-                feedback = self.orch._format_retry_feedback("local_verification", reason=str(verify["reason"]))
+                verify_reason = str(verify["reason"])
+                diff_hash = self._compute_diff_hash()
+                verify_sig = self._compute_verify_sig(verify_reason)
+                self._update_stall_state(state, diff_hash, verify_sig)
+                self._save(state)
+                stop = self._should_stop(state, verify_reason)
+                if stop:
+                    self._print(stop)
+                    break
+                feedback = self.orch._format_retry_feedback("local_verification", reason=verify_reason)
 
         state.status = "failed"
         self._save(state)
-        self._print("Max collab iterations exhausted. Session marked as failed.")
+        self._print("Collab session stopped (no further progress). Session marked as failed.")
         return state
 
     # ── Prompt builders ──────────────────────────────────────────
@@ -607,6 +673,68 @@ class Session:
         if not self.config.gates.commands:
             return {"ok": True, "reason": "no verification commands configured"}
         return self.orch._run_task_verify()
+
+    # ── Convergence detection ────────────────────────────────────
+
+    def _compute_diff_hash(self) -> str:
+        """Return a hash of the current ``git diff`` output."""
+        try:
+            result = subprocess.run(
+                ["git", "diff"],
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return hashlib.sha256(result.stdout.encode()).hexdigest()[:16]
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _normalize_verify_reason(reason: str) -> str:
+        """Strip timestamps, PIDs, and similar noise from verification output."""
+        cleaned = re.sub(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[^\s]*", "<TS>", reason)
+        cleaned = re.sub(r"\bpid[= ]\d+\b", "pid=<PID>", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b0x[0-9a-fA-F]+\b", "<HEX>", cleaned)
+        return cleaned.strip()
+
+    def _compute_verify_sig(self, reason: str) -> str:
+        """Return a hash of the normalized verification failure reason."""
+        normalized = self._normalize_verify_reason(reason)
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+    def _update_stall_state(self, state: SessionState, diff_hash: str, verify_sig: str) -> None:
+        """Update stall tracking.  If both diff and verify signature are
+        unchanged from the previous attempt, increment the stall counter;
+        otherwise reset it."""
+        if (
+            state.last_diff_hash
+            and diff_hash == state.last_diff_hash
+            and verify_sig == state.last_verify_sig
+        ):
+            state.stall_count += 1
+        else:
+            state.stall_count = 0
+        state.last_diff_hash = diff_hash
+        state.last_verify_sig = verify_sig
+
+    def _should_stop(self, state: SessionState, reason: str) -> Optional[str]:
+        """Return a stop-reason string if the session should stop, else None."""
+        if state.stall_count >= SESSION_STALL_THRESHOLD:
+            return (
+                f"No progress detected for {state.stall_count} consecutive attempts "
+                f"(same diff and same verification error). Stopping."
+            )
+        if state.consecutive_agent_errors >= SESSION_AGENT_ERROR_THRESHOLD:
+            return (
+                f"Agent encountered {state.consecutive_agent_errors} consecutive "
+                f"transient errors. Stopping."
+            )
+        if state.current_attempt >= state.hard_ceiling:
+            return (
+                f"Hard attempt ceiling ({state.hard_ceiling}) reached. Stopping."
+            )
+        return None
 
     def _build_error_feedback(self, err_msg: str) -> str:
         """Build feedback string from an agent error, with stall/timeout diagnostics."""
