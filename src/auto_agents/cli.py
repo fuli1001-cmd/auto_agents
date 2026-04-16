@@ -249,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
                 "conversation", "execution_log", "current_attempt",
                 "max_attempts", "updated_at", "stall_count", "last_diff_hash",
                 "last_verify_sig", "consecutive_agent_errors", "hard_ceiling",
+                "baseline_failures", "baseline_git_ref", "fix_verify_command",
             }
             project_root = Path(args.project)
             sessions = list_sessions(project_root)
@@ -259,8 +260,6 @@ def main(argv: list[str] | None = None) -> int:
             rows = []
             for s in sessions:
                 d = {k: v for k, v in s.to_dict().items() if k not in _SESSIONS_OMIT}
-                if isinstance(d.get("goal"), str) and len(d["goal"]) > 80:
-                    d["goal"] = d["goal"][:80] + "…"
                 rows.append(d)
             print(json.dumps(rows, indent=2, ensure_ascii=False))
             return 0

@@ -380,6 +380,9 @@ class SessionState:
     last_verify_sig: str = ""
     consecutive_agent_errors: int = 0
     hard_ceiling: int = 15
+    fix_verify_command: str = ""
+    baseline_failures: List[str] = field(default_factory=list)
+    baseline_git_ref: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "SessionState":
@@ -406,6 +409,9 @@ class SessionState:
             hard_ceiling=int(data.get("hard_ceiling", SESSION_HARD_CEILING.get(
                 str(data.get("mode", "fix")), 15,
             ))),
+            fix_verify_command=str(data.get("fix_verify_command", "")),
+            baseline_failures=[str(f) for f in data.get("baseline_failures", [])],
+            baseline_git_ref=str(data.get("baseline_git_ref", "")),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -426,6 +432,9 @@ class SessionState:
             "last_verify_sig": self.last_verify_sig,
             "consecutive_agent_errors": self.consecutive_agent_errors,
             "hard_ceiling": self.hard_ceiling,
+            "fix_verify_command": self.fix_verify_command,
+            "baseline_failures": list(self.baseline_failures),
+            "baseline_git_ref": self.baseline_git_ref,
         }
 
 

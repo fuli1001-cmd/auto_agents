@@ -18,8 +18,8 @@ from .config import (
     save_session_state,
     session_artifact_paths,
 )
-from .gates import run_commands
-from .git_ops import changed_paths, commit_all
+from .gates import run_commands, run_commands_collect_all, extract_failure_ids
+from .git_ops import changed_paths, commit_all, head_ref
 from .io_utils import read_text, write_text
 from .models import (
     AgentRequest,
@@ -34,6 +34,7 @@ _NOT_A_BUG = re.compile(r"^NOT_A_BUG:\s*(.+)$", re.MULTILINE)
 _NEED_USER_ASSIST = re.compile(r"^NEED_USER_ASSIST:\s*(.+)$", re.MULTILINE)
 _BUG_FOUND = re.compile(r"^BUG_FOUND:\s*(.+)$", re.MULTILINE)
 _GOAL_ACHIEVED = re.compile(r"^GOAL_ACHIEVED:\s*(.+)$", re.MULTILINE)
+_FIX_VERIFY = re.compile(r"^FIX_VERIFY:\s*(.+)$", re.MULTILINE)
 
 
 class Session:
@@ -54,6 +55,7 @@ class Session:
         self.config = orchestrator.config
         self.mode = mode
         self._print_agent_output = print_agent_output
+        self._current_state: Optional[SessionState] = None
         # Expose the same user-input helper used by the orchestrator.
         self._prompt_user = orchestrator._prompt_user
 
@@ -208,7 +210,12 @@ class Session:
                     continue
 
             if _GOAL_CLEAR.search(reply):
-                display = _GOAL_CLEAR.sub("", reply).strip()
+                # Extract optional FIX_VERIFY command from the reply
+                fv_match = _FIX_VERIFY.search(reply)
+                if fv_match and self.mode == "fix":
+                    state.fix_verify_command = fv_match.group(1).strip()
+                display = _GOAL_CLEAR.sub("", reply)
+                display = _FIX_VERIFY.sub("", display).strip()
                 if display:
                     self._print(f"\nAgent:\n{display}")
                 self._print("\nAgent has understood the goal. Proceeding to execution.")
@@ -233,6 +240,8 @@ class Session:
     # ── Phase 2a: Fix mode execution ─────────────────────────────
 
     def _phase_fix_execute(self, state: SessionState) -> SessionState:
+        self._current_state = state
+        self._ensure_baseline(state)
         feedback = ""
         while True:
             state.current_attempt += 1
@@ -329,6 +338,7 @@ class Session:
     # ── Phase 2b: Collab mode loop ───────────────────────────────
 
     def _phase_collab_loop(self, state: SessionState) -> SessionState:
+        self._current_state = state
         feedback = ""
         while True:
             state.current_attempt += 1
@@ -530,6 +540,11 @@ class Session:
                 "(e.g., the behavior is by design, a configuration issue, or a user "
                 "misunderstanding), explain your reasoning clearly and output "
                 "'NOT_A_BUG: <one-line explanation>' on a line by itself.",
+                "- When you output GOAL_CLEAR, also output on a separate line "
+                "'FIX_VERIFY: <shell command>' — a single shell command that will "
+                "return exit code 0 if the bug is fixed and non-zero if the bug still "
+                "exists. This should target the specific bug described, not the whole test suite. "
+                "Examples: a pytest invocation with -k filter, a curl command, a grep check, etc.",
             ])
         lines.extend([
             "- Always explain your understanding before asking questions or declaring ready.",
@@ -669,10 +684,107 @@ class Session:
         return (result.summary or result.stdout).strip()
 
     def _run_verify(self) -> Dict[str, object]:
-        """Run configured gate commands."""
+        """Run verification appropriate for the session mode.
+
+        For fix-mode sessions that have a baseline, this performs
+        two-layer verification:
+        1.  ``fix_verify_command`` — confirms the specific bug is fixed.
+        2.  Baseline-diff gates — runs all gate commands and checks for
+            *new* failures compared to the pre-fix baseline.
+
+        For other sessions (collab, no baseline, no gates) falls back to
+        the original short-circuit gate runner.
+        """
+        # Fix mode always goes through the baseline-diff path so that
+        # fix_verify_command is checked even when no gate commands exist.
+        if self.mode == "fix":
+            return self._run_baseline_diff_verify()
+
         if not self.config.gates.commands:
             return {"ok": True, "reason": "no verification commands configured"}
         return self.orch._run_task_verify()
+
+    # ── Baseline-diff verification (fix mode) ────────────────────
+
+    def _snapshot_baseline(self, state: SessionState) -> None:
+        """Capture the current gate failures and git HEAD as the baseline.
+
+        This is run once when the session transitions from *conversing* to
+        *executing*, and again on resume if the git HEAD has moved.
+        """
+        self._print("Capturing baseline gate snapshot...")
+        gate = run_commands_collect_all(self.config.gates.commands, self.project_root)
+        state.baseline_failures = extract_failure_ids(gate)
+        state.baseline_git_ref = head_ref(self.project_root)
+        if state.baseline_failures:
+            self._print(
+                f"Baseline snapshot: {len(state.baseline_failures)} pre-existing failure(s) recorded."
+            )
+        else:
+            self._print("Baseline snapshot: all gate commands pass.")
+        self._save(state)
+
+    def _ensure_baseline(self, state: SessionState) -> None:
+        """Ensure a baseline snapshot exists, re-capturing if git HEAD moved."""
+        current_head = head_ref(self.project_root)
+        if state.baseline_git_ref and state.baseline_git_ref == current_head:
+            return  # baseline is still valid
+        if state.baseline_git_ref and state.baseline_git_ref != current_head:
+            self._print(
+                "Git HEAD changed since last baseline — re-capturing baseline snapshot."
+            )
+        self._snapshot_baseline(state)
+
+    def _run_baseline_diff_verify(self) -> Dict[str, object]:
+        """Two-layer verification for fix sessions.
+
+        Returns ``{"ok": True, ...}`` only if:
+        1.  ``fix_verify_command`` passes (if configured), AND
+        2.  running the full gates produces no *new* failures relative to
+            the stored baseline.
+        """
+        # Retrieve the current in-memory state via the save/load round-trip
+        # is unnecessary — the caller already has it.  But _run_verify is
+        # called from the loop which doesn't pass state, so we load it.
+        # We'll refactor the signature after the feature is validated.
+        state = self._current_state
+
+        # Layer 1: targeted bug verification
+        if state.fix_verify_command:
+            import subprocess as _sp
+            try:
+                proc = _sp.run(
+                    state.fix_verify_command,
+                    shell=True,
+                    text=True,
+                    capture_output=True,
+                    cwd=str(self.project_root),
+                    timeout=120,
+                )
+            except Exception as exc:
+                return {"ok": False, "reason": f"fix_verify_command error: {exc}"}
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "non-zero exit").strip()
+                return {
+                    "ok": False,
+                    "reason": f"fix_verify_command failed: {detail[:500]}",
+                }
+
+        # Layer 2: baseline-diff gate check
+        if not self.config.gates.commands:
+            return {"ok": True, "reason": "no verification commands configured"}
+        gate = run_commands_collect_all(self.config.gates.commands, self.project_root)
+        current_failures = extract_failure_ids(gate)
+        new_failures = sorted(set(current_failures) - set(state.baseline_failures))
+        if new_failures:
+            return {
+                "ok": False,
+                "reason": (
+                    f"{len(new_failures)} new failure(s) introduced: "
+                    + ", ".join(new_failures[:10])
+                ),
+            }
+        return {"ok": True, "reason": gate.summary}
 
     # ── Convergence detection ────────────────────────────────────
 

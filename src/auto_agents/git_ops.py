@@ -101,3 +101,11 @@ def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] =
         hasher.update(b"\0")
 
     return hasher.hexdigest()
+
+
+def head_ref(project_root: Path) -> str:
+    """Return the current HEAD commit hash, or empty string if unavailable."""
+    result = _git(project_root, "rev-parse", "HEAD")
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()

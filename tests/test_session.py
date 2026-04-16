@@ -1069,6 +1069,9 @@ class SessionStateNewFieldsTests(unittest.TestCase):
         self.assertEqual(state.last_verify_sig, "")
         self.assertEqual(state.consecutive_agent_errors, 0)
         self.assertEqual(state.hard_ceiling, 15)
+        self.assertEqual(state.fix_verify_command, "")
+        self.assertEqual(state.baseline_failures, [])
+        self.assertEqual(state.baseline_git_ref, "")
 
     def test_new_fields_round_trip(self) -> None:
         state = SessionState(
@@ -1078,6 +1081,9 @@ class SessionStateNewFieldsTests(unittest.TestCase):
             last_verify_sig="def",
             consecutive_agent_errors=3,
             hard_ceiling=20,
+            fix_verify_command="pytest -k test_bug",
+            baseline_failures=["tests/test_a.py::test_x", "cmd:npm test"],
+            baseline_git_ref="abc123",
         )
         restored = SessionState.from_dict(state.to_dict())
         self.assertEqual(restored.stall_count, 2)
@@ -1085,6 +1091,9 @@ class SessionStateNewFieldsTests(unittest.TestCase):
         self.assertEqual(restored.last_verify_sig, "def")
         self.assertEqual(restored.consecutive_agent_errors, 3)
         self.assertEqual(restored.hard_ceiling, 20)
+        self.assertEqual(restored.fix_verify_command, "pytest -k test_bug")
+        self.assertEqual(restored.baseline_failures, ["tests/test_a.py::test_x", "cmd:npm test"])
+        self.assertEqual(restored.baseline_git_ref, "abc123")
 
     def test_backward_compat_missing_new_fields(self) -> None:
         """Old session_state.json without new fields should deserialize with defaults."""
@@ -1106,6 +1115,9 @@ class SessionStateNewFieldsTests(unittest.TestCase):
         self.assertEqual(restored.last_diff_hash, "")
         self.assertEqual(restored.consecutive_agent_errors, 0)
         self.assertEqual(restored.hard_ceiling, 15)  # default for fix mode
+        self.assertEqual(restored.fix_verify_command, "")
+        self.assertEqual(restored.baseline_failures, [])
+        self.assertEqual(restored.baseline_git_ref, "")
 
 
 class ResumeFailedSessionTests(unittest.TestCase):
@@ -1208,15 +1220,13 @@ class FixConvergenceTests(unittest.TestCase):
             inputs = iter(user_inputs)
             orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
 
-            # Configure a gate command that always fails with the same output
-            orchestrator.config.gates.commands = ["exit 1"]
-
             call_count = {"n": 0}
 
             def mock_run(request):
                 call_count["n"] += 1
                 if call_count["n"] == 1:
-                    content = "I see the test issue.\nGOAL_CLEAR\n"
+                    # Emit FIX_VERIFY so the targeted check always fails
+                    content = "I see the test issue.\nFIX_VERIFY: exit 1\nGOAL_CLEAR\n"
                 else:
                     # Always produce the same fix — no progress
                     content = "Applied same fix attempt.\n"
@@ -1380,7 +1390,7 @@ class SessionsListSlimTests(unittest.TestCase):
         self.assertNotIn("max_attempts", row)
         self.assertNotIn("updated_at", row)
 
-    def test_goal_truncated(self) -> None:
+    def test_goal_not_truncated(self) -> None:
         from auto_agents.cli import main
         state = create_session(self.tmpdir, "fix")
         state.goal = "A" * 200
@@ -1397,8 +1407,233 @@ class SessionsListSlimTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         data = json.loads(captured.getvalue())
         goal = data[0]["goal"]
-        self.assertLessEqual(len(goal), 81 + len("…"))
-        self.assertTrue(goal.endswith("…"))
+        self.assertEqual(len(goal), 200)
+
+
+class BaselineDiffVerifyTests(unittest.TestCase):
+    """Test baseline-diff verification for fix mode."""
+
+    def test_preexisting_failure_tolerated(self) -> None:
+        """A gate failure that exists in the baseline should not block completion."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = ["The submit button crashes"]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            # Gate command that always fails — will be captured in baseline
+            orchestrator.config.gates.commands = ["echo 'FAILED tests/test_old.py::test_legacy'; exit 1"]
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I see the crash.\nGOAL_CLEAR\n"
+                else:
+                    content = "Fixed the crash.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.start()
+
+            # Should complete because the failure was in the baseline
+            self.assertEqual(result.status, "completed")
+            self.assertIn("tests/test_old.py::test_legacy", result.baseline_failures)
+
+    def test_new_failure_blocks_completion(self) -> None:
+        """A gate failure NOT in the baseline should block completion."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = ["The submit button crashes"]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            # Baseline captured with this command (will pass)
+            # Then we swap to a failing command after baseline capture
+            attempt_count = {"n": 0}
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I see the crash.\nFIX_VERIFY: exit 0\nGOAL_CLEAR\n"
+                else:
+                    # After first fix attempt, swap gate to fail with a new failure
+                    orchestrator.config.gates.commands = [
+                        "echo 'FAILED tests/test_new.py::test_regression'; exit 1"
+                    ]
+                    content = "Applied fix.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.start()
+
+            # Should fail because "tests/test_new.py::test_regression" is a new failure
+            self.assertEqual(result.status, "failed")
+
+    def test_fix_verify_command_parsed_and_used(self) -> None:
+        """FIX_VERIFY command emitted during clarify should be stored and used."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = ["The submit button crashes"]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = (
+                        "I see the crash in handlers.py.\n"
+                        "FIX_VERIFY: python -c \"print('ok')\"\n"
+                        "GOAL_CLEAR\n"
+                    )
+                else:
+                    content = "Fixed by adding null check.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.start()
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.fix_verify_command, "python -c \"print('ok')\"")
+
+    def test_fix_verify_command_failure_blocks_completion(self) -> None:
+        """If fix_verify_command fails, verification should fail."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = ["The submit button crashes"]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I see the bug.\nFIX_VERIFY: exit 1\nGOAL_CLEAR\n"
+                else:
+                    content = "Applied same fix.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.start()
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.fix_verify_command, "exit 1")
+
+    def test_baseline_snapshot_on_resume_stale(self) -> None:
+        """If git HEAD changes between sessions, baseline should be re-captured."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+
+            state = create_session(project_root, "fix")
+            state.status = "failed"
+            state.goal = "Button crash"
+            state.baseline_git_ref = "stale_ref_000"
+            state.baseline_failures = ["tests/test_old.py::test_legacy"]
+            state.conversation = [
+                {"role": "user", "content": "Button crash"},
+                {"role": "agent", "content": "I see.\nGOAL_CLEAR\n"},
+            ]
+            save_session_state(project_root, state)
+
+            user_inputs: list = []
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                content = "Fixed.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.resume(state.session_id)
+
+            self.assertEqual(result.status, "completed")
+            # baseline_git_ref should have been updated (no longer "stale_ref_000")
+            self.assertNotEqual(result.baseline_git_ref, "stale_ref_000")
+
+
+class GatesCollectAllTests(unittest.TestCase):
+    """Test run_commands_collect_all and extract_failure_ids."""
+
+    def test_collect_all_does_not_short_circuit(self) -> None:
+        from auto_agents.gates import run_commands_collect_all
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_commands_collect_all(
+                ["exit 1", "echo ok", "exit 2"],
+                Path(tmp),
+            )
+            self.assertFalse(result.ok)
+            # All 3 commands should have been executed
+            self.assertEqual(len(result.commands), 3)
+            self.assertFalse(result.commands[0].ok)
+            self.assertTrue(result.commands[1].ok)
+            self.assertFalse(result.commands[2].ok)
+
+    def test_extract_pytest_failure_ids(self) -> None:
+        from auto_agents.gates import extract_failure_ids
+        from auto_agents.models import CommandResult, GateResult
+        cmd = CommandResult(
+            command="pytest",
+            ok=False,
+            returncode=1,
+            stdout="FAILED tests/test_a.py::test_x\nFAILED tests/test_b.py::test_y\n",
+            stderr="",
+        )
+        gate = GateResult(ok=False, commands=[cmd])
+        ids = extract_failure_ids(gate)
+        self.assertEqual(ids, ["tests/test_a.py::test_x", "tests/test_b.py::test_y"])
+
+    def test_extract_non_pytest_failure_ids(self) -> None:
+        from auto_agents.gates import extract_failure_ids
+        from auto_agents.models import CommandResult, GateResult
+        cmd = CommandResult(
+            command="npm test",
+            ok=False,
+            returncode=1,
+            stdout="Error: build failed",
+            stderr="",
+        )
+        gate = GateResult(ok=False, commands=[cmd])
+        ids = extract_failure_ids(gate)
+        self.assertEqual(ids, ["cmd:npm test"])
 
 
 if __name__ == "__main__":
