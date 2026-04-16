@@ -600,6 +600,105 @@ class SessionResumeTests(unittest.TestCase):
             result = session.resume(state.session_id)
             self.assertEqual(result.status, "completed")
 
+    def test_fix_not_a_bug_user_agrees(self) -> None:
+        """Agent says NOT_A_BUG, user agrees → session completed with not_a_bug resolution."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = [
+                "The button color changes on hover",  # initial bug description
+                "y",  # agree it's not a bug
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            def mock_run(request):
+                content = (
+                    "After analyzing the code, the hover color change is intentional CSS behavior "
+                    "defined in styles.css. This is the expected design.\n"
+                    "NOT_A_BUG: Hover color change is intentional CSS behavior per design spec.\n"
+                )
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(state.resolution, "not_a_bug")
+            # Should have a not_a_bug entry in execution log
+            not_bug_entries = [e for e in state.execution_log if e.get("action") == "not_a_bug"]
+            self.assertEqual(len(not_bug_entries), 1)
+            self.assertIn("intentional", not_bug_entries[0]["result"])
+
+    def test_fix_not_a_bug_user_disagrees(self) -> None:
+        """Agent says NOT_A_BUG, user disagrees → conversation continues, then GOAL_CLEAR."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+
+            user_inputs = [
+                "The button color changes on hover",  # initial bug description
+                "n",  # disagree with NOT_A_BUG
+                "No, the color should stay blue, not red. Check the spec.",  # explanation
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = (
+                        "The hover effect looks intentional.\n"
+                        "NOT_A_BUG: Hover color change is expected CSS behavior.\n"
+                    )
+                elif call_count["n"] == 2:
+                    content = (
+                        "I see, you're right — the spec says the button should stay blue. "
+                        "The red hover color is a bug in styles.css.\n"
+                        "GOAL_CLEAR\n"
+                    )
+                else:
+                    content = "Fixed the hover color in styles.css.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(state.resolution, "fixed")
+            # Conversation should include the user's disagreement
+            user_msgs = [m["content"] for m in state.conversation if m["role"] == "user"]
+            self.assertTrue(any("blue" in m for m in user_msgs))
+
+    def test_fix_resolution_field_persisted(self) -> None:
+        """Verify the resolution field survives serialization round-trip."""
+        state = SessionState(
+            session_id="test-res-001",
+            mode="fix",
+            status="completed",
+            resolution="not_a_bug",
+        )
+        data = state.to_dict()
+        self.assertEqual(data["resolution"], "not_a_bug")
+
+        restored = SessionState.from_dict(data)
+        self.assertEqual(restored.resolution, "not_a_bug")
+
+        # Default resolution is empty string
+        state2 = SessionState(session_id="test-res-002")
+        self.assertEqual(state2.resolution, "")
+
 
 class SessionCLITests(unittest.TestCase):
     """Test that CLI properly parses fix/collab commands."""

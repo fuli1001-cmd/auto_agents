@@ -448,7 +448,10 @@ would be too heavyweight.
 
 Interactive bug-fix loop:
 
-1. **Converse** — describe the bug; the agent asks clarifying questions until the problem is clear
+1. **Converse** — describe the bug; the agent analyzes the codebase and asks clarifying
+   questions until the problem is clear. If the agent determines the reported issue is
+   **not actually a bug** (e.g., expected behavior, configuration issue), it will explain
+   its reasoning and ask for your confirmation before closing the session
 2. **Execute** — the agent applies a targeted fix with automatic retries
 3. **Verify** — configured gate commands are run to confirm the fix
 4. **Commit** — changes are committed on success

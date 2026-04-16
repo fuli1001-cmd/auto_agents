@@ -369,6 +369,7 @@ class SessionState:
     execution_log: List[Dict[str, object]] = field(default_factory=list)
     current_attempt: int = 0
     max_attempts: int = 4
+    resolution: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -387,6 +388,7 @@ class SessionState:
             execution_log=list(data.get("execution_log", [])),
             current_attempt=int(data.get("current_attempt", 0)),
             max_attempts=int(data.get("max_attempts", 4)),
+            resolution=str(data.get("resolution", "")),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
         )
@@ -401,6 +403,7 @@ class SessionState:
             "execution_log": list(self.execution_log),
             "current_attempt": self.current_attempt,
             "max_attempts": self.max_attempts,
+            "resolution": self.resolution,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

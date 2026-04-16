@@ -26,6 +26,7 @@ from .models import (
 )
 
 _GOAL_CLEAR = re.compile(r"^GOAL_CLEAR\s*$", re.MULTILINE)
+_NOT_A_BUG = re.compile(r"^NOT_A_BUG:\s*(.+)$", re.MULTILINE)
 _NEED_USER_ASSIST = re.compile(r"^NEED_USER_ASSIST:\s*(.+)$", re.MULTILINE)
 _BUG_FOUND = re.compile(r"^BUG_FOUND:\s*(.+)$", re.MULTILINE)
 _GOAL_ACHIEVED = re.compile(r"^GOAL_ACHIEVED:\s*(.+)$", re.MULTILINE)
@@ -150,6 +151,42 @@ class Session:
             state.conversation.append({"role": "agent", "content": reply})
             self._save(state)
 
+            # Check for NOT_A_BUG (fix mode only) before GOAL_CLEAR
+            if self.mode == "fix":
+                not_bug_match = _NOT_A_BUG.search(reply)
+                if not_bug_match:
+                    reason = not_bug_match.group(1).strip()
+                    display = _NOT_A_BUG.sub("", reply).strip()
+                    if display:
+                        self._print(f"\nAgent:\n{display}")
+                    self._print(f"\nAgent believes this is NOT a bug: {reason}")
+                    answer = self._prompt_user(
+                        "Do you agree this is not a bug? (y/n) [y]: ", default="y",
+                    )
+                    if answer.strip().lower() not in ("n", "no"):
+                        state.status = "completed"
+                        state.resolution = "not_a_bug"
+                        state.execution_log.append({
+                            "attempt": 0,
+                            "action": "not_a_bug",
+                            "result": reason,
+                            "timestamp": self._now(),
+                        })
+                        self._save(state)
+                        self._print(f"Session {state.session_id} closed as not-a-bug.")
+                        return state
+                    # User disagrees — continue conversation
+                    user_reply = self._prompt_user(
+                        "\nPlease explain why you believe this is a bug: ",
+                        multiline=True,
+                    )
+                    if not user_reply.strip():
+                        user_reply = "I still believe this is a bug. Please look again."
+                    state.conversation.append({"role": "user", "content": user_reply})
+                    self._save(state)
+                    self._print_agent_thinking()
+                    continue
+
             if _GOAL_CLEAR.search(reply):
                 display = _GOAL_CLEAR.sub("", reply).strip()
                 if display:
@@ -232,6 +269,7 @@ class Session:
             if verify["ok"]:
                 self._print("Verification passed!")
                 state.status = "completed"
+                state.resolution = "fixed"
                 self._git_commit(state, "fix")
                 self._print(f"Bug fix completed in session {state.session_id}.")
                 return state
@@ -419,6 +457,15 @@ class Session:
             f"Analyze the codebase and the {label} description.",
             "- If you need more information, ask specific questions.",
             "- If the problem is clear enough to proceed, output 'GOAL_CLEAR' on a line by itself at the end.",
+        ])
+        if self.mode == "fix":
+            lines.extend([
+                "- If after analyzing the codebase you determine this is NOT actually a bug "
+                "(e.g., the behavior is by design, a configuration issue, or a user "
+                "misunderstanding), explain your reasoning clearly and output "
+                "'NOT_A_BUG: <one-line explanation>' on a line by itself.",
+            ])
+        lines.extend([
             "- Always explain your understanding before asking questions or declaring ready.",
             self.orch._document_language_instruction(),
         ])
