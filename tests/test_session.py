@@ -20,7 +20,7 @@ from auto_agents.config import (
     save_session_state,
     session_state_path,
 )
-from auto_agents.git_ops import working_tree_clean
+from auto_agents.git_ops import commit_all, working_tree_clean
 from auto_agents.io_utils import write_text
 from auto_agents.models import AgentResult, SessionState, DEFAULT_SESSION_MAX_ATTEMPTS
 from auto_agents.orchestrator import Orchestrator
@@ -485,6 +485,59 @@ class SessionCollabFlowTests(unittest.TestCase):
             )
             committed = json.loads(show.stdout)
             self.assertEqual(committed["status"], "completed")
+
+    def test_collab_commits_verified_progress_before_final_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            commit_all(project_root, "chore: baseline")
+
+            app_file = project_root / "app.py"
+            app_file.write_text("value = 0\n", encoding="utf-8")
+            commit_all(project_root, "feat: add app stub")
+
+            user_inputs = [
+                "Make the browser flow work end-to-end",
+                "n",
+                "The first fix helped, but one more issue remains",
+                "y",
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I understand the goal.\nGOAL_CLEAR\n"
+                elif call_count["n"] == 2:
+                    app_file.write_text("value = 1\n", encoding="utf-8")
+                    content = "Applied the first browser fix.\nGOAL_ACHIEVED: The main flow now works\n"
+                else:
+                    app_file.write_text("value = 2\n", encoding="utf-8")
+                    content = "Applied the final follow-up fix.\nGOAL_ACHIEVED: The browser flow is fully working\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="collab")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            self.assertTrue(working_tree_clean(project_root))
+
+            rev_list = subprocess.run(
+                ["git", "rev-list", "--count", "HEAD"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(rev_list.stdout.strip(), "4")
 
 
 class SessionResumeTests(unittest.TestCase):

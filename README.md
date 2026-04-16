@@ -464,9 +464,9 @@ the browser"):
 
 1. **Converse** — describe the goal; the agent clarifies
 2. **Iterate** — the agent works toward the goal autonomously; when it needs user action (e.g. "open
-   the browser and check the result"), it pauses with `NEED_USER_ASSIST`; when it discovers a bug it
-   fixes and verifies; when it believes the goal is achieved it asks for your confirmation
-3. **Complete** — you confirm success and changes are committed
+   the browser and check the result"), it pauses with `NEED_USER_ASSIST`; verified bug fixes are
+   committed as they happen; when it believes the goal is achieved it asks for your confirmation
+3. **Complete** — you confirm success and any remaining changes are committed
 
 ```bash
 python3 -m auto_agents collab --project /tmp/demo

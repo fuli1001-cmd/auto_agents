@@ -17,7 +17,7 @@ from .config import (
     session_artifact_paths,
 )
 from .gates import run_commands
-from .git_ops import commit_all
+from .git_ops import changed_paths, commit_all
 from .io_utils import read_text, write_text
 from .models import (
     AgentRequest,
@@ -326,6 +326,9 @@ class Session:
                     self._print(f"Collaborative session {state.session_id} completed successfully.")
                     return state
 
+                committed = self._commit_verified_progress(state, "collab")
+                if committed:
+                    self._print("Verified progress committed before continuing.")
                 user_feedback = self._prompt_user("What still needs to be done? ", multiline=True)
                 state.conversation.append({"role": "user", "content": user_feedback.strip() or "Not yet done."})
                 self._save(state)
@@ -350,8 +353,11 @@ class Session:
                 self._save(state)
 
                 if verify["ok"]:
-                    self._git_commit(state, "collab")
-                    self._print("Bug fix verified and committed.")
+                    committed = self._commit_verified_progress(state, "collab")
+                    if committed:
+                        self._print("Bug fix verified and committed.")
+                    else:
+                        self._print("Bug fix verified.")
                 else:
                     self._print(f"Bug fix verification failed: {verify['reason']}")
                     feedback = self.orch._format_retry_feedback("local_verification", reason=str(verify["reason"]))
@@ -369,6 +375,9 @@ class Session:
                     self._git_commit(state, "collab")
                     self._print(f"Collaborative session {state.session_id} completed successfully.")
                     return state
+                committed = self._commit_verified_progress(state, "collab")
+                if committed:
+                    self._print("Verified progress committed before continuing.")
                 user_feedback = self._prompt_user("What still needs to be done? ", multiline=True)
                 state.conversation.append({"role": "user", "content": user_feedback.strip() or "Not yet done."})
                 self._save(state)
@@ -586,11 +595,17 @@ class Session:
         self._print(f"Agent call failed (transient): {err_msg[:200]}")
         return f"Previous attempt failed with a transient error: {err_msg[:300]}"
 
-    def _git_commit(self, state: SessionState, prefix: str) -> None:
+    def _commit_verified_progress(self, state: SessionState, prefix: str) -> bool:
+        """Commit verified project changes while the collab loop continues."""
+        if not changed_paths(self.project_root):
+            return False
+        return self._git_commit(state, prefix)
+
+    def _git_commit(self, state: SessionState, prefix: str) -> bool:
         """Persist current state, then commit current changes if auto-commit is enabled."""
         if not self.config.git.commit_each_task:
             self._save(state)
-            return
+            return False
         summary = state.goal[:60].replace("\n", " ")
         message = f"{prefix}: {summary}"
         state.execution_log.append({
@@ -602,7 +617,9 @@ class Session:
         self._save(state)
         try:
             commit_all(self.project_root, message)
+            return True
         except RuntimeError as exc:
+            self._print(f"Git commit failed: {exc}")
             state.execution_log.append({
                 "attempt": state.current_attempt,
                 "action": "commit_failed",
@@ -610,6 +627,7 @@ class Session:
                 "timestamp": self._now(),
             })
             self._save(state)
+            return False
 
     def _consolidate_goal(self, state: SessionState) -> str:
         """Build a consolidated goal description from the conversation."""
