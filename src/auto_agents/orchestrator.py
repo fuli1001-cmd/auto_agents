@@ -30,8 +30,8 @@ from .config import (
     task_plan_path,
     write_run_prompt,
 )
-from .gates import extract_failure_ids, run_commands
-from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, is_repo, require_clean_tree, worktree_fingerprint
+from .gates import extract_failure_ids, run_commands, run_commands_collect_all
+from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, head_ref, is_repo, require_clean_tree, worktree_fingerprint
 from .io_utils import read_text, write_text
 from .models import (
     APPROVAL_ORDER,
@@ -700,6 +700,9 @@ class Orchestrator:
                 task.status = "in_progress"
                 self._persist_tasks(tasks)
 
+            if self._ensure_task_verify_baseline(task):
+                self._persist_tasks(tasks)
+
             gate_result = self._execute_task_with_retries(state, task, resume_existing=resume_existing)
             if not gate_result["ok"]:
                 task.status = "blocked"
@@ -752,22 +755,238 @@ class Orchestrator:
                 "gates.require_clean_git_before_task, or rerun with --allow-dirty-tree."
             ) from error
 
-    def _run_task_verify(self) -> Dict[str, object]:
+    def _run_task_verify(self, task: Optional[TaskSpec] = None) -> Dict[str, object]:
         quick_failure = self._quick_verify_failure()
         if quick_failure:
             return {
                 "ok": False,
                 "reason": quick_failure,
                 "failure_ids": self._normalize_verify_failure_ids([], quick_failure),
+                "current_failure_ids": self._normalize_verify_failure_ids([], quick_failure),
+                "baseline_failure_ids": list(task.verify_baseline_failures) if task is not None else [],
+                "new_failure_ids": self._normalize_verify_failure_ids([], quick_failure),
+                "raw_output": quick_failure,
             }
-        verify_gate = run_commands(self.config.gates.commands, self.project_root)
+        verify_gate = (
+            run_commands_collect_all(self.config.gates.commands, self.project_root)
+            if task is not None
+            else run_commands(self.config.gates.commands, self.project_root)
+        )
+        current_failure_ids = self._normalize_verify_failure_ids(
+            extract_failure_ids(verify_gate),
+            verify_gate.summary,
+        )
+        baseline_failure_ids = (
+            self._normalize_verify_failure_ids(task.verify_baseline_failures, verify_gate.summary)
+            if task is not None and task.verify_baseline_failures
+            else []
+        )
+        new_failure_ids = sorted(set(current_failure_ids) - set(baseline_failure_ids))
+        raw_output = self._gate_raw_output(verify_gate)
+        if task is not None and current_failure_ids and not new_failure_ids:
+            return {
+                "ok": True,
+                "reason": f"task baseline only: {len(current_failure_ids)} pre-existing failure(s) remain",
+                "failure_ids": [],
+                "current_failure_ids": current_failure_ids,
+                "baseline_failure_ids": baseline_failure_ids,
+                "new_failure_ids": [],
+                "raw_output": raw_output,
+            }
         if not verify_gate.ok:
+            effective_failure_ids = new_failure_ids or current_failure_ids
+            if task is not None and new_failure_ids:
+                reason = (
+                    f"{len(new_failure_ids)} new verification failure(s) vs task baseline: "
+                    + ", ".join(new_failure_ids[:10])
+                )
+            else:
+                reason = verify_gate.summary
             return {
                 "ok": False,
-                "reason": verify_gate.summary,
-                "failure_ids": self._normalize_verify_failure_ids(extract_failure_ids(verify_gate), verify_gate.summary),
+                "reason": reason,
+                "failure_ids": effective_failure_ids,
+                "current_failure_ids": current_failure_ids,
+                "baseline_failure_ids": baseline_failure_ids,
+                "new_failure_ids": new_failure_ids or effective_failure_ids,
+                "raw_output": raw_output,
             }
-        return {"ok": True, "reason": verify_gate.summary, "failure_ids": []}
+        return {
+            "ok": True,
+            "reason": verify_gate.summary,
+            "failure_ids": [],
+            "current_failure_ids": current_failure_ids,
+            "baseline_failure_ids": baseline_failure_ids,
+            "new_failure_ids": [],
+            "raw_output": raw_output,
+        }
+
+    def _task_verify_baseline_ref(self) -> str:
+        return f"{head_ref(self.project_root)}:{worktree_fingerprint(self.project_root)}"
+
+    def _ensure_task_verify_baseline(self, task: TaskSpec) -> bool:
+        baseline_ref = self._task_verify_baseline_ref()
+        if task.verify_baseline_ref == baseline_ref:
+            return False
+        task.verify_baseline_ref = baseline_ref
+        if not self.config.gates.commands:
+            task.verify_baseline_failures = []
+            return True
+        gate = run_commands_collect_all(self.config.gates.commands, self.project_root)
+        task.verify_baseline_failures = self._normalize_verify_failure_ids(
+            extract_failure_ids(gate),
+            gate.summary,
+        )
+        return True
+
+    @staticmethod
+    def _gate_raw_output(gate_result) -> str:
+        sections: List[str] = []
+        for cmd_result in gate_result.commands:
+            if cmd_result.ok:
+                continue
+            sections.append(f"$ {cmd_result.command}")
+            if cmd_result.stdout:
+                sections.append(cmd_result.stdout)
+            if cmd_result.stderr:
+                sections.append(cmd_result.stderr)
+        return "\n".join(section for section in sections if section).strip()
+
+    @staticmethod
+    def _truncate_feedback_text(text: str, limit: int = 400) -> str:
+        compact = " ".join(text.split()).strip()
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3].rstrip() + "..."
+
+    def _extract_verify_implicated_paths(self, raw_output: str) -> List[str]:
+        if not raw_output.strip():
+            return []
+        project_root = self.project_root.resolve()
+        paths: List[str] = []
+        for raw_path in re.findall(r'File "([^"]+)"', raw_output):
+            candidate = Path(raw_path)
+            if not candidate.is_absolute():
+                candidate = (project_root / candidate).resolve()
+            else:
+                candidate = candidate.resolve()
+            try:
+                relative = candidate.relative_to(project_root)
+            except ValueError:
+                continue
+            normalized = str(relative)
+            if normalized not in paths:
+                paths.append(normalized)
+        return paths[:8]
+
+    @staticmethod
+    def _truncate_feedback_excerpt(text: str, limit: int = 900) -> str:
+        excerpt = text.strip()
+        if len(excerpt) <= limit:
+            return excerpt
+        return excerpt[: limit - 3].rstrip() + "..."
+
+    @staticmethod
+    def _extract_verify_root_causes(raw_output: str) -> List[str]:
+        if not raw_output.strip():
+            return []
+        pattern = re.compile(
+            r"^\s*(?:AssertionError|RuntimeError|TypeError|ValueError|KeyError|IndexError|"
+            r"StopIteration|AttributeError|NameError|ImportError|ModuleNotFoundError|"
+            r"sqlite3\.[A-Za-z]+Error|OSError|SyntaxError): .+$",
+            re.MULTILINE,
+        )
+        causes: List[str] = []
+        for match in pattern.findall(raw_output):
+            normalized = match.strip()
+            if normalized not in causes:
+                causes.append(normalized)
+        return causes[:4]
+
+    @classmethod
+    def _extract_verify_excerpts(cls, raw_output: str) -> List[str]:
+        if not raw_output.strip():
+            return []
+        lines = raw_output.splitlines()
+        excerpt_starts = [
+            index
+            for index, line in enumerate(lines)
+            if re.match(r"^(?:FAIL|ERROR):\s+|^FAILED\s+\S+", line)
+        ]
+        if not excerpt_starts:
+            excerpt_starts = [
+                max(0, index - 2)
+                for index, line in enumerate(lines)
+                if re.search(
+                    r"(?:AssertionError|RuntimeError|TypeError|ValueError|KeyError|IndexError|"
+                    r"StopIteration|AttributeError|NameError|ImportError|ModuleNotFoundError|"
+                    r"sqlite3\.[A-Za-z]+Error|OSError|SyntaxError):",
+                    line,
+                )
+            ]
+        excerpts: List[str] = []
+        for position, start in enumerate(excerpt_starts[:3]):
+            end = excerpt_starts[position + 1] if position + 1 < len(excerpt_starts) else len(lines)
+            excerpt = "\n".join(lines[start:min(end, start + 14)]).strip()
+            excerpt = cls._truncate_feedback_excerpt(excerpt, limit=900)
+            if excerpt and excerpt not in excerpts:
+                excerpts.append(excerpt)
+        return excerpts[:3]
+
+    def _build_verify_retry_feedback(
+        self,
+        verify_result: Dict[str, object],
+    ) -> Dict[str, object]:
+        reason = str(verify_result.get("reason", "")).strip()
+        current_failure_ids = self._normalize_verify_failure_ids(
+            verify_result.get("current_failure_ids", []),
+            reason,
+        )
+        new_failure_ids = [
+            str(item).strip() for item in verify_result.get("new_failure_ids", []) if str(item).strip()
+        ]
+        baseline_failure_ids = [
+            str(item).strip()
+            for item in verify_result.get("baseline_failure_ids", [])
+            if str(item).strip()
+        ]
+        raw_output = str(verify_result.get("raw_output", "")).strip()
+        summary_lines: List[str] = []
+        if baseline_failure_ids:
+            baseline_remaining = sorted(set(current_failure_ids) & set(baseline_failure_ids))
+            if new_failure_ids:
+                summary_lines.append(
+                    f"New failures vs task baseline ({len(new_failure_ids)}): "
+                    + ", ".join(new_failure_ids[:6])
+                )
+            if baseline_remaining:
+                summary_lines.append(
+                    f"Pre-existing baseline failures still present ({len(baseline_remaining)}): "
+                    + ", ".join(baseline_remaining[:6])
+                )
+            resolved_failures = sorted(set(baseline_failure_ids) - set(current_failure_ids))
+            if resolved_failures:
+                summary_lines.append(
+                    f"Baseline failures resolved in this attempt ({len(resolved_failures)}): "
+                    + ", ".join(resolved_failures[:6])
+                )
+        elif current_failure_ids:
+            summary_lines.append(
+                f"Failing checks ({len(current_failure_ids)}): " + ", ".join(current_failure_ids[:6])
+            )
+        root_causes = self._extract_verify_root_causes(raw_output)
+        if root_causes:
+            summary_lines.append("Likely root causes:")
+            summary_lines.extend(f"  - {item}" for item in root_causes)
+        implicated_paths = self._extract_verify_implicated_paths(raw_output)
+        raw_excerpts = self._extract_verify_excerpts(raw_output)
+        if not raw_excerpts and reason:
+            raw_excerpts = [self._truncate_feedback_text(reason, limit=900)]
+        return {
+            "verification_summary": "\n".join(summary_lines).strip(),
+            "implicated_paths": implicated_paths,
+            "raw_excerpts": raw_excerpts,
+        }
 
     def _run_provider_research(self, state: RunState, spec_file: Path) -> RunState:
         del spec_file
@@ -1044,10 +1263,26 @@ class Orchestrator:
         reason: str = "",
         review_summary: str = "",
         review_history: Optional[List[Dict[str, object]]] = None,
+        verification_summary: str = "",
+        implicated_paths: Optional[List[str]] = None,
+        raw_excerpts: Optional[List[str]] = None,
     ) -> str:
         lines = [f"- Failure type: {failure_type}"]
         if reason:
-            lines.append(f"- Reason: {reason}")
+            rendered_reason = reason
+            if verification_summary.strip() or raw_excerpts:
+                rendered_reason = Orchestrator._truncate_feedback_text(reason, limit=500)
+            lines.append(f"- Reason: {rendered_reason}")
+        if verification_summary.strip():
+            lines.extend(["- Verification triage:", verification_summary.strip()])
+        if implicated_paths:
+            lines.append(f"- Implicated paths: {', '.join(implicated_paths[:8])}")
+        if raw_excerpts:
+            lines.append("- Key verify evidence:")
+            for index, excerpt in enumerate(raw_excerpts[:3], start=1):
+                lines.append(f"  --- Excerpt {index} ---")
+                for raw_line in excerpt.splitlines():
+                    lines.append(f"  {raw_line}")
         if review_history and len(review_history) > 1:
             lines.append("- Review history (oldest first):")
             for i, entry in enumerate(review_history):
@@ -1586,6 +1821,7 @@ class Orchestrator:
         if stage == "implement":
             lines = common + [
                 "Implement only this feature slice.",
+                "If local verification exposes a tightly coupled regression in files you touched or in paths explicitly implicated by retry feedback, fix it in the same attempt even if it sits slightly outside the nominal task slice.",
                 "The bound requirements and acceptance oracles above are hard requirements, not optional background.",
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
@@ -1674,6 +1910,8 @@ class Orchestrator:
                         f"{implement_prompt}\n\nPrevious attempt issues:\n{feedback}\n\n"
                         "CRITICAL: Before writing or modifying any code, you MUST first output a step-by-step "
                         "'Fix Plan' in Markdown detailing how you will address all the issues above. "
+                        "Use the structured verification triage and evidence below to identify the root causes. "
+                        "Do not dismiss tightly coupled regressions in explicitly implicated paths as out of scope. "
                         "Then, proceed to implement the plan."
                     )
                 result = self._run_agent_with_retries(
@@ -1714,7 +1952,7 @@ class Orchestrator:
                     break
                 continue
 
-            verify_result = self._run_task_verify()
+            verify_result = self._run_task_verify(task)
             if not verify_result["ok"]:
                 last_reason = str(verify_result["reason"])
                 failure_ids = self._normalize_verify_failure_ids(
@@ -1724,9 +1962,13 @@ class Orchestrator:
                 verify_analysis = self._analyze_verify_failure(task, failure_ids)
                 verify_stats = str(verify_analysis["stats"])
                 self._record_verify_result(task, attempt, "fail", last_reason, failure_ids)
+                verify_feedback = self._build_verify_retry_feedback(verify_result)
                 feedback = self._format_retry_feedback(
                     "local_verification",
                     reason=last_reason,
+                    verification_summary=str(verify_feedback.get("verification_summary", "")),
+                    implicated_paths=list(verify_feedback.get("implicated_paths", [])),
+                    raw_excerpts=list(verify_feedback.get("raw_excerpts", [])),
                 )
                 self._emit_task_verify_result(task, "fail", last_reason, stats=verify_stats)
                 if bool(verify_analysis["stop_retry"]):
@@ -1949,7 +2191,7 @@ class Orchestrator:
         failure_count = len(failure_ids)
         if not prior_failures:
             return {
-                "stats": f"compare=first-failure failure_ids={failure_count}",
+                "stats": f"compare=first-failure-set failure_ids={failure_count}",
                 "stop_retry": False,
                 "first_attempt": None,
                 "repeat": 1,
@@ -1967,9 +2209,12 @@ class Orchestrator:
             first_attempt = matching_entries[0].get("attempt", "?")
             repeat = len(matching_entries) + 1
             if latest_signature == current_signature:
-                stats = f"compare=same-as-attempt-{first_attempt} repeat={repeat} failure_ids={failure_count}"
+                stats = (
+                    f"compare=same-failure-set-as-attempt-{first_attempt} "
+                    f"repeat={repeat} failure_ids={failure_count}"
+                )
                 if repeat >= 2:
-                    stats = f"{stats} action=stop-unchanged"
+                    stats = f"{stats} action=stop-unchanged-set"
                 return {
                     "stats": stats,
                     "stop_retry": repeat >= 2,
@@ -1978,7 +2223,7 @@ class Orchestrator:
                 }
             return {
                 "stats": (
-                    f"compare=regression same-as-attempt-{first_attempt} "
+                    f"compare=regression failure-set-from-attempt-{first_attempt} "
                     f"previous=attempt-{latest_attempt} repeat={repeat} failure_ids={failure_count}"
                 ),
                 "stop_retry": False,
@@ -1992,7 +2237,7 @@ class Orchestrator:
         resolved_count = len(latest_set - current_set)
         return {
             "stats": (
-                f"compare=changed-vs-attempt-{latest_attempt} failure_ids={failure_count} "
+                f"compare=changed-failure-set-vs-attempt-{latest_attempt} failure_ids={failure_count} "
                 f"new={new_count} resolved={resolved_count}"
             ),
             "stop_retry": False,
@@ -2008,7 +2253,7 @@ class Orchestrator:
         repeat: object,
     ) -> str:
         return (
-            f"unchanged verify failure repeated from attempt-{first_attempt} "
+            f"unchanged verify failure set repeated from attempt-{first_attempt} "
             f"(repeat={repeat}); stopping retries early\n{reason.strip()}"
         )
 

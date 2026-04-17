@@ -23,7 +23,8 @@ The system optimizes for quality over throughput:
 - Task review defaults to a lighter pass and escalates to deeper review only when the current diff looks risky
 - Review prompts are narrowed to the current changed files and diff so the reviewer spends less time rediscovering context
 - Scripts, not the model, enforce quality gates
-- Retry prompts carry structured failure summaries, and cheap local pre-checks can stop obviously invalid verification paths before another review call
+- Retry prompts carry structured failure summaries, implicated paths, and cropped evidence excerpts instead of dumping raw logs back into the next attempt
+- Per-task verification now compares against a task-local baseline so unrelated pre-existing failures are de-emphasized during the implement loop
 - Invalid plans and malformed reviews are rejected and retried with focused feedback
 - Local project isolation is preferred over changing shared system environments
 
@@ -84,9 +85,11 @@ For each task, the effective loop is:
 5. if verification and review both pass, mark the task `done` and optionally commit
 6. continue to the next unfinished task
 
-If verification or review fails, the orchestrator retries the same task with focused feedback. If
-the retry budget is exhausted, that task is marked `blocked` and the run exits with failure instead
-of silently skipping ahead.
+If verification or review fails, the orchestrator retries the same task with focused feedback. The
+retry prompt includes structured verification triage and allows tightly coupled regression fixes in
+explicitly implicated paths, even when those fixes sit slightly outside the original slice. If the
+retry budget is exhausted, that task is marked `blocked` and the run exits with failure instead of
+silently skipping ahead.
 
 Manual approvals are supported at three high-value gates:
 

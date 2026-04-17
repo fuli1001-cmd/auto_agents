@@ -8,6 +8,10 @@ from typing import Iterable, List
 from .models import CommandResult, GateResult
 
 
+_PYTEST_FAILED = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
+_UNITTEST_FAILED = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
+
+
 def _failure_summary(result: CommandResult) -> str:
     details = result.stderr or result.stdout or f"exit code {result.returncode}"
     details = " ".join(details.split())
@@ -82,7 +86,6 @@ def extract_failure_ids(gate_result: GateResult) -> List[str]:
     the command string itself as the failure identifier.
     """
     failures: List[str] = []
-    _PYTEST_FAILED = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
     for cmd_result in gate_result.commands:
         if cmd_result.ok:
             continue
@@ -90,6 +93,10 @@ def extract_failure_ids(gate_result: GateResult) -> List[str]:
         pytest_ids = _PYTEST_FAILED.findall(combined)
         if pytest_ids:
             failures.extend(pytest_ids)
-        else:
-            failures.append(f"cmd:{cmd_result.command}")
+            continue
+        unittest_ids = [item.strip() for item in _UNITTEST_FAILED.findall(combined) if item.strip()]
+        if unittest_ids:
+            failures.extend(unittest_ids)
+            continue
+        failures.append(f"cmd:{cmd_result.command}")
     return failures

@@ -727,7 +727,13 @@ class RetryFlowTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root)
 
             config = orchestrator.config
-            config.gates.commands = ["python -c \"from pathlib import Path; raise SystemExit(0 if Path('artifact.txt').read_text().strip() == 'good' else 1)\""]
+            config.gates.commands = [
+                (
+                    "python -c \"from pathlib import Path; artifact = Path('artifact.txt'); "
+                    "raise SystemExit(0 if artifact.exists() and artifact.read_text().strip() == 'good' else "
+                    "(1 if artifact.exists() else 0))\""
+                )
+            ]
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root)
             orchestrator.adapter = VerifyBeforeReviewAdapter(project_root)
@@ -893,7 +899,12 @@ class RetryFlowTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root)
 
             config = orchestrator.config
-            config.gates.commands = ["python -c \"raise SystemExit(1)\""]
+            config.gates.commands = [
+                (
+                    "python -c \"from pathlib import Path; "
+                    "raise SystemExit(1 if Path('artifact.txt').exists() else 0)\""
+                )
+            ]
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root)
             orchestrator.adapter = RetryFeedbackAdapter(project_root)
@@ -923,7 +934,55 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertEqual(len(orchestrator.adapter.implement_prompts), 2)
             self.assertIn("Failure type: local_verification", orchestrator.adapter.implement_prompts[1])
+            self.assertIn("Verification triage:", orchestrator.adapter.implement_prompts[1])
+            self.assertIn("Do not dismiss tightly coupled regressions", orchestrator.adapter.implement_prompts[1])
             self.assertEqual(orchestrator.adapter.review_calls, 0)
+
+    def test_task_verify_baseline_ignores_preexisting_failure_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            config = orchestrator.config
+            config.gates.commands = [
+                (
+                    "python -c \"print('ERROR: test_legacy (tests.test_demo.LegacyTests.test_legacy)'); "
+                    "raise SystemExit(1)\""
+                )
+            ]
+            config.git.commit_each_task = False
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = BlockedRetryAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains fixed"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(state.tasks[0].verify_baseline_failures, [
+                "test_legacy (tests.test_demo.LegacyTests.test_legacy)"
+            ])
+            self.assertIn("task baseline only: 1 pre-existing failure(s) remain", stream.getvalue())
 
     def test_verify_failure_logs_repeat_statistics_for_same_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -934,7 +993,11 @@ class RetryFlowTests(unittest.TestCase):
 
             config = orchestrator.config
             config.gates.commands = [
-                "python -c \"print('FAILED tests/test_demo.py::test_same'); raise SystemExit(1)\""
+                (
+                    "python -c \"from pathlib import Path; artifact = Path('artifact.txt'); "
+                    "print('FAILED tests/test_demo.py::test_same') if artifact.exists() else None; "
+                    "raise SystemExit(1 if artifact.exists() else 0)\""
+                )
             ]
             config.retries.per_stage["implement"] = 4
             save_project_config(project_root, config)
@@ -967,15 +1030,15 @@ class RetryFlowTests(unittest.TestCase):
             rendered = stream.getvalue()
             self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertIn(
-                "[task:task-001] verify decision=fail compare=first-failure failure_ids=1",
+                "[task:task-001] verify decision=fail compare=first-failure-set failure_ids=1",
                 rendered,
             )
             self.assertIn(
-                "[task:task-001] verify decision=fail compare=same-as-attempt-1 repeat=2 failure_ids=1 action=stop-unchanged",
+                "[task:task-001] verify decision=fail compare=same-failure-set-as-attempt-1 repeat=2 failure_ids=1 action=stop-unchanged-set",
                 rendered,
             )
             self.assertIn(
-                "unchanged verify failure repeated from attempt-1 (repeat=2); stopping retries early",
+                "unchanged verify failure set repeated from attempt-1 (repeat=2); stopping retries early",
                 rendered,
             )
 
@@ -1025,11 +1088,11 @@ class RetryFlowTests(unittest.TestCase):
 
             rendered = stream.getvalue()
             self.assertIn(
-                "[task:task-001] verify decision=fail compare=changed-vs-attempt-1 failure_ids=1 new=1 resolved=1",
+                "[task:task-001] verify decision=fail compare=changed-failure-set-vs-attempt-1 failure_ids=1 new=1 resolved=1",
                 rendered,
             )
             self.assertIn(
-                "[task:task-001] verify decision=fail compare=regression same-as-attempt-1 previous=attempt-2 repeat=2 failure_ids=1",
+                "[task:task-001] verify decision=fail compare=regression failure-set-from-attempt-1 previous=attempt-2 repeat=2 failure_ids=1",
                 rendered,
             )
 

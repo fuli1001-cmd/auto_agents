@@ -54,6 +54,8 @@ class TaskSpec:
     scope_boundaries: str = ""
     review_history: List[Dict[str, object]] = field(default_factory=list)
     verify_history: List[Dict[str, object]] = field(default_factory=list)
+    verify_baseline_failures: List[str] = field(default_factory=list)
+    verify_baseline_ref: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -82,6 +84,8 @@ class TaskSpec:
             scope_boundaries=str(data.get("scope_boundaries", "")),
             review_history=history,
             verify_history=verify_history,
+            verify_baseline_failures=[str(item) for item in data.get("verify_baseline_failures", [])],
+            verify_baseline_ref=str(data.get("verify_baseline_ref", "")),
         )
 
     def to_dict(self) -> Dict[str, object]:

@@ -85,6 +85,18 @@ class ReviewParseTests(unittest.TestCase):
             self.assertIn("It must remain a real conda prefix", prompt)
             self.assertIn(".conda/conda-meta", prompt)
 
+    def test_implement_prompt_allows_tightly_coupled_regression_fixes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = orchestrator._load_tasks_from_plan()[0]
+
+            prompt = orchestrator._build_task_prompt(task, "implement")
+
+            self.assertIn("tightly coupled regression", prompt)
+            self.assertIn("slightly outside the nominal task slice", prompt)
+
     def test_review_prompt_contains_scope_rule(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -157,6 +169,27 @@ class ReviewParseTests(unittest.TestCase):
         # Single entry: no ADDRESSED/CURRENT annotations, just review summary
         self.assertNotIn("[ADDRESSED", feedback)
         self.assertIn("Missing null check.", feedback)
+
+    def test_format_retry_feedback_includes_verify_triage_and_evidence(self) -> None:
+        feedback = Orchestrator._format_retry_feedback(
+            "local_verification",
+            reason="command failed: conda run -p ./.conda python -m unittest discover -s tests (...)",
+            verification_summary=(
+                "New failures vs task baseline (2): test_publish_flow, test_subtitles\n"
+                "Likely root causes:\n"
+                "  - RuntimeError: boom"
+            ),
+            implicated_paths=["app/api/routes/projects.py", "app/application/media.py"],
+            raw_excerpts=[
+                "ERROR: test_publish_flow\nTraceback ...\nRuntimeError: boom",
+            ],
+        )
+
+        self.assertIn("Verification triage:", feedback)
+        self.assertIn("New failures vs task baseline", feedback)
+        self.assertIn("Implicated paths: app/api/routes/projects.py, app/application/media.py", feedback)
+        self.assertIn("Key verify evidence:", feedback)
+        self.assertIn("--- Excerpt 1 ---", feedback)
 
 
 if __name__ == "__main__":

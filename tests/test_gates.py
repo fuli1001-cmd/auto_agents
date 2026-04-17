@@ -5,7 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.gates import run_commands
+from auto_agents.gates import extract_failure_ids, run_commands
+from auto_agents.models import CommandResult, GateResult
 
 
 class GateTests(unittest.TestCase):
@@ -41,6 +42,33 @@ class GateTests(unittest.TestCase):
 
             self.assertFalse(result.ok)
             self.assertIn("boom", result.summary)
+
+    def test_extract_unittest_failure_ids(self) -> None:
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="python -m unittest",
+                    ok=False,
+                    returncode=1,
+                    stdout=(
+                        "ERROR: test_publish_flow (tests.test_api.PublishTests.test_publish_flow)\n"
+                        "FAIL: test_subtitles (tests.test_api.SubtitleTests.test_subtitles)\n"
+                    ),
+                    stderr="",
+                )
+            ],
+        )
+
+        ids = extract_failure_ids(gate)
+
+        self.assertEqual(
+            ids,
+            [
+                "test_publish_flow (tests.test_api.PublishTests.test_publish_flow)",
+                "test_subtitles (tests.test_api.SubtitleTests.test_subtitles)",
+            ],
+        )
 
 
 if __name__ == "__main__":
