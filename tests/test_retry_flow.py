@@ -755,7 +755,7 @@ class RetryFlowTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            self.assertEqual(orchestrator.adapter.implement_calls, orchestrator.config.retries.per_stage["implement"])
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
     def test_resume_reuses_cached_pass_review_for_unchanged_worktree(self) -> None:
@@ -921,10 +921,7 @@ class RetryFlowTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            self.assertEqual(
-                len(orchestrator.adapter.implement_prompts),
-                orchestrator.config.retries.per_stage["implement"],
-            )
+            self.assertEqual(len(orchestrator.adapter.implement_prompts), 2)
             self.assertIn("Failure type: local_verification", orchestrator.adapter.implement_prompts[1])
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
@@ -939,7 +936,7 @@ class RetryFlowTests(unittest.TestCase):
             config.gates.commands = [
                 "python -c \"print('FAILED tests/test_demo.py::test_same'); raise SystemExit(1)\""
             ]
-            config.retries.per_stage["implement"] = 2
+            config.retries.per_stage["implement"] = 4
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
             orchestrator.adapter = SequencedVerifyFailureAdapter(project_root, ["bad", "bad"])
@@ -968,12 +965,17 @@ class RetryFlowTests(unittest.TestCase):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
             rendered = stream.getvalue()
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertIn(
                 "[task:task-001] verify decision=fail compare=first-failure failure_ids=1",
                 rendered,
             )
             self.assertIn(
-                "[task:task-001] verify decision=fail compare=same-as-attempt-1 repeat=2 failure_ids=1",
+                "[task:task-001] verify decision=fail compare=same-as-attempt-1 repeat=2 failure_ids=1 action=stop-unchanged",
+                rendered,
+            )
+            self.assertIn(
+                "unchanged verify failure repeated from attempt-1 (repeat=2); stopping retries early",
                 rendered,
             )
 
@@ -1067,7 +1069,7 @@ class RetryFlowTests(unittest.TestCase):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
             self.assertIn(".conda/conda-meta", str(raised.exception))
-            self.assertEqual(orchestrator.adapter.implement_calls, orchestrator.config.retries.per_stage["implement"])
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
     def test_missing_pytest_target_fails_without_retry(self) -> None:

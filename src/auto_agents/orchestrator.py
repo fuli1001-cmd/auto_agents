@@ -1694,7 +1694,8 @@ class Orchestrator:
             if quick_failure:
                 last_reason, retryable = quick_failure
                 failure_ids = self._normalize_verify_failure_ids([], last_reason)
-                verify_stats = self._describe_verify_failure_stats(task, failure_ids)
+                verify_analysis = self._analyze_verify_failure(task, failure_ids)
+                verify_stats = str(verify_analysis["stats"])
                 self._record_verify_result(task, attempt, "fail", last_reason, failure_ids)
                 feedback = self._format_retry_feedback(
                     "pre_verify_check",
@@ -1702,6 +1703,13 @@ class Orchestrator:
                 )
                 self._emit_task_verify_result(task, "fail", last_reason, stats=verify_stats)
                 if not retryable:
+                    break
+                if bool(verify_analysis["stop_retry"]):
+                    last_reason = self._format_repeated_verify_failure_reason(
+                        last_reason,
+                        first_attempt=verify_analysis["first_attempt"],
+                        repeat=verify_analysis["repeat"],
+                    )
                     break
                 continue
 
@@ -1712,13 +1720,21 @@ class Orchestrator:
                     verify_result.get("failure_ids", []),
                     last_reason,
                 )
-                verify_stats = self._describe_verify_failure_stats(task, failure_ids)
+                verify_analysis = self._analyze_verify_failure(task, failure_ids)
+                verify_stats = str(verify_analysis["stats"])
                 self._record_verify_result(task, attempt, "fail", last_reason, failure_ids)
                 feedback = self._format_retry_feedback(
                     "local_verification",
                     reason=last_reason,
                 )
                 self._emit_task_verify_result(task, "fail", last_reason, stats=verify_stats)
+                if bool(verify_analysis["stop_retry"]):
+                    last_reason = self._format_repeated_verify_failure_reason(
+                        last_reason,
+                        first_attempt=verify_analysis["first_attempt"],
+                        repeat=verify_analysis["repeat"],
+                    )
+                    break
                 continue
 
             self._record_verify_result(task, attempt, "pass", str(verify_result["reason"]))
@@ -1924,14 +1940,19 @@ class Orchestrator:
             return self._normalize_verify_failure_ids(raw_ids, str(entry.get("summary", "")))
         return self._normalize_verify_failure_ids([], str(entry.get("summary", "")))
 
-    def _describe_verify_failure_stats(self, task: TaskSpec, failure_ids: List[str]) -> str:
+    def _analyze_verify_failure(self, task: TaskSpec, failure_ids: List[str]) -> Dict[str, object]:
         prior_failures = [
             entry for entry in task.verify_history
             if isinstance(entry, dict) and str(entry.get("decision", "")) == "fail"
         ]
         failure_count = len(failure_ids)
         if not prior_failures:
-            return f"compare=first-failure failure_ids={failure_count}"
+            return {
+                "stats": f"compare=first-failure failure_ids={failure_count}",
+                "stop_retry": False,
+                "first_attempt": None,
+                "repeat": 1,
+            }
 
         current_signature = tuple(failure_ids)
         latest_entry = prior_failures[-1]
@@ -1945,19 +1966,49 @@ class Orchestrator:
             first_attempt = matching_entries[0].get("attempt", "?")
             repeat = len(matching_entries) + 1
             if latest_signature == current_signature:
-                return f"compare=same-as-attempt-{first_attempt} repeat={repeat} failure_ids={failure_count}"
-            return (
-                f"compare=regression same-as-attempt-{first_attempt} "
-                f"previous=attempt-{latest_attempt} repeat={repeat} failure_ids={failure_count}"
-            )
+                stats = f"compare=same-as-attempt-{first_attempt} repeat={repeat} failure_ids={failure_count}"
+                if repeat >= 2:
+                    stats = f"{stats} action=stop-unchanged"
+                return {
+                    "stats": stats,
+                    "stop_retry": repeat >= 2,
+                    "first_attempt": first_attempt,
+                    "repeat": repeat,
+                }
+            return {
+                "stats": (
+                    f"compare=regression same-as-attempt-{first_attempt} "
+                    f"previous=attempt-{latest_attempt} repeat={repeat} failure_ids={failure_count}"
+                ),
+                "stop_retry": False,
+                "first_attempt": first_attempt,
+                "repeat": repeat,
+            }
 
         latest_set = set(latest_signature)
         current_set = set(current_signature)
         new_count = len(current_set - latest_set)
         resolved_count = len(latest_set - current_set)
+        return {
+            "stats": (
+                f"compare=changed-vs-attempt-{latest_attempt} failure_ids={failure_count} "
+                f"new={new_count} resolved={resolved_count}"
+            ),
+            "stop_retry": False,
+            "first_attempt": None,
+            "repeat": 1,
+        }
+
+    @staticmethod
+    def _format_repeated_verify_failure_reason(
+        reason: str,
+        *,
+        first_attempt: object,
+        repeat: object,
+    ) -> str:
         return (
-            f"compare=changed-vs-attempt-{latest_attempt} failure_ids={failure_count} "
-            f"new={new_count} resolved={resolved_count}"
+            f"unchanged verify failure repeated from attempt-{first_attempt} "
+            f"(repeat={repeat}); stopping retries early\n{reason.strip()}"
         )
 
     @staticmethod
