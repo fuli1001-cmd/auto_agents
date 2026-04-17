@@ -28,6 +28,8 @@ PROJECT_GITIGNORE = """__pycache__/
 node_modules/
 .DS_Store
 """
+AUTO_GITIGNORE_ENTRIES = ("runs/",)
+LEGACY_AUTO_GITIGNORE_ENTRIES = {"state/run_state.json"}
 
 
 PROJECT_BRIEF_TEMPLATE = """# Project Brief
@@ -227,6 +229,30 @@ def review_path(project_root: Path) -> Path:
     return docs_dir(project_root) / "review.md"
 
 
+def auto_gitignore_path(project_root: Path) -> Path:
+    return auto_dir(project_root) / ".gitignore"
+
+
+def ensure_auto_gitignore(project_root: Path) -> None:
+    path = auto_gitignore_path(project_root)
+    current = read_text(path)
+    entries = []
+    seen = set()
+    for raw_line in current.splitlines():
+        line = raw_line.strip()
+        if not line or line in LEGACY_AUTO_GITIGNORE_ENTRIES or line in seen:
+            continue
+        entries.append(line)
+        seen.add(line)
+    for entry in AUTO_GITIGNORE_ENTRIES:
+        if entry not in seen:
+            entries.append(entry)
+    desired = "".join(f"{entry}\n" for entry in entries)
+    if current == desired:
+        return
+    write_text(path, desired)
+
+
 def supported_provider_kinds() -> Tuple[str, ...]:
     return SUPPORTED_PROVIDER_KINDS
 
@@ -255,10 +281,7 @@ def bootstrap_project(project_root: Path, name: str, doc_language: str = "en") -
     config["docs"]["language"] = doc_language
 
     write_json(config_path(root), config)
-    write_if_missing(
-        auto_dir(root) / ".gitignore",
-        "runs/\nstate/run_state.json\n",
-    )
+    ensure_auto_gitignore(root)
     write_if_missing(project_brief_path(root), PROJECT_BRIEF_TEMPLATE)
     write_if_missing(architecture_path(root), ARCHITECTURE_TEMPLATE)
     write_if_missing(review_path(root), "# Review\n\nNo review has been recorded yet.\n")
@@ -311,6 +334,7 @@ def load_run_state(project_root: Path) -> RunState:
 
 
 def save_run_state(project_root: Path, state: RunState) -> None:
+    ensure_auto_gitignore(project_root)
     write_json(run_state_path(project_root), state.to_dict())
 
 

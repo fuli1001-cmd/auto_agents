@@ -15,6 +15,7 @@ from auto_agents.cli import main
 from auto_agents.adapters.codex import CodexAdapter
 from auto_agents.config import (
     DEFAULT_CONFIG,
+    auto_dir,
     config_path,
     load_project_config,
     load_run_state,
@@ -22,6 +23,7 @@ from auto_agents.config import (
     save_run_state,
     task_plan_path,
 )
+from auto_agents.git_ops import working_tree_clean
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentRequest, AgentResult, AgentUsage, ProjectConfig, ProviderConfig, TaskSpec
 from auto_agents.orchestrator import Orchestrator
@@ -33,6 +35,23 @@ from auto_agents.validation import (
 
 
 class ProjectValidationTests(unittest.TestCase):
+    @staticmethod
+    def _configure_git_identity(project_root: Path) -> None:
+        subprocess.run(
+            ["git", "config", "user.name", "test"],
+            cwd=str(project_root),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(project_root),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
     def test_validate_project_config_payload_rejects_bad_effort_and_template(self) -> None:
         payload = {
             "project_name": "demo",
@@ -1171,6 +1190,60 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("聚焦核心目标", payload)
             self.assertIn("架构边界清晰", payload)
             self.assertNotIn("\\u805a\\u7126", payload)
+
+    def test_run_commits_completed_run_state_for_legacy_auto_gitignore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            state = load_run_state(project_root)
+            state.stage_summaries = {
+                "clarify": "done",
+                "design": "done",
+                "plan": "done",
+                "provider_research": "done",
+                "implement": "done",
+                "verify": "done",
+            }
+            state.tasks = [
+                TaskSpec(
+                    task_id="task-001",
+                    title="Done task",
+                    description="desc",
+                    acceptance=["ok"],
+                    status="done",
+                )
+            ]
+            save_run_state(project_root, state)
+            write_text(auto_dir(project_root) / ".gitignore", "runs/\nstate/run_state.json\n")
+
+            orchestrator = Orchestrator(project_root)
+            result = orchestrator.run(spec_file=spec_file, auto_approve=True)
+
+            self.assertEqual(result.status, "completed")
+            self.assertTrue(working_tree_clean(project_root))
+
+            run_state_show = subprocess.run(
+                ["git", "show", "HEAD:.auto-agents/state/run_state.json"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            committed_state = json.loads(run_state_show.stdout)
+            self.assertEqual(committed_state["status"], "completed")
+
+            gitignore_show = subprocess.run(
+                ["git", "show", "HEAD:.auto-agents/.gitignore"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(gitignore_show.stdout, "runs/\n")
 
     def test_clarify_prompt_uses_selected_document_language(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

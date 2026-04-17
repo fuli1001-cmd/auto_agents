@@ -291,6 +291,7 @@ class Orchestrator:
 
             state.status = "completed"
             save_run_state(self.project_root, state)
+            self._commit_if_dirty("chore: finalize run state")
             return state
         finally:
             self._print_agent_output = False
@@ -1199,8 +1200,8 @@ class Orchestrator:
         state.current_stage = "readme"
         state.stage_summaries["readme"] = result.summary.strip()
         state.last_error = ""
-        if is_repo(self.project_root):
-            commit_all(self.project_root, "docs: update README")
+        save_run_state(self.project_root, state)
+        self._commit_if_dirty("docs: update README")
         return state
 
     def _build_readme_proposal_prompt(self, spec_file: Path, history: List[Dict[str, str]] = None) -> str:
@@ -2439,6 +2440,13 @@ class Orchestrator:
             elif stage not in completed:
                 pending.append(stage)
         return pending
+
+    def _commit_if_dirty(self, message: str) -> None:
+        if not is_repo(self.project_root):
+            return
+        if not changed_files(self.project_root):
+            return
+        commit_all(self.project_root, message)
 
     def _commit_planning_baseline_if_needed(self, tasks: Iterable[TaskSpec]) -> None:
         changes = changed_files(self.project_root)
