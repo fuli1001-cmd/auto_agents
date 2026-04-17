@@ -91,6 +91,45 @@ class VerificationPlanAdapter:
         )
 
 
+class RetryingVerificationCommandAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.plan_calls = 0
+
+    def run(self, request):
+        if request.stage == "plan":
+            self.plan_calls += 1
+            target = "tests/test_missing.py" if self.plan_calls == 1 else "tests/test_ok.py"
+            write_json(
+                task_plan_path(self.project_root),
+                {
+                    "test_strategy": "python-pytest",
+                    "verification_commands": [f"conda run -p ./.conda python -m pytest -q {target}"],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Add CLI entrypoint",
+                            "description": "Add a runnable command line entrypoint.",
+                            "acceptance": ["`python -m demo --help` exits successfully."],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            write_text(request.output_path, "verification plan\n")
+        else:
+            write_text(request.output_path, f"{request.stage}\n")
+
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=request.output_path.read_text(encoding="utf-8").strip(),
+            returncode=0,
+        )
+
+
 class RetryingImplementAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
@@ -284,7 +323,66 @@ class RetryFeedbackAdapter:
         )
 
 
+class SequencedVerifyFailureAdapter:
+    def __init__(self, project_root: Path, values):
+        self.project_root = project_root
+        self.values = list(values)
+        self.implement_calls = 0
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            index = min(self.implement_calls, len(self.values) - 1)
+            value = self.values[index]
+            self.implement_calls += 1
+            write_text(self.project_root / "artifact.txt", value + "\n")
+            summary = f"implemented {value}\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = "DECISION: pass\nreview passed\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class MissingCondaFastFailAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            write_text(self.project_root / "artifact.txt", "hello\n")
+            summary = "implemented hello\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = "DECISION: pass\nreview passed\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class MissingPytestTargetFastFailAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
         self.implement_calls = 0
@@ -371,6 +469,26 @@ class RetryFlowTests(unittest.TestCase):
 
             config = load_project_config(project_root)
             self.assertEqual(config.gates.commands, ["conda run -p ./.conda python -m unittest discover -s tests"])
+
+    def test_plan_stage_retries_when_verification_commands_reference_missing_pytest_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(exist_ok=True)
+            write_text(tests_dir / "test_ok.py", "def test_ok():\n    assert True\n")
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = RetryingVerificationCommandAdapter(project_root)
+
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            state = load_run_state(project_root)
+            orchestrator._run_agent_stage("plan", state, spec_file)
+
+            config = load_project_config(project_root)
+            self.assertEqual(orchestrator.adapter.plan_calls, 2)
+            self.assertEqual(config.gates.commands, ["conda run -p ./.conda python -m pytest -q tests/test_ok.py"])
 
     def test_persisted_tasks_keep_generated_verification_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -810,6 +928,109 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("Failure type: local_verification", orchestrator.adapter.implement_prompts[1])
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
+    def test_verify_failure_logs_repeat_statistics_for_same_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            config = orchestrator.config
+            config.gates.commands = [
+                "python -c \"print('FAILED tests/test_demo.py::test_same'); raise SystemExit(1)\""
+            ]
+            config.retries.per_stage["implement"] = 2
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = SequencedVerifyFailureAdapter(project_root, ["bad", "bad"])
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains bad"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            with self.assertRaises(RuntimeError):
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            rendered = stream.getvalue()
+            self.assertIn(
+                "[task:task-001] verify decision=fail compare=first-failure failure_ids=1",
+                rendered,
+            )
+            self.assertIn(
+                "[task:task-001] verify decision=fail compare=same-as-attempt-1 repeat=2 failure_ids=1",
+                rendered,
+            )
+
+    def test_verify_failure_logs_changed_and_regression_statistics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            config = orchestrator.config
+            config.gates.commands = [
+                (
+                    "python -c \"from pathlib import Path; value = Path('artifact.txt').read_text().strip(); "
+                    "print('FAILED tests/test_demo.py::test_alpha' if value == 'alpha' else "
+                    "('FAILED tests/test_demo.py::test_beta' if value == 'beta' else "
+                    "'FAILED tests/test_demo.py::test_alpha')); raise SystemExit(1)\""
+                )
+            ]
+            config.retries.per_stage["implement"] = 3
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = SequencedVerifyFailureAdapter(project_root, ["alpha", "beta", "alpha"])
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt changes"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            with self.assertRaises(RuntimeError):
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            rendered = stream.getvalue()
+            self.assertIn(
+                "[task:task-001] verify decision=fail compare=changed-vs-attempt-1 failure_ids=1 new=1 resolved=1",
+                rendered,
+            )
+            self.assertIn(
+                "[task:task-001] verify decision=fail compare=regression same-as-attempt-1 previous=attempt-2 repeat=2 failure_ids=1",
+                rendered,
+            )
+
     def test_missing_conda_fast_fail_skips_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -847,6 +1068,45 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertIn(".conda/conda-meta", str(raised.exception))
             self.assertEqual(orchestrator.adapter.implement_calls, orchestrator.config.retries.per_stage["implement"])
+            self.assertEqual(orchestrator.adapter.review_calls, 0)
+
+    def test_missing_pytest_target_fails_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = ["conda run -p ./.conda python -m pytest -q tests/test_missing.py"]
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = MissingPytestTargetFastFailAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains hello"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            with self.assertRaises(RuntimeError) as raised:
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertIn("missing pytest target", str(raised.exception))
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
     def test_review_rejection_is_included_in_final_error_summary(self) -> None:

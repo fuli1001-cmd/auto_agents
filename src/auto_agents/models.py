@@ -53,6 +53,7 @@ class TaskSpec:
     review_summary: str = ""
     scope_boundaries: str = ""
     review_history: List[Dict[str, object]] = field(default_factory=list)
+    verify_history: List[Dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -62,6 +63,12 @@ class TaskSpec:
             for entry in raw_history:
                 if isinstance(entry, dict):
                     history.append(entry)
+        raw_verify_history = data.get("verify_history", [])
+        verify_history = []
+        if isinstance(raw_verify_history, list):
+            for entry in raw_verify_history:
+                if isinstance(entry, dict):
+                    verify_history.append(entry)
         return cls(
             task_id=str(data["task_id"]),
             title=str(data["title"]),
@@ -74,6 +81,7 @@ class TaskSpec:
             review_summary=str(data.get("review_summary", "")),
             scope_boundaries=str(data.get("scope_boundaries", "")),
             review_history=history,
+            verify_history=verify_history,
         )
 
     def to_dict(self) -> Dict[str, object]:

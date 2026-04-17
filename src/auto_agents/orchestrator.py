@@ -30,7 +30,7 @@ from .config import (
     task_plan_path,
     write_run_prompt,
 )
-from .gates import run_commands
+from .gates import extract_failure_ids, run_commands
 from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, is_repo, require_clean_tree, worktree_fingerprint
 from .io_utils import read_text, write_text
 from .models import (
@@ -56,8 +56,12 @@ from .requirements import (
     requirements_for_task,
     validate_requirements_trace_payload,
 )
-from .validation import validate_task_plan_with_requirements, validation_report
-from .validation import validate_required_document
+from .validation import (
+    validate_required_document,
+    validate_task_plan_with_requirements,
+    validate_verification_command_paths,
+    validation_report,
+)
 
 _FAILOVER_PATTERN = re.compile(
     r"rate.limit|usage.limit|\b429\b|quota|too many requests|capacity|unavailable"
@@ -748,13 +752,21 @@ class Orchestrator:
             ) from error
 
     def _run_task_verify(self) -> Dict[str, object]:
+        quick_failure = self._quick_verify_failure()
+        if quick_failure:
+            return {
+                "ok": False,
+                "reason": quick_failure,
+                "failure_ids": self._normalize_verify_failure_ids([], quick_failure),
+            }
         verify_gate = run_commands(self.config.gates.commands, self.project_root)
         if not verify_gate.ok:
             return {
                 "ok": False,
                 "reason": verify_gate.summary,
+                "failure_ids": self._normalize_verify_failure_ids(extract_failure_ids(verify_gate), verify_gate.summary),
             }
-        return {"ok": True, "reason": verify_gate.summary}
+        return {"ok": True, "reason": verify_gate.summary, "failure_ids": []}
 
     def _run_provider_research(self, state: RunState, spec_file: Path) -> RunState:
         del spec_file
@@ -953,7 +965,7 @@ class Orchestrator:
                     break
         return "\n".join(lines)
 
-    def _quick_verify_failure(self) -> Optional[str]:
+    def _quick_verify_failure_details(self) -> Optional[Tuple[str, bool]]:
         conda_meta = self.project_root / ".conda" / "conda-meta"
         shell_tokens = {"|", "||", "&&", ";", "$(", "`"}
         shell_builtins = {
@@ -985,12 +997,20 @@ class Orchestrator:
             "wait",
         }
 
+        command_path_errors = validate_verification_command_paths(
+            self.config.gates.commands,
+            self.project_root,
+            "gates.commands",
+        )
+        if command_path_errors:
+            return command_path_errors[0], False
+
         for command in self.config.gates.commands:
             stripped = command.strip()
             if not stripped:
                 continue
             if (".conda/conda-meta" in stripped or "conda run -p ./.conda" in stripped) and not conda_meta.exists():
-                return "expected a project-local conda environment at ./.conda/conda-meta before verification"
+                return "expected a project-local conda environment at ./.conda/conda-meta before verification", True
             if any(token in stripped for token in shell_tokens):
                 continue
             try:
@@ -1005,11 +1025,17 @@ class Orchestrator:
             if "/" in executable:
                 candidate = (self.project_root / executable).resolve() if executable.startswith(".") else Path(executable)
                 if not candidate.exists():
-                    return f"verification command is not runnable: {command}"
+                    return f"verification command is not runnable: {command}", True
                 continue
             if shutil.which(executable) is None:
-                return f"verification command is not runnable: {command}"
+                return f"verification command is not runnable: {command}", True
         return None
+
+    def _quick_verify_failure(self) -> Optional[str]:
+        failure = self._quick_verify_failure_details()
+        if failure is None:
+            return None
+        return failure[0]
 
     @staticmethod
     def _format_retry_feedback(
@@ -1664,26 +1690,38 @@ class Orchestrator:
                     continue
 
             self._emit_task_activity(task, "verify", attempt)
-            quick_failure = self._quick_verify_failure()
+            quick_failure = self._quick_verify_failure_details()
             if quick_failure:
-                last_reason = quick_failure
+                last_reason, retryable = quick_failure
+                failure_ids = self._normalize_verify_failure_ids([], last_reason)
+                verify_stats = self._describe_verify_failure_stats(task, failure_ids)
+                self._record_verify_result(task, attempt, "fail", last_reason, failure_ids)
                 feedback = self._format_retry_feedback(
                     "pre_verify_check",
                     reason=last_reason,
                 )
-                self._emit_task_verify_result(task, "fail", last_reason)
+                self._emit_task_verify_result(task, "fail", last_reason, stats=verify_stats)
+                if not retryable:
+                    break
                 continue
 
             verify_result = self._run_task_verify()
             if not verify_result["ok"]:
                 last_reason = str(verify_result["reason"])
+                failure_ids = self._normalize_verify_failure_ids(
+                    verify_result.get("failure_ids", []),
+                    last_reason,
+                )
+                verify_stats = self._describe_verify_failure_stats(task, failure_ids)
+                self._record_verify_result(task, attempt, "fail", last_reason, failure_ids)
                 feedback = self._format_retry_feedback(
                     "local_verification",
                     reason=last_reason,
                 )
-                self._emit_task_verify_result(task, "fail", last_reason)
+                self._emit_task_verify_result(task, "fail", last_reason, stats=verify_stats)
                 continue
 
+            self._record_verify_result(task, attempt, "pass", str(verify_result["reason"]))
             self._emit_task_verify_result(task, "pass", str(verify_result["reason"]))
 
             review_fingerprint = worktree_fingerprint(self.project_root)
@@ -1872,8 +1910,79 @@ class Orchestrator:
             flush=True,
         )
 
-    def _emit_task_verify_result(self, task: TaskSpec, decision: str, summary: str) -> None:
-        sections = [f"[task:{task.task_id}] verify decision={decision}"]
+    @staticmethod
+    def _normalize_verify_failure_ids(failure_ids: Iterable[str], reason: str) -> List[str]:
+        normalized = sorted({str(item).strip() for item in failure_ids if str(item).strip()})
+        if normalized:
+            return normalized
+        collapsed = " ".join(reason.split()).strip()
+        return [f"reason:{collapsed}"] if collapsed else ["reason:unknown"]
+
+    def _verify_failure_signature_from_entry(self, entry: Dict[str, object]) -> List[str]:
+        raw_ids = entry.get("failure_ids", [])
+        if isinstance(raw_ids, list):
+            return self._normalize_verify_failure_ids(raw_ids, str(entry.get("summary", "")))
+        return self._normalize_verify_failure_ids([], str(entry.get("summary", "")))
+
+    def _describe_verify_failure_stats(self, task: TaskSpec, failure_ids: List[str]) -> str:
+        prior_failures = [
+            entry for entry in task.verify_history
+            if isinstance(entry, dict) and str(entry.get("decision", "")) == "fail"
+        ]
+        failure_count = len(failure_ids)
+        if not prior_failures:
+            return f"compare=first-failure failure_ids={failure_count}"
+
+        current_signature = tuple(failure_ids)
+        latest_entry = prior_failures[-1]
+        latest_attempt = latest_entry.get("attempt", "?")
+        latest_signature = tuple(self._verify_failure_signature_from_entry(latest_entry))
+        matching_entries = [
+            entry for entry in prior_failures
+            if tuple(self._verify_failure_signature_from_entry(entry)) == current_signature
+        ]
+        if matching_entries:
+            first_attempt = matching_entries[0].get("attempt", "?")
+            repeat = len(matching_entries) + 1
+            if latest_signature == current_signature:
+                return f"compare=same-as-attempt-{first_attempt} repeat={repeat} failure_ids={failure_count}"
+            return (
+                f"compare=regression same-as-attempt-{first_attempt} "
+                f"previous=attempt-{latest_attempt} repeat={repeat} failure_ids={failure_count}"
+            )
+
+        latest_set = set(latest_signature)
+        current_set = set(current_signature)
+        new_count = len(current_set - latest_set)
+        resolved_count = len(latest_set - current_set)
+        return (
+            f"compare=changed-vs-attempt-{latest_attempt} failure_ids={failure_count} "
+            f"new={new_count} resolved={resolved_count}"
+        )
+
+    @staticmethod
+    def _record_verify_result(
+        task: TaskSpec,
+        attempt: int,
+        decision: str,
+        summary: str,
+        failure_ids: Optional[Iterable[str]] = None,
+    ) -> None:
+        entry: Dict[str, object] = {
+            "attempt": attempt,
+            "decision": decision,
+            "summary": summary.strip(),
+        }
+        normalized_failure_ids = [str(item).strip() for item in (failure_ids or []) if str(item).strip()]
+        if normalized_failure_ids:
+            entry["failure_ids"] = normalized_failure_ids
+        task.verify_history.append(entry)
+
+    def _emit_task_verify_result(self, task: TaskSpec, decision: str, summary: str, stats: str = "") -> None:
+        header = f"[task:{task.task_id}] verify decision={decision}"
+        if stats.strip():
+            header = f"{header} {stats.strip()}"
+        sections = [header]
         if summary.strip():
             sections.append(summary.strip())
         print(
@@ -2075,6 +2184,13 @@ class Orchestrator:
         payload = load_task_plan(self.project_root)
         trace = load_requirements_trace(self.project_root)
         errors = validate_task_plan_with_requirements(payload, trace)
+        errors.extend(
+            validate_verification_command_paths(
+                payload.get("verification_commands", []),
+                self.project_root,
+                "task plan verification_commands",
+            )
+        )
         if not errors:
             # Soft warning: if this is an iteration with no new pending tasks, nudge the agent.
             is_iteration = any(
@@ -2183,7 +2299,17 @@ class Orchestrator:
             return
         if not self.config.gates.allow_agent_updates:
             return
-        normalized = [str(item) for item in commands]
+        normalized = [str(item).strip() for item in commands if str(item).strip()]
+        if not normalized:
+            return
+        errors = validate_verification_command_paths(
+            normalized,
+            self.project_root,
+            "task plan verification_commands",
+        )
+        if errors:
+            bullets = "\n".join(f"- {item}" for item in errors)
+            raise RuntimeError(f"generated verification commands are invalid:\n{bullets}")
         if self.config.gates.commands == normalized:
             return
         self.config.gates.commands = normalized

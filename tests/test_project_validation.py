@@ -13,7 +13,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.cli import main
 from auto_agents.adapters.codex import CodexAdapter
-from auto_agents.config import DEFAULT_CONFIG, config_path, load_project_config, load_run_state, save_run_state, task_plan_path
+from auto_agents.config import (
+    DEFAULT_CONFIG,
+    config_path,
+    load_project_config,
+    load_run_state,
+    save_project_config,
+    save_run_state,
+    task_plan_path,
+)
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentRequest, AgentResult, AgentUsage, ProjectConfig, ProviderConfig, TaskSpec
 from auto_agents.orchestrator import Orchestrator
@@ -306,6 +314,37 @@ class ProjectValidationTests(unittest.TestCase):
             Orchestrator.init_project(project_root, "demo", "mock")
             report = validation_report(project_root)
             self.assertTrue(any("no verification commands" in item for item in report["warnings"]))
+
+    def test_validation_report_rejects_missing_pytest_targets_in_verification_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+
+            config = load_project_config(project_root)
+            config.gates.commands = ["conda run -p ./.conda python -m pytest -q tests/test_missing.py"]
+            save_project_config(project_root, config)
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "test_strategy": "python-pytest",
+                    "verification_commands": ["conda run -p ./.conda python -m pytest -q tests/test_missing.py"],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Add CLI entrypoint",
+                            "description": "Add a runnable command line entrypoint.",
+                            "acceptance": ["`python -m demo --help` exits successfully."],
+                            "status": "pending",
+                            "commit_message": "feat(task-001): add CLI entrypoint",
+                        }
+                    ],
+                },
+            )
+
+            report = validation_report(project_root)
+
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("missing pytest target" in item for item in report["errors"]))
 
     def test_validation_report_warns_when_task_plan_looks_oversliced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

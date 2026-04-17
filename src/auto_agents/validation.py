@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from json import JSONDecodeError
 from pathlib import Path
 from typing import Dict, List
@@ -38,6 +39,20 @@ GLOBAL_INSTALL_PATTERNS = (
     (re.compile(r"(^|[\s;&|])cargo\s+install\b"), "avoid global cargo installs"),
     (re.compile(r"(^|[\s;&|])go\s+install\b"), "avoid global go installs"),
 )
+CONDA_RUN_VALUE_OPTIONS = {"-n", "--name", "-p", "--prefix", "--cwd"}
+PYTEST_VALUE_OPTIONS = {
+    "-c",
+    "--confcutdir",
+    "--durations",
+    "--ignore",
+    "--ignore-glob",
+    "--junitxml",
+    "--log-file",
+    "--maxfail",
+    "--rootdir",
+    "-k",
+    "-m",
+}
 
 
 def _looks_like_python_workflow(test_strategy: object, commands: object) -> bool:
@@ -89,6 +104,85 @@ def _validate_isolated_commands(commands: object, field_name: str, python_requir
                 f"{field_name}[{index}] must run Python verification inside a project-local conda env such as 'conda run -p ./.conda ...'"
             )
 
+    return errors
+
+
+def _unwrap_conda_run(parts: List[str]) -> List[str]:
+    if len(parts) < 2 or parts[0] != "conda" or parts[1] != "run":
+        return parts
+
+    index = 2
+    while index < len(parts):
+        token = parts[index]
+        if token == "--":
+            return parts[index + 1 :]
+        if token in CONDA_RUN_VALUE_OPTIONS:
+            index += 2
+            continue
+        if any(token.startswith(f"{option}=") for option in CONDA_RUN_VALUE_OPTIONS):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return parts[index:]
+    return []
+
+
+def _pytest_target_candidates(command: str) -> List[str]:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return []
+
+    parts = _unwrap_conda_run(parts)
+    if not parts:
+        return []
+
+    executable = Path(parts[0]).name
+    args: List[str]
+    if executable in {"pytest", "py.test"}:
+        args = parts[1:]
+    elif len(parts) >= 3 and Path(parts[0]).name in {"python", "python3"} and parts[1] == "-m" and parts[2] == "pytest":
+        args = parts[3:]
+    else:
+        return []
+
+    targets: List[str] = []
+    skip_next = False
+    option_parsing_done = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--":
+            option_parsing_done = True
+            continue
+        if not option_parsing_done and arg.startswith("-"):
+            if arg in PYTEST_VALUE_OPTIONS and "=" not in arg:
+                skip_next = True
+            continue
+        targets.append(arg.split("::", 1)[0])
+    return [target for target in targets if target and target not in {".", ".."}]
+
+
+def validate_verification_command_paths(commands: object, project_root: Path, field_name: str) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(commands, list):
+        return errors
+
+    for index, raw in enumerate(commands, start=1):
+        if not isinstance(raw, str):
+            continue
+        command = raw.strip()
+        if not command:
+            continue
+        for target in _pytest_target_candidates(command):
+            candidate = Path(target)
+            resolved = candidate if candidate.is_absolute() else (project_root / candidate).resolve()
+            if resolved.exists():
+                continue
+            errors.append(f"{field_name}[{index}] references missing pytest target: {target}")
     return errors
 
 
@@ -471,6 +565,13 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         errors.append(f"missing config file: {config_path(root)}")
     elif config_payload is not None:
         errors.extend(validate_project_config_payload(config_payload))
+        errors.extend(
+            validate_verification_command_paths(
+                config_payload.get("gates", {}).get("commands", []),
+                root,
+                "gates.commands",
+            )
+        )
 
     try:
         plan_payload = read_json(task_plan_path(root), default=None)
@@ -481,6 +582,13 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         errors.append(f"missing task plan file: {task_plan_path(root)}")
     elif plan_payload is not None:
         errors.extend(validate_task_plan_payload(plan_payload))
+        errors.extend(
+            validate_verification_command_paths(
+                plan_payload.get("verification_commands", []),
+                root,
+                "task plan verification_commands",
+            )
+        )
         warnings.extend(task_plan_warnings(plan_payload))
 
     try:

@@ -280,21 +280,25 @@ class Session:
             self._save(state)
 
             # Quick verify
-            quick_fail = self.orch._quick_verify_failure()
+            quick_fail = self.orch._quick_verify_failure_details()
             if quick_fail:
-                self._print(f"Quick verify failed: {quick_fail}")
-                feedback = self.orch._format_retry_feedback("pre_verify_check", reason=quick_fail)
+                quick_reason, retryable = quick_fail
+                self._print(f"Quick verify failed: {quick_reason}")
+                feedback = self.orch._format_retry_feedback("pre_verify_check", reason=quick_reason)
                 state.execution_log.append({
                     "attempt": state.current_attempt,
                     "action": "quick_verify_fail",
-                    "result": quick_fail,
+                    "result": quick_reason,
                     "timestamp": self._now(),
                 })
                 diff_hash = self._compute_diff_hash()
-                verify_sig = self._compute_verify_sig(quick_fail)
+                verify_sig = self._compute_verify_sig(quick_reason)
                 self._update_stall_state(state, diff_hash, verify_sig)
                 self._save(state)
-                stop = self._should_stop(state, quick_fail)
+                if not retryable:
+                    self._print("Quick verify failure is deterministic. Stopping without retry.")
+                    break
+                stop = self._should_stop(state, quick_reason)
                 if stop:
                     self._print(stop)
                     break
