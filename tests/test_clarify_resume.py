@@ -148,6 +148,72 @@ class ClarifyResumeTests(unittest.TestCase):
         self.assertIn("Agent is thinking, please wait...", output)
         self.assertIn("Also support database-backed state.", conversation_history_path(project_root, state.run_id).read_text(encoding="utf-8"))
 
+    def test_ready_to_generate_rejection_without_feedback_keeps_clarifying(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+
+        state = load_run_state(project_root)
+        history_path = conversation_history_path(project_root, state.run_id)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(
+            history_path,
+            json.dumps(
+                [
+                    {"role": "user", "content": "Build a CLI tool."},
+                    {"role": "agent", "content": "Summary.\nREADY_TO_GENERATE"},
+                ],
+                ensure_ascii=False,
+            ),
+        )
+
+        user_inputs = iter([
+            "n",
+            "",
+            "Add authentication.",
+            "y",
+        ])
+        orchestrator._user_input_fn = lambda _prompt: next(user_inputs)
+
+        clarify_result = AgentResult(
+            ok=True,
+            command=[],
+            output_path=Path("."),
+            summary="What authentication flow do you need?",
+            stdout="",
+        )
+        ready_result = AgentResult(
+            ok=True,
+            command=[],
+            output_path=Path("."),
+            summary="Updated summary.\nREADY_TO_GENERATE",
+            stdout="",
+        )
+        generate_result = AgentResult(
+            ok=True,
+            command=[],
+            output_path=Path("."),
+            summary="Generated brief.",
+            stdout="",
+        )
+
+        with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+            mock_run.side_effect = [clarify_result, ready_result, generate_result]
+            orchestrator._run_interactive_clarify(state, spec_file)
+
+        call_stage_keys = [call.kwargs["stage_key"] for call in mock_run.call_args_list]
+        self.assertEqual(
+            call_stage_keys,
+            ["clarify-conv-3", "clarify-conv-5", "clarify-generate"],
+        )
+
+        saved_history = json.loads(history_path.read_text(encoding="utf-8"))
+        user_msgs = [m.get("content", "") for m in saved_history if m.get("role") == "user"]
+        self.assertIn(
+            "I am not ready to generate the project brief yet. Please continue clarifying the requirements with me.",
+            user_msgs,
+        )
+        self.assertIn("Add authentication.", user_msgs)
+
     def test_rejection_reentry_preserves_history_and_appends_feedback(self):
         """Requirements rejection should preserve prior clarify context and
         append the rejection reason as new user feedback."""

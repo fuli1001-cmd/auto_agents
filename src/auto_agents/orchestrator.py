@@ -420,7 +420,22 @@ class Orchestrator:
                         resume_to_confirm = True
                     break
 
-        skip_to_generation = False
+        confirmed_generation = False
+
+        def _record_clarify_feedback(user_reply: str) -> None:
+            feedback = user_reply.strip()
+            if feedback:
+                history.append({"role": "user", "content": user_reply})
+            else:
+                history.append({
+                    "role": "user",
+                    "content": (
+                        "I am not ready to generate the project brief yet. "
+                        "Please continue clarifying the requirements with me."
+                    ),
+                })
+            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
+            print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
 
         if resume_to_confirm:
             # Show the agent's last reply (minus the marker) and re-ask.
@@ -437,13 +452,10 @@ class Orchestrator:
             print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
             user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
             if user_conf.strip().lower() not in ("n", "no"):
-                skip_to_generation = True
+                confirmed_generation = True
             else:
                 user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
-                if user_reply.strip():
-                    history.append({"role": "user", "content": user_reply})
-                    write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-                print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
+                _record_clarify_feedback(user_reply)
         else:
             # Resume interrupted conversation: if trailing history entries
             # are from the agent (e.g. process crashed before user reply was
@@ -473,7 +485,7 @@ class Orchestrator:
                         history.append({"role": "user", "content": "I have nothing to add. Please proceed to generate if you are ready."})
                 write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
 
-        if not skip_to_generation:
+        if not confirmed_generation:
             print("Entering interactive clarify session, please wait for the agent to analyze the spec...", file=sys.stderr, flush=True)
 
             max_rounds = 15
@@ -541,13 +553,11 @@ class Orchestrator:
                     user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
 
                     if user_conf.strip().lower() not in ("n", "no"):
+                        confirmed_generation = True
                         break
                     else:
                         user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
-                        if user_reply.strip():
-                            history.append({"role": "user", "content": user_reply})
-                            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-                        print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
+                        _record_clarify_feedback(user_reply)
                         continue
 
                 # After rejection, show the agent's response (stripping the
@@ -568,7 +578,12 @@ class Orchestrator:
 
                 write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
                 print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
-                
+
+        if not confirmed_generation:
+            raise RuntimeError(
+                "Clarify ended without explicit confirmation to generate project_brief.md."
+            )
+
         # Generate the actual project brief
         print("\nGenerating project_brief.md, please wait...", file=sys.stderr, flush=True)
         is_iteration = any(t.status == "done" for t in state.tasks)
@@ -859,6 +874,13 @@ class Orchestrator:
             return compact
         return compact[: limit - 3].rstrip() + "..."
 
+    @staticmethod
+    def _truncate_feedback_excerpt(text: str, limit: int = 900) -> str:
+        excerpt = text.strip()
+        if len(excerpt) <= limit:
+            return excerpt
+        return excerpt[: limit - 3].rstrip() + "..."
+
     def _extract_verify_implicated_paths(self, raw_output: str) -> List[str]:
         if not raw_output.strip():
             return []
@@ -878,13 +900,6 @@ class Orchestrator:
             if normalized not in paths:
                 paths.append(normalized)
         return paths[:8]
-
-    @staticmethod
-    def _truncate_feedback_excerpt(text: str, limit: int = 900) -> str:
-        excerpt = text.strip()
-        if len(excerpt) <= limit:
-            return excerpt
-        return excerpt[: limit - 3].rstrip() + "..."
 
     @staticmethod
     def _extract_verify_root_causes(raw_output: str) -> List[str]:
