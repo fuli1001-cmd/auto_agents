@@ -317,6 +317,57 @@ class SessionFixFlowTests(unittest.TestCase):
             committed = json.loads(show.stdout)
             self.assertEqual(committed["status"], "completed")
 
+    def test_fix_flow_commit_message_uses_agent_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            user_inputs = [
+                (
+                    "When users submit the signup form without selecting a plan, the app crashes "
+                    "after several redirects and the saved draft restore flow also breaks."
+                ),
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I understand the bug and can reproduce it.\nGOAL_CLEAR\n"
+                else:
+                    content = (
+                        "## Fix Plan\n"
+                        "1. Reproduce the crash.\n"
+                        "2. Patch the missing plan guard.\n"
+                        "3. Add regression coverage.\n\n"
+                        "Added a plan guard so empty-plan signups no longer crash.\n"
+                    )
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+
+            log = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                log.stdout.strip(),
+                "fix: Added a plan guard so empty-plan signups no longer crash",
+            )
+
 
 class SessionCollabFlowTests(unittest.TestCase):
     """Test the collab mode workflow with mock adapter."""

@@ -319,7 +319,7 @@ class Session:
                 self._print("Verification passed!")
                 state.status = "completed"
                 state.resolution = "fixed"
-                self._git_commit(state, "fix")
+                self._git_commit(state, "fix", reply=reply)
                 self._print(f"Bug fix completed in session {state.session_id}.")
                 return state
 
@@ -429,11 +429,11 @@ class Session:
                 answer = self._prompt_user("Do you confirm the goal is achieved? (y/n) [y]: ", default="y")
                 if answer.strip().lower() not in ("n", "no"):
                     state.status = "completed"
-                    self._git_commit(state, "collab")
+                    self._git_commit(state, "collab", reply=reply)
                     self._print(f"Collaborative session {state.session_id} completed successfully.")
                     return state
 
-                committed = self._commit_verified_progress(state, "collab")
+                committed = self._commit_verified_progress(state, "collab", reply=reply)
                 if committed:
                     self._print("Verified progress committed before continuing.")
                 user_feedback = self._prompt_user("What still needs to be done? ", multiline=True)
@@ -461,7 +461,7 @@ class Session:
                 self._save(state)
 
                 if verify["ok"]:
-                    committed = self._commit_verified_progress(state, "collab")
+                    committed = self._commit_verified_progress(state, "collab", reply=reply)
                     if committed:
                         self._print("Bug fix verified and committed.")
                     else:
@@ -481,10 +481,10 @@ class Session:
                 answer = self._prompt_user("Goal achieved? (y/n) [y]: ", default="y")
                 if answer.strip().lower() not in ("n", "no"):
                     state.status = "completed"
-                    self._git_commit(state, "collab")
+                    self._git_commit(state, "collab", reply=reply)
                     self._print(f"Collaborative session {state.session_id} completed successfully.")
                     return state
-                committed = self._commit_verified_progress(state, "collab")
+                committed = self._commit_verified_progress(state, "collab", reply=reply)
                 if committed:
                     self._print("Verified progress committed before continuing.")
                 user_feedback = self._prompt_user("What still needs to be done? ", multiline=True)
@@ -886,18 +886,72 @@ class Session:
         self._print(f"Agent call failed (transient): {err_msg[:200]}")
         return f"Previous attempt failed with a transient error: {err_msg[:300]}"
 
-    def _commit_verified_progress(self, state: SessionState, prefix: str) -> bool:
+    def _commit_verified_progress(self, state: SessionState, prefix: str, reply: str = "") -> bool:
         """Commit verified project changes while the collab loop continues."""
         if not changed_paths(self.project_root):
             return False
-        return self._git_commit(state, prefix)
+        return self._git_commit(state, prefix, reply=reply)
 
-    def _git_commit(self, state: SessionState, prefix: str) -> bool:
+    def _extract_commit_summary(self, text: str) -> str:
+        """Extract a concise commit summary from an agent reply."""
+        if not text.strip():
+            return ""
+
+        for pattern in (_GOAL_ACHIEVED, _BUG_FOUND, _NOT_A_BUG):
+            match = pattern.search(text)
+            if match:
+                return self._normalize_commit_subject(match.group(1))
+
+        candidates: List[str] = []
+        for raw_line in text.splitlines():
+            line = " ".join(raw_line.strip().split())
+            if not line or line == "GOAL_CLEAR" or line.startswith("FIX_VERIFY:"):
+                continue
+            if any(pattern.match(line) for pattern in (_GOAL_ACHIEVED, _BUG_FOUND, _NOT_A_BUG, _NEED_USER_ASSIST)):
+                continue
+            if line == "```":
+                continue
+            line = re.sub(r"^#{1,6}\s+", "", line).strip()
+            if not line or line.lower() == "fix plan":
+                continue
+            if re.match(r"^(?:[-*+]\s+|\d+\.\s+)", line):
+                continue
+            candidates.append(line)
+
+        if not candidates:
+            return ""
+        return self._normalize_commit_subject(candidates[-1])
+
+    def _normalize_commit_subject(self, text: str, max_length: int = 72) -> str:
+        subject = " ".join(text.replace("`", "").replace("*", "").split())
+        subject = subject.strip(" \t\r\n.,;:-")
+        if not subject:
+            return ""
+        if len(subject) <= max_length:
+            return subject
+        truncated = subject[: max_length + 1].rsplit(" ", 1)[0].rstrip(" \t\r\n.,;:-")
+        if len(truncated) < max_length // 2:
+            truncated = subject[:max_length].rstrip(" \t\r\n.,;:-")
+        return truncated
+
+    def _session_commit_summary(self, state: SessionState, reply: str) -> str:
+        summary = self._extract_commit_summary(reply)
+        if summary:
+            return summary
+        for entry in reversed(state.execution_log):
+            if str(entry.get("action", "")) not in {"fix", "collab"}:
+                continue
+            summary = self._extract_commit_summary(str(entry.get("result", "")))
+            if summary:
+                return summary
+        return self._normalize_commit_subject(state.goal.replace("\n", " ")) or "verified update"
+
+    def _git_commit(self, state: SessionState, prefix: str, reply: str = "") -> bool:
         """Persist current state, then commit current changes if auto-commit is enabled."""
         if not self.config.git.commit_each_task:
             self._save(state)
             return False
-        summary = state.goal[:60].replace("\n", " ")
+        summary = self._session_commit_summary(state, reply)
         message = f"{prefix}: {summary}"
         state.execution_log.append({
             "attempt": state.current_attempt,
