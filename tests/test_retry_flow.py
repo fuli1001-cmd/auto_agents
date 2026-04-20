@@ -6,7 +6,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.config import load_project_config, load_run_state, save_project_config, task_plan_path
+from auto_agents.config import (
+    load_project_config,
+    load_run_state,
+    provider_references_lock_path,
+    requirements_trace_path,
+    save_project_config,
+    save_run_state,
+    task_plan_path,
+)
 from auto_agents.git_ops import worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult
@@ -438,7 +446,122 @@ class PermanentReviewFailureAdapter:
         )
 
 
+class AuditRecoveryAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.plan_calls = 0
+        self.implement_calls = 0
+        self.provider_research_calls = 0
+        self.review_calls = 0
+        self.stage_calls: list[str] = []
+
+    def run(self, request):
+        self.stage_calls.append(request.stage)
+        if request.stage == "plan":
+            self.plan_calls += 1
+            write_json(
+                task_plan_path(self.project_root),
+                {
+                    "test_strategy": "python-unittest",
+                    "verification_commands": ["true"],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": [],
+                            "status": "done",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "task-002",
+                            "title": "Cover requirement",
+                            "description": "Cover the missing mandatory requirement.",
+                            "acceptance": ["coverage is explicit"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+            summary = "plan updated\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "provider_research":
+            self.provider_research_calls += 1
+            reference_path = self.project_root / ".auto-agents" / "docs" / "provider_references" / "provider.md"
+            reference_path.parent.mkdir(parents=True, exist_ok=True)
+            write_text(reference_path, "# Provider reference\n")
+            write_json(
+                provider_references_lock_path(self.project_root),
+                {
+                    "version": 1,
+                    "references": {
+                        "provider": {
+                            "path": ".auto-agents/docs/provider_references/provider.md",
+                            "status": "verified",
+                            "retrieved_at": "2026-04-11T00:00:00Z",
+                            "source_urls": ["https://example.com/official"],
+                            "notes": "",
+                        }
+                    },
+                },
+            )
+            summary = "provider research updated\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "implement":
+            self.implement_calls += 1
+            write_text(self.project_root / "artifact.txt", "modern_backend\n")
+            summary = "implemented audit recovery\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = "DECISION: pass\naudit recovery review passed\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "readme":
+            write_text(
+                self.project_root / "README.md",
+                "# Demo\n## Overview\nRecovered project.\n## Architecture\nSimple test layout.\n## Usage\n```bash\npython -m demo\n```\n## Development\nRun tests.\n",
+            )
+            summary = "readme updated\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class RetryFlowTests(unittest.TestCase):
+    def _seed_verify_ready_state(self, project_root: Path, orchestrator: Orchestrator) -> None:
+        state = load_run_state(project_root)
+        state.status = "pending"
+        state.current_stage = "implement"
+        state.stage_summaries = {
+            "clarify": "done",
+            "design": "done",
+            "plan": "done",
+            "provider_research": "done",
+            "implement": "done",
+        }
+        state.tasks = orchestrator._load_tasks_from_plan()
+        save_run_state(project_root, state)
+
+    def _disable_gates_and_approvals(self, project_root: Path) -> None:
+        orchestrator = Orchestrator(project_root)
+        config = orchestrator.config
+        config.gates.commands = []
+        config.approvals.enabled = []
+        config.gates.require_clean_git_before_task = False
+        save_project_config(project_root, config)
+        (project_root / ".conda" / "conda-meta").mkdir(parents=True, exist_ok=True)
+
     def test_plan_stage_retries_on_invalid_json_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -1296,6 +1419,379 @@ class RetryFlowTests(unittest.TestCase):
                             found = True
                 
                 self.assertTrue(found, "Rejection reason should be injected into clarify prompt")
+
+    def test_requirements_audit_forbidden_pattern_routes_back_to_implement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Do not keep the legacy backend path.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["artifact is modernized"],
+                            "forbidden_patterns": ["legacy_gateway"],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "done",
+                            "commit_message": "",
+                            "review_summary": "legacy_gateway still exists in the current implementation",
+                            "review_history": [{"attempt": 1, "summary": "legacy_gateway still exists in the current implementation"}],
+                        }
+                    ]
+                },
+            )
+            write_text(project_root / "artifact.txt", "legacy_gateway\n")
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = AuditRecoveryAdapter(project_root)
+            self._seed_verify_ready_state(project_root, orchestrator)
+
+            state = orchestrator.run(spec_file=spec_file, auto_approve=True)
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertIn("requirements_audit", state.stage_summaries)
+            self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "modern_backend")
+            task_plan_text = task_plan_path(project_root).read_text(encoding="utf-8")
+            run_state_text = (project_root / ".auto-agents" / "state" / "run_state.json").read_text(encoding="utf-8")
+            self.assertNotIn("legacy_gateway still exists", task_plan_text)
+            self.assertNotIn("legacy_gateway still exists", run_state_text)
+
+    def test_requirements_audit_recovery_emits_verify_failure_before_rewind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Do not keep the legacy backend path.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["artifact is modernized"],
+                            "forbidden_patterns": ["legacy_gateway"],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "done",
+                            "commit_message": "",
+                            "review_summary": "legacy_gateway still exists in the current implementation",
+                            "review_history": [{"attempt": 1, "summary": "legacy_gateway still exists in the current implementation"}],
+                        }
+                    ]
+                },
+            )
+            write_text(project_root / "artifact.txt", "legacy_gateway\n")
+
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = AuditRecoveryAdapter(project_root)
+            self._seed_verify_ready_state(project_root, orchestrator)
+
+            state = orchestrator.run(spec_file=spec_file, auto_approve=True)
+
+            self.assertEqual(state.status, "completed")
+            rendered = stream.getvalue()
+            self.assertIn("[stage:verify] decision=fail route=implement", rendered)
+            self.assertIn("requirements audit failed:", rendered)
+            self.assertLess(
+                rendered.index("[stage:verify] decision=fail route=implement"),
+                rendered.index("[stage:implement] start"),
+            )
+
+    def test_requirements_audit_missing_coverage_routes_back_to_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Cover the requirement in at least one done task.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["task coverage exists"],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": [],
+                            "status": "done",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = AuditRecoveryAdapter(project_root)
+            self._seed_verify_ready_state(project_root, orchestrator)
+
+            state = orchestrator.run(spec_file=spec_file, auto_approve=True)
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(orchestrator.adapter.plan_calls, 1)
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual([task.status for task in state.tasks], ["done", "done"])
+
+    def test_requirements_audit_missing_provider_reference_routes_back_to_provider_research(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Use verified provider documentation.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["provider reference is verified"],
+                            "forbidden_patterns": [],
+                            "external_docs_required": True,
+                            "provider_reference": ".auto-agents/docs/provider_references/provider.md",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "done",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = AuditRecoveryAdapter(project_root)
+            self._seed_verify_ready_state(project_root, orchestrator)
+
+            state = orchestrator.run(spec_file=spec_file, auto_approve=True)
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(orchestrator.adapter.provider_research_calls, 1)
+            self.assertEqual(orchestrator.adapter.implement_calls, 0)
+            self.assertIn("requirements_audit", state.stage_summaries)
+
+    def test_legacy_requirements_audit_failure_state_is_rewound_before_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Do not keep the legacy backend path.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["artifact is modernized"],
+                            "forbidden_patterns": ["legacy_gateway"],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "done",
+                            "commit_message": "",
+                            "review_summary": "legacy_gateway still exists in the current implementation",
+                            "review_history": [{"attempt": 1, "summary": "legacy_gateway still exists in the current implementation"}],
+                        }
+                    ]
+                },
+            )
+            write_text(project_root / "artifact.txt", "legacy_gateway\n")
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = AuditRecoveryAdapter(project_root)
+            state = load_run_state(project_root)
+            state.status = "failed"
+            state.current_stage = "verify"
+            state.last_error = f"requirements audit failed: {project_root / '.auto-agents' / 'docs' / 'requirements_audit.md'}"
+            state.stage_summaries = {
+                "clarify": "done",
+                "design": "done",
+                "plan": "done",
+                "provider_research": "done",
+                "implement": "done",
+                "verify": "done",
+                "requirements_audit": "Result: pass",
+            }
+            state.tasks = orchestrator._load_tasks_from_plan()
+            save_run_state(project_root, state)
+
+            state = orchestrator.run(spec_file=spec_file, auto_approve=True)
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertIn("requirements_audit", state.stage_summaries)
+            self.assertNotIn("readme", state.rejected_stage)
+
+    def test_requirements_audit_blocked_provider_reference_still_fails_clearly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Use verified provider documentation.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["provider reference is verified"],
+                            "forbidden_patterns": [],
+                            "external_docs_required": True,
+                            "provider_reference": ".auto-agents/docs/provider_references/provider.md",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                provider_references_lock_path(project_root),
+                {
+                    "version": 1,
+                    "references": {
+                        "provider": {
+                            "path": ".auto-agents/docs/provider_references/provider.md",
+                            "status": "blocked",
+                            "retrieved_at": "2026-04-11T00:00:00Z",
+                            "source_urls": ["https://example.com/official"],
+                            "notes": "",
+                        }
+                    },
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "done",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+
+            orchestrator = Orchestrator(project_root)
+            self._seed_verify_ready_state(project_root, orchestrator)
+            state = load_run_state(project_root)
+
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator._run_verify(state)
+
+            self.assertIn("Automatic recovery is unsafe", str(ctx.exception))
 
 
 class IterationAdapter:

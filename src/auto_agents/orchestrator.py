@@ -47,12 +47,12 @@ from .models import (
     TaskSpec,
 )
 from .requirements import (
-    audit_requirements,
     external_doc_requirements,
     format_requirement_context,
     load_provider_references_lock,
     load_requirements_trace,
     provider_reference_status,
+    run_requirements_audit,
     requirements_for_task,
     validate_requirements_trace_payload,
 )
@@ -186,9 +186,7 @@ class Orchestrator:
 
         # Reset the rejected stage and all downstream stage outputs so run()
         # can rebuild the pipeline from the right point.
-        target_index = STAGE_ORDER.index(target_stage)
-        for stage in STAGE_ORDER[target_index:]:
-            state.stage_summaries.pop(stage, None)
+        self._rewind_state_from_stage(state, target_stage)
 
         # Remove the rejected approval and any downstream approvals
         # (e.g. reject architecture should also drop release).
@@ -201,6 +199,221 @@ class Orchestrator:
         state.rejected_stage = target_stage
         save_run_state(self.project_root, state)
         return state
+
+    def _rewind_state_from_stage(self, state: RunState, target_stage: str) -> None:
+        target_index = STAGE_ORDER.index(target_stage)
+        for stage in STAGE_ORDER[target_index:]:
+            state.stage_summaries.pop(stage, None)
+        state.stage_summaries.pop("requirements_audit", None)
+        state.pending_approval = ""
+        state.status = "pending"
+        state.current_stage = target_stage
+        state.last_error = ""
+
+    def _normalize_legacy_requirements_audit_resume(self, state: RunState) -> bool:
+        last_error = state.last_error.strip()
+        if not last_error.startswith("requirements audit failed:"):
+            return False
+        has_stale_verify = "verify" in state.stage_summaries
+        has_stale_audit = "requirements_audit" in state.stage_summaries
+        if not (has_stale_verify or has_stale_audit):
+            return False
+        self._rewind_state_from_stage(state, "verify")
+        state.rejected_stage = ""
+        state.rejection_reason = ""
+        return True
+
+    @staticmethod
+    def _audit_issue_route(blocker: Dict[str, object]) -> Tuple[Optional[str], str]:
+        kind = str(blocker.get("kind", "")).strip()
+        message = str(blocker.get("message", "")).strip() or "requirements audit blocker"
+        if kind == "forbidden_pattern":
+            return "implement", ""
+        if kind == "task_coverage":
+            return "plan", ""
+        if kind == "provider_reference":
+            reference = str(blocker.get("reference", "")).strip()
+            ref_status = str(blocker.get("reference_status", "")).strip() or "missing"
+            if ref_status == "missing" and reference:
+                return "provider_research", ""
+            if not reference:
+                return None, f"{message}; provider_reference is missing from the requirement record"
+            return None, (
+                f"{message}; automatic recovery is unsafe because the provider reference "
+                f"requires external resolution ({ref_status})"
+            )
+        return None, f"{message}; no automatic recovery route is defined for blocker kind '{kind or 'unknown'}'"
+
+    @staticmethod
+    def _audit_blocker_feedback(blocker: Dict[str, object]) -> str:
+        kind = str(blocker.get("kind", "")).strip()
+        if kind == "forbidden_pattern":
+            path = str(blocker.get("path", "")).strip() or "unknown path"
+            return f"forbidden pattern found in {path}"
+        return str(blocker.get("message", "")).strip() or "requirements audit blocker"
+
+    def _requirements_audit_route(self, audit_result: Dict[str, object]) -> Tuple[Optional[str], List[str]]:
+        target_stage: Optional[str] = None
+        hard_failures: List[str] = []
+        for issue in audit_result.get("issues", []):
+            if not isinstance(issue, dict) or str(issue.get("result", "")).strip() != "fail":
+                continue
+            req_id = str(issue.get("requirement_id", "")).strip() or "(unknown requirement)"
+            blockers = issue.get("blockers", [])
+            if not isinstance(blockers, list):
+                continue
+            for blocker in blockers:
+                if not isinstance(blocker, dict):
+                    hard_failures.append(f"{req_id}: invalid audit blocker payload")
+                    continue
+                candidate, hard_failure = self._audit_issue_route(blocker)
+                if hard_failure:
+                    hard_failures.append(f"{req_id}: {hard_failure}")
+                    continue
+                if candidate is None:
+                    continue
+                if target_stage is None or STAGE_ORDER.index(candidate) < STAGE_ORDER.index(target_stage):
+                    target_stage = candidate
+        return target_stage, hard_failures
+
+    @staticmethod
+    def _sanitize_text_for_patterns(text: str, compiled_patterns: List[re.Pattern[str]]) -> Tuple[str, bool]:
+        if not text:
+            return text, False
+        updated = text
+        changed = False
+        replacement = "[forbidden pattern omitted; see .auto-agents/docs/requirements_audit.md]"
+        for pattern in compiled_patterns:
+            updated, count = pattern.subn(replacement, updated)
+            if count:
+                changed = True
+        return updated, changed
+
+    def _sanitize_persisted_audit_feedback(self, state: RunState, audit_result: Dict[str, object]) -> bool:
+        compiled_patterns: List[re.Pattern[str]] = []
+        for issue in audit_result.get("issues", []):
+            if not isinstance(issue, dict):
+                continue
+            blockers = issue.get("blockers", [])
+            if not isinstance(blockers, list):
+                continue
+            for blocker in blockers:
+                if not isinstance(blocker, dict):
+                    continue
+                if str(blocker.get("kind", "")).strip() != "forbidden_pattern":
+                    continue
+                raw = str(blocker.get("pattern", "")).strip()
+                if not raw:
+                    continue
+                try:
+                    compiled_patterns.append(re.compile(raw))
+                except re.error:
+                    continue
+        if not compiled_patterns:
+            return False
+
+        changed = False
+        for task in state.tasks:
+            task.review_summary, task_changed = self._sanitize_text_for_patterns(task.review_summary, compiled_patterns)
+            changed = changed or task_changed
+            sanitized_history: List[Dict[str, object]] = []
+            for entry in task.review_history:
+                if not isinstance(entry, dict):
+                    sanitized_history.append(entry)
+                    continue
+                updated_entry = dict(entry)
+                summary = str(updated_entry.get("summary", ""))
+                updated_summary, entry_changed = self._sanitize_text_for_patterns(summary, compiled_patterns)
+                if entry_changed:
+                    updated_entry["summary"] = updated_summary
+                    changed = True
+                sanitized_history.append(updated_entry)
+            task.review_history = sanitized_history
+
+        for cache_entry in state.task_review_cache.values():
+            if not isinstance(cache_entry, dict):
+                continue
+            summary = str(cache_entry.get("summary", ""))
+            updated_summary, entry_changed = self._sanitize_text_for_patterns(summary, compiled_patterns)
+            if entry_changed:
+                cache_entry["summary"] = updated_summary
+                changed = True
+
+        for key, value in list(state.stage_summaries.items()):
+            updated_value, entry_changed = self._sanitize_text_for_patterns(str(value), compiled_patterns)
+            if entry_changed:
+                state.stage_summaries[key] = updated_value
+                changed = True
+
+        state.rejection_reason, entry_changed = self._sanitize_text_for_patterns(state.rejection_reason, compiled_patterns)
+        changed = changed or entry_changed
+        state.last_error, entry_changed = self._sanitize_text_for_patterns(state.last_error, compiled_patterns)
+        changed = changed or entry_changed
+        return changed
+
+    def _requirements_audit_recovery_limit(self) -> int:
+        return max(
+            self._max_attempts("implement"),
+            self._max_attempts("plan"),
+            self._max_attempts("provider_research"),
+        )
+
+    def _build_requirements_audit_feedback(self, audit_result: Dict[str, object], target_stage: str) -> str:
+        report_path = str(audit_result.get("path", requirements_audit_path(self.project_root)))
+        lines = [
+            f"The requirements audit failed. Use {report_path} as the source of truth.",
+            f"Recovery route: rerun from {target_stage}.",
+            "Address every failing mandatory requirement before continuing.",
+        ]
+        for issue in audit_result.get("issues", []):
+            if not isinstance(issue, dict) or str(issue.get("result", "")).strip() != "fail":
+                continue
+            req_id = str(issue.get("requirement_id", "")).strip() or "(unknown requirement)"
+            lines.append(f"- {req_id}:")
+            blockers = issue.get("blockers", [])
+            if isinstance(blockers, list):
+                for blocker in blockers[:4]:
+                    if not isinstance(blocker, dict):
+                        continue
+                    lines.append(f"  - {self._audit_blocker_feedback(blocker)}")
+        lines.append(
+            "Do not copy forbidden pattern literals verbatim into persisted summaries; refer back to the audit report path instead."
+        )
+        return "\n".join(lines)
+
+    def _handle_requirements_audit_failure(self, state: RunState, audit_result: Dict[str, object]) -> bool:
+        target_stage, hard_failures = self._requirements_audit_route(audit_result)
+        report_path = str(audit_result.get("path", requirements_audit_path(self.project_root)))
+        if hard_failures:
+            detail = "\n".join(f"- {entry}" for entry in hard_failures[:8])
+            state.status = "failed"
+            state.last_error = (
+                f"requirements audit failed: {report_path}\n"
+                "Automatic recovery is unsafe for at least one blocker:\n"
+                f"{detail}"
+            )
+            return False
+        if not target_stage:
+            state.status = "failed"
+            state.last_error = f"requirements audit failed: {report_path}"
+            return False
+
+        attempts = int(state.agent_attempts.get("requirements_audit_recovery", 0)) + 1
+        limit = self._requirements_audit_recovery_limit()
+        if attempts > limit:
+            state.status = "failed"
+            state.last_error = (
+                f"requirements audit failed after {limit} automatic recovery attempt(s): {report_path}"
+            )
+            return False
+
+        state.agent_attempts["requirements_audit_recovery"] = attempts
+        self._rewind_state_from_stage(state, target_stage)
+        state.rejection_reason = self._build_requirements_audit_feedback(audit_result, target_stage)
+        state.rejected_stage = target_stage
+        if self._sanitize_persisted_audit_feedback(state, audit_result) and state.tasks:
+            self._persist_tasks(state.tasks)
+        return True
 
     def run(
         self,
@@ -222,6 +435,8 @@ class Orchestrator:
             if doc_language is not None:
                 self._set_document_language(doc_language)
             state = load_run_state(self.project_root)
+            if self._normalize_legacy_requirements_audit_resume(state):
+                save_run_state(self.project_root, state)
             self._active_spec_file = spec_file.expanduser().resolve()
             self._ensure_preconditions(state, spec_file=spec_file, skip_validate=skip_validate)
 
@@ -277,7 +492,7 @@ class Orchestrator:
 
                 save_run_state(self.project_root, state)
                 pending_gate = APPROVAL_BY_STAGE.get(stage)
-                if pending_gate and pending_gate in self.config.approvals.enabled:
+                if pending_gate and pending_gate in self.config.approvals.enabled and stage in state.stage_summaries:
                     if auto_approve or pending_gate in state.approved_gates:
                         if pending_gate not in state.approved_gates:
                             state.approved_gates.append(pending_gate)
@@ -1032,6 +1247,13 @@ class Orchestrator:
 
         provider_references_dir(self.project_root).mkdir(parents=True, exist_ok=True)
         prompt = self._build_provider_research_prompt(unresolved)
+        if state.rejected_stage == "provider_research" and state.rejection_reason:
+            prompt += (
+                "\n\nThe previous provider research output was rejected. Please address this feedback:\n"
+                f"{state.rejection_reason}\n"
+            )
+            state.rejected_stage = ""
+            state.rejection_reason = ""
         result = self._run_agent_with_retries(
             state=state,
             stage="provider_research",
@@ -1342,15 +1564,28 @@ class Orchestrator:
         state.last_error = ""
         if not verify_gate.ok:
             state.status = "failed"
+            self._emit_stage_verify_result("fail", summary.strip())
             raise RuntimeError("verify stage failed")
         tasks = state.tasks or self._load_tasks_from_plan()
-        audit_ok, audit_report = audit_requirements(self.project_root, tasks)
+        state.tasks = tasks
+        audit_result = run_requirements_audit(self.project_root, tasks)
+        audit_ok = bool(audit_result["ok"])
+        audit_report = str(audit_result["report"])
         if not audit_ok:
-            state.status = "failed"
-            state.last_error = f"requirements audit failed: {requirements_audit_path(self.project_root)}"
+            state.stage_summaries.pop("verify", None)
+            if self._handle_requirements_audit_failure(state, audit_result):
+                self._emit_stage_verify_result(
+                    "fail",
+                    f"requirements audit failed: {audit_result['path']}",
+                    route=state.rejected_stage,
+                )
+                save_run_state(self.project_root, state)
+                return state
+            self._emit_stage_verify_result("fail", state.last_error)
             raise RuntimeError(state.last_error)
         if "No requirements are currently tracked." not in audit_report:
             state.stage_summaries["requirements_audit"] = audit_report.strip()
+        state.agent_attempts.pop("requirements_audit_recovery", None)
         return state
 
     def _load_tasks_from_plan(self) -> List[TaskSpec]:
@@ -2131,6 +2366,19 @@ class Orchestrator:
         model = self._model_label_for_top_level_stage(stage)
         print(f"[stage:{stage}] start provider={self._current_provider} model={model}", file=self.agent_output_stream, flush=True)
 
+    def _emit_stage_verify_result(self, decision: str, summary: str, route: str = "") -> None:
+        header = f"[stage:verify] decision={decision}"
+        if route.strip():
+            header = f"{header} route={route.strip()}"
+        sections = [header]
+        if summary.strip():
+            sections.append(summary.strip())
+        print(
+            "\n".join(sections),
+            file=self.agent_output_stream,
+            flush=True,
+        )
+
     def _emit_plan_task_count(self, tasks: Iterable[TaskSpec]) -> None:
         task_list = list(tasks)
         print(f"[stage:plan] tasks={len(task_list)}", file=self.agent_output_stream, flush=True)
@@ -2679,11 +2927,11 @@ class Orchestrator:
     def audit_requirements(self) -> Dict[str, object]:
         state = load_run_state(self.project_root)
         tasks = state.tasks or self._load_tasks_from_plan()
-        ok, report = audit_requirements(self.project_root, tasks)
+        result = run_requirements_audit(self.project_root, tasks)
         return {
-            "ok": ok,
-            "path": str(requirements_audit_path(self.project_root)),
-            "summary": report,
+            "ok": bool(result["ok"]),
+            "path": str(result["path"]),
+            "summary": str(result["report"]),
         }
 
     def _pending_stages(self, state: RunState) -> List[str]:
@@ -2691,6 +2939,9 @@ class Orchestrator:
         completed = set(state.stage_summaries.keys())
         for stage in STAGE_ORDER:
             if stage == "implement":
+                if state.rejected_stage == "implement" and state.rejection_reason:
+                    pending.append(stage)
+                    continue
                 if not state.tasks:
                     pending.append(stage)
                     continue

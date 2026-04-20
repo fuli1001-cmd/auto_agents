@@ -115,4 +115,11 @@ The release audit checks:
   non-runtime material.
 - The final audit writes `.auto-agents/docs/requirements_audit.md`.
 
-Release approval is blocked when audit result is `fail`.
+When the audit result is `fail`, the orchestrator routes recovery by owner:
+
+- implementation-actionable findings rewind to `implement`
+- missing requirement coverage rewinds to `plan`
+- missing provider references rewind to `provider_research`
+- blockers that still require external/user resolution remain hard failures
+
+Release approval is blocked until the rerun audit result is `pass`.

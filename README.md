@@ -399,6 +399,21 @@ What resumes depends on the stage:
   unfinished task is resumed
 - approval pauses: `approve` clears the pending gate, and the next `run` continues from there
 
+Requirements audit failures now participate in the retry pipeline instead of always terminating the
+run immediately:
+
+- implementation-actionable audit failures (for example forbidden-pattern hits in runtime files)
+  automatically rewind to `implement`, attach feedback that points at
+  `.auto-agents/docs/requirements_audit.md`, and retry within the same run
+- missing mandatory requirement coverage rewinds to `plan`, so the planner can append or correct
+  tasks before implementation resumes
+- missing provider references rewind to `provider_research`
+- audit blockers that already require external resolution (for example provider references marked
+  `blocked` or `needs_user_input`) still fail clearly instead of looping unsafely
+
+When an audit failure rewinds the pipeline, the next `run` also resumes from that rewound stage
+rather than pretending `verify` already completed.
+
 Implementation resume is task-aware rather than fully transactional:
 
 - if a task is already marked `in_progress`, the next run first tries to continue from

@@ -248,7 +248,7 @@ def provider_reference_status(lock_payload: dict, reference_path: str) -> str:
     return "missing"
 
 
-def audit_requirements(project_root: Path, tasks: Iterable[TaskSpec]) -> Tuple[bool, str]:
+def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dict:
     trace = load_requirements_trace(project_root)
     lock = load_provider_references_lock(project_root)
     lines = [
@@ -258,6 +258,7 @@ def audit_requirements(project_root: Path, tasks: Iterable[TaskSpec]) -> Tuple[b
         "",
     ]
     ok = True
+    issues: List[dict] = []
     task_requirements = set()
     for task in tasks:
         if task.status == "done":
@@ -269,16 +270,27 @@ def audit_requirements(project_root: Path, tasks: Iterable[TaskSpec]) -> Tuple[b
         priority = str(item.get("priority", "mandatory")).strip()
         if not req_id:
             continue
-        blockers: List[str] = []
+        blockers: List[dict] = []
         if status == "active" and priority == "mandatory" and req_id not in task_requirements:
-            blockers.append("not covered by any done task")
+            blockers.append(
+                {
+                    "kind": "task_coverage",
+                    "message": "not covered by any done task",
+                }
+            )
         if status == "active" and bool(item.get("external_docs_required", False)):
             reference = str(item.get("provider_reference", "")).strip()
             ref_status = provider_reference_status(lock, reference)
             if ref_status not in PASSING_REFERENCE_STATUSES:
-                blockers.append(f"provider reference is {ref_status}")
-        for finding in _forbidden_pattern_findings(project_root, item):
-            blockers.append(finding)
+                blockers.append(
+                    {
+                        "kind": "provider_reference",
+                        "message": f"provider reference is {ref_status}",
+                        "reference": reference,
+                        "reference_status": ref_status,
+                    }
+                )
+        blockers.extend(_forbidden_pattern_findings(project_root, item))
 
         if blockers and status == "active" and priority == "mandatory":
             ok = False
@@ -288,15 +300,26 @@ def audit_requirements(project_root: Path, tasks: Iterable[TaskSpec]) -> Tuple[b
         else:
             result = "pass"
 
+        text = str(item.get("text", "")).strip()
+        issues.append(
+            {
+                "requirement_id": req_id,
+                "result": result,
+                "status": status,
+                "priority": priority,
+                "text": text,
+                "blockers": blockers,
+            }
+        )
+
         lines.append(f"## {req_id}: {result}")
         lines.append("")
-        text = str(item.get("text", "")).strip()
         if text:
             lines.append(text)
             lines.append("")
         if blockers:
             lines.append("Findings:")
-            lines.extend(f"- {entry}" for entry in blockers)
+            lines.extend(f"- {entry['message']}" for entry in blockers)
             lines.append("")
 
     if not requirement_records(trace):
@@ -306,10 +329,20 @@ def audit_requirements(project_root: Path, tasks: Iterable[TaskSpec]) -> Tuple[b
     lines.insert(2, f"Result: {'pass' if ok else 'fail'}")
     report = "\n".join(lines).rstrip() + "\n"
     write_text(requirements_audit_path(project_root), report)
-    return ok, report
+    return {
+        "ok": ok,
+        "report": report,
+        "issues": issues,
+        "path": str(requirements_audit_path(project_root)),
+    }
 
 
-def _forbidden_pattern_findings(project_root: Path, requirement: dict) -> List[str]:
+def audit_requirements(project_root: Path, tasks: Iterable[TaskSpec]) -> Tuple[bool, str]:
+    result = run_requirements_audit(project_root, tasks)
+    return bool(result["ok"]), str(result["report"])
+
+
+def _forbidden_pattern_findings(project_root: Path, requirement: dict) -> List[dict]:
     status = str(requirement.get("status", "active")).strip()
     if status != "active":
         return []
@@ -352,7 +385,14 @@ def _forbidden_pattern_findings(project_root: Path, requirement: dict) -> List[s
                 continue
             for raw, pattern in compiled:
                 if pattern.search(content):
-                    findings.append(f"forbidden pattern '{raw}' found in {rel}")
+                    findings.append(
+                        {
+                            "kind": "forbidden_pattern",
+                            "message": f"forbidden pattern '{raw}' found in {rel}",
+                            "pattern": raw,
+                            "path": rel,
+                        }
+                    )
     return findings
 
 
