@@ -28,6 +28,7 @@ from .models import (
     SESSION_STALL_THRESHOLD,
     SessionState,
 )
+from .validation import _looks_like_python_command, _uses_project_local_conda
 
 _GOAL_CLEAR = re.compile(r"^GOAL_CLEAR\s*$", re.MULTILINE)
 _NOT_A_BUG = re.compile(r"^NOT_A_BUG:\s*(.+)$", re.MULTILINE)
@@ -35,6 +36,7 @@ _NEED_USER_ASSIST = re.compile(r"^NEED_USER_ASSIST:\s*(.+)$", re.MULTILINE)
 _BUG_FOUND = re.compile(r"^BUG_FOUND:\s*(.+)$", re.MULTILINE)
 _GOAL_ACHIEVED = re.compile(r"^GOAL_ACHIEVED:\s*(.+)$", re.MULTILINE)
 _FIX_VERIFY = re.compile(r"^FIX_VERIFY:\s*(.+)$", re.MULTILINE)
+_SHELL_CONTROL_TOKENS = re.compile(r"[|;&<>`\n]")
 
 
 class Session:
@@ -549,7 +551,15 @@ class Session:
                 "return exit code 0 if the bug is fixed and non-zero if the bug still "
                 "exists. This should target the specific bug described, not the whole test suite. "
                 "Examples: a pytest invocation with -k filter, a curl command, a grep check, etc.",
+                "- Match the repository's existing verification conventions when choosing FIX_VERIFY.",
+                "- If the project uses a local conda env at ./.conda, every Python-oriented "
+                "FIX_VERIFY command must run inside it via 'conda run -p ./.conda ...'.",
             ])
+            if self.config.gates.commands:
+                lines.append(
+                    "- Current repository gate commands (reuse them as guidance for FIX_VERIFY when relevant):"
+                )
+                lines.extend(f"  - {command}" for command in self.config.gates.commands)
         lines.extend([
             "- Always explain your understanding before asking questions or declaring ready.",
             self.orch._document_language_instruction(),
@@ -756,9 +766,10 @@ class Session:
         # Layer 1: targeted bug verification
         if state.fix_verify_command:
             import subprocess as _sp
+            verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
             try:
                 proc = _sp.run(
-                    state.fix_verify_command,
+                    verify_command,
                     shell=True,
                     text=True,
                     capture_output=True,
@@ -789,6 +800,23 @@ class Session:
                 ),
             }
         return {"ok": True, "reason": gate.summary}
+
+    def _fix_verify_command_for_execution(self, command: str) -> str:
+        stripped = command.strip()
+        if not stripped:
+            return stripped
+        conda_meta = self.project_root / ".conda" / "conda-meta"
+        if not conda_meta.exists():
+            return stripped
+        if _uses_project_local_conda(stripped):
+            return stripped
+        if not _looks_like_python_command(stripped):
+            return stripped
+        if _SHELL_CONTROL_TOKENS.search(stripped):
+            return stripped
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", stripped):
+            return stripped
+        return f"conda run -p ./.conda {stripped}"
 
     # ── Convergence detection ────────────────────────────────────
 

@@ -1600,6 +1600,50 @@ class BaselineDiffVerifyTests(unittest.TestCase):
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.fix_verify_command, "exit 1")
 
+    def test_fix_verify_python_command_uses_project_conda(self) -> None:
+        """Python FIX_VERIFY commands should run inside the project-local conda env."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            (project_root / ".conda" / "conda-meta").mkdir(parents=True)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.commands = []
+            session = Session(orchestrator, mode="fix")
+            state = create_session(project_root, "fix")
+            state.fix_verify_command = 'pytest -q tests/test_issue_regressions_api.py -k "bug_case"'
+            session._current_state = state
+
+            with patch("subprocess.run") as run_mock:
+                run_mock.return_value = subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                )
+                result = session._run_baseline_diff_verify()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                run_mock.call_args.args[0],
+                'conda run -p ./.conda pytest -q tests/test_issue_regressions_api.py -k "bug_case"',
+            )
+
+    def test_fix_converse_prompt_includes_conda_fix_verify_guidance(self) -> None:
+        """Fix clarify prompt should surface conda requirements and current gate commands."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.commands = [
+                "test -d ./.conda/conda-meta",
+                "conda run -p ./.conda python -m unittest discover -s tests",
+            ]
+            session = Session(orchestrator, mode="fix")
+            state = SessionState(session_id="prompt1", mode="fix", goal="Planning output uses wrong language")
+
+            prompt = session._build_converse_prompt(state)
+
+            self.assertIn("every Python-oriented FIX_VERIFY command must run inside it", prompt)
+            self.assertIn("conda run -p ./.conda python -m unittest discover -s tests", prompt)
+
     def test_baseline_snapshot_on_resume_stale(self) -> None:
         """If git HEAD changes between sessions, baseline should be re-captured."""
         with tempfile.TemporaryDirectory() as tmp:
