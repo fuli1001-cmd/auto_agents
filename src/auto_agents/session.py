@@ -17,6 +17,7 @@ from .config import (
     load_session_state,
     save_session_state,
     session_artifact_paths,
+    sort_sessions,
 )
 from .gates import run_commands, run_commands_collect_all, extract_failure_ids
 from .git_ops import changed_paths, commit_all, head_ref
@@ -96,16 +97,14 @@ class Session:
 
     def offer_resume_or_new(self) -> SessionState:
         """If there are active or failed sessions for this mode, offer to resume; else start new."""
-        resumable = [
+        resumable = sort_sessions([
             s for s in list_sessions(self.project_root)
             if s.mode == self.mode and s.status != "completed"
-        ]
+        ])
         if resumable:
-            latest = resumable[-1]
-            self._print(f"Found resumable {self.mode} session: {latest.session_id} (status={latest.status})")
-            answer = self._prompt_user("Resume this session? (y/n) [y]: ", default="y")
-            if answer.strip().lower() not in ("n", "no"):
-                return self.resume(latest.session_id)
+            selected = self._select_resumable_session(resumable)
+            if selected is not None:
+                return self.resume(selected.session_id)
         return self.start()
 
     # ── Main driver ──────────────────────────────────────────────
@@ -600,6 +599,55 @@ class Session:
             "Final response: short summary of what you changed and why.",
         ])
         return "\n".join(lines)
+
+    def _describe_session_for_resume(self, state: SessionState) -> str:
+        goal = " ".join(state.goal.split()) or "(no goal recorded)"
+        if len(goal) > 80:
+            goal = goal[:77] + "..."
+        parts = [
+            f"{state.session_id}",
+            f"status={state.status}",
+            f"updated={state.updated_at or state.created_at or 'unknown'}",
+            f"goal={goal}",
+        ]
+        if state.status == "failed":
+            for entry in reversed(state.execution_log):
+                if str(entry.get("action", "")).strip():
+                    result = " ".join(str(entry.get("result", "")).split())
+                    if len(result) > 120:
+                        result = result[:117] + "..."
+                    if result:
+                        parts.append(f"last_error={result}")
+                    break
+        return " | ".join(parts)
+
+    def _select_resumable_session(self, resumable: List[SessionState]) -> Optional[SessionState]:
+        self._print(
+            f"Found {len(resumable)} unfinished {self.mode} session(s), newest first. "
+            f"Default recommendation: {resumable[0].session_id}"
+        )
+        for index, item in enumerate(resumable, start=1):
+            self._print(f"  {index}. {self._describe_session_for_resume(item)}")
+        prompt = (
+            "Choose a session number or ID to resume, or enter 'n' to start a new one "
+            f"[1]: "
+        )
+        while True:
+            answer = self._prompt_user(prompt, default="1").strip()
+            if not answer:
+                answer = "1"
+            lowered = answer.lower()
+            if lowered in ("n", "no", "new"):
+                return None
+            if answer.isdigit():
+                index = int(answer)
+                if 1 <= index <= len(resumable):
+                    return resumable[index - 1]
+            else:
+                for item in resumable:
+                    if item.session_id == answer:
+                        return item
+            self._print("Invalid selection. Enter a listed number, a session ID, or 'n' for a new session.")
 
     def _build_collab_prompt(self, state: SessionState, feedback: str) -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"

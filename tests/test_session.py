@@ -14,7 +14,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.config import (
+    clear_sessions,
     create_session,
+    delete_session,
     list_sessions,
     load_session_state,
     save_session_state,
@@ -132,6 +134,43 @@ class SessionConfigTests(unittest.TestCase):
             self.assertEqual(len(sessions), 2)
             modes = {s.mode for s in sessions}
             self.assertEqual(modes, {"fix", "collab"})
+
+    def test_list_sessions_sorted_by_updated_at_desc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            older = create_session(project_root, "fix")
+            older.updated_at = "2026-01-01T00:00:00+00:00"
+            save_session_state(project_root, older)
+            newer = create_session(project_root, "collab")
+            newer.updated_at = "2026-01-02T00:00:00+00:00"
+            save_session_state(project_root, newer)
+
+            sessions = list_sessions(project_root)
+
+            self.assertEqual([s.session_id for s in sessions], [newer.session_id, older.session_id])
+
+    def test_delete_session_removes_only_target_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            keep = create_session(project_root, "fix")
+            delete_me = create_session(project_root, "collab")
+
+            delete_session(project_root, delete_me.session_id)
+
+            remaining = list_sessions(project_root)
+            self.assertEqual([s.session_id for s in remaining], [keep.session_id])
+            self.assertFalse(session_state_path(project_root, delete_me.session_id).exists())
+
+    def test_clear_sessions_removes_all_session_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            create_session(project_root, "fix")
+            create_session(project_root, "collab")
+
+            deleted = clear_sessions(project_root)
+
+            self.assertEqual(deleted, 2)
+            self.assertEqual(list_sessions(project_root), [])
 
     def test_load_nonexistent_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -795,6 +834,19 @@ class SessionCLITests(unittest.TestCase):
         self.assertEqual(args.mode, "fix")
         self.assertTrue(args.all)
 
+    def test_sessions_delete_parser(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["sessions-delete", "--project", "/tmp/test", "--session", "abc123"])
+        self.assertEqual(args.command, "sessions-delete")
+        self.assertEqual(args.session, "abc123")
+
+    def test_sessions_clear_parser(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["sessions-clear", "--project", "/tmp/test"])
+        self.assertEqual(args.command, "sessions-clear")
+
 
 class SessionListCommandTests(unittest.TestCase):
     """Test the sessions list command end-to-end."""
@@ -899,6 +951,85 @@ class SessionListCommandTests(unittest.TestCase):
         data = json.loads(captured.getvalue())
         self.assertEqual(len(data), 1)
         self.assertEqual(data[0]["status"], "completed")
+
+    def test_sessions_list_sorted_newest_first(self) -> None:
+        from auto_agents.config import create_session, save_session_state
+        older = create_session(self.tmpdir, "fix")
+        older.updated_at = "2026-01-01T00:00:00+00:00"
+        save_session_state(self.tmpdir, older)
+        newer = create_session(self.tmpdir, "fix")
+        newer.updated_at = "2026-01-02T00:00:00+00:00"
+        save_session_state(self.tmpdir, newer)
+
+        from auto_agents.cli import main
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            rc = main(["sessions", "--project", str(self.tmpdir), "--all"])
+        finally:
+            sys.stdout = old_stdout
+
+        self.assertEqual(rc, 0)
+        data = json.loads(captured.getvalue())
+        self.assertEqual([row["session_id"] for row in data], [newer.session_id, older.session_id])
+
+    def test_sessions_delete_command(self) -> None:
+        from auto_agents.cli import main
+        state = create_session(self.tmpdir, "fix")
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            with patch("auto_agents.cli._confirm_prompt", return_value="y"):
+                rc = main(["sessions-delete", "--project", str(self.tmpdir), "--session", state.session_id])
+        finally:
+            sys.stdout = old_stdout
+
+        self.assertEqual(rc, 0)
+        data = json.loads(captured.getvalue())
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["deleted_session"], state.session_id)
+        self.assertFalse(session_state_path(self.tmpdir, state.session_id).exists())
+
+    def test_sessions_delete_cancelled(self) -> None:
+        from auto_agents.cli import main
+        state = create_session(self.tmpdir, "fix")
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            with patch("auto_agents.cli._confirm_prompt", return_value="n"):
+                rc = main(["sessions-delete", "--project", str(self.tmpdir), "--session", state.session_id])
+        finally:
+            sys.stdout = old_stdout
+
+        self.assertEqual(rc, 1)
+        data = json.loads(captured.getvalue())
+        self.assertFalse(data["ok"])
+        self.assertTrue(session_state_path(self.tmpdir, state.session_id).exists())
+
+    def test_sessions_clear_command(self) -> None:
+        from auto_agents.cli import main
+        create_session(self.tmpdir, "fix")
+        create_session(self.tmpdir, "collab")
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            with patch("auto_agents.cli._confirm_prompt", return_value="y"):
+                rc = main(["sessions-clear", "--project", str(self.tmpdir)])
+        finally:
+            sys.stdout = old_stdout
+
+        self.assertEqual(rc, 0)
+        data = json.loads(captured.getvalue())
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["deleted_sessions"], 2)
+        self.assertEqual(list_sessions(self.tmpdir), [])
 
 
 class ErrorFeedbackTests(unittest.TestCase):
@@ -1236,8 +1367,8 @@ class ResumeFailedSessionTests(unittest.TestCase):
             ]
             save_session_state(project_root, state)
 
-            # User says "y" to resume, then agent fixes
-            user_inputs = ["y"]
+            # User accepts the default recommended session, then agent fixes
+            user_inputs = [""]
             inputs = iter(user_inputs)
             orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
 
@@ -1254,6 +1385,82 @@ class ResumeFailedSessionTests(unittest.TestCase):
             result = session.offer_resume_or_new()
 
             self.assertEqual(result.session_id, state.session_id)
+            self.assertEqual(result.status, "completed")
+
+    def test_offer_resume_prefers_newest_unfinished_session(self) -> None:
+        """Blank selection should resume the newest unfinished session."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            older = create_session(project_root, "fix")
+            older.goal = "older bug"
+            older.updated_at = "2026-01-01T00:00:00+00:00"
+            save_session_state(project_root, older)
+
+            newer = create_session(project_root, "fix")
+            newer.status = "failed"
+            newer.goal = "newer bug"
+            newer.updated_at = "2026-01-02T00:00:00+00:00"
+            newer.conversation = [
+                {"role": "user", "content": "newer bug"},
+                {"role": "agent", "content": "OK\nGOAL_CLEAR\n"},
+            ]
+            save_session_state(project_root, newer)
+
+            user_inputs = [""]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            def mock_run(request):
+                content = "Fixed newer session.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            result = session.offer_resume_or_new()
+
+            self.assertEqual(result.session_id, newer.session_id)
+            self.assertEqual(result.status, "completed")
+
+    def test_collab_offer_resume_uses_same_newest_first_logic(self) -> None:
+        """Collab mode should share the same unfinished-session chooser."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            older = create_session(project_root, "collab")
+            older.goal = "older collab goal"
+            older.updated_at = "2026-01-01T00:00:00+00:00"
+            save_session_state(project_root, older)
+
+            newer = create_session(project_root, "collab")
+            newer.status = "failed"
+            newer.goal = "newer collab goal"
+            newer.updated_at = "2026-01-02T00:00:00+00:00"
+            newer.conversation = [
+                {"role": "user", "content": "newer collab goal"},
+                {"role": "agent", "content": "I understand.\nGOAL_CLEAR\n"},
+            ]
+            save_session_state(project_root, newer)
+
+            user_inputs = [""]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            def mock_run(request):
+                content = "Applied collab fix.\nGOAL_ACHIEVED: done\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="collab")
+            result = session.offer_resume_or_new()
+
+            self.assertEqual(result.session_id, newer.session_id)
             self.assertEqual(result.status, "completed")
 
 

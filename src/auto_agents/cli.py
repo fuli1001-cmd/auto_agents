@@ -19,6 +19,11 @@ def _default_spec_file(project: Path) -> Path:
     return project / "spec.md"
 
 
+def _confirm_prompt(project_root: Path, prompt: str, default: str = "n") -> str:
+    orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+    return orchestrator._prompt_user(prompt, default=default)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted project delivery.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -162,6 +167,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include completed and failed sessions (default: active only).",
     )
 
+    sessions_delete_parser = subparsers.add_parser(
+        "sessions-delete",
+        help="Delete one saved session record without touching project code changes.",
+    )
+    sessions_delete_parser.add_argument("--project", required=True, help="Target project directory.")
+    sessions_delete_parser.add_argument("--session", required=True, help="Session ID to delete.")
+
+    sessions_clear_parser = subparsers.add_parser(
+        "sessions-clear",
+        help="Delete all saved session records without touching project code changes.",
+    )
+    sessions_clear_parser.add_argument("--project", required=True, help="Target project directory.")
+
     return parser
 
 
@@ -262,6 +280,52 @@ def main(argv: list[str] | None = None) -> int:
                 d = {k: v for k, v in s.to_dict().items() if k not in _SESSIONS_OMIT}
                 rows.append(d)
             print(json.dumps(rows, indent=2, ensure_ascii=False))
+            return 0
+        except (RuntimeError, FileNotFoundError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
+
+    if args.command == "sessions-delete":
+        try:
+            from .config import delete_session
+
+            project_root = Path(args.project)
+            answer = _confirm_prompt(
+                project_root,
+                (
+                    f"Delete saved session {args.session}? "
+                    "This only removes .auto-agents session state and does not revert code changes. (y/n) [n]: "
+                ),
+                default="n",
+            )
+            if answer.strip().lower() not in ("y", "yes"):
+                print(json.dumps({"ok": False, "error": "Session deletion cancelled."}, indent=2, ensure_ascii=False))
+                return 1
+            delete_session(project_root, args.session)
+            print(json.dumps({"ok": True, "deleted_session": args.session}, indent=2, ensure_ascii=False))
+            return 0
+        except (RuntimeError, FileNotFoundError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
+
+    if args.command == "sessions-clear":
+        try:
+            from .config import clear_sessions
+
+            project_root = Path(args.project)
+            answer = _confirm_prompt(
+                project_root,
+                (
+                    "Delete ALL saved sessions? This only removes .auto-agents session state "
+                    "and does not revert code changes. (y/n) [n]: "
+                ),
+                default="n",
+            )
+            if answer.strip().lower() not in ("y", "yes"):
+                print(json.dumps({"ok": False, "error": "Session clear cancelled."}, indent=2, ensure_ascii=False))
+                return 1
+            deleted = clear_sessions(project_root)
+            print(json.dumps({"ok": True, "deleted_sessions": deleted}, indent=2, ensure_ascii=False))
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))

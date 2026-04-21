@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Tuple
 from uuid import uuid4
@@ -398,7 +400,6 @@ def session_artifact_paths(
 
 def create_session(project_root: Path, mode: str) -> SessionState:
     session_id = uuid4().hex[:12]
-    from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
     state = SessionState(
         session_id=session_id,
@@ -427,6 +428,64 @@ def save_session_state(project_root: Path, state: SessionState) -> None:
     write_json(path, state.to_dict())
 
 
+def _session_timestamp(value: str) -> datetime:
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def sort_sessions(sessions: list[SessionState]) -> list[SessionState]:
+    return sorted(
+        sessions,
+        key=lambda s: (
+            _session_timestamp(s.updated_at or s.created_at),
+            _session_timestamp(s.created_at),
+            s.session_id,
+        ),
+        reverse=True,
+    )
+
+
+def _validated_session_dir(project_root: Path, session_id: str) -> Path:
+    root = sessions_dir(project_root).resolve()
+    target = (root / session_id).resolve()
+    try:
+        relative = target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"Invalid session id: {session_id}") from exc
+    if len(relative.parts) != 1:
+        raise ValueError(f"Invalid session id: {session_id}")
+    return target
+
+
+def delete_session(project_root: Path, session_id: str) -> None:
+    target = _validated_session_dir(project_root, session_id)
+    if not target.is_dir():
+        raise FileNotFoundError(f"Session not found: {session_state_path(project_root, session_id)}")
+    shutil.rmtree(target)
+
+
+def clear_sessions(project_root: Path) -> int:
+    root = sessions_dir(project_root)
+    if not root.is_dir():
+        return 0
+    deleted = 0
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        if not (child / "session_state.json").is_file():
+            continue
+        shutil.rmtree(child)
+        deleted += 1
+    return deleted
+
+
 def list_sessions(project_root: Path) -> list:
     root = sessions_dir(project_root)
     if not root.is_dir():
@@ -441,4 +500,4 @@ def list_sessions(project_root: Path) -> list:
                     result.append(SessionState.from_dict(data))
             except Exception:
                 pass
-    return result
+    return sort_sessions(result)
