@@ -601,25 +601,29 @@ class Session:
         return "\n".join(lines)
 
     def _describe_session_for_resume(self, state: SessionState) -> str:
-        goal = " ".join(state.goal.split()) or "(no goal recorded)"
-        if len(goal) > 80:
-            goal = goal[:77] + "..."
-        parts = [
-            f"{state.session_id}",
+        goal = state.goal or "(no goal recorded)"
+        lines = [
+            f"session_id={state.session_id}",
             f"status={state.status}",
-            f"updated={state.updated_at or state.created_at or 'unknown'}",
-            f"goal={goal}",
+            f"updated={self._format_session_timestamp(state.updated_at or state.created_at)}",
         ]
-        if state.status == "failed":
-            for entry in reversed(state.execution_log):
-                if str(entry.get("action", "")).strip():
-                    result = " ".join(str(entry.get("result", "")).split())
-                    if len(result) > 120:
-                        result = result[:117] + "..."
-                    if result:
-                        parts.append(f"last_error={result}")
-                    break
-        return " | ".join(parts)
+        goal_lines = goal.splitlines() or [goal]
+        lines.append(f"goal={goal_lines[0]}")
+        lines.extend(goal_lines[1:])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_session_timestamp(value: str) -> str:
+        if not value:
+            return "unknown"
+        normalized = value
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return value
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
     def _select_resumable_session(self, resumable: List[SessionState]) -> Optional[SessionState]:
         self._print(
@@ -627,7 +631,8 @@ class Session:
             f"Default recommendation: {resumable[0].session_id}"
         )
         for index, item in enumerate(resumable, start=1):
-            self._print(f"  {index}. {self._describe_session_for_resume(item)}")
+            detail = self._describe_session_for_resume(item).replace("\n", "\n     ")
+            self._print(f"  {index}.\n     {detail}")
         prompt = (
             "Choose a session number or ID to resume, or enter 'n' to start a new one "
             f"[1]: "

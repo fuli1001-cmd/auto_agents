@@ -1463,6 +1463,33 @@ class ResumeFailedSessionTests(unittest.TestCase):
             self.assertEqual(result.session_id, newer.session_id)
             self.assertEqual(result.status, "completed")
 
+    def test_resume_session_display_uses_multiline_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "")
+            session = Session(orchestrator, mode="fix")
+            state = SessionState(
+                session_id="abc123",
+                mode="fix",
+                status="failed",
+                goal="first line\nsecond line",
+                updated_at="2026-04-21T05:30:09.905369+00:00",
+                execution_log=[{"action": "verify", "result": "should not render"}],
+            )
+
+            rendered = session._describe_session_for_resume(state)
+
+            self.assertEqual(
+                rendered,
+                "\n".join([
+                    "session_id=abc123",
+                    "status=failed",
+                    "updated=2026-04-21 05:30:09",
+                    "goal=first line",
+                    "second line",
+                ]),
+            )
+
 
 class FixConvergenceTests(unittest.TestCase):
     """Test convergence-based stopping for fix mode."""

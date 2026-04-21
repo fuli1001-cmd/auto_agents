@@ -518,7 +518,9 @@ python3 -m auto_agents collab --project /tmp/demo --session <session_id>
 ```
 
 If `--session` is omitted, the CLI automatically detects resumable sessions (including failed ones)
-of the same mode and offers to resume the most recent one.
+of the same mode, shows all unfinished sessions in newest-first order, and lets you choose a session
+number or ID to resume. Press Enter to accept the newest recommended session, or enter `n` to start
+a new one.
 
 When a **failed** session is resumed, the stall counter and agent-error counter are reset to zero,
 but the conversation history and execution log are preserved so the agent retains full context.
@@ -537,11 +539,18 @@ python3 -m auto_agents sessions --project /tmp/demo --mode fix
 
 # Include completed and failed sessions
 python3 -m auto_agents sessions --project /tmp/demo --all
+
+# Delete one saved session record (state only; does not revert code changes)
+python3 -m auto_agents sessions-delete --project /tmp/demo --session <session_id>
+
+# Delete all saved session records (state only; does not revert code changes)
+python3 -m auto_agents sessions-clear --project /tmp/demo
 ```
 
 The sessions list shows a compact summary per session (`session_id`, `mode`, `status`, `goal`,
 `resolution`, `created_at`). Verbose fields like conversation history and execution logs are omitted
-for readability; use `--session <id>` to inspect a specific session in detail.
+for readability. Results are sorted newest first. `sessions-delete` and `sessions-clear` remove only
+persisted session state under `.auto-agents/state/sessions/` and never roll back worktree changes.
 
 Both `fix` and `collab` accept `--provider` and `--print-agent-output`. Session state is persisted
 independently at `.auto-agents/state/sessions/<session_id>/` and does not interfere with the main
