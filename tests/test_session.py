@@ -407,6 +407,53 @@ class SessionFixFlowTests(unittest.TestCase):
                 "fix: Added a plan guard so empty-plan signups no longer crash",
             )
 
+    def test_fix_flow_commit_message_skips_verification_heading(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            user_inputs = [
+                "未选择套餐时，注册流程会在恢复草稿后崩溃。",
+            ]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "我已经理解问题。\nGOAL_CLEAR\n"
+                else:
+                    content = (
+                        "已修复未选择套餐时的空指针崩溃。\n"
+                        "验证已通过：\n"
+                        "- 已补充回归测试\n"
+                        "- 已手动验证草稿恢复流程\n"
+                    )
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+
+            log = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                log.stdout.strip(),
+                "fix: 已修复未选择套餐时的空指针崩溃",
+            )
+
 
 class SessionCollabFlowTests(unittest.TestCase):
     """Test the collab mode workflow with mock adapter."""

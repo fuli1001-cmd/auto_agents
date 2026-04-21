@@ -981,7 +981,9 @@ class Session:
         for pattern in (_GOAL_ACHIEVED, _BUG_FOUND, _NOT_A_BUG):
             match = pattern.search(text)
             if match:
-                return self._normalize_commit_subject(match.group(1))
+                candidate = self._finalize_commit_candidate(match.group(1))
+                if candidate:
+                    return candidate
 
         candidates: List[str] = []
         for raw_line in text.splitlines():
@@ -997,22 +999,46 @@ class Session:
                 continue
             if re.match(r"^(?:[-*+]\s+|\d+\.\s+)", line):
                 continue
-            candidates.append(line)
+            candidate = self._finalize_commit_candidate(line)
+            if candidate:
+                candidates.append(candidate)
 
         if not candidates:
             return ""
-        return self._normalize_commit_subject(candidates[-1])
+        return candidates[-1]
+
+    @staticmethod
+    def _is_status_only_commit_subject(subject: str) -> bool:
+        return bool(re.fullmatch(
+            r"(?:"
+            r"verification passed|verified|all checks passed|checks passed|tests passed|"
+            r"validation passed|validated|"
+            r"验证已通过|验证通过|已验证|校验已通过|检查已通过|测试已通过|测试通过"
+            r")",
+            subject,
+            flags=re.IGNORECASE,
+        ))
+
+    def _finalize_commit_candidate(self, text: str) -> str:
+        raw = " ".join(text.split()).strip()
+        if not raw or raw.endswith((":", "：")):
+            return ""
+        subject = self._normalize_commit_subject(raw)
+        if not subject or self._is_status_only_commit_subject(subject):
+            return ""
+        return subject
 
     def _normalize_commit_subject(self, text: str, max_length: int = 72) -> str:
         subject = " ".join(text.replace("`", "").replace("*", "").split())
-        subject = subject.strip(" \t\r\n.,;:-")
+        trim_chars = " \t\r\n.,;:!-?，。；：！？"
+        subject = subject.strip(trim_chars)
         if not subject:
             return ""
         if len(subject) <= max_length:
             return subject
-        truncated = subject[: max_length + 1].rsplit(" ", 1)[0].rstrip(" \t\r\n.,;:-")
+        truncated = subject[: max_length + 1].rsplit(" ", 1)[0].rstrip(trim_chars)
         if len(truncated) < max_length // 2:
-            truncated = subject[:max_length].rstrip(" \t\r\n.,;:-")
+            truncated = subject[:max_length].rstrip(trim_chars)
         return truncated
 
     def _session_commit_summary(self, state: SessionState, reply: str) -> str:
