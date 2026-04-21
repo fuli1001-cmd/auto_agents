@@ -37,6 +37,7 @@ _NEED_USER_ASSIST = re.compile(r"^NEED_USER_ASSIST:\s*(.+)$", re.MULTILINE)
 _BUG_FOUND = re.compile(r"^BUG_FOUND:\s*(.+)$", re.MULTILINE)
 _GOAL_ACHIEVED = re.compile(r"^GOAL_ACHIEVED:\s*(.+)$", re.MULTILINE)
 _FIX_VERIFY = re.compile(r"^FIX_VERIFY:\s*(.+)$", re.MULTILINE)
+_COMMIT_MESSAGE = re.compile(r"^COMMIT_MESSAGE:\s*(.+)$", re.MULTILINE)
 _SHELL_CONTROL_TOKENS = re.compile(r"[|;&<>`\n]")
 
 
@@ -597,6 +598,14 @@ class Session:
             "If this is a Python project, use the project-local conda env at ./.conda and install packages only inside it.",
             "",
             "Final response: short summary of what you changed and why.",
+            "",
+            "IMPORTANT: At the very end of your reply, output exactly one line in the form:",
+            "  COMMIT_MESSAGE: <one-sentence description of the bug fix>",
+            "Rules for this line:",
+            "- Describe what the bug was and/or how it was fixed (imperative mood, e.g. 'fix null pointer in public voice handler').",
+            "- Plain prose only: NO file paths, NO markdown links, NO code, NO shell commands, NO backticks, NO brackets.",
+            "- Keep it under 72 characters; write it in the same language as the bug description.",
+            "- This line is used verbatim as the git commit subject, so it must stand alone and be human-readable.",
         ])
         return "\n".join(lines)
 
@@ -709,6 +718,13 @@ class Session:
             "",
             "If this is a Python project, use the project-local conda env at ./.conda and install packages only inside it.",
             "Do not modify .auto-agents state files.",
+            "",
+            "IMPORTANT: If you made code changes in this turn, also output exactly one line in the form:",
+            "  COMMIT_MESSAGE: <one-sentence description of what you changed and why>",
+            "Rules for this line:",
+            "- Imperative mood, plain prose, same language as the user's goal.",
+            "- NO file paths, NO markdown links, NO code, NO shell commands, NO backticks, NO brackets.",
+            "- Keep it under 72 characters; it is used verbatim as the git commit subject.",
         ])
         return "\n".join(lines)
 
@@ -978,6 +994,11 @@ class Session:
         if not text.strip():
             return ""
 
+        for match in _COMMIT_MESSAGE.finditer(text):
+            candidate = self._finalize_commit_candidate(match.group(1))
+            if candidate:
+                return candidate
+
         for pattern in (_GOAL_ACHIEVED, _BUG_FOUND, _NOT_A_BUG):
             match = pattern.search(text)
             if match:
@@ -988,7 +1009,7 @@ class Session:
         candidates: List[str] = []
         for raw_line in text.splitlines():
             line = " ".join(raw_line.strip().split())
-            if not line or line == "GOAL_CLEAR" or line.startswith("FIX_VERIFY:"):
+            if not line or line == "GOAL_CLEAR" or line.startswith("FIX_VERIFY:") or line.startswith("COMMIT_MESSAGE:"):
                 continue
             if any(pattern.match(line) for pattern in (_GOAL_ACHIEVED, _BUG_FOUND, _NOT_A_BUG, _NEED_USER_ASSIST)):
                 continue
@@ -1051,6 +1072,19 @@ class Session:
         raw = " ".join(text.split()).strip()
         if not raw or raw.endswith((":", "：")):
             return ""
+        # Strip inline markdown links `[text](url)` -> `text`.
+        raw = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", raw)
+        # Drop any residual markdown-link fragments or raw filesystem paths —
+        # these indicate a broken / mid-truncated line that is not human-readable.
+        if "](" in raw or re.search(r"[\[\]]", raw):
+            return ""
+        if re.search(r"(?:^|\s)(?:/|\./|\.\./|[A-Za-z]:[\\/])\S+", raw):
+            return ""
+        # Reject candidates containing relative file paths (e.g. "app/foo.py"),
+        # which indicate the line is quoting code locations rather than
+        # describing the fix.
+        if re.search(r"\b[\w.-]+/[\w./-]+\.[A-Za-z0-9]{1,6}\b", raw):
+            return ""
         subject = self._normalize_commit_subject(raw)
         if (
             not subject
@@ -1071,6 +1105,12 @@ class Session:
         truncated = subject[: max_length + 1].rsplit(" ", 1)[0].rstrip(trim_chars)
         if len(truncated) < max_length // 2:
             truncated = subject[:max_length].rstrip(trim_chars)
+        # Refuse truncations that land inside a path/URL/identifier token —
+        # this prevents commit subjects like "... in [foo](/long/path/to/fi".
+        if re.search(r"[\[\]()/\\]", truncated) and not re.search(r"[\[\]()/\\]", subject[:max_length // 2]):
+            return ""
+        if truncated.count("(") != truncated.count(")") or truncated.count("[") != truncated.count("]"):
+            return ""
         return truncated
 
     def _session_commit_summary(self, state: SessionState, reply: str) -> str:

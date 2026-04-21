@@ -499,6 +499,92 @@ class SessionFixFlowTests(unittest.TestCase):
                 "fix: 修复了测试引导阶段的 conda 环境校验失败",
             )
 
+    def test_fix_flow_commit_message_uses_structured_marker(self) -> None:
+        """Agent's explicit COMMIT_MESSAGE line is preferred over prose lines."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            user_inputs = ["Fix the null pointer in public voice handler."]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "Understood.\nGOAL_CLEAR\n"
+                else:
+                    content = (
+                        "我做了最小修复：在 [app/application/public_voice.py]"
+                        "(/home/fuli/projects/sdgp/app/application/public_voice.py) "
+                        "添加了空指针保护。\n"
+                        "COMMIT_MESSAGE: 修复公共语音处理器中的空指针异常\n"
+                    )
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            log = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s"],
+                cwd=str(project_root), check=True, text=True, capture_output=True,
+            )
+            self.assertEqual(
+                log.stdout.strip(),
+                "fix: 修复公共语音处理器中的空指针异常",
+            )
+
+    def test_fix_flow_commit_message_rejects_markdown_link_line(self) -> None:
+        """Without a COMMIT_MESSAGE marker, mid-URL truncated markdown-link
+        lines must be discarded in favor of a cleaner fallback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            user_inputs = ["Fix the null pointer in public voice handler."]
+            inputs = iter(user_inputs)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "Understood.\nGOAL_CLEAR\n"
+                else:
+                    content = (
+                        "修复公共语音处理器中的空指针异常。\n"
+                        "我做了最小修复：在 [app/application/public_voice.py]"
+                        "(/home/fuli/projects/sdgp/app/application/public_voice.py) "
+                        "添加了空指针保护。\n"
+                    )
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True, command=["mock"], output_path=request.output_path,
+                    summary=content.strip(), stdout=content, returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            session = Session(orchestrator, mode="fix")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            log = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s"],
+                cwd=str(project_root), check=True, text=True, capture_output=True,
+            )
+            subject = log.stdout.strip()
+            self.assertNotIn("](", subject)
+            self.assertNotIn("[", subject)
+            self.assertNotIn("/sdgp/", subject)
+            self.assertEqual(subject, "fix: 修复公共语音处理器中的空指针异常")
+
 
 class SessionCollabFlowTests(unittest.TestCase):
     """Test the collab mode workflow with mock adapter."""
