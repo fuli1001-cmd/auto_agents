@@ -1019,12 +1019,44 @@ class Session:
             flags=re.IGNORECASE,
         ))
 
+    @staticmethod
+    def _is_command_like_commit_subject(subject: str) -> bool:
+        stripped = subject.strip()
+        if not stripped:
+            return False
+        if stripped.startswith(("$ ", "> ")):
+            return True
+        if re.match(r"^(?:\./|\.\./|/)", stripped):
+            return True
+
+        lowered = stripped.lower()
+        command_prefixes = (
+            "conda", "python", "python3", "pytest", "py.test", "pip", "pip3", "uv",
+            "poetry", "tox", "nox", "npm", "pnpm", "yarn", "npx", "node", "go",
+            "cargo", "rustc", "make", "cmake", "bash", "sh", "zsh", "git", "docker",
+            "docker-compose", "kubectl", "java", "javac", "mvn", "gradle", "perl",
+            "ruby",
+        )
+        first_token = lowered.split(" ", 1)[0]
+        if first_token not in command_prefixes:
+            return False
+
+        command_markers = (
+            " -", " --", " ./", " ../", " /", ".py", ".sh", ".js", ".ts", ".tsx",
+            ".jsx", "::", " run ", " test", " unittest", " pytest", " discover",
+        )
+        return any(marker in lowered for marker in command_markers)
+
     def _finalize_commit_candidate(self, text: str) -> str:
         raw = " ".join(text.split()).strip()
         if not raw or raw.endswith((":", "：")):
             return ""
         subject = self._normalize_commit_subject(raw)
-        if not subject or self._is_status_only_commit_subject(subject):
+        if (
+            not subject
+            or self._is_status_only_commit_subject(subject)
+            or self._is_command_like_commit_subject(subject)
+        ):
             return ""
         return subject
 
