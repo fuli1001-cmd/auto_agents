@@ -59,6 +59,10 @@ class TaskSpec:
     verify_history: List[Dict[str, object]] = field(default_factory=list)
     verify_baseline_failures: List[str] = field(default_factory=list)
     verify_baseline_ref: str = ""
+    parent_task_id: str = ""
+    split_depth: int = 0
+    expected_test_migrations: List[str] = field(default_factory=list)
+    scratchpad: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -89,6 +93,10 @@ class TaskSpec:
             verify_history=verify_history,
             verify_baseline_failures=[str(item) for item in data.get("verify_baseline_failures", [])],
             verify_baseline_ref=str(data.get("verify_baseline_ref", "")),
+            parent_task_id=str(data.get("parent_task_id", "")),
+            split_depth=int(data.get("split_depth", 0) or 0),
+            expected_test_migrations=[str(item) for item in data.get("expected_test_migrations", [])],
+            scratchpad=str(data.get("scratchpad", "")),
         )
 
     def to_dict(self) -> Dict[str, object]:

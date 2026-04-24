@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -31,7 +32,7 @@ from .config import (
     write_run_prompt,
 )
 from .gates import extract_failure_ids, run_commands, run_commands_collect_all
-from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, head_ref, is_repo, require_clean_tree, worktree_fingerprint
+from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, hard_reset_clean, head_ref, is_repo, require_clean_tree, worktree_fingerprint
 from .io_utils import read_text, write_text
 from .models import (
     APPROVAL_ORDER,
@@ -78,6 +79,9 @@ _FAILOVER_QUOTA_PATTERN = re.compile(
 
 
 class Orchestrator:
+    MAX_SPLIT_DEPTH = 2
+    SPLIT_TASK_MARKER = "SPLIT_TASK:"
+
     def __init__(
         self,
         project_root: Path,
@@ -902,6 +906,88 @@ class Orchestrator:
                     return default
             return default
 
+    @staticmethod
+    def _review_fingerprint(summary: str) -> str:
+        """Normalize a review summary and hash it for stable fingerprinting.
+
+        Strips surrounding whitespace, lowercases, collapses runs of
+        whitespace/punctuation, and SHA-256 hashes the normalized form so
+        semantically identical blocker lists produce identical fingerprints
+        across retries.
+        """
+        text = (summary or "").strip().lower()
+        if not text:
+            return ""
+        normalized = re.sub(r"[\s\W_]+", " ", text).strip()
+        if not normalized:
+            return ""
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+    def _implement_touched_code(self) -> bool:
+        """Return True if the last implement step touched any non-orchestrator file."""
+        try:
+            paths = changed_paths(
+                self.project_root,
+                ignored_prefixes=(".auto-agents/",),
+            )
+        except TypeError:
+            paths = [p for p in changed_paths(self.project_root) if not p.startswith(".auto-agents/")]
+        return bool(paths)
+
+    def _build_split_rejection_reason(
+        self,
+        task: TaskSpec,
+        trigger: str,
+        fingerprint: str,
+        last_review: str,
+        verify_history: List[Dict[str, object]],
+    ) -> str:
+        child_depth = int(task.split_depth) + 1
+        verify_summary: List[str] = []
+        for entry in verify_history[-4:]:
+            if not isinstance(entry, dict):
+                continue
+            ids = entry.get("failure_ids") or []
+            if isinstance(ids, list) and ids:
+                verify_summary.append(
+                    f"attempt {entry.get('attempt', '?')}: " + ", ".join(str(x) for x in ids[:8])
+                )
+        lines = [
+            f"{self.SPLIT_TASK_MARKER} {task.task_id}",
+            "",
+            f"Task '{task.task_id}' ({task.title}) has triggered scope-overflow rollback.",
+            f"Trigger: {trigger}.",
+            f"Blocker fingerprint: {fingerprint or '(empty-diff)'}",
+            "",
+            "SPLIT MODE INSTRUCTIONS — follow these EXACTLY when updating "
+            ".auto-agents/state/task_plan.json:",
+            f"  1. Do NOT modify any task with status 'done'.",
+            f"  2. Locate the offending task (task_id='{task.task_id}') in the plan.",
+            "  3. Replace it IN-PLACE with 2–4 smaller pending sub-tasks, each delivering one",
+            "     coherent testable slice (backend change, single API endpoint, single UI",
+            "     surface, or test migration) with 2–4 acceptance criteria and a concise",
+            "     description. Preserve the surrounding task order.",
+            f"  4. Set 'parent_task_id' = '{task.task_id}' on each child task.",
+            f"  5. Set 'split_depth' = {child_depth} on each child task.",
+            "  6. When the original scope required tests to be updated, populate each child's",
+            "     'expected_test_migrations' with the test ids/names it is allowed to change",
+            "     (e.g. 'tests.test_foo.test_bar') so regression gating knows those are",
+            "     intentional.",
+            "  7. Keep all other pending/blocked tasks untouched unless their scope is now",
+            "     covered by the split children (in which case remove the duplicate).",
+            "  8. Ensure every child still carries requirement_ids that cover the parent's",
+            "     requirement_ids.",
+            "",
+            "Repeating review blockers that forced this rollback:",
+            last_review.strip() or "(no review summary captured)",
+        ]
+        if verify_summary:
+            lines.append("")
+            lines.append("Recent verification failures:")
+            for entry in verify_summary:
+                lines.append(f"  - {entry}")
+        return "\n".join(lines)
+
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
         tasks = state.tasks or self._load_tasks_from_plan()
         
@@ -952,6 +1038,12 @@ class Orchestrator:
 
             gate_result = self._execute_task_with_retries(state, task, resume_existing=resume_existing)
             if not gate_result["ok"]:
+                if gate_result.get("rewind_to_plan"):
+                    rewind_state = self._handle_scope_overflow_rewind(
+                        state, task, tasks, gate_result
+                    )
+                    if rewind_state is not None:
+                        return rewind_state
                 task.status = "blocked"
                 task.review_summary = str(gate_result["review"])
                 self._persist_tasks(tasks)
@@ -979,6 +1071,51 @@ class Orchestrator:
         state.current_stage = "implement"
         state.stage_summaries["implement"] = f"Completed {sum(task.status == 'done' for task in tasks)} tasks."
         state.last_error = ""
+        return state
+
+    def _handle_scope_overflow_rewind(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        tasks: List[TaskSpec],
+        gate_result: Dict[str, object],
+    ) -> Optional[RunState]:
+        """Route a scope-overflow task back to the plan stage for splitting.
+
+        Returns a state to bubble up (plan rewind) or None when rewind is
+        refused (e.g. split-depth cap reached) and the caller should fall
+        through to the normal blocked-task path.
+        """
+        if int(task.split_depth) >= self.MAX_SPLIT_DEPTH:
+            return None
+
+        baseline_ref = task.verify_baseline_ref or state.stage_summaries.get("implement_baseline_ref", "")
+        if baseline_ref:
+            hard_reset_clean(self.project_root, baseline_ref)
+
+        task.status = "pending"
+        task.review_summary = str(gate_result.get("review", ""))
+        task.commit_sha = ""
+        self._persist_tasks(tasks)
+
+        state.tasks = tasks
+        reason = self._build_split_rejection_reason(
+            task,
+            trigger=str(gate_result.get("split_trigger", "")),
+            fingerprint=str(gate_result.get("split_fingerprint", "")),
+            last_review=str(gate_result.get("review", "")),
+            verify_history=list(task.verify_history),
+        )
+        self._rewind_state_from_stage(state, "plan")
+        state.rejected_stage = "plan"
+        state.rejection_reason = reason
+        state.last_error = f"scope_overflow: {gate_result.get('split_trigger', '')}"[:500]
+        save_run_state(self.project_root, state)
+        self._emit_task_blocked(
+            task,
+            f"scope_overflow → rewinding to plan for split (depth {task.split_depth} → "
+            f"{task.split_depth + 1})",
+        )
         return state
 
     def _require_clean_tree_for_task(self, task: TaskSpec) -> None:
@@ -1029,6 +1166,9 @@ class Orchestrator:
             else []
         )
         new_failure_ids = sorted(set(current_failure_ids) - set(baseline_failure_ids))
+        if task is not None and task.expected_test_migrations:
+            allowed_migrations = {str(item) for item in task.expected_test_migrations}
+            new_failure_ids = [fid for fid in new_failure_ids if fid not in allowed_migrations]
         raw_output = self._gate_raw_output(verify_gate)
         if task is not None and current_failure_ids and not new_failure_ids:
             return {
@@ -2306,6 +2446,16 @@ class Orchestrator:
         last_reason = "task failed without a recorded reason"
         last_review = ""
 
+        review_fingerprints: List[str] = []
+        for entry in task.review_history:
+            if isinstance(entry, dict):
+                fp = self._review_fingerprint(str(entry.get("summary", "")))
+                if fp:
+                    review_fingerprints.append(fp)
+        empty_diff_streak = 0
+        overflow_trigger = ""
+        overflow_fingerprint = ""
+
         for attempt in range(1, max_attempts + 1):
             state.current_stage = "implement"
             if resume_existing and attempt == 1:
@@ -2335,6 +2485,25 @@ class Orchestrator:
                         reason=last_reason,
                     )
                     continue
+
+                if not self._implement_touched_code():
+                    empty_diff_streak += 1
+                    last_reason = (
+                        "implement step produced no code changes outside .auto-agents/ "
+                        f"(empty-diff streak={empty_diff_streak})"
+                    )
+                    feedback = self._format_retry_feedback(
+                        "implementation_command",
+                        reason=last_reason,
+                    )
+                    if empty_diff_streak >= 2:
+                        overflow_trigger = (
+                            "empty-diff streak: implement produced no code changes on "
+                            f"{empty_diff_streak} consecutive attempts"
+                        )
+                        break
+                    continue
+                empty_diff_streak = 0
 
             self._emit_task_activity(task, "verify", attempt)
             quick_failure = self._quick_verify_failure_details()
@@ -2414,13 +2583,36 @@ class Orchestrator:
                 "attempt": attempt,
                 "summary": last_review,
             })
-            
+
+            current_fp = self._review_fingerprint(last_review)
+            if current_fp:
+                if current_fp in review_fingerprints:
+                    overflow_trigger = (
+                        f"review blockers repeated (fingerprint {current_fp} seen on "
+                        f"attempts {review_fingerprints.count(current_fp) + 1} of {attempt})"
+                    )
+                    overflow_fingerprint = current_fp
+                    review_fingerprints.append(current_fp)
+                    break
+                review_fingerprints.append(current_fp)
+
             feedback = self._format_retry_feedback(
                 "review_rejected",
                 reason=last_reason,
                 review_history=task.review_history,
                 review_summary=last_review,
             )
+
+        if overflow_trigger:
+            return {
+                "ok": False,
+                "review": last_review or feedback,
+                "reason": f"scope_overflow: {overflow_trigger}",
+                "rewind_to_plan": True,
+                "split_task_id": task.task_id,
+                "split_trigger": overflow_trigger,
+                "split_fingerprint": overflow_fingerprint,
+            }
 
         return {"ok": False, "review": last_review or feedback, "reason": last_reason}
 

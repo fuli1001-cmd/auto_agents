@@ -2021,5 +2021,193 @@ class IterationFlowTests(unittest.TestCase):
             self.assertNotIn("release", state.approved_gates)
 
 
+class RepeatReviewBlockerAdapter:
+    """Implement touches code on every attempt; review always returns the same blockers.
+
+    Used to trigger the scope-overflow fingerprint signal.
+    """
+
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            (self.project_root / f"artifact-{self.implement_calls}.txt").write_text(
+                f"attempt-{self.implement_calls}\n", encoding="utf-8"
+            )
+            summary = f"implement attempt {self.implement_calls}\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = (
+                "DECISION: fail\n"
+                "Core issue: task bundles backend, API, and UI.\n"
+                "- Split backend lifecycle from API surface.\n"
+                "- Split workbench UI from server changes.\n"
+            )
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class ScopeOverflowTests(unittest.TestCase):
+    def test_review_fingerprint_normalizes_and_matches(self) -> None:
+        a = Orchestrator._review_fingerprint(
+            "DECISION: fail\nCore issue: scope too large.\n- Split backend from UI.\n"
+        )
+        b = Orchestrator._review_fingerprint(
+            "  decision: fail\n  core issue: scope too large.  \n  - split backend from ui.  \n"
+        )
+        c = Orchestrator._review_fingerprint("DECISION: pass\n")
+        self.assertTrue(a)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+        self.assertEqual(Orchestrator._review_fingerprint("   "), "")
+
+    def test_repeated_review_blockers_trigger_plan_rewind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.retries.implement = 4
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = RepeatReviewBlockerAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-big",
+                            "title": "Cross-cutting task",
+                            "description": "Bundles too many concerns.",
+                            "acceptance": ["all layers updated"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "split_depth": 0,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            # Rewind: rejected_stage set to plan, plan summary cleared.
+            self.assertEqual(result.rejected_stage, "plan")
+            self.assertIn("SPLIT_TASK:", result.rejection_reason)
+            self.assertIn("task-big", result.rejection_reason)
+            self.assertNotIn("plan", result.stage_summaries)
+            # Task reset to pending (not blocked) so plan can split it.
+            self.assertEqual(result.tasks[0].status, "pending")
+            # Two review failures are enough to trigger the signal (attempt 1 records
+            # fingerprint, attempt 2 matches it).
+            self.assertGreaterEqual(orchestrator.adapter.review_calls, 2)
+
+    def test_split_depth_cap_blocks_instead_of_rewinding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.retries.implement = 4
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = RepeatReviewBlockerAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-child",
+                            "title": "Already-split child",
+                            "description": "Split lineage has reached the cap.",
+                            "acceptance": ["criterion"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "split_depth": Orchestrator.MAX_SPLIT_DEPTH,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            with self.assertRaises(RuntimeError):
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            reloaded_tasks = orchestrator._load_tasks_from_plan()
+            self.assertEqual(reloaded_tasks[0].status, "blocked")
+            reloaded_state = load_run_state(project_root)
+            self.assertNotEqual(reloaded_state.rejected_stage, "plan")
+
+    def test_expected_test_migrations_excluded_from_new_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            from auto_agents.models import TaskSpec as _TaskSpec
+            task = _TaskSpec(
+                task_id="t",
+                title="t",
+                description="",
+                acceptance=[],
+                verify_baseline_failures=["old:legacy_case"],
+                expected_test_migrations=["new:migrated_case"],
+            )
+            # Monkeypatch gate runner to return a fixed failure set that includes
+            # one pre-existing failure (baseline) and one expected migration.
+            class _Gate:
+                ok = False
+                summary = "new:migrated_case FAILED\nold:legacy_case FAILED"
+                stdout = summary
+                stderr = ""
+                returncode = 1
+                commands = []
+
+            import auto_agents.orchestrator as orch_mod
+            original_collect = orch_mod.run_commands_collect_all
+            original_extract = orch_mod.extract_failure_ids
+            try:
+                orch_mod.run_commands_collect_all = lambda *a, **kw: _Gate()
+                orch_mod.extract_failure_ids = lambda gate: ["new:migrated_case", "old:legacy_case"]
+                config.gates.commands = ["echo run"]
+                orchestrator.config = config
+                result = orchestrator._run_task_verify(task)
+            finally:
+                orch_mod.run_commands_collect_all = original_collect
+                orch_mod.extract_failure_ids = original_extract
+
+            # Migration is excluded; baseline failure is also excluded → verify passes.
+            self.assertTrue(result["ok"], msg=str(result))
+
+
 if __name__ == "__main__":
     unittest.main()

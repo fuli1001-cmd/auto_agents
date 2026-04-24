@@ -109,3 +109,35 @@ def head_ref(project_root: Path) -> str:
     if result.returncode != 0:
         return ""
     return result.stdout.strip()
+
+
+def hard_reset_clean(
+    project_root: Path,
+    ref: str = "HEAD",
+    preserve_prefixes: tuple[str, ...] = (".auto-agents/",),
+) -> bool:
+    """Hard-reset tracked files to *ref* and remove untracked files.
+
+    ``preserve_prefixes`` keeps orchestrator state (default ``.auto-agents/``)
+    intact so the run log/plan/task state survive the rollback.
+
+    Returns True when the reset succeeded, False when the repo is missing or
+    the ref cannot be resolved.
+    """
+    if not is_repo(project_root):
+        return False
+    target = ref or "HEAD"
+    rev = _git(project_root, "rev-parse", "--verify", target)
+    if rev.returncode != 0:
+        return False
+    resolved = rev.stdout.strip() or target
+
+    reset = _git(project_root, "reset", "--hard", resolved)
+    if reset.returncode != 0:
+        return False
+
+    clean_args = ["clean", "-fd"]
+    for prefix in preserve_prefixes:
+        clean_args.extend(["-e", prefix.rstrip("/") + "/" if not prefix.endswith("/") else prefix])
+    cleaned = _git(project_root, *clean_args)
+    return cleaned.returncode == 0
