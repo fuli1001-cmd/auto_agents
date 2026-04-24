@@ -153,12 +153,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print each agent output to stderr as it completes.",
     )
 
+    provider_resolve_parser = subparsers.add_parser(
+        "provider-resolve",
+        help="Conversational recovery for a blocked provider_research stage.",
+    )
+    provider_resolve_parser.add_argument("--project", required=True, help="Target project directory.")
+    provider_resolve_parser.add_argument(
+        "--session",
+        help="Resume an existing provider-resolution session by ID.",
+    )
+    provider_resolve_parser.add_argument(
+        "--provider",
+        choices=supported_provider_kinds(),
+        help="Override provider for this session.",
+    )
+    provider_resolve_parser.add_argument(
+        "--print-agent-output",
+        action="store_true",
+        help="Print each agent output to stderr as it completes.",
+    )
+
     # ── sessions (list) ──────────────────────────────────────────
     sessions_parser = subparsers.add_parser("sessions", help="List sessions for a completed project.")
     sessions_parser.add_argument("--project", required=True, help="Target project directory.")
     sessions_parser.add_argument(
         "--mode",
-        choices=["fix", "collab"],
+        choices=["fix", "collab", "provider-resolve"],
         help="Filter by session mode.",
     )
     sessions_parser.add_argument(
@@ -272,7 +292,8 @@ def main(argv: list[str] | None = None) -> int:
             project_root = Path(args.project)
             sessions = list_sessions(project_root)
             if getattr(args, "mode", None):
-                sessions = [s for s in sessions if s.mode == args.mode]
+                selected_mode = "provider_resolve" if args.mode == "provider-resolve" else args.mode
+                sessions = [s for s in sessions if s.mode == selected_mode]
             if not getattr(args, "all", False):
                 sessions = [s for s in sessions if s.status not in ("completed", "failed")]
             rows = []
@@ -331,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
 
-    if args.command in ("fix", "collab"):
+    if args.command in ("fix", "collab", "provider-resolve"):
         try:
             from .session import Session
 
@@ -342,7 +363,7 @@ def main(argv: list[str] | None = None) -> int:
             orchestrator._print_agent_output = bool(args.print_agent_output)
             session = Session(
                 orchestrator,
-                mode=args.command,
+                mode="provider_resolve" if args.command == "provider-resolve" else args.command,
                 print_agent_output=bool(args.print_agent_output),
             )
             if args.session:

@@ -437,7 +437,19 @@ class Orchestrator:
             state = load_run_state(self.project_root)
             if self._normalize_legacy_requirements_audit_resume(state):
                 save_run_state(self.project_root, state)
-            self._active_spec_file = spec_file.expanduser().resolve()
+            resolved_spec_file = spec_file.expanduser().resolve()
+            self._active_spec_file = resolved_spec_file
+            self._capture_resume_context(
+                state,
+                spec_file=resolved_spec_file,
+                auto_approve=auto_approve,
+                allow_dirty_tree=allow_dirty_tree,
+                max_tasks=max_tasks,
+                skip_validate=skip_validate,
+                print_agent_output=print_agent_output,
+                provider_kind=provider_kind,
+                doc_language=doc_language,
+            )
             self._ensure_preconditions(state, spec_file=spec_file, skip_validate=skip_validate)
 
             if state.status == "completed":
@@ -1235,7 +1247,7 @@ class Orchestrator:
         for requirement in docs_required:
             reference = str(requirement.get("provider_reference", "")).strip()
             status = provider_reference_status(lock, reference)
-            if status not in {"verified", "assumption_approved", "deferred"}:
+            if not self._is_resolved_provider_reference_status(status):
                 unresolved.append(requirement)
         if not unresolved:
             summary = "Provider references already verified; research reused from local lock."
@@ -1262,13 +1274,10 @@ class Orchestrator:
             validation_feedback=self._provider_research_validation_feedback,
             effort=self.config.efforts.get("provider_research", "deep"),
         )
-        lock = load_provider_references_lock(self.project_root)
-        still_blocked = []
-        for requirement in docs_required:
-            reference = str(requirement.get("provider_reference", "")).strip()
-            status = provider_reference_status(lock, reference)
-            if status in {"blocked", "needs_user_input", "ambiguous", "missing"}:
-                still_blocked.append(f"{requirement.get('id')}: {reference or '(missing)'} is {status}")
+        still_blocked = [
+            f"{item['requirement_id']}: {item['reference'] or '(missing)'} is {item['status']}"
+            for item in self.provider_research_blockers()
+        ]
         if still_blocked:
             detail = "\n".join(f"- {item}" for item in still_blocked)
             raise RuntimeError(
@@ -1280,6 +1289,150 @@ class Orchestrator:
         state.stage_summaries["provider_research"] = result.summary.strip()
         state.last_error = ""
         return state
+
+    @staticmethod
+    def _is_resolved_provider_reference_status(status: str) -> bool:
+        return status in {"verified", "assumption_approved", "deferred"}
+
+    @staticmethod
+    def is_provider_research_blocked_error(message: str) -> bool:
+        return message.strip().startswith("provider research is blocked;")
+
+    def provider_research_blockers(self) -> List[Dict[str, str]]:
+        trace = load_requirements_trace(self.project_root)
+        lock = load_provider_references_lock(self.project_root)
+        blockers: List[Dict[str, str]] = []
+        for requirement in external_doc_requirements(trace):
+            req_id = str(requirement.get("id", "")).strip() or "(unknown requirement)"
+            reference = str(requirement.get("provider_reference", "")).strip()
+            if not reference:
+                blockers.append(
+                    {
+                        "requirement_id": req_id,
+                        "reference": "",
+                        "status": "missing",
+                        "reason": "missing provider_reference in requirements trace",
+                    }
+                )
+                continue
+            ref_path = self.project_root / reference
+            status = provider_reference_status(lock, reference)
+            normalized_status = status or "missing"
+            if not ref_path.exists():
+                blockers.append(
+                    {
+                        "requirement_id": req_id,
+                        "reference": reference,
+                        "status": "missing",
+                        "reason": f"missing provider reference file {reference}",
+                    }
+                )
+                continue
+            if not self._is_resolved_provider_reference_status(normalized_status):
+                blockers.append(
+                    {
+                        "requirement_id": req_id,
+                        "reference": reference,
+                        "status": normalized_status,
+                        "reason": f"{reference} is {normalized_status}",
+                    }
+                )
+        return blockers
+
+    def provider_research_resolution_report(self, state: Optional[RunState] = None) -> Dict[str, object]:
+        state = state or load_run_state(self.project_root)
+        blockers = self.provider_research_blockers()
+        if not self.is_provider_research_blocked_error(state.last_error):
+            return {
+                "eligible": False,
+                "reason": "Current run is not blocked by provider_research.",
+                "run_id": state.run_id,
+                "last_error": state.last_error,
+                "blockers": blockers,
+            }
+        if not blockers:
+            return {
+                "eligible": False,
+                "reason": "Provider references no longer have unresolved blockers.",
+                "run_id": state.run_id,
+                "last_error": state.last_error,
+                "blockers": [],
+            }
+        return {
+            "eligible": True,
+            "reason": "",
+            "run_id": state.run_id,
+            "last_error": state.last_error,
+            "blockers": blockers,
+        }
+
+    def build_provider_resolve_goal(self, state: Optional[RunState] = None) -> str:
+        report = self.provider_research_resolution_report(state)
+        if not report["eligible"]:
+            raise RuntimeError(str(report["reason"]))
+        lines = [
+            "Recover the blocked provider_research stage for the current run.",
+            f"Run ID: {report['run_id']}",
+            "Current blockers:",
+        ]
+        for blocker in report["blockers"]:
+            if not isinstance(blocker, dict):
+                continue
+            lines.append(
+                f"- {blocker.get('requirement_id')}: {blocker.get('reference') or '(missing)'} "
+                f"is {blocker.get('status')} ({blocker.get('reason')})"
+            )
+        lines.extend(
+            [
+                "",
+                "Discuss the unblock path with the user, update only provider-research artifacts, "
+                "and reach a locally valid provider reference state so the pipeline can resume.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _capture_resume_context(
+        self,
+        state: RunState,
+        *,
+        spec_file: Path,
+        auto_approve: bool,
+        allow_dirty_tree: bool,
+        max_tasks: Optional[int],
+        skip_validate: bool,
+        print_agent_output: bool,
+        provider_kind: Optional[str],
+        doc_language: Optional[str],
+    ) -> None:
+        state.resume_context = {
+            "spec_file": str(spec_file),
+            "auto_approve": bool(auto_approve),
+            "allow_dirty_tree": bool(allow_dirty_tree),
+            "max_tasks": int(max_tasks) if max_tasks is not None else None,
+            "skip_validate": bool(skip_validate),
+            "print_agent_output": bool(print_agent_output),
+            "provider_kind": str(provider_kind).strip() if provider_kind else "",
+            "doc_language": str(doc_language).strip() if doc_language else "",
+        }
+
+    def resume_saved_run(self) -> RunState:
+        state = load_run_state(self.project_root)
+        context = dict(state.resume_context)
+        spec_file = Path(str(context.get("spec_file") or (self.project_root / "spec.md")))
+        raw_max_tasks = context.get("max_tasks")
+        max_tasks = int(raw_max_tasks) if raw_max_tasks not in (None, "") else None
+        provider_kind = str(context.get("provider_kind", "")).strip() or None
+        doc_language = str(context.get("doc_language", "")).strip() or None
+        return self.run(
+            spec_file=spec_file,
+            auto_approve=bool(context.get("auto_approve", False)),
+            allow_dirty_tree=bool(context.get("allow_dirty_tree", False)),
+            max_tasks=max_tasks,
+            skip_validate=bool(context.get("skip_validate", False)),
+            print_agent_output=bool(context.get("print_agent_output", False)),
+            provider_kind=provider_kind,
+            doc_language=doc_language,
+        )
 
     def _run_task_review(self, run_id: str, task: TaskSpec, verify_reason: str = "") -> Dict[str, object]:
         review_effort = self._review_effort_for_task(task)

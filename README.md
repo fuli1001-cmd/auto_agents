@@ -198,6 +198,12 @@ Validate a target project without spending tokens:
 python3 -m auto_agents validate --project /tmp/demo
 ```
 
+Recover a run that is blocked in `provider_research` and continue it after the references are fixed:
+
+```bash
+python3 -m auto_agents provider-resolve --project /tmp/demo
+```
+
 If validation reports that Python commands are running outside `./.conda`, fix the commands before
 rerunning the workflow.
 
@@ -399,6 +405,17 @@ What resumes depends on the stage:
   unfinished task is resumed
 - approval pauses: `approve` clears the pending gate, and the next `run` continues from there
 
+When `provider_research` fails because the remaining provider references still require a user decision
+(`ambiguous`, `blocked`, `needs_user_input`, or similar), you can enter a dedicated recovery dialog:
+
+```bash
+python3 -m auto_agents provider-resolve --project /tmp/demo
+```
+
+That command starts a resumable conversation focused on the provider reference files, applies the
+agreed edits, validates the updated reference state locally, and then reruns the original pipeline
+from the failed `provider_research` point using the stored run context.
+
 Requirements audit failures now participate in the retry pipeline instead of always terminating the
 run immediately:
 
@@ -493,9 +510,27 @@ the browser"):
 python3 -m auto_agents collab --project /tmp/demo
 ```
 
+### Provider research recovery (`provider-resolve`)
+
+Interactive recovery loop for runs blocked in `provider_research` because provider references still
+need explicit user decisions:
+
+1. **Converse** — the agent summarizes the unresolved provider references and asks only the questions
+   needed to decide whether to verify, defer, or assumption-approve them
+2. **Iterate** — the agent edits only provider-research artifacts (`provider_references/*.md`,
+   `provider_references.lock.json`, and tightly coupled trace metadata when needed), then the tool
+   validates the updated reference state locally
+3. **Resume** — once the provider references are locally valid, the command reruns the original
+   `run` flow from the failed `provider_research` point
+
+```bash
+python3 -m auto_agents provider-resolve --project /tmp/demo
+```
+
 ### Convergence-based stopping
 
-Both `fix` and `collab` use **convergence detection** instead of a fixed attempt limit. The loop
+`fix`, `collab`, and `provider-resolve` use **convergence detection** instead of a fixed attempt
+limit. The loop
 continues as long as the agent is making progress, and stops automatically when it stalls:
 
 - **Progress signal** — after each attempt, the tool computes a hash of `git diff` and of the
@@ -505,16 +540,17 @@ continues as long as the agent is making progress, and stops automatically when 
   with a "no progress" message (`SESSION_STALL_THRESHOLD`).
 - **Agent error threshold** — transient agent errors (network timeouts, API failures) are tracked
   independently. **5 consecutive agent errors** trigger a stop (`SESSION_AGENT_ERROR_THRESHOLD`).
-- **Hard ceiling** — a safety net prevents runaway loops: **15 attempts** for fix, **25** for collab
-  (`SESSION_HARD_CEILING`). These are deliberately generous; convergence detection is the primary
-  stop mechanism.
+- **Hard ceiling** — a safety net prevents runaway loops: **15 attempts** for fix, **25** for collab,
+  and **15** for `provider-resolve` (`SESSION_HARD_CEILING`). These are deliberately generous;
+  convergence detection is the primary stop mechanism.
 
 ### Resuming sessions
 
-Resume an interrupted **or failed** session (works for both fix and collab):
+Resume an interrupted **or failed** session (works for `fix`, `collab`, and `provider-resolve`):
 
 ```bash
 python3 -m auto_agents collab --project /tmp/demo --session <session_id>
+python3 -m auto_agents provider-resolve --project /tmp/demo --session <session_id>
 ```
 
 If `--session` is omitted, the CLI automatically detects resumable sessions (including failed ones)
@@ -525,8 +561,9 @@ a new one.
 When a **failed** session is resumed, the stall counter and agent-error counter are reset to zero,
 but the conversation history and execution log are preserved so the agent retains full context.
 
-Both `fix` and `collab` call the agent with the `implement`-stage effort from
-`config.efforts["implement"]` (default: `deep`).
+`fix` and `collab` call the agent with the `implement`-stage effort from
+`config.efforts["implement"]` (default: `deep`). `provider-resolve` uses
+`config.efforts["provider_research"]`.
 
 ### Listing sessions
 

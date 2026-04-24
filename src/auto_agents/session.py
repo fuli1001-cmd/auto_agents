@@ -42,7 +42,7 @@ _SHELL_CONTROL_TOKENS = re.compile(r"[|;&<>`\n]")
 
 
 class Session:
-    """Lightweight conversational workflow for bug fixes and collaborative debugging.
+    """Lightweight conversational workflow for bug fixes and recovery sessions.
 
     Reuses the *Orchestrator* instance for adapter calls, verification and git
     operations but bypasses the seven-stage pipeline entirely.
@@ -119,6 +119,8 @@ class Session:
             if state.status == "executing":
                 if self.mode == "fix":
                     state = self._phase_fix_execute(state)
+                elif self.mode == "provider_resolve":
+                    state = self._phase_provider_resolve_execute(state)
                 else:
                     state = self._phase_collab_loop(state)
         except KeyboardInterrupt:
@@ -140,13 +142,17 @@ class Session:
 
     def _phase_converse(self, state: SessionState) -> SessionState:
         if not state.goal:
-            label = "bug" if self.mode == "fix" else "goal"
-            self._print(f"Describe the {label} you want to address:")
-            user_input = self._prompt_user("", multiline=True)
-            if not user_input.strip():
-                self._print("No input provided. Exiting.")
-                return state
-            state.goal = user_input.strip()
+            if self.mode == "provider_resolve":
+                state.goal = self.orch.build_provider_resolve_goal()
+                self._print("Loaded current provider_research blockers into a recovery session.")
+            else:
+                label = "bug" if self.mode == "fix" else "goal"
+                self._print(f"Describe the {label} you want to address:")
+                user_input = self._prompt_user("", multiline=True)
+                if not user_input.strip():
+                    self._print("No input provided. Exiting.")
+                    return state
+                state.goal = user_input.strip()
             state.conversation.append({"role": "user", "content": state.goal})
             self._save(state)
             self._print_agent_thinking()
@@ -511,9 +517,177 @@ class Session:
         self._print("Collab session stopped (no further progress). Session marked as failed.")
         return state
 
+    def _phase_provider_resolve_execute(self, state: SessionState) -> SessionState:
+        self._current_state = state
+        feedback = ""
+        while True:
+            state.current_attempt += 1
+            self._print(f"\n--- Provider recovery iteration {state.current_attempt} ---")
+
+            prompt = self._build_provider_resolve_prompt(state, feedback)
+            try:
+                reply = self._call_agent(state, f"provider-resolve-{state.current_attempt}", prompt)
+            except RuntimeError as exc:
+                err_msg = str(exc)
+                state.consecutive_agent_errors += 1
+                state.execution_log.append({
+                    "attempt": state.current_attempt,
+                    "action": "agent_error",
+                    "result": err_msg[:500],
+                    "timestamp": self._now(),
+                })
+                self._save(state)
+                stop = self._should_stop(state, "agent_error")
+                if stop:
+                    self._print(stop)
+                    break
+                feedback = self._build_error_feedback(err_msg)
+                self._print("Will retry on next iteration.")
+                continue
+
+            state.consecutive_agent_errors = 0
+            state.conversation.append({"role": "agent", "content": reply})
+            state.execution_log.append({
+                "attempt": state.current_attempt,
+                "action": "provider_resolve",
+                "result": reply[:500],
+                "timestamp": self._now(),
+            })
+            self._save(state)
+
+            assist_match = _NEED_USER_ASSIST.search(reply)
+            if assist_match:
+                state.stall_count = 0
+                display = reply.strip()
+                self._print(f"\nAgent:\n{display}")
+                self._print(f"\nAgent needs your assistance: {assist_match.group(1)}")
+                state.status = "waiting_user"
+                self._save(state)
+                user_reply = self._prompt_user("\nYour response (or decision): ", multiline=True)
+                state.conversation.append({"role": "user", "content": user_reply.strip() or "Done."})
+                state.status = "executing"
+                self._save(state)
+                self._print_agent_thinking()
+                feedback = ""
+                continue
+
+            self._print(f"\nAgent:\n{reply.strip()}")
+            verify = self.orch.provider_research_resolution_report()
+            verify_reason = "" if verify["eligible"] is False and not verify["blockers"] else str(
+                verify.get("reason") or "\n".join(
+                    f"{item.get('requirement_id')}: {item.get('reason')}"
+                    for item in verify.get("blockers", [])
+                    if isinstance(item, dict)
+                )
+            ).strip()
+
+            state.execution_log.append({
+                "attempt": state.current_attempt,
+                "action": "provider_verify",
+                "result": "pass" if not verify.get("blockers") else verify_reason,
+                "timestamp": self._now(),
+            })
+            self._save(state)
+
+            if not verify.get("blockers"):
+                self._print("Provider references now pass local validation. Resuming run...")
+                try:
+                    resumed = self.orch.resume_saved_run()
+                except RuntimeError as exc:
+                    err_msg = str(exc)
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": "resume_run_failed",
+                        "result": err_msg[:500],
+                        "timestamp": self._now(),
+                    })
+                    self._save(state)
+                    if self.orch.is_provider_research_blocked_error(err_msg):
+                        diff_hash = self._compute_diff_hash()
+                        verify_sig = self._compute_verify_sig(err_msg)
+                        self._update_stall_state(state, diff_hash, verify_sig)
+                        self._save(state)
+                        stop = self._should_stop(state, err_msg)
+                        if stop:
+                            self._print(stop)
+                            break
+                        feedback = (
+                            "The provider references were edited, but rerunning the pipeline still reported "
+                            "a provider_research blocker.\n"
+                            f"{err_msg}\n"
+                            "Re-read the current provider reference files and lock entries, explain the remaining "
+                            "gap, and apply the minimal additional edits needed."
+                        )
+                        continue
+                    state.status = "completed"
+                    state.resolution = "provider_research_resolved"
+                    self._save(state)
+                    raise
+
+                state.status = "completed"
+                state.resolution = "provider_research_resolved"
+                state.execution_log.append({
+                    "attempt": state.current_attempt,
+                    "action": "resume_run",
+                    "result": f"run status={resumed.status}",
+                    "timestamp": self._now(),
+                })
+                self._save(state)
+                self._print("Provider-research recovery completed and the run was resumed.")
+                return state
+
+            diff_hash = self._compute_diff_hash()
+            verify_sig = self._compute_verify_sig(verify_reason)
+            self._update_stall_state(state, diff_hash, verify_sig)
+            self._save(state)
+            stop = self._should_stop(state, verify_reason)
+            if stop:
+                self._print(stop)
+                break
+            feedback = (
+                "Provider references are still unresolved.\n"
+                f"{verify_reason}\n"
+                "Update only provider-research artifacts to resolve these blockers."
+            )
+
+        state.status = "failed"
+        self._save(state)
+        self._print("Provider recovery session stopped (no further progress). Session marked as failed.")
+        return state
+
     # ── Prompt builders ──────────────────────────────────────────
 
     def _build_converse_prompt(self, state: SessionState) -> str:
+        if self.mode == "provider_resolve":
+            report = self.orch.provider_research_resolution_report()
+            lines = [
+                f"Project root: {self.project_root}",
+                "",
+                "You are helping recover a blocked provider_research stage.",
+                "The user wants to unblock provider references through conversation and then continue the run.",
+                "",
+                "Blocked-run summary:",
+                state.goal,
+                "",
+                f"Last run error: {report.get('last_error', '')}",
+                "",
+                "--- Conversation History ---",
+            ]
+            for msg in state.conversation:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                lines.append(f"\n[{role.upper()}]:\n{content}")
+            lines.extend([
+                "",
+                "Analyze the unresolved provider references and the user's goal.",
+                "- Ask targeted questions only when a decision is still needed.",
+                "- If the unblock path is clear enough to begin editing provider-research artifacts, output 'GOAL_CLEAR' on a line by itself at the end.",
+                "- Do not propose product-code changes in this mode.",
+                "- Keep the scope limited to provider reference markdown, provider_references.lock.json, and tightly coupled requirement trace metadata only when the user chooses defer/assumption approval.",
+                self.orch._document_language_instruction(),
+            ])
+            return "\n".join(lines)
+
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
         label = "bug" if self.mode == "fix" else "goal"
@@ -563,6 +737,83 @@ class Session:
         lines.extend([
             "- Always explain your understanding before asking questions or declaring ready.",
             self.orch._document_language_instruction(),
+        ])
+        return "\n".join(lines)
+
+    def _build_provider_resolve_prompt(self, state: SessionState, feedback: str) -> str:
+        report = self.orch.provider_research_resolution_report()
+        trace_path = self.project_root / ".auto-agents" / "state" / "requirements_trace.json"
+        lock_path = self.project_root / ".auto-agents" / "state" / "provider_references.lock.json"
+        refs_dir = self.project_root / ".auto-agents" / "docs" / "provider_references"
+        consolidated = self._consolidate_goal(state)
+        lines = [
+            f"Project root: {self.project_root}",
+            f"Requirements trace: {trace_path}",
+            f"Provider references lock: {lock_path}",
+            f"Provider references directory: {refs_dir}",
+            "",
+            "Recovery goal:",
+            consolidated,
+            "",
+            f"Current run error: {report.get('last_error', '')}",
+            "",
+            "Current unresolved provider references:",
+        ]
+        blockers = report.get("blockers", [])
+        if isinstance(blockers, list):
+            for blocker in blockers:
+                if not isinstance(blocker, dict):
+                    continue
+                lines.append(
+                    f"- {blocker.get('requirement_id')}: {blocker.get('reference') or '(missing)'} "
+                    f"is {blocker.get('status')} ({blocker.get('reason')})"
+                )
+        lines.extend([
+            "",
+            "--- Conversation History ---",
+        ])
+        for msg in state.conversation[-20:]:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            lines.append(f"\n[{role.upper()}]:\n{content}")
+
+        if state.execution_log:
+            lines.extend(["", "--- Execution Log (recent) ---"])
+            for entry in state.execution_log[-10:]:
+                lines.append(
+                    f"  Attempt {entry.get('attempt')}: {entry.get('action')} -> "
+                    f"{str(entry.get('result', ''))[:200]}"
+                )
+
+        if feedback:
+            lines.extend([
+                "",
+                "Previous attempt issues:",
+                feedback,
+                "",
+            ])
+
+        lines.extend([
+            "",
+            "Your task:",
+            "1. Inspect the current provider reference markdown and lock files.",
+            "2. Discuss the unblock path with the user when a decision is needed.",
+            "3. Apply only the minimal edits needed to provider-research artifacts.",
+            "4. If you need the user to choose between options, output 'NEED_USER_ASSIST: <question or decision needed>' on a line by itself.",
+            "5. Do not modify product/runtime code, implementation tasks, or unrelated state files.",
+            "",
+            "Success criteria for this mode:",
+            "- every required provider reference exists locally",
+            "- required references now resolve to passing statuses (verified, assumption_approved, or deferred)",
+            "- the pipeline can be resumed from the stored run context",
+            "",
+            "When editing:",
+            "- keep markdown factual and aligned with the user's decision",
+            "- update provider_references.lock.json consistently with the markdown file",
+            "- if the user approves assumptions, record assumption_approved explicitly",
+            "- if the user defers a requirement, make only the tightly coupled trace/lock edits needed for that decision",
+            "",
+            "Final response: brief status update of what you changed and why.",
         ])
         return "\n".join(lines)
 
@@ -736,12 +987,13 @@ class Session:
             self.project_root, state.session_id, label,
         )
         write_text(prompt_path, prompt)
-        effort = self.config.efforts.get("implement", "deep")
+        effort_stage = "provider_research" if self.mode == "provider_resolve" else "implement"
+        effort = self.config.efforts.get(effort_stage, "deep")
         # Always stream in collab/fix mode so the user sees real-time progress.
         # The --print-agent-output flag is not required.
-        should_stream = self._print_agent_output or self.mode in ("collab", "fix")
+        should_stream = self._print_agent_output or self.mode in ("collab", "fix", "provider_resolve")
         request = AgentRequest(
-            stage="implement",
+            stage=effort_stage,
             effort=effort,
             prompt=prompt,
             cwd=self.project_root,

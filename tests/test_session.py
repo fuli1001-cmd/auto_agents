@@ -19,12 +19,16 @@ from auto_agents.config import (
     delete_session,
     list_sessions,
     load_session_state,
+    load_run_state,
+    provider_references_lock_path,
+    requirements_trace_path,
     save_session_state,
+    save_run_state,
     session_state_path,
 )
 from auto_agents.git_ops import commit_all, working_tree_clean
-from auto_agents.io_utils import write_text
-from auto_agents.models import AgentResult, SessionState, DEFAULT_SESSION_MAX_ATTEMPTS
+from auto_agents.io_utils import write_json, write_text
+from auto_agents.models import AgentResult, RunState, SessionState, DEFAULT_SESSION_MAX_ATTEMPTS
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.session import Session
 
@@ -38,6 +42,77 @@ def _make_project(tmp: str, name: str = "demo") -> Path:
     state.status = "completed"
     save_run_state(project_root, state)
     return project_root
+
+
+def _make_provider_blocked_project(tmp: str, name: str = "demo") -> tuple[Path, str]:
+    project_root = Path(tmp) / name
+    Orchestrator.init_project(project_root, name, "mock")
+    spec_file = project_root / "spec.md"
+    spec_file.write_text("# Spec\n", encoding="utf-8")
+    reference = ".auto-agents/docs/provider_references/provider.md"
+    write_json(
+        requirements_trace_path(project_root),
+        {
+            "version": 1,
+            "requirements": [
+                {
+                    "id": "REQ-001",
+                    "text": "Use verified provider documentation.",
+                    "source": "spec",
+                    "status": "active",
+                    "priority": "mandatory",
+                    "acceptance_oracles": ["provider reference is resolved"],
+                    "forbidden_patterns": [],
+                    "external_docs_required": True,
+                    "provider_reference": reference,
+                    "notes": "",
+                }
+            ],
+        },
+    )
+    write_text(
+        project_root / reference,
+        "# Provider Reference\n\n## Status\n\nambiguous\n",
+    )
+    write_json(
+        provider_references_lock_path(project_root),
+        {
+            "version": 1,
+            "references": {
+                "provider": {
+                    "path": reference,
+                    "status": "ambiguous",
+                    "retrieved_at": "2026-04-24T00:00:00Z",
+                    "source_urls": ["https://example.com/official"],
+                    "notes": "Needs a user decision.",
+                }
+            },
+        },
+    )
+    state = load_run_state(project_root)
+    state.status = "failed"
+    state.stage_summaries = {
+        "clarify": "done",
+        "design": "done",
+        "plan": "done",
+    }
+    state.last_error = (
+        "provider research is blocked; provide official docs, defer the requirement, "
+        "choose another provider, or explicitly approve assumptions before resuming.\n"
+        f"- REQ-001: {reference} is ambiguous"
+    )
+    state.resume_context = {
+        "spec_file": str(spec_file),
+        "auto_approve": True,
+        "allow_dirty_tree": False,
+        "max_tasks": None,
+        "skip_validate": False,
+        "print_agent_output": False,
+        "provider_kind": "",
+        "doc_language": "",
+    }
+    save_run_state(project_root, state)
+    return project_root, reference
 
 
 def _configure_git_identity(project_root: Path) -> None:
@@ -98,6 +173,37 @@ class SessionStateModelTests(unittest.TestCase):
         self.assertEqual(restored.mode, "collab")
 
 
+class RunStateModelTests(unittest.TestCase):
+    """Test RunState serialization for resume context."""
+
+    def test_resume_context_round_trip(self) -> None:
+        state = RunState(
+            run_id="run-123",
+            status="failed",
+            current_stage="provider_research",
+            last_error="provider research is blocked",
+            resume_context={
+                "spec_file": "/tmp/demo/spec.md",
+                "auto_approve": True,
+                "allow_dirty_tree": False,
+                "max_tasks": 5,
+                "skip_validate": False,
+                "print_agent_output": True,
+                "provider_kind": "copilot-cli",
+                "doc_language": "zh-CN",
+            },
+        )
+        restored = RunState.from_dict(state.to_dict())
+        self.assertEqual(restored.run_id, "run-123")
+        self.assertEqual(restored.current_stage, "provider_research")
+        self.assertEqual(restored.resume_context["spec_file"], "/tmp/demo/spec.md")
+        self.assertEqual(restored.resume_context["provider_kind"], "copilot-cli")
+
+    def test_resume_context_defaults_to_empty_dict(self) -> None:
+        restored = RunState.from_dict({"run_id": "run-456"})
+        self.assertEqual(restored.resume_context, {})
+
+
 class SessionConfigTests(unittest.TestCase):
     """Test session config helpers (create, load, save, list)."""
 
@@ -124,6 +230,13 @@ class SessionConfigTests(unittest.TestCase):
             loaded = load_session_state(project_root, state.session_id)
             self.assertEqual(loaded.goal, "Test video generation")
             self.assertEqual(loaded.status, "executing")
+
+    def test_create_provider_resolve_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "provider_resolve")
+            self.assertEqual(state.mode, "provider_resolve")
+            self.assertEqual(state.max_attempts, DEFAULT_SESSION_MAX_ATTEMPTS["provider_resolve"])
 
     def test_list_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -855,7 +968,6 @@ class SessionResumeTests(unittest.TestCase):
 
             self.assertEqual(result.status, "completed")
             self.assertGreater(len(result.conversation), 2)
-
     def test_resume_completed_is_noop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
@@ -968,6 +1080,81 @@ class SessionResumeTests(unittest.TestCase):
         self.assertEqual(state2.resolution, "")
 
 
+class SessionProviderResolveTests(unittest.TestCase):
+    def test_provider_resolve_flow_updates_references_and_resumes_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, reference = _make_provider_blocked_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "")
+
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I understand the provider research blocker and can proceed.\nGOAL_CLEAR\n"
+                else:
+                    write_text(
+                        project_root / reference,
+                        "# Provider Reference\n\n## Status\n\nassumption_approved\n",
+                    )
+                    write_json(
+                        provider_references_lock_path(project_root),
+                        {
+                            "version": 1,
+                            "references": {
+                                "provider": {
+                                    "path": reference,
+                                    "status": "assumption_approved",
+                                    "retrieved_at": "2026-04-24T00:30:00Z",
+                                    "source_urls": ["https://example.com/official"],
+                                    "notes": "User approved assumptions for this iteration.",
+                                }
+                            },
+                        },
+                    )
+                    content = "Updated the provider reference to assumption_approved.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content.strip(),
+                    stdout=content,
+                    returncode=0,
+                )
+
+            resume_calls = {"n": 0}
+
+            def mock_resume_saved_run():
+                resume_calls["n"] += 1
+                resumed = load_run_state(project_root)
+                resumed.status = "completed"
+                return resumed
+
+            orchestrator.adapter.run = mock_run
+            orchestrator.resume_saved_run = mock_resume_saved_run
+
+            session = Session(orchestrator, mode="provider_resolve")
+            state = session.start()
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(state.resolution, "provider_research_resolved")
+            self.assertEqual(resume_calls["n"], 1)
+            lock_payload = json.loads(provider_references_lock_path(project_root).read_text(encoding="utf-8"))
+            self.assertEqual(
+                lock_payload["references"]["provider"]["status"],
+                "assumption_approved",
+            )
+
+    def test_provider_resolve_requires_blocked_provider_research_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "")
+            session = Session(orchestrator, mode="provider_resolve")
+            with self.assertRaises(RuntimeError):
+                session.start()
+
+
 class SessionCLITests(unittest.TestCase):
     """Test that CLI properly parses fix/collab commands."""
 
@@ -997,6 +1184,14 @@ class SessionCLITests(unittest.TestCase):
         args = parser.parse_args(["collab", "--project", "/tmp/test", "--print-agent-output"])
         self.assertTrue(args.print_agent_output)
 
+    def test_provider_resolve_parser(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["provider-resolve", "--project", "/tmp/test", "--session", "abc123"])
+        self.assertEqual(args.command, "provider-resolve")
+        self.assertEqual(args.project, "/tmp/test")
+        self.assertEqual(args.session, "abc123")
+
     def test_sessions_parser(self) -> None:
         from auto_agents.cli import build_parser
         parser = build_parser()
@@ -1011,6 +1206,12 @@ class SessionCLITests(unittest.TestCase):
         args = parser.parse_args(["sessions", "--project", "/tmp/test", "--mode", "fix", "--all"])
         self.assertEqual(args.mode, "fix")
         self.assertTrue(args.all)
+
+    def test_sessions_parser_with_provider_resolve_mode_filter(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["sessions", "--project", "/tmp/test", "--mode", "provider-resolve"])
+        self.assertEqual(args.mode, "provider-resolve")
 
     def test_sessions_delete_parser(self) -> None:
         from auto_agents.cli import build_parser

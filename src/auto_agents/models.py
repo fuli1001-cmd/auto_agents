@@ -7,12 +7,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 STAGE_ORDER = ["clarify", "design", "plan", "provider_research", "implement", "verify", "readme"]
 APPROVAL_ORDER = ["requirements", "architecture", "release"]
-SESSION_MODES = ("fix", "collab")
+SESSION_MODES = ("fix", "collab", "provider_resolve")
 SESSION_STATUSES = ("conversing", "executing", "verifying", "waiting_user", "completed", "failed")
-DEFAULT_SESSION_MAX_ATTEMPTS = {"fix": 4, "collab": 10}
+DEFAULT_SESSION_MAX_ATTEMPTS = {"fix": 4, "collab": 10, "provider_resolve": 8}
 SESSION_STALL_THRESHOLD = 3
 SESSION_AGENT_ERROR_THRESHOLD = 5
-SESSION_HARD_CEILING = {"fix": 15, "collab": 25}
+SESSION_HARD_CEILING = {"fix": 15, "collab": 25, "provider_resolve": 15}
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli")
 DEFAULT_EFFORTS = {
@@ -329,6 +329,7 @@ class RunState:
     last_error: str = ""
     rejection_reason: str = ""
     rejected_stage: str = ""
+    resume_context: Dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -352,6 +353,7 @@ class RunState:
             last_error=str(data.get("last_error", "")),
             rejection_reason=str(data.get("rejection_reason", "")),
             rejected_stage=str(data.get("rejected_stage", "")),
+            resume_context=dict(data.get("resume_context", {})),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -371,6 +373,7 @@ class RunState:
             "last_error": self.last_error,
             "rejection_reason": self.rejection_reason,
             "rejected_stage": self.rejected_stage,
+            "resume_context": dict(self.resume_context),
         }
 
 
