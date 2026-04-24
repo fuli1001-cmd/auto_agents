@@ -25,6 +25,8 @@ DEFAULT_EFFORTS = {
     "verify": "balanced",
     "readme": "balanced",
 }
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 1800
+DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS = 3600
 DEFAULT_RETRY_PER_STAGE = {
     "clarify": 2,
     "design": 2,
@@ -107,13 +109,19 @@ class ProviderConfig:
     cwd_flag: str = "-C"
     prompt_via_stdin: bool = True
     output_flag: str = "-o"
-    timeout_seconds: int = 1800
+    timeout_seconds: int = DEFAULT_PROVIDER_TIMEOUT_SECONDS
     idle_timeout_seconds: int = 300
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProviderConfig":
+        kind = str(data.get("kind", "codex"))
+        timeout_default = (
+            DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS
+            if kind == "copilot-cli"
+            else DEFAULT_PROVIDER_TIMEOUT_SECONDS
+        )
         return cls(
-            kind=str(data.get("kind", "codex")),
+            kind=kind,
             binary=str(data.get("binary", "codex")),
             profile_map={str(k): str(v) for k, v in dict(data.get("profile_map", {})).items()}
             or {"balanced": "m", "deep": "h", "max": "xh"},
@@ -121,7 +129,7 @@ class ProviderConfig:
             cwd_flag=str(data.get("cwd_flag", "-C")),
             prompt_via_stdin=bool(data.get("prompt_via_stdin", True)),
             output_flag=str(data.get("output_flag", "-o")),
-            timeout_seconds=int(data.get("timeout_seconds", 1800)),
+            timeout_seconds=int(data.get("timeout_seconds", timeout_default)),
             idle_timeout_seconds=int(data.get("idle_timeout_seconds", 300)),
         )
 
@@ -223,6 +231,7 @@ class ProjectConfig:
                 cwd_flag="-C",
                 prompt_via_stdin=True,
                 output_flag="-o",
+                timeout_seconds=DEFAULT_PROVIDER_TIMEOUT_SECONDS,
             ),
             "copilot-cli": ProviderConfig(
                 kind="copilot-cli",
@@ -232,6 +241,7 @@ class ProjectConfig:
                 cwd_flag="",
                 prompt_via_stdin=True,
                 output_flag="",
+                timeout_seconds=DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS,
             ),
         }
     )

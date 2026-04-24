@@ -169,6 +169,20 @@ class TestIsFailoverError(unittest.TestCase):
         self.assertTrue(Orchestrator._is_failover_error(r))
 
 
+class TestFailoverErrorLabel(unittest.TestCase):
+    def test_timeout_label(self):
+        r = _make_result(ok=False, returncode=1, stderr="timed out after 3600s")
+        self.assertEqual(Orchestrator._failover_error_label(r), "timeout/stall")
+
+    def test_quota_label(self):
+        r = _make_result(ok=False, returncode=1, stderr="429 Too Many Requests")
+        self.assertEqual(Orchestrator._failover_error_label(r), "quota/rate error")
+
+    def test_availability_label(self):
+        r = _make_result(ok=False, returncode=1, stderr="service unavailable")
+        self.assertEqual(Orchestrator._failover_error_label(r), "provider availability error")
+
+
 class TestFailoverProviderOrder(unittest.TestCase):
     def test_active_first(self):
         stub = _stub_orchestrator(
@@ -368,6 +382,18 @@ class TestCallWithFailover(unittest.TestCase):
         log = stub.agent_output_stream.getvalue()
         self.assertIn("[failover] provider=codex quota/rate error", log)
         self.assertIn("[failover] using provider=copilot-cli", log)
+
+    def test_timeout_log_output(self):
+        timeout = _make_result(ok=False, returncode=1, stderr="timed out after 3600s")
+        ok = _make_result(ok=True)
+        stub = _stub_orchestrator(
+            {"copilot-cli": {}, "codex": {}}, "copilot-cli",
+            {"copilot-cli": _FakeAdapter(timeout), "codex": _FakeAdapter(ok)},
+        )
+        stub._call_with_failover(_make_request())
+        log = stub.agent_output_stream.getvalue()
+        self.assertIn("[failover] provider=copilot-cli timeout/stall", log)
+        self.assertNotIn("quota/rate error (timed out", log)
 
 
 if __name__ == "__main__":

@@ -70,6 +70,11 @@ _FAILOVER_PATTERN = re.compile(
     r"|connection.error|connect.error|timed?\s*out|stalled",
     re.IGNORECASE,
 )
+_FAILOVER_TIMEOUT_PATTERN = re.compile(r"timed?\s*out|stalled", re.IGNORECASE)
+_FAILOVER_QUOTA_PATTERN = re.compile(
+    r"rate.limit|usage.limit|\b429\b|quota|too many requests|capacity",
+    re.IGNORECASE,
+)
 
 
 class Orchestrator:
@@ -2783,6 +2788,15 @@ class Orchestrator:
         text = result.stderr or ""
         return _FAILOVER_PATTERN.search(text) is not None
 
+    @staticmethod
+    def _failover_error_label(result: AgentResult) -> str:
+        text = result.stderr or ""
+        if _FAILOVER_TIMEOUT_PATTERN.search(text):
+            return "timeout/stall"
+        if _FAILOVER_QUOTA_PATTERN.search(text):
+            return "quota/rate error"
+        return "provider availability error"
+
     def _failover_provider_order(self) -> List[str]:
         active = self.config.active_provider
         return [active] + [k for k in self.config.providers if k != active]
@@ -2839,8 +2853,9 @@ class Orchestrator:
 
             self._failed_providers.add(kind)
             snippet = (result.stderr or "")[:120]
+            label = self._failover_error_label(result)
             print(
-                f"[failover] provider={kind} quota/rate error ({snippet}), trying next...",
+                f"[failover] provider={kind} {label} ({snippet}), trying next...",
                 file=self.agent_output_stream, flush=True,
             )
             last_error = result.stderr or result.summary or "unknown error"

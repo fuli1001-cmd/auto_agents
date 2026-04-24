@@ -260,7 +260,8 @@ Example project config (`providers` and `active_provider` only):
       "extra_args": [],
       "cwd_flag": "-C",
       "prompt_via_stdin": true,
-      "output_flag": "-o"
+      "output_flag": "-o",
+      "timeout_seconds": 1800
     },
     "copilot-cli": {
       "kind": "copilot-cli",
@@ -273,7 +274,8 @@ Example project config (`providers` and `active_provider` only):
       "extra_args": [],
       "cwd_flag": "",
       "prompt_via_stdin": true,
-      "output_flag": ""
+      "output_flag": "",
+      "timeout_seconds": 3600
     }
   },
   "active_provider": "codex"
@@ -325,7 +327,7 @@ Setting review to `deep` or `max` overrides auto-escalation and uses that effort
 
 When multiple providers are configured, the orchestrator automatically switches to the
 next available provider if the current one returns a **qualifying error** — rate-limit
-(429), quota exhaustion, service unavailable, or binary not found.
+(429), quota exhaustion, timeout/stall, service unavailable, or binary not found.
 
 **How it works**
 
@@ -345,14 +347,15 @@ next available provider if the current one returns a **qualifying error** — ra
 
 **Qualifying error patterns** (matched case-insensitively against stderr):
 
-`rate limit`, `429`, `quota`, `too many requests`, `capacity`, `unavailable`,
-`service unavailable`, `not found`, `No such file`, `ENOENT`
+`rate limit`, `429`, `quota`, `too many requests`, `capacity`, `timed out`,
+`stalled`, `unavailable`, `service unavailable`, `not found`, `No such file`, `ENOENT`
 
 **Log output**
 
 ```
 [failover] provider=codex quota/rate error (429 Too Many Requests), trying next...
 [failover] using provider=copilot-cli
+[failover] provider=copilot-cli timeout/stall (timed out after 3600s), trying next...
 ```
 
 ## Task plan contract

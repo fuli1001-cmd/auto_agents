@@ -64,6 +64,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(copilot.profile_map["balanced"], "balanced")
             self.assertEqual(copilot.profile_map["deep"], "deep")
             self.assertEqual(copilot.profile_map["max"], "max")
+            self.assertEqual(copilot.timeout_seconds, 3600)
 
 
 if __name__ == "__main__":

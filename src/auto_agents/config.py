@@ -144,6 +144,7 @@ DEFAULT_CONFIG = {
             "cwd_flag": "",
             "prompt_via_stdin": True,
             "output_flag": "",
+            "timeout_seconds": 3600,
         },
     },
     "active_provider": "codex",
