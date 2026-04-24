@@ -27,6 +27,7 @@ DEFAULT_EFFORTS = {
 }
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 1800
 DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS = 3600
+DEFAULT_COPILOT_CLI_PROFILE_MAP = {"balanced": "balanced", "deep": "deep", "max": "max"}
 DEFAULT_RETRY_PER_STAGE = {
     "clarify": 2,
     "design": 2,
@@ -129,12 +130,40 @@ class ProviderConfig:
             cwd_flag=str(data.get("cwd_flag", "-C")),
             prompt_via_stdin=bool(data.get("prompt_via_stdin", True)),
             output_flag=str(data.get("output_flag", "-o")),
-            timeout_seconds=int(data.get("timeout_seconds", timeout_default)),
+            timeout_seconds=cls._timeout_seconds_from_dict(data, timeout_default),
             idle_timeout_seconds=int(data.get("idle_timeout_seconds", 300)),
         )
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
+
+    @staticmethod
+    def _timeout_seconds_from_dict(data: Dict[str, object], timeout_default: int) -> int:
+        raw_timeout = data.get("timeout_seconds")
+        if raw_timeout is None:
+            return timeout_default
+
+        timeout_seconds = int(raw_timeout)
+        if ProviderConfig._is_legacy_default_copilot_timeout(data, timeout_seconds):
+            return DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS
+        return timeout_seconds
+
+    @staticmethod
+    def _is_legacy_default_copilot_timeout(data: Dict[str, object], timeout_seconds: int) -> bool:
+        if str(data.get("kind", "")) != "copilot-cli":
+            return False
+        if timeout_seconds != DEFAULT_PROVIDER_TIMEOUT_SECONDS:
+            return False
+        profile_map = {str(k): str(v) for k, v in dict(data.get("profile_map", {})).items()}
+        return (
+            str(data.get("binary", "copilot")) == "copilot"
+            and profile_map == DEFAULT_COPILOT_CLI_PROFILE_MAP
+            and [str(item) for item in data.get("extra_args", [])] == []
+            and str(data.get("cwd_flag", "")) == ""
+            and bool(data.get("prompt_via_stdin", True))
+            and str(data.get("output_flag", "")) == ""
+            and int(data.get("idle_timeout_seconds", 300)) == 300
+        )
 
 
 @dataclass
@@ -236,7 +265,7 @@ class ProjectConfig:
             "copilot-cli": ProviderConfig(
                 kind="copilot-cli",
                 binary="copilot",
-                profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
+                profile_map=dict(DEFAULT_COPILOT_CLI_PROFILE_MAP),
                 extra_args=[],
                 cwd_flag="",
                 prompt_via_stdin=True,

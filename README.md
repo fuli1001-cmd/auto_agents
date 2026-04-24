@@ -282,6 +282,9 @@ Example project config (`providers` and `active_provider` only):
 }
 ```
 
+Legacy auto-generated `copilot-cli.timeout_seconds = 1800` configs are treated as the old default
+and normalize to `3600` on load.
+
 To use an absolute path instead of the conventional `~/.copilot/profiles/` location, set the
 `providers.copilot-cli.profile_map` value to the full path:
 
