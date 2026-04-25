@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -2207,6 +2208,179 @@ class ScopeOverflowTests(unittest.TestCase):
 
             # Migration is excluded; baseline failure is also excluded → verify passes.
             self.assertTrue(result["ok"], msg=str(result))
+
+
+class VaryingReviewArbiterAdapter:
+    """Implement touches code; review always fails with VARYING wording so the
+    static fingerprint signal never matches; arbiter returns a configurable
+    decision."""
+
+    def __init__(self, project_root: Path, arbiter_decision: str = "SPLIT", arbiter_text: Optional[str] = None) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+        self.arbiter_calls = 0
+        self.arbiter_decision = arbiter_decision
+        self.arbiter_text = arbiter_text
+
+    def run(self, request):
+        from auto_agents.adapters.base import AgentResult as _AR
+        if request.stage == "implement":
+            self.implement_calls += 1
+            (self.project_root / f"artifact-{self.implement_calls}.txt").write_text(
+                f"attempt-{self.implement_calls}\n", encoding="utf-8"
+            )
+            summary = f"implement attempt {self.implement_calls}\n"
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = (
+                "DECISION: fail\n"
+                f"This is review #{self.review_calls} with unique wording {self.review_calls}.\n"
+                f"Acceptance criterion {self.review_calls} is not satisfied.\n"
+            )
+        elif request.stage == "arbiter":
+            self.arbiter_calls += 1
+            if self.arbiter_text is not None:
+                summary = self.arbiter_text
+            elif self.arbiter_decision == "SPLIT":
+                summary = (
+                    "DECISION: SPLIT\n"
+                    "RATIONALE: task spans backend and UI which keep alternating as blockers.\n"
+                    "SPLIT_AXIS:\n"
+                    "- backend: extract data layer change\n"
+                    "- UI: extract surface change\n"
+                )
+            else:
+                summary = (
+                    "DECISION: CONTINUE\n"
+                    "RATIONALE: implementer is close; one more sharp attempt should converge.\n"
+                )
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return _AR(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class ScopeArbiterTests(unittest.TestCase):
+    def _make_project(self, tmp: str, with_review_history: int = 0) -> Tuple[Path, Orchestrator]:
+        project_root = Path(tmp) / "demo"
+        Orchestrator.init_project(project_root, "demo", "mock")
+        orchestrator = Orchestrator(project_root)
+        config = orchestrator.config
+        config.gates.commands = []
+        config.retries.implement = 4
+        save_project_config(project_root, config)
+        orchestrator = Orchestrator(project_root)
+        history = []
+        for i in range(with_review_history):
+            history.append({
+                "attempt": i + 1,
+                "summary": f"DECISION: fail\nprior review {i+1}",
+            })
+        write_json(
+            task_plan_path(project_root),
+            {
+                "tasks": [
+                    {
+                        "task_id": "task-arb",
+                        "title": "Cross-cutting task",
+                        "description": "Bundles several layers.",
+                        "acceptance": ["all layers updated"],
+                        "status": "blocked" if with_review_history else "pending",
+                        "commit_message": "",
+                        "split_depth": 0,
+                        "review_history": history,
+                    }
+                ]
+            },
+        )
+        return project_root, orchestrator
+
+    def test_arbiter_parses_split_and_continue(self) -> None:
+        split = Orchestrator._parse_arbiter_decision(
+            "DECISION: SPLIT\nRATIONALE: too coupled.\nSPLIT_AXIS:\n- a\n- b\n"
+        )
+        self.assertEqual(split["decision"], "SPLIT")
+        self.assertEqual(split["rationale"], "too coupled.")
+        self.assertEqual(split["split_axis"], ["a", "b"])
+
+        cont = Orchestrator._parse_arbiter_decision("DECISION: CONTINUE\nRATIONALE: close.\n")
+        self.assertEqual(cont["decision"], "CONTINUE")
+        self.assertEqual(cont["split_axis"], [])
+
+        bad = Orchestrator._parse_arbiter_decision("garbage output")
+        self.assertEqual(bad["decision"], "")
+
+    def test_arbiter_split_triggers_rewind_when_fingerprints_vary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, orchestrator = self._make_project(tmp)
+            orchestrator.adapter = VaryingReviewArbiterAdapter(project_root, arbiter_decision="SPLIT")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(result.rejected_stage, "plan")
+            self.assertIn("SPLIT_TASK:", result.rejection_reason)
+            self.assertIn("Scope arbiter verdict: SPLIT", result.rejection_reason)
+            self.assertIn("backend", result.rejection_reason)
+            self.assertGreaterEqual(orchestrator.adapter.arbiter_calls, 1)
+            self.assertEqual(result.tasks[0].status, "pending")
+            self.assertTrue(result.tasks[0].arbitration_history)
+            self.assertEqual(result.tasks[0].arbitration_history[-1]["decision"], "SPLIT")
+
+    def test_arbiter_continue_lets_loop_exhaust_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, orchestrator = self._make_project(tmp)
+            orchestrator.adapter = VaryingReviewArbiterAdapter(project_root, arbiter_decision="CONTINUE")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            with self.assertRaises(RuntimeError):
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            reloaded_tasks = orchestrator._load_tasks_from_plan()
+            self.assertEqual(reloaded_tasks[0].status, "blocked")
+            reloaded_state = load_run_state(project_root)
+            self.assertNotEqual(reloaded_state.rejected_stage, "plan")
+            self.assertEqual(orchestrator.adapter.review_calls, 4)
+            self.assertGreaterEqual(orchestrator.adapter.arbiter_calls, 3)
+
+    def test_arbiter_consulted_on_first_fail_when_history_already_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, orchestrator = self._make_project(tmp, with_review_history=2)
+            orchestrator.adapter = VaryingReviewArbiterAdapter(project_root, arbiter_decision="SPLIT")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(result.rejected_stage, "plan")
+            self.assertIn("Scope arbiter verdict: SPLIT", result.rejection_reason)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(orchestrator.adapter.arbiter_calls, 1)
+
+    def test_arbiter_unparseable_output_falls_back_to_continue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, orchestrator = self._make_project(tmp)
+            orchestrator.adapter = VaryingReviewArbiterAdapter(
+                project_root, arbiter_text="this is not parseable at all"
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            with self.assertRaises(RuntimeError):
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            reloaded_tasks = orchestrator._load_tasks_from_plan()
+            self.assertEqual(reloaded_tasks[0].status, "blocked")
+            self.assertEqual(orchestrator.adapter.review_calls, 4)
 
 
 if __name__ == "__main__":

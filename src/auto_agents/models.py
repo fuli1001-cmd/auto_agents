@@ -24,6 +24,7 @@ DEFAULT_EFFORTS = {
     "review": "balanced",
     "verify": "balanced",
     "readme": "balanced",
+    "arbiter": "balanced",
 }
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 1800
 DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS = 3600
@@ -35,6 +36,7 @@ DEFAULT_RETRY_PER_STAGE = {
     "provider_research": 2,
     "implement": 4,
     "review": 2,
+    "arbiter": 2,
 }
 APPROVAL_BY_STAGE = {
     "clarify": "requirements",
@@ -63,6 +65,7 @@ class TaskSpec:
     split_depth: int = 0
     expected_test_migrations: List[str] = field(default_factory=list)
     scratchpad: str = ""
+    arbitration_history: List[Dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -97,6 +100,10 @@ class TaskSpec:
             split_depth=int(data.get("split_depth", 0) or 0),
             expected_test_migrations=[str(item) for item in data.get("expected_test_migrations", [])],
             scratchpad=str(data.get("scratchpad", "")),
+            arbitration_history=[
+                entry for entry in (data.get("arbitration_history", []) or [])
+                if isinstance(entry, dict)
+            ],
         )
 
     def to_dict(self) -> Dict[str, object]:

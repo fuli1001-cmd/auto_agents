@@ -81,6 +81,7 @@ _FAILOVER_QUOTA_PATTERN = re.compile(
 class Orchestrator:
     MAX_SPLIT_DEPTH = 2
     SPLIT_TASK_MARKER = "SPLIT_TASK:"
+    ARBITER_MIN_REVIEW_FAILS = 2
 
     def __init__(
         self,
@@ -923,6 +924,164 @@ class Orchestrator:
             return ""
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
+    def _build_arbiter_prompt(self, task: TaskSpec, last_review: str) -> str:
+        history_lines: List[str] = []
+        for idx, entry in enumerate(task.review_history[-6:], start=1):
+            if not isinstance(entry, dict):
+                continue
+            summary = str(entry.get("summary", "")).strip()
+            attempt = entry.get("attempt", idx)
+            if summary:
+                history_lines.append(f"--- review attempt {attempt} ---\n{summary}")
+        verify_lines: List[str] = []
+        for entry in task.verify_history[-4:]:
+            if not isinstance(entry, dict):
+                continue
+            attempt = entry.get("attempt", "?")
+            ids = entry.get("failure_ids") or []
+            outcome = entry.get("outcome", "")
+            ids_str = ", ".join(str(x) for x in (ids or [])[:8]) if isinstance(ids, list) else ""
+            verify_lines.append(f"attempt {attempt} ({outcome}): {ids_str}")
+        try:
+            paths = changed_paths(self.project_root)
+        except Exception:
+            paths = []
+        task_brief = {
+            "task_id": task.task_id,
+            "title": task.title,
+            "description": task.description,
+            "acceptance": list(task.acceptance),
+            "requirement_ids": list(task.requirement_ids),
+            "split_depth": int(task.split_depth),
+            "parent_task_id": task.parent_task_id,
+        }
+        prompt_parts = [
+            "You are the SCOPE ARBITER. Your sole job is to decide whether the current task is",
+            "too coupled / too large to land in one implement+review cycle, given the failure",
+            "history below. You are NOT reviewing code correctness; the review agent already did",
+            "that. You judge task SIZING.",
+            "",
+            "Decide ONE of:",
+            "  - CONTINUE: the task is the right size; the implementer just needs another",
+            "    attempt with sharper guidance. Pick this when the same root cause keeps coming",
+            "    back due to a fixable mistake (missing one call site, wrong file, lint error).",
+            "  - SPLIT: the task spans too many independent slices to converge. Pick this when",
+            "    multiple distinct subsystems / layers / acceptance criteria fail repeatedly,",
+            "    or when each retry trades one blocker for another in different code regions.",
+            "",
+            "OUTPUT FORMAT (strict, machine-parsed):",
+            "  Line 1: 'DECISION: CONTINUE' or 'DECISION: SPLIT' (uppercase, exact).",
+            "  Line 2: 'RATIONALE: <one or two sentences>'.",
+            "  Lines 3+: when DECISION is SPLIT, add 'SPLIT_AXIS:' followed by 2-4 bullet",
+            "  points, each naming one coherent slice the parent task should be split into",
+            "  (e.g. '- backend: stale-flag propagation in regen entrypoints',",
+            "  '- API: query-side filtering of stale results').",
+            "  No other text. No code fences. No preamble.",
+            "",
+            f"Task brief:\n{json.dumps(task_brief, indent=2, ensure_ascii=False)}",
+            "",
+            "Most recent review verdict (latest first):",
+            last_review.strip() or "(no current review summary)",
+        ]
+        if history_lines:
+            prompt_parts.extend(["", "Prior review history:", *history_lines])
+        if verify_lines:
+            prompt_parts.extend(["", "Verify history:", *verify_lines])
+        if paths:
+            prompt_parts.extend([
+                "",
+                f"Files touched in current attempt ({len(paths)}):",
+                *[f"  - {p}" for p in paths[:30]],
+            ])
+        if int(task.split_depth) >= self.MAX_SPLIT_DEPTH:
+            prompt_parts.extend([
+                "",
+                f"NOTE: split_depth={task.split_depth} is at MAX_SPLIT_DEPTH={self.MAX_SPLIT_DEPTH}.",
+                "Further SPLIT will be rejected. Prefer CONTINUE unless splitting is the only viable path.",
+            ])
+        return "\n".join(prompt_parts)
+
+    @staticmethod
+    def _parse_arbiter_decision(text: str) -> Dict[str, object]:
+        decision = ""
+        rationale = ""
+        split_axis: List[str] = []
+        section = ""
+        for raw_line in (text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            upper = line.upper()
+            if upper.startswith("DECISION:"):
+                value = line.split(":", 1)[1].strip().upper()
+                if value.startswith("SPLIT"):
+                    decision = "SPLIT"
+                elif value.startswith("CONTINUE"):
+                    decision = "CONTINUE"
+                section = ""
+                continue
+            if upper.startswith("RATIONALE:"):
+                rationale = line.split(":", 1)[1].strip()
+                section = "rationale"
+                continue
+            if upper.startswith("SPLIT_AXIS") or upper.startswith("SPLIT AXIS"):
+                section = "split_axis"
+                tail = line.split(":", 1)[1].strip() if ":" in line else ""
+                if tail:
+                    split_axis.append(tail.lstrip("-* ").strip())
+                continue
+            if section == "split_axis" and (line.startswith("-") or line.startswith("*")):
+                split_axis.append(line.lstrip("-* ").strip())
+            elif section == "rationale" and not rationale:
+                rationale = line
+        return {
+            "decision": decision,
+            "rationale": rationale,
+            "split_axis": [item for item in split_axis if item],
+        }
+
+    def _run_scope_arbiter(
+        self,
+        run_id: str,
+        task: TaskSpec,
+        last_review: str,
+    ) -> Dict[str, object]:
+        """Invoke the arbiter agent and return a parsed decision dict.
+
+        Always returns a dict with keys: decision ('SPLIT'|'CONTINUE'|''),
+        rationale, split_axis (list), raw (raw agent text), error (str if any).
+        Errors and parse failures are mapped to CONTINUE so the loop never
+        gets stuck waiting on the arbiter.
+        """
+        prompt = self._build_arbiter_prompt(task, last_review)
+        effort = self.config.efforts.get("arbiter", "balanced")
+        try:
+            result = self._run_agent_with_retries(
+                state=None,
+                stage="arbiter",
+                stage_key=f"arbiter-{task.task_id}",
+                prompt=prompt,
+                run_id=run_id,
+                effort=effort,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            return {
+                "decision": "CONTINUE",
+                "rationale": f"arbiter invocation failed: {exc}",
+                "split_axis": [],
+                "raw": "",
+                "error": str(exc),
+            }
+        raw = (result.summary or "").strip()
+        parsed = self._parse_arbiter_decision(raw)
+        if parsed["decision"] not in {"SPLIT", "CONTINUE"}:
+            parsed["decision"] = "CONTINUE"
+            if not parsed.get("rationale"):
+                parsed["rationale"] = "arbiter output unparseable; defaulting to CONTINUE"
+        parsed["raw"] = raw
+        parsed["error"] = ""
+        return parsed
+
     def _implement_touched_code(self) -> bool:
         """Return True if the last implement step touched any non-orchestrator file."""
         try:
@@ -941,6 +1100,7 @@ class Orchestrator:
         fingerprint: str,
         last_review: str,
         verify_history: List[Dict[str, object]],
+        arbiter: Optional[Dict[str, object]] = None,
     ) -> str:
         child_depth = int(task.split_depth) + 1
         verify_summary: List[str] = []
@@ -986,6 +1146,17 @@ class Orchestrator:
             lines.append("Recent verification failures:")
             for entry in verify_summary:
                 lines.append(f"  - {entry}")
+        if arbiter and isinstance(arbiter, dict) and arbiter.get("decision") == "SPLIT":
+            rationale = str(arbiter.get("rationale", "")).strip()
+            split_axis = arbiter.get("split_axis") or []
+            lines.append("")
+            lines.append("Scope arbiter verdict: SPLIT")
+            if rationale:
+                lines.append(f"  Rationale: {rationale}")
+            if isinstance(split_axis, list) and split_axis:
+                lines.append("  Suggested split axes (use as guidance, not as a rigid prescription):")
+                for axis in split_axis[:6]:
+                    lines.append(f"    - {axis}")
         return "\n".join(lines)
 
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
@@ -1105,6 +1276,7 @@ class Orchestrator:
             fingerprint=str(gate_result.get("split_fingerprint", "")),
             last_review=str(gate_result.get("review", "")),
             verify_history=list(task.verify_history),
+            arbiter=gate_result.get("arbiter") if isinstance(gate_result.get("arbiter"), dict) else None,
         )
         self._rewind_state_from_stage(state, "plan")
         state.rejected_stage = "plan"
@@ -2452,9 +2624,16 @@ class Orchestrator:
                 fp = self._review_fingerprint(str(entry.get("summary", "")))
                 if fp:
                     review_fingerprints.append(fp)
+        # Seed the arbiter trigger counter from persisted history so resumed
+        # blocked tasks consult the arbiter on their FIRST fresh review fail
+        # instead of waiting for new fails to accumulate from zero.
+        prior_review_fails = len([
+            entry for entry in task.review_history if isinstance(entry, dict)
+        ])
         empty_diff_streak = 0
         overflow_trigger = ""
         overflow_fingerprint = ""
+        overflow_arbiter: Optional[Dict[str, object]] = None
 
         for attempt in range(1, max_attempts + 1):
             state.current_stage = "implement"
@@ -2596,6 +2775,29 @@ class Orchestrator:
                     break
                 review_fingerprints.append(current_fp)
 
+            total_review_fails = prior_review_fails + attempt
+            if total_review_fails >= self.ARBITER_MIN_REVIEW_FAILS:
+                arbiter_result = self._run_scope_arbiter(
+                    state.run_id, task, last_review,
+                )
+                task.arbitration_history.append({
+                    "attempt": attempt,
+                    "total_review_fails": total_review_fails,
+                    "decision": arbiter_result.get("decision", ""),
+                    "rationale": arbiter_result.get("rationale", ""),
+                    "split_axis": list(arbiter_result.get("split_axis", []) or []),
+                })
+                self._persist_tasks(state.tasks if state.tasks else [task])
+                if arbiter_result.get("decision") == "SPLIT":
+                    overflow_trigger = (
+                        "scope arbiter SPLIT after "
+                        f"{total_review_fails} review fail(s): "
+                        + (str(arbiter_result.get("rationale", "")) or "no rationale")
+                    )
+                    overflow_fingerprint = current_fp
+                    overflow_arbiter = arbiter_result
+                    break
+
             feedback = self._format_retry_feedback(
                 "review_rejected",
                 reason=last_reason,
@@ -2612,6 +2814,7 @@ class Orchestrator:
                 "split_task_id": task.task_id,
                 "split_trigger": overflow_trigger,
                 "split_fingerprint": overflow_fingerprint,
+                "arbiter": overflow_arbiter or {},
             }
 
         return {"ok": False, "review": last_review or feedback, "reason": last_reason}
