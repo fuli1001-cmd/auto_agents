@@ -1260,9 +1260,8 @@ class Orchestrator:
         if int(task.split_depth) >= self.MAX_SPLIT_DEPTH:
             return None
 
-        baseline_ref = task.verify_baseline_ref or state.stage_summaries.get("implement_baseline_ref", "")
-        if baseline_ref:
-            hard_reset_clean(self.project_root, baseline_ref)
+        baseline_ref = task.verify_baseline_ref or state.stage_summaries.get("implement_baseline_ref", "") or "HEAD"
+        hard_reset_clean(self.project_root, baseline_ref)
 
         task.status = "pending"
         task.review_summary = str(gate_result.get("review", ""))
