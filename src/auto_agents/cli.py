@@ -83,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("en", "zh"),
         help="Override and persist the language for generated documents.",
     )
+    run_parser.add_argument(
+        "--no-repo-map",
+        action="store_true",
+        help="Disable Aider-style repo map injection for this run.",
+    )
 
     approve_parser = subparsers.add_parser("approve", help="Approve a pending manual gate.")
     approve_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -231,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
             project_root = Path(args.project)
             spec_file = Path(args.spec_file) if args.spec_file else _default_spec_file(project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            if getattr(args, "no_repo_map", False):
+                orchestrator.config.repo_map.enabled = False
             state = orchestrator.run(
                 spec_file=spec_file,
                 auto_approve=bool(args.auto_approve),

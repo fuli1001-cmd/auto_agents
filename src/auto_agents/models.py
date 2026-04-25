@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .repomap.config import RepoMapConfig
+
 
 STAGE_ORDER = ["clarify", "design", "plan", "provider_research", "implement", "verify", "readme"]
 APPROVAL_ORDER = ["requirements", "architecture", "release"]
@@ -310,6 +312,7 @@ class ProjectConfig:
     git: GitConfig = field(default_factory=GitConfig)
     approvals: ApprovalConfig = field(default_factory=ApprovalConfig)
     retries: RetryConfig = field(default_factory=RetryConfig)
+    repo_map: RepoMapConfig = field(default_factory=RepoMapConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProjectConfig":
@@ -352,6 +355,7 @@ class ProjectConfig:
                 )
             ),
             retries=RetryConfig.from_dict(dict(data.get("retries", {}))),
+            repo_map=RepoMapConfig.from_dict(dict(data.get("repo_map", {}))),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -365,6 +369,7 @@ class ProjectConfig:
             "git": self.git.to_dict(),
             "approvals": self.approvals.to_dict(),
             "retries": self.retries.to_dict(),
+            "repo_map": self.repo_map.to_dict(),
         }
 
     @property

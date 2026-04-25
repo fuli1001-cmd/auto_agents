@@ -858,7 +858,38 @@ class Session:
             "- Keep it under 72 characters; write it in the same language as the bug description.",
             "- This line is used verbatim as the git commit subject, so it must stand alone and be human-readable.",
         ])
-        return "\n".join(lines)
+        prompt = "\n".join(lines)
+        repo_map = self._build_repo_map_section_for_session(consolidated, feedback)
+        if repo_map:
+            prompt = f"{prompt}\n\n{repo_map}"
+        return prompt
+
+    def _build_repo_map_section_for_session(self, goal: str, feedback: str = "") -> str:
+        """Inject a repo map for fix-mode prompts when enabled.
+
+        Reuses the orchestrator's RepoMapBuilder so the cache is shared and
+        all configuration goes through a single place.
+        """
+        builder = self.orch._get_repo_map_builder() if hasattr(self.orch, "_get_repo_map_builder") else None
+        if builder is None:
+            self.orch._last_repo_map_result = None
+            return ""
+
+        class _SessionTaskLike:
+            title = ""
+            description = ""
+            acceptance: List[str] = []
+            scope_boundaries = ""
+            commit_message = ""
+
+        task_like = _SessionTaskLike()
+        task_like.description = goal or ""
+        task_like.acceptance = [feedback] if feedback else []
+
+        budget = self.orch.config.repo_map.review_budget_tokens
+        result = builder.build(task_like, budget_tokens=budget)
+        self.orch._last_repo_map_result = result
+        return result.text or ""
 
     def _describe_session_for_resume(self, state: SessionState) -> str:
         goal = state.goal or "(no goal recorded)"

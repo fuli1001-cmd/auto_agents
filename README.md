@@ -97,6 +97,46 @@ Manual approvals are supported at three high-value gates:
 - `architecture`
 - `release`
 
+## Repo map (token saver)
+
+Implement / review / fix prompts are augmented with a token-budgeted, ranked
+**repo map** — a flat outline of class/function signatures from the most relevant
+files. The goal is to give the agent an upfront bird's-eye view so it spends
+fewer tokens on blind `grep`/`view` exploration.
+
+Behavior:
+
+- Auto-skipped on non-Python projects (no signal markers, no `.py` files)
+- Auto-skipped if explicitly disabled
+- Cached per `git HEAD` + file mtimes under `.auto-agents/state/repomap_cache.json`
+- Anchor files mentioned in the task description / acceptance / retry feedback
+  are forced into the map even under tight budget
+- Repo map header tells the agent it's a partial view and to use `grep`/`view`
+  for symbols not listed
+
+Configuration in `.auto-agents/config.json`:
+
+```json
+{
+  "repo_map": {
+    "enabled": true,
+    "budget_tokens": 1500,
+    "review_budget_tokens": 750,
+    "max_files_scanned": 2000
+  }
+}
+```
+
+CLI override (single run, does not persist):
+
+```sh
+auto_agents run --no-repo-map
+```
+
+Per-run metrics include `repo_map_enabled`, `repo_map_skipped_reason`,
+`repo_map_files_included`, `repo_map_tokens_actual`, `repo_map_tokens_budget`,
+and `repo_map_cache_hit` so you can quantify savings from telemetry.
+
 ## Quick start
 
 Create a target project skeleton:

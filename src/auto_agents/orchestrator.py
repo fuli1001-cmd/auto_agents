@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, TextIO, Tuple
 
 from .adapters import CodexAdapter, CopilotCliAdapter, MockAdapter, ShellAdapter
+from .repomap import RepoMapBuilder, RepoMapResult
 from .config import (
     bootstrap_project,
     docs_dir,
@@ -101,6 +102,8 @@ class Orchestrator:
         self._last_successful_provider: Optional[str] = None
         self._failed_providers: Set[str] = set()
         self._current_provider: str = self.config.active_provider
+        self._repo_map_builder: Optional[RepoMapBuilder] = None
+        self._last_repo_map_result: Optional[RepoMapResult] = None
 
     @staticmethod
     def init_project(
@@ -2520,6 +2523,41 @@ class Orchestrator:
             return "Use the input spec to preserve both the intended product scope and the key architecture choices."
         return "Use the input spec mainly as product context and describe the implemented repository state faithfully."
 
+    def _get_repo_map_builder(self) -> Optional[RepoMapBuilder]:
+        """Lazy-construct the repo map builder, honoring the enabled flag.
+
+        Returns None if disabled so callers can skip the work entirely and
+        keep prompts byte-identical to the pre-RepoMap behavior.
+        """
+        config = getattr(self.config, "repo_map", None)
+        if config is None or not config.enabled:
+            return None
+        if self._repo_map_builder is None:
+            self._repo_map_builder = RepoMapBuilder(self.project_root, config)
+        return self._repo_map_builder
+
+    def _build_repo_map_section(
+        self,
+        task: "TaskSpec",
+        *,
+        stage: str,
+        extra_anchor_paths: Iterable[str] = (),
+    ) -> str:
+        """Return the repo map text to append to a task prompt, or "" if disabled/empty."""
+        builder = self._get_repo_map_builder()
+        if builder is None:
+            self._last_repo_map_result = None
+            return ""
+        config = self.config.repo_map
+        budget = config.review_budget_tokens if stage in ("review", "fix") else config.budget_tokens
+        result = builder.build(
+            task,
+            budget_tokens=budget,
+            extra_anchor_paths=list(extra_anchor_paths),
+        )
+        self._last_repo_map_result = result
+        return result.text or ""
+
     def _build_task_prompt(self, task: TaskSpec, stage: str, review_context: str = "") -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
@@ -2553,7 +2591,11 @@ class Orchestrator:
                 "Do not modify .auto-agents state files except when explicitly requested.",
                 "Final response: 3 short bullets describing what changed.",
             ]
-            return "\n".join(lines)
+            prompt = "\n".join(lines)
+            repo_map = self._build_repo_map_section(task, stage="implement")
+            if repo_map:
+                prompt = f"{prompt}\n\n{repo_map}"
+            return prompt
 
         if stage == "review":
             lines = common + [
@@ -2595,7 +2637,11 @@ class Orchestrator:
                 )
             if review_context.strip():
                 lines.extend(["", review_context.strip()])
-            return "\n".join(lines)
+            prompt = "\n".join(lines)
+            repo_map = self._build_repo_map_section(task, stage="review")
+            if repo_map:
+                prompt = f"{prompt}\n\n{repo_map}"
+            return prompt
 
         raise RuntimeError(f"Unsupported task stage: {stage}")
 
@@ -2949,12 +2995,23 @@ class Orchestrator:
                 f"input={usage.input_tokens} cached_input={usage.cached_input_tokens} "
                 f"output={usage.output_tokens} total={usage.total_tokens}"
             )
+        repo_map_text = ""
+        rm = self._last_repo_map_result
+        if rm is not None:
+            repo_map_text = (
+                f" repo_map_enabled={str(rm.enabled).lower()}"
+                f" repo_map_skipped={rm.skipped_reason or 'none'}"
+                f" repo_map_files={rm.files_included}"
+                f" repo_map_tokens={rm.tokens_actual}/{rm.tokens_budget}"
+                f" repo_map_cache_hit={str(rm.cache_hit).lower()}"
+            )
         print(
             (
                 f"[agent:{stage_key}] completed ok={str(result.ok).lower()} "
                 f"returncode={result.returncode} attempts={attempts} "
                 f"provider={self._current_provider} model={model or 'unknown'} "
                 f"tokens={usage_text}"
+                f"{repo_map_text}"
             ),
             file=self.agent_output_stream,
             flush=True,
