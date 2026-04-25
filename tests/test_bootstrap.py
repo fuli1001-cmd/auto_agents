@@ -66,6 +66,17 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(copilot.profile_map["deep"], "deep")
             self.assertEqual(copilot.profile_map["max"], "max")
             self.assertEqual(copilot.timeout_seconds, 3600)
+            self.assertEqual(copilot.idle_timeout_seconds, 3600)
+            self.assertEqual(config.providers["codex"].idle_timeout_seconds, 3600)
+
+    def test_init_project_writes_idle_timeout_3600_to_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo")
+
+            raw = json.loads(config_path(project_root).read_text(encoding="utf-8"))
+            self.assertEqual(raw["providers"]["codex"]["idle_timeout_seconds"], 3600)
+            self.assertEqual(raw["providers"]["copilot-cli"]["idle_timeout_seconds"], 3600)
 
     def test_load_project_config_upgrades_legacy_copilot_timeout_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,6 +91,19 @@ class BootstrapTests(unittest.TestCase):
 
             config = load_project_config(project_root)
             self.assertEqual(config.providers["copilot-cli"].timeout_seconds, 3600)
+
+    def test_load_project_config_defaults_missing_copilot_idle_timeout_to_3600(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo")
+
+            config_file = config_path(project_root)
+            raw = json.loads(config_file.read_text(encoding="utf-8"))
+            del raw["providers"]["copilot-cli"]["idle_timeout_seconds"]
+            config_file.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+            config = load_project_config(project_root)
+            self.assertEqual(config.providers["copilot-cli"].idle_timeout_seconds, 3600)
 
 
 if __name__ == "__main__":

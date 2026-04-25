@@ -9,9 +9,11 @@ from uuid import uuid4
 
 from .io_utils import read_json, read_text, write_if_missing, write_json, write_text
 from .models import (
+    DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
     DEFAULT_EFFORTS,
     DEFAULT_RETRY_PER_STAGE,
     DEFAULT_SESSION_MAX_ATTEMPTS,
+    DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
     ProjectConfig,
     RunState,
     SESSION_HARD_CEILING,
@@ -131,6 +133,7 @@ DEFAULT_CONFIG = {
             "cwd_flag": "-C",
             "prompt_via_stdin": True,
             "output_flag": "-o",
+            "idle_timeout_seconds": DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
         },
         "copilot-cli": {
             "kind": "copilot-cli",
@@ -145,6 +148,7 @@ DEFAULT_CONFIG = {
             "prompt_via_stdin": True,
             "output_flag": "",
             "timeout_seconds": 3600,
+            "idle_timeout_seconds": DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
         },
     },
     "active_provider": "codex",

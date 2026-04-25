@@ -261,7 +261,8 @@ Example project config (`providers` and `active_provider` only):
       "cwd_flag": "-C",
       "prompt_via_stdin": true,
       "output_flag": "-o",
-      "timeout_seconds": 1800
+      "timeout_seconds": 1800,
+      "idle_timeout_seconds": 3600
     },
     "copilot-cli": {
       "kind": "copilot-cli",
@@ -275,7 +276,8 @@ Example project config (`providers` and `active_provider` only):
       "cwd_flag": "",
       "prompt_via_stdin": true,
       "output_flag": "",
-      "timeout_seconds": 3600
+      "timeout_seconds": 3600,
+      "idle_timeout_seconds": 3600
     }
   },
   "active_provider": "codex"
@@ -284,6 +286,9 @@ Example project config (`providers` and `active_provider` only):
 
 Legacy auto-generated `copilot-cli.timeout_seconds = 1800` configs are treated as the old default
 and normalize to `3600` on load.
+
+New project configs write `idle_timeout_seconds: 3600` for the bundled providers, and omitted
+provider entries now also default to `3600` on load.
 
 To use an absolute path instead of the conventional `~/.copilot/profiles/` location, set the
 `providers.copilot-cli.profile_map` value to the full path:
