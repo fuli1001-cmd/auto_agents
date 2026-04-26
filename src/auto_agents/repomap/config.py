@@ -9,6 +9,7 @@ DEFAULT_INCLUDE_GLOBS: List[str] = ["**/*.py"]
 DEFAULT_EXCLUDE_GLOBS: List[str] = [
     ".auto-agents/**",
     ".conda/**",
+    ".conda-pkgs/**",
     ".venv/**",
     "venv/**",
     "**/__pycache__/**",

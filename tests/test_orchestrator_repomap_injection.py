@@ -113,6 +113,17 @@ class OrchestratorRepoMapInjectionTests(unittest.TestCase):
             self.assertFalse(reloaded.repo_map.enabled)
             self.assertEqual(reloaded.repo_map.budget_tokens, 999)
 
+    def test_new_project_writes_repo_map_default_globs(self) -> None:
+        from auto_agents.config import load_project_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+
+            cfg = load_project_config(project_root)
+            self.assertEqual(cfg.repo_map.include_globs, ["**/*.py"])
+            self.assertIn(".conda-pkgs/**", cfg.repo_map.exclude_globs)
+
 
 if __name__ == "__main__":
     unittest.main()

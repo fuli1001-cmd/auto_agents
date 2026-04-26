@@ -34,7 +34,7 @@ def is_python_project(
     other_count = 0
     scanned = 0
     skip_dirs = {
-        ".git", ".auto-agents", ".conda", ".venv", "venv",
+        ".git", ".auto-agents", ".conda", ".conda-pkgs", ".venv", "venv",
         "node_modules", "__pycache__", "build", "dist",
     }
     for path in root.rglob("*"):

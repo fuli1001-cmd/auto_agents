@@ -106,6 +106,17 @@ class DetectorTests(unittest.TestCase):
             ok, _reason = is_python_project(root)
             self.assertFalse(ok)
 
+    def test_conda_pkgs_does_not_make_project_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / ".conda-pkgs" / "lib"
+            pkg.mkdir(parents=True)
+            (pkg / "stdlib.py").write_text("def helper(): pass\n", encoding="utf-8")
+            (root / "README.md").write_text("# demo\n", encoding="utf-8")
+            ok, reason = is_python_project(root)
+            self.assertFalse(ok)
+            self.assertEqual(reason, "no_python_files")
+
 
 if __name__ == "__main__":
     unittest.main()
