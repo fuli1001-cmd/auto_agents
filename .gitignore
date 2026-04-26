@@ -6,4 +6,4 @@ __pycache__/
 dist/
 build/
 .DS_Store
-
+.auto-agents/state/repomap_cache.json
