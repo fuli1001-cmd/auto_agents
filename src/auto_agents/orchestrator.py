@@ -104,6 +104,10 @@ class Orchestrator:
         self._current_provider: str = self.config.active_provider
         self._repo_map_builder: Optional[RepoMapBuilder] = None
         self._last_repo_map_result: Optional[RepoMapResult] = None
+        # Snapshot of active/deferred REQ IDs captured BEFORE a clarify
+        # iteration generation; used by _clarify_validation_feedback to
+        # detect silent deletion of existing requirements.
+        self._clarify_pre_trace_ids: Set[str] = set()
 
     @staticmethod
     def init_project(
@@ -823,6 +827,15 @@ class Orchestrator:
         # Generate the actual project brief
         print("\nGenerating project_brief.md, please wait...", file=sys.stderr, flush=True)
         is_iteration = any(t.status == "done" for t in state.tasks)
+        # Snapshot active/deferred REQ IDs so _clarify_validation_feedback can
+        # detect silent deletion (iteration must use status='superseded' rather
+        # than removal). Empty set on first run.
+        if is_iteration:
+            self._clarify_pre_trace_ids = self._active_or_deferred_req_ids(
+                load_requirements_trace(self.project_root)
+            )
+        else:
+            self._clarify_pre_trace_ids = set()
         generate_prompt = self._build_prompt(stage="clarify", spec_file=spec_file, is_iteration=is_iteration)
         if history:
             generate_prompt += "\n\n--- Conversation History ---\n"
@@ -2268,6 +2281,11 @@ class Orchestrator:
                     "ADD or UPDATE sections relevant to the new iteration scope while preserving existing content.",
                     "Extend existing sections in place rather than appending a separate duplicate block at the end.",
                     f"Review the existing task plan at {task_plan_path(self.project_root)} to understand what has already been completed.",
+                    "The existing requirements_trace.json is a CUMULATIVE contract across iterations; downstream task plans reference REQ IDs by value.",
+                    "Do NOT delete existing REQ entries and do NOT renumber or reuse REQ IDs from the existing trace.",
+                    "Mark requirements that are no longer in scope as status='superseded' (preserve id/text/source/acceptance_oracles) instead of removing them.",
+                    "For new iteration scope, append entries with new IDs that continue the existing numbering (e.g., if the highest existing ID is REQ-029, the next new one is REQ-030).",
+                    "Only add a brand-new requirement when it cannot be expressed as an update to an existing active or deferred entry.",
                 ])
             lines.append("Final response: 3 short bullets summarizing the clarified scope.")
             return "\n".join(lines)
@@ -3430,6 +3448,27 @@ class Orchestrator:
         errors = validate_required_document(path, "project_brief.md")
         trace = load_requirements_trace(self.project_root)
         errors.extend(validate_requirements_trace_payload(trace))
+
+        # Iteration safety: detect silent deletion of pre-existing REQ IDs.
+        # The pre-snapshot is captured in _run_interactive_clarify before
+        # generation; on first run it is empty so this check is a no-op.
+        pre_ids = getattr(self, "_clarify_pre_trace_ids", set()) or set()
+        if pre_ids:
+            current_ids = {
+                str(item.get("id", "")).strip()
+                for item in (trace.get("requirements") or [])
+                if isinstance(item, dict) and str(item.get("id", "")).strip()
+            }
+            missing = sorted(pre_ids - current_ids)
+            if missing:
+                preview = ", ".join(missing[:10])
+                more = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+                errors.append(
+                    "iteration trace deleted existing REQ IDs without marking them superseded: "
+                    f"{preview}{more}. Restore these entries; if they are no longer in scope, "
+                    "keep id/text/source/acceptance_oracles and set status='superseded' instead of removing them."
+                )
+
         if not errors:
             return None
         bullets = "\n".join(f"- {item}" for item in errors)
@@ -3438,6 +3477,24 @@ class Orchestrator:
             "preserving required brief headings and valid requirements_trace.json shape.\n"
             f"{bullets}"
         )
+
+    @staticmethod
+    def _active_or_deferred_req_ids(trace: dict) -> Set[str]:
+        ids: Set[str] = set()
+        for item in (trace.get("requirements") or []):
+            if not isinstance(item, dict):
+                continue
+            req_id = str(item.get("id", "")).strip()
+            if not req_id:
+                continue
+            status = str(item.get("status", "")).strip().lower()
+            # Superseded entries are already obsolete; we only require that
+            # active/deferred entries are not silently dropped. (We still
+            # forbid deleting superseded entries via the prompt, but we do
+            # not hard-fail on those to avoid blocking long-tail cleanup.)
+            if status in ("", "active", "deferred"):
+                ids.add(req_id)
+        return ids
 
     def _design_validation_feedback(self, _: AgentResult) -> Optional[str]:
         path = docs_dir(self.project_root) / "architecture.md"
