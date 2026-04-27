@@ -2264,7 +2264,7 @@ class Orchestrator:
             lines = common + [
                 f"Read the input spec from: {spec_file}",
                 f"Update this file in place: {brief}",
-                f"Generate or update the requirements trace in place: {requirements_trace}",
+                f"Write the requirements trace at: {requirements_trace}",
                 "Keep the brief compact and focused on the target scope.",
                 "Preserve the exact top-level and section headings already present in the file.",
                 "The requirements trace is the downstream execution contract. It must be valid JSON with version=1 and a requirements list.",
@@ -2274,6 +2274,11 @@ class Orchestrator:
                 self._clarify_spec_instruction(spec_kind),
                 self._document_language_instruction(),
             ]
+            if not is_iteration:
+                lines.append(
+                    "This is the FIRST clarify run; the requirements trace is empty. "
+                    "Populate it with the requirements derived from the input spec."
+                )
             if is_iteration:
                 lines.extend([
                     f"This is an ITERATION run. The project already has completed work and an existing brief at {brief}.",
