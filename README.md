@@ -97,6 +97,9 @@ Manual approvals are supported at three high-value gates:
 - `architecture`
 - `release`
 
+`run --auto-approve` auto-passes those manual gates only. It does not disable interactive clarify or
+README conversations.
+
 ## Repo map (token saver)
 
 Implement / review / fix prompts are augmented with a token-budgeted, ranked

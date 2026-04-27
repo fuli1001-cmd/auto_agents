@@ -572,11 +572,7 @@ class Orchestrator:
 
     def _run_agent_stage(self, stage: str, state: RunState, spec_file: Path, auto_approve: bool = False) -> RunState:
         if stage == "clarify":
-            if auto_approve:
-                # If auto_approve is on, skip conversation and just do a single-shot generation
-                pass
-            else:
-                return self._run_interactive_clarify(state, spec_file)
+            return self._run_interactive_clarify(state, spec_file)
 
         is_iteration = any(t.status == "done" for t in state.tasks)
         prompt = self._build_prompt(stage=stage, spec_file=spec_file, is_iteration=is_iteration)

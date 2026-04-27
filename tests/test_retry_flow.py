@@ -1808,7 +1808,9 @@ class IterationAdapter:
 
     def run(self, request):
         self.stage_calls.append(request.stage)
-        if request.stage == "plan":
+        if request.stage == "clarify":
+            write_text(request.output_path, "Clarified iteration scope.\nREADY_TO_GENERATE\n")
+        elif request.stage == "plan":
             # Read existing plan so we can preserve done tasks
             import json
             existing = {"tasks": []}
@@ -1994,6 +1996,59 @@ class IterationFlowTests(unittest.TestCase):
             self.assertEqual(state.pending_approval, "requirements")
             # approved_gates should be empty (cleared at iteration start)
             self.assertEqual(state.approved_gates, [])
+
+    def test_auto_approve_still_runs_interactive_clarify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\nPhase 1 features.\n", encoding="utf-8")
+
+            config = load_project_config(project_root)
+            config.approvals.enabled = ["requirements"]
+            save_project_config(project_root, config)
+
+            state = load_run_state(project_root)
+            state.stage_summaries = {
+                "design": "done",
+                "plan": "done",
+                "provider_research": "done",
+                "implement": "done",
+                "verify": "done",
+                "readme": "done",
+            }
+            from auto_agents.models import TaskSpec
+
+            state.tasks = [
+                TaskSpec(
+                    task_id="task-001",
+                    title="Existing task",
+                    description="Already complete.",
+                    acceptance=["done"],
+                    status="done",
+                    commit_message="feat: done",
+                )
+            ]
+            save_run_state(project_root, state)
+
+            orchestrator = Orchestrator(project_root)
+            interactive_calls: list[str] = []
+
+            def fake_interactive(state, clarify_spec_file):
+                interactive_calls.append(str(clarify_spec_file))
+                state.current_stage = "clarify"
+                state.stage_summaries["clarify"] = "clarified"
+                state.last_error = ""
+                return state
+
+            orchestrator._run_interactive_clarify = fake_interactive
+
+            state = orchestrator.run(spec_file=spec_file, auto_approve=True, skip_validate=True)
+
+            self.assertEqual(interactive_calls, [str(spec_file)])
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(state.pending_approval, "")
+            self.assertIn("requirements", state.approved_gates)
 
     def test_reject_architecture_clears_downstream_state(self):
         """Rejecting architecture should clear design+ downstream summaries
