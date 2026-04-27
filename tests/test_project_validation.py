@@ -589,7 +589,7 @@ class ProjectValidationTests(unittest.TestCase):
 
             class FakeState:
                 def to_dict(self):
-                    return {"status": "completed"}
+                    return {"status": "completed", "run_id": "run-123"}
 
             class FakeOrchestrator:
                 def __init__(self, project_root, agent_output_stream=None):
@@ -607,9 +607,12 @@ class ProjectValidationTests(unittest.TestCase):
                         ["run", "--project", str(project_root), "--spec-file", str(spec_file), "--print-agent-output"]
                     )
 
-            payload = json.loads(buffer.getvalue())
+            rendered = buffer.getvalue()
             self.assertEqual(exit_code, 0)
-            self.assertEqual(payload["status"], "completed")
+            self.assertIn("Run completed successfully.", rendered)
+            self.assertIn(".auto-agents/state/task_plan.json", rendered)
+            self.assertIn(".auto-agents/state/run_state.json", rendered)
+            self.assertIn(".auto-agents/runs/run-123/outputs", rendered)
             self.assertTrue(calls["print_agent_output"])
             self.assertTrue(calls["has_stream"])
 
@@ -640,9 +643,10 @@ class ProjectValidationTests(unittest.TestCase):
                         ["run", "--project", str(project_root), "--spec-file", str(spec_file), "--allow-dirty-tree"]
                     )
 
-            payload = json.loads(buffer.getvalue())
+            rendered = buffer.getvalue()
             self.assertEqual(exit_code, 0)
-            self.assertEqual(payload["status"], "completed")
+            self.assertIn("Run completed successfully.", rendered)
+            self.assertIn("python3 -m auto_agents status --project", rendered)
             self.assertTrue(calls["allow_dirty_tree"])
 
     def test_cli_run_passes_document_language_override(self) -> None:
@@ -672,12 +676,13 @@ class ProjectValidationTests(unittest.TestCase):
                         ["run", "--project", str(project_root), "--spec-file", str(spec_file), "--doc-language", "zh"]
                     )
 
-            payload = json.loads(buffer.getvalue())
+            rendered = buffer.getvalue()
             self.assertEqual(exit_code, 0)
-            self.assertEqual(payload["status"], "completed")
+            self.assertIn("Run completed successfully.", rendered)
+            self.assertIn("README.md", rendered)
             self.assertEqual(calls["doc_language"], "zh")
 
-    def test_cli_run_prints_utf8_json_for_chinese_stage_summaries(self) -> None:
+    def test_cli_run_prints_pending_approval_guidance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             spec_file = project_root / "spec.md"
@@ -687,10 +692,9 @@ class ProjectValidationTests(unittest.TestCase):
             class FakeState:
                 def to_dict(self):
                     return {
-                        "status": "completed",
-                        "stage_summaries": {
-                            "clarify": "聚焦核心目标",
-                        },
+                        "status": "paused",
+                        "pending_approval": "requirements",
+                        "run_id": "run-456",
                     }
 
             class FakeOrchestrator:
@@ -709,10 +713,14 @@ class ProjectValidationTests(unittest.TestCase):
 
             rendered = buffer.getvalue()
             self.assertEqual(exit_code, 0)
-            self.assertIn("聚焦核心目标", rendered)
-            self.assertNotIn("\\u805a\\u7126", rendered)
-            payload = json.loads(rendered)
-            self.assertEqual(payload["stage_summaries"]["clarify"], "聚焦核心目标")
+            self.assertIn("Run paused: approval required for requirements.", rendered)
+            self.assertIn(".auto-agents/docs/project_brief.md", rendered)
+            self.assertIn(".auto-agents/state/requirements_trace.json", rendered)
+            self.assertIn(".auto-agents/state/run_state.json", rendered)
+            self.assertIn(".auto-agents/runs/run-456/outputs", rendered)
+            self.assertIn("python3 -m auto_agents approve --project", rendered)
+            self.assertIn("--gate requirements", rendered)
+            self.assertIn("python3 -m auto_agents reject --project", rendered)
 
     def test_orchestrator_emits_agent_output_to_stderr_stream(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

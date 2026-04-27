@@ -2,9 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from pathlib import Path
 
+from .config import (
+    architecture_path,
+    project_brief_path,
+    requirements_audit_path,
+    requirements_trace_path,
+    run_path,
+    run_state_path,
+    task_plan_path,
+)
 from .config import supported_provider_kinds
 from .orchestrator import Orchestrator
 from .validation import validation_report
@@ -22,6 +32,118 @@ def _default_spec_file(project: Path) -> Path:
 def _confirm_prompt(project_root: Path, prompt: str, default: str = "n") -> str:
     orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
     return orchestrator._prompt_user(prompt, default=default)
+
+
+def _display_path(project_root: Path, path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(project_root.resolve()))
+    except ValueError:
+        return str(path)
+
+
+def _format_command(*parts: str) -> str:
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def _render_key_files(project_root: Path, state_payload: dict[str, object]) -> list[str]:
+    run_id = str(state_payload.get("run_id", "")).strip()
+    pending_approval = str(state_payload.get("pending_approval", "")).strip()
+
+    key_files: list[Path] = []
+    if pending_approval == "requirements":
+        key_files.extend([
+            project_brief_path(project_root),
+            requirements_trace_path(project_root),
+        ])
+    elif pending_approval == "architecture":
+        key_files.append(architecture_path(project_root))
+    elif pending_approval == "release":
+        key_files.extend([
+            requirements_audit_path(project_root),
+            task_plan_path(project_root),
+        ])
+    else:
+        key_files.extend([
+            project_root / "README.md",
+            task_plan_path(project_root),
+        ])
+
+    key_files.append(run_state_path(project_root))
+    rendered = [_display_path(project_root, path) for path in key_files]
+    if run_id:
+        rendered.append(_display_path(project_root, run_path(project_root, run_id) / "outputs"))
+    return rendered
+
+
+def _render_run_summary(project_root: Path, state_payload: dict[str, object]) -> str:
+    status = str(state_payload.get("status", "")).strip()
+    pending_approval = str(state_payload.get("pending_approval", "")).strip()
+    current_stage = str(state_payload.get("current_stage", "")).strip() or "unknown"
+
+    key_files = _render_key_files(project_root, state_payload)
+    status_cmd = _format_command("python3", "-m", "auto_agents", "status", "--project", str(project_root))
+    run_cmd = _format_command("python3", "-m", "auto_agents", "run", "--project", str(project_root))
+
+    if status == "paused" and pending_approval:
+        approve_cmd = _format_command(
+            "python3",
+            "-m",
+            "auto_agents",
+            "approve",
+            "--project",
+            str(project_root),
+            "--gate",
+            pending_approval,
+        )
+        reject_cmd = _format_command(
+            "python3",
+            "-m",
+            "auto_agents",
+            "reject",
+            "--project",
+            str(project_root),
+            "--gate",
+            pending_approval,
+            "--reason",
+            "<feedback>",
+        )
+        lines = [
+            f"Run paused: approval required for {pending_approval}.",
+            "",
+            "Key files to review:",
+            *[f"- {item}" for item in key_files],
+            "",
+            "Next steps:",
+            f"- Approve and continue: {approve_cmd} && {run_cmd}",
+            f"- Reject and revise: {reject_cmd} && {run_cmd}",
+            f"- Inspect persisted status: {status_cmd}",
+        ]
+        return "\n".join(lines)
+
+    if status == "completed":
+        lines = [
+            "Run completed successfully.",
+            "",
+            "Key files to review:",
+            *[f"- {item}" for item in key_files],
+            "",
+            "Next steps:",
+            "- Review the generated files above.",
+            f"- Inspect persisted status: {status_cmd}",
+            f"- Start another iteration later: {run_cmd}",
+        ]
+        return "\n".join(lines)
+
+    lines = [
+        f"Run finished with status: {status or 'unknown'} (stage: {current_stage}).",
+        "",
+        "Key files to review:",
+        *[f"- {item}" for item in key_files],
+        "",
+        "Next steps:",
+        f"- Inspect persisted status: {status_cmd}",
+    ]
+    return "\n".join(lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -248,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
                 doc_language=args.doc_language,
                 provider_kind=args.provider,
             )
-            print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
+            print(_render_run_summary(project_root, state.to_dict()))
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))

@@ -172,7 +172,7 @@ python3 -m auto_agents run --project /tmp/demo
 The input spec can be either a rough product idea or a more detailed design document. The
 orchestrator classifies it automatically and adjusts the clarify/design prompts accordingly.
 
-Stream agent stdout and stderr to the terminal while keeping the final JSON response on stdout:
+Stream agent stdout and stderr to the terminal while keeping the final run summary on stdout:
 
 ```bash
 python3 -m auto_agents run --project /tmp/demo --print-agent-output
