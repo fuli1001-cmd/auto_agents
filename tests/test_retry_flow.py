@@ -16,7 +16,7 @@ from auto_agents.config import (
     save_run_state,
     task_plan_path,
 )
-from auto_agents.git_ops import worktree_fingerprint
+from auto_agents.git_ops import changed_paths, commit_all, worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
@@ -2173,9 +2173,57 @@ class ScopeOverflowTests(unittest.TestCase):
             self.assertNotIn("plan", result.stage_summaries)
             # Task reset to pending (not blocked) so plan can split it.
             self.assertEqual(result.tasks[0].status, "pending")
+            self.assertEqual(changed_paths(project_root), [])
+            self.assertFalse((project_root / "artifact-1.txt").exists())
+            self.assertFalse((project_root / "artifact-2.txt").exists())
             # Two review failures are enough to trigger the signal (attempt 1 records
             # fingerprint, attempt 2 matches it).
             self.assertGreaterEqual(orchestrator.adapter.review_calls, 2)
+
+    def test_scope_overflow_rewind_failure_stops_split(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.retries.implement = 4
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = RepeatReviewBlockerAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-big",
+                            "title": "Cross-cutting task",
+                            "description": "Bundles too many concerns.",
+                            "acceptance": ["all layers updated"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "split_depth": 0,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            import auto_agents.orchestrator as orch_mod
+
+            original_reset = orch_mod.hard_reset_clean
+            try:
+                orch_mod.hard_reset_clean = lambda *_args, **_kwargs: False
+                with self.assertRaises(RuntimeError) as ctx:
+                    orchestrator._run_implementation_loop(state, max_tasks=1)
+            finally:
+                orch_mod.hard_reset_clean = original_reset
+
+            self.assertIn("scope-overflow rewind failed to restore the baseline", str(ctx.exception))
 
     def test_split_depth_cap_blocks_instead_of_rewinding(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2355,6 +2403,8 @@ class ScopeArbiterTests(unittest.TestCase):
                 ]
             },
         )
+        if with_review_history:
+            commit_all(project_root, "test: persist blocked task baseline")
         return project_root, orchestrator
 
     def test_arbiter_parses_split_and_continue(self) -> None:

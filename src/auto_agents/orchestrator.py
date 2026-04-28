@@ -1272,8 +1272,13 @@ class Orchestrator:
         if int(task.split_depth) >= self.MAX_SPLIT_DEPTH:
             return None
 
-        baseline_ref = task.verify_baseline_ref or state.stage_summaries.get("implement_baseline_ref", "") or "HEAD"
-        hard_reset_clean(self.project_root, baseline_ref)
+        baseline_ref = task.verify_baseline_ref or state.stage_summaries.get("implement_baseline_ref", "")
+        rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
+        if not hard_reset_clean(self.project_root, rewind_ref):
+            raise RuntimeError(
+                "scope-overflow rewind failed to restore the baseline before "
+                f"splitting task {task.task_id}. Resolved git ref: {rewind_ref}."
+            )
 
         task.status = "pending"
         task.review_summary = str(gate_result.get("review", ""))
@@ -1393,6 +1398,19 @@ class Orchestrator:
 
     def _task_verify_baseline_ref(self) -> str:
         return f"{head_ref(self.project_root)}:{worktree_fingerprint(self.project_root)}"
+
+    @staticmethod
+    def _git_ref_from_verify_baseline_ref(baseline_ref: str) -> str:
+        candidate = str(baseline_ref or "").strip()
+        if not candidate:
+            return ""
+        head, sep, _ = candidate.partition(":")
+        if sep:
+            if re.fullmatch(r"[0-9a-f]{7,40}", head, flags=re.IGNORECASE):
+                return head
+            if not head:
+                return ""
+        return candidate
 
     def _ensure_task_verify_baseline(self, task: TaskSpec) -> bool:
         baseline_ref = self._task_verify_baseline_ref()
