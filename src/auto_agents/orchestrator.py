@@ -26,6 +26,7 @@ from .config import (
     requirements_trace_path,
     review_path,
     run_artifact_paths,
+    run_state_path,
     save_project_config,
     save_run_state,
     save_task_plan,
@@ -737,6 +738,7 @@ class Orchestrator:
                     f"Project root: {self.project_root}",
                     "Read the input spec from: " + str(spec_file),
                     "Clarify will later generate both project_brief.md and .auto-agents/state/requirements_trace.json.",
+                    "During these clarify conversation turns, do NOT modify repository files yet; ask questions and reason only.",
                     "As you discuss requirements, identify concrete mandatory requirements, non-goals, acceptance oracles, forbidden patterns, and any external provider docs needed.",
                     "If the project repository already contains an active codebase and a history of completed tasks, please review them to understand the current progress before discussing the next features.",
                     "You are an expert product manager analyzing the spec.",
@@ -972,6 +974,7 @@ class Orchestrator:
             "too coupled / too large to land in one implement+review cycle, given the failure",
             "history below. You are NOT reviewing code correctness; the review agent already did",
             "that. You judge task SIZING.",
+            "This stage is read-only. Do not modify any repository files.",
             "",
             "Decide ONE of:",
             "  - CONTINUE: the task is the right size; the implementer just needs another",
@@ -1093,6 +1096,142 @@ class Orchestrator:
         parsed["raw"] = raw
         parsed["error"] = ""
         return parsed
+
+    def _worktree_change_snapshot(self) -> Dict[str, str]:
+        snapshot: Dict[str, str] = {}
+        for status, path in changed_entries(self.project_root, ignored_prefixes=()):
+            hasher = hashlib.sha256()
+            hasher.update(status.encode("utf-8"))
+            hasher.update(b"\0")
+            file_path = self.project_root / path
+            if file_path.is_file():
+                hasher.update(file_path.read_bytes())
+            elif file_path.exists():
+                hasher.update(b"[dir]")
+            else:
+                hasher.update(b"[missing]")
+            snapshot[path] = hasher.hexdigest()
+        return snapshot
+
+    @staticmethod
+    def _snapshot_delta_paths(before: Dict[str, str], after: Dict[str, str]) -> List[str]:
+        return sorted(
+            path for path in set(before) | set(after)
+            if before.get(path) != after.get(path)
+        )
+
+    @staticmethod
+    def _changed_path_preview(paths: Iterable[str], limit: int = 5) -> str:
+        normalized = [str(path).strip() for path in paths if str(path).strip()]
+        if not normalized:
+            return ""
+        preview = ", ".join(normalized[:limit])
+        if len(normalized) > limit:
+            preview += f", +{len(normalized) - limit} more"
+        return preview
+
+    def _relative_repo_path(self, path: Path) -> str:
+        return str(path.relative_to(self.project_root)).replace("\\", "/")
+
+    def _stage_mutation_policy(
+        self,
+        *,
+        stage: str,
+        stage_key: str,
+        run_id: str,
+    ) -> Tuple[List[str], Callable[[str], bool]]:
+        run_prefix = f".auto-agents/runs/{run_id}/"
+        brief_path = self._relative_repo_path(docs_dir(self.project_root) / "project_brief.md")
+        architecture_path = self._relative_repo_path(docs_dir(self.project_root) / "architecture.md")
+        trace_path = self._relative_repo_path(requirements_trace_path(self.project_root))
+        plan_path = self._relative_repo_path(task_plan_path(self.project_root))
+        readme_path = "README.md"
+        provider_lock_path = self._relative_repo_path(provider_references_lock_path(self.project_root))
+        provider_refs_prefix = self._relative_repo_path(provider_references_dir(self.project_root)).rstrip("/") + "/"
+        run_state_rel = self._relative_repo_path(run_state_path(self.project_root))
+        auto_gitignore_rel = ".auto-agents/.gitignore"
+
+        if stage == "clarify":
+            if stage_key == "clarify-generate":
+                allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, brief_path, trace_path]
+                return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel, brief_path, trace_path}
+            allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel]
+            return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel}
+
+        if stage == "design":
+            allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, architecture_path]
+            return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel, architecture_path}
+
+        if stage == "plan":
+            allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, plan_path]
+            return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel, plan_path}
+
+        if stage == "provider_research":
+            allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, provider_lock_path, f"{provider_refs_prefix}**"]
+            return allowed, (
+                lambda path: path.startswith(run_prefix)
+                or path == run_state_rel
+                or path == auto_gitignore_rel
+                or path == provider_lock_path
+                or path.startswith(provider_refs_prefix)
+            )
+
+        if stage == "readme":
+            if stage_key.startswith("readme-propose"):
+                allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel]
+                return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel}
+            allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, readme_path]
+            return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel, readme_path}
+
+        if stage == "implement":
+            allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, "any non-.auto-agents project path"]
+            return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel} or not path.startswith(".auto-agents/")
+
+        allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel]
+        return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel}
+
+    def _assert_stage_mutation_scope(
+        self,
+        *,
+        stage: str,
+        stage_key: str,
+        run_id: str,
+        before_snapshot: Dict[str, str],
+    ) -> None:
+        after_snapshot = self._worktree_change_snapshot()
+        delta_paths = self._snapshot_delta_paths(before_snapshot, after_snapshot)
+        if not delta_paths:
+            return
+        allowed_scope, is_allowed = self._stage_mutation_policy(
+            stage=stage,
+            stage_key=stage_key,
+            run_id=run_id,
+        )
+        offending = [path for path in delta_paths if not is_allowed(path)]
+        if not offending:
+            return
+        raise RuntimeError(
+            f"stage {stage} modified files outside its ownership during {stage_key}. "
+            f"Changed paths: {self._changed_path_preview(offending)}. "
+            f"Allowed scope: {'; '.join(allowed_scope)}."
+        )
+
+    def _run_gate_commands(self, *, collect_all: bool, context: str):
+        before_snapshot = self._worktree_change_snapshot()
+        gate = (
+            run_commands_collect_all(self.config.gates.commands, self.project_root)
+            if collect_all
+            else run_commands(self.config.gates.commands, self.project_root)
+        )
+        after_snapshot = self._worktree_change_snapshot()
+        changed = self._snapshot_delta_paths(before_snapshot, after_snapshot)
+        reason = ""
+        if changed:
+            reason = (
+                f"{context} modified tracked or unignored files: "
+                f"{self._changed_path_preview(changed)}"
+            )
+        return gate, reason
 
     def _implement_touched_code(self) -> bool:
         """Return True if the last implement step touched any non-orchestrator file."""
@@ -1339,11 +1478,21 @@ class Orchestrator:
                 "new_failure_ids": self._normalize_verify_failure_ids([], quick_failure),
                 "raw_output": quick_failure,
             }
-        verify_gate = (
-            run_commands_collect_all(self.config.gates.commands, self.project_root)
-            if task is not None
-            else run_commands(self.config.gates.commands, self.project_root)
+        verify_gate, mutation_error = self._run_gate_commands(
+            collect_all=task is not None,
+            context="task verification commands" if task is not None else "verification commands",
         )
+        if mutation_error:
+            failure_ids = self._normalize_verify_failure_ids([], mutation_error)
+            return {
+                "ok": False,
+                "reason": mutation_error,
+                "failure_ids": failure_ids,
+                "current_failure_ids": failure_ids,
+                "baseline_failure_ids": list(task.verify_baseline_failures) if task is not None else [],
+                "new_failure_ids": failure_ids,
+                "raw_output": mutation_error,
+            }
         current_failure_ids = self._normalize_verify_failure_ids(
             extract_failure_ids(verify_gate),
             verify_gate.summary,
@@ -1420,7 +1569,12 @@ class Orchestrator:
         if not self.config.gates.commands:
             task.verify_baseline_failures = []
             return True
-        gate = run_commands_collect_all(self.config.gates.commands, self.project_root)
+        gate, mutation_error = self._run_gate_commands(
+            collect_all=True,
+            context="task verify baseline commands",
+        )
+        if mutation_error:
+            raise RuntimeError(mutation_error)
         task.verify_baseline_failures = self._normalize_verify_failure_ids(
             extract_failure_ids(gate),
             gate.summary,
@@ -2051,7 +2205,12 @@ class Orchestrator:
         save_run_state(self.project_root, state)
 
     def _run_verify(self, state: RunState) -> RunState:
-        verify_gate = run_commands(self.config.gates.commands, self.project_root)
+        verify_gate, mutation_error = self._run_gate_commands(
+            collect_all=False,
+            context="verify stage commands",
+        )
+        if mutation_error:
+            raise RuntimeError(mutation_error)
         lines = ["# Verify", "", f"Result: {'pass' if verify_gate.ok else 'fail'}", ""]
         for item in verify_gate.commands:
             lines.append(f"- `{item.command}` -> {'ok' if item.ok else 'failed'}")
@@ -2200,6 +2359,7 @@ class Orchestrator:
             f"Read the architecture doc: {architecture}",
             f"Read the task plan: {plan}",
             "You are about to write a README for this project.",
+            "This proposal round is read-only. Do not modify README.md or any other repository file yet.",
             "List the topics / sections you plan to include in the README, with a short description of each.",
             "Do NOT write the README yet. Only outline the planned sections.",
             lang_instruction,
@@ -2228,6 +2388,8 @@ class Orchestrator:
             "Only use official provider documentation or user-provided protocol notes already in the repository.",
             "Do not use blogs, forum answers, random SDK examples, or unofficial mirrors as source of truth.",
             "Do not implement product code in this stage.",
+            "Only modify provider reference markdown files under .auto-agents/docs/provider_references/ and .auto-agents/state/provider_references.lock.json.",
+            "Do not modify project code, tests, README.md, or task-planning artifacts in this stage.",
             "For each requirement below, create or update the provider_reference markdown file named in the trace.",
             "Each reference must include: Status, Retrieved at, Official sources, Authentication, Request, Response, Errors, Contract Test Requirements, Unknowns / Ambiguities.",
             "If official docs are unavailable or ambiguous, write a blocked/needs_user_input reference with the exact missing information and recovery options.",
@@ -2284,6 +2446,7 @@ class Orchestrator:
                 f"Update this file in place: {brief}",
                 f"Write the requirements trace at: {requirements_trace}",
                 "Keep the brief compact and focused on the target scope.",
+                "Only update project_brief.md and requirements_trace.json in this stage; do not modify project code, tests, or other repository documents.",
                 "Preserve the exact top-level and section headings already present in the file.",
                 "The requirements trace is the downstream execution contract. It must be valid JSON with version=1 and a requirements list.",
                 "Every active requirement must have id, text, source, status, priority, acceptance_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields.",
@@ -2319,6 +2482,7 @@ class Orchestrator:
                 f"Read the current project brief: {brief}",
                 f"Update this file in place: {architecture}",
                 "Record only top-level architecture decisions and major risks.",
+                "Only update architecture.md in this stage. Do not modify project code, tests, README.md, or .auto-agents state files.",
                 "Preserve the exact top-level and section headings already present in the file.",
                 self._design_spec_instruction(spec_kind),
                 self._document_language_instruction(),
@@ -2343,6 +2507,7 @@ class Orchestrator:
                 f"Read: {architecture}",
                 f"Read the requirements trace: {requirements_trace}",
                 f"Replace this JSON file with a task plan of minimal verifiable feature slices: {plan}",
+                "Only update .auto-agents/state/task_plan.json in this stage. Do not modify project code, tests, README.md, or other repository files to make the plan pass.",
                 "At the root of the JSON, also define test_strategy and verification_commands.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
                 "All active mandatory requirements in requirements_trace.json must be covered by at least one task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
@@ -2361,6 +2526,7 @@ class Orchestrator:
                 self._plan_spec_instruction(spec_kind),
                 self._plan_language_instruction(),
                 "Review .auto-agents/state/task_plan.json if it exists. DO NOT overwrite or delete existing completed tasks. APPEND new tasks to the end of the JSON array for the new features.",
+                "If future implementation will require test updates, encode that need in task scope, acceptance, and expected_test_migrations. Do NOT pre-edit repository tests in this planning stage.",
                 "When existing completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create tasks for capabilities already delivered by completed tasks.",
                 "CRITICAL — COVERAGE VERIFICATION: when determining whether a done task covers a brief requirement, you MUST compare the requirement against the task's ACCEPTANCE CRITERIA and REVIEW SUMMARY, not its title or description alone. A task titled 'Real X Integration' does NOT cover a requirement for actual real-model output if its acceptance criteria only verify adapter switching, infrastructure patterns, or fixture/stub results rather than actual external API calls producing real output.",
                 "If the brief explicitly states that a capability must be 'real' / 'production' / '真实' / '公网', verify that the done task's acceptance criteria confirm actual external API calls producing real output — not just adapter infrastructure or fixture-based testing.",
@@ -2394,6 +2560,7 @@ class Orchestrator:
                 f"Read the task plan and verification strategy: {plan}",
                 f"Update this file in place: {readme}",
                 "Write a practical README for the finished project, not for auto_agents itself.",
+                "Only update README.md in this final README generation step. Do not modify project code, tests, or .auto-agents planning/state files.",
                 "The README MUST include ALL of the following sections (in any order, using appropriate headings):",
                 "  1. Project overview / introduction",
                 "  2. Currently implemented features (list what has actually been built so far)",
@@ -2626,6 +2793,7 @@ class Orchestrator:
                 "Do not use '.conda' as a generic directory, pip target, virtualenv, or venv path. It must remain a real conda prefix created with 'conda create -p ./.conda ...', including '.conda/conda-meta'.",
                 "For any other stack, keep dependencies and tool state local to the repository and never rely on global installs.",
                 "Do not modify .auto-agents state files except when explicitly requested.",
+                "Do not modify .auto-agents docs/state files or planning artifacts as part of implementation. Keep orchestrator-owned files untouched.",
                 "Final response: 3 short bullets describing what changed.",
             ]
             prompt = "\n".join(lines)
@@ -2654,6 +2822,7 @@ class Orchestrator:
                 "issue 'DECISION: pass' with those concerns listed as '[NON-BLOCKING]' notes.",
                 "For external provider integrations, verify the code and tests against the provider_reference file. Fail if the implementation invents protocol fields, reuses a legacy private gateway payload, or tests only mock an internal gateway contract.",
                 "Use the supplied changed-file and diff context first. Only inspect the rest of the repository when the diff is insufficient.",
+                "This stage is read-only. Do not modify any repository files; return only the review result.",
                 "Return only the review result. Do not include any preamble, file path note, or tool narration.",
                 "The first non-empty line must be exactly 'DECISION: pass' or 'DECISION: fail'.",
                 self._review_language_instruction(),
@@ -2913,6 +3082,7 @@ class Orchestrator:
     ) -> AgentResult:
         attempts = self._max_attempts(stage)
         active_run_id = run_id or (state.run_id if state is not None else load_run_state(self.project_root).run_id)
+        snapshot_before = self._worktree_change_snapshot()
         resolved_effort = effort or self.config.efforts.get(stage, "balanced")
         feedback = ""
         last_error = f"{stage_key} failed"
@@ -2943,6 +3113,12 @@ class Orchestrator:
             if state is not None:
                 state.agent_attempts[stage_key] = attempt
                 save_run_state(self.project_root, state)
+            self._assert_stage_mutation_scope(
+                stage=stage,
+                stage_key=stage_key,
+                run_id=active_run_id,
+                before_snapshot=snapshot_before,
+            )
 
             if not result.ok:
                 last_error = result.stderr or result.summary or f"{stage_key} failed"

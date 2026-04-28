@@ -100,6 +100,151 @@ class VerificationPlanAdapter:
         )
 
 
+class OutOfScopePlanAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+
+    def run(self, request):
+        if request.stage == "plan":
+            write_json(
+                task_plan_path(self.project_root),
+                {
+                    "test_strategy": "python-unittest",
+                    "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Plan slice",
+                            "description": "A valid task plan entry.",
+                            "acceptance": ["Plan remains valid."],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            leaked = self.project_root / "tests" / "test_stage_leak.py"
+            leaked.parent.mkdir(parents=True, exist_ok=True)
+            write_text(leaked, "def test_stage_leak():\n    assert True\n")
+            summary = "plan with out-of-scope mutation\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class OutOfScopeProviderResearchAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+
+    def run(self, request):
+        if request.stage == "provider_research":
+            reference_path = self.project_root / ".auto-agents" / "docs" / "provider_references" / "provider.md"
+            reference_path.parent.mkdir(parents=True, exist_ok=True)
+            write_text(reference_path, "# Provider reference\n")
+            write_json(
+                provider_references_lock_path(self.project_root),
+                {
+                    "version": 1,
+                    "references": {
+                        "provider": {
+                            "path": ".auto-agents/docs/provider_references/provider.md",
+                            "status": "verified",
+                            "retrieved_at": "2026-04-11T00:00:00Z",
+                            "source_urls": ["https://example.com/official"],
+                            "notes": "",
+                        }
+                    },
+                },
+            )
+            leaked = self.project_root / "tests" / "test_provider_stage_leak.py"
+            leaked.parent.mkdir(parents=True, exist_ok=True)
+            write_text(leaked, "def test_provider_stage_leak():\n    assert True\n")
+            summary = "provider research with out-of-scope mutation\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class OutOfScopeReviewAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+
+    def run(self, request):
+        if request.stage == "review":
+            write_text(self.project_root / "notes.txt", "review should be read-only\n")
+            summary = "DECISION: pass\nLooks good.\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class OutOfScopeImplementAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+
+    def run(self, request):
+        if request.stage == "implement":
+            write_text(task_plan_path(self.project_root), "{\"tasks\": []}\n")
+            summary = "implemented with forbidden auto-agents mutation\n"
+        elif request.stage == "review":
+            summary = "DECISION: pass\nLooks good.\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class ReadmeProposalMutationAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.calls = 0
+
+    def run(self, request):
+        if request.stage == "readme":
+            self.calls += 1
+            write_text(self.project_root / "README.md", "# premature write\n")
+            summary = "proposal mutated readme\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class RetryingVerificationCommandAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
@@ -521,11 +666,14 @@ class AuditRecoveryAdapter:
             summary = "DECISION: pass\naudit recovery review passed\n"
             write_text(request.output_path, summary)
         elif request.stage == "readme":
-            write_text(
-                self.project_root / "README.md",
-                "# Demo\n## Overview\nRecovered project.\n## Architecture\nSimple test layout.\n## Usage\n```bash\npython -m demo\n```\n## Development\nRun tests.\n",
-            )
-            summary = "readme updated\n"
+            if "Do NOT write the README yet. Only outline the planned sections." in request.prompt:
+                summary = "- Overview\n- Architecture\n- Usage\n"
+            else:
+                write_text(
+                    self.project_root / "README.md",
+                    "# Demo\n## Overview\nRecovered project.\n## Architecture\nSimple test layout.\n## Usage\n```bash\npython -m demo\n```\n## Development\nRun tests.\n",
+                )
+                summary = "readme updated\n"
             write_text(request.output_path, summary)
         else:
             summary = f"{request.stage}\n"
@@ -613,6 +761,145 @@ class RetryFlowTests(unittest.TestCase):
             config = load_project_config(project_root)
             self.assertEqual(orchestrator.adapter.plan_calls, 2)
             self.assertEqual(config.gates.commands, ["conda run -p ./.conda python -m pytest -q tests/test_ok.py"])
+
+    def test_plan_stage_rejects_out_of_scope_file_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = OutOfScopePlanAdapter(project_root)
+
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            state = load_run_state(project_root)
+
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator._run_agent_stage("plan", state, spec_file)
+
+            self.assertIn("stage plan modified files outside its ownership", str(ctx.exception))
+            self.assertIn("tests/test_stage_leak.py", str(ctx.exception))
+
+    def test_provider_research_rejects_out_of_scope_file_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Use official provider docs.",
+                            "source": "spec.md",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["provider reference is verified"],
+                            "forbidden_patterns": [],
+                            "external_docs_required": True,
+                            "provider_reference": ".auto-agents/docs/provider_references/provider.md",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = OutOfScopeProviderResearchAdapter(project_root)
+            state = load_run_state(project_root)
+
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator._run_provider_research(state, project_root / "spec.md")
+
+            self.assertIn("stage provider_research modified files outside its ownership", str(ctx.exception))
+            self.assertIn("tests/test_provider_stage_leak.py", str(ctx.exception))
+
+    def test_review_stage_rejects_out_of_scope_file_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = OutOfScopeReviewAdapter(project_root)
+            state = load_run_state(project_root)
+            task = orchestrator._load_tasks_from_plan()[0]
+
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator._run_task_review(state.run_id, task)
+
+            self.assertIn("stage review modified files outside its ownership", str(ctx.exception))
+            self.assertIn("notes.txt", str(ctx.exception))
+
+    def test_readme_proposal_stage_rejects_repository_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = ReadmeProposalMutationAdapter(project_root)
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            state = load_run_state(project_root)
+
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator._run_readme(state, spec_file)
+
+            self.assertIn("stage readme modified files outside its ownership during readme-propose", str(ctx.exception))
+            self.assertIn("README.md", str(ctx.exception))
+
+    def test_implement_stage_rejects_auto_agents_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = OutOfScopeImplementAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains good"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertIn("stage implement modified files outside its ownership", str(ctx.exception))
+            self.assertIn(".auto-agents/state/task_plan.json", str(ctx.exception))
+
+    def test_task_verify_rejects_dirty_command_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = [
+                "python -c \"from pathlib import Path; Path('verify-leak.txt').write_text('x', encoding='utf-8')\""
+            ]
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            task = orchestrator._load_tasks_from_plan()[0]
+            result = orchestrator._run_task_verify(task)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("task verification commands modified tracked or unignored files", str(result["reason"]))
+            self.assertIn("verify-leak.txt", str(result["reason"]))
 
     def test_persisted_tasks_keep_generated_verification_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1845,14 +2132,17 @@ class IterationAdapter:
                 summary=summary.strip(), returncode=0,
             )
         elif request.stage == "readme":
-            readme_content = (
-                "# Demo\n## Overview\nA demo project.\n"
-                "## Architecture\nSimple layout.\n"
-                "## Usage\n```bash\npython main.py\n```\n"
-                "## Development\nRun tests.\n"
-            )
-            write_text(self.project_root / "README.md", readme_content)
-            write_text(request.output_path, "readme updated\n")
+            if "Do NOT write the README yet. Only outline the planned sections." in request.prompt:
+                write_text(request.output_path, "- Overview\n- Architecture\n- Usage\n")
+            else:
+                readme_content = (
+                    "# Demo\n## Overview\nA demo project.\n"
+                    "## Architecture\nSimple layout.\n"
+                    "## Usage\n```bash\npython main.py\n```\n"
+                    "## Development\nRun tests.\n"
+                )
+                write_text(self.project_root / "README.md", readme_content)
+                write_text(request.output_path, "readme updated\n")
         else:
             write_text(request.output_path, f"{request.stage}\n")
 

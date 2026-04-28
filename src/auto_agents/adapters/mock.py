@@ -16,6 +16,22 @@ class MockAdapter(AgentAdapter):
         elif request.stage == "review":
             content = "DECISION: pass\nMock review passed.\n"
         elif request.stage == "readme":
+            if "Do NOT write the README yet. Only outline the planned sections." in request.prompt:
+                content = "- Overview\n- Architecture\n- Usage\n"
+                write_text(request.output_path, content)
+                streamed_stdout = False
+                if request.stream_output is not None:
+                    request.stream_output("stdout", content)
+                    streamed_stdout = True
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content.strip(),
+                    stdout=content,
+                    returncode=0,
+                    streamed_stdout=streamed_stdout,
+                )
             use_chinese = "Simplified Chinese" in request.prompt
             readme = (
                 "# Mock Project\n\n"
