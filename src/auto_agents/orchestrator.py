@@ -223,10 +223,16 @@ class Orchestrator:
         for stage in STAGE_ORDER[target_index:]:
             state.stage_summaries.pop(stage, None)
         state.stage_summaries.pop("requirements_audit", None)
+        state.stage_summaries.pop("implement_baseline_ref", None)
         state.pending_approval = ""
         state.status = "pending"
         state.current_stage = target_stage
         state.last_error = ""
+        if target_index <= STAGE_ORDER.index("plan"):
+            state.plan_task_replacements = {}
+        if target_index <= STAGE_ORDER.index("implement"):
+            state.implement_verify_baseline_failures = []
+            state.implement_verify_baseline_ref = ""
 
     def _normalize_legacy_requirements_audit_resume(self, state: RunState) -> bool:
         last_error = state.last_error.strip()
@@ -482,6 +488,9 @@ class Orchestrator:
                     state.approved_gates = []
                     state.agent_attempts = {}
                     state.task_review_cache = {}
+                    state.implement_verify_baseline_failures = []
+                    state.implement_verify_baseline_ref = ""
+                    state.plan_task_replacements = {}
                     save_run_state(self.project_root, state)
                 else:
                     return state
@@ -580,6 +589,7 @@ class Orchestrator:
             return self._run_interactive_clarify(state, spec_file)
 
         is_iteration = any(t.status == "done" for t in state.tasks)
+        prior_tasks = list(state.tasks)
         prompt = self._build_prompt(stage=stage, spec_file=spec_file, is_iteration=is_iteration)
 
         if state.rejected_stage == stage and state.rejection_reason:
@@ -610,6 +620,7 @@ class Orchestrator:
         if stage == "plan":
             self._apply_generated_verification_config()
             state.tasks = self._load_tasks_from_plan()
+            state.plan_task_replacements = self._derive_plan_task_replacements(prior_tasks, state.tasks)
             self._emit_plan_task_count(state.tasks)
         return state
 
@@ -1331,6 +1342,7 @@ class Orchestrator:
             
         state.tasks = tasks
         self._commit_planning_baseline_if_needed(tasks)
+        self._ensure_implement_verify_baseline(state, tasks)
 
         processed = 0
         for task in tasks:
@@ -1411,7 +1423,11 @@ class Orchestrator:
         if int(task.split_depth) >= self.MAX_SPLIT_DEPTH:
             return None
 
-        baseline_ref = task.verify_baseline_ref or state.stage_summaries.get("implement_baseline_ref", "")
+        baseline_ref = (
+            task.verify_baseline_ref
+            or state.implement_verify_baseline_ref
+            or state.stage_summaries.get("implement_baseline_ref", "")
+        )
         rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
         if not hard_reset_clean(self.project_root, rewind_ref):
             raise RuntimeError(
@@ -1466,7 +1482,12 @@ class Orchestrator:
                 "gates.require_clean_git_before_task, or rerun with --allow-dirty-tree."
             ) from error
 
-    def _run_task_verify(self, task: Optional[TaskSpec] = None) -> Dict[str, object]:
+    def _run_task_verify(
+        self,
+        task: Optional[TaskSpec] = None,
+        *,
+        state: Optional[RunState] = None,
+    ) -> Dict[str, object]:
         quick_failure = self._quick_verify_failure()
         if quick_failure:
             return {
@@ -1535,6 +1556,21 @@ class Orchestrator:
                 "new_failure_ids": new_failure_ids or effective_failure_ids,
                 "raw_output": raw_output,
             }
+        stale_plan_audit = self._run_stale_plan_coupled_test_audit(task, state=state)
+        if stale_plan_audit:
+            stale_failure_ids = self._normalize_verify_failure_ids(
+                stale_plan_audit.get("failure_ids", []),
+                str(stale_plan_audit.get("reason", "")),
+            )
+            return {
+                "ok": False,
+                "reason": str(stale_plan_audit["reason"]),
+                "failure_ids": stale_failure_ids,
+                "current_failure_ids": stale_failure_ids,
+                "baseline_failure_ids": baseline_failure_ids,
+                "new_failure_ids": stale_failure_ids,
+                "raw_output": str(stale_plan_audit.get("raw_output", "")),
+            }
         return {
             "ok": True,
             "reason": verify_gate.summary,
@@ -1566,20 +1602,40 @@ class Orchestrator:
         if task.verify_baseline_ref == baseline_ref:
             return False
         task.verify_baseline_ref = baseline_ref
-        if not self.config.gates.commands:
-            task.verify_baseline_failures = []
-            return True
-        gate, mutation_error = self._run_gate_commands(
-            collect_all=True,
-            context="task verify baseline commands",
-        )
-        if mutation_error:
-            raise RuntimeError(mutation_error)
-        task.verify_baseline_failures = self._normalize_verify_failure_ids(
-            extract_failure_ids(gate),
-            gate.summary,
-        )
         return True
+
+    def _ensure_implement_verify_baseline(
+        self,
+        state: RunState,
+        tasks: Iterable[TaskSpec],
+    ) -> bool:
+        baseline_ref = self._task_verify_baseline_ref()
+        changed = False
+        if state.implement_verify_baseline_ref != baseline_ref:
+            state.implement_verify_baseline_ref = baseline_ref
+            if not self.config.gates.commands:
+                state.implement_verify_baseline_failures = []
+            else:
+                gate, mutation_error = self._run_gate_commands(
+                    collect_all=True,
+                    context="implement verify baseline commands",
+                )
+                if mutation_error:
+                    raise RuntimeError(mutation_error)
+                state.implement_verify_baseline_failures = (
+                    self._normalize_verify_failure_ids(extract_failure_ids(gate), gate.summary)
+                    if not gate.ok
+                    else []
+                )
+            changed = True
+        baseline_failures = list(state.implement_verify_baseline_failures)
+        for task in tasks:
+            if task.status == "done":
+                continue
+            if task.verify_baseline_failures != baseline_failures:
+                task.verify_baseline_failures = list(baseline_failures)
+                changed = True
+        return changed
 
     @staticmethod
     def _gate_raw_output(gate_result) -> str:
@@ -1934,12 +1990,20 @@ class Orchestrator:
             doc_language=doc_language,
         )
 
-    def _run_task_review(self, run_id: str, task: TaskSpec, verify_reason: str = "") -> Dict[str, object]:
+    def _run_task_review(
+        self,
+        run_id: str,
+        task: TaskSpec,
+        verify_reason: str = "",
+        state: Optional[RunState] = None,
+    ) -> Dict[str, object]:
         review_effort = self._review_effort_for_task(task)
+        plan_migration_context = self._build_task_plan_migration_context(state, task)
         review_prompt = self._build_task_prompt(
             task,
             "review",
             review_context=self._build_review_context(verify_reason=verify_reason),
+            plan_migration_context=plan_migration_context,
         )
         review_result = self._run_agent_with_retries(
             state=None,
@@ -2346,6 +2410,155 @@ class Orchestrator:
         save_run_state(self.project_root, state)
         self._commit_if_dirty("docs: update README")
         return state
+
+    @staticmethod
+    def _derive_plan_task_replacements(
+        previous_tasks: Iterable[TaskSpec],
+        current_tasks: Iterable[TaskSpec],
+    ) -> Dict[str, List[str]]:
+        previous_ids = {task.task_id for task in previous_tasks if task.task_id.strip()}
+        current_list = [task for task in current_tasks if task.task_id.strip()]
+        current_ids = {task.task_id for task in current_list}
+        replacements: Dict[str, List[str]] = {}
+        for task in current_list:
+            parent_id = task.parent_task_id.strip()
+            if not parent_id or parent_id not in previous_ids or parent_id in current_ids:
+                continue
+            replacements.setdefault(parent_id, []).append(task.task_id)
+        return {
+            retired_id: sorted(set(children))
+            for retired_id, children in replacements.items()
+        }
+
+    @staticmethod
+    def _looks_like_test_path(path: str) -> bool:
+        normalized = str(path or "").strip().replace("\\", "/")
+        if not normalized or normalized.startswith(".auto-agents/"):
+            return False
+        lower = normalized.lower()
+        parts = [part for part in lower.split("/") if part]
+        filename = parts[-1] if parts else lower
+        if any(part in {"tests", "test", "__tests__"} for part in parts[:-1]):
+            return True
+        return (
+            filename.startswith("test_")
+            or filename.endswith("_test.py")
+            or filename.endswith("_spec.py")
+            or ".test." in filename
+            or ".spec." in filename
+        )
+
+    def _repository_test_paths(self) -> List[str]:
+        output = self._git_text("ls-files", "-co", "--exclude-standard")
+        paths: List[str] = []
+        for raw_line in output.splitlines():
+            path = raw_line.strip().replace("\\", "/")
+            if not self._looks_like_test_path(path):
+                continue
+            file_path = self.project_root / path
+            if file_path.is_file():
+                paths.append(path)
+        return sorted(set(paths))
+
+    def _task_plan_replacements_for_retired_id(self, state: RunState, retired_id: str) -> List[str]:
+        replacements = [
+            task.task_id
+            for task in state.tasks
+            if task.parent_task_id.strip() == retired_id and task.task_id.strip()
+        ]
+        mapped = state.plan_task_replacements.get(retired_id, [])
+        return sorted(set([*mapped, *replacements]))
+
+    def _task_retired_plan_ids(self, state: RunState, task: TaskSpec) -> List[str]:
+        current_ids = {item.task_id for item in state.tasks if item.task_id.strip()}
+        retired_ids: Set[str] = set()
+        parent_id = task.parent_task_id.strip()
+        if parent_id and parent_id not in current_ids:
+            retired_ids.add(parent_id)
+        for retired_id, replacements in state.plan_task_replacements.items():
+            if task.task_id in replacements:
+                retired_ids.add(retired_id)
+        return sorted(retired_ids)
+
+    def _build_task_plan_migration_context(self, state: Optional[RunState], task: TaskSpec) -> str:
+        active_state = state or load_run_state(self.project_root)
+        retired_ids = self._task_retired_plan_ids(active_state, task)
+        if not retired_ids:
+            return ""
+        lines = [
+            "PLAN MIGRATION CONTEXT:",
+            "This task is responsible for keeping plan-coupled repository tests aligned with the current task plan.",
+        ]
+        for retired_id in retired_ids:
+            replacements = self._task_plan_replacements_for_retired_id(active_state, retired_id)
+            replacement_text = ", ".join(replacements) if replacements else task.task_id
+            lines.append(
+                f"- Retired task ID `{retired_id}` was replaced by: {replacement_text}."
+            )
+        lines.append(
+            "If repository tests still reference the retired task IDs or rely on the pre-split plan shape, update those tests in this task."
+        )
+        return "\n".join(lines)
+
+    def _run_stale_plan_coupled_test_audit(
+        self,
+        task: Optional[TaskSpec],
+        *,
+        state: Optional[RunState] = None,
+    ) -> Optional[Dict[str, object]]:
+        if task is None:
+            return None
+        active_state = state or load_run_state(self.project_root)
+        retired_ids = self._task_retired_plan_ids(active_state, task)
+        if not retired_ids:
+            return None
+
+        findings: List[Dict[str, object]] = []
+        for relative_path in self._repository_test_paths():
+            content = read_text(self.project_root / relative_path)
+            if not content.strip():
+                continue
+            for retired_id in retired_ids:
+                if retired_id not in content:
+                    continue
+                findings.append(
+                    {
+                        "path": relative_path,
+                        "retired_id": retired_id,
+                        "replacement_ids": self._task_plan_replacements_for_retired_id(active_state, retired_id),
+                    }
+                )
+
+        if not findings:
+            return None
+
+        lines = [
+            "Stale plan-coupled tests still reference retired task IDs for this task's re-plan scope.",
+            "Update the repository tests so they match the current task plan before continuing.",
+        ]
+        failure_ids: List[str] = []
+        seen_failures: Set[str] = set()
+        for item in findings[:12]:
+            retired_id = str(item["retired_id"])
+            path = str(item["path"])
+            replacement_ids = [str(value) for value in item.get("replacement_ids", []) if str(value).strip()]
+            replacement_text = ", ".join(replacement_ids) if replacement_ids else task.task_id
+            lines.append(
+                f"- {path}: replace retired task ID `{retired_id}` with current task-plan references ({replacement_text})."
+            )
+            failure_id = f"stale-plan-coupled-test:{path}:{retired_id}"
+            if failure_id not in seen_failures:
+                failure_ids.append(failure_id)
+                seen_failures.add(failure_id)
+        if len(findings) > 12:
+            lines.append(f"- ... {len(findings) - 12} more stale test reference(s)")
+
+        reason = "\n".join(lines)
+        return {
+            "reason": reason,
+            "failure_ids": failure_ids,
+            "raw_output": reason,
+        }
 
     def _build_readme_proposal_prompt(self, spec_file: Path, history: List[Dict[str, str]] = None) -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
@@ -2762,7 +2975,13 @@ class Orchestrator:
         self._last_repo_map_result = result
         return result.text or ""
 
-    def _build_task_prompt(self, task: TaskSpec, stage: str, review_context: str = "") -> str:
+    def _build_task_prompt(
+        self,
+        task: TaskSpec,
+        stage: str,
+        review_context: str = "",
+        plan_migration_context: str = "",
+    ) -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
         task_json = json.dumps(task.to_dict(), indent=2, ensure_ascii=False)
@@ -2778,6 +2997,8 @@ class Orchestrator:
         ]
         if requirement_context:
             common.extend(["", requirement_context])
+        if plan_migration_context.strip():
+            common.extend(["", plan_migration_context.strip()])
 
         if stage == "implement":
             lines = common + [
@@ -2786,6 +3007,7 @@ class Orchestrator:
                 "The bound requirements and acceptance oracles above are hard requirements, not optional background.",
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
+                "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
                 "Tests should validate observable behavior (API contracts, input/output, side-effects), not internal implementation details.",
                 "For external provider integrations, use the listed provider_reference files as the source of truth. Do not search for alternate docs or invent protocol details unless the reference is marked insufficient; stop and report missing documentation instead.",
                 "For protocol/direct-integration tasks, add contract tests that verify outbound request shape, auth/header behavior, response normalization, and forbidden legacy payloads where applicable.",
@@ -2811,6 +3033,7 @@ class Orchestrator:
                 "input/output, side-effects) rather than internal implementation details. "
                 "If the tests only pass by mocking/faking internal state instead of exercising real "
                 "public interfaces, that is a 'DECISION: fail' issue.",
+                "If plan migration context lists retired task IDs, stale repository tests that still reference those retired IDs or the pre-split task-plan structure are also a 'DECISION: fail' issue.",
                 "SCOPE RULE: Your review scope is bounded by the acceptance criteria in the Task JSON plus the bound requirements and acceptance oracles above. "
                 "A 'DECISION: fail' is warranted ONLY when the implementation does not satisfy one or more "
                 "task acceptance criteria, bound requirement oracles, introduces a regression in existing tests, or leaves the codebase in a "
@@ -2892,7 +3115,11 @@ class Orchestrator:
                 result = None
             else:
                 self._emit_task_activity(task, "implement", attempt)
-                implement_prompt = self._build_task_prompt(task, "implement")
+                implement_prompt = self._build_task_prompt(
+                    task,
+                    "implement",
+                    plan_migration_context=self._build_task_plan_migration_context(state, task),
+                )
                 if feedback:
                     implement_prompt = (
                         f"{implement_prompt}\n\nPrevious attempt issues:\n{feedback}\n\n"
@@ -2959,7 +3186,7 @@ class Orchestrator:
                     break
                 continue
 
-            verify_result = self._run_task_verify(task)
+            verify_result = self._run_task_verify(task, state=state)
             if not verify_result["ok"]:
                 last_reason = str(verify_result["reason"])
                 failure_ids = self._normalize_verify_failure_ids(
@@ -2994,7 +3221,12 @@ class Orchestrator:
             gate_result = self._cached_review_result(state, task, review_fingerprint)
             if gate_result is None:
                 self._emit_task_activity(task, "review", attempt)
-                gate_result = self._run_task_review(state.run_id, task, verify_reason=str(verify_result["reason"]))
+                gate_result = self._run_task_review(
+                    state.run_id,
+                    task,
+                    verify_reason=str(verify_result["reason"]),
+                    state=state,
+                )
                 if gate_result["ok"]:
                     self._store_task_review_cache(
                         state,

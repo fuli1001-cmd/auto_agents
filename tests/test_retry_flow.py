@@ -370,6 +370,38 @@ class BlockedRetryAdapter:
         )
 
 
+class SequentialArtifactAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            write_text(
+                self.project_root / f"artifact-{self.implement_calls}.txt",
+                f"attempt-{self.implement_calls}\n",
+            )
+            summary = f"implemented attempt {self.implement_calls}\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = "DECISION: pass\nsequential task passed review\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class VerifyBeforeReviewAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
@@ -468,6 +500,89 @@ class RetryFeedbackAdapter:
         else:
             summary = f"{request.stage}\n"
             write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class SplitPlanAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+
+    def run(self, request):
+        if request.stage == "plan":
+            write_json(
+                task_plan_path(self.project_root),
+                {
+                    "test_strategy": "python-unittest",
+                    "verification_commands": ["true"],
+                    "tasks": [
+                        {
+                            "task_id": "task-child-a",
+                            "title": "First child",
+                            "description": "First split child.",
+                            "acceptance": ["child a done"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "parent_task_id": "task-legacy",
+                            "split_depth": 1,
+                        },
+                        {
+                            "task_id": "task-child-b",
+                            "title": "Second child",
+                            "description": "Second split child.",
+                            "acceptance": ["child b done"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "parent_task_id": "task-legacy",
+                            "split_depth": 1,
+                        },
+                    ]
+                },
+            )
+            summary = "plan split legacy task\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class StalePlanAuditRecoveryAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+        self.implement_prompts = []
+        self.review_prompts = []
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            self.implement_prompts.append(request.prompt)
+            if self.implement_calls == 2:
+                write_text(
+                    self.project_root / "tests" / "test_plan_contract.py",
+                    "EXPECTED_TASK = 'task-child-a'\n",
+                )
+            write_text(self.project_root / "artifact.txt", f"attempt-{self.implement_calls}\n")
+            summary = f"implemented attempt {self.implement_calls}\n"
+        elif request.stage == "review":
+            self.review_calls += 1
+            self.review_prompts.append(request.prompt)
+            summary = "DECISION: pass\nreview passed after stale test migration\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
         return AgentResult(
             ok=True,
             command=["fake"],
@@ -1394,6 +1509,159 @@ class RetryFlowTests(unittest.TestCase):
                 "test_legacy (tests.test_demo.LegacyTests.test_legacy)"
             ])
             self.assertIn("task baseline only: 1 pre-existing failure(s) remain", stream.getvalue())
+
+    def test_task_verify_baseline_does_not_absorb_failures_from_prior_done_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            config = orchestrator.config
+            config.gates.commands = [
+                (
+                    "python -c \"import json; from pathlib import Path; "
+                    "tasks = json.loads(Path('.auto-agents/state/task_plan.json').read_text(encoding='utf-8')).get('tasks', []); "
+                    "done = any(task.get('task_id') == 'task-001' and task.get('status') == 'done' for task in tasks); "
+                    "print('FAILED tests/test_plan_state.py::test_task_001_stays_pending') if done else None; "
+                    "raise SystemExit(1 if done else 0)\""
+                )
+            ]
+            config.git.commit_each_task = True
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = SequentialArtifactAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "First task",
+                            "description": "Finish the first slice.",
+                            "acceptance": ["artifact-1.txt exists"],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "task-002",
+                            "title": "Second task",
+                            "description": "Start the next slice.",
+                            "acceptance": ["artifact-2.txt exists"],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator._run_implementation_loop(state, max_tasks=2)
+
+            self.assertIn(
+                "new verification failure(s) vs task baseline: tests/test_plan_state.py::test_task_001_stays_pending",
+                str(ctx.exception),
+            )
+            self.assertEqual(state.implement_verify_baseline_failures, [])
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(state.tasks[1].status, "blocked")
+            self.assertEqual(state.tasks[1].verify_baseline_failures, [])
+            self.assertNotIn("task baseline only", stream.getvalue())
+
+    def test_plan_stage_records_split_task_replacements(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = SplitPlanAdapter(project_root)
+
+            from auto_agents.models import TaskSpec
+
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            state = load_run_state(project_root)
+            state.tasks = [
+                TaskSpec(
+                    task_id="task-legacy",
+                    title="Legacy task",
+                    description="Old task before split.",
+                    acceptance=["legacy done"],
+                    status="pending",
+                )
+            ]
+
+            state = orchestrator._run_agent_stage("plan", state, spec_file)
+
+            self.assertEqual(
+                state.plan_task_replacements,
+                {"task-legacy": ["task-child-a", "task-child-b"]},
+            )
+
+    def test_stale_plan_coupled_tests_retry_implement_until_migrated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = StalePlanAuditRecoveryAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-child-a",
+                            "title": "First child",
+                            "description": "Migrate stale test references.",
+                            "acceptance": ["stale tests migrate to child ids"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "parent_task_id": "task-legacy",
+                            "split_depth": 1,
+                        },
+                        {
+                            "task_id": "task-child-b",
+                            "title": "Second child",
+                            "description": "Sibling split child.",
+                            "acceptance": ["sibling remains available"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "parent_task_id": "task-legacy",
+                            "split_depth": 1,
+                        },
+                    ]
+                },
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(exist_ok=True)
+            write_text(tests_dir / "test_plan_contract.py", "EXPECTED_TASK = 'task-legacy'\n")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.plan_task_replacements = {"task-legacy": ["task-child-a", "task-child-b"]}
+
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(state.tasks[1].status, "pending")
+            self.assertIn("PLAN MIGRATION CONTEXT", orchestrator.adapter.implement_prompts[0])
+            self.assertIn("`task-legacy` was replaced by: task-child-a, task-child-b", orchestrator.adapter.implement_prompts[0])
+            self.assertIn(
+                "Stale plan-coupled tests still reference retired task IDs",
+                orchestrator.adapter.implement_prompts[1],
+            )
+            self.assertIn("tests/test_plan_contract.py", orchestrator.adapter.implement_prompts[1])
+            self.assertIn("PLAN MIGRATION CONTEXT", orchestrator.adapter.review_prompts[0])
+            self.assertNotIn(
+                "task-legacy",
+                (project_root / "tests" / "test_plan_contract.py").read_text(encoding="utf-8"),
+            )
 
     def test_verify_failure_logs_repeat_statistics_for_same_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

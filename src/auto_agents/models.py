@@ -399,6 +399,9 @@ class RunState:
     stage_summaries: Dict[str, str] = field(default_factory=dict)
     agent_attempts: Dict[str, int] = field(default_factory=dict)
     task_review_cache: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    implement_verify_baseline_failures: List[str] = field(default_factory=list)
+    implement_verify_baseline_ref: str = ""
+    plan_task_replacements: Dict[str, List[str]] = field(default_factory=dict)
     last_error: str = ""
     rejection_reason: str = ""
     rejected_stage: str = ""
@@ -423,6 +426,15 @@ class RunState:
                 str(key): {str(inner_key): str(inner_value) for inner_key, inner_value in dict(value).items()}
                 for key, value in dict(data.get("task_review_cache", {})).items()
             },
+            implement_verify_baseline_failures=[
+                str(item) for item in data.get("implement_verify_baseline_failures", [])
+            ],
+            implement_verify_baseline_ref=str(data.get("implement_verify_baseline_ref", "")),
+            plan_task_replacements={
+                str(key): [str(item) for item in value]
+                for key, value in dict(data.get("plan_task_replacements", {})).items()
+                if isinstance(value, list)
+            },
             last_error=str(data.get("last_error", "")),
             rejection_reason=str(data.get("rejection_reason", "")),
             rejected_stage=str(data.get("rejected_stage", "")),
@@ -442,6 +454,11 @@ class RunState:
             "task_review_cache": {
                 key: {inner_key: inner_value for inner_key, inner_value in value.items()}
                 for key, value in self.task_review_cache.items()
+            },
+            "implement_verify_baseline_failures": list(self.implement_verify_baseline_failures),
+            "implement_verify_baseline_ref": self.implement_verify_baseline_ref,
+            "plan_task_replacements": {
+                key: list(value) for key, value in self.plan_task_replacements.items()
             },
             "last_error": self.last_error,
             "rejection_reason": self.rejection_reason,

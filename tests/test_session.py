@@ -181,6 +181,9 @@ class RunStateModelTests(unittest.TestCase):
             run_id="run-123",
             status="failed",
             current_stage="provider_research",
+            implement_verify_baseline_failures=["tests/test_demo.py::test_example"],
+            implement_verify_baseline_ref="deadbeef:e3b0c442",
+            plan_task_replacements={"task-legacy": ["task-child-a", "task-child-b"]},
             last_error="provider research is blocked",
             resume_context={
                 "spec_file": "/tmp/demo/spec.md",
@@ -196,6 +199,15 @@ class RunStateModelTests(unittest.TestCase):
         restored = RunState.from_dict(state.to_dict())
         self.assertEqual(restored.run_id, "run-123")
         self.assertEqual(restored.current_stage, "provider_research")
+        self.assertEqual(
+            restored.implement_verify_baseline_failures,
+            ["tests/test_demo.py::test_example"],
+        )
+        self.assertEqual(restored.implement_verify_baseline_ref, "deadbeef:e3b0c442")
+        self.assertEqual(
+            restored.plan_task_replacements,
+            {"task-legacy": ["task-child-a", "task-child-b"]},
+        )
         self.assertEqual(restored.resume_context["spec_file"], "/tmp/demo/spec.md")
         self.assertEqual(restored.resume_context["provider_kind"], "copilot-cli")
 
