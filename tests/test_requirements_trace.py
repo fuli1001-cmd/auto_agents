@@ -14,7 +14,7 @@ from auto_agents.config import (
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import TaskSpec
 from auto_agents.orchestrator import Orchestrator
-from auto_agents.requirements import audit_requirements
+from auto_agents.requirements import audit_requirements, validate_requirements_trace_payload
 from auto_agents.validation import validate_task_plan_with_requirements, validation_report
 
 
@@ -26,6 +26,10 @@ def _requirement(**overrides):
         "status": "active",
         "priority": "mandatory",
         "acceptance_oracles": ["The public API returns normalized provider output."],
+        "oracle_type": "integration_test",
+        "oracle_strength": "behavioral",
+        "evidence_boundary": "system_boundary",
+        "forbidden_proxy_oracles": [],
         "forbidden_patterns": [],
         "external_docs_required": False,
         "provider_reference": "",
@@ -174,6 +178,32 @@ class RequirementsTraceTests(unittest.TestCase):
 
             self.assertTrue(ok)
             self.assertIn("REQ-001: pass", report)
+
+    def test_requirements_trace_requires_quality_contract_fields(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                {
+                    "id": "REQ-001",
+                    "text": "Implement the direct integration.",
+                    "source": "user conversation",
+                    "status": "active",
+                    "priority": "mandatory",
+                    "acceptance_oracles": ["The public API returns normalized provider output."],
+                    "forbidden_patterns": [],
+                    "external_docs_required": False,
+                    "provider_reference": "",
+                    "notes": "",
+                }
+            ],
+        }
+
+        errors = validate_requirements_trace_payload(trace)
+
+        self.assertTrue(any("oracle_type" in item for item in errors))
+        self.assertTrue(any("oracle_strength" in item for item in errors))
+        self.assertTrue(any("evidence_boundary" in item for item in errors))
+        self.assertTrue(any("forbidden_proxy_oracles" in item for item in errors))
 
     def test_provider_research_reuses_verified_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

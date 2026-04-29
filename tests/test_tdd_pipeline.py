@@ -77,6 +77,10 @@ class ImplementPipelineTests(unittest.TestCase):
                             "status": "active",
                             "priority": "mandatory",
                             "acceptance_oracles": ["Outbound requests use the direct endpoint path."],
+                            "oracle_type": "integration_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": ["metadata-only request evidence"],
                             "forbidden_patterns": ["legacy_gateway"],
                             "external_docs_required": True,
                             "provider_reference": ".auto-agents/docs/provider_references/doubao_tts.md",
@@ -99,6 +103,9 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("REQ-001", prompt)
             self.assertIn("Use the official direct TTS endpoint.", prompt)
             self.assertIn("Outbound requests use the direct endpoint path.", prompt)
+            self.assertIn("Oracle strength: behavioral", prompt)
+            self.assertIn("Evidence boundary: system_boundary", prompt)
+            self.assertIn("metadata-only request evidence", prompt)
             self.assertIn(".auto-agents/docs/provider_references/doubao_tts.md", prompt)
             self.assertIn("Do not search for alternate docs", prompt)
 
@@ -135,6 +142,10 @@ class ImplementPipelineTests(unittest.TestCase):
                             "status": "active",
                             "priority": "mandatory",
                             "acceptance_oracles": ["Tests fail if the gateway payload shape is used."],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": ["internal-only serializer unit tests"],
                             "forbidden_patterns": ["GatewayPayload"],
                             "external_docs_required": False,
                             "provider_reference": "",
@@ -155,6 +166,8 @@ class ImplementPipelineTests(unittest.TestCase):
             prompt = orchestrator._build_task_prompt(task, "review")
             self.assertIn("REQ-002", prompt)
             self.assertIn("bound requirement oracles", prompt)
+            self.assertIn("weaker oracle than the requirement allows", prompt)
+            self.assertIn("forbidden_proxy_oracles", prompt)
             self.assertIn("GatewayPayload", prompt)
 
     def test_implement_runs_without_test_writer(self) -> None:

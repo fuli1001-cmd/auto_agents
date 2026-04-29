@@ -473,6 +473,18 @@ The plan root can also define:
 Those fields are required for completed plan output and are preserved when task status is updated
 during implementation.
 
+`state/requirements_trace.json` is also a contract, not scratch metadata. Each active requirement is
+expected to carry:
+
+- `acceptance_oracles`
+- `oracle_type`
+- `oracle_strength`
+- `evidence_boundary`
+- `forbidden_proxy_oracles`
+
+This lets downstream planning and review distinguish proxy checks from behavioral/semantic oracles
+and distinguish internal-state evidence from system-boundary or external-side-effect proof.
+
 Interrupted implementation work is resumable:
 
 - `in_progress` tasks can continue from review and verification

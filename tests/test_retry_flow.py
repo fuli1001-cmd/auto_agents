@@ -930,6 +930,10 @@ class RetryFlowTests(unittest.TestCase):
                             "status": "active",
                             "priority": "mandatory",
                             "acceptance_oracles": ["provider reference is verified"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
                             "forbidden_patterns": [],
                             "external_docs_required": True,
                             "provider_reference": ".auto-agents/docs/provider_references/provider.md",
@@ -2127,6 +2131,10 @@ class RetryFlowTests(unittest.TestCase):
                             "status": "active",
                             "priority": "mandatory",
                             "acceptance_oracles": ["artifact is modernized"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
                             "forbidden_patterns": ["legacy_gateway"],
                             "external_docs_required": False,
                             "provider_reference": "",
@@ -2189,6 +2197,10 @@ class RetryFlowTests(unittest.TestCase):
                             "status": "active",
                             "priority": "mandatory",
                             "acceptance_oracles": ["artifact is modernized"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
                             "forbidden_patterns": ["legacy_gateway"],
                             "external_docs_required": False,
                             "provider_reference": "",
@@ -2252,6 +2264,10 @@ class RetryFlowTests(unittest.TestCase):
                             "status": "active",
                             "priority": "mandatory",
                             "acceptance_oracles": ["task coverage exists"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
                             "forbidden_patterns": [],
                             "external_docs_required": False,
                             "provider_reference": "",
@@ -2307,6 +2323,10 @@ class RetryFlowTests(unittest.TestCase):
                             "status": "active",
                             "priority": "mandatory",
                             "acceptance_oracles": ["provider reference is verified"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
                             "forbidden_patterns": [],
                             "external_docs_required": True,
                             "provider_reference": ".auto-agents/docs/provider_references/provider.md",
@@ -2343,6 +2363,32 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(orchestrator.adapter.implement_calls, 0)
             self.assertIn("requirements_audit", state.stage_summaries)
 
+    def test_pending_stages_reruns_explicitly_failed_verify(self) -> None:
+        from auto_agents.models import RunState, TaskSpec
+
+        state = RunState(run_id="run-123", status="failed", current_stage="verify")
+        state.tasks = [
+            TaskSpec(
+                task_id="task-001",
+                title="Done task",
+                description="Already finished.",
+                acceptance=["done"],
+                status="done",
+            )
+        ]
+        state.stage_summaries = {
+            "clarify": "done",
+            "design": "done",
+            "plan": "done",
+            "provider_research": "done",
+            "implement": "done",
+            "verify": "# Verify\n\nResult: fail\n\n- `pytest` -> failed",
+        }
+
+        pending = Orchestrator._pending_stages(object.__new__(Orchestrator), state)
+
+        self.assertEqual(pending, ["verify", "readme"])
+
     def test_legacy_requirements_audit_failure_state_is_rewound_before_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -2362,6 +2408,10 @@ class RetryFlowTests(unittest.TestCase):
                             "status": "active",
                             "priority": "mandatory",
                             "acceptance_oracles": ["artifact is modernized"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
                             "forbidden_patterns": ["legacy_gateway"],
                             "external_docs_required": False,
                             "provider_reference": "",
@@ -2432,6 +2482,10 @@ class RetryFlowTests(unittest.TestCase):
                             "status": "active",
                             "priority": "mandatory",
                             "acceptance_oracles": ["provider reference is verified"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
                             "forbidden_patterns": [],
                             "external_docs_required": True,
                             "provider_reference": ".auto-agents/docs/provider_references/provider.md",

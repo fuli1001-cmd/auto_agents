@@ -551,6 +551,11 @@ class Orchestrator:
                         save_run_state(self.project_root, state)
                         return state
 
+            if self._verify_stage_failed(state):
+                state.status = "failed"
+                state.last_error = "cannot finalize run while verify summary indicates failure"
+                save_run_state(self.project_root, state)
+                raise RuntimeError(state.last_error)
             state.status = "completed"
             save_run_state(self.project_root, state)
             self._commit_if_dirty("chore: finalize run state")
@@ -3013,9 +3018,10 @@ class Orchestrator:
                 "Only update project_brief.md and requirements_trace.json in this stage; do not modify project code, tests, or other repository documents.",
                 "Preserve the exact top-level and section headings already present in the file.",
                 "The requirements trace is the downstream execution contract. It must be valid JSON with version=1 and a requirements list.",
-                "Every active requirement must have id, text, source, status, priority, acceptance_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields.",
+                "Every active requirement must have id, text, source, status, priority, acceptance_oracles, oracle_type, oracle_strength, evidence_boundary, forbidden_proxy_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields.",
                 "Use stable IDs like REQ-001. Mark hard requirements as priority='mandatory'. Use status='active', 'deferred', or 'superseded'.",
                 "If a requirement needs an external provider protocol or official API docs, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/.",
+                "Use oracle_type to name the primary proof mechanism (for example deterministic_test, integration_test, runtime_evidence, judge_model, benchmark, human_review, or mixed). Use oracle_strength to record the minimum acceptable fidelity (proxy, behavioral, semantic, or human). Use evidence_boundary to say where proof must come from (internal_state, system_boundary, or external_side_effect). Record any checks that must NOT be treated as sufficient in forbidden_proxy_oracles.",
                 self._clarify_spec_instruction(spec_kind),
                 self._document_language_instruction(),
             ]
@@ -3076,6 +3082,7 @@ class Orchestrator:
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
                 "All active mandatory requirements in requirements_trace.json must be covered by at least one task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
                 "Task acceptance criteria must preserve the bound requirement's concrete acceptance_oracles; do not weaken direct/API/protocol requirements into naming or configuration-only checks.",
+                "Preserve each bound requirement's oracle_type, oracle_strength, evidence_boundary, and forbidden_proxy_oracles when slicing tasks. Requirements that demand semantic or human-strength proof are NOT satisfied by proxy checks, internal-state-only checks, config-only checks, or metadata/log snapshots. Requirements that demand system_boundary or external_side_effect evidence are NOT covered unless the task acceptance requires proof at that boundary.",
                 "If a requirement has external_docs_required=true, create at least one implementation task that consumes its provider_reference and tests against that protocol reference.",
                 "Choose the smallest practical automated verification strategy for this stack.",
                 "If this is a Python project, require a project-local conda env at ./.conda.",
@@ -3364,6 +3371,7 @@ class Orchestrator:
                 "Implement only this feature slice.",
                 "If local verification exposes a tightly coupled regression in files you touched or in paths explicitly implicated by retry feedback, fix it in the same attempt even if it sits slightly outside the nominal task slice.",
                 "The bound requirements and acceptance oracles above are hard requirements, not optional background.",
+                "Honor the bound oracle contract exactly: the implementation and tests must meet or exceed each requirement's oracle_strength, collect proof at the required evidence_boundary, and avoid every forbidden proxy oracle listed in the requirement context.",
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
@@ -3403,6 +3411,7 @@ class Orchestrator:
                 "or requirement ID/oracle that is not satisfied. If no acceptance criterion or requirement oracle is violated but you have advisory concerns, "
                 "issue 'DECISION: pass' with those concerns listed as '[NON-BLOCKING]' notes.",
                 "For external provider integrations, verify the code and tests against the provider_reference file. Fail if the implementation invents protocol fields, reuses a legacy private gateway payload, or tests only mock an internal gateway contract.",
+                "Also fail when the implementation uses a weaker oracle than the requirement allows (for example: proxy-only checks for semantic/human requirements, internal-state-only checks for system_boundary/external_side_effect requirements, or any check explicitly listed in forbidden_proxy_oracles).",
                 "Use the supplied changed-file and diff context first. Only inspect the rest of the repository when the diff is insufficient.",
                 "This stage is read-only. Do not modify any repository files; return only the review result.",
                 "Return only the review result. Do not include any preamble, file path note, or tool narration.",
@@ -4415,9 +4424,26 @@ class Orchestrator:
                 if any(task.status != "done" for task in state.tasks):
                     pending.append(stage)
                     continue
+            elif stage == "verify":
+                if stage not in completed:
+                    pending.append(stage)
+                    continue
+                if self._verify_stage_failed(state):
+                    pending.append(stage)
+                    continue
             elif stage not in completed:
                 pending.append(stage)
         return pending
+
+    @staticmethod
+    def _stage_summary_result(summary: str) -> str:
+        match = re.search(r"^Result:\s*(pass|fail)\s*$", str(summary or ""), re.IGNORECASE | re.MULTILINE)
+        if not match:
+            return ""
+        return match.group(1).lower()
+
+    def _verify_stage_failed(self, state: RunState) -> bool:
+        return self._stage_summary_result(state.stage_summaries.get("verify", "")) == "fail"
 
     def _commit_if_dirty(self, message: str) -> None:
         if not is_repo(self.project_root):

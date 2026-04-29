@@ -20,6 +20,10 @@
           "status",
           "priority",
           "acceptance_oracles",
+          "oracle_type",
+          "oracle_strength",
+          "evidence_boundary",
+          "forbidden_proxy_oracles",
           "forbidden_patterns",
           "external_docs_required",
           "provider_reference",
@@ -46,6 +50,32 @@
             "enum": ["mandatory", "optional"]
           },
           "acceptance_oracles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "oracle_type": {
+            "type": "string",
+            "enum": [
+              "benchmark",
+              "deterministic_test",
+              "human_review",
+              "integration_test",
+              "judge_model",
+              "mixed",
+              "runtime_evidence"
+            ]
+          },
+          "oracle_strength": {
+            "type": "string",
+            "enum": ["proxy", "behavioral", "semantic", "human"]
+          },
+          "evidence_boundary": {
+            "type": "string",
+            "enum": ["internal_state", "system_boundary", "external_side_effect"]
+          },
+          "forbidden_proxy_oracles": {
             "type": "array",
             "items": {
               "type": "string"

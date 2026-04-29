@@ -19,6 +19,17 @@ ALLOWED_REQUIREMENT_STATUSES = {"active", "deferred", "superseded"}
 ALLOWED_REQUIREMENT_PRIORITIES = {"mandatory", "optional"}
 BLOCKING_REFERENCE_STATUSES = {"missing", "blocked", "needs_user_input", "ambiguous"}
 PASSING_REFERENCE_STATUSES = {"verified", "assumption_approved"}
+ALLOWED_ORACLE_TYPES = {
+    "deterministic_test",
+    "integration_test",
+    "runtime_evidence",
+    "human_review",
+    "judge_model",
+    "benchmark",
+    "mixed",
+}
+ALLOWED_ORACLE_STRENGTHS = {"proxy", "behavioral", "semantic", "human"}
+ALLOWED_EVIDENCE_BOUNDARIES = {"internal_state", "system_boundary", "external_side_effect"}
 
 
 def empty_requirements_trace() -> dict:
@@ -94,11 +105,31 @@ def validate_requirements_trace_payload(payload: object) -> List[str]:
                 f"{prefix} priority must be one of: {', '.join(sorted(ALLOWED_REQUIREMENT_PRIORITIES))}"
             )
 
-        oracles = item.get("acceptance_oracles", [])
+        oracles = item.get("acceptance_oracles")
         if not isinstance(oracles, list) or any(not isinstance(entry, str) for entry in oracles):
             errors.append(f"{prefix} acceptance_oracles must be a list of strings")
+        oracle_type = str(item.get("oracle_type", "")).strip()
+        if oracle_type not in ALLOWED_ORACLE_TYPES:
+            errors.append(
+                f"{prefix} oracle_type must be one of: {', '.join(sorted(ALLOWED_ORACLE_TYPES))}"
+            )
+        oracle_strength = str(item.get("oracle_strength", "")).strip()
+        if oracle_strength not in ALLOWED_ORACLE_STRENGTHS:
+            errors.append(
+                f"{prefix} oracle_strength must be one of: {', '.join(sorted(ALLOWED_ORACLE_STRENGTHS))}"
+            )
+        evidence_boundary = str(item.get("evidence_boundary", "")).strip()
+        if evidence_boundary not in ALLOWED_EVIDENCE_BOUNDARIES:
+            errors.append(
+                f"{prefix} evidence_boundary must be one of: {', '.join(sorted(ALLOWED_EVIDENCE_BOUNDARIES))}"
+            )
+        forbidden_proxy_oracles = item.get("forbidden_proxy_oracles")
+        if not isinstance(forbidden_proxy_oracles, list) or any(
+            not isinstance(entry, str) for entry in forbidden_proxy_oracles
+        ):
+            errors.append(f"{prefix} forbidden_proxy_oracles must be a list of strings")
 
-        forbidden = item.get("forbidden_patterns", [])
+        forbidden = item.get("forbidden_patterns")
         if not isinstance(forbidden, list) or any(not isinstance(entry, str) for entry in forbidden):
             errors.append(f"{prefix} forbidden_patterns must be a list of strings")
         else:
@@ -217,6 +248,23 @@ def format_requirement_context(requirements: Iterable[dict]) -> str:
         if isinstance(oracles, list) and oracles:
             lines.append("  Acceptance oracles:")
             lines.extend(f"  - {str(oracle).strip()}" for oracle in oracles if str(oracle).strip())
+        oracle_type = str(item.get("oracle_type", "")).strip()
+        oracle_strength = str(item.get("oracle_strength", "")).strip()
+        evidence_boundary = str(item.get("evidence_boundary", "")).strip()
+        if oracle_type:
+            lines.append(f"  Oracle type: {oracle_type}")
+        if oracle_strength:
+            lines.append(f"  Oracle strength: {oracle_strength}")
+        if evidence_boundary:
+            lines.append(f"  Evidence boundary: {evidence_boundary}")
+        forbidden_proxy_oracles = item.get("forbidden_proxy_oracles", [])
+        if isinstance(forbidden_proxy_oracles, list) and forbidden_proxy_oracles:
+            lines.append("  Forbidden proxy oracles:")
+            lines.extend(
+                f"  - {str(oracle).strip()}"
+                for oracle in forbidden_proxy_oracles
+                if str(oracle).strip()
+            )
         forbidden = item.get("forbidden_patterns", [])
         if isinstance(forbidden, list) and forbidden:
             lines.append("  Forbidden patterns:")
@@ -301,6 +349,10 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
             result = "pass"
 
         text = str(item.get("text", "")).strip()
+        oracle_type = str(item.get("oracle_type", "")).strip()
+        oracle_strength = str(item.get("oracle_strength", "")).strip()
+        evidence_boundary = str(item.get("evidence_boundary", "")).strip()
+        forbidden_proxy_oracles = item.get("forbidden_proxy_oracles", [])
         issues.append(
             {
                 "requirement_id": req_id,
@@ -316,6 +368,22 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
         lines.append("")
         if text:
             lines.append(text)
+            lines.append("")
+        if oracle_type or oracle_strength or evidence_boundary:
+            lines.append(
+                "Oracle contract: "
+                f"type={oracle_type or '(missing)'}; "
+                f"strength={oracle_strength or '(missing)'}; "
+                f"evidence_boundary={evidence_boundary or '(missing)'}"
+            )
+            lines.append("")
+        if isinstance(forbidden_proxy_oracles, list) and forbidden_proxy_oracles:
+            lines.append("Forbidden proxy oracles:")
+            lines.extend(
+                f"- {str(oracle).strip()}"
+                for oracle in forbidden_proxy_oracles
+                if str(oracle).strip()
+            )
             lines.append("")
         if blockers:
             lines.append("Findings:")
