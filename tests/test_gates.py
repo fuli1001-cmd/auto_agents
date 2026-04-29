@@ -5,8 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.gates import extract_failure_ids, run_commands
-from auto_agents.models import CommandResult, GateResult
+from auto_agents.gates import extract_failure_ids, run_commands, run_gate_plan
+from auto_agents.models import CommandResult, GateParallelGroup, GateResult
 
 
 class GateTests(unittest.TestCase):
@@ -69,6 +69,72 @@ class GateTests(unittest.TestCase):
                 "test_subtitles (tests.test_api.SubtitleTests.test_subtitles)",
             ],
         )
+
+    def test_run_gate_plan_runs_parallel_group_and_preserves_config_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_gate_plan(
+                ["python3 -c \"print('first')\""],
+                [
+                    GateParallelGroup(
+                        name="checks",
+                        commands=[
+                            "python3 -c \"import time; time.sleep(0.2); print('second')\"",
+                            "python3 -c \"print('third')\"",
+                        ],
+                    )
+                ],
+                Path(tmp),
+                collect_all=True,
+            )
+            self.assertTrue(result.ok)
+            self.assertEqual([item.stdout for item in result.commands], ["first", "second", "third"])
+
+    def test_run_gate_plan_stops_after_failed_parallel_group_when_not_collecting_all(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_gate_plan(
+                ["python3 -c \"print('before')\""],
+                [
+                    GateParallelGroup(
+                        name="checks",
+                        commands=[
+                            "python3 -c \"import sys; sys.exit(4)\"",
+                            "python3 -c \"print('peer')\"",
+                        ],
+                    ),
+                    GateParallelGroup(
+                        name="later",
+                        commands=["python3 -c \"print('after')\""],
+                    ),
+                ],
+                Path(tmp),
+                collect_all=False,
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(len(result.commands), 3)
+            self.assertNotIn("after", [item.stdout for item in result.commands])
+
+    def test_run_gate_plan_collect_all_runs_later_groups_after_parallel_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_gate_plan(
+                [],
+                [
+                    GateParallelGroup(
+                        name="checks",
+                        commands=[
+                            "python3 -c \"import sys; sys.exit(2)\"",
+                            "python3 -c \"print('peer')\"",
+                        ],
+                    ),
+                    GateParallelGroup(
+                        name="later",
+                        commands=["python3 -c \"print('after')\""],
+                    ),
+                ],
+                Path(tmp),
+                collect_all=True,
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual([item.stdout for item in result.commands], ["", "peer", "after"])
 
 
 if __name__ == "__main__":

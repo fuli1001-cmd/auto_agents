@@ -17,15 +17,29 @@ def _normalized_commands(commands: Sequence[str]) -> List[str]:
     return [str(command).strip() for command in commands if str(command).strip()]
 
 
+def _normalized_parallel_groups(parallel_groups: Sequence[object]) -> List[Dict[str, object]]:
+    normalized: List[Dict[str, object]] = []
+    for group in parallel_groups:
+        name = str(getattr(group, "name", "")).strip()
+        commands = _normalized_commands(getattr(group, "commands", []))
+        normalized.append({
+            "name": name,
+            "commands": commands,
+        })
+    return normalized
+
+
 def make_cache_key(
     baseline_ref: str,
     commands: Sequence[str],
     *,
     collect_all: bool,
+    parallel_groups: Sequence[object] = (),
 ) -> str:
     payload = {
         "baseline_ref": str(baseline_ref).strip(),
         "commands": _normalized_commands(commands),
+        "parallel_groups": _normalized_parallel_groups(parallel_groups),
         "collect_all": bool(collect_all),
         "execution_mode_version": EXECUTION_MODE_VERSION,
     }
@@ -45,11 +59,17 @@ class GateBaselineCache:
         commands: Sequence[str],
         *,
         collect_all: bool,
+        parallel_groups: Sequence[object] = (),
     ) -> Optional[List[str]]:
         payload = self._read()
         if payload is None:
             return None
-        key = make_cache_key(baseline_ref, commands, collect_all=collect_all)
+        key = make_cache_key(
+            baseline_ref,
+            commands,
+            collect_all=collect_all,
+            parallel_groups=parallel_groups,
+        )
         entry = payload.get("entries", {}).get(key)
         if not isinstance(entry, dict):
             return None
@@ -66,12 +86,19 @@ class GateBaselineCache:
         failure_ids: Sequence[str],
         mutation_detected: bool = False,
         summary: str = "",
+        parallel_groups: Sequence[object] = (),
     ) -> None:
         payload = self._read() or {"version": CACHE_VERSION, "entries": {}}
-        key = make_cache_key(baseline_ref, commands, collect_all=collect_all)
+        key = make_cache_key(
+            baseline_ref,
+            commands,
+            collect_all=collect_all,
+            parallel_groups=parallel_groups,
+        )
         payload.setdefault("entries", {})[key] = {
             "baseline_ref": str(baseline_ref).strip(),
             "commands": _normalized_commands(commands),
+            "parallel_groups": _normalized_parallel_groups(parallel_groups),
             "collect_all": bool(collect_all),
             "execution_mode_version": EXECUTION_MODE_VERSION,
             "failure_ids": [str(item).strip() for item in failure_ids if str(item).strip()],

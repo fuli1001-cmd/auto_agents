@@ -196,21 +196,49 @@ class ProviderConfig:
 
 
 @dataclass
+class GateParallelGroup:
+    name: str = ""
+    commands: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "GateParallelGroup":
+        return cls(
+            name=str(data.get("name", "")),
+            commands=[str(item) for item in data.get("commands", [])],
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class GateConfig:
     commands: List[str] = field(default_factory=list)
+    parallel_groups: List[GateParallelGroup] = field(default_factory=list)
     require_clean_git_before_task: bool = True
     allow_agent_updates: bool = True
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "GateConfig":
+        raw_groups = data.get("parallel_groups", [])
         return cls(
             commands=[str(item) for item in data.get("commands", [])],
+            parallel_groups=[
+                GateParallelGroup.from_dict(dict(item))
+                for item in raw_groups
+                if isinstance(item, dict)
+            ],
             require_clean_git_before_task=bool(data.get("require_clean_git_before_task", True)),
             allow_agent_updates=bool(data.get("allow_agent_updates", True)),
         )
 
     def to_dict(self) -> Dict[str, object]:
-        return asdict(self)
+        return {
+            "commands": list(self.commands),
+            "parallel_groups": [group.to_dict() for group in self.parallel_groups],
+            "require_clean_git_before_task": self.require_clean_git_before_task,
+            "allow_agent_updates": self.allow_agent_updates,
+        }
 
 
 @dataclass

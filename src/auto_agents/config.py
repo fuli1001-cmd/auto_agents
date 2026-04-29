@@ -158,6 +158,7 @@ DEFAULT_CONFIG = {
     "efforts": dict(DEFAULT_EFFORTS),
     "gates": {
         "commands": [],
+        "parallel_groups": [],
         "require_clean_git_before_task": True,
         "allow_agent_updates": True,
     },

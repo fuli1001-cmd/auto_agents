@@ -168,6 +168,28 @@
             "type": "string"
           }
         },
+        "parallel_groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "commands"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "commands": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
         "require_clean_git_before_task": {
           "type": "boolean"
         },

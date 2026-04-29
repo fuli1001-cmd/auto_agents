@@ -34,7 +34,7 @@ from .config import (
     task_plan_path,
     write_run_prompt,
 )
-from .gates import extract_failure_ids, run_commands, run_commands_collect_all
+from .gates import extract_failure_ids, run_gate_plan, run_commands, run_commands_collect_all
 from .gate_baseline_cache import GateBaselineCache
 from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, hard_reset_clean, head_ref, is_repo, require_clean_tree, worktree_fingerprint
 from .io_utils import read_text, write_text
@@ -1235,10 +1235,11 @@ class Orchestrator:
 
     def _run_gate_commands(self, *, collect_all: bool, context: str):
         before_snapshot = self._worktree_change_snapshot()
-        gate = (
-            run_commands_collect_all(self.config.gates.commands, self.project_root)
-            if collect_all
-            else run_commands(self.config.gates.commands, self.project_root)
+        gate = run_gate_plan(
+            self.config.gates.commands,
+            self.config.gates.parallel_groups,
+            self.project_root,
+            collect_all=collect_all,
         )
         after_snapshot = self._worktree_change_snapshot()
         changed = self._snapshot_delta_paths(before_snapshot, after_snapshot)
@@ -1632,6 +1633,7 @@ class Orchestrator:
                     baseline_ref,
                     self.config.gates.commands,
                     collect_all=True,
+                    parallel_groups=self.config.gates.parallel_groups,
                 )
                 if cached_failures is not None:
                     state.implement_verify_baseline_failures = list(cached_failures)
@@ -1654,6 +1656,7 @@ class Orchestrator:
                         collect_all=True,
                         failure_ids=failures,
                         summary=gate.summary,
+                        parallel_groups=self.config.gates.parallel_groups,
                     )
             changed = True
         baseline_failures = list(state.implement_verify_baseline_failures)
@@ -1684,6 +1687,7 @@ class Orchestrator:
             collect_all=True,
             failure_ids=normalized,
             summary="warm clean-head baseline",
+            parallel_groups=self.config.gates.parallel_groups,
         )
 
     @staticmethod
@@ -2345,6 +2349,7 @@ class Orchestrator:
                         verify_gate.summary,
                     ),
                     summary=verify_gate.summary,
+                    parallel_groups=self.config.gates.parallel_groups,
                 )
             self._emit_stage_verify_result("fail", summary.strip())
             raise RuntimeError("verify stage failed")
@@ -2355,6 +2360,7 @@ class Orchestrator:
                 collect_all=False,
                 failure_ids=[],
                 summary=verify_gate.summary,
+                parallel_groups=self.config.gates.parallel_groups,
             )
         tasks = state.tasks or self._load_tasks_from_plan()
         state.tasks = tasks

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import subprocess
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Sequence
 
-from .models import CommandResult, GateResult
+from .models import CommandResult, GateParallelGroup, GateResult
 
 
 _PYTEST_FAILED = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
@@ -18,25 +19,46 @@ def _failure_summary(result: CommandResult) -> str:
     return f"command failed: {result.command} ({details})"
 
 
+def _run_command(command: str, cwd: Path) -> CommandResult:
+    process = subprocess.run(
+        command,
+        shell=True,
+        text=True,
+        capture_output=True,
+        cwd=str(cwd),
+    )
+    return CommandResult(
+        command=command,
+        ok=process.returncode == 0,
+        returncode=process.returncode,
+        stdout=process.stdout.strip(),
+        stderr=process.stderr.strip(),
+    )
+
+
+def _run_parallel_commands(commands: Sequence[str], cwd: Path) -> List[CommandResult]:
+    if not commands:
+        return []
+    if len(commands) == 1:
+        return [_run_command(commands[0], cwd)]
+
+    results: List[CommandResult] = [None] * len(commands)  # type: ignore[list-item]
+    with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+        future_to_index = {
+            executor.submit(_run_command, command, cwd): index
+            for index, command in enumerate(commands)
+        }
+        for future in as_completed(future_to_index):
+            results[future_to_index[future]] = future.result()
+    return results
+
+
 def run_commands(commands: Iterable[str], cwd: Path) -> GateResult:
     results: List[CommandResult] = []
     ok = True
     summary = "all commands passed"
     for command in commands:
-        process = subprocess.run(
-            command,
-            shell=True,
-            text=True,
-            capture_output=True,
-            cwd=str(cwd),
-        )
-        result = CommandResult(
-            command=command,
-            ok=process.returncode == 0,
-            returncode=process.returncode,
-            stdout=process.stdout.strip(),
-            stderr=process.stderr.strip(),
-        )
+        result = _run_command(command, cwd)
         results.append(result)
         if not result.ok:
             ok = False
@@ -56,24 +78,47 @@ def run_commands_collect_all(commands: Iterable[str], cwd: Path) -> GateResult:
     ok = True
     summaries: List[str] = []
     for command in commands:
-        process = subprocess.run(
-            command,
-            shell=True,
-            text=True,
-            capture_output=True,
-            cwd=str(cwd),
-        )
-        result = CommandResult(
-            command=command,
-            ok=process.returncode == 0,
-            returncode=process.returncode,
-            stdout=process.stdout.strip(),
-            stderr=process.stderr.strip(),
-        )
+        result = _run_command(command, cwd)
         results.append(result)
         if not result.ok:
             ok = False
             summaries.append(_failure_summary(result))
+    summary = "all commands passed" if ok else "; ".join(summaries)
+    return GateResult(ok=ok, commands=results, summary=summary)
+
+
+def run_gate_plan(
+    commands: Iterable[str],
+    parallel_groups: Sequence[GateParallelGroup],
+    cwd: Path,
+    *,
+    collect_all: bool,
+) -> GateResult:
+    results: List[CommandResult] = []
+    summaries: List[str] = []
+    ok = True
+
+    for command in commands:
+        result = _run_command(command, cwd)
+        results.append(result)
+        if result.ok:
+            continue
+        ok = False
+        summaries.append(_failure_summary(result))
+        if not collect_all:
+            return GateResult(ok=False, commands=results, summary=summaries[0])
+
+    for group in parallel_groups:
+        group_results = _run_parallel_commands(group.commands, cwd)
+        results.extend(group_results)
+        failed = [result for result in group_results if not result.ok]
+        if not failed:
+            continue
+        ok = False
+        summaries.extend(_failure_summary(result) for result in failed)
+        if not collect_all:
+            break
+
     summary = "all commands passed" if ok else "; ".join(summaries)
     return GateResult(ok=ok, commands=results, summary=summary)
 

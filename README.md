@@ -379,6 +379,11 @@ Implementation-stage verification baselines are also cached under
 set. After a task passes verification and is committed, the next task can reuse the clean-head
 baseline instead of rerunning identical baseline gates.
 
+Gate commands remain sequential by default. To opt into concurrent execution for independent,
+non-mutating checks, declare `gates.parallel_groups`; the runner executes `gates.commands`
+sequentially first, then each parallel group in listed order while preserving command-result order in
+the collected output.
+
 ### Provider auto-failover
 
 When multiple providers are configured, the orchestrator automatically switches to the

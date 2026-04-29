@@ -19,7 +19,7 @@ from auto_agents.config import (
 )
 from auto_agents.git_ops import changed_paths, commit_all, worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentResult
+from auto_agents.models import AgentResult, GateParallelGroup
 from auto_agents.orchestrator import Orchestrator
 
 
@@ -1653,6 +1653,36 @@ class RetryFlowTests(unittest.TestCase):
             fresh_state.tasks = second._load_tasks_from_plan()
             self.assertTrue(second._ensure_implement_verify_baseline(fresh_state, fresh_state.tasks))
             self.assertEqual(fresh_state.implement_verify_baseline_failures, [])
+
+    def test_run_gate_commands_uses_parallel_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            config = load_project_config(project_root)
+            config.gates.commands = ["python3 -c \"print('before')\""]
+            config.gates.parallel_groups = [
+                GateParallelGroup(
+                    name="checks",
+                    commands=[
+                        "python3 -c \"print('peer-a')\"",
+                        "python3 -c \"print('peer-b')\"",
+                    ],
+                )
+            ]
+            save_project_config(project_root, config)
+
+            orchestrator = Orchestrator(project_root)
+            gate, mutation_error = orchestrator._run_gate_commands(
+                collect_all=True,
+                context="parallel test commands",
+            )
+
+            self.assertEqual(mutation_error, "")
+            self.assertTrue(gate.ok)
+            self.assertEqual(
+                [item.stdout for item in gate.commands],
+                ["before", "peer-a", "peer-b"],
+            )
 
     def test_plan_stage_records_split_task_replacements(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

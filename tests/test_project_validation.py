@@ -248,6 +248,140 @@ class ProjectValidationTests(unittest.TestCase):
 
         self.assertEqual(validate_project_config_payload(payload), [])
 
+    def test_validate_project_config_payload_accepts_parallel_gate_groups(self) -> None:
+        payload = {
+            "project_name": "demo",
+            "providers": {
+                "codex": {
+                    "kind": "codex",
+                    "binary": "codex",
+                    "profile_map": {"balanced": "m", "deep": "h", "max": "xh"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
+                "copilot-cli": {
+                    "kind": "copilot-cli",
+                    "binary": "copilot",
+                    "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
+            },
+            "active_provider": "codex",
+            "docs": {"language": "en"},
+            "efforts": {
+                "clarify": "deep",
+                "design": "deep",
+                "plan": "balanced",
+                "provider_research": "deep",
+                "implement": "balanced",
+                "review": "deep",
+                "verify": "balanced",
+                "readme": "balanced",
+            },
+            "gates": {
+                "commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                "parallel_groups": [
+                    {
+                        "name": "quality",
+                        "commands": [
+                            "conda run -p ./.conda python -m unittest discover -s tests",
+                            "conda run -p ./.conda python -m pytest -q tests/test_ok.py",
+                        ],
+                    }
+                ],
+                "require_clean_git_before_task": True,
+                "allow_agent_updates": True,
+            },
+            "git": {
+                "auto_init_repo": True,
+                "commit_each_task": True,
+                "commit_message_template": "feat({task_id}): {title}",
+            },
+            "approvals": {"enabled": ["requirements", "architecture", "release"]},
+            "retries": {
+                "default_max_attempts": 2,
+                "per_stage": {
+                    "clarify": 2,
+                    "design": 2,
+                    "plan": 3,
+                    "provider_research": 2,
+                    "implement": 2,
+                    "review": 2,
+                },
+            },
+        }
+
+        self.assertEqual(validate_project_config_payload(payload), [])
+
+    def test_validate_project_config_payload_rejects_invalid_parallel_gate_groups(self) -> None:
+        payload = {
+            "project_name": "demo",
+            "providers": {
+                "codex": {
+                    "kind": "codex",
+                    "binary": "codex",
+                    "profile_map": {"balanced": "m", "deep": "h", "max": "xh"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
+                "copilot-cli": {
+                    "kind": "copilot-cli",
+                    "binary": "copilot",
+                    "profile_map": {"balanced": "balanced", "deep": "deep", "max": "max"},
+                    "extra_args": [],
+                    "cwd_flag": "-C",
+                    "prompt_via_stdin": True,
+                    "output_flag": "-o",
+                },
+            },
+            "active_provider": "codex",
+            "docs": {"language": "en"},
+            "efforts": {
+                "clarify": "deep",
+                "design": "deep",
+                "plan": "balanced",
+                "provider_research": "deep",
+                "implement": "balanced",
+                "review": "deep",
+                "verify": "balanced",
+                "readme": "balanced",
+            },
+            "gates": {
+                "commands": [],
+                "parallel_groups": [{"name": "", "commands": [""]}],
+                "require_clean_git_before_task": True,
+                "allow_agent_updates": True,
+            },
+            "git": {
+                "auto_init_repo": True,
+                "commit_each_task": True,
+                "commit_message_template": "feat({task_id}): {title}",
+            },
+            "approvals": {"enabled": ["requirements", "architecture", "release"]},
+            "retries": {
+                "default_max_attempts": 2,
+                "per_stage": {
+                    "clarify": 2,
+                    "design": 2,
+                    "plan": 3,
+                    "provider_research": 2,
+                    "implement": 2,
+                    "review": 2,
+                },
+            },
+        }
+
+        errors = validate_project_config_payload(payload)
+        self.assertTrue(any("gates.parallel_groups[1].name" in item for item in errors))
+        self.assertTrue(any("gates.parallel_groups[1].commands" in item for item in errors))
+
     def test_validate_project_config_payload_accepts_config_without_docs(self) -> None:
         payload = {
             "project_name": "demo",

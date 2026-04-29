@@ -19,7 +19,7 @@ from .config import (
     session_artifact_paths,
     sort_sessions,
 )
-from .gates import run_commands, run_commands_collect_all, extract_failure_ids
+from .gates import extract_failure_ids, run_gate_plan, run_commands, run_commands_collect_all
 from .git_ops import changed_paths, commit_all, head_ref
 from .io_utils import read_text, write_text
 from .models import (
@@ -1079,7 +1079,12 @@ class Session:
         *executing*, and again on resume if the git HEAD has moved.
         """
         self._print("Capturing baseline gate snapshot...")
-        gate = run_commands_collect_all(self.config.gates.commands, self.project_root)
+        gate = run_gate_plan(
+            self.config.gates.commands,
+            self.config.gates.parallel_groups,
+            self.project_root,
+            collect_all=True,
+        )
         state.baseline_failures = extract_failure_ids(gate)
         state.baseline_git_ref = head_ref(self.project_root)
         if state.baseline_failures:
@@ -1140,7 +1145,12 @@ class Session:
         # Layer 2: baseline-diff gate check
         if not self.config.gates.commands:
             return {"ok": True, "reason": "no verification commands configured"}
-        gate = run_commands_collect_all(self.config.gates.commands, self.project_root)
+        gate = run_gate_plan(
+            self.config.gates.commands,
+            self.config.gates.parallel_groups,
+            self.project_root,
+            collect_all=True,
+        )
         current_failures = extract_failure_ids(gate)
         new_failures = sorted(set(current_failures) - set(state.baseline_failures))
         if new_failures:

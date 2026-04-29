@@ -107,6 +107,39 @@ def _validate_isolated_commands(commands: object, field_name: str, python_requir
     return errors
 
 
+def _validate_parallel_gate_groups(parallel_groups: object) -> List[str]:
+    errors: List[str] = []
+    if parallel_groups is None:
+        return errors
+    if not isinstance(parallel_groups, list):
+        return ["gates.parallel_groups must be a list of objects"]
+    for index, group in enumerate(parallel_groups, start=1):
+        prefix = f"gates.parallel_groups[{index}]"
+        if not isinstance(group, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+        name = group.get("name")
+        if not isinstance(name, str) or not name.strip():
+            errors.append(f"{prefix}.name must be a non-empty string")
+        commands = group.get("commands")
+        if (
+            not isinstance(commands, list)
+            or not commands
+            or any(not isinstance(item, str) or not item.strip() for item in commands)
+        ):
+            errors.append(f"{prefix}.commands must be a non-empty list of strings")
+            continue
+        python_required = _looks_like_python_workflow(None, commands)
+        errors.extend(
+            _validate_isolated_commands(
+                commands,
+                f"{prefix}.commands",
+                python_required=python_required,
+            )
+        )
+    return errors
+
+
 def _unwrap_conda_run(parts: List[str]) -> List[str]:
     if len(parts) < 2 or parts[0] != "conda" or parts[1] != "run":
         return parts
@@ -493,6 +526,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     python_required=python_required,
                 )
             )
+        errors.extend(_validate_parallel_gate_groups(gates.get("parallel_groups", [])))
         clean = gates.get("require_clean_git_before_task")
         if not isinstance(clean, bool):
             errors.append("gates.require_clean_git_before_task must be a boolean")
