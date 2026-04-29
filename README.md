@@ -111,7 +111,7 @@ Behavior:
 
 - Auto-skipped on non-Python projects (no signal markers, no `.py` files)
 - Auto-skipped if explicitly disabled
-- Cached per `git HEAD` + file mtimes under `.auto-agents/state/repomap_cache.json`
+- Cached per file under `.auto-agents/state/repomap_cache.json`, keyed by parser version and file content
 - Anchor files mentioned in the task description / acceptance / retry feedback
   are forced into the map even under tight budget
 - Repo map header tells the agent it's a partial view and to use `grep`/`view`
@@ -138,7 +138,8 @@ auto_agents run --no-repo-map
 
 Per-run metrics include `repo_map_enabled`, `repo_map_skipped_reason`,
 `repo_map_files_included`, `repo_map_tokens_actual`, `repo_map_tokens_budget`,
-and `repo_map_cache_hit` so you can quantify savings from telemetry.
+`repo_map_cache_hit`, `repo_map_cache_hits`, and `repo_map_cache_misses` so you can quantify savings
+from telemetry.
 
 ## Quick start
 

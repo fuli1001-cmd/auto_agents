@@ -39,6 +39,7 @@ class BaseParser:
     """Pluggable parser interface. Future tree-sitter backends implement this."""
 
     extensions: Sequence[str] = ()
+    cache_version: int = 1
 
     def parse(self, project_root: Path, rel_path: str) -> FileSummary:
         raise NotImplementedError

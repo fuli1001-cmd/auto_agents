@@ -1,58 +1,36 @@
 """Repo map parse cache.
 
-Cache key combines:
-    - the current git HEAD SHA (or "no-git")
-    - SHA256 over sorted ``(rel_path, mtime_ns)`` tuples for tracked Python files
-
-Cache value is the parsed list of FileSummary serialized to JSON. Cache misses
-trigger a fresh parse pass via the supplied parser.
-
-The cache lives under ``.auto-agents/state/repomap_cache.json`` and stores a
-single entry; older entries are overwritten when the key changes.
+Version 2 stores summaries per file so a task-sized edit only reparses the
+files that actually changed. Legacy cache payloads are treated as misses.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import subprocess
-from dataclasses import asdict
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .parser import BaseParser, FileSummary, Symbol
 
 
-def _git_head(project_root: Path) -> str:
+CACHE_VERSION = 2
+
+
+def _file_content_hash(path: Path) -> str:
     try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(project_root),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if proc.returncode == 0:
-            return proc.stdout.strip() or "no-git"
-    except (FileNotFoundError, OSError, subprocess.SubprocessError):
-        pass
-    return "no-git"
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "missing"
 
 
 def compute_cache_key(project_root: Path, rel_paths: Sequence[str]) -> str:
-    head = _git_head(project_root)
     hasher = hashlib.sha256()
-    hasher.update(head.encode("utf-8"))
-    hasher.update(b"\0")
     for rel in sorted(rel_paths):
-        try:
-            mtime = (project_root / rel).stat().st_mtime_ns
-        except OSError:
-            mtime = 0
+        path = project_root / rel
         hasher.update(rel.encode("utf-8"))
         hasher.update(b"\0")
-        hasher.update(str(mtime).encode("ascii"))
+        hasher.update(_file_content_hash(path).encode("ascii"))
         hasher.update(b"\0")
     return hasher.hexdigest()
 
@@ -121,7 +99,7 @@ def _summary_from_json(data: Dict[str, object]) -> FileSummary:
 
 
 class RepoMapCache:
-    """JSON-backed cache for repo map parses, keyed by git+mtime fingerprint."""
+    """JSON-backed cache for repo map parses, keyed per file."""
 
     def __init__(self, project_root: Path, cache_path: Optional[Path] = None) -> None:
         self.project_root = Path(project_root)
@@ -129,21 +107,69 @@ class RepoMapCache:
             cache_path = self.project_root / ".auto-agents" / "state" / "repomap_cache.json"
         self.cache_path = Path(cache_path)
         self.last_hit: Optional[bool] = None
+        self.last_hits: int = 0
+        self.last_misses: int = 0
+
+    @staticmethod
+    def _fingerprint(parser: BaseParser, path: Path) -> Dict[str, object]:
+        try:
+            stat = path.stat()
+            size = stat.st_size
+            mtime_ns = stat.st_mtime_ns
+        except OSError:
+            size = 0
+            mtime_ns = 0
+        return {
+            "cache_version": int(getattr(parser, "cache_version", 1) or 1),
+            "parser": parser.__class__.__name__,
+            "content_hash": _file_content_hash(path),
+            "size": size,
+            "mtime_ns": mtime_ns,
+        }
 
     def get_or_build(
         self,
         rel_paths: Sequence[str],
         parser: BaseParser,
     ) -> List[FileSummary]:
-        key = compute_cache_key(self.project_root, rel_paths)
         cached = self._read()
-        if cached and cached.get("key") == key:
-            self.last_hit = True
-            return [_summary_from_json(s) for s in cached.get("summaries", [])]
+        entries = dict(cached.get("entries", {})) if cached else {}
+        summaries: List[FileSummary] = []
+        next_entries: Dict[str, Dict[str, object]] = {}
+        hits = 0
+        misses = 0
 
-        self.last_hit = False
-        summaries = [parser.parse(self.project_root, rp) for rp in rel_paths]
-        self._write(key, summaries)
+        for rel_path in rel_paths:
+            fingerprint = self._fingerprint(parser, self.project_root / rel_path)
+            cached_entry = entries.get(rel_path)
+            if (
+                isinstance(cached_entry, dict)
+                and cached_entry.get("fingerprint") == fingerprint
+                and isinstance(cached_entry.get("summary"), dict)
+            ):
+                summaries.append(_summary_from_json(cached_entry["summary"]))
+                next_entries[rel_path] = cached_entry
+                hits += 1
+                continue
+
+            summary = parser.parse(self.project_root, rel_path)
+            summaries.append(summary)
+            next_entries[rel_path] = {
+                "fingerprint": fingerprint,
+                "summary": _summary_to_json(summary),
+            }
+            misses += 1
+
+        for rel_path, cached_entry in entries.items():
+            if rel_path in next_entries:
+                continue
+            if (self.project_root / rel_path).exists():
+                next_entries[rel_path] = cached_entry
+
+        self.last_hits = hits
+        self.last_misses = misses
+        self.last_hit = misses == 0 and bool(rel_paths)
+        self._write(next_entries)
         return summaries
 
     def invalidate(self) -> None:
@@ -156,22 +182,22 @@ class RepoMapCache:
         try:
             with self.cache_path.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            if isinstance(data, dict):
+            if isinstance(data, dict) and int(data.get("version", 0) or 0) == CACHE_VERSION:
                 return data
         except (OSError, json.JSONDecodeError):
             return None
         return None
 
-    def _write(self, key: str, summaries: Sequence[FileSummary]) -> None:
+    def _write(self, entries: Dict[str, Dict[str, object]]) -> None:
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                "key": key,
-                "summaries": [_summary_to_json(s) for s in summaries],
+                "version": CACHE_VERSION,
+                "entries": entries,
             }
             tmp = self.cache_path.with_suffix(self.cache_path.suffix + ".tmp")
             with tmp.open("w", encoding="utf-8") as fh:
-                json.dump(payload, fh, ensure_ascii=False)
+                json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
             os.replace(tmp, self.cache_path)
         except OSError:
             # Cache failures should never break the run.

@@ -32,7 +32,11 @@ PROJECT_GITIGNORE = """__pycache__/
 node_modules/
 .DS_Store
 """
-AUTO_GITIGNORE_ENTRIES = ("runs/", "state/gate_baseline_cache.json")
+AUTO_GITIGNORE_ENTRIES = (
+    "runs/",
+    "state/gate_baseline_cache.json",
+    "state/repomap_cache.json",
+)
 LEGACY_AUTO_GITIGNORE_ENTRIES = {"state/run_state.json"}
 
 

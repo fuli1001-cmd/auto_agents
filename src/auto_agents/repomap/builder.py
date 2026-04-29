@@ -50,6 +50,8 @@ class RepoMapResult:
     tokens_actual: int = 0
     tokens_budget: int = 0
     cache_hit: bool = False
+    cache_hits: int = 0
+    cache_misses: int = 0
 
     def to_metrics(self) -> Dict[str, object]:
         return {
@@ -59,6 +61,8 @@ class RepoMapResult:
             "repo_map_tokens_actual": self.tokens_actual,
             "repo_map_tokens_budget": self.tokens_budget,
             "repo_map_cache_hit": self.cache_hit,
+            "repo_map_cache_hits": self.cache_hits,
+            "repo_map_cache_misses": self.cache_misses,
         }
 
 
@@ -215,6 +219,8 @@ class RepoMapBuilder:
             tokens_actual=tokens,
             tokens_budget=budget,
             cache_hit=cache_hit,
+            cache_hits=self.cache.last_hits,
+            cache_misses=self.cache.last_misses,
         )
 
     def _fit_budget(

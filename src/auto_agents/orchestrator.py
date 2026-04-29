@@ -3526,6 +3526,8 @@ class Orchestrator:
                 f" repo_map_files={rm.files_included}"
                 f" repo_map_tokens={rm.tokens_actual}/{rm.tokens_budget}"
                 f" repo_map_cache_hit={str(rm.cache_hit).lower()}"
+                f" repo_map_cache_hits={rm.cache_hits}"
+                f" repo_map_cache_misses={rm.cache_misses}"
             )
         print(
             (
