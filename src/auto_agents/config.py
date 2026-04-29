@@ -32,7 +32,7 @@ PROJECT_GITIGNORE = """__pycache__/
 node_modules/
 .DS_Store
 """
-AUTO_GITIGNORE_ENTRIES = ("runs/",)
+AUTO_GITIGNORE_ENTRIES = ("runs/", "state/gate_baseline_cache.json")
 LEGACY_AUTO_GITIGNORE_ENTRIES = {"state/run_state.json"}
 
 
@@ -230,6 +230,10 @@ def requirements_trace_path(project_root: Path) -> Path:
 
 def provider_references_lock_path(project_root: Path) -> Path:
     return state_dir(project_root) / "provider_references.lock.json"
+
+
+def gate_baseline_cache_path(project_root: Path) -> Path:
+    return state_dir(project_root) / "gate_baseline_cache.json"
 
 
 def review_path(project_root: Path) -> Path:

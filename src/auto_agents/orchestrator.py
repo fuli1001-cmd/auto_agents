@@ -17,6 +17,7 @@ from .repomap import RepoMapBuilder, RepoMapResult
 from .config import (
     bootstrap_project,
     docs_dir,
+    gate_baseline_cache_path,
     load_project_config,
     load_run_state,
     load_task_plan,
@@ -34,6 +35,7 @@ from .config import (
     write_run_prompt,
 )
 from .gates import extract_failure_ids, run_commands, run_commands_collect_all
+from .gate_baseline_cache import GateBaselineCache
 from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, hard_reset_clean, head_ref, is_repo, require_clean_tree, worktree_fingerprint
 from .io_utils import read_text, write_text
 from .models import (
@@ -105,6 +107,10 @@ class Orchestrator:
         self._current_provider: str = self.config.active_provider
         self._repo_map_builder: Optional[RepoMapBuilder] = None
         self._last_repo_map_result: Optional[RepoMapResult] = None
+        self._gate_baseline_cache = GateBaselineCache(
+            self.project_root,
+            cache_path=gate_baseline_cache_path(self.project_root),
+        )
         # Snapshot of active/deferred REQ IDs captured BEFORE a clarify
         # iteration generation; used by _clarify_validation_feedback to
         # detect silent deletion of existing requirements.
@@ -1399,6 +1405,10 @@ class Orchestrator:
             self._persist_tasks(tasks)
             if self.config.git.commit_each_task:
                 task.commit_sha = commit_all(self.project_root, commit_message)
+                self._warm_clean_head_verify_baseline(
+                    state,
+                    failure_ids=gate_result.get("verify_current_failure_ids", []),
+                )
             processed += 1
 
         state.tasks = tasks
@@ -1514,9 +1524,11 @@ class Orchestrator:
                 "new_failure_ids": failure_ids,
                 "raw_output": mutation_error,
             }
-        current_failure_ids = self._normalize_verify_failure_ids(
-            extract_failure_ids(verify_gate),
-            verify_gate.summary,
+        extracted_failure_ids = extract_failure_ids(verify_gate)
+        current_failure_ids = (
+            self._normalize_verify_failure_ids(extracted_failure_ids, verify_gate.summary)
+            if extracted_failure_ids
+            else []
         )
         baseline_failure_ids = (
             self._normalize_verify_failure_ids(task.verify_baseline_failures, verify_gate.summary)
@@ -1616,17 +1628,33 @@ class Orchestrator:
             if not self.config.gates.commands:
                 state.implement_verify_baseline_failures = []
             else:
-                gate, mutation_error = self._run_gate_commands(
+                cached_failures = self._gate_baseline_cache.get(
+                    baseline_ref,
+                    self.config.gates.commands,
                     collect_all=True,
-                    context="implement verify baseline commands",
                 )
-                if mutation_error:
-                    raise RuntimeError(mutation_error)
-                state.implement_verify_baseline_failures = (
-                    self._normalize_verify_failure_ids(extract_failure_ids(gate), gate.summary)
-                    if not gate.ok
-                    else []
-                )
+                if cached_failures is not None:
+                    state.implement_verify_baseline_failures = list(cached_failures)
+                else:
+                    gate, mutation_error = self._run_gate_commands(
+                        collect_all=True,
+                        context="implement verify baseline commands",
+                    )
+                    if mutation_error:
+                        raise RuntimeError(mutation_error)
+                    failures = (
+                        self._normalize_verify_failure_ids(extract_failure_ids(gate), gate.summary)
+                        if not gate.ok
+                        else []
+                    )
+                    state.implement_verify_baseline_failures = list(failures)
+                    self._gate_baseline_cache.put(
+                        baseline_ref,
+                        self.config.gates.commands,
+                        collect_all=True,
+                        failure_ids=failures,
+                        summary=gate.summary,
+                    )
             changed = True
         baseline_failures = list(state.implement_verify_baseline_failures)
         for task in tasks:
@@ -1636,6 +1664,27 @@ class Orchestrator:
                 task.verify_baseline_failures = list(baseline_failures)
                 changed = True
         return changed
+
+    def _warm_clean_head_verify_baseline(
+        self,
+        state: RunState,
+        *,
+        failure_ids: Iterable[str],
+    ) -> None:
+        baseline_ref = self._task_verify_baseline_ref()
+        failure_list = [str(item).strip() for item in failure_ids if str(item).strip()]
+        normalized = self._normalize_verify_failure_ids(failure_list, "") if failure_list else []
+        state.implement_verify_baseline_ref = baseline_ref
+        state.implement_verify_baseline_failures = list(normalized)
+        if not self.config.gates.commands:
+            return
+        self._gate_baseline_cache.put(
+            baseline_ref,
+            self.config.gates.commands,
+            collect_all=True,
+            failure_ids=normalized,
+            summary="warm clean-head baseline",
+        )
 
     @staticmethod
     def _gate_raw_output(gate_result) -> str:
@@ -2286,8 +2335,27 @@ class Orchestrator:
         state.last_error = ""
         if not verify_gate.ok:
             state.status = "failed"
+            if self.config.gates.commands:
+                self._gate_baseline_cache.put(
+                    self._task_verify_baseline_ref(),
+                    self.config.gates.commands,
+                    collect_all=False,
+                    failure_ids=self._normalize_verify_failure_ids(
+                        extract_failure_ids(verify_gate),
+                        verify_gate.summary,
+                    ),
+                    summary=verify_gate.summary,
+                )
             self._emit_stage_verify_result("fail", summary.strip())
             raise RuntimeError("verify stage failed")
+        if self.config.gates.commands:
+            self._gate_baseline_cache.put(
+                self._task_verify_baseline_ref(),
+                self.config.gates.commands,
+                collect_all=False,
+                failure_ids=[],
+                summary=verify_gate.summary,
+            )
         tasks = state.tasks or self._load_tasks_from_plan()
         state.tasks = tasks
         audit_result = run_requirements_audit(self.project_root, tasks)
@@ -3235,6 +3303,9 @@ class Orchestrator:
                         str(gate_result["review"]),
                     )
             if gate_result["ok"]:
+                gate_result["verify_current_failure_ids"] = list(
+                    verify_result.get("current_failure_ids", [])
+                )
                 return gate_result
 
             last_reason = str(gate_result["reason"])

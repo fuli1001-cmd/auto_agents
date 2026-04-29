@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.config import (
+    gate_baseline_cache_path,
     load_project_config,
     load_run_state,
     provider_references_lock_path,
@@ -1570,6 +1571,88 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.tasks[1].status, "blocked")
             self.assertEqual(state.tasks[1].verify_baseline_failures, [])
             self.assertNotIn("task baseline only", stream.getvalue())
+
+    def test_commit_warms_next_clean_head_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            config = orchestrator.config
+            config.gates.commands = ["python -c \"print('ok')\""]
+            config.git.commit_each_task = True
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = SequentialArtifactAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "First task",
+                            "description": "Finish the first slice.",
+                            "acceptance": ["artifact-1.txt exists"],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "task-002",
+                            "title": "Second task",
+                            "description": "Finish the second slice.",
+                            "acceptance": ["artifact-2.txt exists"],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            contexts = []
+            original_run_gate_commands = orchestrator._run_gate_commands
+
+            def tracking_run_gate_commands(*, collect_all, context):
+                contexts.append(context)
+                return original_run_gate_commands(collect_all=collect_all, context=context)
+
+            orchestrator._run_gate_commands = tracking_run_gate_commands
+            state = orchestrator._run_implementation_loop(state, max_tasks=2)
+
+            baseline_runs = [
+                item for item in contexts if item == "implement verify baseline commands"
+            ]
+            self.assertEqual(len(baseline_runs), 1)
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(state.tasks[1].status, "done")
+
+    def test_implement_baseline_uses_persistent_cache_across_orchestrators(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            config = load_project_config(project_root)
+            config.gates.commands = ["python -c \"print('ok')\""]
+            save_project_config(project_root, config)
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            self.assertTrue(orchestrator._ensure_implement_verify_baseline(state, state.tasks))
+            self.assertTrue(gate_baseline_cache_path(project_root).exists())
+
+            second = Orchestrator(project_root)
+
+            def fail_run_gate_commands(*, collect_all, context):
+                raise AssertionError(f"gate commands should be reused from cache during {context}")
+
+            second._run_gate_commands = fail_run_gate_commands
+            fresh_state = load_run_state(project_root)
+            fresh_state.tasks = second._load_tasks_from_plan()
+            self.assertTrue(second._ensure_implement_verify_baseline(fresh_state, fresh_state.tasks))
+            self.assertEqual(fresh_state.implement_verify_baseline_failures, [])
 
     def test_plan_stage_records_split_task_replacements(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

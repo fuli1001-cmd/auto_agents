@@ -1251,7 +1251,7 @@ class ProjectValidationTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
             )
-            self.assertEqual(gitignore_show.stdout, "runs/\n")
+            self.assertEqual(gitignore_show.stdout, "runs/\nstate/gate_baseline_cache.json\n")
 
     def test_clarify_prompt_uses_selected_document_language(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

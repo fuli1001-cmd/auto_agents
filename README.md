@@ -374,6 +374,11 @@ Review auto-escalation triggers (when configured as `balanced`):
 
 Setting review to `deep` or `max` overrides auto-escalation and uses that effort for every review.
 
+Implementation-stage verification baselines are also cached under
+`.auto-agents/state/gate_baseline_cache.json`, keyed by the effective baseline ref and gate command
+set. After a task passes verification and is committed, the next task can reuse the clean-head
+baseline instead of rerunning identical baseline gates.
+
 ### Provider auto-failover
 
 When multiple providers are configured, the orchestrator automatically switches to the
