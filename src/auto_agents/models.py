@@ -57,6 +57,7 @@ class TaskSpec:
     description: str
     acceptance: List[str]
     requirement_ids: List[str] = field(default_factory=list)
+    depends_on: List[str] = field(default_factory=list)
     status: str = "pending"
     commit_message: str = ""
     commit_sha: str = ""
@@ -92,6 +93,7 @@ class TaskSpec:
             description=str(data.get("description", "")),
             acceptance=[str(item) for item in data.get("acceptance", [])],
             requirement_ids=[str(item) for item in data.get("requirement_ids", [])],
+            depends_on=[str(item) for item in data.get("depends_on", [])],
             status=str(data.get("status", "pending")),
             commit_message=str(data.get("commit_message", "")),
             commit_sha=str(data.get("commit_sha", "")),
@@ -305,6 +307,40 @@ class RetryConfig:
 
 
 @dataclass
+class ParallelTasksConfig:
+    enabled: bool = False
+    max_workers: int = 2
+    strict: bool = False
+    worktree_root: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "ParallelTasksConfig":
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            max_workers=int(data.get("max_workers", 2)),
+            strict=bool(data.get("strict", False)),
+            worktree_root=str(data.get("worktree_root", "")),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class ExecutionConfig:
+    parallel_tasks: ParallelTasksConfig = field(default_factory=ParallelTasksConfig)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "ExecutionConfig":
+        return cls(
+            parallel_tasks=ParallelTasksConfig.from_dict(dict(data.get("parallel_tasks", {}))),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"parallel_tasks": self.parallel_tasks.to_dict()}
+
+
+@dataclass
 class ProjectConfig:
     project_name: str
     providers: Dict[str, ProviderConfig] = field(
@@ -338,6 +374,7 @@ class ProjectConfig:
     efforts: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_EFFORTS))
     gates: GateConfig = field(default_factory=GateConfig)
     git: GitConfig = field(default_factory=GitConfig)
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     approvals: ApprovalConfig = field(default_factory=ApprovalConfig)
     retries: RetryConfig = field(default_factory=RetryConfig)
     repo_map: RepoMapConfig = field(default_factory=RepoMapConfig)
@@ -374,6 +411,7 @@ class ProjectConfig:
             },
             gates=GateConfig.from_dict(dict(data.get("gates", {}))),
             git=GitConfig.from_dict(dict(data.get("git", {}))),
+            execution=ExecutionConfig.from_dict(dict(data.get("execution", {}))),
             approvals=ApprovalConfig.from_dict(
                 dict(
                     data.get(
@@ -395,6 +433,7 @@ class ProjectConfig:
             "efforts": dict(self.efforts),
             "gates": self.gates.to_dict(),
             "git": self.git.to_dict(),
+            "execution": self.execution.to_dict(),
             "approvals": self.approvals.to_dict(),
             "retries": self.retries.to_dict(),
             "repo_map": self.repo_map.to_dict(),

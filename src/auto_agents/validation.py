@@ -228,7 +228,91 @@ def schema_paths() -> Dict[str, str]:
     }
 
 
-def validate_task_plan_payload(payload: object, require_verification: bool = False) -> List[str]:
+def validate_task_dependencies(
+    tasks: object,
+    *,
+    require_depends_on_for_pending: bool = False,
+) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(tasks, list):
+        return errors
+
+    known_ids = {
+        str(task.get("task_id")).strip()
+        for task in tasks
+        if isinstance(task, dict) and isinstance(task.get("task_id"), str) and str(task.get("task_id")).strip()
+    }
+    dependency_map: Dict[str, List[str]] = {}
+
+    for index, task in enumerate(tasks, start=1):
+        if not isinstance(task, dict):
+            continue
+        prefix = f"task #{index}"
+        task_id = str(task.get("task_id", "")).strip()
+        status = str(task.get("status", "pending")).strip()
+        depends_on = task.get("depends_on")
+        if depends_on is None:
+            if require_depends_on_for_pending and status != "done":
+                errors.append(
+                    f"{prefix} depends_on must be present for non-done tasks when execution.parallel_tasks.strict is enabled"
+                )
+            if task_id:
+                dependency_map[task_id] = []
+            continue
+        if (
+            not isinstance(depends_on, list)
+            or any(not isinstance(item, str) or not item.strip() for item in depends_on)
+        ):
+            errors.append(f"{prefix} depends_on must be a list of non-empty strings")
+            continue
+        normalized = [item.strip() for item in depends_on]
+        if len(set(normalized)) != len(normalized):
+            errors.append(f"{prefix} depends_on must not contain duplicates")
+        if task_id:
+            dependency_map[task_id] = normalized
+
+    for task_id, dependencies in dependency_map.items():
+        for dependency in dependencies:
+            if dependency == task_id:
+                errors.append(f"task '{task_id}' cannot depend on itself")
+                continue
+            if dependency not in known_ids:
+                errors.append(f"task '{task_id}' depends_on unknown task '{dependency}'")
+
+    cycle_reported = False
+    visiting: List[str] = []
+    visited = set()
+
+    def visit(node: str) -> None:
+        nonlocal cycle_reported
+        if node in visited or cycle_reported:
+            return
+        if node in visiting:
+            cycle = visiting[visiting.index(node) :] + [node]
+            errors.append("tasks contain cyclic depends_on relationship: " + " -> ".join(cycle))
+            cycle_reported = True
+            return
+        visiting.append(node)
+        for dependency in dependency_map.get(node, []):
+            if dependency in known_ids and dependency != node:
+                visit(dependency)
+        visiting.pop()
+        visited.add(node)
+
+    for task_id in sorted(known_ids):
+        visit(task_id)
+        if cycle_reported:
+            break
+
+    return errors
+
+
+def validate_task_plan_payload(
+    payload: object,
+    require_verification: bool = False,
+    *,
+    require_depends_on_for_pending: bool = False,
+) -> List[str]:
     errors: List[str] = []
     if not isinstance(payload, dict):
         return ["task plan root must be a JSON object"]
@@ -338,6 +422,12 @@ def validate_task_plan_payload(payload: object, require_verification: bool = Fal
         ):
             errors.append(f"{prefix} requirement_ids must be a list of non-empty strings")
 
+    errors.extend(
+        validate_task_dependencies(
+            tasks,
+            require_depends_on_for_pending=require_depends_on_for_pending,
+        )
+    )
     return errors
 
 
@@ -550,6 +640,30 @@ def validate_project_config_payload(payload: object) -> List[str]:
             if "{title}" not in template:
                 errors.append("git.commit_message_template must contain '{title}'")
 
+    execution = payload.get("execution")
+    if execution is not None:
+        if not isinstance(execution, dict):
+            errors.append("execution must be an object")
+        else:
+            parallel_tasks = execution.get("parallel_tasks", {})
+            if not isinstance(parallel_tasks, dict):
+                errors.append("execution.parallel_tasks must be an object")
+            else:
+                enabled = parallel_tasks.get("enabled")
+                if not isinstance(enabled, bool):
+                    errors.append("execution.parallel_tasks.enabled must be a boolean")
+                max_workers = parallel_tasks.get("max_workers")
+                if not isinstance(max_workers, int) or max_workers < 1:
+                    errors.append("execution.parallel_tasks.max_workers must be an integer >= 1")
+                strict = parallel_tasks.get("strict")
+                if not isinstance(strict, bool):
+                    errors.append("execution.parallel_tasks.strict must be a boolean")
+                worktree_root = parallel_tasks.get("worktree_root")
+                if not isinstance(worktree_root, str):
+                    errors.append("execution.parallel_tasks.worktree_root must be a string")
+                if enabled is True and isinstance(git, dict) and git.get("commit_each_task") is not True:
+                    errors.append("execution.parallel_tasks.enabled requires git.commit_each_task=true")
+
     approvals = payload.get("approvals")
     if not isinstance(approvals, dict):
         errors.append("approvals must be an object")
@@ -624,6 +738,25 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
             )
         )
         warnings.extend(task_plan_warnings(plan_payload))
+        parallel_tasks = (
+            config_payload.get("execution", {}).get("parallel_tasks", {})
+            if isinstance(config_payload, dict)
+            else {}
+        )
+        if (
+            isinstance(parallel_tasks, dict)
+            and bool(parallel_tasks.get("enabled"))
+            and bool(parallel_tasks.get("strict", False))
+        ):
+            for index, task in enumerate(plan_payload.get("tasks", []), start=1):
+                if not isinstance(task, dict):
+                    continue
+                if str(task.get("status", "pending")) == "done":
+                    continue
+                if "depends_on" not in task:
+                    errors.append(
+                        f"task #{index} depends_on must be present for non-done tasks when execution.parallel_tasks.strict is enabled"
+                    )
 
     try:
         trace_payload = read_json(requirements_trace_path(root), default=None)

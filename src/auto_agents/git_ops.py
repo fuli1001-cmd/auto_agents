@@ -57,6 +57,23 @@ def commit_all(project_root: Path, message: str) -> str:
     return rev_process.stdout.strip()
 
 
+def commit_all_except(project_root: Path, message: str, exclude_prefixes: tuple[str, ...]) -> str:
+    add_args = ["add", "-A", "--", "."]
+    add_args.extend(f":(exclude){prefix.rstrip('/')}" for prefix in exclude_prefixes)
+    add_process = _git(project_root, *add_args)
+    if add_process.returncode != 0:
+        raise RuntimeError(add_process.stderr.strip() or "git add failed")
+
+    commit_process = _git(project_root, "commit", "-m", message)
+    if commit_process.returncode != 0:
+        raise RuntimeError(commit_process.stderr.strip() or "git commit failed")
+
+    rev_process = _git(project_root, "rev-parse", "HEAD")
+    if rev_process.returncode != 0:
+        raise RuntimeError(rev_process.stderr.strip() or "git rev-parse failed")
+    return rev_process.stdout.strip()
+
+
 def changed_files(project_root: Path) -> str:
     process = _git(project_root, "status", "--short")
     if process.returncode != 0:
@@ -109,6 +126,44 @@ def head_ref(project_root: Path) -> str:
     if result.returncode != 0:
         return ""
     return result.stdout.strip()
+
+
+def add_worktree(project_root: Path, worktree_path: Path, ref: str = "HEAD") -> None:
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    result = _git(project_root, "worktree", "add", "--detach", str(worktree_path), ref)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git worktree add failed")
+
+
+def remove_worktree(project_root: Path, worktree_path: Path, force: bool = True) -> None:
+    args = ["worktree", "remove"]
+    if force:
+        args.append("--force")
+    args.append(str(worktree_path))
+    result = _git(project_root, *args)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git worktree remove failed")
+
+
+def list_worktrees(project_root: Path) -> list[str]:
+    result = _git(project_root, "worktree", "list", "--porcelain")
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git worktree list failed")
+    paths: list[str] = []
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            paths.append(line[len("worktree ") :].strip())
+    return paths
+
+
+def cherry_pick_no_commit(project_root: Path, commit_sha: str) -> None:
+    result = _git(project_root, "cherry-pick", "--no-commit", commit_sha)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git cherry-pick failed")
+
+
+def abort_cherry_pick(project_root: Path) -> None:
+    _git(project_root, "cherry-pick", "--abort")
 
 
 def hard_reset_clean(

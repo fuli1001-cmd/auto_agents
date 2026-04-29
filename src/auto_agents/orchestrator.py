@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, TextIO, Tuple
 
@@ -36,7 +37,7 @@ from .config import (
 )
 from .gates import extract_failure_ids, run_gate_plan, run_commands, run_commands_collect_all
 from .gate_baseline_cache import GateBaselineCache
-from .git_ops import changed_entries, changed_files, changed_paths, commit_all, ensure_repo, hard_reset_clean, head_ref, is_repo, require_clean_tree, worktree_fingerprint
+from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, ensure_repo, hard_reset_clean, head_ref, is_repo, remove_worktree, require_clean_tree, worktree_fingerprint
 from .io_utils import read_text, write_text
 from .models import (
     APPROVAL_ORDER,
@@ -63,6 +64,7 @@ from .requirements import (
 )
 from .validation import (
     validate_required_document,
+    validate_task_dependencies,
     validate_task_plan_with_requirements,
     validate_verification_command_paths,
     validation_report,
@@ -1330,7 +1332,7 @@ class Orchestrator:
 
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
         tasks = state.tasks or self._load_tasks_from_plan()
-        
+
         if state.rejected_stage == "implement" and state.rejection_reason:
             import time
             tasks.append(
@@ -1346,70 +1348,29 @@ class Orchestrator:
             )
             state.rejected_stage = ""
             state.rejection_reason = ""
-            
+
         state.tasks = tasks
         self._commit_planning_baseline_if_needed(tasks)
         self._ensure_implement_verify_baseline(state, tasks)
+        if self.config.execution.parallel_tasks.enabled:
+            return self._run_parallel_implementation_loop(state, tasks, max_tasks)
+        return self._run_sequential_implementation_loop(state, tasks, max_tasks)
 
+    def _run_sequential_implementation_loop(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        max_tasks: Optional[int],
+    ) -> RunState:
         processed = 0
         for task in tasks:
             if task.status == "done":
                 continue
             if max_tasks is not None and processed >= max_tasks:
                 break
-
-            resume_existing = task.status == "in_progress" or self._should_resume_task(state, task)
-            allow_dirty_retry = task.status == "blocked"
-            if (resume_existing or allow_dirty_retry) and task.status != "in_progress":
-                task.status = "in_progress"
-                self._persist_tasks(tasks)
-
-            if (
-                not (resume_existing or allow_dirty_retry or self._allow_dirty_tree)
-                and self.config.gates.require_clean_git_before_task
-            ):
-                self._require_clean_tree_for_task(task)
-
-            if task.status == "pending":
-                task.status = "in_progress"
-                self._persist_tasks(tasks)
-
-            if self._ensure_task_verify_baseline(task):
-                self._persist_tasks(tasks)
-
-            gate_result = self._execute_task_with_retries(state, task, resume_existing=resume_existing)
-            if not gate_result["ok"]:
-                if gate_result.get("rewind_to_plan"):
-                    rewind_state = self._handle_scope_overflow_rewind(
-                        state, task, tasks, gate_result
-                    )
-                    if rewind_state is not None:
-                        return rewind_state
-                task.status = "blocked"
-                task.review_summary = str(gate_result["review"])
-                self._persist_tasks(tasks)
-                self._emit_task_blocked(task, str(gate_result["reason"]))
-                raise RuntimeError(
-                    self._format_task_failure_error(
-                        task,
-                        reason=str(gate_result["reason"]),
-                        review_summary=task.review_summary,
-                    )
-                )
-
-            task.status = "done"
-            task.review_summary = str(gate_result["review"])
-            commit_message = task.commit_message or self.config.git.commit_message_template.format(
-                task_id=task.task_id,
-                title=task.title,
-            )
-            self._persist_tasks(tasks)
-            if self.config.git.commit_each_task:
-                task.commit_sha = commit_all(self.project_root, commit_message)
-                self._warm_clean_head_verify_baseline(
-                    state,
-                    failure_ids=gate_result.get("verify_current_failure_ids", []),
-                )
+            rewind_state = self._execute_task_in_main_worktree(state, tasks, task)
+            if rewind_state is not None:
+                return rewind_state
             processed += 1
 
         state.tasks = tasks
@@ -1417,6 +1378,322 @@ class Orchestrator:
         state.stage_summaries["implement"] = f"Completed {sum(task.status == 'done' for task in tasks)} tasks."
         state.last_error = ""
         return state
+
+    def _run_parallel_implementation_loop(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        max_tasks: Optional[int],
+    ) -> RunState:
+        fallback_reason = self._parallel_execution_fallback_reason(tasks)
+        if fallback_reason:
+            if self.config.execution.parallel_tasks.strict:
+                raise RuntimeError(fallback_reason)
+            print(f"[parallel-tasks] fallback to sequential: {fallback_reason}", file=self.agent_output_stream)
+            return self._run_sequential_implementation_loop(state, tasks, max_tasks)
+
+        processed = 0
+        while True:
+            if max_tasks is not None and processed >= max_tasks:
+                break
+            ready = self._ready_parallel_tasks(tasks)
+            if not ready:
+                break
+            remaining = (max_tasks - processed) if max_tasks is not None else len(ready)
+            batch = ready[: min(self.config.execution.parallel_tasks.max_workers, remaining)]
+            if len(batch) < 2:
+                rewind_state = self._execute_task_in_main_worktree(state, tasks, batch[0])
+                if rewind_state is not None:
+                    return rewind_state
+                processed += 1
+                continue
+
+            require_clean_tree(self.project_root)
+            results = self._run_parallel_task_batch(state, tasks, batch)
+            for task in batch:
+                result = results[task.task_id]
+                if not result["ok"]:
+                    updated_task = TaskSpec.from_dict(dict(result["task"]))
+                    task.review_summary = updated_task.review_summary
+                    task.review_history = list(updated_task.review_history)
+                    task.verify_history = list(updated_task.verify_history)
+                    task.status = "blocked"
+                    self._persist_tasks(tasks)
+                    self._emit_task_blocked(task, str(result["reason"]))
+                    raise RuntimeError(
+                        self._format_task_failure_error(
+                            task,
+                            reason=str(result["reason"]),
+                            review_summary=task.review_summary,
+                        )
+                    )
+
+                self._apply_parallel_task_snapshot(task, dict(result["task"]))
+                commit_sha = self._integrate_parallel_task_result(task, tasks, str(result["commit_sha"]))
+                task.commit_sha = commit_sha
+                self._warm_clean_head_verify_baseline(
+                    state,
+                    failure_ids=result.get("verify_current_failure_ids", []),
+                )
+                processed += 1
+
+        state.tasks = tasks
+        state.current_stage = "implement"
+        state.stage_summaries["implement"] = f"Completed {sum(task.status == 'done' for task in tasks)} tasks."
+        state.last_error = ""
+        return state
+
+    def _execute_task_in_main_worktree(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+    ) -> Optional[RunState]:
+        resume_existing = task.status == "in_progress" or self._should_resume_task(state, task)
+        allow_dirty_retry = task.status == "blocked"
+        if (resume_existing or allow_dirty_retry) and task.status != "in_progress":
+            task.status = "in_progress"
+            self._persist_tasks(tasks)
+
+        if (
+            not (resume_existing or allow_dirty_retry or self._allow_dirty_tree)
+            and self.config.gates.require_clean_git_before_task
+        ):
+            self._require_clean_tree_for_task(task)
+
+        if task.status == "pending":
+            task.status = "in_progress"
+            self._persist_tasks(tasks)
+
+        if self._ensure_task_verify_baseline(task):
+            self._persist_tasks(tasks)
+
+        gate_result = self._execute_task_with_retries(state, task, resume_existing=resume_existing)
+        if not gate_result["ok"]:
+            if gate_result.get("rewind_to_plan"):
+                rewind_state = self._handle_scope_overflow_rewind(
+                    state, task, tasks, gate_result
+                )
+                if rewind_state is not None:
+                    return rewind_state
+            task.status = "blocked"
+            task.review_summary = str(gate_result["review"])
+            self._persist_tasks(tasks)
+            self._emit_task_blocked(task, str(gate_result["reason"]))
+            raise RuntimeError(
+                self._format_task_failure_error(
+                    task,
+                    reason=str(gate_result["reason"]),
+                    review_summary=task.review_summary,
+                )
+            )
+
+        task.status = "done"
+        task.review_summary = str(gate_result["review"])
+        commit_message = task.commit_message or self.config.git.commit_message_template.format(
+            task_id=task.task_id,
+            title=task.title,
+        )
+        self._persist_tasks(tasks)
+        if self.config.git.commit_each_task:
+            task.commit_sha = commit_all(self.project_root, commit_message)
+            self._warm_clean_head_verify_baseline(
+                state,
+                failure_ids=gate_result.get("verify_current_failure_ids", []),
+            )
+        return None
+
+    def _parallel_execution_fallback_reason(self, tasks: List[TaskSpec]) -> str:
+        if not self.config.git.commit_each_task:
+            return "parallel task execution requires git.commit_each_task=true"
+        if self.config.execution.parallel_tasks.max_workers < 2:
+            return "parallel task execution requires execution.parallel_tasks.max_workers >= 2"
+        if any(task.status not in {"pending", "done"} for task in tasks):
+            return "parallel task execution only supports fresh pending/done task sets; resume and blocked retries stay sequential"
+        raw_plan = load_task_plan(self.project_root)
+        raw_tasks = raw_plan.get("tasks", []) if isinstance(raw_plan, dict) else []
+        missing_depends_on = []
+        for index, item in enumerate(raw_tasks, start=1):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("status", "pending")) == "done":
+                continue
+            if "depends_on" not in item:
+                missing_depends_on.append(str(item.get("task_id") or f"task #{index}"))
+        if missing_depends_on:
+            preview = ", ".join(missing_depends_on[:5])
+            return (
+                "parallel task execution requires planner-generated depends_on on each non-done task; "
+                f"missing for {preview}"
+            )
+        dependency_errors = validate_task_dependencies(
+            raw_tasks,
+            require_depends_on_for_pending=self.config.execution.parallel_tasks.strict,
+        )
+        if dependency_errors:
+            return dependency_errors[0]
+        try:
+            require_clean_tree(self.project_root)
+        except RuntimeError as error:
+            return str(error)
+        return ""
+
+    def _ready_parallel_tasks(self, tasks: List[TaskSpec]) -> List[TaskSpec]:
+        completed = {task.task_id for task in tasks if task.status == "done"}
+        return [
+            task
+            for task in tasks
+            if task.status == "pending"
+            and all(dependency in completed for dependency in task.depends_on)
+        ]
+
+    def _parallel_worktree_root(self) -> Path:
+        configured = self.config.execution.parallel_tasks.worktree_root.strip()
+        if not configured:
+            return (self.project_root.parent / f".{self.project_root.name}-auto-agents-worktrees").resolve()
+        root = Path(configured)
+        if not root.is_absolute():
+            root = (self.project_root.parent / root).resolve()
+        return root
+
+    def _run_parallel_task_batch(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        batch: List[TaskSpec],
+    ) -> Dict[str, Dict[str, object]]:
+        batch_tasks = [TaskSpec.from_dict(task.to_dict()) for task in tasks]
+        state_snapshot = RunState.from_dict(state.to_dict())
+        state_snapshot.tasks = batch_tasks
+        results: Dict[str, Dict[str, object]] = {}
+        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            future_map = {
+                executor.submit(
+                    self._run_task_in_worktree,
+                    state_snapshot,
+                    [TaskSpec.from_dict(item.to_dict()) for item in batch_tasks],
+                    task.task_id,
+                ): task.task_id
+                for task in batch
+            }
+            for future, task_id in future_map.items():
+                results[task_id] = future.result()
+        return results
+
+    def _run_task_in_worktree(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task_id: str,
+    ) -> Dict[str, object]:
+        base_ref = head_ref(self.project_root) or "HEAD"
+        worktree_path = self._parallel_worktree_root() / state.run_id / task_id
+        worktree_created = False
+        try:
+            add_worktree(self.project_root, worktree_path, ref=base_ref)
+            worktree_created = True
+            worker = self.__class__(
+                worktree_path,
+                agent_output_stream=self.agent_output_stream,
+                user_input_fn=self._user_input_fn,
+            )
+            worker._print_agent_output = self._print_agent_output
+            worker._allow_dirty_tree = self._allow_dirty_tree
+            worker_state = RunState.from_dict(state.to_dict())
+            worker_tasks = [TaskSpec.from_dict(item.to_dict()) for item in tasks]
+            worker_state.tasks = worker_tasks
+            save_run_state(worktree_path, worker_state)
+            worker._persist_tasks(worker_tasks)
+            worker_task = next(task for task in worker_tasks if task.task_id == task_id)
+            if worker._ensure_task_verify_baseline(worker_task):
+                worker._persist_tasks(worker_tasks)
+            gate_result = worker._execute_task_with_retries(worker_state, worker_task, resume_existing=False)
+            if not gate_result["ok"]:
+                worker_task.status = "blocked"
+                worker_task.review_summary = str(gate_result["review"])
+                return {
+                    "ok": False,
+                    "task": worker_task.to_dict(),
+                    "reason": str(gate_result["reason"]),
+                    "review": str(gate_result["review"]),
+                }
+
+            worker_task.status = "done"
+            worker_task.review_summary = str(gate_result["review"])
+            worker._persist_tasks(worker_tasks)
+            commit_message = worker_task.commit_message or worker.config.git.commit_message_template.format(
+                task_id=worker_task.task_id,
+                title=worker_task.title,
+            )
+            worker_commit_sha = commit_all_except(
+                worktree_path,
+                commit_message,
+                exclude_prefixes=(".auto-agents",),
+            )
+            return {
+                "ok": True,
+                "task": worker_task.to_dict(),
+                "reason": "",
+                "review": str(gate_result["review"]),
+                "commit_sha": worker_commit_sha,
+                "verify_current_failure_ids": list(gate_result.get("verify_current_failure_ids", [])),
+            }
+        except Exception as error:
+            task = next((item for item in tasks if item.task_id == task_id), None)
+            task_payload = task.to_dict() if task is not None else {"task_id": task_id}
+            return {
+                "ok": False,
+                "task": task_payload,
+                "reason": f"parallel worktree execution failed: {error}",
+                "review": "",
+            }
+        finally:
+            if worktree_created:
+                remove_worktree(self.project_root, worktree_path, force=True)
+
+    def _apply_parallel_task_snapshot(self, task: TaskSpec, payload: Dict[str, object]) -> None:
+        updated = TaskSpec.from_dict(payload)
+        task.description = updated.description
+        task.acceptance = list(updated.acceptance)
+        task.requirement_ids = list(updated.requirement_ids)
+        task.depends_on = list(updated.depends_on)
+        task.review_summary = updated.review_summary
+        task.scope_boundaries = updated.scope_boundaries
+        task.review_history = list(updated.review_history)
+        task.verify_history = list(updated.verify_history)
+        task.verify_baseline_failures = list(updated.verify_baseline_failures)
+        task.verify_baseline_ref = updated.verify_baseline_ref
+        task.expected_test_migrations = list(updated.expected_test_migrations)
+        task.scratchpad = updated.scratchpad
+        task.arbitration_history = list(updated.arbitration_history)
+        task.status = "done"
+
+    def _integrate_parallel_task_result(
+        self,
+        task: TaskSpec,
+        tasks: List[TaskSpec],
+        worker_commit_sha: str,
+    ) -> str:
+        try:
+            cherry_pick_no_commit(self.project_root, worker_commit_sha)
+        except RuntimeError as error:
+            abort_cherry_pick(self.project_root)
+            task.status = "blocked"
+            self._persist_tasks(tasks)
+            self._emit_task_blocked(task, f"merge failed: {error}")
+            raise RuntimeError(
+                self._format_task_failure_error(
+                    task,
+                    reason=f"parallel integration failed while merging worker commit: {error}",
+                    review_summary=task.review_summary,
+                )
+            )
+        self._persist_tasks(tasks)
+        commit_message = task.commit_message or self.config.git.commit_message_template.format(
+            task_id=task.task_id,
+            title=task.title,
+        )
+        return commit_all(self.project_root, commit_message)
 
     def _handle_scope_overflow_rewind(
         self,
@@ -2836,6 +3113,14 @@ class Orchestrator:
                 "",
                 "Final response: 3 short bullets summarizing the plan.",
             ]
+            if self.config.execution.parallel_tasks.enabled:
+                lines[lines.index("Each task must contain task_id, title, description, acceptance, status, commit_message.")] = (
+                    "Each task must contain task_id, title, description, acceptance, status, commit_message, depends_on."
+                )
+                lines.insert(
+                    lines.index("A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined."),
+                    "Experimental parallel task execution is enabled for this project. The planner—not the user—must generate depends_on for every non-done task. Use [] when a task has no prerequisites, and only reference existing task_id values that are true prerequisites.",
+                )
             return "\n".join(lines)
 
         if stage == "readme":

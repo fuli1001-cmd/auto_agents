@@ -191,6 +191,88 @@ class TaskPlanValidationTests(unittest.TestCase):
         self.assertTrue(any(">500 chars" in item for item in warnings))
         self.assertIn("task-001", " ".join(warnings))
 
+    def test_accepts_planner_generated_depends_on(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Base slice",
+                    "description": "Build the prerequisite slice.",
+                    "acceptance": ["base slice works"],
+                    "depends_on": [],
+                    "status": "done",
+                    "commit_message": "",
+                },
+                {
+                    "task_id": "task-002",
+                    "title": "Follow-up slice",
+                    "description": "Build on the prerequisite slice.",
+                    "acceptance": ["follow-up works"],
+                    "depends_on": ["task-001"],
+                    "status": "pending",
+                    "commit_message": "",
+                },
+            ]
+        }
+
+        self.assertEqual(validate_task_plan_payload(payload), [])
+
+    def test_rejects_invalid_depends_on_graph(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "First",
+                    "description": "First task.",
+                    "acceptance": ["first works"],
+                    "depends_on": ["task-002"],
+                    "status": "pending",
+                    "commit_message": "",
+                },
+                {
+                    "task_id": "task-002",
+                    "title": "Second",
+                    "description": "Second task.",
+                    "acceptance": ["second works"],
+                    "depends_on": ["task-001", "task-001"],
+                    "status": "pending",
+                    "commit_message": "",
+                },
+                {
+                    "task_id": "task-003",
+                    "title": "Third",
+                    "description": "Third task.",
+                    "acceptance": ["third works"],
+                    "depends_on": ["missing-task", "task-003"],
+                    "status": "pending",
+                    "commit_message": "",
+                },
+            ]
+        }
+
+        errors = validate_task_plan_payload(payload)
+        self.assertTrue(any("must not contain duplicates" in item for item in errors))
+        self.assertTrue(any("unknown task 'missing-task'" in item for item in errors))
+        self.assertTrue(any("cannot depend on itself" in item for item in errors))
+        self.assertTrue(any("cyclic depends_on relationship" in item for item in errors))
+
+    def test_strict_parallel_mode_requires_depends_on_on_non_done_tasks(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "First",
+                    "description": "First task.",
+                    "acceptance": ["first works"],
+                    "status": "pending",
+                    "commit_message": "",
+                }
+            ]
+        }
+
+        errors = validate_task_plan_payload(payload, require_depends_on_for_pending=True)
+        self.assertTrue(any("depends_on must be present" in item for item in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

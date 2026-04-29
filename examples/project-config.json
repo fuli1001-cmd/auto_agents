@@ -55,6 +55,14 @@
     "commit_each_task": true,
     "commit_message_template": "feat({task_id}): {title}"
   },
+  "execution": {
+    "parallel_tasks": {
+      "enabled": false,
+      "max_workers": 2,
+      "strict": false,
+      "worktree_root": ""
+    }
+  },
   "approvals": {
     "enabled": [
       "requirements",

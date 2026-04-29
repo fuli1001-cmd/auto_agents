@@ -220,6 +220,32 @@
       },
       "additionalProperties": false
     },
+    "execution": {
+      "type": "object",
+      "properties": {
+        "parallel_tasks": {
+          "type": "object",
+          "required": ["enabled", "max_workers", "strict", "worktree_root"],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "max_workers": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "strict": {
+              "type": "boolean"
+            },
+            "worktree_root": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "approvals": {
       "type": "object",
       "required": ["enabled"],

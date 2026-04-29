@@ -88,6 +88,7 @@ TASK_PLAN_TEMPLATE = {
             "title": "replace-me",
             "description": "Describe one minimal verifiable feature slice.",
             "requirement_ids": [],
+            "depends_on": [],
             "acceptance": ["State one concrete acceptance criterion."],
             "status": "pending",
             "commit_message": ""
@@ -170,6 +171,14 @@ DEFAULT_CONFIG = {
         "auto_init_repo": True,
         "commit_each_task": True,
         "commit_message_template": "feat({task_id}): {title}",
+    },
+    "execution": {
+        "parallel_tasks": {
+            "enabled": False,
+            "max_workers": 2,
+            "strict": False,
+            "worktree_root": "",
+        },
     },
     "approvals": {
         "enabled": ["requirements", "architecture", "release"],

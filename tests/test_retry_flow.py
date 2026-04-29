@@ -1,9 +1,11 @@
 import io
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Optional, Tuple
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -804,6 +806,23 @@ class AuditRecoveryAdapter:
 
 
 class RetryFlowTests(unittest.TestCase):
+    @staticmethod
+    def _configure_git_identity(project_root: Path) -> None:
+        subprocess.run(
+            ["git", "config", "user.name", "test"],
+            cwd=str(project_root),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=str(project_root),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+
     def _seed_verify_ready_state(self, project_root: Path, orchestrator: Orchestrator) -> None:
         state = load_run_state(project_root)
         state.status = "pending"
@@ -2461,6 +2480,169 @@ class RetryFlowTests(unittest.TestCase):
                 orchestrator._run_verify(state)
 
             self.assertIn("Automatic recovery is unsafe", str(ctx.exception))
+
+    def test_parallel_tasks_fall_back_to_sequential_without_depends_on(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            config = orchestrator.config
+            config.gates.commands = ["python3 -c \"print('ok')\""]
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.max_workers = 2
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = SequentialArtifactAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "First task",
+                            "description": "Finish the first slice.",
+                            "acceptance": ["artifact-1.txt exists"],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "task-002",
+                            "title": "Second task",
+                            "description": "Finish the second slice.",
+                            "acceptance": ["artifact-2.txt exists"],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state = orchestrator._run_implementation_loop(state, max_tasks=2)
+
+            self.assertEqual([task.status for task in state.tasks], ["done", "done"])
+            self.assertIn("fallback to sequential", stream.getvalue())
+
+    def test_parallel_tasks_strict_mode_requires_depends_on(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.strict = True
+            config.execution.parallel_tasks.max_workers = 2
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "First task",
+                            "description": "Finish the first slice.",
+                            "acceptance": ["artifact-1.txt exists"],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "task-002",
+                            "title": "Second task",
+                            "description": "Finish the second slice.",
+                            "acceptance": ["artifact-2.txt exists"],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator._run_implementation_loop(state, max_tasks=2)
+
+            self.assertIn("depends_on", str(ctx.exception))
+
+    def test_parallel_tasks_integrate_ready_batch_in_task_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.max_workers = 2
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "First task",
+                            "description": "Finish the first slice.",
+                            "acceptance": ["artifact-1.txt exists"],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "task-002",
+                            "title": "Second task",
+                            "description": "Finish the second slice.",
+                            "acceptance": ["artifact-2.txt exists"],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            integrated = []
+
+            def fake_run_task_in_worktree(state_snapshot, tasks_snapshot, task_id):
+                task = next(item for item in tasks_snapshot if item.task_id == task_id)
+                task.status = "done"
+                task.review_summary = f"review for {task_id}"
+                return {
+                    "ok": True,
+                    "task": task.to_dict(),
+                    "reason": "",
+                    "review": task.review_summary,
+                    "commit_sha": f"worker-{task_id}",
+                    "verify_current_failure_ids": [],
+                }
+
+            def fake_integrate(task, tasks, worker_commit_sha):
+                integrated.append((task.task_id, worker_commit_sha))
+                return f"main-{task.task_id}"
+
+            with patch.object(orchestrator, "_run_task_in_worktree", side_effect=fake_run_task_in_worktree):
+                with patch.object(orchestrator, "_integrate_parallel_task_result", side_effect=fake_integrate):
+                    result = orchestrator._run_implementation_loop(state, max_tasks=2)
+
+            self.assertEqual(
+                integrated,
+                [("task-001", "worker-task-001"), ("task-002", "worker-task-002")],
+            )
+            self.assertEqual([task.status for task in result.tasks], ["done", "done"])
+            self.assertEqual(
+                [task.commit_sha for task in result.tasks],
+                ["main-task-001", "main-task-002"],
+            )
 
 
 class IterationAdapter:

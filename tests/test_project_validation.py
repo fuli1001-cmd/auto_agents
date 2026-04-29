@@ -382,6 +382,34 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(any("gates.parallel_groups[1].name" in item for item in errors))
         self.assertTrue(any("gates.parallel_groups[1].commands" in item for item in errors))
 
+    def test_validate_project_config_payload_accepts_parallel_task_execution(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        payload["execution"] = {
+            "parallel_tasks": {
+                "enabled": True,
+                "max_workers": 3,
+                "strict": False,
+                "worktree_root": "",
+            }
+        }
+
+        self.assertEqual(validate_project_config_payload(payload), [])
+
+    def test_validate_project_config_payload_rejects_parallel_tasks_without_commits(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        payload["git"]["commit_each_task"] = False
+        payload["execution"] = {
+            "parallel_tasks": {
+                "enabled": True,
+                "max_workers": 2,
+                "strict": True,
+                "worktree_root": "",
+            }
+        }
+
+        errors = validate_project_config_payload(payload)
+        self.assertTrue(any("requires git.commit_each_task=true" in item for item in errors))
+
     def test_validate_project_config_payload_accepts_config_without_docs(self) -> None:
         payload = {
             "project_name": "demo",

@@ -66,7 +66,7 @@ becomes the execution contract for the rest of the run.
 There is no hard task-count cap now. Instead, validation warns when a plan looks over-fragmented so
 you can inspect whether the work was sliced too finely.
 
-Task execution is sequential, not parallel:
+Task execution is sequential by default:
 
 - the orchestrator walks `task_plan.json` in order
 - each task moves `pending -> in_progress -> done` or `blocked`
@@ -75,6 +75,17 @@ Task execution is sequential, not parallel:
   next unfinished task in the same `run`
 - `--max-tasks N` stops the current invocation after `N` successful tasks, which is useful for demos
   or controlled rollout
+
+An experimental opt-in path can parallelize independent tasks in separate git worktrees. That mode
+stays conservative:
+
+- `execution.parallel_tasks.enabled` must be true
+- `git.commit_each_task` must stay true
+- every non-done task must carry planner-generated `depends_on`
+- malformed or missing dependency metadata falls back to sequential mode, or fails fast when
+  `execution.parallel_tasks.strict=true`
+- each worker still runs implement/verify/review, and the main worktree still integrates task
+  results one commit at a time
 
 For each task, the effective loop is:
 
@@ -384,6 +395,26 @@ Gate commands remain sequential by default. To opt into concurrent execution for
 non-mutating checks, declare `gates.parallel_groups`; the runner executes `gates.commands`
 sequentially first, then each parallel group in listed order while preserving command-result order in
 the collected output.
+
+Experimental parallel task execution uses planner-generated dependencies plus isolated git
+worktrees. Example:
+
+```json
+{
+  "execution": {
+    "parallel_tasks": {
+      "enabled": true,
+      "max_workers": 2,
+      "strict": false,
+      "worktree_root": ""
+    }
+  }
+}
+```
+
+When that mode is enabled, the planner should emit `depends_on` arrays in
+`.auto-agents/state/task_plan.json`, for example `[]` for an independent task or
+`["task-001"]` for a dependent slice.
 
 ### Provider auto-failover
 
