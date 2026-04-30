@@ -30,6 +30,9 @@ ALLOWED_ORACLE_TYPES = {
 }
 ALLOWED_ORACLE_STRENGTHS = {"proxy", "behavioral", "semantic", "human"}
 ALLOWED_EVIDENCE_BOUNDARIES = {"internal_state", "system_boundary", "external_side_effect"}
+DEFAULT_ORACLE_TYPE = "mixed"
+DEFAULT_ORACLE_STRENGTH = "behavioral"
+DEFAULT_EVIDENCE_BOUNDARY = "system_boundary"
 
 
 def empty_requirements_trace() -> dict:
@@ -40,11 +43,52 @@ def empty_provider_references_lock() -> dict:
     return {"version": 1, "references": {}}
 
 
-def load_requirements_trace(project_root: Path) -> dict:
+def _normalize_requirement_record(item: dict) -> dict:
+    normalized = dict(item)
+
+    oracle_type = normalized.get("oracle_type")
+    if oracle_type is None or (isinstance(oracle_type, str) and not oracle_type.strip()):
+        normalized["oracle_type"] = DEFAULT_ORACLE_TYPE
+
+    oracle_strength = normalized.get("oracle_strength")
+    if oracle_strength is None or (isinstance(oracle_strength, str) and not oracle_strength.strip()):
+        normalized["oracle_strength"] = DEFAULT_ORACLE_STRENGTH
+
+    evidence_boundary = normalized.get("evidence_boundary")
+    if evidence_boundary is None or (
+        isinstance(evidence_boundary, str) and not evidence_boundary.strip()
+    ):
+        normalized["evidence_boundary"] = DEFAULT_EVIDENCE_BOUNDARY
+
+    if "forbidden_proxy_oracles" not in normalized or normalized.get("forbidden_proxy_oracles") is None:
+        normalized["forbidden_proxy_oracles"] = []
+
+    return normalized
+
+
+def normalize_requirements_trace_payload(payload: object) -> object:
+    if not isinstance(payload, dict):
+        return payload
+
+    normalized = dict(payload)
+    requirements = payload.get("requirements")
+    if isinstance(requirements, list):
+        normalized["requirements"] = [
+            _normalize_requirement_record(item) if isinstance(item, dict) else item
+            for item in requirements
+        ]
+    return normalized
+
+
+def load_requirements_trace(project_root: Path, *, normalize: bool = True) -> dict:
     payload = read_json(requirements_trace_path(project_root), default=None)
     if payload is None:
         return empty_requirements_trace()
     if isinstance(payload, dict):
+        if normalize:
+            normalized = normalize_requirements_trace_payload(payload)
+            if isinstance(normalized, dict):
+                return normalized
         return payload
     return empty_requirements_trace()
 
@@ -159,7 +203,10 @@ def validate_requirements_trace_payload(payload: object) -> List[str]:
 
 
 def requirement_records(trace_payload: dict) -> List[dict]:
-    raw = trace_payload.get("requirements", [])
+    normalized = normalize_requirements_trace_payload(trace_payload)
+    if not isinstance(normalized, dict):
+        return []
+    raw = normalized.get("requirements", [])
     if not isinstance(raw, list):
         return []
     return [item for item in raw if isinstance(item, dict)]

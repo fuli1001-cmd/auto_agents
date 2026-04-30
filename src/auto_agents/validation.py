@@ -9,7 +9,11 @@ from typing import Dict, List
 from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, task_plan_path
 from .io_utils import read_json, read_text
 from .models import APPROVAL_ORDER, DEFAULT_EFFORTS, DOCUMENT_LANGUAGE_OPTIONS
-from .requirements import validate_requirements_trace_payload, validate_task_requirement_coverage
+from .requirements import (
+    normalize_requirements_trace_payload,
+    validate_requirements_trace_payload,
+    validate_task_requirement_coverage,
+)
 
 
 TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -434,6 +438,7 @@ def validate_task_plan_payload(
 def validate_task_plan_with_requirements(plan_payload: object, trace_payload: object) -> List[str]:
     errors = validate_task_plan_payload(plan_payload, require_verification=True)
     if isinstance(trace_payload, dict):
+        trace_payload = normalize_requirements_trace_payload(trace_payload)
         trace_errors = validate_requirements_trace_payload(trace_payload)
         errors.extend(trace_errors)
         if not trace_errors:
@@ -764,6 +769,7 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         trace_payload = None
         errors.append(f"requirements trace file is not valid JSON: {requirements_trace_path(root)} ({error.msg})")
     if trace_payload is not None:
+        trace_payload = normalize_requirements_trace_payload(trace_payload)
         trace_errors = validate_requirements_trace_payload(trace_payload)
         errors.extend(trace_errors)
 

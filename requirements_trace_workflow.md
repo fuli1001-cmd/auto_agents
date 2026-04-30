@@ -15,7 +15,9 @@ that downstream stages can validate against.
 
 - Generate and maintain `.auto-agents/state/requirements_trace.json` during clarify.
 - Give every active requirement a stable ID, source, mandatory/deferred status, acceptance oracles,
-  optional forbidden patterns, and optional provider-documentation requirements.
+  an explicit oracle contract (`oracle_type`, `oracle_strength`, `evidence_boundary`,
+  `forbidden_proxy_oracles`), optional forbidden patterns, and optional provider-documentation
+  requirements.
 - Require task plans to map tasks to requirement IDs.
 - Validate that every mandatory active requirement is covered by at least one task, unless it is
   explicitly deferred or superseded.
@@ -52,6 +54,13 @@ The trace is the machine-readable source of truth after clarify. Required shape:
         "Outbound requests match the official provider request schema.",
         "Legacy private gateway payload fields are not used."
       ],
+      "oracle_type": "integration_test",
+      "oracle_strength": "behavioral",
+      "evidence_boundary": "system_boundary",
+      "forbidden_proxy_oracles": [
+        "configuration-only checks",
+        "log-only evidence"
+      ],
       "forbidden_patterns": [
         "task_type.*tts_synthesize"
       ],
@@ -62,6 +71,10 @@ The trace is the machine-readable source of truth after clarify. Required shape:
   ]
 }
 ```
+
+Legacy traces that predate the oracle-contract fields are normalized in memory to
+`mixed` / `behavioral` / `system_boundary` / `[]` so existing projects still validate, but new
+clarify output should write the full shape explicitly.
 
 Allowed requirement statuses:
 

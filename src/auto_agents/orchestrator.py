@@ -4250,7 +4250,7 @@ class Orchestrator:
     def _clarify_validation_feedback(self, _: AgentResult) -> Optional[str]:
         path = docs_dir(self.project_root) / "project_brief.md"
         errors = validate_required_document(path, "project_brief.md")
-        trace = load_requirements_trace(self.project_root)
+        trace = load_requirements_trace(self.project_root, normalize=False)
         errors.extend(validate_requirements_trace_payload(trace))
 
         # Iteration safety: detect silent deletion of pre-existing REQ IDs.

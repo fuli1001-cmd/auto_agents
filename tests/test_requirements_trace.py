@@ -14,7 +14,11 @@ from auto_agents.config import (
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import TaskSpec
 from auto_agents.orchestrator import Orchestrator
-from auto_agents.requirements import audit_requirements, validate_requirements_trace_payload
+from auto_agents.requirements import (
+    audit_requirements,
+    load_requirements_trace,
+    validate_requirements_trace_payload,
+)
 from auto_agents.validation import validate_task_plan_with_requirements, validation_report
 
 
@@ -35,6 +39,14 @@ def _requirement(**overrides):
         "provider_reference": "",
         "notes": "",
     }
+    payload.update(overrides)
+    return payload
+
+
+def _legacy_requirement(**overrides):
+    payload = _requirement()
+    for field in ("oracle_type", "oracle_strength", "evidence_boundary", "forbidden_proxy_oracles"):
+        payload.pop(field, None)
     payload.update(overrides)
     return payload
 
@@ -94,6 +106,31 @@ class RequirementsTraceTests(unittest.TestCase):
 
             self.assertTrue(report["ok"])
             self.assertEqual(report["errors"], [])
+
+    def test_project_validation_accepts_legacy_requirements_trace_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(requirements_trace_path(project_root), {"version": 1, "requirements": [_legacy_requirement()]})
+
+            report = validation_report(project_root)
+
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["errors"], [])
+
+    def test_load_requirements_trace_backfills_legacy_quality_contract_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(requirements_trace_path(project_root), {"version": 1, "requirements": [_legacy_requirement()]})
+
+            trace = load_requirements_trace(project_root)
+            requirement = trace["requirements"][0]
+
+            self.assertEqual(requirement["oracle_type"], "mixed")
+            self.assertEqual(requirement["oracle_strength"], "behavioral")
+            self.assertEqual(requirement["evidence_boundary"], "system_boundary")
+            self.assertEqual(requirement["forbidden_proxy_oracles"], [])
 
     def test_requirements_audit_fails_for_forbidden_pattern(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -179,24 +216,13 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertIn("REQ-001: pass", report)
 
-    def test_requirements_trace_requires_quality_contract_fields(self) -> None:
-        trace = {
-            "version": 1,
-            "requirements": [
-                {
-                    "id": "REQ-001",
-                    "text": "Implement the direct integration.",
-                    "source": "user conversation",
-                    "status": "active",
-                    "priority": "mandatory",
-                    "acceptance_oracles": ["The public API returns normalized provider output."],
-                    "forbidden_patterns": [],
-                    "external_docs_required": False,
-                    "provider_reference": "",
-                    "notes": "",
-                }
-            ],
-        }
+    def test_requirements_trace_rejects_invalid_quality_contract_values(self) -> None:
+        trace = {"version": 1, "requirements": [_requirement(
+            oracle_type="legacy_gateway",
+            oracle_strength="weak",
+            evidence_boundary="ui_only",
+            forbidden_proxy_oracles="logs only",
+        )]}
 
         errors = validate_requirements_trace_payload(trace)
 
