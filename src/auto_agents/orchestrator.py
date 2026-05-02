@@ -2840,7 +2840,25 @@ class Orchestrator:
         if not task_id.strip():
             return False
         pattern = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(task_id)}(?![A-Za-z0-9_-])")
-        return pattern.search(content) is not None
+        return any(
+            not self._task_id_match_is_allowed_parent_reference(content, match)
+            for match in pattern.finditer(content)
+        )
+
+    @staticmethod
+    def _task_id_match_is_allowed_parent_reference(
+        content: str,
+        match: re.Match[str],
+    ) -> bool:
+        prefix = content[max(0, match.start() - 160): match.start()]
+        allowed_prefix_patterns = (
+            re.compile(r"(?:['\"]parent_task_id['\"]|parent_task_id)\s*:\s*['\"]?$"),
+            re.compile(r"\[\s*['\"]parent_task_id['\"]\s*\]\s*,\s*['\"]?$"),
+            re.compile(r"\[\s*['\"]parent_task_id['\"]\s*\]\s*(?:==|!=)\s*['\"]?$"),
+            re.compile(r"\.parent_task_id\s*,\s*['\"]?$"),
+            re.compile(r"\.parent_task_id\s*(?:==|!=)\s*['\"]?$"),
+        )
+        return any(pattern.search(prefix) for pattern in allowed_prefix_patterns)
 
     def _build_task_plan_migration_context(self, state: Optional[RunState], task: TaskSpec) -> str:
         active_state = state or load_run_state(self.project_root)
