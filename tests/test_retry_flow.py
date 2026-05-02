@@ -1799,6 +1799,54 @@ class RetryFlowTests(unittest.TestCase):
                 (project_root / "tests" / "test_plan_contract.py").read_text(encoding="utf-8"),
             )
 
+    def test_stale_plan_coupled_test_audit_ignores_split_child_suffixes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-078a",
+                            "title": "First child",
+                            "description": "Split child A.",
+                            "acceptance": ["uses child ids only"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "parent_task_id": "task-078",
+                            "split_depth": 1,
+                        },
+                        {
+                            "task_id": "task-078b",
+                            "title": "Second child",
+                            "description": "Split child B.",
+                            "acceptance": ["uses child ids only"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "parent_task_id": "task-078",
+                            "split_depth": 1,
+                        },
+                    ]
+                },
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(exist_ok=True)
+            write_text(
+                tests_dir / "test_plan_contract.py",
+                "EXPECTED_TASKS = ['task-078a', 'task-078b']\n",
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.plan_task_replacements = {"task-078": ["task-078a", "task-078b"]}
+
+            audit = orchestrator._run_stale_plan_coupled_test_audit(state.tasks[0], state=state)
+
+            self.assertIsNone(audit)
+
     def test_verify_failure_logs_repeat_statistics_for_same_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

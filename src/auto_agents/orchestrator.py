@@ -2836,6 +2836,12 @@ class Orchestrator:
                 retired_ids.add(retired_id)
         return sorted(retired_ids)
 
+    def _text_references_task_id(self, content: str, task_id: str) -> bool:
+        if not task_id.strip():
+            return False
+        pattern = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(task_id)}(?![A-Za-z0-9_-])")
+        return pattern.search(content) is not None
+
     def _build_task_plan_migration_context(self, state: Optional[RunState], task: TaskSpec) -> str:
         active_state = state or load_run_state(self.project_root)
         retired_ids = self._task_retired_plan_ids(active_state, task)
@@ -2875,7 +2881,7 @@ class Orchestrator:
             if not content.strip():
                 continue
             for retired_id in retired_ids:
-                if retired_id not in content:
+                if not self._text_references_task_id(content, retired_id):
                     continue
                 findings.append(
                     {
