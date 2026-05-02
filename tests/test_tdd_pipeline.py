@@ -109,6 +109,38 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn(".auto-agents/docs/provider_references/doubao_tts.md", prompt)
             self.assertIn("Do not search for alternate docs", prompt)
 
+    def test_implement_prompt_includes_task_status_migration_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(exist_ok=True)
+            write_text(
+                tests_dir / "test_status_contract.py",
+                (
+                    "EXPECTED = {\n"
+                    "    'task-080': {\n"
+                    "        'status': 'in_progress',\n"
+                    "    },\n"
+                    "}\n"
+                ),
+            )
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-080",
+                title="Finish continuity acceptance",
+                description="Complete the remaining test migration.",
+                acceptance=["task reaches done"],
+            )
+
+            prompt = orchestrator._build_task_prompt(task, "implement")
+            self.assertIn("TASK STATUS MIGRATION CONTEXT", prompt)
+            self.assertIn("task `task-080`", prompt)
+            self.assertIn("status `done`", prompt)
+            self.assertIn("tests/test_status_contract.py", prompt)
+            self.assertIn("in_progress", prompt)
+
     def test_review_prompt_includes_test_audit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -125,6 +157,36 @@ class ImplementPipelineTests(unittest.TestCase):
             prompt = orchestrator._build_task_prompt(task, "review")
             self.assertIn("TEST AUDIT", prompt)
             self.assertIn("observable behavior", prompt)
+
+    def test_review_prompt_includes_task_status_migration_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(exist_ok=True)
+            write_text(
+                tests_dir / "test_status_contract.py",
+                (
+                    "EXPECTED = {\n"
+                    "    'task-080': {\n"
+                    "        'status': 'pending',\n"
+                    "    },\n"
+                    "}\n"
+                ),
+            )
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-080",
+                title="Finish continuity acceptance",
+                description="Complete the remaining test migration.",
+                acceptance=["task reaches done"],
+            )
+
+            prompt = orchestrator._build_task_prompt(task, "review")
+            self.assertIn("TASK STATUS MIGRATION CONTEXT", prompt)
+            self.assertIn("tests/test_status_contract.py", prompt)
+            self.assertIn("pending", prompt)
 
     def test_review_prompt_checks_bound_requirement_oracles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

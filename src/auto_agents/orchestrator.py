@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import hashlib
 import os
@@ -1866,6 +1867,24 @@ class Orchestrator:
                 "new_failure_ids": stale_failure_ids,
                 "raw_output": str(stale_plan_audit.get("raw_output", "")),
             }
+        stale_status_audit = self._run_task_status_coupled_test_audit(
+            task,
+            expected_status="done",
+        )
+        if stale_status_audit:
+            stale_failure_ids = self._normalize_verify_failure_ids(
+                stale_status_audit.get("failure_ids", []),
+                str(stale_status_audit.get("reason", "")),
+            )
+            return {
+                "ok": False,
+                "reason": str(stale_status_audit["reason"]),
+                "failure_ids": stale_failure_ids,
+                "current_failure_ids": stale_failure_ids,
+                "baseline_failure_ids": baseline_failure_ids,
+                "new_failure_ids": stale_failure_ids,
+                "raw_output": str(stale_status_audit.get("raw_output", "")),
+            }
         return {
             "ok": True,
             "reason": verify_gate.summary,
@@ -2010,6 +2029,17 @@ class Orchestrator:
                 candidate = (project_root / candidate).resolve()
             else:
                 candidate = candidate.resolve()
+            try:
+                relative = candidate.relative_to(project_root)
+            except ValueError:
+                continue
+            normalized = str(relative)
+            if normalized not in paths:
+                paths.append(normalized)
+        for raw_path in re.findall(r"(?:(?<=^)|(?<=[\s`'\"(]))((?:tests?|__tests__)/[^\s:`'\")]+)", raw_output, re.MULTILINE):
+            candidate = (project_root / raw_path).resolve()
+            if not candidate.exists():
+                continue
             try:
                 relative = candidate.relative_to(project_root)
             except ValueError:
@@ -2860,6 +2890,77 @@ class Orchestrator:
         )
         return any(pattern.search(prefix) for pattern in allowed_prefix_patterns)
 
+    @staticmethod
+    def _ast_string_literal(node: Optional[ast.AST]) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return ""
+
+    @classmethod
+    def _dict_string_literal_items(cls, node: ast.AST) -> Dict[str, str]:
+        if not isinstance(node, ast.Dict):
+            return {}
+        items: Dict[str, str] = {}
+        for key, value in zip(node.keys, node.values):
+            rendered_key = cls._ast_string_literal(key)
+            rendered_value = cls._ast_string_literal(value)
+            if rendered_key and rendered_value:
+                items[rendered_key] = rendered_value
+        return items
+
+    @classmethod
+    def _python_test_task_status_literals(cls, content: str, task_id: str) -> List[str]:
+        if not task_id.strip():
+            return []
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return []
+
+        statuses: List[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            literal_items = cls._dict_string_literal_items(node)
+            direct_task_id = literal_items.get("task_id", "")
+            direct_status = literal_items.get("status", "")
+            if direct_task_id == task_id and direct_status:
+                statuses.append(direct_status)
+            for key, value in zip(node.keys, node.values):
+                if cls._ast_string_literal(key) != task_id:
+                    continue
+                nested_status = cls._dict_string_literal_items(value).get("status", "")
+                if nested_status:
+                    statuses.append(nested_status)
+        return sorted(set(statuses))
+
+    @classmethod
+    def _text_task_status_literals(cls, content: str, task_id: str) -> List[str]:
+        if not task_id.strip():
+            return []
+        statuses: List[str] = []
+        patterns = (
+            re.compile(
+                rf"['\"]{re.escape(task_id)}['\"]\s*:\s*\{{[\s\S]{{0,600}}?['\"]status['\"]\s*:\s*['\"](pending|in_progress|blocked|done)['\"]",
+                re.MULTILINE,
+            ),
+            re.compile(
+                rf"['\"]task_id['\"]\s*:\s*['\"]{re.escape(task_id)}['\"][\s\S]{{0,300}}?['\"]status['\"]\s*:\s*['\"](pending|in_progress|blocked|done)['\"]",
+                re.MULTILINE,
+            ),
+        )
+        for pattern in patterns:
+            statuses.extend(match.group(1) for match in pattern.finditer(content))
+        return sorted(set(statuses))
+
+    @classmethod
+    def _test_file_task_status_literals(cls, relative_path: str, content: str, task_id: str) -> List[str]:
+        if relative_path.endswith(".py"):
+            statuses = cls._python_test_task_status_literals(content, task_id)
+            if statuses:
+                return statuses
+        return cls._text_task_status_literals(content, task_id)
+
     def _build_task_plan_migration_context(self, state: Optional[RunState], task: TaskSpec) -> str:
         active_state = state or load_run_state(self.project_root)
         retired_ids = self._task_retired_plan_ids(active_state, task)
@@ -2878,6 +2979,47 @@ class Orchestrator:
         lines.append(
             "If repository tests still reference the retired task IDs or rely on the pre-split plan shape, update those tests in this task."
         )
+        return "\n".join(lines)
+
+    def _build_task_status_migration_context(
+        self,
+        task: TaskSpec,
+        *,
+        expected_status: str = "done",
+    ) -> str:
+        if not task.task_id.strip() or not expected_status.strip():
+            return ""
+
+        lines = [
+            "TASK STATUS MIGRATION CONTEXT:",
+            (
+                f"If this task succeeds, the orchestrator will persist task `{task.task_id}` "
+                f"with status `{expected_status}`."
+            ),
+            (
+                "If repository tests or task-plan snapshots still assert an older status for this task, "
+                "update them in the same task."
+            ),
+        ]
+
+        findings: List[str] = []
+        for relative_path in self._repository_test_paths():
+            content = read_text(self.project_root / relative_path)
+            if not content.strip() or not self._text_references_task_id(content, task.task_id):
+                continue
+            statuses = self._test_file_task_status_literals(relative_path, content, task.task_id)
+            stale_statuses = [status for status in statuses if status != expected_status]
+            if not stale_statuses:
+                continue
+            findings.append(
+                f"- {relative_path}: currently asserts `{task.task_id}` as {', '.join(sorted(set(stale_statuses)))}."
+            )
+
+        if findings:
+            lines.append("Repository tests currently look stale for this status transition:")
+            lines.extend(findings[:8])
+            if len(findings) > 8:
+                lines.append(f"- ... {len(findings) - 8} more stale task-status assertion(s)")
         return "\n".join(lines)
 
     def _run_stale_plan_coupled_test_audit(
@@ -2932,6 +3074,59 @@ class Orchestrator:
                 seen_failures.add(failure_id)
         if len(findings) > 12:
             lines.append(f"- ... {len(findings) - 12} more stale test reference(s)")
+
+        reason = "\n".join(lines)
+        return {
+            "reason": reason,
+            "failure_ids": failure_ids,
+            "raw_output": reason,
+        }
+
+    def _run_task_status_coupled_test_audit(
+        self,
+        task: Optional[TaskSpec],
+        *,
+        expected_status: str,
+    ) -> Optional[Dict[str, object]]:
+        if task is None or not task.task_id.strip() or not expected_status.strip():
+            return None
+
+        findings: List[Dict[str, object]] = []
+        for relative_path in self._repository_test_paths():
+            content = read_text(self.project_root / relative_path)
+            if not content.strip() or not self._text_references_task_id(content, task.task_id):
+                continue
+            statuses = self._test_file_task_status_literals(relative_path, content, task.task_id)
+            stale_statuses = [status for status in statuses if status != expected_status]
+            if not stale_statuses:
+                continue
+            findings.append({"path": relative_path, "statuses": stale_statuses})
+
+        if not findings:
+            return None
+
+        lines = [
+            f"Plan-coupled repository tests still expect task `{task.task_id}` to have a stale status.",
+            f"A successful implementation attempt for this task must leave it at status `{expected_status}`.",
+            "Update the repository tests so they match the current task plan before continuing.",
+        ]
+        failure_ids: List[str] = []
+        seen_failures: Set[str] = set()
+        for item in findings[:12]:
+            path = str(item["path"])
+            stale_statuses = [str(value) for value in item.get("statuses", []) if str(value).strip()]
+            status_text = ", ".join(sorted(set(stale_statuses)))
+            lines.append(
+                f"- {path}: task `{task.task_id}` should now be asserted as `{expected_status}`, not `{status_text}`."
+            )
+            for stale_status in stale_statuses:
+                failure_id = f"stale-task-status-test:{path}:{task.task_id}:{stale_status}"
+                if failure_id in seen_failures:
+                    continue
+                failure_ids.append(failure_id)
+                seen_failures.add(failure_id)
+        if len(findings) > 12:
+            lines.append(f"- ... {len(findings) - 12} more stale task-status assertion(s)")
 
         reason = "\n".join(lines)
         return {
@@ -3376,6 +3571,7 @@ class Orchestrator:
         architecture = docs_dir(self.project_root) / "architecture.md"
         task_json = json.dumps(task.to_dict(), indent=2, ensure_ascii=False)
         requirement_context = format_requirement_context(requirements_for_task(self.project_root, task))
+        task_status_migration_context = self._build_task_status_migration_context(task)
         common = [
             f"Project root: {self.project_root}",
             f"Project brief: {brief}",
@@ -3389,6 +3585,8 @@ class Orchestrator:
             common.extend(["", requirement_context])
         if plan_migration_context.strip():
             common.extend(["", plan_migration_context.strip()])
+        if task_status_migration_context.strip():
+            common.extend(["", task_status_migration_context.strip()])
 
         if stage == "implement":
             lines = common + [

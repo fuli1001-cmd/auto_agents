@@ -595,6 +595,47 @@ class StalePlanAuditRecoveryAdapter:
         )
 
 
+class StaleTaskStatusAuditRecoveryAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+        self.implement_prompts = []
+        self.review_prompts = []
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            self.implement_prompts.append(request.prompt)
+            if self.implement_calls == 2:
+                write_text(
+                    self.project_root / "tests" / "test_status_contract.py",
+                    (
+                        "EXPECTED = {\n"
+                        "    'task-080': {\n"
+                        "        'status': 'done',\n"
+                        "    },\n"
+                        "}\n"
+                    ),
+                )
+            write_text(self.project_root / "artifact.txt", f"attempt-{self.implement_calls}\n")
+            summary = f"implemented attempt {self.implement_calls}\n"
+        elif request.stage == "review":
+            self.review_calls += 1
+            self.review_prompts.append(request.prompt)
+            summary = "DECISION: pass\nreview passed after stale task-status migration\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class SequencedVerifyFailureAdapter:
     def __init__(self, project_root: Path, values):
         self.project_root = project_root
@@ -1899,6 +1940,105 @@ class RetryFlowTests(unittest.TestCase):
             audit = orchestrator._run_stale_plan_coupled_test_audit(state.tasks[0], state=state)
 
             self.assertIsNone(audit)
+
+    def test_task_status_coupled_test_audit_flags_stale_done_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-080",
+                            "title": "Continuity acceptance",
+                            "description": "Finish the acceptance slice.",
+                            "acceptance": ["status reaches done"],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(exist_ok=True)
+            write_text(
+                tests_dir / "test_status_contract.py",
+                (
+                    "EXPECTED = {\n"
+                    "    'task-080': {\n"
+                    "        'status': 'in_progress',\n"
+                    "    },\n"
+                    "}\n"
+                ),
+            )
+
+            task = orchestrator._load_tasks_from_plan()[0]
+            audit = orchestrator._run_task_status_coupled_test_audit(task, expected_status="done")
+
+            self.assertIsNotNone(audit)
+            assert audit is not None
+            self.assertIn("task `task-080`", str(audit["reason"]))
+            self.assertIn("`done`", str(audit["reason"]))
+            self.assertIn("`in_progress`", str(audit["reason"]))
+            self.assertIn("tests/test_status_contract.py", str(audit["reason"]))
+
+    def test_status_coupled_tests_retry_implement_until_migrated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = StaleTaskStatusAuditRecoveryAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-080",
+                            "title": "Continuity acceptance",
+                            "description": "Finish the acceptance slice.",
+                            "acceptance": ["status reaches done"],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(exist_ok=True)
+            write_text(
+                tests_dir / "test_status_contract.py",
+                (
+                    "EXPECTED = {\n"
+                    "    'task-080': {\n"
+                    "        'status': 'in_progress',\n"
+                    "    },\n"
+                    "}\n"
+                ),
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertIn(
+                "Plan-coupled repository tests still expect task `task-080` to have a stale status.",
+                orchestrator.adapter.implement_prompts[1],
+            )
+            self.assertIn("tests/test_status_contract.py", orchestrator.adapter.implement_prompts[1])
+            self.assertIn("`done`", orchestrator.adapter.implement_prompts[1])
+            self.assertIn(
+                "'status': 'done'",
+                (project_root / "tests" / "test_status_contract.py").read_text(encoding="utf-8"),
+            )
 
     def test_verify_failure_logs_repeat_statistics_for_same_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
