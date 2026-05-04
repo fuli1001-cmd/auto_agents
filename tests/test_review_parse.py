@@ -44,6 +44,29 @@ class ReviewParseTests(unittest.TestCase):
 
             self.assertIsNotNone(issue)
 
+    def test_review_validation_rejects_orchestrator_state_snapshot_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            result = AgentResult(
+                ok=True,
+                command=["fake"],
+                output_path=project_root / "out.md",
+                summary=(
+                    "DECISION: fail\n"
+                    "`.auto-agents/state/task_plan.json` and `.auto-agents/state/run_state.json` "
+                    "still show task-001 as `in_progress` instead of `done`.\n"
+                ),
+                returncode=0,
+            )
+
+            issue = orchestrator._review_validation_feedback(result)
+
+            self.assertIsNotNone(issue)
+            assert issue is not None
+            self.assertIn("orchestrator-owned", issue)
+
     def test_review_prompt_forbids_preamble_and_file_note(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

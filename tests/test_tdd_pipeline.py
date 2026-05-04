@@ -140,6 +140,7 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("status `done`", prompt)
             self.assertIn("tests/test_status_contract.py", prompt)
             self.assertIn("in_progress", prompt)
+            self.assertIn("orchestrator-owned run snapshots", prompt)
 
     def test_review_prompt_includes_test_audit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -187,6 +188,7 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("TASK STATUS MIGRATION CONTEXT", prompt)
             self.assertIn("tests/test_status_contract.py", prompt)
             self.assertIn("pending", prompt)
+            self.assertIn("review stale repository test assertions only", prompt)
 
     def test_review_prompt_checks_bound_requirement_oracles(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

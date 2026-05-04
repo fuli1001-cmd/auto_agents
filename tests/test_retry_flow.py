@@ -1150,6 +1150,8 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertEqual(state.tasks[0].status, "done")
             self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "good")
+            reloaded_state = load_run_state(project_root)
+            self.assertEqual(reloaded_state.tasks[0].status, "done")
 
     def test_resume_in_progress_task_skips_reimplementation_and_commits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1501,6 +1501,7 @@ class Orchestrator:
             title=task.title,
         )
         self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
         if self.config.git.commit_each_task:
             task.commit_sha = commit_all(self.project_root, commit_message)
             self._warm_clean_head_verify_baseline(
@@ -2997,9 +2998,9 @@ class Orchestrator:
                 f"with status `{expected_status}`."
             ),
             (
-                "If repository tests or task-plan snapshots still assert an older status for this task, "
-                "update them in the same task."
+                "If repository tests still assert an older status for this task, update them in the same task."
             ),
+            "Internal .auto-agents state files are orchestrator-owned run snapshots, not implementation targets.",
         ]
 
         findings: List[str] = []
@@ -3597,6 +3598,7 @@ class Orchestrator:
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
+                "When task status migration context is present, migrate only repository tests that assert stale task status. Do not edit orchestrator-owned .auto-agents state snapshots to force that transition early.",
                 "Tests should validate observable behavior (API contracts, input/output, side-effects), not internal implementation details.",
                 "For external provider integrations, use the listed provider_reference files as the source of truth. Do not search for alternate docs or invent protocol details unless the reference is marked insufficient; stop and report missing documentation instead.",
                 "For protocol/direct-integration tasks, add contract tests that verify outbound request shape, auth/header behavior, response normalization, and forbidden legacy payloads where applicable.",
@@ -3623,6 +3625,7 @@ class Orchestrator:
                 "If the tests only pass by mocking/faking internal state instead of exercising real "
                 "public interfaces, that is a 'DECISION: fail' issue.",
                 "If plan migration context lists retired task IDs, stale repository tests that still reference those retired IDs or the pre-split task-plan structure are also a 'DECISION: fail' issue.",
+                "If task status migration context is present, review stale repository test assertions only. Do NOT fail solely because orchestrator-owned .auto-agents state snapshots still show `in_progress` during review.",
                 "SCOPE RULE: Your review scope is bounded by the acceptance criteria in the Task JSON plus the bound requirements and acceptance oracles above. "
                 "A 'DECISION: fail' is warranted ONLY when the implementation does not satisfy one or more "
                 "task acceptance criteria, bound requirement oracles, introduces a regression in existing tests, or leaves the codebase in a "
@@ -4462,12 +4465,31 @@ class Orchestrator:
         return None
 
     def _review_validation_feedback(self, result: AgentResult) -> Optional[str]:
-        if self._has_explicit_review_decision(result.summary):
-            return None
-        return (
-            "The review response is invalid. It must include a line exactly equal to "
-            "'DECISION: pass' or 'DECISION: fail'. Rewrite the review output."
-        )
+        if not self._has_explicit_review_decision(result.summary):
+            return (
+                "The review response is invalid. It must include a line exactly equal to "
+                "'DECISION: pass' or 'DECISION: fail'. Rewrite the review output."
+            )
+        decision, summary = self._parse_review_decision(result.summary)
+        if decision == "fail" and self._review_blocks_on_orchestrator_state_snapshot(summary):
+            return (
+                "The review response is invalid. Do not fail solely because orchestrator-owned "
+                ".auto-agents state snapshots still show an in-flight task status. Review product "
+                "behavior and repository tests instead, and rewrite the review output."
+            )
+        return None
+
+    @staticmethod
+    def _review_blocks_on_orchestrator_state_snapshot(summary: str) -> bool:
+        text = (summary or "").lower()
+        if not text:
+            return False
+        if (
+            ".auto-agents/state/task_plan.json" not in text
+            and ".auto-agents/state/run_state.json" not in text
+        ):
+            return False
+        return any(token in text for token in ("in_progress", "`in_progress`", "status", "`done`", "done"))
 
     def _clarify_validation_feedback(self, _: AgentResult) -> Optional[str]:
         path = docs_dir(self.project_root) / "project_brief.md"
