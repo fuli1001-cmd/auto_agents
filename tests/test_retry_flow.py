@@ -204,6 +204,33 @@ class OutOfScopeReviewAdapter:
         )
 
 
+class ReviewTsBuildInfoAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            write_text(self.project_root / "artifact.txt", "good\n")
+            summary = "implemented good\n"
+        elif request.stage == "review":
+            self.review_calls += 1
+            workbench = self.project_root / "workbench"
+            workbench.mkdir(parents=True, exist_ok=True)
+            write_text(workbench / "tsconfig.tsbuildinfo", '{"version":"incremental-2"}\n')
+            summary = "DECISION: pass\nreview passed despite tooling cache churn\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class OutOfScopeImplementAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
@@ -1192,6 +1219,58 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(orchestrator.adapter.review_calls, 1)
             self.assertEqual(state.tasks[0].status, "done")
             self.assertTrue(state.tasks[0].commit_sha)
+
+    def test_review_stage_cleans_ephemeral_tsbuildinfo_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.gates.require_clean_git_before_task = False
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = ReviewTsBuildInfoAdapter(project_root)
+
+            workbench = project_root / "workbench"
+            workbench.mkdir(exist_ok=True)
+            tsbuildinfo_path = workbench / "tsconfig.tsbuildinfo"
+            write_text(tsbuildinfo_path, '{"version":"incremental-1"}\n')
+            commit_all(project_root, "chore: seed tsbuildinfo")
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains good"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(tsbuildinfo_path.read_text(encoding="utf-8").strip(), '{"version":"incremental-1"}')
+            status = subprocess.run(
+                ["git", "status", "--short", "--", "workbench/tsconfig.tsbuildinfo"],
+                cwd=str(project_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            self.assertEqual(status.stdout.strip(), "")
 
     def test_blocked_task_can_retry_with_dirty_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

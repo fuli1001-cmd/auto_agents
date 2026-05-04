@@ -1139,6 +1139,42 @@ class Orchestrator:
         return snapshot
 
     @staticmethod
+    def _is_ephemeral_tooling_artifact(path: str) -> bool:
+        normalized = str(path).replace("\\", "/").lower()
+        return normalized.endswith(".tsbuildinfo")
+
+    def _cleanup_ephemeral_tooling_artifacts(self) -> None:
+        candidates = [
+            path
+            for _, path in changed_entries(self.project_root, ignored_prefixes=())
+            if self._is_ephemeral_tooling_artifact(path)
+        ]
+        for path in candidates:
+            file_path = self.project_root / path
+            tracked = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", path],
+                cwd=str(self.project_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            ).returncode == 0
+            if tracked:
+                restore = subprocess.run(
+                    ["git", "restore", "--source=HEAD", "--staged", "--worktree", "--", path],
+                    cwd=str(self.project_root),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                )
+                if restore.returncode != 0:
+                    raise RuntimeError(restore.stderr.strip() or f"git restore failed for {path}")
+                continue
+            if file_path.is_dir():
+                shutil.rmtree(file_path)
+            elif file_path.exists() or file_path.is_symlink():
+                file_path.unlink()
+
+    @staticmethod
     def _snapshot_delta_paths(before: Dict[str, str], after: Dict[str, str]) -> List[str]:
         return sorted(
             path for path in set(before) | set(after)
@@ -1249,6 +1285,7 @@ class Orchestrator:
             self.project_root,
             collect_all=collect_all,
         )
+        self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
         changed = self._snapshot_delta_paths(before_snapshot, after_snapshot)
         reason = ""
@@ -3938,6 +3975,7 @@ class Orchestrator:
                 cumulative_usage = (cumulative_usage or AgentUsage()).plus(result.usage)
                 usage_available = True
             self._emit_agent_output(artifact_stage, result)
+            self._cleanup_ephemeral_tooling_artifacts()
             if state is not None:
                 state.agent_attempts[stage_key] = attempt
                 save_run_state(self.project_root, state)
