@@ -469,6 +469,7 @@ The plan root can also define:
 
 - `test_strategy`
 - `verification_commands`
+- `oracle_proof_schema_version`
 
 Those fields are required for completed plan output and are preserved when task status is updated
 during implementation.
@@ -484,6 +485,30 @@ expected to carry:
 
 This lets downstream planning and review distinguish proxy checks from behavioral/semantic oracles
 and distinguish internal-state evidence from system-boundary or external-side-effect proof.
+
+New task plans set `oracle_proof_schema_version: 1` and use `requirement_proofs` on every task
+that declares `requirement_ids`. A proof entry maps one requirement oracle to concrete evidence:
+
+```json
+{
+  "requirement_id": "REQ-057",
+  "oracle_index": 1,
+  "proof_type": "integration_test",
+  "oracle_strength": "behavioral",
+  "evidence_boundary": "system_boundary",
+  "evidence_refs": ["tests/test_retry_budget.py::test_retry_budget_is_per_asset"],
+  "forbidden_proxy_oracles": ["ledger output without retry decision coverage"],
+  "proxy_oracles": [],
+  "status": "verified"
+}
+```
+
+In strict oracle-proof mode, the final requirements audit does not treat `requirement_ids` alone as
+coverage. Every active mandatory acceptance oracle needs a verified done-task proof with concrete
+`evidence_refs`, sufficient oracle strength, and the required evidence boundary. For example, a
+per-asset retry-budget requirement is not proven merely by outputting a retry ledger; the cited proof
+must exercise the retry decision path at the required boundary and exclude ledger-only proxy evidence
+when the requirement forbids that proxy.
 
 Interrupted implementation work is resumable:
 

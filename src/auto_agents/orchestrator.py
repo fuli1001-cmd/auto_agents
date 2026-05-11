@@ -3387,8 +3387,11 @@ class Orchestrator:
                 f"Replace this JSON file with a task plan of minimal verifiable feature slices: {plan}",
                 "Only update .auto-agents/state/task_plan.json in this stage. Do not modify project code, tests, README.md, or other repository files to make the plan pass.",
                 "At the root of the JSON, also define test_strategy and verification_commands.",
+                "At the root of the JSON, set oracle_proof_schema_version to 1 for all new plans.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
+                "Every task that covers requirement_ids must include requirement_proofs. Each proof must include requirement_id, oracle_index (1-based) or exact acceptance_oracle, proof_type, oracle_strength, evidence_boundary, evidence_refs, status='planned', and forbidden_proxy_oracles copied from the bound requirement.",
                 "All active mandatory requirements in requirements_trace.json must be covered by at least one task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
+                "All active mandatory requirement acceptance_oracles must also be covered by at least one task requirement_proofs entry; requirement_ids alone are not sufficient coverage.",
                 "Task acceptance criteria must preserve the bound requirement's concrete acceptance_oracles; do not weaken direct/API/protocol requirements into naming or configuration-only checks.",
                 "Preserve each bound requirement's oracle_type, oracle_strength, evidence_boundary, and forbidden_proxy_oracles when slicing tasks. Requirements that demand semantic or human-strength proof are NOT satisfied by proxy checks, internal-state-only checks, config-only checks, or metadata/log snapshots. Requirements that demand system_boundary or external_side_effect evidence are NOT covered unless the task acceptance requires proof at that boundary.",
                 "If a requirement has external_docs_required=true, create at least one implementation task that consumes its provider_reference and tests against that protocol reference.",
@@ -3683,6 +3686,8 @@ class Orchestrator:
                 "If local verification exposes a tightly coupled regression in files you touched or in paths explicitly implicated by retry feedback, fix it in the same attempt even if it sits slightly outside the nominal task slice.",
                 "The bound requirements and acceptance oracles above are hard requirements, not optional background.",
                 "Honor the bound oracle contract exactly: the implementation and tests must meet or exceed each requirement's oracle_strength, collect proof at the required evidence_boundary, and avoid every forbidden proxy oracle listed in the requirement context.",
+                "Update the task's requirement_proofs entries as you implement: keep the bound requirement_id/oracle_index, set status='verified' only when concrete evidence exists, and fill evidence_refs with the exact tests, APIs, commands, or artifacts that prove the oracle at the required boundary.",
+                "Do not mark requirement_proofs verified for proxy evidence listed in forbidden_proxy_oracles, for final-status-only checks, or for config/metadata-only checks when the requirement demands behavioral/system-boundary proof.",
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
@@ -3707,6 +3712,7 @@ class Orchestrator:
             lines = common + [
                 "Review the current uncommitted changes for correctness, regressions, and missing tests.",
                 "The bound requirements and acceptance oracles above are in scope. A task passes only if both Task JSON and the bound requirement oracles are satisfied.",
+                "ORACLE PROOF AUDIT: Review every requirement_proofs entry. Fail unless each bound acceptance oracle has verified proof with concrete evidence_refs, the proof_type/oracle_strength/evidence_boundary meet or exceed the requirement, and proxy_oracles do not include anything listed in forbidden_proxy_oracles.",
                 "TEST AUDIT: Separately evaluate whether the tests truly cover the acceptance criteria "
                 "from the Task JSON. Check that tests validate observable behavior (API contracts, "
                 "input/output, side-effects) rather than internal implementation details. "
@@ -3721,7 +3727,7 @@ class Orchestrator:
                 "beyond the stated acceptance criteria and bound requirements should be noted as '[NON-BLOCKING]' advisory notes, "
                 "NOT as failure reasons.",
                 "When issuing 'DECISION: fail', you MUST cite the specific acceptance criterion (by index or text) "
-                "or requirement ID/oracle that is not satisfied. If no acceptance criterion or requirement oracle is violated but you have advisory concerns, "
+                "or requirement ID/oracle/proof entry that is not satisfied. If no acceptance criterion or requirement oracle is violated but you have advisory concerns, "
                 "issue 'DECISION: pass' with those concerns listed as '[NON-BLOCKING]' notes.",
                 "For external provider integrations, verify the code and tests against the provider_reference file. Fail if the implementation invents protocol fields, reuses a legacy private gateway payload, or tests only mock an internal gateway contract.",
                 "Also fail when the implementation uses a weaker oracle than the requirement allows (for example: proxy-only checks for semantic/human requirements, internal-state-only checks for system_boundary/external_side_effect requirements, or any check explicitly listed in forbidden_proxy_oracles).",

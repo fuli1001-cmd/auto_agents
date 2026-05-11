@@ -10,6 +10,7 @@ from .config import (
     provider_references_lock_path,
     requirements_audit_path,
     requirements_trace_path,
+    task_plan_path,
 )
 from .io_utils import read_json, write_json, write_text
 from .models import TaskSpec
@@ -33,6 +34,9 @@ ALLOWED_EVIDENCE_BOUNDARIES = {"internal_state", "system_boundary", "external_si
 DEFAULT_ORACLE_TYPE = "mixed"
 DEFAULT_ORACLE_STRENGTH = "behavioral"
 DEFAULT_EVIDENCE_BOUNDARY = "system_boundary"
+ORACLE_PROOF_SCHEMA_VERSION = 1
+ORACLE_STRENGTH_ORDER = {"proxy": 0, "behavioral": 1, "semantic": 2, "human": 3}
+EVIDENCE_BOUNDARY_ORDER = {"internal_state": 0, "system_boundary": 1, "external_side_effect": 2}
 
 
 def empty_requirements_trace() -> dict:
@@ -269,7 +273,108 @@ def validate_task_requirement_coverage(plan_payload: object, trace_payload: dict
             "mandatory active requirements are not covered by any task requirement_ids: "
             + ", ".join(missing)
         )
+    errors.extend(validate_task_requirement_proofs(plan_payload, trace_payload))
     return errors
+
+
+def _plan_oracle_proof_schema_enabled(plan_payload: dict) -> bool:
+    try:
+        if int(plan_payload.get("oracle_proof_schema_version") or 0) >= ORACLE_PROOF_SCHEMA_VERSION:
+            return True
+    except (TypeError, ValueError):
+        pass
+    tasks = plan_payload.get("tasks")
+    return isinstance(tasks, list) and any(
+        isinstance(task, dict) and "requirement_proofs" in task for task in tasks
+    )
+
+
+def validate_task_requirement_proofs(plan_payload: object, trace_payload: dict) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(plan_payload, dict):
+        return errors
+    if not _plan_oracle_proof_schema_enabled(plan_payload):
+        return errors
+    tasks = plan_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return errors
+
+    by_req = {str(item.get("id", "")).strip(): item for item in requirement_records(trace_payload)}
+    proofs_by_requirement: Dict[str, List[dict]] = {}
+    for index, task in enumerate(tasks, start=1):
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id", f"#{index}"))
+        requirement_ids = {
+            str(item).strip()
+            for item in task.get("requirement_ids", [])
+            if isinstance(item, str) and str(item).strip()
+        }
+        proofs = task.get("requirement_proofs")
+        if requirement_ids and proofs is None:
+            errors.append(f"task {task_id} must define requirement_proofs in oracle proof schema mode")
+            continue
+        if proofs is None:
+            continue
+        if not isinstance(proofs, list):
+            errors.append(f"task {task_id} requirement_proofs must be a list")
+            continue
+        for proof_index, proof in enumerate(proofs, start=1):
+            prefix = f"task {task_id} requirement_proofs[{proof_index}]"
+            if not isinstance(proof, dict):
+                errors.append(f"{prefix} must be an object")
+                continue
+            req_id = str(proof.get("requirement_id", "")).strip()
+            if not req_id:
+                errors.append(f"{prefix} requirement_id must be a non-empty string")
+                continue
+            if req_id not in by_req:
+                errors.append(f"{prefix} references unknown requirement_id: {req_id}")
+                continue
+            if req_id not in requirement_ids:
+                errors.append(f"{prefix} requirement_id must also appear in task requirement_ids: {req_id}")
+            if not _proof_matches_any_requirement_oracle(proof, by_req[req_id]):
+                errors.append(f"{prefix} must identify an acceptance oracle by oracle_index or exact acceptance_oracle")
+            for key in ("proof_type", "oracle_strength", "evidence_boundary", "status"):
+                if not isinstance(proof.get(key), str) or not str(proof.get(key)).strip():
+                    errors.append(f"{prefix} {key} must be a non-empty string")
+            status = str(proof.get("status", "")).strip()
+            if status and status not in {"planned", "verified"}:
+                errors.append(f"{prefix} status must be planned or verified")
+            evidence_refs = proof.get("evidence_refs")
+            if (
+                not isinstance(evidence_refs, list)
+                or not evidence_refs
+                or any(not isinstance(item, str) or not item.strip() for item in evidence_refs)
+            ):
+                errors.append(f"{prefix} evidence_refs must be a non-empty list of strings")
+            for key in ("forbidden_proxy_oracles", "proxy_oracles"):
+                value = proof.get(key, [])
+                if value is not None and (
+                    not isinstance(value, list)
+                    or any(not isinstance(item, str) for item in value)
+                ):
+                    errors.append(f"{prefix} {key} must be a list of strings")
+            for message in _proof_contract_messages(by_req[req_id], proof, require_verified=False):
+                errors.append(f"{prefix} {message}")
+            proofs_by_requirement.setdefault(req_id, []).append(proof)
+
+    for req_id, requirement in by_req.items():
+        if str(requirement.get("status", "active")).strip() != "active":
+            continue
+        if str(requirement.get("priority", "mandatory")).strip() != "mandatory":
+            continue
+        for index, oracle in enumerate(_requirement_acceptance_oracles(requirement)):
+            if not any(_proof_matches_oracle(proof, oracle, index) for proof in proofs_by_requirement.get(req_id, [])):
+                errors.append(f"mandatory requirement {req_id} acceptance oracle #{index + 1} is not covered by requirement_proofs")
+    return errors
+
+
+def _proof_matches_any_requirement_oracle(proof: dict, requirement: dict) -> bool:
+    return any(
+        _proof_matches_oracle(proof, oracle, index)
+        for index, oracle in enumerate(_requirement_acceptance_oracles(requirement))
+    )
 
 
 def requirements_for_task(project_root: Path, task: TaskSpec) -> List[dict]:
@@ -278,6 +383,166 @@ def requirements_for_task(project_root: Path, task: TaskSpec) -> List[dict]:
     trace = load_requirements_trace(project_root)
     by_id = {str(item.get("id", "")).strip(): item for item in requirement_records(trace)}
     return [by_id[req_id] for req_id in task.requirement_ids if req_id in by_id]
+
+
+def _oracle_proof_audit_enabled(project_root: Path, tasks: Iterable[TaskSpec]) -> bool:
+    plan = read_json(task_plan_path(project_root), default={})
+    if isinstance(plan, dict):
+        try:
+            if int(plan.get("oracle_proof_schema_version") or 0) >= ORACLE_PROOF_SCHEMA_VERSION:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return any(bool(task.requirement_proofs) for task in tasks)
+
+
+def _requirement_acceptance_oracles(requirement: dict) -> List[str]:
+    values = requirement.get("acceptance_oracles", [])
+    if not isinstance(values, list):
+        return []
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _proofs_for_requirement(tasks: Iterable[TaskSpec], requirement_id: str) -> List[Tuple[TaskSpec, dict]]:
+    proofs: List[Tuple[TaskSpec, dict]] = []
+    for task in tasks:
+        if task.status != "done":
+            continue
+        for proof in task.requirement_proofs:
+            if not isinstance(proof, dict):
+                continue
+            if str(proof.get("requirement_id", "")).strip() == requirement_id:
+                proofs.append((task, proof))
+    return proofs
+
+
+def _proof_matches_oracle(proof: dict, oracle: str, zero_based_index: int) -> bool:
+    raw_index = proof.get("oracle_index")
+    try:
+        index = int(raw_index)
+    except (TypeError, ValueError):
+        index = None
+    if index in {zero_based_index, zero_based_index + 1}:
+        return True
+    return str(proof.get("acceptance_oracle", "")).strip() == oracle
+
+
+def _proof_list_field(proof: dict, key: str) -> List[str]:
+    values = proof.get(key, [])
+    if not isinstance(values, list):
+        return []
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _rank_meets(value: str, required: str, ranking: Dict[str, int]) -> bool:
+    if required not in ranking:
+        return True
+    if value not in ranking:
+        return False
+    return ranking[value] >= ranking[required]
+
+
+def _proof_contract_messages(
+    requirement: dict,
+    proof: dict,
+    *,
+    require_verified: bool,
+) -> List[str]:
+    required_type = str(requirement.get("oracle_type", "")).strip()
+    required_strength = str(requirement.get("oracle_strength", "")).strip()
+    required_boundary = str(requirement.get("evidence_boundary", "")).strip()
+    forbidden_proxy_oracles = [
+        str(item).strip()
+        for item in requirement.get("forbidden_proxy_oracles", [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+    forbidden_proxy_set = set(forbidden_proxy_oracles)
+    proof_type = str(proof.get("proof_type", "")).strip()
+    proof_strength = str(proof.get("oracle_strength", "")).strip()
+    proof_boundary = str(proof.get("evidence_boundary", "")).strip()
+    evidence_refs = _proof_list_field(proof, "evidence_refs")
+    proxy_oracles = set(_proof_list_field(proof, "proxy_oracles"))
+    recorded_forbidden = set(_proof_list_field(proof, "forbidden_proxy_oracles"))
+    messages: List[str] = []
+
+    if require_verified and str(proof.get("status", "")).strip() != "verified":
+        messages.append("proof is not verified")
+    if not proof_type:
+        messages.append("missing proof_type")
+    elif proof_type not in ALLOWED_ORACLE_TYPES:
+        messages.append(f"proof_type {proof_type} is not allowed")
+    elif required_type and required_type != "mixed" and proof_type not in {required_type, "mixed"}:
+        messages.append(f"proof_type {proof_type} does not satisfy {required_type}")
+    if not proof_strength:
+        messages.append("missing oracle_strength")
+    elif proof_strength not in ALLOWED_ORACLE_STRENGTHS:
+        messages.append(f"oracle_strength {proof_strength} is not allowed")
+    elif not _rank_meets(proof_strength, required_strength, ORACLE_STRENGTH_ORDER):
+        messages.append(f"oracle_strength {proof_strength} is weaker than {required_strength}")
+    if not proof_boundary:
+        messages.append("missing evidence_boundary")
+    elif proof_boundary not in ALLOWED_EVIDENCE_BOUNDARIES:
+        messages.append(f"evidence_boundary {proof_boundary} is not allowed")
+    elif not _rank_meets(proof_boundary, required_boundary, EVIDENCE_BOUNDARY_ORDER):
+        messages.append(f"evidence_boundary {proof_boundary} is weaker than {required_boundary}")
+    if not evidence_refs:
+        messages.append("missing evidence_refs")
+    forbidden_used = sorted(proxy_oracles & forbidden_proxy_set)
+    if forbidden_used:
+        messages.append("uses forbidden proxy oracle(s): " + ", ".join(forbidden_used))
+    missing_forbidden = sorted(forbidden_proxy_set - recorded_forbidden)
+    if missing_forbidden:
+        messages.append("does not record forbidden proxy exclusion(s): " + ", ".join(missing_forbidden))
+    return messages
+
+
+def _oracle_proof_findings(requirement: dict, proofs: List[Tuple[TaskSpec, dict]]) -> List[dict]:
+    req_id = str(requirement.get("id", "")).strip()
+    blockers: List[dict] = []
+    oracles = _requirement_acceptance_oracles(requirement)
+
+    if not proofs:
+        blockers.append(
+            {
+                "kind": "oracle_proof_missing",
+                "message": f"{req_id} has no done-task oracle proof entries",
+            }
+        )
+        return blockers
+
+    for index, oracle in enumerate(oracles):
+        matching = [
+            (task, proof)
+            for task, proof in proofs
+            if _proof_matches_oracle(proof, oracle, index)
+        ]
+        if not matching:
+            blockers.append(
+                {
+                    "kind": "oracle_proof_missing",
+                    "message": f"{req_id} acceptance oracle #{index + 1} has no proof entry",
+                }
+            )
+            continue
+        oracle_ok = False
+        proof_messages: List[str] = []
+        for task, proof in matching:
+            local_messages = _proof_contract_messages(requirement, proof, require_verified=True)
+            if not local_messages:
+                oracle_ok = True
+                break
+            proof_messages.append(f"{task.task_id}: " + "; ".join(local_messages))
+        if not oracle_ok:
+            blockers.append(
+                {
+                    "kind": "oracle_proof_invalid",
+                    "message": (
+                        f"{req_id} acceptance oracle #{index + 1} has no valid verified proof"
+                        + (": " + " | ".join(proof_messages[:3]) if proof_messages else "")
+                    ),
+                }
+            )
+    return blockers
 
 
 def format_requirement_context(requirements: Iterable[dict]) -> str:
@@ -344,12 +609,15 @@ def provider_reference_status(lock_payload: dict, reference_path: str) -> str:
 
 
 def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dict:
+    tasks = list(tasks)
     trace = load_requirements_trace(project_root)
     lock = load_provider_references_lock(project_root)
+    oracle_proof_audit = _oracle_proof_audit_enabled(project_root, tasks)
     lines = [
         "# Requirements Audit",
         "",
         f"Generated at: {_dt.datetime.utcnow().replace(microsecond=0).isoformat()}Z",
+        f"Oracle proof audit: {'strict' if oracle_proof_audit else 'legacy'}",
         "",
     ]
     ok = True
@@ -373,6 +641,8 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
                     "message": "not covered by any done task",
                 }
             )
+        if status == "active" and priority == "mandatory" and oracle_proof_audit:
+            blockers.extend(_oracle_proof_findings(item, _proofs_for_requirement(tasks, req_id)))
         if status == "active" and bool(item.get("external_docs_required", False)):
             reference = str(item.get("provider_reference", "")).strip()
             ref_status = provider_reference_status(lock, reference)
@@ -430,6 +700,11 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
                 f"- {str(oracle).strip()}"
                 for oracle in forbidden_proxy_oracles
                 if str(oracle).strip()
+            )
+            lines.append("")
+        if not oracle_proof_audit and status == "active" and priority == "mandatory":
+            lines.append(
+                "Oracle proof audit is in legacy mode; requirement pass only confirms done-task coverage."
             )
             lines.append("")
         if blockers:

@@ -70,6 +70,7 @@ class TaskSpec:
     parent_task_id: str = ""
     split_depth: int = 0
     expected_test_migrations: List[str] = field(default_factory=list)
+    requirement_proofs: List[Dict[str, object]] = field(default_factory=list)
     scratchpad: str = ""
     arbitration_history: List[Dict[str, object]] = field(default_factory=list)
 
@@ -87,6 +88,12 @@ class TaskSpec:
             for entry in raw_verify_history:
                 if isinstance(entry, dict):
                     verify_history.append(entry)
+        raw_requirement_proofs = data.get("requirement_proofs", [])
+        requirement_proofs = []
+        if isinstance(raw_requirement_proofs, list):
+            for entry in raw_requirement_proofs:
+                if isinstance(entry, dict):
+                    requirement_proofs.append(entry)
         return cls(
             task_id=str(data["task_id"]),
             title=str(data["title"]),
@@ -106,6 +113,7 @@ class TaskSpec:
             parent_task_id=str(data.get("parent_task_id", "")),
             split_depth=int(data.get("split_depth", 0) or 0),
             expected_test_migrations=[str(item) for item in data.get("expected_test_migrations", [])],
+            requirement_proofs=requirement_proofs,
             scratchpad=str(data.get("scratchpad", "")),
             arbitration_history=[
                 entry for entry in (data.get("arbitration_history", []) or [])

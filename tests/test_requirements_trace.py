@@ -51,6 +51,23 @@ def _legacy_requirement(**overrides):
     return payload
 
 
+def _proof(**overrides):
+    payload = {
+        "requirement_id": "REQ-001",
+        "oracle_index": 1,
+        "acceptance_oracle": "The public API returns normalized provider output.",
+        "proof_type": "integration_test",
+        "oracle_strength": "behavioral",
+        "evidence_boundary": "system_boundary",
+        "evidence_refs": ["tests/test_public_api.py::test_normalized_provider_output"],
+        "forbidden_proxy_oracles": [],
+        "proxy_oracles": [],
+        "status": "verified",
+    }
+    payload.update(overrides)
+    return payload
+
+
 class RequirementsTraceTests(unittest.TestCase):
     def test_plan_validation_requires_mandatory_requirement_coverage(self) -> None:
         trace = {"version": 1, "requirements": [_requirement()]}
@@ -95,6 +112,95 @@ class RequirementsTraceTests(unittest.TestCase):
         errors = validate_task_plan_with_requirements(plan, trace)
 
         self.assertTrue(any("unknown requirement_ids" in item for item in errors))
+
+    def test_plan_validation_requires_oracle_proofs_in_strict_mode(self) -> None:
+        trace = {"version": 1, "requirements": [_requirement()]}
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Build feature",
+                    "description": "Build it.",
+                    "acceptance": ["works"],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                }
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertTrue(any("requirement_proofs" in item for item in errors))
+
+    def test_plan_validation_accepts_oracle_proofs_in_strict_mode(self) -> None:
+        trace = {"version": 1, "requirements": [_requirement()]}
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Build feature",
+                    "description": "Build it.",
+                    "acceptance": ["works"],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [_proof(status="planned")],
+                }
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertEqual(errors, [])
+
+    def test_plan_validation_rejects_weak_or_proxy_oracle_proof(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(
+                    oracle_strength="behavioral",
+                    evidence_boundary="system_boundary",
+                    forbidden_proxy_oracles=["metadata-only request evidence"],
+                )
+            ],
+        }
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Build feature",
+                    "description": "Build it.",
+                    "acceptance": ["works"],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [
+                        _proof(
+                            oracle_strength="proxy",
+                            evidence_boundary="internal_state",
+                            forbidden_proxy_oracles=["metadata-only request evidence"],
+                            proxy_oracles=["metadata-only request evidence"],
+                            status="planned",
+                        )
+                    ],
+                }
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertTrue(any("oracle_strength proxy is weaker than behavioral" in item for item in errors))
+        self.assertTrue(any("uses forbidden proxy oracle" in item for item in errors))
 
     def test_project_validation_does_not_block_between_clarify_and_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -215,6 +321,102 @@ class RequirementsTraceTests(unittest.TestCase):
 
             self.assertTrue(ok)
             self.assertIn("REQ-001: pass", report)
+
+    def test_requirements_audit_fails_missing_oracle_proof_in_strict_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(requirements_trace_path(project_root), {"version": 1, "requirements": [_requirement()]})
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "test_strategy": "unit tests",
+                    "verification_commands": ["npm test"],
+                    "tasks": [],
+                },
+            )
+
+            ok, report = audit_requirements(
+                project_root,
+                [
+                    TaskSpec(
+                        task_id="task-001",
+                        title="Build",
+                        description="Build it.",
+                        acceptance=["works"],
+                        requirement_ids=["REQ-001"],
+                        status="done",
+                    )
+                ],
+            )
+
+            self.assertFalse(ok)
+            self.assertIn("oracle proof", report.lower())
+            self.assertIn("has no done-task oracle proof entries", report)
+
+    def test_requirements_audit_passes_verified_oracle_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(requirements_trace_path(project_root), {"version": 1, "requirements": [_requirement()]})
+
+            ok, report = audit_requirements(
+                project_root,
+                [
+                    TaskSpec(
+                        task_id="task-001",
+                        title="Build",
+                        description="Build it.",
+                        acceptance=["works"],
+                        requirement_ids=["REQ-001"],
+                        requirement_proofs=[_proof()],
+                        status="done",
+                    )
+                ],
+            )
+
+            self.assertTrue(ok, msg=report)
+            self.assertIn("Oracle proof audit: strict", report)
+
+    def test_requirements_audit_fails_forbidden_proxy_oracle_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            forbidden_proxy_oracles=["metadata-only request evidence"],
+                        )
+                    ],
+                },
+            )
+
+            ok, report = audit_requirements(
+                project_root,
+                [
+                    TaskSpec(
+                        task_id="task-001",
+                        title="Build",
+                        description="Build it.",
+                        acceptance=["works"],
+                        requirement_ids=["REQ-001"],
+                        requirement_proofs=[
+                            _proof(
+                                forbidden_proxy_oracles=["metadata-only request evidence"],
+                                proxy_oracles=["metadata-only request evidence"],
+                            )
+                        ],
+                        status="done",
+                    )
+                ],
+            )
+
+            self.assertFalse(ok)
+            self.assertIn("uses forbidden proxy oracle", report)
 
     def test_requirements_trace_rejects_invalid_quality_contract_values(self) -> None:
         trace = {"version": 1, "requirements": [_requirement(

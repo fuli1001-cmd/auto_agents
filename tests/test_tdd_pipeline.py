@@ -108,6 +108,9 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("metadata-only request evidence", prompt)
             self.assertIn(".auto-agents/docs/provider_references/doubao_tts.md", prompt)
             self.assertIn("Do not search for alternate docs", prompt)
+            self.assertIn("requirement_proofs", prompt)
+            self.assertIn("evidence_refs", prompt)
+            self.assertIn("status='verified'", prompt)
 
     def test_implement_prompt_includes_task_status_migration_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -233,6 +236,22 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("weaker oracle than the requirement allows", prompt)
             self.assertIn("forbidden_proxy_oracles", prompt)
             self.assertIn("GatewayPayload", prompt)
+            self.assertIn("ORACLE PROOF AUDIT", prompt)
+            self.assertIn("evidence_refs", prompt)
+
+    def test_plan_prompt_requires_oracle_proof_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "Build the feature.\n")
+            orchestrator = Orchestrator(project_root)
+
+            prompt = orchestrator._build_prompt("plan", spec_file)
+
+            self.assertIn("oracle_proof_schema_version", prompt)
+            self.assertIn("requirement_proofs", prompt)
+            self.assertIn("requirement_ids alone are not sufficient coverage", prompt)
 
     def test_implement_runs_without_test_writer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
