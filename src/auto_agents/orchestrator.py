@@ -9,6 +9,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -1191,6 +1192,37 @@ class Orchestrator:
             preview += f", +{len(normalized) - limit} more"
         return preview
 
+    def _capture_auto_agents_restore_point(self, restore_root: Path) -> None:
+        for relative in (
+            ".auto-agents/.gitignore",
+            ".auto-agents/state",
+            ".auto-agents/docs",
+        ):
+            source = self.project_root / relative
+            target = restore_root / relative
+            if source.is_dir():
+                shutil.copytree(source, target, dirs_exist_ok=True)
+            elif source.exists() or source.is_symlink():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target, follow_symlinks=False)
+
+    def _restore_paths_from_restore_point(self, paths: Iterable[str], restore_root: Path) -> None:
+        for relative in sorted({str(path).strip() for path in paths if str(path).strip()}):
+            target = self.project_root / relative
+            source = restore_root / relative
+            if target.is_dir() and not source.is_dir():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+            if source.is_dir():
+                shutil.copytree(source, target, dirs_exist_ok=True)
+            elif source.exists() or source.is_symlink():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target, follow_symlinks=False)
+
     def _relative_repo_path(self, path: Path) -> str:
         return str(path.relative_to(self.project_root)).replace("\\", "/")
 
@@ -1259,10 +1291,33 @@ class Orchestrator:
         run_id: str,
         before_snapshot: Dict[str, str],
     ) -> None:
+        violation = self._stage_mutation_scope_violation(
+            stage=stage,
+            stage_key=stage_key,
+            run_id=run_id,
+            before_snapshot=before_snapshot,
+        )
+        if violation is None:
+            return
+        offending, allowed_scope = violation
+        raise RuntimeError(
+            f"stage {stage} modified files outside its ownership during {stage_key}. "
+            f"Changed paths: {self._changed_path_preview(offending)}. "
+            f"Allowed scope: {'; '.join(allowed_scope)}."
+        )
+
+    def _stage_mutation_scope_violation(
+        self,
+        *,
+        stage: str,
+        stage_key: str,
+        run_id: str,
+        before_snapshot: Dict[str, str],
+    ) -> Optional[Tuple[List[str], List[str]]]:
         after_snapshot = self._worktree_change_snapshot()
         delta_paths = self._snapshot_delta_paths(before_snapshot, after_snapshot)
         if not delta_paths:
-            return
+            return None
         allowed_scope, is_allowed = self._stage_mutation_policy(
             stage=stage,
             stage_key=stage_key,
@@ -1270,12 +1325,8 @@ class Orchestrator:
         )
         offending = [path for path in delta_paths if not is_allowed(path)]
         if not offending:
-            return
-        raise RuntimeError(
-            f"stage {stage} modified files outside its ownership during {stage_key}. "
-            f"Changed paths: {self._changed_path_preview(offending)}. "
-            f"Allowed scope: {'; '.join(allowed_scope)}."
-        )
+            return None
+        return offending, allowed_scope
 
     def _run_gate_commands(self, *, collect_all: bool, context: str):
         before_snapshot = self._worktree_change_snapshot()
@@ -3953,59 +4004,91 @@ class Orchestrator:
         last_error = f"{stage_key} failed"
         cumulative_usage: Optional[AgentUsage] = None
         usage_available = False
+        restore_workspace = None
+        restore_root: Optional[Path] = None
+        if stage == "implement":
+            restore_workspace = tempfile.TemporaryDirectory(prefix="auto-agents-restore-")
+            restore_root = Path(restore_workspace.name)
+            self._capture_auto_agents_restore_point(restore_root)
 
-        for attempt in range(1, attempts + 1):
-            attempt_prompt = prompt
-            if feedback:
-                attempt_prompt = f"{prompt}\n\nPrevious attempt issues:\n{feedback}\n"
+        try:
+            for attempt in range(1, attempts + 1):
+                attempt_prompt = prompt
+                if feedback:
+                    attempt_prompt = f"{prompt}\n\nPrevious attempt issues:\n{feedback}\n"
 
-            artifact_stage = stage_key if attempt == 1 else f"{stage_key}-attempt-{attempt}"
-            output_path = self._stage_output_path(active_run_id, artifact_stage)
-            write_run_prompt(self.project_root, active_run_id, artifact_stage, attempt_prompt)
-            request = AgentRequest(
-                stage=stage,
-                effort=resolved_effort,
-                prompt=attempt_prompt,
-                cwd=self.project_root,
-                output_path=output_path,
-                stream_output=self._stream_agent_output_callback(artifact_stage) if self._print_agent_output else None,
-            )
-            result = self._call_with_failover(request)
-            if result.usage is not None:
-                cumulative_usage = (cumulative_usage or AgentUsage()).plus(result.usage)
-                usage_available = True
-            self._emit_agent_output(artifact_stage, result)
-            self._cleanup_ephemeral_tooling_artifacts()
-            if state is not None:
-                state.agent_attempts[stage_key] = attempt
-                save_run_state(self.project_root, state)
-            self._assert_stage_mutation_scope(
-                stage=stage,
-                stage_key=stage_key,
-                run_id=active_run_id,
-                before_snapshot=snapshot_before,
-            )
+                artifact_stage = stage_key if attempt == 1 else f"{stage_key}-attempt-{attempt}"
+                output_path = self._stage_output_path(active_run_id, artifact_stage)
+                write_run_prompt(self.project_root, active_run_id, artifact_stage, attempt_prompt)
+                request = AgentRequest(
+                    stage=stage,
+                    effort=resolved_effort,
+                    prompt=attempt_prompt,
+                    cwd=self.project_root,
+                    output_path=output_path,
+                    stream_output=self._stream_agent_output_callback(artifact_stage) if self._print_agent_output else None,
+                )
+                result = self._call_with_failover(request)
+                if result.usage is not None:
+                    cumulative_usage = (cumulative_usage or AgentUsage()).plus(result.usage)
+                    usage_available = True
+                self._emit_agent_output(artifact_stage, result)
+                self._cleanup_ephemeral_tooling_artifacts()
+                if state is not None:
+                    state.agent_attempts[stage_key] = attempt
+                    save_run_state(self.project_root, state)
+                violation = self._stage_mutation_scope_violation(
+                    stage=stage,
+                    stage_key=stage_key,
+                    run_id=active_run_id,
+                    before_snapshot=snapshot_before,
+                )
+                if violation is not None:
+                    offending, allowed_scope = violation
+                    if (
+                        stage == "implement"
+                        and restore_root is not None
+                        and all(path.startswith(".auto-agents/") for path in offending)
+                    ):
+                        self._restore_paths_from_restore_point(offending, restore_root)
+                        last_error = (
+                            f"stage {stage} modified files outside its ownership during {stage_key}. "
+                            f"Changed paths: {self._changed_path_preview(offending)}. "
+                            f"Allowed scope: {'; '.join(allowed_scope)}. "
+                            "Do not edit orchestrator-owned .auto-agents state, docs, or planning files "
+                            "during implementation; update repository tests instead."
+                        )
+                        feedback = last_error
+                        continue
+                    raise RuntimeError(
+                        f"stage {stage} modified files outside its ownership during {stage_key}. "
+                        f"Changed paths: {self._changed_path_preview(offending)}. "
+                        f"Allowed scope: {'; '.join(allowed_scope)}."
+                    )
 
-            if not result.ok:
-                last_error = result.stderr or result.summary or f"{stage_key} failed"
-                feedback = f"- The command failed.\n- Details: {last_error}"
-                continue
-
-            if validation_feedback is not None:
-                issue = validation_feedback(result)
-                if issue:
-                    last_error = issue
-                    feedback = issue
+                if not result.ok:
+                    last_error = result.stderr or result.summary or f"{stage_key} failed"
+                    feedback = f"- The command failed.\n- Details: {last_error}"
                     continue
 
-            self._emit_agent_metrics(
-                stage_key,
-                result,
-                attempts=attempt,
-                usage=(cumulative_usage if usage_available else None),
-                model=result.model or self._model_label_for_agent_stage(stage, resolved_effort),
-            )
-            return result
+                if validation_feedback is not None:
+                    issue = validation_feedback(result)
+                    if issue:
+                        last_error = issue
+                        feedback = issue
+                        continue
+
+                self._emit_agent_metrics(
+                    stage_key,
+                    result,
+                    attempts=attempt,
+                    usage=(cumulative_usage if usage_available else None),
+                    model=result.model or self._model_label_for_agent_stage(stage, resolved_effort),
+                )
+                return result
+        finally:
+            if restore_workspace is not None:
+                restore_workspace.cleanup()
 
         self._emit_agent_metrics(
             stage_key,
