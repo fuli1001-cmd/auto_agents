@@ -211,6 +211,18 @@ class RequirementsTraceTests(unittest.TestCase):
                 self.assertEqual(route, "plan")
                 self.assertEqual(hard_failure, "")
 
+    def test_verify_failure_with_oracle_proof_text_is_auditable(self) -> None:
+        self.assertTrue(
+            Orchestrator._verify_failure_looks_like_oracle_proof_state(
+                "AssertionError: 'planned' != 'verified' in requirement_proofs"
+            )
+        )
+        self.assertFalse(
+            Orchestrator._verify_failure_looks_like_oracle_proof_state(
+                "AssertionError: expected 200 response"
+            )
+        )
+
     def test_plan_validation_rejects_weak_or_proxy_oracle_proof(self) -> None:
         trace = {
             "version": 1,

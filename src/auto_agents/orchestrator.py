@@ -1519,6 +1519,22 @@ class Orchestrator:
             lines.append(f"- ... {len(findings) - 12} more proof finding(s)")
         return "\n".join(lines)
 
+    @staticmethod
+    def _verify_failure_looks_like_oracle_proof_state(text: str) -> bool:
+        normalized = str(text or "").lower()
+        if not normalized:
+            return False
+        return any(
+            token in normalized
+            for token in (
+                "requirement_proofs",
+                "oracle proof",
+                "requirements_audit_state",
+                "proof is not verified",
+                "has no valid verified proof",
+            )
+        )
+
     def _build_split_rejection_reason(
         self,
         task: TaskSpec,
@@ -2902,6 +2918,7 @@ class Orchestrator:
         state.last_error = ""
         if not verify_gate.ok:
             state.status = "failed"
+            raw_output = self._gate_raw_output(verify_gate)
             if self.config.gates.commands:
                 self._gate_baseline_cache.put(
                     self._task_verify_baseline_ref(),
@@ -2914,6 +2931,20 @@ class Orchestrator:
                     summary=verify_gate.summary,
                     parallel_groups=self.config.gates.parallel_groups,
                 )
+            if self._verify_failure_looks_like_oracle_proof_state(f"{verify_gate.summary}\n{raw_output}"):
+                tasks = state.tasks or self._load_tasks_from_plan()
+                state.tasks = tasks
+                audit_result = run_requirements_audit(self.project_root, tasks)
+                if not bool(audit_result["ok"]):
+                    state.stage_summaries.pop("verify", None)
+                    if self._handle_requirements_audit_failure(state, audit_result):
+                        self._emit_stage_verify_result(
+                            "fail",
+                            f"requirements audit failed: {audit_result['path']}",
+                            route=state.rejected_stage,
+                        )
+                        save_run_state(self.project_root, state)
+                        return state
             self._emit_stage_verify_result("fail", summary.strip())
             raise RuntimeError("verify stage failed")
         if self.config.gates.commands:
