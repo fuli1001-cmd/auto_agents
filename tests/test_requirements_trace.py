@@ -17,6 +17,7 @@ from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import (
     audit_requirements,
     load_requirements_trace,
+    validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
 )
 from auto_agents.validation import validate_task_plan_with_requirements, validation_report
@@ -159,6 +160,56 @@ class RequirementsTraceTests(unittest.TestCase):
         errors = validate_task_plan_with_requirements(plan, trace)
 
         self.assertEqual(errors, [])
+
+    def test_plan_validation_rejects_done_task_with_unverified_oracle_proof(self) -> None:
+        trace = {"version": 1, "requirements": [_requirement()]}
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Build feature",
+                    "description": "Build it.",
+                    "acceptance": ["works"],
+                    "status": "done",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [_proof(status="planned")],
+                }
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertTrue(any("proof is not verified" in item for item in errors))
+
+    def test_done_task_proof_validation_reports_unverified_bound_proof(self) -> None:
+        trace = {"version": 1, "requirements": [_requirement()]}
+        task = TaskSpec(
+            task_id="task-001",
+            title="Build",
+            description="Build it.",
+            acceptance=["works"],
+            requirement_ids=["REQ-001"],
+            requirement_proofs=[_proof(status="planned")],
+            status="in_progress",
+        )
+
+        findings = validate_done_task_requirement_proofs(task, trace)
+
+        self.assertTrue(any("proof is not verified" in str(item["message"]) for item in findings))
+
+    def test_oracle_proof_audit_blockers_route_to_plan(self) -> None:
+        for kind in ("oracle_proof_missing", "oracle_proof_invalid"):
+            with self.subTest(kind=kind):
+                route, hard_failure = Orchestrator._audit_issue_route(
+                    {"kind": kind, "message": "proof blocker"}
+                )
+
+                self.assertEqual(route, "plan")
+                self.assertEqual(hard_failure, "")
 
     def test_plan_validation_rejects_weak_or_proxy_oracle_proof(self) -> None:
         trace = {

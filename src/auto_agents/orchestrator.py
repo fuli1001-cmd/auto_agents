@@ -62,6 +62,7 @@ from .requirements import (
     provider_reference_status,
     run_requirements_audit,
     requirements_for_task,
+    validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
 )
 from .validation import (
@@ -276,6 +277,8 @@ class Orchestrator:
                 f"{message}; automatic recovery is unsafe because the provider reference "
                 f"requires external resolution ({ref_status})"
             )
+        if kind in {"oracle_proof_missing", "oracle_proof_invalid"}:
+            return "plan", ""
         return None, f"{message}; no automatic recovery route is defined for blocker kind '{kind or 'unknown'}'"
 
     @staticmethod
@@ -1358,6 +1361,164 @@ class Orchestrator:
             paths = [p for p in changed_paths(self.project_root) if not p.startswith(".auto-agents/")]
         return bool(paths)
 
+    @staticmethod
+    def _extract_oracle_proof_updates(text: str) -> Tuple[List[Dict[str, object]], str]:
+        marker = "ORACLE_PROOF_UPDATES"
+        if marker not in text:
+            return [], ""
+
+        fenced = re.search(
+            rf"{marker}\s*:\s*```(?:json)?\s*(.*?)\s*```",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if fenced:
+            raw_json = fenced.group(1).strip()
+        else:
+            inline = re.search(
+                rf"{marker}\s*:\s*(\[[\s\S]*?\]|\{{[\s\S]*?\}})(?=\s*(?:\n[A-Z][A-Z0-9_ -]*:|\Z))",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if not inline:
+                return [], "ORACLE_PROOF_UPDATES marker found but no JSON object or array followed it"
+            raw_json = inline.group(1).strip()
+
+        try:
+            payload = json.loads(raw_json)
+        except json.JSONDecodeError as error:
+            return [], f"ORACLE_PROOF_UPDATES is not valid JSON: {error}"
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            return [], "ORACLE_PROOF_UPDATES must be a JSON object or array of objects"
+        updates: List[Dict[str, object]] = []
+        for index, item in enumerate(payload, start=1):
+            if not isinstance(item, dict):
+                return [], f"ORACLE_PROOF_UPDATES[{index}] must be an object"
+            updates.append(item)
+        return updates, ""
+
+    @staticmethod
+    def _proof_oracle_index(value: object) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _apply_oracle_proof_updates_from_text(self, task: TaskSpec, text: str) -> Tuple[bool, str]:
+        updates, parse_error = self._extract_oracle_proof_updates(text)
+        if parse_error:
+            return False, parse_error
+        if not updates:
+            return False, ""
+        if not task.requirement_proofs:
+            return False, (
+                "ORACLE_PROOF_UPDATES was provided, but the current task has no existing "
+                "requirement_proofs entries to update"
+            )
+
+        allowed_keys = {
+            "requirement_id",
+            "oracle_index",
+            "acceptance_oracle",
+            "proof_type",
+            "oracle_strength",
+            "evidence_boundary",
+            "evidence_refs",
+            "forbidden_proxy_oracles",
+            "proxy_oracles",
+            "status",
+        }
+        list_keys = {"evidence_refs", "forbidden_proxy_oracles", "proxy_oracles"}
+        updated_proofs = [dict(proof) for proof in task.requirement_proofs if isinstance(proof, dict)]
+        errors: List[str] = []
+
+        for update_index, update in enumerate(updates, start=1):
+            prefix = f"ORACLE_PROOF_UPDATES[{update_index}]"
+            local_errors: List[str] = []
+            unknown = sorted(set(update) - allowed_keys)
+            if unknown:
+                errors.append(f"{prefix} contains unsupported field(s): {', '.join(unknown)}")
+                continue
+            req_id = str(update.get("requirement_id", "")).strip()
+            oracle_index = self._proof_oracle_index(update.get("oracle_index"))
+            if not req_id:
+                errors.append(f"{prefix}.requirement_id must be a non-empty string")
+                continue
+            if oracle_index is None:
+                errors.append(f"{prefix}.oracle_index must be an integer")
+                continue
+            if str(update.get("status", "")).strip() != "verified":
+                errors.append(f"{prefix}.status must be 'verified'")
+                continue
+
+            match = next(
+                (
+                    proof
+                    for proof in updated_proofs
+                    if str(proof.get("requirement_id", "")).strip() == req_id
+                    and self._proof_oracle_index(proof.get("oracle_index")) == oracle_index
+                ),
+                None,
+            )
+            if match is None:
+                errors.append(
+                    f"{prefix} does not match an existing proof on task {task.task_id}: "
+                    f"{req_id} oracle #{oracle_index}"
+                )
+                continue
+            for key in list_keys:
+                if key not in update:
+                    continue
+                value = update.get(key)
+                if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+                    local_errors.append(f"{prefix}.{key} must be a list of non-empty strings")
+                elif key == "evidence_refs" and not value:
+                    local_errors.append(f"{prefix}.{key} must be a non-empty list of strings")
+            for key in ("proof_type", "oracle_strength", "evidence_boundary"):
+                if key in update and (not isinstance(update.get(key), str) or not str(update.get(key)).strip()):
+                    local_errors.append(f"{prefix}.{key} must be a non-empty string")
+            if local_errors:
+                errors.extend(local_errors)
+                continue
+            for key in allowed_keys - {"requirement_id", "oracle_index"}:
+                if key in update:
+                    match[key] = update[key]
+
+        if errors:
+            return False, "Invalid ORACLE_PROOF_UPDATES:\n" + "\n".join(f"- {item}" for item in errors)
+        task.requirement_proofs = updated_proofs
+        return True, ""
+
+    def _task_completion_proof_findings(self, task: TaskSpec) -> List[dict]:
+        plan = load_task_plan(self.project_root)
+        strict_plan = False
+        if isinstance(plan, dict):
+            try:
+                strict_plan = int(plan.get("oracle_proof_schema_version") or 0) >= 1
+            except (TypeError, ValueError):
+                strict_plan = False
+        if not strict_plan and not task.requirement_proofs:
+            return []
+        trace = load_requirements_trace(self.project_root)
+        return validate_done_task_requirement_proofs(task, trace)
+
+    @staticmethod
+    def _format_requirement_proof_findings(task: TaskSpec, findings: List[dict]) -> str:
+        lines = [
+            f"task {task.task_id} cannot be marked done because requirement_proofs are not verified.",
+            "Emit a valid ORACLE_PROOF_UPDATES JSON block with concrete evidence_refs for each finding.",
+        ]
+        for item in findings[:12]:
+            req_id = str(item.get("requirement_id", "")).strip() or "(unknown requirement)"
+            oracle_index = str(item.get("oracle_index", "")).strip()
+            oracle_text = f" oracle #{oracle_index}" if oracle_index else ""
+            lines.append(f"- {req_id}{oracle_text}: {item.get('message', 'invalid proof')}")
+        if len(findings) > 12:
+            lines.append(f"- ... {len(findings) - 12} more proof finding(s)")
+        return "\n".join(lines)
+
     def _build_split_rejection_reason(
         self,
         task: TaskSpec,
@@ -1759,6 +1920,7 @@ class Orchestrator:
         task.verify_baseline_failures = list(updated.verify_baseline_failures)
         task.verify_baseline_ref = updated.verify_baseline_ref
         task.expected_test_migrations = list(updated.expected_test_migrations)
+        task.requirement_proofs = list(updated.requirement_proofs)
         task.scratchpad = updated.scratchpad
         task.arbitration_history = list(updated.arbitration_history)
         task.status = "done"
@@ -3286,6 +3448,8 @@ class Orchestrator:
             item.pop("commit_sha", None)
             payload.append(item)
         next_payload = {"tasks": payload}
+        if isinstance(current_payload.get("oracle_proof_schema_version"), int):
+            next_payload["oracle_proof_schema_version"] = current_payload["oracle_proof_schema_version"]
         if isinstance(current_payload.get("test_strategy"), str) and current_payload["test_strategy"].strip():
             next_payload["test_strategy"] = current_payload["test_strategy"].strip()
         verification_commands = current_payload.get("verification_commands")
@@ -3686,8 +3850,10 @@ class Orchestrator:
                 "If local verification exposes a tightly coupled regression in files you touched or in paths explicitly implicated by retry feedback, fix it in the same attempt even if it sits slightly outside the nominal task slice.",
                 "The bound requirements and acceptance oracles above are hard requirements, not optional background.",
                 "Honor the bound oracle contract exactly: the implementation and tests must meet or exceed each requirement's oracle_strength, collect proof at the required evidence_boundary, and avoid every forbidden proxy oracle listed in the requirement context.",
-                "Update the task's requirement_proofs entries as you implement: keep the bound requirement_id/oracle_index, set status='verified' only when concrete evidence exists, and fill evidence_refs with the exact tests, APIs, commands, or artifacts that prove the oracle at the required boundary.",
-                "Do not mark requirement_proofs verified for proxy evidence listed in forbidden_proxy_oracles, for final-status-only checks, or for config/metadata-only checks when the requirement demands behavioral/system-boundary proof.",
+                "When the task has requirement_proofs, do NOT edit .auto-agents/state/task_plan.json directly. Instead, include an ORACLE_PROOF_UPDATES JSON block in your final response.",
+                "Each ORACLE_PROOF_UPDATES entry must update an existing current-task proof by requirement_id and oracle_index, set status='verified', and include concrete evidence_refs plus proof_type/oracle_strength/evidence_boundary/proxy_oracles when relevant.",
+                "Do not submit proof updates for proxy evidence listed in forbidden_proxy_oracles, for final-status-only checks, or for config/metadata-only checks when the requirement demands behavioral/system-boundary proof.",
+                "Example final response block:\nORACLE_PROOF_UPDATES:\n```json\n[{\"requirement_id\":\"REQ-001\",\"oracle_index\":1,\"status\":\"verified\",\"proof_type\":\"integration_test\",\"oracle_strength\":\"behavioral\",\"evidence_boundary\":\"system_boundary\",\"evidence_refs\":[\"tests/test_public_api.py::test_behavior\"],\"proxy_oracles\":[]}]\n```",
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
@@ -3698,8 +3864,8 @@ class Orchestrator:
                 "If this is a Python project, create and use a project-local conda env at ./.conda and install packages only inside it.",
                 "Do not use '.conda' as a generic directory, pip target, virtualenv, or venv path. It must remain a real conda prefix created with 'conda create -p ./.conda ...', including '.conda/conda-meta'.",
                 "For any other stack, keep dependencies and tool state local to the repository and never rely on global installs.",
-                "Do not modify .auto-agents state files except when explicitly requested.",
-                "Do not modify .auto-agents docs/state files or planning artifacts as part of implementation. Keep orchestrator-owned files untouched.",
+                "Do not modify .auto-agents state files except through ORACLE_PROOF_UPDATES or when explicitly requested.",
+                "Do not modify .auto-agents docs/state files or planning artifacts directly as part of implementation. Keep orchestrator-owned files untouched.",
                 "Final response: 3 short bullets describing what changed.",
             ]
             prompt = "\n".join(lines)
@@ -3830,7 +3996,29 @@ class Orchestrator:
                     )
                     continue
 
-                if not self._implement_touched_code():
+                proof_updates_applied, proof_update_error = self._apply_oracle_proof_updates_from_text(
+                    task,
+                    result.summary or result.stdout,
+                )
+                if proof_update_error:
+                    last_reason = proof_update_error
+                    feedback = self._format_retry_feedback(
+                        "oracle_proof_update",
+                        reason=last_reason,
+                    )
+                    continue
+                if proof_updates_applied:
+                    proof_findings = self._task_completion_proof_findings(task)
+                    if proof_findings:
+                        last_reason = self._format_requirement_proof_findings(task, proof_findings)
+                        feedback = self._format_retry_feedback(
+                            "oracle_proof_update",
+                            reason=last_reason,
+                        )
+                        continue
+                    self._persist_tasks(state.tasks if state.tasks else [task])
+
+                if not self._implement_touched_code() and not proof_updates_applied:
                     empty_diff_streak += 1
                     last_reason = (
                         "implement step produced no code changes outside .auto-agents/ "
@@ -3922,6 +4110,14 @@ class Orchestrator:
                         str(gate_result["review"]),
                     )
             if gate_result["ok"]:
+                proof_findings = self._task_completion_proof_findings(task)
+                if proof_findings:
+                    last_reason = self._format_requirement_proof_findings(task, proof_findings)
+                    feedback = self._format_retry_feedback(
+                        "oracle_proof_gate",
+                        reason=last_reason,
+                    )
+                    continue
                 gate_result["verify_current_failure_ids"] = list(
                     verify_result.get("current_failure_ids", [])
                 )

@@ -42,6 +42,50 @@ class SimpleImplementAdapter:
         )
 
 
+class ProofUpdateAdapter(SimpleImplementAdapter):
+    """Adapter that fixes missing oracle proof evidence on the second implement attempt."""
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            if self.implement_calls == 1:
+                write_text(self.project_root / "artifact.txt", "done\n")
+                summary = "implemented feature"
+            else:
+                summary = (
+                    "proof evidence updated\n"
+                    "ORACLE_PROOF_UPDATES:\n"
+                    "```json\n"
+                    "[{\n"
+                    '  "requirement_id": "REQ-001",\n'
+                    '  "oracle_index": 1,\n'
+                    '  "status": "verified",\n'
+                    '  "proof_type": "integration_test",\n'
+                    '  "oracle_strength": "behavioral",\n'
+                    '  "evidence_boundary": "system_boundary",\n'
+                    '  "evidence_refs": ["tests/test_public_api.py::test_normalized_provider_output"],\n'
+                    '  "proxy_oracles": []\n'
+                    "}]\n"
+                    "```"
+                )
+            write_text(request.output_path, summary + "\n")
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = "DECISION: pass\nAll good"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class ImplementPipelineTests(unittest.TestCase):
 
     def test_implement_prompt_includes_test_writing(self) -> None:
@@ -289,6 +333,126 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertGreaterEqual(adapter.implement_calls, 1)
             self.assertGreaterEqual(adapter.review_calls, 1)
             self.assertEqual(state.tasks[0].status, "done")
+
+    def test_task_completion_requires_verified_oracle_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Return normalized provider output.",
+                            "source": "user conversation",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["The public API returns normalized provider output."],
+                            "oracle_type": "integration_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            adapter = ProofUpdateAdapter(project_root)
+            orchestrator.adapter = adapter
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write feature",
+                            "description": "Write a feature.",
+                            "acceptance": ["feature works"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "requirement_ids": ["REQ-001"],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "oracle_index": 1,
+                                    "acceptance_oracle": "The public API returns normalized provider output.",
+                                    "proof_type": "integration_test",
+                                    "oracle_strength": "behavioral",
+                                    "evidence_boundary": "system_boundary",
+                                    "evidence_refs": ["planned evidence"],
+                                    "forbidden_proxy_oracles": [],
+                                    "proxy_oracles": [],
+                                    "status": "planned",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(adapter.implement_calls, 2)
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(state.tasks[0].requirement_proofs[0]["status"], "verified")
+            self.assertEqual(
+                state.tasks[0].requirement_proofs[0]["evidence_refs"],
+                ["tests/test_public_api.py::test_normalized_provider_output"],
+            )
+
+    def test_oracle_proof_updates_cannot_modify_unbound_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Write feature",
+                description="Write a feature.",
+                acceptance=["feature works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "planned",
+                        "proof_type": "integration_test",
+                        "oracle_strength": "behavioral",
+                        "evidence_boundary": "system_boundary",
+                        "evidence_refs": ["planned evidence"],
+                        "forbidden_proxy_oracles": [],
+                        "proxy_oracles": [],
+                    }
+                ],
+            )
+
+            applied, error = orchestrator._apply_oracle_proof_updates_from_text(
+                task,
+                (
+                    "ORACLE_PROOF_UPDATES:\n"
+                    "```json\n"
+                    '[{"requirement_id":"REQ-999","oracle_index":1,"status":"verified",'
+                    '"evidence_refs":["tests/test_public_api.py::test_other"]}]\n'
+                    "```"
+                ),
+            )
+
+            self.assertFalse(applied)
+            self.assertIn("does not match an existing proof", error)
+            self.assertEqual(task.requirement_proofs[0]["status"], "planned")
 
     def test_build_task_prompt_unsupported_stage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

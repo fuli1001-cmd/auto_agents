@@ -355,7 +355,8 @@ def validate_task_requirement_proofs(plan_payload: object, trace_payload: dict) 
                     or any(not isinstance(item, str) for item in value)
                 ):
                     errors.append(f"{prefix} {key} must be a list of strings")
-            for message in _proof_contract_messages(by_req[req_id], proof, require_verified=False):
+            require_verified = str(task.get("status", "")).strip() == "done"
+            for message in _proof_contract_messages(by_req[req_id], proof, require_verified=require_verified):
                 errors.append(f"{prefix} {message}")
             proofs_by_requirement.setdefault(req_id, []).append(proof)
 
@@ -494,6 +495,109 @@ def _proof_contract_messages(
     if missing_forbidden:
         messages.append("does not record forbidden proxy exclusion(s): " + ", ".join(missing_forbidden))
     return messages
+
+
+def _is_active_mandatory_requirement(requirement: dict) -> bool:
+    return (
+        str(requirement.get("status", "active")).strip() == "active"
+        and str(requirement.get("priority", "mandatory")).strip() == "mandatory"
+    )
+
+
+def validate_done_task_requirement_proofs(task: TaskSpec, trace_payload: dict) -> List[dict]:
+    """Validate the oracle proofs that would allow a task to become done."""
+    requirement_ids = {
+        str(item).strip()
+        for item in task.requirement_ids
+        if isinstance(item, str) and str(item).strip()
+    }
+    if not requirement_ids and not task.requirement_proofs:
+        return []
+
+    by_req = {str(item.get("id", "")).strip(): item for item in requirement_records(trace_payload)}
+    active_bound_requirements = {
+        req_id: by_req[req_id]
+        for req_id in requirement_ids
+        if req_id in by_req and _is_active_mandatory_requirement(by_req[req_id])
+    }
+    if not active_bound_requirements:
+        return []
+
+    findings: List[dict] = []
+    proofs_by_requirement: Dict[str, List[dict]] = {req_id: [] for req_id in active_bound_requirements}
+    for proof_index, proof in enumerate(task.requirement_proofs, start=1):
+        prefix = f"requirement_proofs[{proof_index}]"
+        if not isinstance(proof, dict):
+            findings.append(
+                {
+                    "kind": "oracle_proof_invalid",
+                    "task_id": task.task_id,
+                    "requirement_id": "",
+                    "oracle_index": "",
+                    "message": f"{prefix} must be an object",
+                }
+            )
+            continue
+        req_id = str(proof.get("requirement_id", "")).strip()
+        requirement = by_req.get(req_id)
+        if requirement is None:
+            findings.append(
+                {
+                    "kind": "oracle_proof_invalid",
+                    "task_id": task.task_id,
+                    "requirement_id": req_id,
+                    "oracle_index": str(proof.get("oracle_index", "")),
+                    "message": f"{prefix} references unknown requirement_id: {req_id or '(missing)'}",
+                }
+            )
+            continue
+        if not _is_active_mandatory_requirement(requirement):
+            continue
+        if req_id not in requirement_ids:
+            findings.append(
+                {
+                    "kind": "oracle_proof_invalid",
+                    "task_id": task.task_id,
+                    "requirement_id": req_id,
+                    "oracle_index": str(proof.get("oracle_index", "")),
+                    "message": f"{prefix} requirement_id must also appear in task requirement_ids: {req_id}",
+                }
+            )
+            continue
+        proofs_by_requirement.setdefault(req_id, []).append(proof)
+        if not _proof_matches_any_requirement_oracle(proof, requirement):
+            findings.append(
+                {
+                    "kind": "oracle_proof_invalid",
+                    "task_id": task.task_id,
+                    "requirement_id": req_id,
+                    "oracle_index": str(proof.get("oracle_index", "")),
+                    "message": f"{prefix} must identify an acceptance oracle by oracle_index or exact acceptance_oracle",
+                }
+            )
+        for message in _proof_contract_messages(requirement, proof, require_verified=True):
+            findings.append(
+                {
+                    "kind": "oracle_proof_invalid",
+                    "task_id": task.task_id,
+                    "requirement_id": req_id,
+                    "oracle_index": str(proof.get("oracle_index", "")),
+                    "message": f"{prefix} {message}",
+                }
+            )
+
+    for req_id in active_bound_requirements:
+        if not proofs_by_requirement.get(req_id):
+            findings.append(
+                {
+                    "kind": "oracle_proof_missing",
+                    "task_id": task.task_id,
+                    "requirement_id": req_id,
+                    "oracle_index": "",
+                    "message": f"task {task.task_id} has no requirement_proofs for active mandatory requirement {req_id}",
+                }
+            )
+    return findings
 
 
 def _oracle_proof_findings(requirement: dict, proofs: List[Tuple[TaskSpec, dict]]) -> List[dict]:
