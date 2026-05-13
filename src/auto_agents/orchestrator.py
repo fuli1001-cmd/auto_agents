@@ -2880,6 +2880,88 @@ class Orchestrator:
             lines.extend(["- Review summary:", review_summary.strip()])
         return "\n".join(lines)
 
+    @staticmethod
+    def _task_requirement_proof_keys(task: TaskSpec) -> Set[Tuple[str, int]]:
+        keys: Set[Tuple[str, int]] = set()
+        for proof in task.requirement_proofs:
+            if not isinstance(proof, dict):
+                continue
+            req_id = str(proof.get("requirement_id", "")).strip()
+            oracle_index = Orchestrator._proof_oracle_index(proof.get("oracle_index"))
+            if req_id and oracle_index is not None:
+                keys.add((req_id, oracle_index))
+        return keys
+
+    @staticmethod
+    def _review_feedback_oracle_refs(text: str) -> Set[Tuple[str, int]]:
+        refs: Set[Tuple[str, int]] = set()
+        if not text:
+            return refs
+        req_pattern = r"(REQ-\d+)"
+        patterns = [
+            rf"{req_pattern}.{{0,120}}?oracle_index\s*[:=#]?\s*(\d+)",
+            rf"{req_pattern}.{{0,120}}?acceptance\s+oracle\s*#?\s*(\d+)",
+            rf"{req_pattern}.{{0,120}}?oracle\s*#\s*(\d+)",
+            rf"{req_pattern}.{{0,120}}?第\s*(\d+)\s*条.{{0,40}}?oracle",
+        ]
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+                try:
+                    refs.add((match.group(1), int(match.group(2))))
+                except (TypeError, ValueError):
+                    continue
+        return refs
+
+    @staticmethod
+    def _review_feedback_is_obsolete_for_task(task: TaskSpec, text: str) -> bool:
+        current_keys = Orchestrator._task_requirement_proof_keys(task)
+        if not current_keys:
+            return False
+        referenced_keys = Orchestrator._review_feedback_oracle_refs(text)
+        return bool(referenced_keys) and referenced_keys.isdisjoint(current_keys)
+
+    @staticmethod
+    def _format_task_review_retry_feedback(
+        task: TaskSpec,
+        *,
+        reason: str,
+        review_summary: str = "",
+        review_history: Optional[List[Dict[str, object]]] = None,
+    ) -> str:
+        review_history = review_history or []
+        if Orchestrator._review_feedback_is_obsolete_for_task(task, review_summary):
+            return Orchestrator._format_retry_feedback(
+                "review_rejected",
+                reason=(
+                    reason
+                    + "\nPersisted review feedback was omitted because it only references "
+                    "requirement oracle proof(s) that are not present in this task's current "
+                    "requirement_proofs. The current Task JSON proof ownership is authoritative."
+                ),
+            )
+
+        filtered_history = [
+            entry
+            for entry in review_history
+            if not Orchestrator._review_feedback_is_obsolete_for_task(
+                task,
+                str(entry.get("summary", "")) if isinstance(entry, dict) else "",
+            )
+        ]
+        if len(filtered_history) != len(review_history):
+            reason = (
+                reason
+                + "\nSome older review feedback was omitted because it references requirement "
+                "oracle proof(s) outside this task's current requirement_proofs."
+            )
+
+        return Orchestrator._format_retry_feedback(
+            "review_rejected",
+            reason=reason,
+            review_history=filtered_history,
+            review_summary=review_summary,
+        )
+
     def _cached_review_result(self, state: RunState, task: TaskSpec, fingerprint: str) -> Optional[Dict[str, object]]:
         cache_entry = state.task_review_cache.get(task.task_id, {})
         if cache_entry.get("fingerprint") != fingerprint:
@@ -3867,6 +3949,10 @@ class Orchestrator:
             "Work only on the current task.",
             "Keep changes scoped and testable.",
             f"Task JSON:\n{task_json}",
+            "If Task JSON includes requirement_proofs, those entries define the current task's "
+            "owned requirement-oracle proof pairs. Acceptance oracles from the same requirement "
+            "that are absent from this task's requirement_proofs may be covered by other tasks; "
+            "do not implement, review-fail, or emit ORACLE_PROOF_UPDATES for those absent pairs.",
         ]
         if requirement_context:
             common.extend(["", requirement_context])
@@ -3879,8 +3965,8 @@ class Orchestrator:
             lines = common + [
                 "Implement only this feature slice.",
                 "If local verification exposes a tightly coupled regression in files you touched or in paths explicitly implicated by retry feedback, fix it in the same attempt even if it sits slightly outside the nominal task slice.",
-                "The bound requirements and acceptance oracles above are hard requirements, not optional background.",
-                "Honor the bound oracle contract exactly: the implementation and tests must meet or exceed each requirement's oracle_strength, collect proof at the required evidence_boundary, and avoid every forbidden proxy oracle listed in the requirement context.",
+                "The current task's owned acceptance criteria and owned requirement proof entries are hard requirements, not optional background.",
+                "Honor each owned oracle contract exactly: the implementation and tests must meet or exceed each requirement's oracle_strength, collect proof at the required evidence_boundary, and avoid every forbidden proxy oracle listed in the requirement context.",
                 "When the task has requirement_proofs, do NOT edit .auto-agents/state/task_plan.json directly. Instead, include an ORACLE_PROOF_UPDATES JSON block in your final response.",
                 "Each ORACLE_PROOF_UPDATES entry must update an existing current-task proof by requirement_id and oracle_index, set status='verified', and include concrete evidence_refs plus proof_type/oracle_strength/evidence_boundary/proxy_oracles when relevant.",
                 "Do not submit proof updates for proxy evidence listed in forbidden_proxy_oracles, for final-status-only checks, or for config/metadata-only checks when the requirement demands behavioral/system-boundary proof.",
@@ -3908,8 +3994,8 @@ class Orchestrator:
         if stage == "review":
             lines = common + [
                 "Review the current uncommitted changes for correctness, regressions, and missing tests.",
-                "The bound requirements and acceptance oracles above are in scope. A task passes only if both Task JSON and the bound requirement oracles are satisfied.",
-                "ORACLE PROOF AUDIT: Review every requirement_proofs entry. Fail unless each bound acceptance oracle has verified proof with concrete evidence_refs, the proof_type/oracle_strength/evidence_boundary meet or exceed the requirement, and proxy_oracles do not include anything listed in forbidden_proxy_oracles.",
+                "The Task JSON acceptance criteria and current-task requirement_proofs are in scope. A task passes only if both Task JSON and the owned requirement proof entries are satisfied.",
+                "ORACLE PROOF AUDIT: Review every current-task requirement_proofs entry. Fail unless each owned acceptance oracle has verified proof with concrete evidence_refs, the proof_type/oracle_strength/evidence_boundary meet or exceed the requirement, and proxy_oracles do not include anything listed in forbidden_proxy_oracles.",
                 "TEST AUDIT: Separately evaluate whether the tests truly cover the acceptance criteria "
                 "from the Task JSON. Check that tests validate observable behavior (API contracts, "
                 "input/output, side-effects) rather than internal implementation details. "
@@ -3967,8 +4053,8 @@ class Orchestrator:
         max_attempts = self._max_attempts("implement")
         feedback = ""
         if task.review_summary.strip():
-            feedback = self._format_retry_feedback(
-                "review_rejected",
+            feedback = self._format_task_review_retry_feedback(
+                task,
                 reason="review rejected the task",
                 review_history=task.review_history,
                 review_summary=task.review_summary,
@@ -4198,8 +4284,8 @@ class Orchestrator:
                     overflow_arbiter = arbiter_result
                     break
 
-            feedback = self._format_retry_feedback(
-                "review_rejected",
+            feedback = self._format_task_review_retry_feedback(
+                task,
                 reason=last_reason,
                 review_history=task.review_history,
                 review_summary=last_review,

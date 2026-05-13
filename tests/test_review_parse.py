@@ -5,7 +5,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.models import AgentResult
+from auto_agents.config import requirements_trace_path
+from auto_agents.io_utils import write_json
+from auto_agents.models import AgentResult, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 
 
@@ -213,6 +215,103 @@ class ReviewParseTests(unittest.TestCase):
         self.assertIn("Implicated paths: app/api/routes/projects.py, app/application/media.py", feedback)
         self.assertIn("Key verify evidence:", feedback)
         self.assertIn("--- Excerpt 1 ---", feedback)
+
+    def test_task_review_retry_feedback_omits_obsolete_proof_review(self) -> None:
+        task = TaskSpec(
+            task_id="task-113",
+            title="Build six-step detail",
+            description="Current split owns only the first three REQ-074 oracles.",
+            acceptance=["six steps"],
+            requirement_ids=["REQ-074"],
+            requirement_proofs=[
+                {"requirement_id": "REQ-074", "oracle_index": 1, "status": "verified"},
+                {"requirement_id": "REQ-074", "oracle_index": 2, "status": "verified"},
+                {"requirement_id": "REQ-074", "oracle_index": 3, "status": "verified"},
+            ],
+        )
+
+        feedback = Orchestrator._format_task_review_retry_feedback(
+            task,
+            reason="review rejected the task",
+            review_summary="REQ-074 的第 4 条验收 oracle 仍没有单独的已验证 proof。",
+            review_history=[
+                {"attempt": 1, "summary": "REQ-074 的第 4 条验收 oracle 仍没有单独的已验证 proof。"},
+            ],
+        )
+
+        self.assertIn("Persisted review feedback was omitted", feedback)
+        self.assertIn("current requirement_proofs", feedback)
+        self.assertNotIn("第 4 条验收 oracle 仍没有单独", feedback)
+
+    def test_task_review_retry_feedback_keeps_current_proof_review(self) -> None:
+        task = TaskSpec(
+            task_id="task-113",
+            title="Build six-step detail",
+            description="Current split owns REQ-074 oracle 2.",
+            acceptance=["single panel"],
+            requirement_ids=["REQ-074"],
+            requirement_proofs=[
+                {"requirement_id": "REQ-074", "oracle_index": 2, "status": "planned"},
+            ],
+        )
+
+        feedback = Orchestrator._format_task_review_retry_feedback(
+            task,
+            reason="review rejected the task",
+            review_summary="REQ-074 oracle #2 is still missing evidence.",
+            review_history=[
+                {"attempt": 1, "summary": "REQ-074 oracle #2 is still missing evidence."},
+            ],
+        )
+
+        self.assertIn("REQ-074 oracle #2 is still missing evidence.", feedback)
+        self.assertNotIn("Persisted review feedback was omitted", feedback)
+
+    def test_task_prompts_scope_requirement_oracles_to_current_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Feature must satisfy two independently owned oracles.",
+                            "source": "test",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["owned by this task", "owned by another task"],
+                            "oracle_type": "mixed",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Owned slice",
+                description="Own only oracle 1.",
+                acceptance=["owned slice works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    {"requirement_id": "REQ-001", "oracle_index": 1, "status": "planned"},
+                ],
+            )
+
+            prompt = orchestrator._build_task_prompt(task, "review")
+
+            self.assertIn("requirement_proofs, those entries define the current task's", prompt)
+            self.assertIn("do not implement, review-fail, or emit ORACLE_PROOF_UPDATES", prompt)
+            self.assertIn("owned requirement proof entries", prompt)
 
 
 if __name__ == "__main__":
