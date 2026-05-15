@@ -19,6 +19,7 @@ from auto_agents.config import (
     config_path,
     load_project_config,
     load_run_state,
+    requirements_trace_path,
     save_project_config,
     save_run_state,
     task_plan_path,
@@ -1098,6 +1099,63 @@ class ProjectValidationTests(unittest.TestCase):
 
             rendered = stream.getvalue()
             self.assertIn("[stage:plan] tasks=1", rendered)
+
+    def test_plan_validation_accepts_no_new_iteration_tasks_with_coverage_justification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Existing capability remains covered.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["done task still covers capability"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "test_strategy": "unittest",
+                    "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already done.",
+                            "acceptance": ["done task still covers capability"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "done",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+
+            result = AgentResult(
+                ok=True,
+                command=[],
+                output_path=Path("."),
+                summary="COVERAGE ANALYSIS: REQ-001 is covered by task-001. UNCOVERED: none.",
+                stdout="",
+            )
+
+            self.assertIsNone(Orchestrator(project_root)._plan_validation_feedback(result))
 
     def test_execute_task_emits_implement_and_review_task_logs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -5301,7 +5301,26 @@ class Orchestrator:
     def _max_attempts(self, stage: str) -> int:
         return max(1, self.config.retries.per_stage.get(stage, self.config.retries.default_max_attempts))
 
-    def _plan_validation_feedback(self, _: AgentResult) -> Optional[str]:
+    @staticmethod
+    def _plan_summary_justifies_no_new_tasks(summary: str) -> bool:
+        normalized = str(summary or "").strip().lower()
+        if "coverage analysis" not in normalized and "覆盖分析" not in normalized:
+            return False
+        no_uncovered_markers = (
+            "uncovered: none",
+            "uncovered：none",
+            "uncovered: no",
+            "uncovered：no",
+            "uncovered: 无",
+            "uncovered：无",
+            "未发现 uncovered",
+            "无 uncovered",
+            "无缺失",
+            "无未覆盖",
+        )
+        return any(marker in normalized for marker in no_uncovered_markers)
+
+    def _plan_validation_feedback(self, result: AgentResult) -> Optional[str]:
         payload = load_task_plan(self.project_root)
         trace = load_requirements_trace(self.project_root)
         errors = validate_task_plan_with_requirements(payload, trace)
@@ -5323,6 +5342,8 @@ class Orchestrator:
                 for t in payload.get("tasks", [])
             )
             if is_iteration and not has_new:
+                if self._plan_summary_justifies_no_new_tasks(result.summary):
+                    return None
                 return (
                     "WARNING: This is an iteration run but the task plan contains NO new pending tasks. "
                     "All tasks are marked 'done'. Re-examine whether the done tasks' ACCEPTANCE CRITERIA "
