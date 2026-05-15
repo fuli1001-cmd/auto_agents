@@ -276,7 +276,21 @@ class Orchestrator:
         )
 
     def _normalize_blocked_requirements_audit_recovery_resume(self, state: RunState) -> bool:
-        tasks = state.tasks or self._load_tasks_from_plan()
+        tasks = list(state.tasks)
+        if not tasks:
+            try:
+                payload = load_task_plan(self.project_root)
+            except Exception:
+                return False
+            raw_tasks = payload.get("tasks", []) if isinstance(payload, dict) else []
+            if not isinstance(raw_tasks, list) or not raw_tasks:
+                return False
+            try:
+                tasks = [TaskSpec.from_dict(item) for item in raw_tasks if isinstance(item, dict)]
+            except Exception:
+                return False
+            if not tasks:
+                return False
         recovery_tasks = [
             task
             for task in tasks
@@ -565,9 +579,9 @@ class Orchestrator:
                 provider_kind=provider_kind,
                 doc_language=doc_language,
             )
-            self._ensure_preconditions(state, spec_file=spec_file, skip_validate=skip_validate)
             if self._normalize_blocked_requirements_audit_recovery_resume(state):
                 save_run_state(self.project_root, state)
+            self._ensure_preconditions(state, spec_file=spec_file, skip_validate=skip_validate)
 
             if state.status == "completed":
                 print("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]", file=sys.stderr)
