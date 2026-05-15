@@ -1,4 +1,5 @@
 import io
+import json
 import subprocess
 import sys
 import tempfile
@@ -875,6 +876,9 @@ class AuditRecoveryAdapter:
         elif request.stage == "implement":
             self.implement_calls += 1
             write_text(self.project_root / "artifact.txt", "modern_backend\n")
+            service_path = self.project_root / "app" / "service.py"
+            if service_path.exists():
+                write_text(service_path, "modern_backend = True\n")
             summary = "implemented audit recovery\n"
             write_text(request.output_path, summary)
         elif request.stage == "review":
@@ -2663,6 +2667,186 @@ class RetryFlowTests(unittest.TestCase):
                 
                 self.assertTrue(found, "Rejection reason should be injected into clarify prompt")
 
+    def test_requirements_audit_forbidden_pattern_routes_by_flagged_path_owner(self) -> None:
+        cases = {
+            ".auto-agents/docs/project_brief.md": "clarify",
+            ".auto-agents/state/requirements_trace.json": "clarify",
+            ".auto-agents/docs/architecture.md": "design",
+            ".auto-agents/state/task_plan.json": "plan",
+            ".auto-agents/docs/provider_references/provider.md": "provider_research",
+            "app/service.py": "implement",
+        }
+
+        for path, expected_stage in cases.items():
+            with self.subTest(path=path):
+                stage, hard_failure = Orchestrator._audit_issue_route(
+                    {
+                        "kind": "forbidden_pattern",
+                        "message": f"forbidden pattern found in {path}",
+                        "path": path,
+                    }
+                )
+                self.assertEqual(stage, expected_stage)
+                self.assertEqual(hard_failure, "")
+
+    def test_misrouted_project_brief_audit_recovery_rewinds_to_clarify_on_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            write_text(project_root / "spec.md", "# Spec\n")
+            write_text(project_root / ".auto-agents" / "docs" / "project_brief.md", "legacy_gateway\n")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Do not keep legacy wording in the project brief.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["project brief uses current wording"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": ["legacy_gateway"],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "done",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "fix-rejection-123",
+                            "title": "Fix issues after release rejection",
+                            "description": (
+                                "The release was rejected with the following feedback:\n"
+                                "The requirements audit failed. Use "
+                                f"{project_root / '.auto-agents' / 'docs' / 'requirements_audit.md'} "
+                                "as the source of truth.\n\nPlease fix these issues."
+                            ),
+                            "acceptance": ["Feedback is fully addressed", "Tests pass"],
+                            "requirement_ids": [],
+                            "status": "blocked",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "failed"
+            state.current_stage = "implement"
+            state.last_error = "Task fix-rejection-123 failed gates: review rejected the task"
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            changed = orchestrator._normalize_blocked_requirements_audit_recovery_resume(state)
+
+            self.assertTrue(changed)
+            self.assertEqual(state.current_stage, "clarify")
+            self.assertEqual(state.rejected_stage, "clarify")
+            self.assertIn("owned by clarify", state.rejection_reason)
+            task_ids = [task.task_id for task in state.tasks]
+            self.assertEqual(task_ids, ["task-001"])
+            persisted_task_ids = [
+                item["task_id"]
+                for item in json.loads(task_plan_path(project_root).read_text(encoding="utf-8"))["tasks"]
+            ]
+            self.assertEqual(persisted_task_ids, ["task-001"])
+
+    def test_requirements_audit_recovery_task_verify_fails_before_review_when_audit_still_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            (project_root / "app").mkdir()
+            write_text(project_root / "app" / "service.py", "legacy_gateway = True\n")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Do not keep the legacy backend path.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["artifact is modernized"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": ["legacy_gateway"],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "done",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "fix-rejection-123",
+                            "title": "Fix issues after release rejection",
+                            "description": (
+                                "The release was rejected with the following feedback:\n"
+                                "The requirements audit failed. Use "
+                                f"{project_root / '.auto-agents' / 'docs' / 'requirements_audit.md'} "
+                                "as the source of truth.\n\nPlease fix these issues."
+                            ),
+                            "acceptance": ["Feedback is fully addressed", "Tests pass"],
+                            "requirement_ids": [],
+                            "status": "in_progress",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            recovery_task = state.tasks[1]
+
+            result = orchestrator._run_task_verify(recovery_task, state=state)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("requirements audit still failed", str(result["reason"]))
+            self.assertIn("REQ-001", result["failure_ids"])
+
     def test_requirements_audit_forbidden_pattern_routes_back_to_implement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -2706,13 +2890,12 @@ class RetryFlowTests(unittest.TestCase):
                             "requirement_ids": ["REQ-001"],
                             "status": "done",
                             "commit_message": "",
-                            "review_summary": "legacy_gateway still exists in the current implementation",
-                            "review_history": [{"attempt": 1, "summary": "legacy_gateway still exists in the current implementation"}],
                         }
                     ]
                 },
             )
-            write_text(project_root / "artifact.txt", "legacy_gateway\n")
+            (project_root / "app").mkdir()
+            write_text(project_root / "app" / "service.py", "legacy_gateway = True\n")
 
             orchestrator = Orchestrator(project_root)
             orchestrator.adapter = AuditRecoveryAdapter(project_root)
@@ -2723,7 +2906,10 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.status, "completed")
             self.assertEqual(orchestrator.adapter.implement_calls, 1)
             self.assertIn("requirements_audit", state.stage_summaries)
-            self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "modern_backend")
+            self.assertEqual(
+                (project_root / "app" / "service.py").read_text(encoding="utf-8").strip(),
+                "modern_backend = True",
+            )
             task_plan_text = task_plan_path(project_root).read_text(encoding="utf-8")
             run_state_text = (project_root / ".auto-agents" / "state" / "run_state.json").read_text(encoding="utf-8")
             self.assertNotIn("legacy_gateway still exists", task_plan_text)
@@ -2772,13 +2958,12 @@ class RetryFlowTests(unittest.TestCase):
                             "requirement_ids": ["REQ-001"],
                             "status": "done",
                             "commit_message": "",
-                            "review_summary": "legacy_gateway still exists in the current implementation",
-                            "review_history": [{"attempt": 1, "summary": "legacy_gateway still exists in the current implementation"}],
                         }
                     ]
                 },
             )
-            write_text(project_root / "artifact.txt", "legacy_gateway\n")
+            (project_root / "app").mkdir()
+            write_text(project_root / "app" / "service.py", "legacy_gateway = True\n")
 
             stream = io.StringIO()
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
@@ -2983,13 +3168,12 @@ class RetryFlowTests(unittest.TestCase):
                             "requirement_ids": ["REQ-001"],
                             "status": "done",
                             "commit_message": "",
-                            "review_summary": "legacy_gateway still exists in the current implementation",
-                            "review_history": [{"attempt": 1, "summary": "legacy_gateway still exists in the current implementation"}],
                         }
                     ]
                 },
             )
-            write_text(project_root / "artifact.txt", "legacy_gateway\n")
+            (project_root / "app").mkdir()
+            write_text(project_root / "app" / "service.py", "legacy_gateway = True\n")
 
             orchestrator = Orchestrator(project_root)
             orchestrator.adapter = AuditRecoveryAdapter(project_root)

@@ -262,11 +262,84 @@ class Orchestrator:
         return True
 
     @staticmethod
-    def _audit_issue_route(blocker: Dict[str, object]) -> Tuple[Optional[str], str]:
+    def _is_requirements_audit_recovery_task(task: Optional[TaskSpec]) -> bool:
+        if task is None:
+            return False
+        if not str(task.task_id).startswith("fix-rejection-"):
+            return False
+        if str(task.title).strip() != "Fix issues after release rejection":
+            return False
+        description = str(task.description)
+        return (
+            "requirements audit failed" in description
+            and ".auto-agents/docs/requirements_audit.md" in description
+        )
+
+    def _normalize_blocked_requirements_audit_recovery_resume(self, state: RunState) -> bool:
+        tasks = state.tasks or self._load_tasks_from_plan()
+        recovery_tasks = [
+            task
+            for task in tasks
+            if task.status != "done" and self._is_requirements_audit_recovery_task(task)
+        ]
+        if not recovery_tasks:
+            return False
+
+        audit_result = run_requirements_audit(self.project_root, tasks)
+        if bool(audit_result.get("ok")):
+            return False
+
+        target_stage, hard_failures = self._requirements_audit_route(audit_result)
+        if hard_failures or not target_stage or target_stage == "implement":
+            return False
+
+        state.tasks = [
+            task
+            for task in tasks
+            if task not in recovery_tasks
+        ]
+        self._persist_tasks(state.tasks)
+        self._rewind_state_from_stage(state, target_stage)
+        state.rejection_reason = self._build_requirements_audit_feedback(audit_result, target_stage)
+        state.rejected_stage = target_stage
+        if self._sanitize_persisted_audit_feedback(state, audit_result) and state.tasks:
+            self._persist_tasks(state.tasks)
+        return True
+
+    @staticmethod
+    def _normalize_audit_blocker_path(path: object) -> str:
+        normalized = str(path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized
+
+    @classmethod
+    def _forbidden_pattern_owner_stage(cls, blocker: Dict[str, object]) -> str:
+        path = cls._normalize_audit_blocker_path(blocker.get("path"))
+        if path in {
+            ".auto-agents/docs/project_brief.md",
+            ".auto-agents/state/requirements_trace.json",
+        }:
+            return "clarify"
+        if path == ".auto-agents/docs/architecture.md":
+            return "design"
+        if path == ".auto-agents/state/task_plan.json":
+            return "plan"
+        if (
+            path.startswith(".auto-agents/docs/provider_references/")
+            or path == ".auto-agents/state/provider_references.lock.json"
+        ):
+            return "provider_research"
+        if path.startswith(".auto-agents/state/"):
+            return "verify"
+        return "implement"
+
+    @classmethod
+    def _audit_issue_route(cls, blocker: Dict[str, object]) -> Tuple[Optional[str], str]:
         kind = str(blocker.get("kind", "")).strip()
         message = str(blocker.get("message", "")).strip() or "requirements audit blocker"
         if kind == "forbidden_pattern":
-            return "implement", ""
+            return cls._forbidden_pattern_owner_stage(blocker), ""
         if kind == "task_coverage":
             return "plan", ""
         if kind == "provider_reference":
@@ -289,7 +362,8 @@ class Orchestrator:
         kind = str(blocker.get("kind", "")).strip()
         if kind == "forbidden_pattern":
             path = str(blocker.get("path", "")).strip() or "unknown path"
-            return f"forbidden pattern found in {path}"
+            owner_stage = Orchestrator._forbidden_pattern_owner_stage(blocker)
+            return f"forbidden pattern found in {path} (owned by {owner_stage})"
         return str(blocker.get("message", "")).strip() or "requirements audit blocker"
 
     def _requirements_audit_route(self, audit_result: Dict[str, object]) -> Tuple[Optional[str], List[str]]:
@@ -404,6 +478,7 @@ class Orchestrator:
             f"The requirements audit failed. Use {report_path} as the source of truth.",
             f"Recovery route: rerun from {target_stage}.",
             "Address every failing mandatory requirement before continuing.",
+            "Fix the source-of-truth file reported by each finding; do not satisfy this by only editing tests, excluding the flagged path, or asserting that the current failure is expected.",
         ]
         for issue in audit_result.get("issues", []):
             if not isinstance(issue, dict) or str(issue.get("result", "")).strip() != "fail":
@@ -491,6 +566,8 @@ class Orchestrator:
                 doc_language=doc_language,
             )
             self._ensure_preconditions(state, spec_file=spec_file, skip_validate=skip_validate)
+            if self._normalize_blocked_requirements_audit_recovery_resume(state):
+                save_run_state(self.project_root, state)
 
             if state.status == "completed":
                 print("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]", file=sys.stderr)
@@ -2150,6 +2227,21 @@ class Orchestrator:
                 "new_failure_ids": stale_failure_ids,
                 "raw_output": str(stale_status_audit.get("raw_output", "")),
             }
+        requirements_audit_check = self._run_task_requirements_audit_recovery_check(task, state)
+        if requirements_audit_check:
+            audit_failure_ids = self._normalize_verify_failure_ids(
+                requirements_audit_check.get("failure_ids", []),
+                str(requirements_audit_check.get("reason", "")),
+            )
+            return {
+                "ok": False,
+                "reason": str(requirements_audit_check["reason"]),
+                "failure_ids": audit_failure_ids,
+                "current_failure_ids": audit_failure_ids,
+                "baseline_failure_ids": baseline_failure_ids,
+                "new_failure_ids": audit_failure_ids,
+                "raw_output": str(requirements_audit_check.get("raw_output", "")),
+            }
         proof_evidence = self._run_task_proof_evidence(task)
         if proof_evidence is not None and not bool(proof_evidence.get("ok")):
             failure_ids = self._normalize_verify_failure_ids(
@@ -2175,6 +2267,29 @@ class Orchestrator:
             "new_failure_ids": [],
             "raw_output": raw_output,
             "proof_evidence": proof_evidence,
+        }
+
+    def _run_task_requirements_audit_recovery_check(
+        self,
+        task: Optional[TaskSpec],
+        state: Optional[RunState],
+    ) -> Optional[Dict[str, object]]:
+        if not self._is_requirements_audit_recovery_task(task):
+            return None
+        tasks = state.tasks if state is not None and state.tasks else self._load_tasks_from_plan()
+        audit_result = run_requirements_audit(self.project_root, tasks)
+        if bool(audit_result.get("ok")):
+            return None
+        failed_requirements = [
+            str(issue.get("requirement_id", "")).strip()
+            for issue in audit_result.get("issues", [])
+            if isinstance(issue, dict) and str(issue.get("result", "")).strip() == "fail"
+        ]
+        failed_requirements = [item for item in failed_requirements if item]
+        return {
+            "reason": f"requirements audit still failed: {audit_result['path']}",
+            "failure_ids": failed_requirements,
+            "raw_output": str(audit_result.get("report", "")),
         }
 
     @staticmethod
