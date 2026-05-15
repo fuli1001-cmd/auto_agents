@@ -261,6 +261,53 @@ class ClarifyResumeTests(unittest.TestCase):
         self.assertIn("Please add auth.", prompt)
         self.assertIn("revision pass after a requirements rejection", prompt)
 
+    def test_rejection_reentry_ready_proceeds_to_generate_without_extra_reply(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+
+        state = load_run_state(project_root)
+        state.rejected_stage = "clarify"
+        state.rejection_reason = "Fix the requirements audit findings."
+        history_path = conversation_history_path(project_root, state.run_id)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(
+            history_path,
+            json.dumps(
+                [
+                    {"role": "user", "content": "Original discussion."},
+                    {"role": "agent", "content": "Plan.\nREADY_TO_GENERATE"},
+                ],
+                ensure_ascii=False,
+            ),
+        )
+
+        def fail_if_prompted(prompt: str) -> str:
+            raise AssertionError(f"post-rejection ready clarify should not prompt for extra input: {prompt}")
+
+        orchestrator._user_input_fn = fail_if_prompted
+        clarify_result = AgentResult(
+            ok=True,
+            command=[],
+            output_path=Path("."),
+            summary="Audit feedback addressed.\nREADY_TO_GENERATE",
+            stdout="",
+        )
+        generate_result = AgentResult(
+            ok=True,
+            command=[],
+            output_path=Path("."),
+            summary="Generated brief.",
+            stdout="",
+        )
+
+        with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+            mock_run.side_effect = [clarify_result, generate_result]
+            state = orchestrator._run_interactive_clarify(state, spec_file)
+
+        call_stage_keys = [call.kwargs["stage_key"] for call in mock_run.call_args_list]
+        self.assertEqual(call_stage_keys, ["clarify-conv-3", "clarify-generate"])
+        self.assertEqual(state.stage_summaries["clarify"], "Generated brief.")
+
     def test_reject_requirements_keeps_clarify_history_file(self):
         project_root, _spec_file = self._setup_project()
         orchestrator = Orchestrator(project_root)

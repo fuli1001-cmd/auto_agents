@@ -909,11 +909,15 @@ class Orchestrator:
                 history.append({"role": "agent", "content": reply})
                 write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
 
-                if "READY_TO_GENERATE" in reply and not post_rejection:
+                if "READY_TO_GENERATE" in reply:
                     display_reply = reply.replace("READY_TO_GENERATE", "").strip()
                     if display_reply:
                         print("\nAgent:", file=sys.stderr)
                         print(display_reply, file=sys.stderr)
+                    if post_rejection:
+                        confirmed_generation = True
+                        post_rejection = False
+                        break
                     print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
                     user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
 
