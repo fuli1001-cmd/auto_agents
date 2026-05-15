@@ -66,6 +66,8 @@ from .requirements import (
     validate_requirements_trace_payload,
 )
 from .validation import (
+    PYTEST_VALUE_OPTIONS,
+    _unwrap_conda_run,
     validate_required_document,
     validate_task_dependencies,
     validate_task_plan_with_requirements,
@@ -112,6 +114,7 @@ class Orchestrator:
         self._current_provider: str = self.config.active_provider
         self._repo_map_builder: Optional[RepoMapBuilder] = None
         self._last_repo_map_result: Optional[RepoMapResult] = None
+        self._task_proof_evidence_cache: Dict[Tuple[str, str], Dict[str, object]] = {}
         self._gate_baseline_cache = GateBaselineCache(
             self.project_root,
             cache_path=gate_baseline_cache_path(self.project_root),
@@ -2091,17 +2094,12 @@ class Orchestrator:
             allowed_migrations = {str(item) for item in task.expected_test_migrations}
             new_failure_ids = [fid for fid in new_failure_ids if fid not in allowed_migrations]
         raw_output = self._gate_raw_output(verify_gate)
+        baseline_only_reason = ""
         if task is not None and current_failure_ids and not new_failure_ids:
-            return {
-                "ok": True,
-                "reason": f"task baseline only: {len(current_failure_ids)} pre-existing failure(s) remain",
-                "failure_ids": [],
-                "current_failure_ids": current_failure_ids,
-                "baseline_failure_ids": baseline_failure_ids,
-                "new_failure_ids": [],
-                "raw_output": raw_output,
-            }
-        if not verify_gate.ok:
+            baseline_only_reason = (
+                f"task baseline only: {len(current_failure_ids)} pre-existing failure(s) remain"
+            )
+        if not verify_gate.ok and not baseline_only_reason:
             effective_failure_ids = new_failure_ids or current_failure_ids
             if task is not None and new_failure_ids:
                 reason = (
@@ -2152,15 +2150,231 @@ class Orchestrator:
                 "new_failure_ids": stale_failure_ids,
                 "raw_output": str(stale_status_audit.get("raw_output", "")),
             }
+        proof_evidence = self._run_task_proof_evidence(task)
+        if proof_evidence is not None and not bool(proof_evidence.get("ok")):
+            failure_ids = self._normalize_verify_failure_ids(
+                proof_evidence.get("failure_ids", []),
+                str(proof_evidence.get("reason", "")),
+            )
+            return {
+                "ok": False,
+                "reason": str(proof_evidence.get("reason", "")),
+                "failure_ids": failure_ids,
+                "current_failure_ids": failure_ids,
+                "baseline_failure_ids": baseline_failure_ids,
+                "new_failure_ids": failure_ids,
+                "raw_output": str(proof_evidence.get("raw_output", "")),
+                "proof_evidence": proof_evidence,
+            }
         return {
             "ok": True,
-            "reason": verify_gate.summary,
+            "reason": baseline_only_reason or verify_gate.summary,
             "failure_ids": [],
             "current_failure_ids": current_failure_ids,
             "baseline_failure_ids": baseline_failure_ids,
             "new_failure_ids": [],
             "raw_output": raw_output,
+            "proof_evidence": proof_evidence,
         }
+
+    @staticmethod
+    def _task_requirement_evidence_refs(task: Optional[TaskSpec]) -> List[str]:
+        if task is None:
+            return []
+        refs: List[str] = []
+        for proof in task.requirement_proofs:
+            if not isinstance(proof, dict):
+                continue
+            if str(proof.get("status", "")).strip() != "verified":
+                continue
+            for raw_ref in proof.get("evidence_refs", []) or []:
+                ref = str(raw_ref).strip()
+                if ref and ref not in refs:
+                    refs.append(ref)
+        return refs
+
+    @staticmethod
+    def _looks_like_pytest_evidence_ref(ref: str) -> bool:
+        normalized = str(ref).strip()
+        if not normalized:
+            return False
+        return (
+            " " not in normalized
+            and (normalized.endswith(".py") or ".py::" in normalized)
+        )
+
+    def _proof_evidence_cache_key(self, task: TaskSpec) -> Tuple[str, str]:
+        return (task.task_id, worktree_fingerprint(self.project_root))
+
+    def _proof_verification_command_templates(self) -> List[str]:
+        commands: List[str] = []
+        try:
+            payload = load_task_plan(self.project_root)
+        except Exception:
+            payload = {}
+        for raw_command in payload.get("verification_commands", []) or []:
+            command = str(raw_command).strip()
+            if command and command not in commands:
+                commands.append(command)
+        for raw_command in self.config.gates.commands:
+            command = str(raw_command).strip()
+            if command and command not in commands:
+                commands.append(command)
+        return commands
+
+    def _rewrite_pytest_command_targets(
+        self,
+        command: str,
+        targets: List[str],
+    ) -> Optional[str]:
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return None
+        if not parts:
+            return None
+        inner = _unwrap_conda_run(parts)
+        prefix = parts[: len(parts) - len(inner)] if inner and len(inner) < len(parts) else []
+        if not inner:
+            return None
+        executable = Path(inner[0]).name
+        runner: List[str]
+        args: List[str]
+        if executable in {"pytest", "py.test"}:
+            runner = [inner[0]]
+            args = inner[1:]
+        elif (
+            len(inner) >= 3
+            and Path(inner[0]).name in {"python", "python3"}
+            and inner[1] == "-m"
+            and inner[2] == "pytest"
+        ):
+            runner = inner[:3]
+            args = inner[3:]
+        else:
+            return None
+
+        preserved_args: List[str] = []
+        index = 0
+        option_parsing_done = False
+        while index < len(args):
+            arg = args[index]
+            if arg == "--":
+                preserved_args.append(arg)
+                preserved_args.extend(args[index + 1 :])
+                break
+            if not option_parsing_done and arg.startswith("-"):
+                preserved_args.append(arg)
+                if arg in PYTEST_VALUE_OPTIONS and "=" not in arg and index + 1 < len(args):
+                    preserved_args.append(args[index + 1])
+                    index += 2
+                    continue
+                index += 1
+                continue
+            option_parsing_done = True
+            index += 1
+
+        return shlex.join([*prefix, *runner, *preserved_args, *targets])
+
+    def _build_task_proof_evidence_command(self, evidence_refs: List[str]) -> str:
+        for command in self._proof_verification_command_templates():
+            rewritten = self._rewrite_pytest_command_targets(command, evidence_refs)
+            if rewritten:
+                return rewritten
+        quoted_refs = " ".join(shlex.quote(ref) for ref in evidence_refs)
+        conda_meta = self.project_root / ".conda" / "conda-meta"
+        if conda_meta.exists():
+            return f"conda run -p ./.conda python -m pytest -q {quoted_refs}"
+        return f"{shlex.quote(sys.executable)} -m pytest -q {quoted_refs}"
+
+    def _run_task_proof_evidence(self, task: Optional[TaskSpec]) -> Optional[Dict[str, object]]:
+        if task is None:
+            return None
+        evidence_refs = self._task_requirement_evidence_refs(task)
+        if not evidence_refs:
+            return None
+
+        cache_key = self._proof_evidence_cache_key(task)
+        cached = self._task_proof_evidence_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        unsupported_refs = [
+            ref for ref in evidence_refs if not self._looks_like_pytest_evidence_ref(ref)
+        ]
+        if unsupported_refs:
+            result = {
+                "ok": False,
+                "reason": (
+                    "owned proof evidence_refs are not executable pytest targets: "
+                    + ", ".join(unsupported_refs)
+                ),
+                "summary": (
+                    f"Unsupported owned proof evidence refs ({len(unsupported_refs)}): "
+                    + ", ".join(unsupported_refs)
+                ),
+                "evidence_refs": evidence_refs,
+                "passed_refs": [],
+                "failed_refs": list(unsupported_refs),
+                "failure_ids": list(unsupported_refs),
+                "command": "",
+                "raw_output": "",
+            }
+            self._task_proof_evidence_cache[cache_key] = dict(result)
+            return result
+
+        command = self._build_task_proof_evidence_command(evidence_refs)
+        gate_result = run_commands([command], self.project_root)
+        raw_output = self._gate_raw_output(gate_result)
+        failure_ids = self._normalize_verify_failure_ids(
+            extract_failure_ids(gate_result),
+            gate_result.summary,
+        )
+        failed_refs = [ref for ref in evidence_refs if ref in failure_ids]
+        passed_refs = (
+            list(evidence_refs)
+            if gate_result.ok
+            else [ref for ref in evidence_refs if ref not in failed_refs]
+            if failed_refs and all(item in evidence_refs for item in failure_ids)
+            else []
+        )
+        if gate_result.ok:
+            result = {
+                "ok": True,
+                "reason": "",
+                "summary": (
+                    f"Owned proof evidence passed ({len(evidence_refs)} refs): "
+                    + ", ".join(evidence_refs)
+                ),
+                "evidence_refs": evidence_refs,
+                "passed_refs": passed_refs,
+                "failed_refs": [],
+                "failure_ids": [],
+                "command": command,
+                "raw_output": raw_output,
+            }
+        else:
+            failed_label = ", ".join(failed_refs[:6]) if failed_refs else gate_result.summary
+            result = {
+                "ok": False,
+                "reason": (
+                    f"owned proof evidence failed: {failed_label}"
+                    if failed_label
+                    else "owned proof evidence failed"
+                ),
+                "summary": (
+                    f"Owned proof evidence failed ({len(failed_refs) or len(evidence_refs)} refs): "
+                    + failed_label
+                ),
+                "evidence_refs": evidence_refs,
+                "passed_refs": passed_refs,
+                "failed_refs": failed_refs or list(evidence_refs),
+                "failure_ids": failure_ids or list(evidence_refs),
+                "command": command,
+                "raw_output": raw_output or gate_result.summary,
+            }
+        self._task_proof_evidence_cache[cache_key] = dict(result)
+        return result
 
     def _task_verify_baseline_ref(self) -> str:
         return f"{head_ref(self.project_root)}:{worktree_fingerprint(self.project_root)}"
@@ -2627,6 +2841,7 @@ class Orchestrator:
         run_id: str,
         task: TaskSpec,
         verify_reason: str = "",
+        proof_evidence: Optional[Dict[str, object]] = None,
         state: Optional[RunState] = None,
     ) -> Dict[str, object]:
         review_effort = self._review_effort_for_task(task)
@@ -2634,7 +2849,10 @@ class Orchestrator:
         review_prompt = self._build_task_prompt(
             task,
             "review",
-            review_context=self._build_review_context(verify_reason=verify_reason),
+            review_context=self._build_review_context(
+                verify_reason=verify_reason,
+                proof_evidence=proof_evidence,
+            ),
             plan_migration_context=plan_migration_context,
         )
         review_result = self._run_agent_with_retries(
@@ -2726,13 +2944,49 @@ class Orchestrator:
             return ""
         return process.stdout.strip()
 
-    def _build_review_context(self, verify_reason: str = "", max_diff_chars: int = 20000) -> str:
+    @staticmethod
+    def _format_proof_evidence_summary(proof_evidence: Optional[Dict[str, object]]) -> str:
+        if not isinstance(proof_evidence, dict):
+            return ""
+        summary = str(proof_evidence.get("summary", "")).strip()
+        if not summary:
+            return ""
+        lines = [summary]
+        command = str(proof_evidence.get("command", "")).strip()
+        if command:
+            lines.append(f"Command: {command}")
+        passed_refs = [
+            str(item).strip()
+            for item in proof_evidence.get("passed_refs", [])
+            if str(item).strip()
+        ]
+        failed_refs = [
+            str(item).strip()
+            for item in proof_evidence.get("failed_refs", [])
+            if str(item).strip()
+        ]
+        if passed_refs:
+            lines.append("Passed refs: " + ", ".join(passed_refs))
+        if failed_refs:
+            lines.append("Failed refs: " + ", ".join(failed_refs))
+        return "\n".join(lines)
+
+    def _build_review_context(
+        self,
+        verify_reason: str = "",
+        *,
+        proof_evidence: Optional[Dict[str, object]] = None,
+        max_diff_chars: int = 20000,
+    ) -> str:
         entries = changed_entries(self.project_root)
         lines = [
             "Review the current task by prioritizing the diff context below before exploring unrelated files.",
         ]
         if verify_reason.strip():
             lines.extend(["Local verification summary:", verify_reason.strip()])
+        proof_summary = self._format_proof_evidence_summary(proof_evidence)
+        if proof_summary:
+            lines.extend(["Current owned proof evidence:", proof_summary])
         if entries:
             lines.append("Changed files:")
             lines.extend(f"- {path}" for _, path in entries[:40])
@@ -2850,6 +3104,7 @@ class Orchestrator:
         review_summary: str = "",
         review_history: Optional[List[Dict[str, object]]] = None,
         verification_summary: str = "",
+        proof_evidence_summary: str = "",
         implicated_paths: Optional[List[str]] = None,
         raw_excerpts: Optional[List[str]] = None,
     ) -> str:
@@ -2861,6 +3116,8 @@ class Orchestrator:
             lines.append(f"- Reason: {rendered_reason}")
         if verification_summary.strip():
             lines.extend(["- Verification triage:", verification_summary.strip()])
+        if proof_evidence_summary.strip():
+            lines.extend(["- Current proof evidence:", proof_evidence_summary.strip()])
         if implicated_paths:
             lines.append(f"- Implicated paths: {', '.join(implicated_paths[:8])}")
         if raw_excerpts:
@@ -2913,6 +3170,18 @@ class Orchestrator:
         return refs
 
     @staticmethod
+    def _review_feedback_evidence_refs(text: str) -> Set[str]:
+        refs: Set[str] = set()
+        if not text:
+            return refs
+        pattern = re.compile(r"((?:tests?|__tests__)/[^\s`'\"()]+\.py(?:::[^\s`'\"()]+)*)")
+        for match in pattern.findall(text):
+            normalized = str(match).strip().rstrip(".,)")
+            if normalized:
+                refs.add(normalized)
+        return refs
+
+    @staticmethod
     def _review_feedback_is_obsolete_for_task(task: TaskSpec, text: str) -> bool:
         current_keys = Orchestrator._task_requirement_proof_keys(task)
         if not current_keys:
@@ -2921,12 +3190,30 @@ class Orchestrator:
         return bool(referenced_keys) and referenced_keys.isdisjoint(current_keys)
 
     @staticmethod
+    def _review_feedback_is_resolved_by_current_evidence(
+        text: str,
+        proof_evidence: Optional[Dict[str, object]],
+    ) -> bool:
+        if not text or not isinstance(proof_evidence, dict) or not bool(proof_evidence.get("ok")):
+            return False
+        passed_refs = {
+            str(item).strip()
+            for item in proof_evidence.get("passed_refs", [])
+            if str(item).strip()
+        }
+        if not passed_refs:
+            return False
+        referenced_refs = Orchestrator._review_feedback_evidence_refs(text)
+        return bool(referenced_refs) and referenced_refs.issubset(passed_refs)
+
+    @staticmethod
     def _format_task_review_retry_feedback(
         task: TaskSpec,
         *,
         reason: str,
         review_summary: str = "",
         review_history: Optional[List[Dict[str, object]]] = None,
+        proof_evidence: Optional[Dict[str, object]] = None,
     ) -> str:
         review_history = review_history or []
         if Orchestrator._review_feedback_is_obsolete_for_task(task, review_summary):
@@ -2938,6 +3225,17 @@ class Orchestrator:
                     "requirement oracle proof(s) that are not present in this task's current "
                     "requirement_proofs. The current Task JSON proof ownership is authoritative."
                 ),
+                proof_evidence_summary=Orchestrator._format_proof_evidence_summary(proof_evidence),
+            )
+        if Orchestrator._review_feedback_is_resolved_by_current_evidence(review_summary, proof_evidence):
+            return Orchestrator._format_retry_feedback(
+                "review_rejected",
+                reason=(
+                    reason
+                    + "\nPersisted review feedback was omitted because its cited evidence_refs now "
+                    "pass on the current worktree."
+                ),
+                proof_evidence_summary=Orchestrator._format_proof_evidence_summary(proof_evidence),
             )
 
         filtered_history = [
@@ -2947,12 +3245,17 @@ class Orchestrator:
                 task,
                 str(entry.get("summary", "")) if isinstance(entry, dict) else "",
             )
+            and not Orchestrator._review_feedback_is_resolved_by_current_evidence(
+                str(entry.get("summary", "")) if isinstance(entry, dict) else "",
+                proof_evidence,
+            )
         ]
         if len(filtered_history) != len(review_history):
             reason = (
                 reason
                 + "\nSome older review feedback was omitted because it references requirement "
-                "oracle proof(s) outside this task's current requirement_proofs."
+                "oracle proof(s) outside this task's current requirement_proofs or cites "
+                "evidence_refs that now pass on the current worktree."
             )
 
         return Orchestrator._format_retry_feedback(
@@ -2960,6 +3263,7 @@ class Orchestrator:
             reason=reason,
             review_history=filtered_history,
             review_summary=review_summary,
+            proof_evidence_summary=Orchestrator._format_proof_evidence_summary(proof_evidence),
         )
 
     def _cached_review_result(self, state: RunState, task: TaskSpec, fingerprint: str) -> Optional[Dict[str, object]]:
@@ -4052,12 +4356,14 @@ class Orchestrator:
     ) -> Dict[str, object]:
         max_attempts = self._max_attempts("implement")
         feedback = ""
+        current_proof_evidence = self._run_task_proof_evidence(task) if task.review_summary.strip() else None
         if task.review_summary.strip():
             feedback = self._format_task_review_retry_feedback(
                 task,
                 reason="review rejected the task",
                 review_history=task.review_history,
                 review_summary=task.review_summary,
+                proof_evidence=current_proof_evidence,
             )
         last_reason = "task failed without a recorded reason"
         last_review = ""
@@ -4193,6 +4499,11 @@ class Orchestrator:
                     "local_verification",
                     reason=last_reason,
                     verification_summary=str(verify_feedback.get("verification_summary", "")),
+                    proof_evidence_summary=self._format_proof_evidence_summary(
+                        verify_result.get("proof_evidence")
+                        if isinstance(verify_result.get("proof_evidence"), dict)
+                        else None
+                    ),
                     implicated_paths=list(verify_feedback.get("implicated_paths", [])),
                     raw_excerpts=list(verify_feedback.get("raw_excerpts", [])),
                 )
@@ -4217,6 +4528,11 @@ class Orchestrator:
                     state.run_id,
                     task,
                     verify_reason=str(verify_result["reason"]),
+                    proof_evidence=(
+                        verify_result.get("proof_evidence")
+                        if isinstance(verify_result.get("proof_evidence"), dict)
+                        else None
+                    ),
                     state=state,
                 )
                 if gate_result["ok"]:
@@ -4233,6 +4549,11 @@ class Orchestrator:
                     feedback = self._format_retry_feedback(
                         "oracle_proof_gate",
                         reason=last_reason,
+                        proof_evidence_summary=self._format_proof_evidence_summary(
+                            verify_result.get("proof_evidence")
+                            if isinstance(verify_result.get("proof_evidence"), dict)
+                            else None
+                        ),
                     )
                     continue
                 gate_result["verify_current_failure_ids"] = list(
@@ -4289,6 +4610,11 @@ class Orchestrator:
                 reason=last_reason,
                 review_history=task.review_history,
                 review_summary=last_review,
+                proof_evidence=(
+                    verify_result.get("proof_evidence")
+                    if isinstance(verify_result.get("proof_evidence"), dict)
+                    else None
+                ),
             )
 
         if overflow_trigger:

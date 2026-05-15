@@ -98,6 +98,27 @@ class ReviewParseTests(unittest.TestCase):
             self.assertIn("Changed files:", prompt)
             self.assertIn("artifact.txt", prompt)
 
+    def test_review_context_includes_current_proof_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            review_context = orchestrator._build_review_context(
+                "task baseline only: 1 pre-existing failure(s) remain",
+                proof_evidence={
+                    "ok": True,
+                    "summary": "Owned proof evidence passed (1 refs): tests/test_api.py::test_contract",
+                    "command": "conda run -p ./.conda python -m pytest -q tests/test_api.py::test_contract",
+                    "passed_refs": ["tests/test_api.py::test_contract"],
+                    "failed_refs": [],
+                },
+            )
+
+            self.assertIn("Current owned proof evidence:", review_context)
+            self.assertIn("tests/test_api.py::test_contract", review_context)
+            self.assertIn("Command:", review_context)
+
     def test_implement_prompt_protects_conda_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -266,6 +287,62 @@ class ReviewParseTests(unittest.TestCase):
 
         self.assertIn("REQ-074 oracle #2 is still missing evidence.", feedback)
         self.assertNotIn("Persisted review feedback was omitted", feedback)
+
+    def test_task_review_retry_feedback_omits_review_when_cited_evidence_now_passes(self) -> None:
+        task = TaskSpec(
+            task_id="task-121",
+            title="Evidence projection",
+            description="Own one proof.",
+            acceptance=["contract works"],
+            requirement_ids=["REQ-058"],
+            requirement_proofs=[
+                {
+                    "requirement_id": "REQ-058",
+                    "oracle_index": 4,
+                    "status": "planned",
+                    "evidence_refs": [
+                        "tests/test_asset_consistency_runtime_api.py::AssetConsistencyRuntimeApiTests::test_passed_assets_are_marked_reuse_asset_in_local_regeneration_plan"
+                    ],
+                }
+            ],
+        )
+
+        feedback = Orchestrator._format_task_review_retry_feedback(
+            task,
+            reason="review rejected the task",
+            review_summary=(
+                "Still failing: "
+                "tests/test_asset_consistency_runtime_api.py::AssetConsistencyRuntimeApiTests::"
+                "test_passed_assets_are_marked_reuse_asset_in_local_regeneration_plan"
+            ),
+            review_history=[
+                {
+                    "attempt": 1,
+                    "summary": (
+                        "Still failing: "
+                        "tests/test_asset_consistency_runtime_api.py::AssetConsistencyRuntimeApiTests::"
+                        "test_passed_assets_are_marked_reuse_asset_in_local_regeneration_plan"
+                    ),
+                }
+            ],
+            proof_evidence={
+                "ok": True,
+                "summary": (
+                    "Owned proof evidence passed (1 refs): "
+                    "tests/test_asset_consistency_runtime_api.py::AssetConsistencyRuntimeApiTests::"
+                    "test_passed_assets_are_marked_reuse_asset_in_local_regeneration_plan"
+                ),
+                "passed_refs": [
+                    "tests/test_asset_consistency_runtime_api.py::AssetConsistencyRuntimeApiTests::test_passed_assets_are_marked_reuse_asset_in_local_regeneration_plan"
+                ],
+                "failed_refs": [],
+                "command": "conda run -p ./.conda python -m pytest -q tests/test_asset_consistency_runtime_api.py::AssetConsistencyRuntimeApiTests::test_passed_assets_are_marked_reuse_asset_in_local_regeneration_plan",
+            },
+        )
+
+        self.assertIn("cited evidence_refs now pass", feedback)
+        self.assertIn("Current proof evidence:", feedback)
+        self.assertNotIn("Still failing:", feedback)
 
     def test_task_prompts_scope_requirement_oracles_to_current_proofs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

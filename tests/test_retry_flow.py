@@ -1190,6 +1190,62 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("task verification commands modified tracked or unignored files", str(result["reason"]))
             self.assertIn("verify-leak.txt", str(result["reason"]))
 
+    def test_task_verify_runs_owned_proof_evidence_even_with_baseline_only_gate_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = ["python -c \"print('ERROR: test_legacy (tests.test_demo.LegacyTests.test_legacy)'); raise SystemExit(1)\""]
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            from auto_agents.models import TaskSpec as _TaskSpec
+
+            task = _TaskSpec(
+                task_id="task-001",
+                title="Verify proof evidence",
+                description="Make sure proof evidence still runs after baseline-only verify.",
+                acceptance=["proof evidence passes"],
+                verify_baseline_failures=["test_legacy (tests.test_demo.LegacyTests.test_legacy)"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "verified",
+                        "evidence_refs": ["tests/test_public_api.py::test_contract"],
+                    }
+                ],
+            )
+
+            proof_calls = []
+            orchestrator._run_task_proof_evidence = lambda current_task: (
+                proof_calls.append(current_task.task_id),
+                {
+                    "ok": False,
+                    "reason": "owned proof evidence failed: tests/test_public_api.py::test_contract",
+                    "summary": "Owned proof evidence failed (1 refs): tests/test_public_api.py::test_contract",
+                    "evidence_refs": ["tests/test_public_api.py::test_contract"],
+                    "passed_refs": [],
+                    "failed_refs": ["tests/test_public_api.py::test_contract"],
+                    "failure_ids": ["tests/test_public_api.py::test_contract"],
+                    "command": "conda run -p ./.conda python -m pytest -q tests/test_public_api.py::test_contract",
+                    "raw_output": "FAILED tests/test_public_api.py::test_contract",
+                },
+            )[1]
+
+            result = orchestrator._run_task_verify(task)
+
+            self.assertEqual(proof_calls, ["task-001"])
+            self.assertFalse(result["ok"])
+            self.assertIn("owned proof evidence failed", str(result["reason"]))
+            self.assertEqual(
+                result["failure_ids"],
+                ["tests/test_public_api.py::test_contract"],
+            )
+
     def test_persisted_tasks_keep_generated_verification_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -2474,6 +2530,97 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("[task:task-001] review decision=fail", rendered)
             self.assertIn("Core issue: health endpoint is not actually exercised.", rendered)
             self.assertIn("[task:task-001] blocked reason=review rejected the task", rendered)
+
+    def test_blocked_retry_omits_stale_review_when_current_proof_evidence_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            class PromptCaptureAdapter:
+                def __init__(self, root: Path) -> None:
+                    self.root = root
+                    self.implement_prompts = []
+
+                def run(self, request):
+                    if request.stage == "implement":
+                        self.implement_prompts.append(request.prompt)
+                        write_text(self.root / "artifact.txt", "fixed\n")
+                        summary = "implemented\n"
+                    elif request.stage == "review":
+                        summary = "DECISION: pass\nreview passed\n"
+                    else:
+                        summary = f"{request.stage}\n"
+                    write_text(request.output_path, summary)
+                    return AgentResult(
+                        ok=True,
+                        command=["fake"],
+                        output_path=request.output_path,
+                        summary=summary.strip(),
+                        returncode=0,
+                    )
+
+            config = orchestrator.config
+            config.gates.commands = ["python -c \"print('ok')\""]
+            config.git.commit_each_task = False
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            adapter = PromptCaptureAdapter(project_root)
+            orchestrator.adapter = adapter
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Recover blocked proof task",
+                            "description": "Resume after stale review.",
+                            "acceptance": ["artifact.txt contains fixed"],
+                            "status": "blocked",
+                            "commit_message": "",
+                            "review_summary": (
+                                "Still failing: tests/test_public_api.py::test_contract"
+                            ),
+                            "review_history": [
+                                {"attempt": 1, "summary": "Still failing: tests/test_public_api.py::test_contract"}
+                            ],
+                            "requirement_ids": ["REQ-001"],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "oracle_index": 1,
+                                    "status": "verified",
+                                    "evidence_refs": ["tests/test_public_api.py::test_contract"],
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+
+            orchestrator._run_task_proof_evidence = lambda task: {
+                "ok": True,
+                "reason": "",
+                "summary": "Owned proof evidence passed (1 refs): tests/test_public_api.py::test_contract",
+                "evidence_refs": ["tests/test_public_api.py::test_contract"],
+                "passed_refs": ["tests/test_public_api.py::test_contract"],
+                "failed_refs": [],
+                "failure_ids": [],
+                "command": "conda run -p ./.conda python -m pytest -q tests/test_public_api.py::test_contract",
+                "raw_output": "",
+            }
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(len(adapter.implement_prompts), 1)
+            self.assertIn("cited evidence_refs now pass", adapter.implement_prompts[0])
+            self.assertIn("Current proof evidence:", adapter.implement_prompts[0])
+            retry_feedback = adapter.implement_prompts[0].split("Previous attempt issues:\n", 1)[1]
+            self.assertNotIn("Still failing: tests/test_public_api.py::test_contract", retry_feedback)
 
 
     def test_reject_resets_stage_and_injects_feedback(self):

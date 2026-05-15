@@ -369,6 +369,26 @@ class ImplementPipelineTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root)
             adapter = ProofUpdateAdapter(project_root)
             orchestrator.adapter = adapter
+            orchestrator._run_task_proof_evidence = lambda task: (
+                {
+                    "ok": True,
+                    "reason": "",
+                    "summary": "Owned proof evidence passed (1 refs): tests/test_public_api.py::test_normalized_provider_output",
+                    "evidence_refs": ["tests/test_public_api.py::test_normalized_provider_output"],
+                    "passed_refs": ["tests/test_public_api.py::test_normalized_provider_output"],
+                    "failed_refs": [],
+                    "failure_ids": [],
+                    "command": "python -m pytest -q tests/test_public_api.py::test_normalized_provider_output",
+                    "raw_output": "",
+                }
+                if task is not None
+                and any(
+                    isinstance(proof, dict)
+                    and str(proof.get("status", "")).strip() == "verified"
+                    for proof in task.requirement_proofs
+                )
+                else None
+            )
             write_json(
                 task_plan_path(project_root),
                 {
