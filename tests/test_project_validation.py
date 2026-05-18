@@ -17,8 +17,10 @@ from auto_agents.config import (
     DEFAULT_CONFIG,
     auto_dir,
     config_path,
+    create_session,
     load_project_config,
     load_run_state,
+    save_session_state,
     requirements_trace_path,
     save_project_config,
     save_run_state,
@@ -26,7 +28,7 @@ from auto_agents.config import (
 )
 from auto_agents.git_ops import working_tree_clean
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentRequest, AgentResult, AgentUsage, ProjectConfig, ProviderConfig, TaskSpec
+from auto_agents.models import AgentRequest, AgentResult, AgentUsage, ProjectConfig, ProviderConfig, SessionState, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.validation import (
     validate_required_document,
@@ -637,6 +639,70 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(exit_code, 1)
             self.assertFalse(payload["ok"])
             self.assertIn("Expecting property name enclosed in double quotes", payload["error"])
+
+    def test_cli_run_auto_starts_fresh_provider_resolve_for_current_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            blocked_error = (
+                "provider research is blocked; provide official docs, defer the requirement, "
+                "choose another provider, or explicitly approve assumptions before resuming.\n"
+                "- REQ-001: .auto-agents/docs/provider_references/provider.md is ambiguous"
+            )
+            run_state = load_run_state(project_root)
+            run_state.status = "failed"
+            run_state.current_stage = "provider_research"
+            run_state.last_error = blocked_error
+            save_run_state(project_root, run_state)
+
+            old_session = create_session(project_root, "provider_resolve")
+            old_session.status = "failed"
+            old_session.goal = "old blocker"
+            save_session_state(project_root, old_session)
+
+            session_calls = {"start": 0, "offer": 0}
+
+            def mock_run(_self, *args, **kwargs):
+                raise RuntimeError(blocked_error)
+
+            def mock_start(self):
+                session_calls["start"] += 1
+                resumed = load_run_state(project_root)
+                resumed.status = "completed"
+                resumed.current_stage = "readme"
+                resumed.last_error = ""
+                save_run_state(project_root, resumed)
+                return SessionState(
+                    session_id="provider-auto-001",
+                    mode="provider_resolve",
+                    status="completed",
+                    goal="Recover current blocker",
+                    resolution="provider_research_resolved",
+                )
+
+            def fail_offer(_self):
+                session_calls["offer"] += 1
+                raise AssertionError("automatic recovery must not use offer_resume_or_new")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch.object(Orchestrator, "run", mock_run),
+                patch("auto_agents.session.Session.start", mock_start),
+                patch("auto_agents.session.Session.offer_resume_or_new", fail_offer),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                exit_code = main(["run", "--project", str(project_root), "--spec-file", str(spec_file)])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(session_calls["start"], 1)
+            self.assertEqual(session_calls["offer"], 0)
+            self.assertIn("Run completed successfully.", stdout.getvalue())
+            self.assertIn("Starting automatic provider recovery", stderr.getvalue())
 
     def test_cli_init_defaults_name_from_project_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

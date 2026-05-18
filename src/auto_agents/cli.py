@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .config import (
     architecture_path,
+    load_run_state,
     project_brief_path,
     requirements_audit_path,
     requirements_trace_path,
@@ -144,6 +145,63 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
         f"- Inspect persisted status: {status_cmd}",
     ]
     return "\n".join(lines)
+
+
+def _auto_resolve_provider_blocker(
+    project_root: Path,
+    orchestrator: Orchestrator,
+    *,
+    print_agent_output: bool,
+) -> int:
+    from .session import Session
+
+    print(
+        "Run hit a provider_research blocker. Starting automatic provider recovery...",
+        file=sys.stderr,
+    )
+    orchestrator._print_agent_output = bool(print_agent_output)
+    session = Session(
+        orchestrator,
+        mode="provider_resolve",
+        print_agent_output=bool(print_agent_output),
+    )
+    try:
+        session_state = session.start()
+    except (RuntimeError, FileNotFoundError, ValueError) as error:
+        print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+        return 1
+    if session_state.status != "completed":
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "automatic provider-resolve session did not complete; "
+                        f"session_id={session_state.session_id} status={session_state.status}"
+                    ),
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 1
+
+    resumed_state = load_run_state(project_root)
+    if resumed_state.status == "failed":
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": resumed_state.last_error or "run failed after automatic provider recovery",
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 1
+
+    print(_render_run_summary(project_root, resumed_state.to_dict()))
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -354,6 +412,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
+        orchestrator = None
         try:
             project_root = Path(args.project)
             spec_file = Path(args.spec_file) if args.spec_file else _default_spec_file(project_root)
@@ -373,6 +432,12 @@ def main(argv: list[str] | None = None) -> int:
             print(_render_run_summary(project_root, state.to_dict()))
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
+            if orchestrator is not None and orchestrator.is_provider_research_blocked_error(str(error)):
+                return _auto_resolve_provider_blocker(
+                    project_root,
+                    orchestrator,
+                    print_agent_output=bool(args.print_agent_output),
+                )
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
 

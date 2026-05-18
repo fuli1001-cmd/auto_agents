@@ -259,6 +259,11 @@ Recover a run that is blocked in `provider_research` and continue it after the r
 python3 -m auto_agents provider-resolve --project /tmp/demo
 ```
 
+`python3 -m auto_agents run ...` now auto-enters a fresh provider-recovery session for the
+current blocker when it fails with `provider research is blocked`, and continues the saved run
+automatically after the provider references are resolved. The explicit `provider-resolve` command
+remains available for manual recovery or resuming an interrupted recovery session.
+
 If validation reports that Python commands are running outside `./.conda`, fix the commands before
 rerunning the workflow.
 
@@ -659,6 +664,11 @@ need explicit user decisions:
 ```bash
 python3 -m auto_agents provider-resolve --project /tmp/demo
 ```
+
+If `python3 -m auto_agents run ...` encounters this blocker, it now starts a **fresh**
+provider-recovery session for the current blocked run automatically instead of asking whether to
+resume unrelated historical provider-recovery sessions first. Manual `provider-resolve` invocations
+keep the existing resumable-session chooser behavior.
 
 ### Convergence-based stopping
 

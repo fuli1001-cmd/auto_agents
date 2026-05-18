@@ -30,6 +30,9 @@ PROJECT_GITIGNORE = """__pycache__/
 .conda/
 .venv/
 node_modules/
+.data/
+.tmp/
+.tmp-tests/
 .DS_Store
 """
 AUTO_GITIGNORE_ENTRIES = (
@@ -58,6 +61,7 @@ PROJECT_BRIEF_TEMPLATE = """# Project Brief
 
 - Budget, stack, deployment, compliance, or integration constraints.
 - Do not modify the system-wide environment; Python projects must use a project-local conda env at `./.conda`.
+- Mutable local test/runtime artifacts should live under ignored temp/data paths such as `./.tmp/`, `./.tmp-tests/`, or `./.data/`, not as tracked repo-root files.
 """
 
 
