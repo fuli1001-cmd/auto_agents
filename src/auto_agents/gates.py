@@ -17,6 +17,18 @@ _VITEST_FAILED = re.compile(
 _UNITTEST_FAILED = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
 
 
+def _pytest_failure_ids(output: str) -> List[str]:
+    ids: List[str] = []
+    for item in _PYTEST_FAILED.findall(output):
+        candidate = item.strip()
+        if candidate.startswith("("):
+            continue
+        if ".py" not in candidate and "::" not in candidate:
+            continue
+        ids.append(candidate)
+    return ids
+
+
 def _failure_summary(result: CommandResult) -> str:
     details = result.stderr or result.stdout or f"exit code {result.returncode}"
     details = " ".join(details.split())
@@ -139,7 +151,7 @@ def extract_failure_ids(gate_result: GateResult) -> List[str]:
         if cmd_result.ok:
             continue
         combined = f"{cmd_result.stdout}\n{cmd_result.stderr}"
-        pytest_ids = _PYTEST_FAILED.findall(combined)
+        pytest_ids = _pytest_failure_ids(combined)
         if pytest_ids:
             failures.extend(pytest_ids)
             continue

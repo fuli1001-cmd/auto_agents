@@ -70,6 +70,53 @@ class GateTests(unittest.TestCase):
                 ],
             )
 
+    def test_extract_unittest_failure_ids_ignores_summary_line(self) -> None:
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="python -m unittest discover -s tests",
+                    ok=False,
+                    returncode=1,
+                    stdout=(
+                        "ERROR: test_publish_flow (tests.test_api.PublishTests.test_publish_flow)\n"
+                        "FAIL: test_subtitles (tests.test_api.SubtitleTests.test_subtitles)\n"
+                        "FAILED (failures=5, errors=2)\n"
+                    ),
+                    stderr="",
+                )
+            ],
+        )
+
+        ids = extract_failure_ids(gate)
+
+        self.assertEqual(
+            ids,
+            [
+                "test_publish_flow (tests.test_api.PublishTests.test_publish_flow)",
+                "test_subtitles (tests.test_api.SubtitleTests.test_subtitles)",
+            ],
+        )
+        self.assertNotIn("(failures=5,", ids)
+
+    def test_extract_unittest_summary_only_falls_back_to_command(self) -> None:
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="python -m unittest discover -s tests",
+                    ok=False,
+                    returncode=1,
+                    stdout="FAILED (failures=5, errors=2)\n",
+                    stderr="",
+                )
+            ],
+        )
+
+        ids = extract_failure_ids(gate)
+
+        self.assertEqual(ids, ["cmd:python -m unittest discover -s tests"])
+
     def test_run_gate_plan_runs_parallel_group_and_preserves_config_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = run_gate_plan(
