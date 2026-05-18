@@ -67,8 +67,8 @@ class GateTests(unittest.TestCase):
             [
                 "test_publish_flow (tests.test_api.PublishTests.test_publish_flow)",
                 "test_subtitles (tests.test_api.SubtitleTests.test_subtitles)",
-            ],
-        )
+                ],
+            )
 
     def test_run_gate_plan_runs_parallel_group_and_preserves_config_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -135,6 +135,33 @@ class GateTests(unittest.TestCase):
             )
             self.assertFalse(result.ok)
             self.assertEqual([item.stdout for item in result.commands], ["", "peer", "after"])
+
+    def test_extract_vitest_failure_ids(self) -> None:
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="npm test",
+                    ok=False,
+                    returncode=1,
+                    stdout=(
+                        " FAIL  workbench/src/components/project-detail-workbench.test.tsx > "
+                        "ProjectDetailWorkbench > 生成失败展示用户可理解原因和下一步动作\n"
+                    ),
+                    stderr="",
+                )
+            ],
+        )
+
+        ids = extract_failure_ids(gate)
+
+        self.assertEqual(
+            ids,
+            [
+                "workbench/src/components/project-detail-workbench.test.tsx > "
+                "ProjectDetailWorkbench > 生成失败展示用户可理解原因和下一步动作"
+            ],
+        )
 
 
 if __name__ == "__main__":

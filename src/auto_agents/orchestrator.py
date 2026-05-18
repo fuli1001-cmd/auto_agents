@@ -1700,7 +1700,7 @@ class Orchestrator:
         return "\n".join(lines)
 
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
-        tasks = state.tasks or self._load_tasks_from_plan()
+        tasks = self._load_implementation_tasks(state)
 
         if state.rejected_stage == "implement" and state.rejection_reason:
             import time
@@ -1724,6 +1724,18 @@ class Orchestrator:
         if self.config.execution.parallel_tasks.enabled:
             return self._run_parallel_implementation_loop(state, tasks, max_tasks)
         return self._run_sequential_implementation_loop(state, tasks, max_tasks)
+
+    def _load_implementation_tasks(self, state: RunState) -> List[TaskSpec]:
+        plan_tasks = self._load_tasks_from_plan()
+        if not state.tasks:
+            return plan_tasks
+        state_tasks = [task.to_dict() for task in state.tasks]
+        plan_payload = [task.to_dict() for task in plan_tasks]
+        if state_tasks == plan_payload:
+            return state.tasks
+        state.tasks = plan_tasks
+        save_run_state(self.project_root, state)
+        return plan_tasks
 
     def _run_sequential_implementation_loop(
         self,
@@ -2336,6 +2348,31 @@ class Orchestrator:
             and (normalized.endswith(".py") or ".py::" in normalized)
         )
 
+    @staticmethod
+    def _split_evidence_ref(ref: str) -> Tuple[str, str]:
+        normalized = str(ref).strip()
+        if "::" not in normalized:
+            return normalized, ""
+        path, selector = normalized.split("::", 1)
+        return path.strip(), selector.strip()
+
+    @staticmethod
+    def _looks_like_vitest_evidence_ref(ref: str) -> bool:
+        path, _ = Orchestrator._split_evidence_ref(ref)
+        lowered = path.lower()
+        return lowered.endswith(
+            (
+                ".test.js",
+                ".test.jsx",
+                ".test.ts",
+                ".test.tsx",
+                ".spec.js",
+                ".spec.jsx",
+                ".spec.ts",
+                ".spec.tsx",
+            )
+        )
+
     def _proof_evidence_cache_key(self, task: TaskSpec) -> Tuple[str, str]:
         return (task.task_id, worktree_fingerprint(self.project_root))
 
@@ -2420,6 +2457,98 @@ class Orchestrator:
             return f"conda run -p ./.conda python -m pytest -q {quoted_refs}"
         return f"{shlex.quote(sys.executable)} -m pytest -q {quoted_refs}"
 
+    def _find_package_root_for_evidence_ref(self, ref: str) -> Optional[Path]:
+        path, _ = self._split_evidence_ref(ref)
+        if not path:
+            return None
+        candidate = Path(path)
+        candidate = candidate if candidate.is_absolute() else (self.project_root / candidate)
+        candidate = candidate.resolve()
+        try:
+            candidate.relative_to(self.project_root)
+        except ValueError:
+            return None
+        current = candidate.parent if candidate.suffix else candidate
+        while True:
+            if (current / "package.json").exists():
+                return current
+            if current == self.project_root:
+                return None
+            parent = current.parent
+            if parent == current:
+                return None
+            current = parent
+
+    @staticmethod
+    def _load_package_manifest(package_root: Path) -> Dict[str, object]:
+        try:
+            with (package_root / "package.json").open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @classmethod
+    def _package_test_script_uses_vitest(cls, package_root: Path) -> bool:
+        manifest = cls._load_package_manifest(package_root)
+        scripts = manifest.get("scripts")
+        if not isinstance(scripts, dict):
+            return False
+        test_script = str(scripts.get("test", "")).strip().lower()
+        return "vitest" in test_script
+
+    @classmethod
+    def _package_supports_vitest(cls, package_root: Path) -> bool:
+        manifest = cls._load_package_manifest(package_root)
+        for key in ("devDependencies", "dependencies"):
+            deps = manifest.get(key)
+            if isinstance(deps, dict) and "vitest" in deps:
+                return True
+        if cls._package_test_script_uses_vitest(package_root):
+            return True
+        return any(
+            (package_root / name).exists()
+            for name in (
+                "vitest.config.ts",
+                "vitest.config.js",
+                "vitest.config.mts",
+                "vitest.config.mjs",
+                "vitest.config.cts",
+                "vitest.config.cjs",
+            )
+        )
+
+    def _build_vitest_evidence_command(self, ref: str) -> Optional[str]:
+        package_root = self._find_package_root_for_evidence_ref(ref)
+        if package_root is None or not self._package_supports_vitest(package_root):
+            return None
+        path, selector = self._split_evidence_ref(ref)
+        candidate = Path(path)
+        candidate = candidate if candidate.is_absolute() else (self.project_root / candidate)
+        candidate = candidate.resolve()
+        try:
+            target = candidate.relative_to(package_root)
+            package_prefix = package_root.relative_to(self.project_root)
+        except ValueError:
+            return None
+        command: List[str] = ["npm"]
+        if package_prefix != Path("."):
+            command.extend(["--prefix", str(package_prefix)])
+        if self._package_test_script_uses_vitest(package_root):
+            command.extend(["test", "--", str(target)])
+        else:
+            command.extend(["exec", "--", "vitest", "run", str(target)])
+        if selector:
+            command.extend(["-t", selector])
+        return shlex.join(command)
+
+    def _build_task_proof_evidence_command_for_ref(self, ref: str) -> Optional[str]:
+        if self._looks_like_pytest_evidence_ref(ref):
+            return self._build_task_proof_evidence_command([ref])
+        if self._looks_like_vitest_evidence_ref(ref):
+            return self._build_vitest_evidence_command(ref)
+        return None
+
     def _run_task_proof_evidence(self, task: Optional[TaskSpec]) -> Optional[Dict[str, object]]:
         if task is None:
             return None
@@ -2432,14 +2561,19 @@ class Orchestrator:
         if cached is not None:
             return dict(cached)
 
-        unsupported_refs = [
-            ref for ref in evidence_refs if not self._looks_like_pytest_evidence_ref(ref)
-        ]
+        command_pairs: List[Tuple[str, str]] = []
+        unsupported_refs: List[str] = []
+        for ref in evidence_refs:
+            command = self._build_task_proof_evidence_command_for_ref(ref)
+            if not command:
+                unsupported_refs.append(ref)
+                continue
+            command_pairs.append((ref, command))
         if unsupported_refs:
             result = {
                 "ok": False,
                 "reason": (
-                    "owned proof evidence_refs are not executable pytest targets: "
+                    "owned proof evidence_refs are not executable verification targets: "
                     + ", ".join(unsupported_refs)
                 ),
                 "summary": (
@@ -2456,21 +2590,16 @@ class Orchestrator:
             self._task_proof_evidence_cache[cache_key] = dict(result)
             return result
 
-        command = self._build_task_proof_evidence_command(evidence_refs)
-        gate_result = run_commands([command], self.project_root)
+        commands = [command for _, command in command_pairs]
+        gate_result = run_commands_collect_all(commands, self.project_root)
         raw_output = self._gate_raw_output(gate_result)
-        failure_ids = self._normalize_verify_failure_ids(
-            extract_failure_ids(gate_result),
-            gate_result.summary,
-        )
-        failed_refs = [ref for ref in evidence_refs if ref in failure_ids]
-        passed_refs = (
-            list(evidence_refs)
-            if gate_result.ok
-            else [ref for ref in evidence_refs if ref not in failed_refs]
-            if failed_refs and all(item in evidence_refs for item in failure_ids)
-            else []
-        )
+        failed_refs = [
+            ref
+            for (ref, _command), command_result in zip(command_pairs, gate_result.commands)
+            if not command_result.ok
+        ]
+        passed_refs = [ref for ref in evidence_refs if ref not in failed_refs]
+        command = commands[0] if len(commands) == 1 else "\n".join(commands)
         if gate_result.ok:
             result = {
                 "ok": True,
@@ -2502,7 +2631,7 @@ class Orchestrator:
                 "evidence_refs": evidence_refs,
                 "passed_refs": passed_refs,
                 "failed_refs": failed_refs or list(evidence_refs),
-                "failure_ids": failure_ids or list(evidence_refs),
+                "failure_ids": failed_refs or list(evidence_refs),
                 "command": command,
                 "raw_output": raw_output or gate_result.summary,
             }
@@ -3307,7 +3436,9 @@ class Orchestrator:
         refs: Set[str] = set()
         if not text:
             return refs
-        pattern = re.compile(r"((?:tests?|__tests__)/[^\s`'\"()]+\.py(?:::[^\s`'\"()]+)*)")
+        pattern = re.compile(
+            r"((?:[\w.-]+/)+[^\s`'\"()]+\.(?:py|(?:test|spec)\.[jt]sx?)(?:::[^\n`'\"]+)?)"
+        )
         for match in pattern.findall(text):
             normalized = str(match).strip().rstrip(".,)")
             if normalized:

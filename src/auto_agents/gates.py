@@ -10,6 +10,10 @@ from .models import CommandResult, GateParallelGroup, GateResult
 
 
 _PYTEST_FAILED = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
+_VITEST_FAILED = re.compile(
+    r"^\s*FAIL\s+(\S+\.(?:test|spec)\.[jt]sx?(?:\s+>\s+.+)?)$",
+    re.MULTILINE,
+)
 _UNITTEST_FAILED = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
 
 
@@ -138,6 +142,10 @@ def extract_failure_ids(gate_result: GateResult) -> List[str]:
         pytest_ids = _PYTEST_FAILED.findall(combined)
         if pytest_ids:
             failures.extend(pytest_ids)
+            continue
+        vitest_ids = [item.strip() for item in _VITEST_FAILED.findall(combined) if item.strip()]
+        if vitest_ids:
+            failures.extend(vitest_ids)
             continue
         unittest_ids = [item.strip() for item in _UNITTEST_FAILED.findall(combined) if item.strip()]
         if unittest_ids:

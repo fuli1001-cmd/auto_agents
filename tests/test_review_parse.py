@@ -344,6 +344,53 @@ class ReviewParseTests(unittest.TestCase):
         self.assertIn("Current proof evidence:", feedback)
         self.assertNotIn("Still failing:", feedback)
 
+    def test_task_review_retry_feedback_omits_review_when_cited_vitest_evidence_now_passes(self) -> None:
+        ref = (
+            "workbench/src/components/project-detail-workbench.test.tsx::"
+            "ProjectDetailWorkbench > 生成失败展示用户可理解原因和下一步动作"
+        )
+        task = TaskSpec(
+            task_id="task-124",
+            title="Asset failure explanation",
+            description="Own one vitest-backed proof.",
+            acceptance=["contract works"],
+            requirement_ids=["REQ-080"],
+            requirement_proofs=[
+                {
+                    "requirement_id": "REQ-080",
+                    "oracle_index": 1,
+                    "status": "planned",
+                    "evidence_refs": [ref],
+                }
+            ],
+        )
+
+        feedback = Orchestrator._format_task_review_retry_feedback(
+            task,
+            reason="review rejected the task",
+            review_summary=f"Still failing: {ref}",
+            review_history=[
+                {
+                    "attempt": 1,
+                    "summary": f"Still failing: {ref}",
+                }
+            ],
+            proof_evidence={
+                "ok": True,
+                "summary": f"Owned proof evidence passed (1 refs): {ref}",
+                "passed_refs": [ref],
+                "failed_refs": [],
+                "command": (
+                    "npm --prefix workbench test -- src/components/project-detail-workbench.test.tsx "
+                    "-t 'ProjectDetailWorkbench > 生成失败展示用户可理解原因和下一步动作'"
+                ),
+            },
+        )
+
+        self.assertIn("cited evidence_refs now pass", feedback)
+        self.assertIn("Current proof evidence:", feedback)
+        self.assertNotIn("Still failing:", feedback)
+
     def test_task_prompts_scope_requirement_oracles_to_current_proofs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

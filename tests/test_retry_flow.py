@@ -22,7 +22,7 @@ from auto_agents.config import (
 )
 from auto_agents.git_ops import changed_paths, commit_all, worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentResult, GateParallelGroup
+from auto_agents.models import AgentResult, CommandResult, GateParallelGroup, GateResult, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 
 
@@ -1250,6 +1250,90 @@ class RetryFlowTests(unittest.TestCase):
                 ["tests/test_public_api.py::test_contract"],
             )
 
+    def test_task_proof_evidence_supports_mixed_pytest_and_vitest_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            workbench_root = project_root / "workbench"
+            (workbench_root / "src" / "components").mkdir(parents=True)
+            write_text(
+                workbench_root / "package.json",
+                json.dumps(
+                    {
+                        "name": "demo-workbench",
+                        "private": True,
+                        "scripts": {"test": "vitest run"},
+                        "devDependencies": {"vitest": "3.1.1"},
+                    }
+                ),
+            )
+            write_text(workbench_root / "vitest.config.ts", "export default {}\n")
+            write_text(
+                workbench_root / "src" / "components" / "project-detail-workbench.test.tsx",
+                "export {};\n",
+            )
+            (project_root / "tests").mkdir()
+            write_text(project_root / "tests" / "test_public_api.py", "def test_contract():\n    assert True\n")
+
+            vitest_ref = (
+                "workbench/src/components/project-detail-workbench.test.tsx::"
+                "ProjectDetailWorkbench > 生成失败展示用户可理解原因和下一步动作"
+            )
+            task = TaskSpec(
+                task_id="task-001",
+                title="Verify mixed proof evidence",
+                description="Make sure pytest and vitest proof refs both run.",
+                acceptance=["proof evidence passes"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "verified",
+                        "evidence_refs": [
+                            "tests/test_public_api.py::test_contract",
+                            vitest_ref,
+                        ],
+                    }
+                ],
+            )
+
+            captured_commands = []
+
+            def fake_run(commands, cwd):
+                captured_commands.extend(commands)
+                return GateResult(
+                    ok=True,
+                    commands=[
+                        CommandResult(
+                            command=command,
+                            ok=True,
+                            returncode=0,
+                            stdout="",
+                            stderr="",
+                        )
+                        for command in commands
+                    ],
+                    summary="all commands passed",
+                )
+
+            with patch("auto_agents.orchestrator.run_commands_collect_all", side_effect=fake_run):
+                result = orchestrator._run_task_proof_evidence(task)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(
+                result["passed_refs"],
+                ["tests/test_public_api.py::test_contract", vitest_ref],
+            )
+            self.assertEqual(len(captured_commands), 2)
+            self.assertIn("pytest -q tests/test_public_api.py::test_contract", captured_commands[0])
+            self.assertIn("npm --prefix workbench test --", captured_commands[1])
+            self.assertIn("src/components/project-detail-workbench.test.tsx", captured_commands[1])
+            self.assertIn("-t", captured_commands[1])
+            self.assertIn("ProjectDetailWorkbench > 生成失败展示用户可理解原因和下一步动作", captured_commands[1])
+
     def test_persisted_tasks_keep_generated_verification_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -1361,6 +1445,60 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(orchestrator.adapter.review_calls, 1)
             self.assertEqual(state.tasks[0].status, "done")
             self.assertTrue(state.tasks[0].commit_sha)
+
+    def test_implementation_loop_prefers_task_plan_when_run_state_tasks_are_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = ResumeReviewAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains hello"],
+                            "status": "in_progress",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+            (project_root / "artifact.txt").write_text("hello\n", encoding="utf-8")
+
+            state = load_run_state(project_root)
+            state.tasks = [
+                TaskSpec.from_dict(
+                    {
+                        "task_id": "task-001",
+                        "title": "Write artifact",
+                        "description": "Write the artifact file.",
+                        "acceptance": ["artifact.txt contains hello"],
+                        "status": "pending",
+                        "commit_message": "",
+                        "test_generated": True,
+                    }
+                )
+            ]
+            state.agent_attempts["implement-task-001"] = 1
+
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 0)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(state.tasks[0].status, "done")
+            reloaded_state = load_run_state(project_root)
+            self.assertEqual(reloaded_state.tasks[0].status, "done")
 
     def test_review_stage_cleans_ephemeral_tsbuildinfo_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
