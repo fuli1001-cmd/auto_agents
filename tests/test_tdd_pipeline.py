@@ -278,6 +278,7 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("REQ-002", prompt)
             self.assertIn("bound requirement oracles", prompt)
             self.assertIn("weaker oracle than the requirement allows", prompt)
+            self.assertIn("dropping a concrete forbidden field/path/API token", prompt)
             self.assertIn("forbidden_proxy_oracles", prompt)
             self.assertIn("GatewayPayload", prompt)
             self.assertIn("ORACLE PROOF AUDIT", prompt)
@@ -296,6 +297,7 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("oracle_proof_schema_version", prompt)
             self.assertIn("requirement_proofs", prompt)
             self.assertIn("requirement_ids alone are not sufficient coverage", prompt)
+            self.assertIn("preserve every concrete field/path/API token", prompt)
 
     def test_implement_runs_without_test_writer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

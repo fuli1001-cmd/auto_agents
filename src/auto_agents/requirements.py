@@ -37,6 +37,134 @@ DEFAULT_EVIDENCE_BOUNDARY = "system_boundary"
 ORACLE_PROOF_SCHEMA_VERSION = 1
 ORACLE_STRENGTH_ORDER = {"proxy": 0, "behavioral": 1, "semantic": 2, "human": 3}
 EVIDENCE_BOUNDARY_ORDER = {"internal_state": 0, "system_boundary": 1, "external_side_effect": 2}
+NEGATIVE_CONTRACT_MARKERS = (
+    "must not",
+    "mustn't",
+    "do not",
+    "don't",
+    "does not",
+    "doesn't",
+    "should not",
+    "shouldn't",
+    "cannot",
+    "can't",
+    "no ",
+    "not ",
+    "without ",
+    "omit",
+    "omits",
+    "omitted",
+    "exclude",
+    "excludes",
+    "excluded",
+    "不",
+    "无",
+    "未",
+    "禁止",
+    "不得",
+    "不能",
+    "不要",
+    "不可",
+    "不应",
+    "不再",
+    "不存在",
+    "不包含",
+    "不携带",
+    "不返回",
+    "不嵌入",
+    "排除",
+    "移除",
+)
+CONTRACT_TOKEN_RE = re.compile(
+    r"`([^`]+)`"
+    r"|[A-Za-z_][A-Za-z0-9_]*(?:\[\])?(?:[.][A-Za-z_][A-Za-z0-9_]*(?:\[\])?)+"
+    r"|/[A-Za-z0-9_{}:/?.=&%+~-]+"
+    r"|[A-Za-z_][A-Za-z0-9_]*(?:_[A-Za-z0-9]+)+"
+)
+
+
+def _normalize_contract_token(value: str) -> str:
+    return re.sub(r"\s+", "", value.strip().strip("`'\"“”‘’.,;:，。；：、"))
+
+
+def _contract_text_contains_token(text: str, token: str) -> bool:
+    if not token:
+        return True
+    normalized_text = _normalize_contract_token(text).lower()
+    normalized_token = _normalize_contract_token(token).lower()
+    if not normalized_token:
+        return True
+    return normalized_token in normalized_text
+
+
+def _split_contract_clauses(text: str) -> List[str]:
+    return [
+        item.strip()
+        for item in re.split(r"[\n。；;]", text)
+        if item.strip()
+    ]
+
+
+def _clause_has_negative_contract_marker(clause: str) -> bool:
+    lowered = clause.lower()
+    return any(marker in lowered for marker in NEGATIVE_CONTRACT_MARKERS)
+
+
+def _contract_clause_tokens(clause: str) -> List[str]:
+    tokens: List[str] = []
+    for match in CONTRACT_TOKEN_RE.finditer(clause):
+        token = _normalize_contract_token(match.group(1) or match.group(0))
+        if token and token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _negative_contract_atoms(text: str) -> List[dict]:
+    atoms: List[dict] = []
+    for clause in _split_contract_clauses(text):
+        if not _clause_has_negative_contract_marker(clause):
+            continue
+        tokens = _contract_clause_tokens(clause)
+        if not tokens:
+            continue
+        atoms.append({"clause": clause, "tokens": tokens})
+    return atoms
+
+
+def _task_contract_text_from_payload(task: dict) -> str:
+    parts: List[str] = []
+    for key in ("title", "description", "scope_boundaries"):
+        value = task.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    for key in ("acceptance", "expected_test_migrations"):
+        value = task.get(key)
+        if isinstance(value, list):
+            parts.extend(str(item) for item in value if isinstance(item, str))
+    return "\n".join(parts)
+
+
+def _task_contract_text_from_spec(task: TaskSpec) -> str:
+    parts = [task.title, task.description, task.scope_boundaries]
+    parts.extend(task.acceptance)
+    parts.extend(task.expected_test_migrations)
+    return "\n".join(str(item) for item in parts if str(item).strip())
+
+
+def _oracle_preservation_messages(task_contract_text: str, oracle: str) -> List[str]:
+    messages: List[str] = []
+    for atom in _negative_contract_atoms(oracle):
+        missing_tokens = [
+            token
+            for token in atom["tokens"]
+            if not _contract_text_contains_token(task_contract_text, token)
+        ]
+        if missing_tokens:
+            messages.append(
+                "task acceptance weakens a negative requirement clause; "
+                f"missing token(s) {', '.join(missing_tokens)} from oracle clause: {atom['clause']}"
+            )
+    return messages
 
 
 def empty_requirements_trace() -> dict:
@@ -319,6 +447,7 @@ def validate_task_requirement_proofs(plan_payload: object, trace_payload: dict) 
         if not isinstance(proofs, list):
             errors.append(f"task {task_id} requirement_proofs must be a list")
             continue
+        task_contract_text = _task_contract_text_from_payload(task)
         for proof_index, proof in enumerate(proofs, start=1):
             prefix = f"task {task_id} requirement_proofs[{proof_index}]"
             if not isinstance(proof, dict):
@@ -333,8 +462,12 @@ def validate_task_requirement_proofs(plan_payload: object, trace_payload: dict) 
                 continue
             if req_id not in requirement_ids:
                 errors.append(f"{prefix} requirement_id must also appear in task requirement_ids: {req_id}")
-            if not _proof_matches_any_requirement_oracle(proof, by_req[req_id]):
+            matched_oracle = _matched_requirement_oracle(proof, by_req[req_id])
+            if matched_oracle is None:
                 errors.append(f"{prefix} must identify an acceptance oracle by oracle_index or exact acceptance_oracle")
+            else:
+                for message in _oracle_preservation_messages(task_contract_text, matched_oracle[1]):
+                    errors.append(f"{prefix} {message}")
             for key in ("proof_type", "oracle_strength", "evidence_boundary", "status"):
                 if not isinstance(proof.get(key), str) or not str(proof.get(key)).strip():
                     errors.append(f"{prefix} {key} must be a non-empty string")
@@ -376,6 +509,13 @@ def _proof_matches_any_requirement_oracle(proof: dict, requirement: dict) -> boo
         _proof_matches_oracle(proof, oracle, index)
         for index, oracle in enumerate(_requirement_acceptance_oracles(requirement))
     )
+
+
+def _matched_requirement_oracle(proof: dict, requirement: dict) -> Tuple[int, str] | None:
+    for index, oracle in enumerate(_requirement_acceptance_oracles(requirement)):
+        if _proof_matches_oracle(proof, oracle, index):
+            return index, oracle
+    return None
 
 
 def requirements_for_task(project_root: Path, task: TaskSpec) -> List[dict]:
@@ -524,6 +664,7 @@ def validate_done_task_requirement_proofs(task: TaskSpec, trace_payload: dict) -
         return []
 
     findings: List[dict] = []
+    task_contract_text = _task_contract_text_from_spec(task)
     proofs_by_requirement: Dict[str, List[dict]] = {req_id: [] for req_id in active_bound_requirements}
     for proof_index, proof in enumerate(task.requirement_proofs, start=1):
         prefix = f"requirement_proofs[{proof_index}]"
@@ -565,7 +706,8 @@ def validate_done_task_requirement_proofs(task: TaskSpec, trace_payload: dict) -
             )
             continue
         proofs_by_requirement.setdefault(req_id, []).append(proof)
-        if not _proof_matches_any_requirement_oracle(proof, requirement):
+        matched_oracle = _matched_requirement_oracle(proof, requirement)
+        if matched_oracle is None:
             findings.append(
                 {
                     "kind": "oracle_proof_invalid",
@@ -575,6 +717,17 @@ def validate_done_task_requirement_proofs(task: TaskSpec, trace_payload: dict) -
                     "message": f"{prefix} must identify an acceptance oracle by oracle_index or exact acceptance_oracle",
                 }
             )
+        else:
+            for message in _oracle_preservation_messages(task_contract_text, matched_oracle[1]):
+                findings.append(
+                    {
+                        "kind": "oracle_proof_invalid",
+                        "task_id": task.task_id,
+                        "requirement_id": req_id,
+                        "oracle_index": str(proof.get("oracle_index", "")),
+                        "message": f"{prefix} {message}",
+                    }
+                )
         for message in _proof_contract_messages(requirement, proof, require_verified=True):
             findings.append(
                 {
@@ -632,6 +785,9 @@ def _oracle_proof_findings(requirement: dict, proofs: List[Tuple[TaskSpec, dict]
         proof_messages: List[str] = []
         for task, proof in matching:
             local_messages = _proof_contract_messages(requirement, proof, require_verified=True)
+            local_messages.extend(
+                _oracle_preservation_messages(_task_contract_text_from_spec(task), oracle)
+            )
             if not local_messages:
                 oracle_ok = True
                 break

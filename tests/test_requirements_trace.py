@@ -161,6 +161,102 @@ class RequirementsTraceTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
 
+    def test_plan_validation_rejects_weakened_negative_contract_atom(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(
+                    acceptance_oracles=[
+                        "GET /api/v1/projects/{project_id} default response must not contain complete `tasks[].result`, `retry_trace`, or `retry_attempts`."
+                    ],
+                    forbidden_proxy_oracles=[
+                        "Only removing retry_trace while still returning tasks[].result"
+                    ],
+                )
+            ],
+        }
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Lightweight project detail",
+                    "description": "Trim oversized retry evidence from project detail responses.",
+                    "acceptance": [
+                        "Project detail task result omits `retry_trace` and `retry_attempts`."
+                    ],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [
+                        _proof(
+                            oracle_index=1,
+                            acceptance_oracle="",
+                            forbidden_proxy_oracles=[
+                                "Only removing retry_trace while still returning tasks[].result"
+                            ],
+                            status="planned",
+                        )
+                    ],
+                }
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertTrue(any("tasks[].result" in item for item in errors), errors)
+        self.assertTrue(any("weakens a negative requirement clause" in item for item in errors))
+
+    def test_plan_validation_accepts_preserved_negative_contract_atom(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(
+                    acceptance_oracles=[
+                        "GET /api/v1/projects/{project_id} default response must not contain complete `tasks[].result`, `retry_trace`, or `retry_attempts`."
+                    ],
+                    forbidden_proxy_oracles=[
+                        "Only removing retry_trace while still returning tasks[].result"
+                    ],
+                )
+            ],
+        }
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Lightweight project detail",
+                    "description": "Split project detail task summaries from task diagnostics.",
+                    "acceptance": [
+                        "GET /api/v1/projects/{project_id} default response omits `tasks[].result`, `retry_trace`, and `retry_attempts`.",
+                        "GET /api/v1/tasks/{task_id} keeps complete diagnostics available on demand.",
+                    ],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [
+                        _proof(
+                            oracle_index=1,
+                            acceptance_oracle="",
+                            forbidden_proxy_oracles=[
+                                "Only removing retry_trace while still returning tasks[].result"
+                            ],
+                            status="planned",
+                        )
+                    ],
+                }
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertEqual(errors, [])
+
     def test_plan_validation_rejects_done_task_with_unverified_oracle_proof(self) -> None:
         trace = {"version": 1, "requirements": [_requirement()]}
         plan = {
@@ -200,6 +296,87 @@ class RequirementsTraceTests(unittest.TestCase):
         findings = validate_done_task_requirement_proofs(task, trace)
 
         self.assertTrue(any("proof is not verified" in str(item["message"]) for item in findings))
+
+    def test_done_task_proof_validation_rejects_weakened_negative_contract_atom(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(
+                    acceptance_oracles=[
+                        "Default project detail payload must not contain `tasks[].result`, `retry_trace`, or scorer raw evidence."
+                    ],
+                    forbidden_proxy_oracles=[
+                        "Only hiding retry_trace in the frontend"
+                    ],
+                )
+            ],
+        }
+        task = TaskSpec(
+            task_id="task-001",
+            title="Trim project detail evidence",
+            description="Remove raw retry traces from the public response.",
+            acceptance=["The public response omits `retry_trace`."],
+            requirement_ids=["REQ-001"],
+            requirement_proofs=[
+                _proof(
+                    oracle_index=1,
+                    acceptance_oracle="",
+                    forbidden_proxy_oracles=["Only hiding retry_trace in the frontend"],
+                    status="verified",
+                )
+            ],
+            status="in_progress",
+        )
+
+        findings = validate_done_task_requirement_proofs(task, trace)
+
+        self.assertTrue(any("tasks[].result" in str(item["message"]) for item in findings), findings)
+
+    def test_requirements_audit_fails_done_task_with_weakened_negative_contract_atom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            (project_root / ".auto-agents" / "state").mkdir(parents=True)
+            (project_root / ".auto-agents" / "docs").mkdir(parents=True)
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            acceptance_oracles=[
+                                "Default project detail payload must not contain `tasks[].result`, `retry_trace`, or `retry_attempts`."
+                            ],
+                            forbidden_proxy_oracles=[
+                                "Only trimming retry_trace from a still-present result field"
+                            ],
+                        )
+                    ],
+                },
+            )
+            write_json(task_plan_path(project_root), {"oracle_proof_schema_version": 1, "tasks": []})
+            task = TaskSpec(
+                task_id="task-001",
+                title="Trim project detail evidence",
+                description="Remove retry trace from task result summaries.",
+                acceptance=["Project detail result omits `retry_trace` and `retry_attempts`."],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    _proof(
+                        oracle_index=1,
+                        acceptance_oracle="",
+                        forbidden_proxy_oracles=[
+                            "Only trimming retry_trace from a still-present result field"
+                        ],
+                        status="verified",
+                    )
+                ],
+                status="done",
+            )
+
+            ok, report = audit_requirements(project_root, [task])
+
+        self.assertFalse(ok)
+        self.assertIn("tasks[].result", report)
 
     def test_oracle_proof_audit_blockers_route_to_plan(self) -> None:
         for kind in ("oracle_proof_missing", "oracle_proof_invalid"):
