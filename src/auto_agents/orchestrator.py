@@ -1430,6 +1430,7 @@ class Orchestrator:
         return offending, allowed_scope
 
     def _run_gate_commands(self, *, collect_all: bool, context: str):
+        self._apply_generated_verification_config()
         before_snapshot = self._worktree_change_snapshot()
         gate = run_gate_plan(
             self.config.gates.commands,
@@ -4545,6 +4546,9 @@ class Orchestrator:
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
                 "When task status migration context is present, migrate only repository tests that assert stale task status. Do not edit orchestrator-owned .auto-agents state snapshots to force that transition early.",
                 "Tests should validate observable behavior (API contracts, input/output, side-effects), not internal implementation details.",
+                "Python proof tests must be deterministic under the project's configured verification command. Do not rely on pytest-only or unittest-only ambient state; explicitly configure test adapters, environment variables, and dependency injection needed by the test.",
+                "Python tests must not contact real external services by accident. Use explicit fakes/mocks or test adapters for object storage, providers, databases, and network clients.",
+                "Use per-test unique temp paths for mutable artifacts such as sqlite databases, object-storage roots, caches, and generated fixtures so repeated, resumed, or mixed-runner verification cannot reuse stale state.",
                 "For external provider integrations, use the listed provider_reference files as the source of truth. Do not search for alternate docs or invent protocol details unless the reference is marked insufficient; stop and report missing documentation instead.",
                 "For protocol/direct-integration tasks, add contract tests that verify outbound request shape, auth/header behavior, response normalization, and forbidden legacy payloads where applicable.",
                 "If this is a Python project, create and use a project-local conda env at ./.conda and install packages only inside it.",
@@ -4571,6 +4575,8 @@ class Orchestrator:
                 "input/output, side-effects) rather than internal implementation details. "
                 "If the tests only pass by mocking/faking internal state instead of exercising real "
                 "public interfaces, that is a 'DECISION: fail' issue.",
+                "For Python projects, fail tests that depend on runner-specific ambient state, shared fixed "
+                "sqlite/temp paths, or real external services instead of explicit test fakes/adapters.",
                 "If plan migration context lists retired task IDs, stale repository tests that still reference those retired IDs or the pre-split task-plan structure are also a 'DECISION: fail' issue.",
                 "If task status migration context is present, review stale repository test assertions only. Do NOT fail solely because orchestrator-owned .auto-agents state snapshots still show `in_progress` during review.",
                 "SCOPE RULE: Your review scope is bounded by the acceptance criteria in the Task JSON plus the bound requirements and acceptance oracles above. "

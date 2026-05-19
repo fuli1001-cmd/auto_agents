@@ -24,6 +24,7 @@ from auto_agents.git_ops import changed_paths, commit_all, worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, CommandResult, GateParallelGroup, GateResult, TaskSpec
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.validation import validation_report
 
 
 class RetryingPlanAdapter:
@@ -978,6 +979,78 @@ class RetryFlowTests(unittest.TestCase):
 
             config = load_project_config(project_root)
             self.assertEqual(config.gates.commands, ["conda run -p ./.conda python -m unittest discover -s tests"])
+
+    def test_gate_run_syncs_drifted_config_commands_from_task_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "test_strategy": "shell",
+                    "verification_commands": ["true"],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Keep verification synced",
+                            "description": "Exercise drift recovery.",
+                            "acceptance": ["Gate config is synced before verify."],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            config = load_project_config(project_root)
+            config.gates.commands = ["false"]
+            save_project_config(project_root, config)
+
+            orchestrator = Orchestrator(project_root)
+            gate, mutation_error = orchestrator._run_gate_commands(
+                collect_all=False,
+                context="test gate commands",
+            )
+
+            self.assertFalse(mutation_error)
+            self.assertTrue(gate.ok, msg=gate.summary)
+            self.assertEqual([item.command for item in gate.commands], ["true"])
+            self.assertEqual(load_project_config(project_root).gates.commands, ["true"])
+
+    def test_validation_warns_when_gate_commands_drift_from_task_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "test_strategy": "shell",
+                    "verification_commands": ["true"],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Keep verification synced",
+                            "description": "Exercise drift warning.",
+                            "acceptance": ["Validation surfaces gate drift."],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            config = load_project_config(project_root)
+            config.gates.commands = ["false"]
+            save_project_config(project_root, config)
+
+            report = validation_report(project_root)
+
+            self.assertTrue(report["ok"], msg=str(report))
+            self.assertTrue(
+                any(
+                    "gates.commands differ from task plan verification_commands" in warning
+                    for warning in report["warnings"]
+                ),
+                msg=str(report["warnings"]),
+            )
 
     def test_plan_stage_retries_when_verification_commands_reference_missing_pytest_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -789,6 +789,25 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         plan_commands = plan_payload.get("verification_commands", [])
         if not gate_commands and not plan_commands:
             warnings.append("no verification commands are configured yet; verify stage will be a no-op")
+        if isinstance(gate_commands, list) and isinstance(plan_commands, list) and plan_commands:
+            normalized_gate_commands = [
+                str(item).strip() for item in gate_commands if isinstance(item, str) and str(item).strip()
+            ]
+            normalized_plan_commands = [
+                str(item).strip() for item in plan_commands if isinstance(item, str) and str(item).strip()
+            ]
+            if normalized_plan_commands and normalized_gate_commands != normalized_plan_commands:
+                allow_updates = bool(config_payload.get("gates", {}).get("allow_agent_updates", False))
+                if allow_updates:
+                    warnings.append(
+                        "gates.commands differ from task plan verification_commands; "
+                        "auto_agents will sync gates.commands from the task plan before running gates"
+                    )
+                else:
+                    warnings.append(
+                        "gates.commands differ from task plan verification_commands and "
+                        "gates.allow_agent_updates is false; verify stage will use gates.commands"
+                    )
 
     return {"errors": errors, "warnings": warnings}
 
