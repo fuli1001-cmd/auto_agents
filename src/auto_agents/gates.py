@@ -36,12 +36,18 @@ def _failure_summary(result: CommandResult) -> str:
 
 
 def _run_command(command: str, cwd: Path) -> CommandResult:
+    import os
+    env = dict(os.environ)
+    env["PYTEST_CURRENT_TEST"] = "auto_agents_gate_run"
+    env["AUTO_AGENTS_TEST"] = "True"
+    env["TESTING"] = "True"
     process = subprocess.run(
         command,
         shell=True,
         text=True,
         capture_output=True,
         cwd=str(cwd),
+        env=env,
     )
     return CommandResult(
         command=command,

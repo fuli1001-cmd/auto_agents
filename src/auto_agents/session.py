@@ -1125,6 +1125,11 @@ class Session:
             import subprocess as _sp
             verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
             try:
+                import os
+                env = dict(os.environ)
+                env["PYTEST_CURRENT_TEST"] = "auto_agents_session_verify"
+                env["AUTO_AGENTS_TEST"] = "True"
+                env["TESTING"] = "True"
                 proc = _sp.run(
                     verify_command,
                     shell=True,
@@ -1132,6 +1137,7 @@ class Session:
                     capture_output=True,
                     cwd=str(self.project_root),
                     timeout=120,
+                    env=env,
                 )
             except Exception as exc:
                 return {"ok": False, "reason": f"fix_verify_command error: {exc}"}
