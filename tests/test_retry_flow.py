@@ -1407,6 +1407,123 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("-t", captured_commands[1])
             self.assertIn("ProjectDetailWorkbench > 生成失败展示用户可理解原因和下一步动作", captured_commands[1])
 
+    def test_task_proof_evidence_keeps_unittest_node_ids_and_skips_source_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-001",
+                title="Verify source-backed proof evidence",
+                description="Run executable tests and keep source symbols as supporting evidence.",
+                acceptance=["proof evidence passes"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "verified",
+                        "evidence_refs": [
+                            "tests/test_openai_strict_schema_contract.py::OpenAIStrictSchemaContractTests::test_planning_schema_passes_openai_strict_contract",
+                            "app/stage_backends/text.py::OpenAICompatiblePlanningBackend._planning_schema",
+                            "app/application/openai_strict_schema.py::ensure_openai_strict_json_schema",
+                        ],
+                    }
+                ],
+            )
+
+            captured_commands = []
+
+            def fake_run(commands, cwd):
+                captured_commands.extend(commands)
+                return GateResult(
+                    ok=True,
+                    commands=[
+                        CommandResult(
+                            command=command,
+                            ok=True,
+                            returncode=0,
+                            stdout="",
+                            stderr="",
+                        )
+                        for command in commands
+                    ],
+                    summary="all commands passed",
+                )
+
+            with patch("auto_agents.orchestrator.run_commands_collect_all", side_effect=fake_run):
+                result = orchestrator._run_task_proof_evidence(task)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(len(captured_commands), 1)
+            self.assertIn(
+                "tests/test_openai_strict_schema_contract.py::OpenAIStrictSchemaContractTests::"
+                "test_planning_schema_passes_openai_strict_contract",
+                captured_commands[0],
+            )
+            self.assertNotIn("app/stage_backends/text.py", captured_commands[0])
+            self.assertEqual(
+                result["supporting_refs"],
+                [
+                    "app/stage_backends/text.py::OpenAICompatiblePlanningBackend._planning_schema",
+                    "app/application/openai_strict_schema.py::ensure_openai_strict_json_schema",
+                ],
+            )
+            self.assertEqual(result["failed_refs"], [])
+
+    def test_task_proof_evidence_cache_key_changes_when_refs_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-001",
+                title="Verify cache invalidation",
+                description="Do not reuse proof evidence after refs are updated.",
+                acceptance=["proof evidence passes"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "verified",
+                        "evidence_refs": ["tests/test_public_api.py::test_first"],
+                    }
+                ],
+            )
+
+            captured_commands = []
+
+            def fake_run(commands, cwd):
+                captured_commands.extend(commands)
+                return GateResult(
+                    ok=True,
+                    commands=[
+                        CommandResult(
+                            command=command,
+                            ok=True,
+                            returncode=0,
+                            stdout="",
+                            stderr="",
+                        )
+                        for command in commands
+                    ],
+                    summary="all commands passed",
+                )
+
+            with patch("auto_agents.orchestrator.run_commands_collect_all", side_effect=fake_run):
+                first = orchestrator._run_task_proof_evidence(task)
+                task.requirement_proofs[0]["evidence_refs"] = ["tests/test_public_api.py::test_second"]
+                second = orchestrator._run_task_proof_evidence(task)
+
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertEqual(len(captured_commands), 2)
+            self.assertIn("tests/test_public_api.py::test_first", captured_commands[0])
+            self.assertIn("tests/test_public_api.py::test_second", captured_commands[1])
+
     def test_persisted_tasks_keep_generated_verification_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

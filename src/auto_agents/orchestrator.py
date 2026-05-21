@@ -2344,10 +2344,23 @@ class Orchestrator:
         normalized = str(ref).strip()
         if not normalized:
             return False
+        path, _ = Orchestrator._split_evidence_ref(normalized)
+        normalized_path = path.replace("\\", "/").strip()
+        file_name = normalized_path.rsplit("/", 1)[-1].lower()
         return (
-            " " not in normalized
-            and (normalized.endswith(".py") or ".py::" in normalized)
+            " " not in normalized_path
+            and normalized_path.endswith(".py")
+            and (
+                file_name.startswith("test_")
+                or file_name.endswith("_test.py")
+                or "/tests/" in f"/{normalized_path}"
+            )
         )
+
+    @staticmethod
+    def _looks_like_python_evidence_ref(ref: str) -> bool:
+        path, _ = Orchestrator._split_evidence_ref(ref)
+        return path.replace("\\", "/").strip().endswith(".py")
 
     @staticmethod
     def _split_evidence_ref(ref: str) -> Tuple[str, str]:
@@ -2375,7 +2388,13 @@ class Orchestrator:
         )
 
     def _proof_evidence_cache_key(self, task: TaskSpec) -> Tuple[str, str]:
-        return (task.task_id, worktree_fingerprint(self.project_root))
+        refs_payload = json.dumps(
+            self._task_requirement_evidence_refs(task),
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        digest = hashlib.sha256(refs_payload.encode("utf-8")).hexdigest()
+        return (task.task_id, f"{worktree_fingerprint(self.project_root)}:{digest}")
 
     def _proof_verification_command_templates(self) -> List[str]:
         commands: List[str] = []
@@ -2453,6 +2472,9 @@ class Orchestrator:
             if rewritten:
                 return rewritten
         quoted_refs = " ".join(shlex.quote(ref) for ref in evidence_refs)
+        conda_python = self.project_root / ".conda" / "bin" / "python"
+        if conda_python.exists():
+            return f"./.conda/bin/python -m pytest -q {quoted_refs}"
         conda_meta = self.project_root / ".conda" / "conda-meta"
         if conda_meta.exists():
             return f"conda run -p ./.conda python -m pytest -q {quoted_refs}"
@@ -2564,29 +2586,35 @@ class Orchestrator:
 
         command_pairs: List[Tuple[str, str]] = []
         unsupported_refs: List[str] = []
+        supporting_refs: List[str] = []
         for ref in evidence_refs:
             command = self._build_task_proof_evidence_command_for_ref(ref)
             if not command:
-                unsupported_refs.append(ref)
+                if self._looks_like_python_evidence_ref(ref):
+                    supporting_refs.append(ref)
+                else:
+                    unsupported_refs.append(ref)
                 continue
             command_pairs.append((ref, command))
-        if unsupported_refs:
+        if unsupported_refs or not command_pairs:
+            failed_refs = list(unsupported_refs or evidence_refs)
             result = {
                 "ok": False,
                 "reason": (
                     "owned proof evidence_refs are not executable verification targets: "
-                    + ", ".join(unsupported_refs)
+                    + ", ".join(failed_refs)
                 ),
                 "summary": (
-                    f"Unsupported owned proof evidence refs ({len(unsupported_refs)}): "
-                    + ", ".join(unsupported_refs)
+                    f"Unsupported owned proof evidence refs ({len(failed_refs)}): "
+                    + ", ".join(failed_refs)
                 ),
                 "evidence_refs": evidence_refs,
                 "passed_refs": [],
-                "failed_refs": list(unsupported_refs),
-                "failure_ids": list(unsupported_refs),
+                "failed_refs": failed_refs,
+                "failure_ids": failed_refs,
                 "command": "",
                 "raw_output": "",
+                "supporting_refs": supporting_refs,
             }
             self._task_proof_evidence_cache[cache_key] = dict(result)
             return result
@@ -2615,6 +2643,7 @@ class Orchestrator:
                 "failure_ids": [],
                 "command": command,
                 "raw_output": raw_output,
+                "supporting_refs": supporting_refs,
             }
         else:
             failed_label = ", ".join(failed_refs[:6]) if failed_refs else gate_result.summary
@@ -2635,6 +2664,7 @@ class Orchestrator:
                 "failure_ids": failed_refs or list(evidence_refs),
                 "command": command,
                 "raw_output": raw_output or gate_result.summary,
+                "supporting_refs": supporting_refs,
             }
         self._task_proof_evidence_cache[cache_key] = dict(result)
         return result
