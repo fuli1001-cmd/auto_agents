@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gates import (
+    build_failure_identity_diagnostic_command,
     command_from_verification_step,
     extract_failure_ids,
     extract_failure_info,
@@ -161,6 +162,47 @@ class GateTests(unittest.TestCase):
         self.assertTrue(info.comparable)
         self.assertEqual(info.failure_ids, ["tests/test_demo.py::test_example"])
 
+    def test_verbose_pytest_failure_line_is_comparable(self) -> None:
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="python -m pytest -x -vv tests",
+                    ok=False,
+                    returncode=1,
+                    stdout="tests/test_demo.py::test_example FAILED                         [100%]\n",
+                    stderr="",
+                )
+            ],
+        )
+
+        info = extract_failure_info(gate)
+
+        self.assertTrue(info.comparable)
+        self.assertEqual(info.failure_ids, ["tests/test_demo.py::test_example"])
+
+    def test_verbose_pytest_passed_line_is_ignored(self) -> None:
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="python -m pytest -x -vv tests",
+                    ok=False,
+                    returncode=1,
+                    stdout=(
+                        "tests/test_demo.py::test_ok PASSED\n"
+                        "tests/test_demo.py::test_example FAILED                         [100%]\n"
+                    ),
+                    stderr="",
+                )
+            ],
+        )
+
+        info = extract_failure_info(gate)
+
+        self.assertTrue(info.comparable)
+        self.assertEqual(info.failure_ids, ["tests/test_demo.py::test_example"])
+
     def test_mixed_test_case_and_unparsed_failures_are_non_comparable_but_keep_known_ids(self) -> None:
         gate = GateResult(
             ok=False,
@@ -212,6 +254,16 @@ class GateTests(unittest.TestCase):
         ).to_dict()
 
         self.assertNotIn("command", payload)
+
+    def test_identity_diagnostic_command_upgrades_pytest_verbosity(self) -> None:
+        command = build_failure_identity_diagnostic_command(
+            "conda run -p ./.conda python -m pytest -q tests"
+        )
+
+        self.assertEqual(
+            command,
+            "conda run -p ./.conda python -m pytest -x -vv -rA --tb=short -o console_output_style=classic tests",
+        )
 
     def test_run_gate_plan_runs_parallel_group_and_preserves_config_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

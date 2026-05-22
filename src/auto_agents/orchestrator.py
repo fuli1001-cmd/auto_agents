@@ -38,6 +38,7 @@ from .config import (
     write_run_prompt,
 )
 from .gates import (
+    build_failure_identity_diagnostic_command,
     commands_from_verification_steps,
     extract_failure_ids,
     extract_failure_info,
@@ -150,6 +151,18 @@ class Orchestrator:
             return str(path.relative_to(self.project_root))
         except ValueError:
             return str(path)
+
+    def _run_verify_failure_identity_diagnostic(self, verify_gate: GateResult) -> Optional[GateResult]:
+        commands: List[str] = []
+        for result in verify_gate.commands:
+            if result.ok:
+                continue
+            diagnostic_command = build_failure_identity_diagnostic_command(result.command)
+            if diagnostic_command and diagnostic_command not in commands:
+                commands.append(diagnostic_command)
+        if not commands:
+            return None
+        return run_commands_collect_all(commands, self.project_root)
 
     @staticmethod
     def init_project(
@@ -2222,6 +2235,21 @@ class Orchestrator:
                 "comparable_failures": False,
             }
         extraction = extract_failure_info(verify_gate)
+        diagnostic_identity_only = False
+        raw_output = self._gate_raw_output(verify_gate)
+        if not verify_gate.ok and not extraction.comparable:
+            diagnostic_gate = self._run_verify_failure_identity_diagnostic(verify_gate)
+            if diagnostic_gate is not None:
+                diagnostic_extraction = extract_failure_info(diagnostic_gate)
+                diagnostic_raw_output = self._gate_raw_output(diagnostic_gate)
+                if diagnostic_raw_output.strip():
+                    raw_output = (
+                        f"{raw_output.rstrip()}\n\n=== Failure Identity Diagnostic ===\n"
+                        f"{diagnostic_raw_output.strip()}\n"
+                    ).strip()
+                if diagnostic_extraction.comparable and diagnostic_extraction.failure_ids:
+                    extraction = diagnostic_extraction
+                    diagnostic_identity_only = True
         current_failure_ids = (
             self._normalize_verify_failure_ids(extraction.failure_ids, verify_gate.summary)
             if extraction.failure_ids
@@ -2240,18 +2268,30 @@ class Orchestrator:
         if task is not None and task.expected_test_migrations:
             allowed_migrations = {str(item) for item in task.expected_test_migrations}
             new_failure_ids = [fid for fid in new_failure_ids if fid not in allowed_migrations]
-        raw_output = self._gate_raw_output(verify_gate)
         raw_log_path = ""
         if not verify_gate.ok:
             raw_log_path = self._persist_failed_verification_log(raw_output, label="task-verify")
         baseline_only_reason = ""
-        if task is not None and extraction.comparable and current_failure_ids and not new_failure_ids:
+        if (
+            task is not None
+            and extraction.comparable
+            and not diagnostic_identity_only
+            and current_failure_ids
+            and not new_failure_ids
+        ):
             baseline_only_reason = (
                 f"task baseline only: {len(current_failure_ids)} pre-existing failure(s) remain"
             )
         if not verify_gate.ok and not baseline_only_reason:
             effective_failure_ids = new_failure_ids or current_failure_ids
-            if not extraction.comparable:
+            if diagnostic_identity_only:
+                reason = (
+                    "verification failed before a stable full failure summary was emitted; "
+                    f"identity diagnostic captured: {', '.join(current_failure_ids[:10])}"
+                )
+                if raw_log_path:
+                    reason = f"{reason}; raw log: {raw_log_path}"
+            elif not extraction.comparable:
                 reason = (
                     "non-comparable verification failure: failed command did not yield stable "
                     "test-case failure ids"

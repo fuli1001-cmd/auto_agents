@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import re
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Iterable, List, Sequence
@@ -34,6 +35,17 @@ def _pytest_failure_ids(output: str) -> List[str]:
         if ".py" not in candidate and "::" not in candidate:
             continue
         ids.append(candidate)
+    for line in output.splitlines():
+        candidate = line.strip()
+        if not candidate or candidate.startswith("FAILED "):
+            continue
+        if not re.search(r"\s+(?:FAILED|ERROR)(?:\s+\[\s*\d+%\])?$", candidate):
+            continue
+        candidate = re.sub(r"\s+(?:FAILED|ERROR)(?:\s+\[\s*\d+%\])?$", "", candidate).strip()
+        if ".py" not in candidate or "::" not in candidate:
+            continue
+        if candidate not in ids:
+            ids.append(candidate)
     return ids
 
 
@@ -63,6 +75,45 @@ def command_from_verification_step(step: VerificationStep) -> str:
 
 def commands_from_verification_steps(steps: Sequence[VerificationStep]) -> List[str]:
     return [command_from_verification_step(step) for step in steps]
+
+
+def build_failure_identity_diagnostic_command(command: str) -> str:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return ""
+    if not parts:
+        return ""
+
+    pytest_index = -1
+    if "pytest" in parts:
+        pytest_index = parts.index("pytest")
+    else:
+        for index in range(len(parts) - 2):
+            if parts[index + 1] == "-m" and parts[index + 2] == "pytest":
+                pytest_index = index + 2
+                break
+    if pytest_index >= 0:
+        filtered = [part for part in parts if part not in {"-q", "--quiet", "-qq"}]
+        for flag in ("-x", "-vv", "-rA", "--tb=short", "console_output_style=classic"):
+            if flag in filtered:
+                filtered = [part for part in filtered if part != flag]
+        if "-o" in filtered:
+            for index in range(len(filtered) - 1):
+                if filtered[index] == "-o" and filtered[index + 1] == "console_output_style=classic":
+                    del filtered[index:index + 2]
+                    break
+        insert_at = filtered.index("pytest") + 1 if "pytest" in filtered else pytest_index + 1
+        filtered[insert_at:insert_at] = ["-x", "-vv", "-rA", "--tb=short", "-o", "console_output_style=classic"]
+        return shlex.join(filtered)
+
+    if "vitest" in parts:
+        filtered = [part for part in parts if part not in {"--reporter=verbose"}]
+        insert_at = filtered.index("vitest") + 1
+        filtered[insert_at:insert_at] = ["--reporter=verbose"]
+        return shlex.join(filtered)
+
+    return ""
 
 
 def _run_command(command: str, cwd: Path) -> CommandResult:

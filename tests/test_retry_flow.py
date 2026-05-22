@@ -1356,6 +1356,77 @@ class RetryFlowTests(unittest.TestCase):
                 ["tests/test_public_api.py::test_contract"],
             )
 
+    def test_task_verify_runs_identity_diagnostic_for_killed_pytest_suite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            verify_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command="conda run -p ./.conda python -m pytest -q tests",
+                        ok=False,
+                        returncode=137,
+                        stdout="...................F...\n",
+                        stderr="Killed\n",
+                    )
+                ],
+                summary="command failed: killed pytest suite",
+            )
+
+            orchestrator._run_gate_commands = lambda **_kwargs: (verify_gate, None)
+            task = TaskSpec(
+                task_id="task-001",
+                title="diagnose verify identity",
+                description="",
+                acceptance=[],
+            )
+
+            diagnostic_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=(
+                            "conda run -p ./.conda python -m pytest -x -vv -rA --tb=short "
+                            "-o console_output_style=classic tests"
+                        ),
+                        ok=False,
+                        returncode=1,
+                        stdout="tests/test_demo.py::test_example FAILED                         [100%]\n",
+                        stderr="",
+                    )
+                ],
+                summary="command failed: diagnostic found identity",
+            )
+
+            import auto_agents.orchestrator as orch_mod
+            original_collect = orch_mod.run_commands_collect_all
+            try:
+                captured = {}
+
+                def _fake_collect(commands, cwd):
+                    captured["commands"] = list(commands)
+                    captured["cwd"] = cwd
+                    return diagnostic_gate
+
+                orch_mod.run_commands_collect_all = _fake_collect
+                result = orchestrator._run_task_verify(task)
+            finally:
+                orch_mod.run_commands_collect_all = original_collect
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["comparable_failures"])
+            self.assertEqual(result["failure_ids"], ["tests/test_demo.py::test_example"])
+            self.assertIn("identity diagnostic captured", str(result["reason"]))
+            self.assertEqual(
+                captured["commands"],
+                [
+                    "conda run -p ./.conda python -m pytest -x -vv -rA --tb=short -o console_output_style=classic tests"
+                ],
+            )
+
     def test_task_proof_evidence_supports_mixed_pytest_and_vitest_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
