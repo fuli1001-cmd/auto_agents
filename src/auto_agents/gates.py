@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 import re
 import subprocess
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
-from .models import CommandResult, GateParallelGroup, GateResult
+from .models import CommandResult, GateParallelGroup, GateResult, VerificationStep
 
 
 _PYTEST_FAILED = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
@@ -15,6 +16,13 @@ _VITEST_FAILED = re.compile(
     re.MULTILINE,
 )
 _UNITTEST_FAILED = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
+
+
+@dataclass
+class FailureExtraction:
+    failure_ids: List[str]
+    comparable: bool
+    non_comparable_ids: List[str]
 
 
 def _pytest_failure_ids(output: str) -> List[str]:
@@ -33,6 +41,28 @@ def _failure_summary(result: CommandResult) -> str:
     details = result.stderr or result.stdout or f"exit code {result.returncode}"
     details = " ".join(details.split())
     return f"command failed: {result.command} ({details})"
+
+
+def command_from_verification_step(step: VerificationStep) -> str:
+    runner = step.runner.strip().lower()
+    kind = step.kind.strip().lower() or "test"
+    targets = [item.strip() for item in step.targets if item.strip()]
+    args = [item.strip() for item in step.args if item.strip()]
+    if kind == "test" and runner == "pytest":
+        parts = ["conda", "run", "-p", "./.conda", "python", "-m", "pytest", "-q"]
+        parts.extend(args)
+        parts.extend(targets or ["tests"])
+        return " ".join(parts)
+    if kind == "test" and runner == "vitest":
+        parts = ["npm", "exec", "--", "vitest", "run"]
+        parts.extend(args)
+        parts.extend(targets)
+        return " ".join(parts)
+    raise ValueError(f"unsupported verification step runner: {step.runner or '<empty>'}")
+
+
+def commands_from_verification_steps(steps: Sequence[VerificationStep]) -> List[str]:
+    return [command_from_verification_step(step) for step in steps]
 
 
 def _run_command(command: str, cwd: Path) -> CommandResult:
@@ -145,14 +175,16 @@ def run_gate_plan(
     return GateResult(ok=ok, commands=results, summary=summary)
 
 
-def extract_failure_ids(gate_result: GateResult) -> List[str]:
+def extract_failure_info(gate_result: GateResult) -> FailureExtraction:
     """Extract a list of unique failure identifiers from gate results.
 
     For pytest commands the function tries to pull individual ``FAILED``
-    test node IDs from the output.  For other commands it falls back to
-    the command string itself as the failure identifier.
+    test node IDs from the output.  If a command fails without test-level
+    failures, the result is intentionally marked non-comparable so retry
+    logic cannot treat a command-level failure as the same test failure.
     """
     failures: List[str] = []
+    non_comparable: List[str] = []
     for cmd_result in gate_result.commands:
         if cmd_result.ok:
             continue
@@ -169,5 +201,14 @@ def extract_failure_ids(gate_result: GateResult) -> List[str]:
         if unittest_ids:
             failures.extend(unittest_ids)
             continue
-        failures.append(f"cmd:{cmd_result.command}")
-    return failures
+        non_comparable.append(f"cmd:{cmd_result.command}")
+    comparable = bool(failures) and not non_comparable
+    return FailureExtraction(
+        failure_ids=failures if comparable else failures + non_comparable,
+        comparable=comparable,
+        non_comparable_ids=non_comparable,
+    )
+
+
+def extract_failure_ids(gate_result: GateResult) -> List[str]:
+    return extract_failure_info(gate_result).failure_ids

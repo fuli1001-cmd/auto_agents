@@ -28,7 +28,7 @@ from auto_agents.config import (
 )
 from auto_agents.git_ops import commit_all, working_tree_clean
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentResult, RunState, SessionState, DEFAULT_SESSION_MAX_ATTEMPTS
+from auto_agents.models import AgentResult, RunState, SessionState, DEFAULT_SESSION_MAX_ATTEMPTS, VerificationStep
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.session import Session
 
@@ -2272,6 +2272,21 @@ class BaselineDiffVerifyTests(unittest.TestCase):
 
             self.assertIn("every Python-oriented FIX_VERIFY command must run inside it", prompt)
             self.assertIn("conda run -p ./.conda python -m unittest discover -s tests", prompt)
+
+    def test_fix_converse_prompt_derives_gate_commands_from_structured_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.commands = []
+            orchestrator.config.gates.steps = [
+                VerificationStep(kind="test", runner="pytest", targets=["tests"])
+            ]
+            session = Session(orchestrator, mode="fix")
+            state = SessionState(session_id="prompt1", mode="fix", goal="Planning output uses wrong language")
+
+            prompt = session._build_converse_prompt(state)
+
+            self.assertIn("conda run -p ./.conda python -m pytest -q tests", prompt)
 
     def test_baseline_snapshot_on_resume_stale(self) -> None:
         """If git HEAD changes between sessions, baseline should be re-captured."""

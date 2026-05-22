@@ -5,8 +5,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.gates import extract_failure_ids, run_commands, run_gate_plan
-from auto_agents.models import CommandResult, GateParallelGroup, GateResult
+from auto_agents.gates import (
+    command_from_verification_step,
+    extract_failure_ids,
+    extract_failure_info,
+    run_commands,
+    run_gate_plan,
+)
+from auto_agents.models import CommandResult, GateParallelGroup, GateResult, VerificationStep
 
 
 class GateTests(unittest.TestCase):
@@ -116,6 +122,96 @@ class GateTests(unittest.TestCase):
         ids = extract_failure_ids(gate)
 
         self.assertEqual(ids, ["cmd:python -m unittest discover -s tests"])
+
+    def test_unparsed_command_failure_is_non_comparable(self) -> None:
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="python -m unittest discover -s tests",
+                    ok=False,
+                    returncode=1,
+                    stdout="FAILED (failures=5, errors=2)\n",
+                    stderr="",
+                )
+            ],
+        )
+
+        info = extract_failure_info(gate)
+
+        self.assertFalse(info.comparable)
+        self.assertEqual(info.failure_ids, ["cmd:python -m unittest discover -s tests"])
+
+    def test_test_case_failure_is_comparable(self) -> None:
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="python -m pytest -q tests",
+                    ok=False,
+                    returncode=1,
+                    stdout="FAILED tests/test_demo.py::test_example - AssertionError\n",
+                    stderr="",
+                )
+            ],
+        )
+
+        info = extract_failure_info(gate)
+
+        self.assertTrue(info.comparable)
+        self.assertEqual(info.failure_ids, ["tests/test_demo.py::test_example"])
+
+    def test_mixed_test_case_and_unparsed_failures_are_non_comparable_but_keep_known_ids(self) -> None:
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="python -m pytest -q tests",
+                    ok=False,
+                    returncode=1,
+                    stdout="FAILED tests/test_demo.py::test_example - AssertionError\n",
+                    stderr="",
+                ),
+                CommandResult(command="npm run lint", ok=False, returncode=1, stdout="boom", stderr=""),
+            ],
+        )
+
+        info = extract_failure_info(gate)
+
+        self.assertFalse(info.comparable)
+        self.assertEqual(
+            info.failure_ids,
+            ["tests/test_demo.py::test_example", "cmd:npm run lint"],
+        )
+
+    def test_verification_step_derives_pytest_command(self) -> None:
+        command = command_from_verification_step(
+            VerificationStep(kind="test", runner="pytest", targets=["tests/test_demo.py"], args=["-x"])
+        )
+
+        self.assertEqual(command, "conda run -p ./.conda python -m pytest -q -x tests/test_demo.py")
+
+    def test_verification_step_ignores_freeform_command_field(self) -> None:
+        command = command_from_verification_step(
+            VerificationStep(
+                kind="test",
+                runner="pytest",
+                targets=["tests"],
+                command="echo should-not-run",
+            )
+        )
+
+        self.assertEqual(command, "conda run -p ./.conda python -m pytest -q tests")
+
+    def test_verification_step_serializes_without_freeform_command(self) -> None:
+        payload = VerificationStep(
+            kind="test",
+            runner="pytest",
+            targets=["tests"],
+            command="echo should-not-persist",
+        ).to_dict()
+
+        self.assertNotIn("command", payload)
 
     def test_run_gate_plan_runs_parallel_group_and_preserves_config_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

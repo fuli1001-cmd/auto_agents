@@ -27,6 +27,7 @@ REQUIRED_DOC_HEADINGS = {
 }
 PYTHON_STRATEGY_HINTS = ("python", "pytest", "unittest")
 PYTHON_COMMAND_HINTS = ("python", "pytest", "unittest", "coverage", ".py")
+SUPPORTED_VERIFICATION_TEST_RUNNERS = {"pytest", "vitest"}
 GLOBAL_INSTALL_PATTERNS = (
     (re.compile(r"(^|[\s;&|])pip(?:3)?\s+install\b"), "use the project-local conda env instead of global pip installs"),
     (
@@ -107,6 +108,10 @@ def _validate_isolated_commands(commands: object, field_name: str, python_requir
             errors.append(
                 f"{field_name}[{index}] must run Python verification inside a project-local conda env such as 'conda run -p ./.conda ...'"
             )
+        if re.search(r"\bpython(?:3)?\s+-m\s+unittest\b|\bunittest\s+discover\b", lowered):
+            errors.append(
+                f"{field_name}[{index}] uses unittest; Python verification must use pytest"
+            )
 
     return errors
 
@@ -141,6 +146,44 @@ def _validate_parallel_gate_groups(parallel_groups: object) -> List[str]:
                 python_required=python_required,
             )
         )
+    return errors
+
+
+def validate_verification_steps(steps: object, field_name: str = "verification_steps") -> List[str]:
+    errors: List[str] = []
+    if steps is None:
+        return errors
+    if not isinstance(steps, list):
+        return [f"{field_name} must be a list of objects"]
+    if not steps:
+        return errors
+    for index, raw_step in enumerate(steps, start=1):
+        prefix = f"{field_name}[{index}]"
+        if not isinstance(raw_step, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+        kind = str(raw_step.get("kind", "test")).strip().lower()
+        runner = str(raw_step.get("runner", "")).strip().lower()
+        if kind != "test":
+            errors.append(f"{prefix}.kind must be 'test'")
+        if runner not in SUPPORTED_VERIFICATION_TEST_RUNNERS:
+            allowed = ", ".join(sorted(SUPPORTED_VERIFICATION_TEST_RUNNERS))
+            errors.append(f"{prefix}.runner must be one of: {allowed}")
+        targets = raw_step.get("targets", [])
+        if targets is not None and (
+            not isinstance(targets, list)
+            or any(not isinstance(item, str) or not item.strip() for item in targets)
+        ):
+            errors.append(f"{prefix}.targets must be a list of non-empty strings when provided")
+        args = raw_step.get("args", [])
+        if args is not None and (
+            not isinstance(args, list)
+            or any(not isinstance(item, str) or not item.strip() for item in args)
+        ):
+            errors.append(f"{prefix}.args must be a list of non-empty strings when provided")
+        command = str(raw_step.get("command", "")).strip()
+        if command:
+            errors.append(f"{prefix}.command is not allowed for structured test steps")
     return errors
 
 
@@ -215,6 +258,8 @@ def validate_verification_command_paths(commands: object, project_root: Path, fi
         if not command:
             continue
         for target in _pytest_target_candidates(command):
+            if not target.endswith(".py") and ".py::" not in target:
+                continue
             candidate = Path(target)
             resolved = candidate if candidate.is_absolute() else (project_root / candidate).resolve()
             if resolved.exists():
@@ -329,6 +374,12 @@ def validate_task_plan_payload(
         errors.append("task plan test_strategy must be a non-empty string when provided")
 
     verification_commands = payload.get("verification_commands")
+    verification_steps = payload.get("verification_steps")
+    has_verification_steps = "verification_steps" in payload
+    if has_verification_steps and verification_steps == []:
+        verification_steps = None
+    if verification_steps is not None:
+        errors.extend(validate_verification_steps(verification_steps, "task plan verification_steps"))
     has_verification_commands = "verification_commands" in payload
     if has_verification_commands and verification_commands == []:
         verification_commands = None
@@ -341,8 +392,14 @@ def validate_task_plan_payload(
     if require_verification:
         if not isinstance(test_strategy, str) or not test_strategy.strip():
             errors.append("task plan must define a non-empty test_strategy")
-        if not isinstance(verification_commands, list) or not verification_commands:
-            errors.append("task plan must define at least one verification command")
+        if (
+            not isinstance(verification_steps, list)
+            or not verification_steps
+        ) and (
+            not isinstance(verification_commands, list)
+            or not verification_commands
+        ):
+            errors.append("task plan must define at least one verification step")
     python_required = _looks_like_python_workflow(test_strategy, verification_commands)
     errors.extend(
         _validate_isolated_commands(
@@ -621,6 +678,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     python_required=python_required,
                 )
             )
+        errors.extend(validate_verification_steps(gates.get("steps", []), "gates.steps"))
         errors.extend(_validate_parallel_gate_groups(gates.get("parallel_groups", [])))
         clean = gates.get("require_clean_git_before_task")
         if not isinstance(clean, bool):
@@ -735,13 +793,30 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         errors.append(f"missing task plan file: {task_plan_path(root)}")
     elif plan_payload is not None:
         errors.extend(validate_task_plan_payload(plan_payload))
-        errors.extend(
-            validate_verification_command_paths(
-                plan_payload.get("verification_commands", []),
-                root,
-                "task plan verification_commands",
+        verification_steps = plan_payload.get("verification_steps", [])
+        if isinstance(verification_steps, list) and verification_steps:
+            for index, step in enumerate(verification_steps, start=1):
+                if not isinstance(step, dict):
+                    continue
+                if str(step.get("runner", "")).strip().lower() != "pytest":
+                    continue
+                for target in step.get("targets", []) or []:
+                    if not str(target).endswith(".py") and ".py::" not in str(target):
+                        continue
+                    candidate = Path(str(target))
+                    resolved = candidate if candidate.is_absolute() else (root / candidate).resolve()
+                    if not resolved.exists():
+                        errors.append(
+                            f"task plan verification_steps[{index}] references missing pytest target: {target}"
+                        )
+        else:
+            errors.extend(
+                validate_verification_command_paths(
+                    plan_payload.get("verification_commands", []),
+                    root,
+                    "task plan verification_commands",
+                )
             )
-        )
         warnings.extend(task_plan_warnings(plan_payload))
         parallel_tasks = (
             config_payload.get("execution", {}).get("parallel_tasks", {})
@@ -785,11 +860,19 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         warnings.append(f"review file not found yet: {review_file}")
 
     if config_payload is not None and plan_payload is not None:
-        gate_commands = config_payload.get("gates", {}).get("commands", [])
+        gates = config_payload.get("gates", {})
+        gate_commands = gates.get("commands", []) if isinstance(gates, dict) else []
+        gate_steps = gates.get("steps", []) if isinstance(gates, dict) else []
         plan_commands = plan_payload.get("verification_commands", [])
-        if not gate_commands and not plan_commands:
-            warnings.append("no verification commands are configured yet; verify stage will be a no-op")
-        if isinstance(gate_commands, list) and isinstance(plan_commands, list) and plan_commands:
+        plan_steps = plan_payload.get("verification_steps", [])
+        if not gate_commands and not gate_steps and not plan_commands and not plan_steps:
+            warnings.append("no verification steps are configured yet; verify stage will be a no-op")
+        if (
+            not plan_steps
+            and isinstance(gate_commands, list)
+            and isinstance(plan_commands, list)
+            and plan_commands
+        ):
             normalized_gate_commands = [
                 str(item).strip() for item in gate_commands if isinstance(item, str) and str(item).strip()
             ]

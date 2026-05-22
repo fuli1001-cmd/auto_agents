@@ -19,7 +19,14 @@ from .config import (
     session_artifact_paths,
     sort_sessions,
 )
-from .gates import extract_failure_ids, run_gate_plan, run_commands, run_commands_collect_all
+from .gates import (
+    commands_from_verification_steps,
+    extract_failure_ids,
+    extract_failure_info,
+    run_gate_plan,
+    run_commands,
+    run_commands_collect_all,
+)
 from .git_ops import changed_paths, commit_all, head_ref
 from .io_utils import read_text, write_text
 from .models import (
@@ -62,6 +69,11 @@ class Session:
         self._current_state: Optional[SessionState] = None
         # Expose the same user-input helper used by the orchestrator.
         self._prompt_user = orchestrator._prompt_user
+
+    def _gate_commands(self) -> List[str]:
+        if self.config.gates.steps:
+            return commands_from_verification_steps(self.config.gates.steps)
+        return list(self.config.gates.commands)
 
     # ── Public entry points ──────────────────────────────────────
 
@@ -729,11 +741,12 @@ class Session:
                 "- If the project uses a local conda env at ./.conda, every Python-oriented "
                 "FIX_VERIFY command must run inside it via 'conda run -p ./.conda ...'.",
             ])
-            if self.config.gates.commands:
+            gate_commands = self._gate_commands()
+            if gate_commands:
                 lines.append(
                     "- Current repository gate commands (reuse them as guidance for FIX_VERIFY when relevant):"
                 )
-                lines.extend(f"  - {command}" for command in self.config.gates.commands)
+                lines.extend(f"  - {command}" for command in gate_commands)
         lines.extend([
             "- Always explain your understanding before asking questions or declaring ready.",
             self.orch._document_language_instruction(),
@@ -1066,8 +1079,8 @@ class Session:
         if self.mode == "fix":
             return self._run_baseline_diff_verify()
 
-        if not self.config.gates.commands:
-            return {"ok": True, "reason": "no verification commands configured"}
+        if not self._gate_commands():
+            return {"ok": True, "reason": "no verification steps or commands configured"}
         return self.orch._run_task_verify()
 
     # ── Baseline-diff verification (fix mode) ────────────────────
@@ -1079,8 +1092,9 @@ class Session:
         *executing*, and again on resume if the git HEAD has moved.
         """
         self._print("Capturing baseline gate snapshot...")
+        gate_commands = self._gate_commands()
         gate = run_gate_plan(
-            self.config.gates.commands,
+            gate_commands,
             self.config.gates.parallel_groups,
             self.project_root,
             collect_all=True,
@@ -1149,15 +1163,22 @@ class Session:
                 }
 
         # Layer 2: baseline-diff gate check
-        if not self.config.gates.commands:
-            return {"ok": True, "reason": "no verification commands configured"}
+        gate_commands = self._gate_commands()
+        if not gate_commands:
+            return {"ok": True, "reason": "no verification steps or commands configured"}
         gate = run_gate_plan(
-            self.config.gates.commands,
+            gate_commands,
             self.config.gates.parallel_groups,
             self.project_root,
             collect_all=True,
         )
-        current_failures = extract_failure_ids(gate)
+        extraction = extract_failure_info(gate)
+        current_failures = extraction.failure_ids
+        if not extraction.comparable and not gate.ok:
+            return {
+                "ok": False,
+                "reason": "non-comparable verification failure: failed command did not yield stable test-case failure ids",
+            }
         new_failures = sorted(set(current_failures) - set(state.baseline_failures))
         if new_failures:
             return {

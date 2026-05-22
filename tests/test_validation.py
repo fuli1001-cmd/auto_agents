@@ -53,7 +53,7 @@ class TaskPlanValidationTests(unittest.TestCase):
         }
         errors = validate_task_plan_payload(payload, require_verification=True)
         self.assertTrue(any("test_strategy" in item for item in errors))
-        self.assertTrue(any("verification command" in item for item in errors))
+        self.assertTrue(any("verification step" in item for item in errors))
 
     def test_rejects_duplicate_ids_and_empty_acceptance(self) -> None:
         payload = {
@@ -101,10 +101,10 @@ class TaskPlanValidationTests(unittest.TestCase):
         errors = validate_task_plan_payload(payload, require_verification=True)
         self.assertTrue(any("project-local conda env" in item for item in errors))
 
-    def test_accepts_python_verification_inside_project_local_conda(self) -> None:
+    def test_accepts_python_pytest_verification_step(self) -> None:
         payload = {
-            "test_strategy": "python-unittest",
-            "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+            "test_strategy": "python-pytest",
+            "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
             "tasks": [
                 {
                     "task_id": "task-001",

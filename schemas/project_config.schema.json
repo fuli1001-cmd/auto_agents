@@ -168,6 +168,38 @@
             "type": "string"
           }
         },
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "runner"],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": ["test"]
+              },
+              "runner": {
+                "type": "string",
+                "enum": ["pytest", "vitest"]
+              },
+              "targets": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
         "parallel_groups": {
           "type": "array",
           "items": {

@@ -224,7 +224,7 @@ class ProjectValidationTests(unittest.TestCase):
                 "readme": "balanced",
             },
             "gates": {
-                "commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                "commands": ["conda run -p ./.conda python -m pytest -q tests"],
                 "require_clean_git_before_task": True,
                 "allow_agent_updates": True,
             },
@@ -287,12 +287,12 @@ class ProjectValidationTests(unittest.TestCase):
                 "readme": "balanced",
             },
             "gates": {
-                "commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                "commands": ["conda run -p ./.conda python -m pytest -q tests"],
                 "parallel_groups": [
                     {
                         "name": "quality",
                         "commands": [
-                            "conda run -p ./.conda python -m unittest discover -s tests",
+                            "conda run -p ./.conda python -m pytest -q tests",
                             "conda run -p ./.conda python -m pytest -q tests/test_ok.py",
                         ],
                     }
@@ -448,7 +448,7 @@ class ProjectValidationTests(unittest.TestCase):
                 "readme": "balanced",
             },
             "gates": {
-                "commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                "commands": ["conda run -p ./.conda python -m pytest -q tests"],
                 "require_clean_git_before_task": True,
                 "allow_agent_updates": True,
             },
@@ -497,7 +497,7 @@ class ProjectValidationTests(unittest.TestCase):
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
             report = validation_report(project_root)
-            self.assertTrue(any("no verification commands" in item for item in report["warnings"]))
+            self.assertTrue(any("no verification steps" in item for item in report["warnings"]))
 
     def test_validation_report_rejects_missing_pytest_targets_in_verification_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1106,12 +1106,12 @@ class ProjectValidationTests(unittest.TestCase):
 
             class ClarifyOnlyAdapter:
                 def run(self, request):
-                    write_text(request.output_path, "clarified scope\n")
+                    write_text(request.output_path, "clarified scope\nREADY_TO_GENERATE\n")
                     return AgentResult(
                         ok=True,
                         command=["fake"],
                         output_path=request.output_path,
-                        summary="clarified scope",
+                        summary="clarified scope\nREADY_TO_GENERATE",
                         returncode=0,
                     )
 
@@ -1136,8 +1136,8 @@ class ProjectValidationTests(unittest.TestCase):
                     write_json(
                         task_plan_path(project_root),
                         {
-                            "test_strategy": "unittest",
-                            "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                            "test_strategy": "python-pytest",
+                            "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
                             "tasks": [
                                 {
                                     "task_id": "task-001",
@@ -1197,8 +1197,8 @@ class ProjectValidationTests(unittest.TestCase):
             write_json(
                 task_plan_path(project_root),
                 {
-                    "test_strategy": "unittest",
-                    "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
                     "tasks": [
                         {
                             "task_id": "task-001",
@@ -1275,16 +1275,17 @@ class ProjectValidationTests(unittest.TestCase):
                 output_path=output_path,
             )
 
-            with patch("auto_agents.adapters.codex.subprocess.run") as run_mock:
-                run_mock.return_value = subprocess.CompletedProcess(
-                    args=["codex"],
-                    returncode=0,
-                    stdout=(
+            with patch("auto_agents.adapters.codex.run_subprocess_with_optional_streaming") as run_mock:
+                run_mock.return_value = (
+                    (
                         '{"type":"thread.started","thread_id":"t"}\n'
                         '{"type":"item.completed","item":{"type":"agent_message","text":"final summary"}}\n'
                         '{"type":"turn.completed","usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":25}}\n'
                     ),
-                    stderr="",
+                    "",
+                    0,
+                    False,
+                    False,
                 )
                 result = adapter.run(request)
 
@@ -1627,8 +1628,8 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("Choose the number of tasks based on project complexity", prompt)
             self.assertIn("do not split into trivial housekeeping-only tasks", prompt)
             self.assertIn("Avoid oversized tasks", prompt)
-            self.assertIn("must run inside that env via 'conda run -p ./.conda ...'", prompt)
-            self.assertIn("Do not include bare 'python', 'python3', 'pytest', 'coverage', or 'pip'", prompt)
+            self.assertIn("verification_steps entries with kind='test', runner='pytest'", prompt)
+            self.assertIn("Do not generate free-form shell verification commands", prompt)
 
     def test_mock_readme_stage_updates_project_readme(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

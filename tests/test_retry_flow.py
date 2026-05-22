@@ -42,8 +42,8 @@ class RetryingPlanAdapter:
                 write_json(
                     task_plan_path(self.project_root),
                     {
-                        "test_strategy": "python-unittest",
-                        "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                        "test_strategy": "python-pytest",
+                        "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
                         "tasks": [
                             {
                                 "task_id": "task-001",
@@ -78,8 +78,8 @@ class VerificationPlanAdapter:
             write_json(
                 task_plan_path(self.project_root),
                 {
-                    "test_strategy": "python-unittest",
-                    "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
                     "tasks": [
                         {
                             "task_id": "task-001",
@@ -105,6 +105,39 @@ class VerificationPlanAdapter:
         )
 
 
+class VerifyFailureClassificationTests(unittest.TestCase):
+    def test_repeated_non_comparable_failures_stop_as_unresolved_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-001",
+                title="demo",
+                description="",
+                acceptance=[],
+                verify_history=[
+                    {
+                        "attempt": 1,
+                        "decision": "fail",
+                        "summary": "non-comparable verification failure",
+                        "failure_ids": ["cmd:conda run -p ./.conda python -m pytest -q tests"],
+                        "comparable_failures": False,
+                    }
+                ],
+            )
+
+            analysis = orchestrator._analyze_verify_failure(
+                task,
+                ["cmd:conda run -p ./.conda python -m pytest -q tests"],
+                comparable=False,
+            )
+
+            self.assertTrue(analysis["stop_retry"])
+            self.assertIn("non-comparable", analysis["stats"])
+            self.assertIn("stop-unresolved-identity", analysis["stats"])
+
+
 class OutOfScopePlanAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
@@ -114,8 +147,8 @@ class OutOfScopePlanAdapter:
             write_json(
                 task_plan_path(self.project_root),
                 {
-                    "test_strategy": "python-unittest",
-                    "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
                     "tasks": [
                         {
                             "task_id": "task-001",
@@ -580,7 +613,7 @@ class SplitPlanAdapter:
             write_json(
                 task_plan_path(self.project_root),
                 {
-                    "test_strategy": "python-unittest",
+                    "test_strategy": "python-pytest",
                     "verification_commands": ["true"],
                     "tasks": [
                         {
@@ -826,7 +859,7 @@ class AuditRecoveryAdapter:
             write_json(
                 task_plan_path(self.project_root),
                 {
-                    "test_strategy": "python-unittest",
+                    "test_strategy": "python-pytest",
                     "verification_commands": ["true"],
                     "tasks": [
                         {
@@ -978,7 +1011,7 @@ class RetryFlowTests(unittest.TestCase):
             orchestrator._run_agent_stage("plan", state, spec_file)
 
             config = load_project_config(project_root)
-            self.assertEqual(config.gates.commands, ["conda run -p ./.conda python -m unittest discover -s tests"])
+            self.assertEqual(config.gates.commands, ["conda run -p ./.conda python -m pytest -q tests"])
 
     def test_gate_run_syncs_drifted_config_commands_from_task_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1532,8 +1565,8 @@ class RetryFlowTests(unittest.TestCase):
             write_json(
                 task_plan_path(project_root),
                 {
-                    "test_strategy": "python-unittest",
-                    "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
                     "tasks": [
                         {
                             "task_id": "task-001",
@@ -1553,8 +1586,8 @@ class RetryFlowTests(unittest.TestCase):
             orchestrator._persist_tasks(tasks)
 
             payload = task_plan_path(project_root).read_text(encoding="utf-8")
-            self.assertIn('"test_strategy": "python-unittest"', payload)
-            self.assertIn('"verification_commands": [', payload)
+            self.assertIn('"test_strategy": "python-pytest"', payload)
+            self.assertIn('"verification_steps": [', payload)
 
     def test_implement_stage_retries_after_review_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2710,7 +2743,7 @@ class RetryFlowTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root)
 
             config = orchestrator.config
-            config.gates.commands = ["conda run -p ./.conda python -m unittest discover -s tests"]
+            config.gates.commands = ["conda run -p ./.conda python -m pytest -q tests"]
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root)
             orchestrator.adapter = MissingCondaFastFailAdapter(project_root)
@@ -3796,8 +3829,8 @@ class IterationAdapter:
                 "test_generated": True,
             }
             write_json(tp, {
-                "test_strategy": "python-unittest",
-                "verification_commands": ["conda run -p ./.conda python -m unittest discover -s tests"],
+                "test_strategy": "python-pytest",
+                "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
                 "tasks": done_tasks + [new_task],
             })
             write_text(request.output_path, "iteration plan\n")

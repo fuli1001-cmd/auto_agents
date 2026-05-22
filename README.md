@@ -45,8 +45,8 @@ The workflow now treats environment isolation as a hard rule rather than a sugge
 
 - Python projects must use a project-local conda environment at `./.conda`
 - Python package installation must run inside that conda environment
-- Python verification commands must run through that environment, for example:
-  `conda run -p ./.conda python -m unittest discover -s tests`
+- Python verification uses structured `verification_steps` with the `pytest` runner; auto_agents
+  derives commands such as `conda run -p ./.conda python -m pytest -q tests`
 - Non-Python projects must also avoid modifying shared system state; prefer repo-local dependency
   directories, project-local toolchains, or other isolated setup that stays inside the project
 
@@ -207,13 +207,16 @@ By default, implementation refuses to start if the target repository already has
 Use `--allow-dirty-tree` only when you explicitly want task work to proceed on top of an existing
 dirty workspace.
 
-During `plan`, the agent must write `test_strategy` and `verification_commands` into
-`.auto-agents/state/task_plan.json`. By default the orchestrator copies those verification commands
-into `.auto-agents/config.json`, so new projects do not need a hand-written `gates.commands` block.
+During `plan`, the agent must write `test_strategy` and structured `verification_steps` into
+`.auto-agents/state/task_plan.json`. By default the orchestrator derives runnable gate commands from
+those steps and stores both the structured steps and derived commands in `.auto-agents/config.json`,
+so new projects do not need a hand-written `gates.commands` block.
 
-For Python projects, those generated verification commands must use the project-local conda env at
-`./.conda`. Every Python-oriented command in `verification_commands` must itself be prefixed with
-`conda run -p ./.conda ...`; bare `python`, `pytest`, or `coverage` commands are rejected.
+Python verification steps must use `runner: "pytest"`. The orchestrator derives the project-local
+conda command automatically, for example `conda run -p ./.conda python -m pytest -q tests`.
+JavaScript and TypeScript verification steps must use `runner: "vitest"`. Legacy
+`verification_commands` are still accepted for compatibility, but new plans should not generate
+free-form shell verification commands.
 
 Inspect persisted progress:
 
@@ -244,7 +247,7 @@ python3 -m auto_agents reject --project /tmp/demo --reason "Add a PostgreSQL dat
 Run tests for this repository:
 
 ```bash
-python3 -m unittest discover -s tests
+python3 -m pytest -q tests
 ```
 
 Validate a target project without spending tokens:
@@ -473,7 +476,7 @@ the implementation loop starts.
 The plan root can also define:
 
 - `test_strategy`
-- `verification_commands`
+- `verification_steps`
 - `oracle_proof_schema_version`
 
 Those fields are required for completed plan output and are preserved when task status is updated

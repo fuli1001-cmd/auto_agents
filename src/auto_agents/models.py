@@ -206,6 +206,33 @@ class ProviderConfig:
 
 
 @dataclass
+class VerificationStep:
+    kind: str = "test"
+    runner: str = ""
+    targets: List[str] = field(default_factory=list)
+    args: List[str] = field(default_factory=list)
+    command: str = ""
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "VerificationStep":
+        return cls(
+            kind=str(data.get("kind", "test")),
+            runner=str(data.get("runner", "")),
+            targets=[str(item) for item in data.get("targets", [])],
+            args=[str(item) for item in data.get("args", [])],
+            command=str(data.get("command", "")),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "kind": self.kind,
+            "runner": self.runner,
+            "targets": list(self.targets),
+            "args": list(self.args),
+        }
+
+
+@dataclass
 class GateParallelGroup:
     name: str = ""
     commands: List[str] = field(default_factory=list)
@@ -224,6 +251,7 @@ class GateParallelGroup:
 @dataclass
 class GateConfig:
     commands: List[str] = field(default_factory=list)
+    steps: List[VerificationStep] = field(default_factory=list)
     parallel_groups: List[GateParallelGroup] = field(default_factory=list)
     require_clean_git_before_task: bool = True
     allow_agent_updates: bool = True
@@ -231,8 +259,14 @@ class GateConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "GateConfig":
         raw_groups = data.get("parallel_groups", [])
+        raw_steps = data.get("steps", [])
         return cls(
             commands=[str(item) for item in data.get("commands", [])],
+            steps=[
+                VerificationStep.from_dict(dict(item))
+                for item in raw_steps
+                if isinstance(item, dict)
+            ],
             parallel_groups=[
                 GateParallelGroup.from_dict(dict(item))
                 for item in raw_groups
@@ -245,6 +279,7 @@ class GateConfig:
     def to_dict(self) -> Dict[str, object]:
         return {
             "commands": list(self.commands),
+            "steps": [step.to_dict() for step in self.steps],
             "parallel_groups": [group.to_dict() for group in self.parallel_groups],
             "require_clean_git_before_task": self.require_clean_git_before_task,
             "allow_agent_updates": self.allow_agent_updates,
@@ -674,6 +709,7 @@ class CommandResult:
     returncode: int
     stdout: str = ""
     stderr: str = ""
+    comparable_failures: bool = False
 
 
 @dataclass
@@ -681,3 +717,4 @@ class GateResult:
     ok: bool
     commands: List[CommandResult]
     summary: str = ""
+    comparable_failures: bool = True

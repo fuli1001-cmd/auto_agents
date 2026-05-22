@@ -15,6 +15,38 @@
         "minLength": 1
       }
     },
+    "verification_steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "runner"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["test"]
+          },
+          "runner": {
+            "type": "string",
+            "enum": ["pytest", "vitest"]
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
     "oracle_proof_schema_version": {
       "type": "integer",
       "minimum": 1,
