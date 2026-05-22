@@ -1628,7 +1628,7 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("Choose the number of tasks based on project complexity", prompt)
             self.assertIn("do not split into trivial housekeeping-only tasks", prompt)
             self.assertIn("Avoid oversized tasks", prompt)
-            self.assertIn("verification_steps entries with kind='test', runner='pytest'", prompt)
+            self.assertIn("verification_steps entries with kind='test' and runner='pytest'", prompt)
             self.assertIn("Do not generate free-form shell verification commands", prompt)
 
     def test_mock_readme_stage_updates_project_readme(self) -> None:

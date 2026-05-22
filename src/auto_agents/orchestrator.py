@@ -42,6 +42,7 @@ from .gates import (
     commands_from_verification_steps,
     extract_failure_ids,
     extract_failure_info,
+    expand_pytest_directory_steps,
     run_gate_plan,
     run_commands,
     run_commands_collect_all,
@@ -4421,7 +4422,7 @@ class Orchestrator:
                 "Keep each task small enough to implement, review, and verify independently, but do not split into trivial housekeeping-only tasks.",
                 "Avoid oversized tasks that bundle multiple loosely related features together.",
                 "Prefer tasks that each deliver one coherent, testable capability or technical slice.",
-                "For Python verification, use verification_steps entries with kind='test', runner='pytest', and targets such as ['tests']; do not use unittest as the planned runner.",
+                "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist; auto_agents may expand directory targets such as ['tests'] into per-file pytest steps before running gates.",
                 "For JavaScript/TypeScript verification, use verification_steps entries with kind='test', runner='vitest'.",
                 "Do not generate free-form shell verification commands for test steps; auto_agents derives the runnable command from verification_steps.",
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
@@ -5920,6 +5921,7 @@ class Orchestrator:
                 if isinstance(item, dict)
             ]
         if steps:
+            steps = expand_pytest_directory_steps(steps, self.project_root)
             if not self.config.gates.allow_agent_updates:
                 return
             try:

@@ -1013,6 +1013,35 @@ class RetryFlowTests(unittest.TestCase):
             config = load_project_config(project_root)
             self.assertEqual(config.gates.commands, ["conda run -p ./.conda python -m pytest -q tests"])
 
+    def test_plan_stage_expands_pytest_directory_steps_to_test_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(exist_ok=True)
+            write_text(tests_dir / "test_alpha.py", "def test_alpha():\n    assert True\n")
+            write_text(tests_dir / "test_beta.py", "def test_beta():\n    assert True\n")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = VerificationPlanAdapter(project_root)
+
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            state = load_run_state(project_root)
+            orchestrator._run_agent_stage("plan", state, spec_file)
+
+            config = load_project_config(project_root)
+            self.assertEqual(
+                config.gates.commands,
+                [
+                    "conda run -p ./.conda python -m pytest -q tests/test_alpha.py",
+                    "conda run -p ./.conda python -m pytest -q tests/test_beta.py",
+                ],
+            )
+            self.assertEqual(
+                [step.targets for step in config.gates.steps],
+                [["tests/test_alpha.py"], ["tests/test_beta.py"]],
+            )
+
     def test_gate_run_syncs_drifted_config_commands_from_task_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

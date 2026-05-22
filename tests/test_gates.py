@@ -10,6 +10,7 @@ from auto_agents.gates import (
     command_from_verification_step,
     extract_failure_ids,
     extract_failure_info,
+    expand_pytest_directory_steps,
     run_commands,
     run_gate_plan,
 )
@@ -232,6 +233,36 @@ class GateTests(unittest.TestCase):
         )
 
         self.assertEqual(command, "conda run -p ./.conda python -m pytest -q -x tests/test_demo.py")
+
+    def test_expand_pytest_directory_steps_splits_existing_test_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests_dir = root / "tests"
+            nested_dir = tests_dir / "nested"
+            nested_dir.mkdir(parents=True)
+            (tests_dir / "test_alpha.py").write_text("def test_alpha():\n    assert True\n", encoding="utf-8")
+            (nested_dir / "beta_test.py").write_text("def test_beta():\n    assert True\n", encoding="utf-8")
+
+            steps = expand_pytest_directory_steps(
+                [VerificationStep(kind="test", runner="pytest", targets=["tests"])],
+                root,
+            )
+
+            self.assertEqual(
+                [step.targets for step in steps],
+                [["tests/nested/beta_test.py"], ["tests/test_alpha.py"]],
+            )
+
+    def test_expand_pytest_directory_steps_keeps_missing_targets_for_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            steps = expand_pytest_directory_steps(
+                [VerificationStep(kind="test", runner="pytest", targets=["tests"])],
+                root,
+            )
+
+            self.assertEqual([step.targets for step in steps], [["tests"]])
 
     def test_verification_step_ignores_freeform_command_field(self) -> None:
         command = command_from_verification_step(

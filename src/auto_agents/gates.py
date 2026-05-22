@@ -73,6 +73,70 @@ def command_from_verification_step(step: VerificationStep) -> str:
     raise ValueError(f"unsupported verification step runner: {step.runner or '<empty>'}")
 
 
+def expand_pytest_directory_steps(
+    steps: Sequence[VerificationStep],
+    project_root: Path,
+) -> List[VerificationStep]:
+    expanded: List[VerificationStep] = []
+    for step in steps:
+        runner = step.runner.strip().lower()
+        kind = step.kind.strip().lower() or "test"
+        if kind != "test" or runner != "pytest":
+            expanded.append(step)
+            continue
+
+        raw_targets = [item.strip() for item in step.targets if item.strip()] or ["tests"]
+        seen_targets: set[str] = set()
+        for target in raw_targets:
+            test_files = _pytest_files_for_target(project_root, target)
+            if not test_files:
+                if target not in seen_targets:
+                    expanded.append(
+                        VerificationStep(
+                            kind=step.kind,
+                            runner=step.runner,
+                            targets=[target],
+                            args=list(step.args),
+                        )
+                    )
+                    seen_targets.add(target)
+                continue
+            for test_file in test_files:
+                if test_file in seen_targets:
+                    continue
+                expanded.append(
+                    VerificationStep(
+                        kind=step.kind,
+                        runner=step.runner,
+                        targets=[test_file],
+                        args=list(step.args),
+                    )
+                )
+                seen_targets.add(test_file)
+    return expanded
+
+
+def _pytest_files_for_target(project_root: Path, target: str) -> List[str]:
+    if "::" in target:
+        return []
+    root = project_root.resolve()
+    candidate = Path(target)
+    resolved = candidate if candidate.is_absolute() else root / candidate
+    if not resolved.is_dir():
+        return []
+    files = {
+        path.resolve()
+        for pattern in ("test_*.py", "*_test.py")
+        for path in resolved.rglob(pattern)
+        if path.is_file()
+    }
+    return [
+        path.relative_to(root).as_posix()
+        for path in sorted(files)
+        if path.is_relative_to(root)
+    ]
+
+
 def commands_from_verification_steps(steps: Sequence[VerificationStep]) -> List[str]:
     return [command_from_verification_step(step) for step in steps]
 
