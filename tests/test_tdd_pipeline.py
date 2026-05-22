@@ -104,6 +104,8 @@ class ImplementPipelineTests(unittest.TestCase):
             prompt = orchestrator._build_task_prompt(task, "implement")
             self.assertIn("MUST also write or update tests", prompt)
             self.assertIn("observable behavior", prompt)
+            self.assertIn("same API fields", prompt)
+            self.assertIn("internal failure reasons/error codes", prompt)
 
     def test_implement_prompt_includes_bound_requirements_and_provider_reference(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -205,6 +207,8 @@ class ImplementPipelineTests(unittest.TestCase):
             prompt = orchestrator._build_task_prompt(task, "review")
             self.assertIn("TEST AUDIT", prompt)
             self.assertIn("observable behavior", prompt)
+            self.assertIn("collapse distinct semantics", prompt)
+            self.assertIn("nearby existing tests", prompt)
 
     def test_review_prompt_includes_task_status_migration_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -4719,6 +4719,8 @@ class Orchestrator:
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
                 "When task status migration context is present, migrate only repository tests that assert stale task status. Do not edit orchestrator-owned .auto-agents state snapshots to force that transition early.",
                 "Tests should validate observable behavior (API contracts, input/output, side-effects), not internal implementation details.",
+                "Before adding or changing tests, inspect nearby repository tests for the same API fields, state-machine outputs, and public payload keys. Preserve existing semantic distinctions unless the task explicitly changes the contract.",
+                "Do not collapse layered semantics in assertions. Distinguish internal failure reasons/error codes from outward-facing state labels, next-action hints, and user-action flags unless the repository already defines them as the same contract.",
                 "Python proof tests must be deterministic under the project's configured verification command. Do not rely on pytest-only or unittest-only ambient state; explicitly configure test adapters, environment variables, and dependency injection needed by the test.",
                 "Python tests must not contact real external services by accident. Use explicit fakes/mocks or test adapters for object storage, providers, databases, and network clients.",
                 "Use per-test unique temp paths for mutable artifacts such as sqlite databases, object-storage roots, caches, and generated fixtures so repeated, resumed, or mixed-runner verification cannot reuse stale state.",
@@ -4748,6 +4750,8 @@ class Orchestrator:
                 "input/output, side-effects) rather than internal implementation details. "
                 "If the tests only pass by mocking/faking internal state instead of exercising real "
                 "public interfaces, that is a 'DECISION: fail' issue.",
+                "Also fail if tests collapse distinct semantics for neighboring public fields. Check whether reason/error-code fields, public state labels, next-action hints, and waiting/manual-action flags are asserted consistently with adjacent repository tests and the implementation contract.",
+                "Also fail if a new or edited test contradicts nearby existing tests for the same public payload fields without an explicit contract change in the task scope.",
                 "For Python projects, fail tests that depend on runner-specific ambient state, shared fixed "
                 "sqlite/temp paths, or real external services instead of explicit test fakes/adapters.",
                 "If plan migration context lists retired task IDs, stale repository tests that still reference those retired IDs or the pre-split task-plan structure are also a 'DECISION: fail' issue.",

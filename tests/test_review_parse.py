@@ -156,6 +156,8 @@ class ReviewParseTests(unittest.TestCase):
             self.assertIn("DECISION: fail' is warranted ONLY", prompt)
             self.assertIn("[NON-BLOCKING]", prompt)
             self.assertIn("cite the specific acceptance criterion", prompt)
+            self.assertIn("reason/error-code fields", prompt)
+            self.assertIn("nearby existing tests", prompt)
 
     def test_review_prompt_includes_scope_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
