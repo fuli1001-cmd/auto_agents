@@ -1389,7 +1389,7 @@ class RetryFlowTests(unittest.TestCase):
                 commands=[
                     CommandResult(
                         command=(
-                            "conda run -p ./.conda python -m pytest -x -vv -rA --tb=short "
+                            "conda run -p ./.conda python -m pytest -vv -rA --tb=short "
                             "-o console_output_style=classic tests"
                         ),
                         ok=False,
@@ -1423,7 +1423,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(
                 captured["commands"],
                 [
-                    "conda run -p ./.conda python -m pytest -x -vv -rA --tb=short -o console_output_style=classic tests"
+                    "conda run -p ./.conda python -m pytest -vv -rA --tb=short -o console_output_style=classic tests"
                 ],
             )
 

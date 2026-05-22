@@ -104,7 +104,7 @@ def build_failure_identity_diagnostic_command(command: str) -> str:
                     del filtered[index:index + 2]
                     break
         insert_at = filtered.index("pytest") + 1 if "pytest" in filtered else pytest_index + 1
-        filtered[insert_at:insert_at] = ["-x", "-vv", "-rA", "--tb=short", "-o", "console_output_style=classic"]
+        filtered[insert_at:insert_at] = ["-vv", "-rA", "--tb=short", "-o", "console_output_style=classic"]
         return shlex.join(filtered)
 
     if "vitest" in parts:

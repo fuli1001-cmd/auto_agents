@@ -262,7 +262,17 @@ class GateTests(unittest.TestCase):
 
         self.assertEqual(
             command,
-            "conda run -p ./.conda python -m pytest -x -vv -rA --tb=short -o console_output_style=classic tests",
+            "conda run -p ./.conda python -m pytest -vv -rA --tb=short -o console_output_style=classic tests",
+        )
+
+    def test_identity_diagnostic_command_removes_pytest_fail_fast(self) -> None:
+        command = build_failure_identity_diagnostic_command(
+            "conda run -p ./.conda python -m pytest -q -x tests"
+        )
+
+        self.assertEqual(
+            command,
+            "conda run -p ./.conda python -m pytest -vv -rA --tb=short -o console_output_style=classic tests",
         )
 
     def test_run_gate_plan_runs_parallel_group_and_preserves_config_order(self) -> None:
