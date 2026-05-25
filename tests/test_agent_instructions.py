@@ -141,6 +141,60 @@ class AgentInstructionSyncTests(unittest.TestCase):
             self.assertNotIn("这些内容只是给人阅读的解释" * 5, agents)
             self.assertLess(len((project_root / ".github" / "copilot-instructions.md").read_text(encoding="utf-8")), 1800)
 
+    def test_sync_combines_result_intro_with_following_enum_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(
+                project_rules_path(project_root),
+                "输入审核结果只能是：\n\n"
+                "- `pass`\n"
+                "- `review`\n"
+                "- `block`\n\n"
+                "默认合同规定：`pass` 后直接进入 `export`。\n",
+            )
+
+            sync_agent_instructions(project_root)
+
+            agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
+            product_rules = (
+                project_root / ".github" / "instructions" / "product-contract.instructions.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("输入审核结果只能是: pass, review, block", agents)
+            self.assertIn("默认合同规定：pass 后直接进入 export", product_rules)
+            self.assertNotIn("输入审核结果只能是：\n\nSee", agents)
+
+    def test_sync_combines_general_intro_lists_and_skips_stage_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(
+                project_rules_path(project_root),
+                "默认仍保留三个人工确认点：\n\n"
+                "- 确认规划\n"
+                "- 确认资产\n"
+                "- 确认分镜\n\n"
+                "也就是说，默认合同是：\n\n"
+                "```text\noutput_review pass -> export\n```\n\n"
+                "这两步都必须以真实模型能力落地。\n"
+                "当前用户真正关心的是“输入能不能生成”和“最终成片能不能交付”\n"
+                "输出审核 output_review\n"
+                "最终导出 export\n",
+            )
+
+            sync_agent_instructions(project_root)
+
+            agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
+            product_rules = (
+                project_root / ".github" / "instructions" / "product-contract.instructions.md"
+            ).read_text(encoding="utf-8")
+            self.assertIn("默认仍保留三个人工确认点: 确认规划, 确认资产, 确认分镜", agents)
+            self.assertIn("输入审核和输出审核都必须以真实模型能力落地", agents)
+            self.assertNotIn("也就是说，默认合同是", product_rules)
+            self.assertNotIn("当前用户真正关心", product_rules)
+            self.assertNotIn("- 输出审核 output_review", product_rules)
+            self.assertNotIn("- 最终导出 export", product_rules)
+
     def test_sync_removes_legacy_generated_project_instruction_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

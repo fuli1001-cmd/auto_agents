@@ -263,20 +263,87 @@ def _extract_project_rules(project_rules: str) -> Dict[str, List[str]]:
 
 def _candidate_rule_lines(project_rules: str) -> List[str]:
     candidates: List[str] = []
-    for raw_line in project_rules.splitlines():
+    lines = project_rules.splitlines()
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
         line = raw_line.strip()
         if not line or line.startswith("```"):
+            index += 1
             continue
         if re.match(r"^#{1,6}\s+", line):
+            index += 1
             continue
         if line.startswith(("- ", "* ")):
             candidates.append(line[2:].strip())
+            index += 1
             continue
         if re.match(r"^\d+[.)]\s+", line):
             candidates.append(re.sub(r"^\d+[.)]\s+", "", line).strip())
+            index += 1
+            continue
+        if _has_following_list(lines, index) and not _is_structural_intro(line):
+            intro, consumed = _consume_list_intro(lines, index)
+            if intro:
+                candidates.append(intro)
+                index = consumed
+                continue
+            index += 1
+            continue
+        if _is_structural_intro(line):
+            index += 1
             continue
         candidates.extend(_split_rule_sentences(line))
+        index += 1
     return candidates
+
+
+def _has_following_list(lines: List[str], index: int) -> bool:
+    line = lines[index].strip()
+    if not line.endswith((":", "：")):
+        return False
+    cursor = index + 1
+    while cursor < len(lines):
+        next_line = lines[cursor].strip()
+        if not next_line:
+            cursor += 1
+            continue
+        return next_line.startswith(("- ", "* "))
+    return False
+
+
+def _consume_list_intro(lines: List[str], index: int) -> tuple[str, int]:
+    intro = lines[index].strip().rstrip(":：")
+    values: List[str] = []
+    cursor = index + 1
+    while cursor < len(lines):
+        line = lines[cursor].strip()
+        if not line:
+            cursor += 1
+            continue
+        if re.match(r"^#{1,6}\s+", line):
+            break
+        if not line.startswith(("- ", "* ")):
+            break
+        value = line[2:].strip()
+        if value:
+            values.append(_inline_code_to_plain(value))
+        cursor += 1
+    if not values:
+        return "", index + 1
+    return f"{intro}: {', '.join(values)}", cursor
+
+
+def _is_structural_intro(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped.endswith((":", "：")):
+        return False
+    lowered = stripped.lower()
+    structural_markers = (
+        "如下", "关注", "不在本文档", "原因", "建议输入", "也就是说",
+        "examples", "example", "for example",
+    )
+    return any(marker in lowered or marker in stripped for marker in structural_markers)
 
 
 def _split_rule_sentences(line: str) -> List[str]:
@@ -287,10 +354,12 @@ def _split_rule_sentences(line: str) -> List[str]:
 
 
 def _normalize_rule(value: str) -> str:
-    text = re.sub(r"`([^`]+)`", r"\1", value.strip())
+    text = _inline_code_to_plain(value.strip())
     text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"\s+", " ", text).strip(" -:\t\r\n")
+    if text.startswith("这两步"):
+        text = "输入审核和输出审核" + text[len("这两步"):]
     if not _looks_like_instruction(text):
         return ""
     if len(text) > MAX_RULE_CHARS:
@@ -298,17 +367,39 @@ def _normalize_rule(value: str) -> str:
     return text
 
 
+def _inline_code_to_plain(value: str) -> str:
+    return re.sub(r"`([^`]+)`", r"\1", value)
+
+
 def _looks_like_instruction(text: str) -> bool:
     if len(text) < 8:
+        return False
+    if "当前用户真正关心" in text:
+        return False
+    if " / " in text and "边界" in text:
+        return False
+    if _looks_like_stage_label(text):
         return False
     lowered = text.lower()
     markers = (
         "must", "should", "shall", "only", "never", "default", "require", "avoid",
-        "keep", "do not", "don't", "fail", "pass", "block", "review", "export",
+        "keep", "do not", "don't",
         "test", "verify", "contract", "必须", "应该", "只能", "不要", "不能", "不再",
         "默认", "保留", "去掉", "审核", "校验", "导出", "确认", "测试", "合同",
     )
     return any(marker in lowered or marker in text for marker in markers)
+
+
+def _looks_like_stage_label(text: str) -> bool:
+    if any(char in text for char in "，。；：:,.!?！？"):
+        return False
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_/-]*", text)
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", text))
+    if has_cjk and len(text) <= 18 and len(words) <= 2:
+        return True
+    if not has_cjk and 1 <= len(words) <= 3:
+        return True
+    return False
 
 
 def _rule_category(text: str) -> str:
