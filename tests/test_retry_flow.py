@@ -20,6 +20,7 @@ from auto_agents.config import (
     save_run_state,
     task_plan_path,
 )
+from auto_agents.gates import FailureExtraction
 from auto_agents.git_ops import changed_paths, commit_all, worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, CommandResult, GateParallelGroup, GateResult, TaskSpec
@@ -136,6 +137,205 @@ class VerifyFailureClassificationTests(unittest.TestCase):
             self.assertTrue(analysis["stop_retry"])
             self.assertIn("non-comparable", analysis["stats"])
             self.assertIn("stop-unresolved-identity", analysis["stats"])
+
+    def test_task_verify_commands_follow_owned_proof_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-001",
+                title="Schema contract",
+                description="",
+                acceptance=[],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "planned",
+                        "evidence_refs": [
+                            "tests/test_public_api.py::test_contract",
+                            "app/service.py::build_payload",
+                        ],
+                    }
+                ],
+            )
+
+            commands = orchestrator._build_task_verify_commands(task)
+
+            self.assertEqual(len(commands), 1)
+            self.assertIn("tests/test_public_api.py::test_contract", commands[0])
+            self.assertNotIn("app/service.py::build_payload", commands[0])
+
+    def test_task_verify_prefers_owned_commands_over_global_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.gates.commands = ["conda run -p ./.conda python -m pytest -q tests"]
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-001",
+                title="Owned gate",
+                description="",
+                acceptance=[],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "planned",
+                        "evidence_refs": ["tests/test_public_api.py::test_contract"],
+                    }
+                ],
+            )
+
+            def fail_global(*args, **kwargs):
+                raise AssertionError("global gate should not run for owned task verification")
+
+            def pass_owned(commands, *, collect_all, context):
+                self.assertTrue(collect_all)
+                self.assertIn("tests/test_public_api.py::test_contract", commands[0])
+                return (
+                    GateResult(
+                        ok=True,
+                        commands=[
+                            CommandResult(
+                                command=commands[0],
+                                ok=True,
+                                returncode=0,
+                                stdout="",
+                                stderr="",
+                            )
+                        ],
+                        summary="all commands passed",
+                    ),
+                    "",
+                )
+
+            with patch.object(orchestrator, "_run_gate_commands", side_effect=fail_global):
+                with patch.object(
+                    orchestrator,
+                    "_run_gate_commands_for_commands",
+                    side_effect=pass_owned,
+                ):
+                    with patch.object(orchestrator, "_quick_verify_failure", return_value=""):
+                        result = orchestrator._run_task_verify(task)
+
+            self.assertTrue(result["ok"], msg=str(result))
+
+    def test_task_verify_marks_cross_domain_failure_as_scope_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-001",
+                title="Contract mismatch",
+                description="",
+                acceptance=[],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "planned",
+                        "evidence_refs": ["app/stage_backends/text.py::PlanningBackend._schema"],
+                    }
+                ],
+            )
+
+            failed_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command="conda run -p ./.conda python -m pytest -q tests",
+                        ok=False,
+                        returncode=1,
+                        stdout=(
+                            "FAILED tests/test_real_voice_adapter_api.py::"
+                            "RealVoiceAdapterApiTests::test_compose_resubmission\n"
+                        ),
+                        stderr="",
+                    )
+                ],
+                summary="FAILED tests/test_real_voice_adapter_api.py::RealVoiceAdapterApiTests::test_compose_resubmission",
+            )
+
+            with patch.object(orchestrator, "_run_gate_commands", return_value=(failed_gate, "")):
+                with patch(
+                    "auto_agents.orchestrator.extract_failure_info",
+                    return_value=FailureExtraction(
+                        failure_ids=[
+                            "tests/test_real_voice_adapter_api.py::RealVoiceAdapterApiTests::test_compose_resubmission"
+                        ],
+                        comparable=True,
+                        non_comparable_ids=[],
+                    ),
+                ):
+                    result = orchestrator._run_task_verify(task)
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["contract_scope_issue"])
+            self.assertIn("verification scope mismatch", str(result["reason"]))
+
+    def test_task_verify_baseline_uses_owned_commands_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-001",
+                title="Owned baseline",
+                description="",
+                acceptance=[],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "planned",
+                        "evidence_refs": ["tests/test_public_api.py::test_contract"],
+                    }
+                ],
+            )
+
+            captured = {}
+
+            def fake_owned(commands, *, collect_all, context):
+                captured["commands"] = list(commands)
+                return (
+                    GateResult(
+                        ok=False,
+                        commands=[
+                            CommandResult(
+                                command=commands[0],
+                                ok=False,
+                                returncode=1,
+                                stdout="FAILED tests/test_public_api.py::test_contract",
+                                stderr="",
+                            )
+                        ],
+                        summary="FAILED tests/test_public_api.py::test_contract",
+                    ),
+                    "",
+                )
+
+            with patch.object(orchestrator, "_run_gate_commands_for_commands", side_effect=fake_owned):
+                changed = orchestrator._ensure_task_verify_baseline(task)
+
+            self.assertTrue(changed)
+            self.assertEqual(
+                captured["commands"],
+                [orchestrator._build_task_proof_evidence_command(["tests/test_public_api.py::test_contract"])],
+            )
+            self.assertEqual(
+                task.verify_baseline_failures,
+                ["tests/test_public_api.py::test_contract"],
+            )
 
 
 class OutOfScopePlanAdapter:
@@ -1323,7 +1523,8 @@ class RetryFlowTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root)
 
             task = orchestrator._load_tasks_from_plan()[0]
-            result = orchestrator._run_task_verify(task)
+            with patch.object(orchestrator, "_build_task_verify_commands", return_value=[]):
+                result = orchestrator._run_task_verify(task)
 
             self.assertFalse(result["ok"])
             self.assertIn("task verification commands modified tracked or unignored files", str(result["reason"]))
@@ -1375,7 +1576,8 @@ class RetryFlowTests(unittest.TestCase):
                 },
             )[1]
 
-            result = orchestrator._run_task_verify(task)
+            with patch.object(orchestrator, "_build_task_verify_commands", return_value=[]):
+                result = orchestrator._run_task_verify(task)
 
             self.assertEqual(proof_calls, ["task-001"])
             self.assertFalse(result["ok"])

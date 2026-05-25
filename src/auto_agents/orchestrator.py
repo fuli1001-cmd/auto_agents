@@ -1474,11 +1474,7 @@ class Orchestrator:
     def _run_gate_commands(self, *, collect_all: bool, context: str):
         self._apply_generated_verification_config()
         before_snapshot = self._worktree_change_snapshot()
-        commands = (
-            commands_from_verification_steps(self.config.gates.steps)
-            if self.config.gates.steps
-            else self.config.gates.commands
-        )
+        commands = self._default_gate_commands()
         gate = run_gate_plan(
             commands,
             self.config.gates.parallel_groups,
@@ -1495,6 +1491,39 @@ class Orchestrator:
                 f"{self._changed_path_preview(changed)}"
             )
         return gate, reason
+
+    def _run_gate_commands_for_commands(
+        self,
+        commands: List[str],
+        *,
+        collect_all: bool,
+        context: str,
+    ):
+        self._apply_generated_verification_config()
+        before_snapshot = self._worktree_change_snapshot()
+        gate = run_gate_plan(
+            commands,
+            [],
+            self.project_root,
+            collect_all=collect_all,
+        )
+        self._cleanup_ephemeral_tooling_artifacts()
+        after_snapshot = self._worktree_change_snapshot()
+        changed = self._snapshot_delta_paths(before_snapshot, after_snapshot)
+        reason = ""
+        if changed:
+            reason = (
+                f"{context} modified tracked or unignored files: "
+                f"{self._changed_path_preview(changed)}"
+            )
+        return gate, reason
+
+    def _default_gate_commands(self) -> List[str]:
+        return (
+            commands_from_verification_steps(self.config.gates.steps)
+            if self.config.gates.steps
+            else self.config.gates.commands
+        )
 
     def _implement_touched_code(self) -> bool:
         """Return True if the last implement step touched any non-orchestrator file."""
@@ -2219,10 +2248,23 @@ class Orchestrator:
                 "raw_output": quick_failure,
                 "comparable_failures": False,
             }
-        verify_gate, mutation_error = self._run_gate_commands(
-            collect_all=task is not None,
-            context="task verification commands" if task is not None else "verification commands",
-        )
+        task_commands = self._build_task_verify_commands(task)
+        task_scope_label = self._task_verify_command_scope_label(task)
+        if task_commands:
+            verify_gate, mutation_error = self._run_gate_commands_for_commands(
+                task_commands,
+                collect_all=True,
+                context=(
+                    f"task verification commands ({task.task_id})"
+                    if task is not None
+                    else "task verification commands"
+                ),
+            )
+        else:
+            verify_gate, mutation_error = self._run_gate_commands(
+                collect_all=task is not None,
+                context="task verification commands" if task is not None else "verification commands",
+            )
         if mutation_error:
             failure_ids = self._normalize_verify_failure_ids([], mutation_error)
             return {
@@ -2306,6 +2348,24 @@ class Orchestrator:
                 )
             else:
                 reason = verify_gate.summary
+            out_of_scope_reason = self._task_verify_contract_scope_reason(
+                task,
+                new_failure_ids or effective_failure_ids,
+                task_scope_label=task_scope_label,
+            )
+            if out_of_scope_reason:
+                return {
+                    "ok": False,
+                    "reason": out_of_scope_reason,
+                    "failure_ids": effective_failure_ids,
+                    "current_failure_ids": current_failure_ids,
+                    "baseline_failure_ids": baseline_failure_ids,
+                    "new_failure_ids": new_failure_ids or effective_failure_ids,
+                    "raw_output": raw_output,
+                    "raw_log_path": raw_log_path,
+                    "comparable_failures": extraction.comparable,
+                    "contract_scope_issue": True,
+                }
             return {
                 "ok": False,
                 "reason": reason,
@@ -2426,6 +2486,20 @@ class Orchestrator:
             if not isinstance(proof, dict):
                 continue
             if str(proof.get("status", "")).strip() != "verified":
+                continue
+            for raw_ref in proof.get("evidence_refs", []) or []:
+                ref = str(raw_ref).strip()
+                if ref and ref not in refs:
+                    refs.append(ref)
+        return refs
+
+    @staticmethod
+    def _task_planned_evidence_refs(task: Optional[TaskSpec]) -> List[str]:
+        if task is None:
+            return []
+        refs: List[str] = []
+        for proof in task.requirement_proofs:
+            if not isinstance(proof, dict):
                 continue
             for raw_ref in proof.get("evidence_refs", []) or []:
                 ref = str(raw_ref).strip()
@@ -2687,6 +2761,29 @@ class Orchestrator:
             return self._build_vitest_evidence_command(ref)
         return None
 
+    def _build_task_verify_commands(self, task: Optional[TaskSpec]) -> List[str]:
+        if task is None:
+            return []
+        commands: List[str] = []
+        for ref in self._task_planned_evidence_refs(task):
+            command = self._build_task_proof_evidence_command_for_ref(ref)
+            if command and command not in commands:
+                commands.append(command)
+        return commands
+
+    def _task_verify_command_scope_label(self, task: Optional[TaskSpec]) -> str:
+        refs = self._task_planned_evidence_refs(task)
+        executable = [
+            ref for ref in refs
+            if self._build_task_proof_evidence_command_for_ref(ref)
+        ]
+        if not executable:
+            return ""
+        preview = ", ".join(executable[:4])
+        if len(executable) > 4:
+            preview = f"{preview}, ..."
+        return preview
+
     def _run_task_proof_evidence(self, task: Optional[TaskSpec]) -> Optional[Dict[str, object]]:
         if task is None:
             return None
@@ -2802,9 +2899,42 @@ class Orchestrator:
 
     def _ensure_task_verify_baseline(self, task: TaskSpec) -> bool:
         baseline_ref = self._task_verify_baseline_ref()
+        task_commands = self._build_task_verify_commands(task)
         if task.verify_baseline_ref == baseline_ref:
             return False
         task.verify_baseline_ref = baseline_ref
+        if not task_commands:
+            return True
+        cached_failures = self._gate_baseline_cache.get(
+            baseline_ref,
+            task_commands,
+            collect_all=True,
+            parallel_groups=[],
+        )
+        if cached_failures is not None:
+            task.verify_baseline_failures = list(cached_failures)
+            return True
+        gate, mutation_error = self._run_gate_commands_for_commands(
+            task_commands,
+            collect_all=True,
+            context=f"task baseline verification commands ({task.task_id})",
+        )
+        if mutation_error:
+            raise RuntimeError(mutation_error)
+        failures = (
+            self._normalize_verify_failure_ids(extract_failure_ids(gate), gate.summary)
+            if not gate.ok
+            else []
+        )
+        task.verify_baseline_failures = list(failures)
+        self._gate_baseline_cache.put(
+            baseline_ref,
+            task_commands,
+            collect_all=True,
+            failure_ids=failures,
+            summary=gate.summary,
+            parallel_groups=[],
+        )
         return True
 
     def _ensure_implement_verify_baseline(
@@ -2816,11 +2946,7 @@ class Orchestrator:
         changed = False
         if state.implement_verify_baseline_ref != baseline_ref:
             state.implement_verify_baseline_ref = baseline_ref
-            gate_commands = (
-                commands_from_verification_steps(self.config.gates.steps)
-                if self.config.gates.steps
-                else self.config.gates.commands
-            )
+            gate_commands = self._default_gate_commands()
             if not gate_commands:
                 state.implement_verify_baseline_failures = []
             else:
@@ -4981,6 +5107,8 @@ class Orchestrator:
                     raw_excerpts=list(verify_feedback.get("raw_excerpts", [])),
                 )
                 self._emit_task_verify_result(task, "fail", last_reason, stats=verify_stats)
+                if bool(verify_result.get("contract_scope_issue")):
+                    break
                 if bool(verify_analysis["stop_retry"]):
                     if not comparable_failures:
                         last_reason = self._format_non_comparable_verify_failure_reason(last_reason)
@@ -5465,6 +5593,51 @@ class Orchestrator:
             "verification failed without stable test-case failure ids; "
             "stopping automatic retries until the failure identity can be resolved\n"
             f"{reason.strip()}"
+        )
+
+    def _task_verify_contract_scope_reason(
+        self,
+        task: Optional[TaskSpec],
+        failure_ids: Iterable[str],
+        *,
+        task_scope_label: str,
+    ) -> str:
+        if task is None:
+            return ""
+        task_commands = self._build_task_verify_commands(task)
+        if task_commands:
+            return ""
+        evidence_refs = self._task_planned_evidence_refs(task)
+        if not evidence_refs:
+            return ""
+        owned_paths = {
+            self._split_evidence_ref(ref)[0].replace("\\", "/").strip()
+            for ref in evidence_refs
+            if self._split_evidence_ref(ref)[0].replace("\\", "/").strip()
+        }
+        if not owned_paths:
+            return ""
+        failure_paths = {
+            self._split_evidence_ref(failure_id)[0].replace("\\", "/").strip()
+            for failure_id in failure_ids
+            if str(failure_id).strip()
+            and not str(failure_id).strip().startswith("reason:")
+            and not str(failure_id).strip().startswith("cmd:")
+        }
+        if not failure_paths:
+            return ""
+        if failure_paths & owned_paths:
+            return ""
+        scope = task_scope_label or ", ".join(sorted(owned_paths)[:4])
+        if len(owned_paths) > 4:
+            scope = f"{scope}, ..."
+        failure_preview = ", ".join(sorted(failure_paths)[:4])
+        if len(failure_paths) > 4:
+            failure_preview = f"{failure_preview}, ..."
+        return (
+            "verification scope mismatch: new failures are outside this task's owned test/proof "
+            f"surface. Owned scope: {scope}. New failure paths: {failure_preview}. "
+            "Treat this as a product-contract or gate-scope issue instead of retrying implementation."
         )
 
     @staticmethod

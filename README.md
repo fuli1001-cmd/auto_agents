@@ -91,7 +91,8 @@ For each task, the effective loop is:
 
 1. mark the task `in_progress`
 2. run the implementation agent for the current slice
-3. run local verification commands
+3. run task-owned local verification first, derived from the task's proof `evidence_refs` when
+   executable tests are available; otherwise fall back to the configured gate commands
 4. run an independent review for the current uncommitted changes
 5. if verification and review both pass, mark the task `done` and optionally commit
 6. continue to the next unfinished task
@@ -100,7 +101,11 @@ If verification or review fails, the orchestrator retries the same task with foc
 retry prompt includes structured verification triage and allows tightly coupled regression fixes in
 explicitly implicated paths, even when those fixes sit slightly outside the original slice. If the
 retry budget is exhausted, that task is marked `blocked` and the run exits with failure instead of
-silently skipping ahead.
+silently skipping ahead. When a task falls back to full gate verification and the new failures are
+clearly outside the task's owned proof/test surface, auto_agents stops retrying that implementation
+loop and reports the result as a contract or gate-scope mismatch.
+
+The top-level `verify` stage still runs the full configured verification suite before release.
 
 Manual approvals are supported at three high-value gates:
 
