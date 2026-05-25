@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
-from .config import agent_instructions_lock_path, project_rules_path
+from .config import agent_instructions_lock_path, normalized_project_rules_path, project_rules_path
 from .io_utils import read_json, read_text, write_json, write_text
 
 
@@ -14,6 +15,12 @@ MAX_ROOT_AGENTS_CHARS = 2800
 MAX_COPILOT_ROOT_CHARS = 1800
 MAX_PROJECT_INSTRUCTIONS_CHARS = 3600
 MAX_RULE_CHARS = 220
+NORMALIZED_RULE_KEYS = (
+    "hard_rules",
+    "workflow_contracts",
+    "engineering_validation",
+    "testing_contracts",
+)
 
 
 DEFAULT_ENGINEERING_RULES = """# Project Agent Instructions
@@ -83,13 +90,107 @@ class AgentInstructionSyncResult:
         }
 
 
+def project_rules_source_sha256(project_root: Path) -> str:
+    source = project_rules_path(project_root.resolve())
+    if not source.exists():
+        return _sha256_bytes(b"")
+    return _sha256_bytes(source.read_bytes())
+
+
+def project_rules_are_meaningful(project_root: Path) -> bool:
+    return _meaningful_project_rules(read_text(project_rules_path(project_root.resolve())).strip())
+
+
+def normalized_project_rules_current(project_root: Path) -> bool:
+    root = project_root.resolve()
+    normalized_path = normalized_project_rules_path(root)
+    if load_current_normalized_project_rules(root) is None:
+        return False
+
+    lock = read_json(agent_instructions_lock_path(root), default={})
+    generated = lock.get("generated_sha256", {}) if isinstance(lock, dict) else {}
+    if not isinstance(generated, dict):
+        return False
+
+    rel_path = _relative_path(root, normalized_path)
+    expected_hash = generated.get(rel_path)
+    if expected_hash is None:
+        return True
+    return normalized_path.is_file() and _sha256_bytes(normalized_path.read_bytes()) == str(expected_hash)
+
+
+def load_current_normalized_project_rules(project_root: Path) -> Optional[Dict[str, List[str]]]:
+    root = project_root.resolve()
+    source_sha = project_rules_source_sha256(root)
+    try:
+        payload = read_json(normalized_project_rules_path(root), default=None)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("source_sha256", "")) != source_sha:
+        return None
+    rules = normalize_project_rules_payload(payload)
+    if rules is None:
+        return None
+    return rules
+
+
+def write_normalized_project_rules(
+    project_root: Path,
+    *,
+    source_sha256: str,
+    rules: Dict[str, List[str]],
+) -> None:
+    payload = {
+        "source_sha256": source_sha256,
+        "rules": {key: list(rules.get(key, [])) for key in NORMALIZED_RULE_KEYS},
+    }
+    write_json(normalized_project_rules_path(project_root.resolve()), payload)
+
+
+def normalize_project_rules_payload(payload: object) -> Optional[Dict[str, List[str]]]:
+    if not isinstance(payload, dict):
+        return None
+    raw_rules = payload.get("rules", payload)
+    if not isinstance(raw_rules, dict):
+        return None
+    normalized: Dict[str, List[str]] = {}
+    for key in NORMALIZED_RULE_KEYS:
+        value = raw_rules.get(key, [])
+        if not isinstance(value, list):
+            return None
+        items = []
+        for item in value:
+            text = str(item).strip()
+            if text and text not in items:
+                items.append(text)
+        normalized[key] = items
+    return normalized
+
+
+def parse_normalized_project_rules_output(text: str) -> Dict[str, List[str]]:
+    payload = _loads_json_object(text)
+    normalized = normalize_project_rules_payload(payload)
+    if normalized is None:
+        raise ValueError(
+            "normalized project rules must be a JSON object with rules.hard_rules, "
+            "rules.workflow_contracts, rules.engineering_validation, and rules.testing_contracts arrays"
+        )
+    return normalized
+
+
 def ensure_agent_instructions_synced(project_root: Path) -> AgentInstructionSyncResult:
     if _agent_instructions_current(project_root):
         return _sync_result_from_lock(project_root, synced=False)
     return sync_agent_instructions(project_root)
 
 
-def sync_agent_instructions(project_root: Path) -> AgentInstructionSyncResult:
+def sync_agent_instructions(
+    project_root: Path,
+    *,
+    normalized_rules: Optional[Dict[str, List[str]]] = None,
+) -> AgentInstructionSyncResult:
     root = project_root.resolve()
     source = project_rules_path(root)
     if not source.exists():
@@ -98,13 +199,26 @@ def sync_agent_instructions(project_root: Path) -> AgentInstructionSyncResult:
     raw_rules = read_text(source)
     project_rules = raw_rules.strip()
     meaningful = _meaningful_project_rules(project_rules)
-    generated_files = _render_generated_files(project_rules if meaningful else "")
+    normalized_path = normalized_project_rules_path(root)
+    if not meaningful and normalized_path.is_file():
+        normalized_path.unlink()
+    if normalized_rules is None:
+        normalized_rules = (
+            load_current_normalized_project_rules(root)
+            if meaningful
+            else None
+        )
+    if normalized_rules is None:
+        normalized_rules = _extract_project_rules(project_rules if meaningful else "")
+    generated_files = _render_generated_files(normalized_rules)
 
     generated_sha256: Dict[str, str] = {}
     for rel_path, content in generated_files.items():
         path = root / rel_path
         write_text(path, content)
         generated_sha256[rel_path] = _sha256_text(content)
+    if normalized_path.is_file() and load_current_normalized_project_rules(root) is not None:
+        generated_sha256[_relative_path(root, normalized_path)] = _sha256_bytes(normalized_path.read_bytes())
     _remove_legacy_generated_files(root)
 
     source_sha = _sha256_bytes(source.read_bytes() if source.exists() else b"")
@@ -120,6 +234,26 @@ def sync_agent_instructions(project_root: Path) -> AgentInstructionSyncResult:
         generated_sha256=generated_sha256,
         project_rules_meaningful=meaningful,
     )
+
+
+def _loads_json_object(text: str) -> object:
+    stripped = str(text or "").strip()
+    if not stripped:
+        raise ValueError("normalized project rules output is empty")
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.DOTALL)
+    if fenced:
+        return json.loads(fenced.group(1))
+
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start >= 0 and end > start:
+        return json.loads(stripped[start : end + 1])
+    raise ValueError("normalized project rules output did not contain a JSON object")
 
 
 def _agent_instructions_current(project_root: Path) -> bool:
@@ -166,14 +300,14 @@ def _sync_result_from_lock(project_root: Path, *, synced: bool) -> AgentInstruct
     )
 
 
-def _render_generated_files(project_rules: str) -> Dict[str, str]:
-    extracted = _extract_project_rules(project_rules)
+def _render_generated_files(extracted: Dict[str, List[str]]) -> Dict[str, str]:
+    internal_rules = _internal_rule_categories(extracted)
     return {
         "AGENTS.md": _limit_markdown(
             _join_sections(
                 GENERATED_NOTICE,
                 DEFAULT_ENGINEERING_RULES.strip(),
-                _agents_project_summary(extracted),
+                _agents_project_summary(internal_rules),
             ),
             MAX_ROOT_AGENTS_CHARS,
         ),
@@ -181,7 +315,7 @@ def _render_generated_files(project_rules: str) -> Dict[str, str]:
             _join_sections(
                 GENERATED_NOTICE,
                 COPILOT_ROOT_RULES.strip(),
-                _copilot_project_summary(extracted),
+                _copilot_project_summary(internal_rules),
             ),
             MAX_COPILOT_ROOT_CHARS,
         ),
@@ -189,10 +323,19 @@ def _render_generated_files(project_rules: str) -> Dict[str, str]:
             _join_sections(
                 GENERATED_NOTICE,
                 PRODUCT_CONTRACT_HEADER.strip(),
-                _product_contract_instructions(extracted),
+                _product_contract_instructions(internal_rules),
             ),
             MAX_PROJECT_INSTRUCTIONS_CHARS,
         ),
+    }
+
+
+def _internal_rule_categories(rules: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    return {
+        "must": list(rules.get("hard_rules", [])),
+        "workflow": list(rules.get("workflow_contracts", [])),
+        "validation": list(rules.get("engineering_validation", [])),
+        "testing": list(rules.get("testing_contracts", [])),
     }
 
 
@@ -242,7 +385,12 @@ def _product_contract_instructions(extracted: Dict[str, List[str]]) -> str:
 
 
 def _extract_project_rules(project_rules: str) -> Dict[str, List[str]]:
-    rules = {"must": [], "workflow": [], "validation": [], "testing": []}
+    rules = {
+        "hard_rules": [],
+        "workflow_contracts": [],
+        "engineering_validation": [],
+        "testing_contracts": [],
+    }
     if not project_rules.strip():
         return rules
 
@@ -254,9 +402,14 @@ def _extract_project_rules(project_rules: str) -> Dict[str, List[str]]:
         if category:
             _append_unique(rules[category], normalized)
         if _is_hard_rule(normalized):
-            _append_unique(rules["must"], normalized)
+            _append_unique(rules["hard_rules"], normalized)
 
-    for key, limit in (("must", 10), ("workflow", 10), ("validation", 8), ("testing", 8)):
+    for key, limit in (
+        ("hard_rules", 10),
+        ("workflow_contracts", 10),
+        ("engineering_validation", 8),
+        ("testing_contracts", 8),
+    ):
         rules[key] = rules[key][:limit]
     return rules
 
@@ -407,18 +560,18 @@ def _rule_category(text: str) -> str:
     if any(marker in lowered or marker in text for marker in (
         "test", "verify", "acceptance", "pytest", "测试", "验证", "断言", "期望",
     )):
-        return "testing"
+        return "testing_contracts"
     if any(marker in lowered or marker in text for marker in (
         "validation", "validate", "artifact", "file", "json", "format", "工程校验", "校验",
         "产物", "结构", "文件", "格式",
     )):
-        return "validation"
+        return "engineering_validation"
     if any(marker in lowered or marker in text for marker in (
         "workflow", "state", "compose", "export", "review", "confirm", "moderation",
         "pipeline", "input", "output", "流程", "状态", "审核", "确认", "导出", "合成",
         "输入", "输出",
     )):
-        return "workflow"
+        return "workflow_contracts"
     return ""
 
 

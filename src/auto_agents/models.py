@@ -384,6 +384,22 @@ class ExecutionConfig:
 
 
 @dataclass
+class AgentInstructionsConfig:
+    normalize_with_llm: bool = True
+    normalization_effort_stage: str = "plan"
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "AgentInstructionsConfig":
+        return cls(
+            normalize_with_llm=bool(data.get("normalize_with_llm", True)),
+            normalization_effort_stage=str(data.get("normalization_effort_stage", "plan") or "plan"),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class ProjectConfig:
     project_name: str
     providers: Dict[str, ProviderConfig] = field(
@@ -421,6 +437,7 @@ class ProjectConfig:
     approvals: ApprovalConfig = field(default_factory=ApprovalConfig)
     retries: RetryConfig = field(default_factory=RetryConfig)
     repo_map: RepoMapConfig = field(default_factory=RepoMapConfig)
+    agent_instructions: AgentInstructionsConfig = field(default_factory=AgentInstructionsConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProjectConfig":
@@ -465,6 +482,9 @@ class ProjectConfig:
             ),
             retries=RetryConfig.from_dict(dict(data.get("retries", {}))),
             repo_map=RepoMapConfig.from_dict(dict(data.get("repo_map", {}))),
+            agent_instructions=AgentInstructionsConfig.from_dict(
+                dict(data.get("agent_instructions", {}))
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -480,6 +500,7 @@ class ProjectConfig:
             "approvals": self.approvals.to_dict(),
             "retries": self.retries.to_dict(),
             "repo_map": self.repo_map.to_dict(),
+            "agent_instructions": self.agent_instructions.to_dict(),
         }
 
     @property

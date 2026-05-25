@@ -7,11 +7,57 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.agent_instructions import ensure_agent_instructions_synced, sync_agent_instructions
-from auto_agents.config import agent_instructions_lock_path, project_rules_path
+from auto_agents.agent_instructions import (
+    ensure_agent_instructions_synced,
+    load_current_normalized_project_rules,
+    normalized_project_rules_current,
+    parse_normalized_project_rules_output,
+    project_rules_source_sha256,
+    sync_agent_instructions,
+    write_normalized_project_rules,
+)
+from auto_agents.config import (
+    agent_instructions_lock_path,
+    load_project_config,
+    normalized_project_rules_path,
+    project_rules_path,
+    save_project_config,
+)
 from auto_agents.io_utils import write_text
-from auto_agents.models import TaskSpec
+from auto_agents.models import AgentResult, TaskSpec
 from auto_agents.orchestrator import Orchestrator
+
+
+class RecordingNormalizeAdapter:
+    def __init__(self, hard_rule: str = "Normalized output review pass proceeds directly to export.") -> None:
+        self.hard_rule = hard_rule
+        self.requests = []
+
+    def available(self) -> bool:
+        return True
+
+    def run(self, request):
+        self.requests.append(request)
+        content = json.dumps(
+            {
+                "rules": {
+                    "hard_rules": [self.hard_rule],
+                    "workflow_contracts": ["output_review pass -> export"],
+                    "engineering_validation": ["Intermediate artifacts must be structurally valid before composition."],
+                    "testing_contracts": ["Tests must not expect awaiting_output_confirmation on the default path."],
+                }
+            },
+            ensure_ascii=False,
+        )
+        write_text(request.output_path, content)
+        return AgentResult(
+            ok=True,
+            command=["recording-normalize"],
+            output_path=request.output_path,
+            summary=content,
+            stdout=content,
+            returncode=0,
+        )
 
 
 class AgentInstructionSyncTests(unittest.TestCase):
@@ -64,18 +110,168 @@ class AgentInstructionSyncTests(unittest.TestCase):
             self.assertIn("Default compose success path is output_review pass -> export", agents)
             self.assertIn("Do not reintroduce a default output confirmation gate", copilot)
 
+    def test_sync_uses_current_normalized_rules_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(
+                project_rules_path(project_root),
+                "A long human document says output review pass must continue to export.\n",
+            )
+            write_normalized_project_rules(
+                project_root,
+                source_sha256=project_rules_source_sha256(project_root),
+                rules={
+                    "hard_rules": ["Normalized contract: output_review pass must export immediately."],
+                    "workflow_contracts": [],
+                    "engineering_validation": [],
+                    "testing_contracts": [],
+                },
+            )
+
+            sync_agent_instructions(project_root)
+
+            agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("Normalized contract: output_review pass must export immediately", agents)
+
+    def test_parse_normalized_project_rules_output_accepts_fenced_json(self) -> None:
+        payload = parse_normalized_project_rules_output(
+            "```json\n"
+            "{\n"
+            '  "rules": {\n'
+            '    "hard_rules": ["A"],\n'
+            '    "workflow_contracts": ["B"],\n'
+            '    "engineering_validation": ["C"],\n'
+            '    "testing_contracts": ["D"]\n'
+            "  }\n"
+            "}\n"
+            "```"
+        )
+
+        self.assertEqual(payload["hard_rules"], ["A"])
+        self.assertEqual(payload["workflow_contracts"], ["B"])
+        self.assertEqual(payload["engineering_validation"], ["C"])
+        self.assertEqual(payload["testing_contracts"], ["D"])
+
+    def test_orchestrator_normalizes_project_rules_with_plan_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            config = load_project_config(project_root)
+            config.efforts["plan"] = "max"
+            save_project_config(project_root, config)
+            write_text(
+                project_rules_path(project_root),
+                "默认输出审核通过后必须直接进入 export，不能等待额外输出确认。\n",
+            )
+            adapter = RecordingNormalizeAdapter()
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = adapter
+
+            result = orchestrator._ensure_agent_instructions_synced()
+
+            self.assertTrue(result.synced)
+            self.assertEqual(len(adapter.requests), 1)
+            self.assertEqual(adapter.requests[0].stage, "normalize_project_rules")
+            self.assertEqual(adapter.requests[0].effort, "max")
+            self.assertTrue(normalized_project_rules_path(project_root).is_file())
+            self.assertTrue(normalized_project_rules_current(project_root))
+            normalized = load_current_normalized_project_rules(project_root)
+            self.assertIsNotNone(normalized)
+            self.assertIn(adapter.hard_rule, normalized["hard_rules"])
+            lock = json.loads(agent_instructions_lock_path(project_root).read_text(encoding="utf-8"))
+            self.assertIn(".auto-agents/project-rules.normalized.json", lock["generated_sha256"])
+            agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn(adapter.hard_rule, agents)
+
+    def test_orchestrator_reuses_current_normalized_rules_without_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(
+                project_rules_path(project_root),
+                "默认输出审核通过后必须直接进入 export，不能等待额外输出确认。\n",
+            )
+            adapter = RecordingNormalizeAdapter()
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = adapter
+            orchestrator._ensure_agent_instructions_synced()
+
+            result = orchestrator._ensure_agent_instructions_synced()
+
+            self.assertFalse(result.synced)
+            self.assertEqual(len(adapter.requests), 1)
+
+    def test_orchestrator_refreshes_normalized_rules_when_source_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(
+                project_rules_path(project_root),
+                "默认输出审核通过后必须直接进入 export，不能等待额外输出确认。\n",
+            )
+            adapter = RecordingNormalizeAdapter("First normalized rule.")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = adapter
+            orchestrator._ensure_agent_instructions_synced()
+            write_text(
+                project_rules_path(project_root),
+                "默认输出审核通过后必须直接进入 export，不能等待额外输出确认。测试必须遵守该合同。\n",
+            )
+            adapter.hard_rule = "Second normalized rule."
+
+            orchestrator._ensure_agent_instructions_synced()
+
+            self.assertEqual(len(adapter.requests), 2)
+            agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("Second normalized rule", agents)
+
+    def test_orchestrator_refreshes_normalized_rules_when_generated_normalized_file_drifts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(
+                project_rules_path(project_root),
+                "默认输出审核通过后必须直接进入 export，不能等待额外输出确认。\n",
+            )
+            adapter = RecordingNormalizeAdapter("Original normalized rule.")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = adapter
+            orchestrator._ensure_agent_instructions_synced()
+            write_text(normalized_project_rules_path(project_root), '{"rules": {"hard_rules": ["manual drift"]}}\n')
+            adapter.hard_rule = "Refreshed normalized rule."
+
+            orchestrator._ensure_agent_instructions_synced()
+
+            self.assertEqual(len(adapter.requests), 2)
+            normalized = load_current_normalized_project_rules(project_root)
+            self.assertIsNotNone(normalized)
+            self.assertIn("Refreshed normalized rule.", normalized["hard_rules"])
+
     def test_unmeaningful_project_rules_fall_back_to_default_rules(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
+            write_normalized_project_rules(
+                project_root,
+                source_sha256=project_rules_source_sha256(project_root),
+                rules={
+                    "hard_rules": ["stale normalized rule"],
+                    "workflow_contracts": [],
+                    "engineering_validation": [],
+                    "testing_contracts": [],
+                },
+            )
             write_text(project_rules_path(project_root), "todo\n")
 
             result = sync_agent_instructions(project_root)
 
             self.assertFalse(result.project_rules_meaningful)
+            self.assertFalse(normalized_project_rules_path(project_root).exists())
             agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("No project-specific rules are currently defined", agents)
             self.assertNotIn("todo", agents)
+            self.assertNotIn("stale normalized rule", agents)
 
     def test_ensure_resyncs_when_source_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

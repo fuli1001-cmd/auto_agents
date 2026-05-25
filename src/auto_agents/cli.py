@@ -6,7 +6,6 @@ import shlex
 import sys
 from pathlib import Path
 
-from .agent_instructions import ensure_agent_instructions_synced, sync_agent_instructions
 from .config import (
     architecture_path,
     load_run_state,
@@ -460,7 +459,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "sync-agent-instructions":
         try:
-            result = sync_agent_instructions(Path(args.project))
+            orchestrator = Orchestrator(Path(args.project), agent_output_stream=sys.stderr)
+            result = orchestrator._ensure_agent_instructions_synced()
             print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
@@ -568,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
 
             project_root = Path(args.project)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
-            ensure_agent_instructions_synced(project_root)
+            orchestrator._ensure_agent_instructions_synced()
             if getattr(args, "provider", None):
                 orchestrator._set_active_provider(args.provider)
             orchestrator._print_agent_output = bool(args.print_agent_output)

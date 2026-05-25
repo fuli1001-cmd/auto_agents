@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from ..io_utils import write_text
 from ..models import AgentRequest, AgentResult
 from .base import AgentAdapter
@@ -13,6 +15,22 @@ class MockAdapter(AgentAdapter):
         content = f"MOCK stage={request.stage} effort={request.effort}\n"
         if request.stage == "clarify":
             content += "READY_TO_GENERATE\n"
+        elif request.stage == "normalize_project_rules":
+            hard_rules = []
+            if "Default output review pass must proceed to export" in request.prompt:
+                hard_rules.append("Default output review pass must proceed to export.")
+            content = json.dumps(
+                {
+                    "rules": {
+                        "hard_rules": hard_rules,
+                        "workflow_contracts": [],
+                        "engineering_validation": [],
+                        "testing_contracts": [],
+                    }
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
         elif request.stage == "review":
             content = "DECISION: pass\nMock review passed.\n"
         elif request.stage == "readme":

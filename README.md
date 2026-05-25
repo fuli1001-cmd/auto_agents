@@ -179,11 +179,15 @@ project contracts there when a repository needs domain-specific behavior, then r
 python3 -m auto_agents sync-agent-instructions --project /tmp/demo
 ```
 
-`sync-agent-instructions` extracts concise agent-facing rules from the human-readable source instead
-of copying the whole document into provider context. `run`, `fix`, `collab`, and `provider-resolve`
-automatically check the source hash and generated file hashes before starting agent work. If
-`.auto-agents/project-rules.md` changes, or if a generated instruction file drifts, auto_agents
-regenerates the files and continues.
+`sync-agent-instructions` uses the configured provider to normalize the human-readable source into
+`.auto-agents/project-rules.normalized.json`, then renders concise agent-facing rules from that
+structured file instead of copying the whole document into provider context. The normalization stage
+uses the same effort profile as `plan` by default and can be disabled with
+`agent_instructions.normalize_with_llm=false` in `.auto-agents/config.json`.
+
+`run`, `fix`, `collab`, and `provider-resolve` automatically check the source hash and generated file
+hashes before starting agent work. If `.auto-agents/project-rules.md` changes, or if a generated
+instruction file drifts, auto_agents regenerates the files and continues.
 
 Switch provider at run time and persist the new default provider:
 

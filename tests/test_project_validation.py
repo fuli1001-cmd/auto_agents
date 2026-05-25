@@ -413,6 +413,18 @@ class ProjectValidationTests(unittest.TestCase):
         errors = validate_project_config_payload(payload)
         self.assertTrue(any("requires git.commit_each_task=true" in item for item in errors))
 
+    def test_validate_project_config_payload_rejects_invalid_agent_instructions_config(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        payload["agent_instructions"] = {
+            "normalize_with_llm": "yes",
+            "normalization_effort_stage": "",
+        }
+
+        errors = validate_project_config_payload(payload)
+
+        self.assertTrue(any("agent_instructions.normalize_with_llm" in item for item in errors))
+        self.assertTrue(any("agent_instructions.normalization_effort_stage" in item for item in errors))
+
     def test_validate_project_config_payload_accepts_config_without_docs(self) -> None:
         payload = {
             "project_name": "demo",

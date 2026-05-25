@@ -185,6 +185,10 @@ DEFAULT_CONFIG = {
             "worktree_root": "",
         },
     },
+    "agent_instructions": {
+        "normalize_with_llm": True,
+        "normalization_effort_stage": "plan",
+    },
     "approvals": {
         "enabled": ["requirements", "architecture", "release"],
     },
@@ -253,6 +257,10 @@ def provider_references_lock_path(project_root: Path) -> Path:
 
 def project_rules_path(project_root: Path) -> Path:
     return auto_dir(project_root) / "project-rules.md"
+
+
+def normalized_project_rules_path(project_root: Path) -> Path:
+    return auto_dir(project_root) / "project-rules.normalized.json"
 
 
 def agent_instructions_lock_path(project_root: Path) -> Path:

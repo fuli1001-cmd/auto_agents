@@ -19,8 +19,15 @@ from .adapters import CodexAdapter, CopilotCliAdapter, MockAdapter, ShellAdapter
 from .agent_instructions import (
     GENERATED_AGENT_INSTRUCTION_PATHS,
     LEGACY_GENERATED_AGENT_INSTRUCTION_PATHS,
+    AgentInstructionSyncResult,
     ensure_agent_instructions_synced,
+    load_current_normalized_project_rules,
+    normalized_project_rules_current,
+    parse_normalized_project_rules_output,
+    project_rules_are_meaningful,
+    project_rules_source_sha256,
     sync_agent_instructions,
+    write_normalized_project_rules,
 )
 from .repomap import RepoMapBuilder, RepoMapResult
 from .config import (
@@ -604,7 +611,7 @@ class Orchestrator:
         provider_kind: Optional[str] = None,
     ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
-        ensure_agent_instructions_synced(self.project_root)
+        self._ensure_agent_instructions_synced()
         self._print_agent_output = print_agent_output
         self._allow_dirty_tree = allow_dirty_tree
         try:
@@ -785,6 +792,89 @@ class Orchestrator:
             state.plan_task_replacements = self._derive_plan_task_replacements(prior_tasks, state.tasks)
             self._emit_plan_task_count(state.tasks)
         return state
+
+    def _ensure_agent_instructions_synced(self) -> AgentInstructionSyncResult:
+        if not self.config.agent_instructions.normalize_with_llm:
+            return ensure_agent_instructions_synced(self.project_root)
+        if not project_rules_are_meaningful(self.project_root):
+            return ensure_agent_instructions_synced(self.project_root)
+
+        source_sha = project_rules_source_sha256(self.project_root)
+        if normalized_project_rules_current(self.project_root):
+            return ensure_agent_instructions_synced(self.project_root)
+
+        normalized = load_current_normalized_project_rules(self.project_root)
+        if normalized is None or not normalized_project_rules_current(self.project_root):
+            normalized = self._normalize_project_rules_with_llm(source_sha)
+        return sync_agent_instructions(self.project_root, normalized_rules=normalized)
+
+    def _normalize_project_rules_with_llm(self, source_sha: str) -> Dict[str, List[str]]:
+        source_path = self.project_root / ".auto-agents" / "project-rules.md"
+        source_text = read_text(source_path).strip()
+        if not source_text:
+            rules = {
+                "hard_rules": [],
+                "workflow_contracts": [],
+                "engineering_validation": [],
+                "testing_contracts": [],
+            }
+            write_normalized_project_rules(
+                self.project_root,
+                source_sha256=source_sha,
+                rules=rules,
+            )
+            return rules
+
+        prompt = "\n".join([
+            "Normalize the human-readable project rules into strict JSON for agent instruction generation.",
+            "",
+            "Return ONLY a JSON object with this exact shape:",
+            "{",
+            '  "rules": {',
+            '    "hard_rules": ["short imperative rules that must always hold"],',
+            '    "workflow_contracts": ["state-machine, product flow, and API behavior contracts"],',
+            '    "engineering_validation": ["deterministic validation and artifact integrity rules"],',
+            '    "testing_contracts": ["test expectation and regression coverage rules"]',
+            "  }",
+            "}",
+            "",
+            "Rules:",
+            "- Preserve precise product semantics and enum values.",
+            "- Do not copy background explanation, examples, headings, or process diagrams unless they are actual rules.",
+            "- Keep each item concise and standalone; avoid pronouns like 'this step' or 'these two'.",
+            "- Do not invent rules not supported by the source.",
+            "- If a category has no rules, use an empty array.",
+            "",
+            f"Source file: {source_path}",
+            "",
+            "Source markdown:",
+            source_text,
+        ])
+        effort_stage = self.config.agent_instructions.normalization_effort_stage or "plan"
+        effort = self.config.efforts.get(effort_stage, self.config.efforts.get("plan", "deep"))
+        result = self._run_agent_with_retries(
+            state=None,
+            stage="normalize_project_rules",
+            stage_key="normalize-project-rules",
+            prompt=prompt,
+            validation_feedback=self._normalized_project_rules_validation_feedback,
+            effort=effort,
+        )
+        rules = parse_normalized_project_rules_output(result.summary)
+        write_normalized_project_rules(
+            self.project_root,
+            source_sha256=source_sha,
+            rules=rules,
+        )
+        return rules
+
+    @staticmethod
+    def _normalized_project_rules_validation_feedback(result: AgentResult) -> Optional[str]:
+        try:
+            parse_normalized_project_rules_output(result.summary)
+        except ValueError as error:
+            return str(error)
+        return None
 
     def _run_interactive_clarify(self, state: RunState, spec_file: Path) -> RunState:
         from .config import conversation_history_path

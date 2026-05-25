@@ -727,6 +727,18 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 if enabled is True and isinstance(git, dict) and git.get("commit_each_task") is not True:
                     errors.append("execution.parallel_tasks.enabled requires git.commit_each_task=true")
 
+    agent_instructions = payload.get("agent_instructions")
+    if agent_instructions is not None:
+        if not isinstance(agent_instructions, dict):
+            errors.append("agent_instructions must be an object")
+        else:
+            normalize = agent_instructions.get("normalize_with_llm", True)
+            if not isinstance(normalize, bool):
+                errors.append("agent_instructions.normalize_with_llm must be a boolean")
+            effort_stage = agent_instructions.get("normalization_effort_stage", "plan")
+            if not isinstance(effort_stage, str) or not effort_stage.strip():
+                errors.append("agent_instructions.normalization_effort_stage must be a non-empty string")
+
     approvals = payload.get("approvals")
     if not isinstance(approvals, dict):
         errors.append("approvals must be an object")
