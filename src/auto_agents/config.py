@@ -251,6 +251,14 @@ def provider_references_lock_path(project_root: Path) -> Path:
     return state_dir(project_root) / "provider_references.lock.json"
 
 
+def project_rules_path(project_root: Path) -> Path:
+    return auto_dir(project_root) / "project-rules.md"
+
+
+def agent_instructions_lock_path(project_root: Path) -> Path:
+    return state_dir(project_root) / "agent_instructions.lock.json"
+
+
 def gate_baseline_cache_path(project_root: Path) -> Path:
     return state_dir(project_root) / "gate_baseline_cache.json"
 

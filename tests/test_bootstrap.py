@@ -8,9 +8,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.config import (
     auto_dir,
+    agent_instructions_lock_path,
     config_path,
     docs_dir,
     load_project_config,
+    project_rules_path,
     provider_references_dir,
     provider_references_lock_path,
     requirements_trace_path,
@@ -37,6 +39,11 @@ class BootstrapTests(unittest.TestCase):
             self.assertTrue(provider_references_lock_path(project_root).exists())
             self.assertTrue(task_plan_path(project_root).exists())
             self.assertTrue(run_state_path(project_root).exists())
+            self.assertTrue(project_rules_path(project_root).exists())
+            self.assertTrue(agent_instructions_lock_path(project_root).exists())
+            self.assertTrue((project_root / "AGENTS.md").exists())
+            self.assertTrue((project_root / ".github" / "copilot-instructions.md").exists())
+            self.assertTrue((project_root / ".github" / "instructions" / "project.instructions.md").exists())
             self.assertTrue(is_repo(project_root))
             auto_gitignore = (auto_dir(project_root) / ".gitignore").read_text(encoding="utf-8")
             self.assertEqual(

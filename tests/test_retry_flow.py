@@ -3942,6 +3942,7 @@ class RetryFlowTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
             config = orchestrator.config
             config.gates.commands = ["python3 -c \"print('ok')\""]
+            config.gates.require_clean_git_before_task = False
             config.execution.parallel_tasks.enabled = True
             config.execution.parallel_tasks.max_workers = 2
             save_project_config(project_root, config)
@@ -3986,6 +3987,7 @@ class RetryFlowTests(unittest.TestCase):
             self._configure_git_identity(project_root)
             orchestrator = Orchestrator(project_root)
             config = orchestrator.config
+            config.gates.require_clean_git_before_task = False
             config.execution.parallel_tasks.enabled = True
             config.execution.parallel_tasks.strict = True
             config.execution.parallel_tasks.max_workers = 2
@@ -4030,9 +4032,11 @@ class RetryFlowTests(unittest.TestCase):
             self._configure_git_identity(project_root)
             orchestrator = Orchestrator(project_root)
             config = orchestrator.config
+            config.gates.require_clean_git_before_task = False
             config.execution.parallel_tasks.enabled = True
             config.execution.parallel_tasks.max_workers = 2
             save_project_config(project_root, config)
+            commit_all(project_root, "baseline")
             orchestrator = Orchestrator(project_root)
 
             write_json(
@@ -4446,6 +4450,9 @@ class ScopeOverflowTests(unittest.TestCase):
             config.gates.commands = []
             config.retries.implement = 4
             save_project_config(project_root, config)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(project_root), check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(project_root), check=True)
+            commit_all(project_root, "baseline")
             orchestrator = Orchestrator(project_root)
             orchestrator.adapter = RepeatReviewBlockerAdapter(project_root)
 
@@ -4684,6 +4691,9 @@ class ScopeArbiterTests(unittest.TestCase):
         config.gates.commands = []
         config.retries.implement = 4
         save_project_config(project_root, config)
+        subprocess.run(["git", "config", "user.name", "test"], cwd=str(project_root), check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(project_root), check=True)
+        commit_all(project_root, "baseline")
         orchestrator = Orchestrator(project_root)
         history = []
         for i in range(with_review_history):

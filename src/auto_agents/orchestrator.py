@@ -16,6 +16,11 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, TextIO, Tuple
 
 from .adapters import CodexAdapter, CopilotCliAdapter, MockAdapter, ShellAdapter
+from .agent_instructions import (
+    GENERATED_AGENT_INSTRUCTION_PATHS,
+    ensure_agent_instructions_synced,
+    sync_agent_instructions,
+)
 from .repomap import RepoMapBuilder, RepoMapResult
 from .config import (
     bootstrap_project,
@@ -48,7 +53,7 @@ from .gates import (
     run_commands_collect_all,
 )
 from .gate_baseline_cache import GateBaselineCache
-from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, ensure_repo, hard_reset_clean, head_ref, is_repo, remove_worktree, require_clean_tree, worktree_fingerprint
+from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, ensure_repo, hard_reset_clean, head_ref, is_repo, remove_worktree, worktree_fingerprint
 from .io_utils import read_text, write_text
 from .models import (
     APPROVAL_ORDER,
@@ -211,6 +216,7 @@ class Orchestrator:
             config.active_provider = provider_kind
             save_project_config(root, config)
         ensure_repo(root, auto_init=True)
+        sync_agent_instructions(root)
         return root
 
     def approve(self, gate: Optional[str] = None) -> RunState:
@@ -597,6 +603,7 @@ class Orchestrator:
         provider_kind: Optional[str] = None,
     ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
+        ensure_agent_instructions_synced(self.project_root)
         self._print_agent_output = print_agent_output
         self._allow_dirty_tree = allow_dirty_tree
         try:
@@ -1866,7 +1873,7 @@ class Orchestrator:
                 processed += 1
                 continue
 
-            require_clean_tree(self.project_root)
+            self._require_clean_tree_excluding_agent_instructions()
             results = self._run_parallel_task_batch(state, tasks, batch)
             for task in batch:
                 result = results[task.task_id]
@@ -1992,7 +1999,7 @@ class Orchestrator:
         if dependency_errors:
             return dependency_errors[0]
         try:
-            require_clean_tree(self.project_root)
+            self._require_clean_tree_excluding_agent_instructions()
         except RuntimeError as error:
             return str(error)
         return ""
@@ -2211,12 +2218,12 @@ class Orchestrator:
 
     def _require_clean_tree_for_task(self, task: TaskSpec) -> None:
         try:
-            require_clean_tree(self.project_root)
+            self._require_clean_tree_excluding_agent_instructions()
         except RuntimeError as error:
             if str(error) != "working tree is not clean":
                 raise
 
-            changed = changed_paths(self.project_root)
+            changed = self._changed_paths_excluding_agent_instructions()
             preview = ", ".join(changed[:5])
             if len(changed) > 5:
                 preview += f", +{len(changed) - 5} more"
@@ -2229,6 +2236,17 @@ class Orchestrator:
                 "Commit or stash those changes first, disable "
                 "gates.require_clean_git_before_task, or rerun with --allow-dirty-tree."
             ) from error
+
+    def _require_clean_tree_excluding_agent_instructions(self) -> None:
+        changed = self._changed_paths_excluding_agent_instructions()
+        if changed:
+            raise RuntimeError("working tree is not clean")
+
+    def _changed_paths_excluding_agent_instructions(self) -> List[str]:
+        ignored = list(GENERATED_AGENT_INSTRUCTION_PATHS)
+        if not head_ref(self.project_root):
+            ignored.extend(["README.md", ".gitignore"])
+        return changed_paths(self.project_root, ignored_prefixes=(".auto-agents/", *ignored))
 
     def _run_task_verify(
         self,
@@ -3430,7 +3448,7 @@ class Orchestrator:
         if task.review_summary.strip():
             return "deep"
 
-        paths = changed_paths(self.project_root)
+        paths = self._changed_paths_excluding_agent_instructions()
         has_test_changes = any(self._is_test_path(path) for path in paths)
         non_test_paths = [path for path in paths if not self._is_test_path(path)]
         if not non_test_paths:

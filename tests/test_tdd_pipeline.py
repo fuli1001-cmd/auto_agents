@@ -395,6 +395,7 @@ class ImplementPipelineTests(unittest.TestCase):
                 )
                 else None
             )
+            orchestrator._build_task_verify_commands = lambda task: []
             write_json(
                 task_plan_path(project_root),
                 {

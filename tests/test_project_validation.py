@@ -730,6 +730,26 @@ class ProjectValidationTests(unittest.TestCase):
             config = load_project_config(project_root)
             self.assertEqual(config.docs.language, "zh")
 
+    def test_cli_sync_agent_instructions_generates_project_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(
+                project_root / ".auto-agents" / "project-rules.md",
+                "- Default output review pass must proceed to export.\n",
+            )
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = main(["sync-agent-instructions", "--project", str(project_root)])
+
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["synced"])
+            self.assertTrue(payload["project_rules_meaningful"])
+            agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("Default output review pass must proceed to export", agents)
+
     def test_cli_run_defaults_spec_file_to_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
