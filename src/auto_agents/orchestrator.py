@@ -18,6 +18,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, TextIO, Tuple
 from .adapters import CodexAdapter, CopilotCliAdapter, MockAdapter, ShellAdapter
 from .agent_instructions import (
     GENERATED_AGENT_INSTRUCTION_PATHS,
+    LEGACY_GENERATED_AGENT_INSTRUCTION_PATHS,
     ensure_agent_instructions_synced,
     sync_agent_instructions,
 )
@@ -2243,7 +2244,7 @@ class Orchestrator:
             raise RuntimeError("working tree is not clean")
 
     def _changed_paths_excluding_agent_instructions(self) -> List[str]:
-        ignored = list(GENERATED_AGENT_INSTRUCTION_PATHS)
+        ignored = list(GENERATED_AGENT_INSTRUCTION_PATHS) + list(LEGACY_GENERATED_AGENT_INSTRUCTION_PATHS)
         if not head_ref(self.project_root):
             ignored.extend(["README.md", ".gitignore"])
         return changed_paths(self.project_root, ignored_prefixes=(".auto-agents/", *ignored))

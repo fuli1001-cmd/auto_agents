@@ -170,7 +170,7 @@ python3 -m auto_agents init --project /tmp/demo --name demo
 
 - `AGENTS.md`
 - `.github/copilot-instructions.md`
-- `.github/instructions/project.instructions.md`
+- `.github/instructions/product-contract.instructions.md`
 
 Leave `.auto-agents/project-rules.md` empty to use only the default engineering rules. Add stable
 project contracts there when a repository needs domain-specific behavior, then run:
@@ -179,9 +179,11 @@ project contracts there when a repository needs domain-specific behavior, then r
 python3 -m auto_agents sync-agent-instructions --project /tmp/demo
 ```
 
-`run`, `fix`, `collab`, and `provider-resolve` automatically check the source hash and generated
-file hashes before starting agent work. If `.auto-agents/project-rules.md` changes, or if a generated
-instruction file drifts, auto_agents regenerates the files and continues.
+`sync-agent-instructions` extracts concise agent-facing rules from the human-readable source instead
+of copying the whole document into provider context. `run`, `fix`, `collab`, and `provider-resolve`
+automatically check the source hash and generated file hashes before starting agent work. If
+`.auto-agents/project-rules.md` changes, or if a generated instruction file drifts, auto_agents
+regenerates the files and continues.
 
 Switch provider at run time and persist the new default provider:
 

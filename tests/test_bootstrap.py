@@ -43,7 +43,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertTrue(agent_instructions_lock_path(project_root).exists())
             self.assertTrue((project_root / "AGENTS.md").exists())
             self.assertTrue((project_root / ".github" / "copilot-instructions.md").exists())
-            self.assertTrue((project_root / ".github" / "instructions" / "project.instructions.md").exists())
+            self.assertTrue((project_root / ".github" / "instructions" / "product-contract.instructions.md").exists())
             self.assertTrue(is_repo(project_root))
             auto_gitignore = (auto_dir(project_root) / ".gitignore").read_text(encoding="utf-8")
             self.assertEqual(
