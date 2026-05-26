@@ -11,6 +11,7 @@ from auto_agents.agent_instructions import (
     ensure_agent_instructions_synced,
     load_current_normalized_project_rules,
     normalized_project_rules_current,
+    normalized_project_rules_identifier_feedback,
     parse_normalized_project_rules_output,
     project_rules_source_sha256,
     sync_agent_instructions,
@@ -53,6 +54,29 @@ class RecordingNormalizeAdapter:
         return AgentResult(
             ok=True,
             command=["recording-normalize"],
+            output_path=request.output_path,
+            summary=content,
+            stdout=content,
+            returncode=0,
+        )
+
+
+class SequentialNormalizeAdapter:
+    def __init__(self, payloads) -> None:
+        self.payloads = list(payloads)
+        self.requests = []
+
+    def available(self) -> bool:
+        return True
+
+    def run(self, request):
+        self.requests.append(request)
+        index = min(len(self.requests) - 1, len(self.payloads) - 1)
+        content = json.dumps(self.payloads[index], ensure_ascii=False)
+        write_text(request.output_path, content)
+        return AgentResult(
+            ok=True,
+            command=["sequential-normalize"],
             output_path=request.output_path,
             summary=content,
             stdout=content,
@@ -163,7 +187,7 @@ class AgentInstructionSyncTests(unittest.TestCase):
             save_project_config(project_root, config)
             write_text(
                 project_rules_path(project_root),
-                "默认输出审核通过后必须直接进入 export，不能等待额外输出确认。\n",
+                "默认 `output_review` 通过后必须直接进入 export，不能等待 `awaiting_output_confirmation`。\n",
             )
             adapter = RecordingNormalizeAdapter()
             orchestrator = Orchestrator(project_root)
@@ -187,13 +211,68 @@ class AgentInstructionSyncTests(unittest.TestCase):
             agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn(adapter.hard_rule, agents)
 
+    def test_normalized_identifier_feedback_rejects_identifiers_missing_from_source(self) -> None:
+        feedback = normalized_project_rules_identifier_feedback(
+            source_text="默认合同是 `process_review` pass -> `output_review` pass -> export。\n",
+            rules={
+                "hard_rules": ["Do not keep `process_moderation` in the default path."],
+                "workflow_contracts": ["`output_review` pass -> export."],
+                "engineering_validation": [],
+                "testing_contracts": [],
+            },
+        )
+
+        self.assertIsNotNone(feedback)
+        self.assertIn("process_moderation", feedback or "")
+        self.assertNotIn("output_review", feedback or "")
+
+    def test_orchestrator_retries_normalized_rules_that_invent_identifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(
+                project_rules_path(project_root),
+                "默认合同是 `process_review` pass -> `output_review` pass -> export。\n"
+                "不要把 `process_review` 作为独立产品审核阶段。\n",
+            )
+            adapter = SequentialNormalizeAdapter([
+                {
+                    "rules": {
+                        "hard_rules": ["Do not keep `process_moderation` in the default path."],
+                        "workflow_contracts": ["`input_moderation` pass -> `output_review` pass -> export."],
+                        "engineering_validation": [],
+                        "testing_contracts": [],
+                    }
+                },
+                {
+                    "rules": {
+                        "hard_rules": ["Do not keep `process_review` as an independent product review stage."],
+                        "workflow_contracts": ["`process_review` pass -> `output_review` pass -> export."],
+                        "engineering_validation": [],
+                        "testing_contracts": [],
+                    }
+                },
+            ])
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = adapter
+
+            result = orchestrator._ensure_agent_instructions_synced()
+
+            self.assertTrue(result.synced)
+            self.assertEqual(len(adapter.requests), 2)
+            self.assertIn("process_moderation", adapter.requests[1].prompt)
+            normalized = load_current_normalized_project_rules(project_root)
+            self.assertIsNotNone(normalized)
+            self.assertIn("process_review", "\n".join(normalized["hard_rules"] + normalized["workflow_contracts"]))
+            self.assertNotIn("process_moderation", "\n".join(normalized["hard_rules"] + normalized["workflow_contracts"]))
+
     def test_orchestrator_reuses_current_normalized_rules_without_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
             write_text(
                 project_rules_path(project_root),
-                "默认输出审核通过后必须直接进入 export，不能等待额外输出确认。\n",
+                "默认 `output_review` 通过后必须直接进入 export，不能等待 `awaiting_output_confirmation`。\n",
             )
             adapter = RecordingNormalizeAdapter()
             orchestrator = Orchestrator(project_root)
@@ -211,7 +290,7 @@ class AgentInstructionSyncTests(unittest.TestCase):
             Orchestrator.init_project(project_root, "demo", "mock")
             write_text(
                 project_rules_path(project_root),
-                "默认输出审核通过后必须直接进入 export，不能等待额外输出确认。\n",
+                "默认 `output_review` 通过后必须直接进入 export，不能等待 `awaiting_output_confirmation`。\n",
             )
             adapter = RecordingNormalizeAdapter("First normalized rule.")
             orchestrator = Orchestrator(project_root)
@@ -219,7 +298,7 @@ class AgentInstructionSyncTests(unittest.TestCase):
             orchestrator._ensure_agent_instructions_synced()
             write_text(
                 project_rules_path(project_root),
-                "默认输出审核通过后必须直接进入 export，不能等待额外输出确认。测试必须遵守该合同。\n",
+                "默认 `output_review` 通过后必须直接进入 export，不能等待 `awaiting_output_confirmation`。测试必须遵守该合同。\n",
             )
             adapter.hard_rule = "Second normalized rule."
 
@@ -235,7 +314,7 @@ class AgentInstructionSyncTests(unittest.TestCase):
             Orchestrator.init_project(project_root, "demo", "mock")
             write_text(
                 project_rules_path(project_root),
-                "默认输出审核通过后必须直接进入 export，不能等待额外输出确认。\n",
+                "默认 `output_review` 通过后必须直接进入 export，不能等待 `awaiting_output_confirmation`。\n",
             )
             adapter = RecordingNormalizeAdapter("Original normalized rule.")
             orchestrator = Orchestrator(project_root)

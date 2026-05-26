@@ -23,6 +23,7 @@ from .agent_instructions import (
     ensure_agent_instructions_synced,
     load_current_normalized_project_rules,
     normalized_project_rules_current,
+    normalized_project_rules_identifier_feedback,
     parse_normalized_project_rules_output,
     project_rules_are_meaningful,
     project_rules_source_sha256,
@@ -861,7 +862,10 @@ class Orchestrator:
             stage="normalize_project_rules",
             stage_key="normalize-project-rules",
             prompt=prompt,
-            validation_feedback=self._normalized_project_rules_validation_feedback,
+            validation_feedback=lambda result: self._normalized_project_rules_validation_feedback(
+                result,
+                source_text=source_text,
+            ),
             effort=effort,
         )
         rules = parse_normalized_project_rules_output(result.summary)
@@ -873,11 +877,20 @@ class Orchestrator:
         return rules
 
     @staticmethod
-    def _normalized_project_rules_validation_feedback(result: AgentResult) -> Optional[str]:
+    def _normalized_project_rules_validation_feedback(
+        result: AgentResult,
+        *,
+        source_text: str = "",
+    ) -> Optional[str]:
         try:
-            parse_normalized_project_rules_output(result.summary)
+            rules = parse_normalized_project_rules_output(result.summary)
         except ValueError as error:
             return str(error)
+        if source_text.strip():
+            return normalized_project_rules_identifier_feedback(
+                source_text=source_text,
+                rules=rules,
+            )
         return None
 
     def _run_interactive_clarify(self, state: RunState, spec_file: Path) -> RunState:

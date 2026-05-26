@@ -176,6 +176,32 @@ def parse_normalized_project_rules_output(text: str) -> Dict[str, List[str]]:
     return normalized
 
 
+def normalized_project_rules_identifier_feedback(
+    *,
+    source_text: str,
+    rules: Dict[str, List[str]],
+) -> Optional[str]:
+    source_identifiers = _code_like_identifiers(source_text)
+
+    introduced: List[str] = []
+    for items in rules.values():
+        for item in items:
+            for identifier in _code_like_identifiers(item):
+                if identifier not in source_identifiers and identifier not in introduced:
+                    introduced.append(identifier)
+
+    if not introduced:
+        return None
+    preview = ", ".join(introduced[:8])
+    if len(introduced) > 8:
+        preview += f", +{len(introduced) - 8} more"
+    return (
+        "normalized project rules introduced code-like identifiers that do not appear "
+        f"in the source document: {preview}. Preserve source identifiers verbatim; "
+        "do not infer, translate, rename, or invent implementation identifiers."
+    )
+
+
 def ensure_agent_instructions_synced(project_root: Path) -> AgentInstructionSyncResult:
     if _agent_instructions_current(project_root):
         return _sync_result_from_lock(project_root, synced=False)
@@ -250,6 +276,42 @@ def _loads_json_object(text: str) -> object:
     if start >= 0 and end > start:
         return json.loads(stripped[start : end + 1])
     raise ValueError("normalized project rules output did not contain a JSON object")
+
+
+_BACKTICK_IDENTIFIER_RE = re.compile(r"`([^`\n]+)`")
+_SEPARATOR_IDENTIFIER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?:\.?[A-Za-z0-9][A-Za-z0-9]*(?:[._/-][A-Za-z0-9][A-Za-z0-9]*)+)"
+    r"(?![A-Za-z0-9_])"
+)
+
+
+def _code_like_identifiers(text: str) -> set[str]:
+    identifiers: set[str] = set()
+    for raw in _BACKTICK_IDENTIFIER_RE.findall(str(text or "")):
+        candidate = raw.strip()
+        if _is_code_like_identifier(candidate, from_backtick=True):
+            identifiers.add(candidate)
+        for nested in _SEPARATOR_IDENTIFIER_RE.findall(candidate):
+            if _is_code_like_identifier(nested, from_backtick=True):
+                identifiers.add(nested)
+    for candidate in _SEPARATOR_IDENTIFIER_RE.findall(str(text or "")):
+        if _is_code_like_identifier(candidate):
+            identifiers.add(candidate)
+    return identifiers
+
+
+def _is_code_like_identifier(candidate: str, *, from_backtick: bool = False) -> bool:
+    value = str(candidate or "").strip().strip(".,;:()[]{}<>\"'")
+    if not value or " " in value:
+        return False
+    if not re.search(r"[A-Za-z]", value):
+        return False
+    if value.startswith(("http://", "https://")):
+        return False
+    if not from_backtick and "-" in value and not any(marker in value for marker in ("_", ".", "/")):
+        return False
+    return bool(_SEPARATOR_IDENTIFIER_RE.fullmatch(value))
 
 
 def _agent_instructions_current(project_root: Path) -> bool:
