@@ -185,10 +185,6 @@ DEFAULT_CONFIG = {
             "worktree_root": "",
         },
     },
-    "agent_instructions": {
-        "normalize_with_llm": True,
-        "normalization_effort_stage": "plan",
-    },
     "approvals": {
         "enabled": ["requirements", "architecture", "release"],
     },

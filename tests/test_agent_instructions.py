@@ -153,12 +153,12 @@ class AgentInstructionSyncTests(unittest.TestCase):
         self.assertEqual(payload["engineering_validation"], ["C"])
         self.assertEqual(payload["testing_contracts"], ["D"])
 
-    def test_orchestrator_normalizes_project_rules_with_plan_effort(self) -> None:
+    def test_orchestrator_normalizes_project_rules_with_sync_agent_instructions_effort(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
             config = load_project_config(project_root)
-            config.efforts["plan"] = "max"
+            config.efforts["sync-agent-instructions"] = "max"
             save_project_config(project_root, config)
             write_text(
                 project_rules_path(project_root),

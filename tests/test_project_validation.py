@@ -413,17 +413,13 @@ class ProjectValidationTests(unittest.TestCase):
         errors = validate_project_config_payload(payload)
         self.assertTrue(any("requires git.commit_each_task=true" in item for item in errors))
 
-    def test_validate_project_config_payload_rejects_invalid_agent_instructions_config(self) -> None:
+    def test_validate_project_config_payload_rejects_invalid_sync_agent_instructions_effort(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
-        payload["agent_instructions"] = {
-            "normalize_with_llm": "yes",
-            "normalization_effort_stage": "",
-        }
+        payload["efforts"]["sync-agent-instructions"] = "wrong"
 
         errors = validate_project_config_payload(payload)
 
-        self.assertTrue(any("agent_instructions.normalize_with_llm" in item for item in errors))
-        self.assertTrue(any("agent_instructions.normalization_effort_stage" in item for item in errors))
+        self.assertTrue(any("efforts.sync-agent-instructions" in item for item in errors))
 
     def test_validate_project_config_payload_accepts_config_without_docs(self) -> None:
         payload = {
@@ -490,11 +486,25 @@ class ProjectValidationTests(unittest.TestCase):
     def test_legacy_efforts_missing_defaulted_stages_are_accepted(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
         del payload["efforts"]["provider_research"]
+        del payload["efforts"]["sync-agent-instructions"]
 
         self.assertEqual(validate_project_config_payload(payload), [])
 
         config = ProjectConfig.from_dict(payload)
         self.assertEqual(config.efforts["provider_research"], "deep")
+        self.assertEqual(config.efforts["sync-agent-instructions"], "deep")
+
+    def test_project_config_ignores_legacy_agent_instructions_node(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        payload["agent_instructions"] = {
+            "normalize_with_llm": False,
+            "normalization_effort_stage": "design",
+        }
+
+        config = ProjectConfig.from_dict(payload)
+
+        self.assertEqual(config.efforts["sync-agent-instructions"], "deep")
+        self.assertNotIn("agent_instructions", config.to_dict())
 
     def test_validate_project_config_payload_still_requires_other_effort_stages(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)

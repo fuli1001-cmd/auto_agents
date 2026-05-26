@@ -20,7 +20,7 @@ TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALLOWED_TASK_STATUS = {"pending", "in_progress", "blocked", "done"}
 ALLOWED_EFFORTS = {"balanced", "deep", "max"}
 REQUIRED_EFFORT_STAGES = tuple(DEFAULT_EFFORTS)
-DEFAULTED_EFFORT_STAGES = {"provider_research", "arbiter"}
+DEFAULTED_EFFORT_STAGES = {"sync-agent-instructions", "provider_research", "arbiter"}
 REQUIRED_DOC_HEADINGS = {
     "project_brief.md": ("# Project Brief", "## Problem", "## MVP Scope", "## Non-Goals", "## Constraints"),
     "architecture.md": ("# Architecture", "## System Boundary", "## Core Modules", "## Data Flow", "## Risks"),
@@ -726,18 +726,6 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     errors.append("execution.parallel_tasks.worktree_root must be a string")
                 if enabled is True and isinstance(git, dict) and git.get("commit_each_task") is not True:
                     errors.append("execution.parallel_tasks.enabled requires git.commit_each_task=true")
-
-    agent_instructions = payload.get("agent_instructions")
-    if agent_instructions is not None:
-        if not isinstance(agent_instructions, dict):
-            errors.append("agent_instructions must be an object")
-        else:
-            normalize = agent_instructions.get("normalize_with_llm", True)
-            if not isinstance(normalize, bool):
-                errors.append("agent_instructions.normalize_with_llm must be a boolean")
-            effort_stage = agent_instructions.get("normalization_effort_stage", "plan")
-            if not isinstance(effort_stage, str) or not effort_stage.strip():
-                errors.append("agent_instructions.normalization_effort_stage must be a non-empty string")
 
     approvals = payload.get("approvals")
     if not isinstance(approvals, dict):

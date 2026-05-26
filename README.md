@@ -182,8 +182,9 @@ python3 -m auto_agents sync-agent-instructions --project /tmp/demo
 `sync-agent-instructions` uses the configured provider to normalize the human-readable source into
 `.auto-agents/project-rules.normalized.json`, then renders concise agent-facing rules from that
 structured file instead of copying the whole document into provider context. The normalization stage
-uses the same effort profile as `plan` by default and can be disabled with
-`agent_instructions.normalize_with_llm=false` in `.auto-agents/config.json`.
+uses `efforts.sync-agent-instructions` when configured, otherwise it falls back to `efforts.plan`.
+If `.auto-agents/project-rules.md` is empty or clearly placeholder text, auto_agents skips the LLM
+call and emits only the default engineering rules.
 
 `run`, `fix`, `collab`, and `provider-resolve` automatically check the source hash and generated file
 hashes before starting agent work. If `.auto-agents/project-rules.md` changes, or if a generated

@@ -794,8 +794,6 @@ class Orchestrator:
         return state
 
     def _ensure_agent_instructions_synced(self) -> AgentInstructionSyncResult:
-        if not self.config.agent_instructions.normalize_with_llm:
-            return ensure_agent_instructions_synced(self.project_root)
         if not project_rules_are_meaningful(self.project_root):
             return ensure_agent_instructions_synced(self.project_root)
 
@@ -850,8 +848,10 @@ class Orchestrator:
             "Source markdown:",
             source_text,
         ])
-        effort_stage = self.config.agent_instructions.normalization_effort_stage or "plan"
-        effort = self.config.efforts.get(effort_stage, self.config.efforts.get("plan", "deep"))
+        effort = self.config.efforts.get(
+            "sync-agent-instructions",
+            self.config.efforts.get("plan", "deep"),
+        )
         result = self._run_agent_with_retries(
             state=None,
             stage="normalize_project_rules",
