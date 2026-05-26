@@ -432,6 +432,12 @@ class ProjectConfig:
                 "Invalid config format: expected 'providers' and 'active_provider'. "
                 "Re-run 'auto_agents init' to regenerate the config."
             )
+        if "agent_instructions" in data:
+            raise ValueError(
+                "Invalid config format: 'agent_instructions' is no longer supported. "
+                "Move sync-agent-instructions effort into 'efforts.sync-agent-instructions' "
+                "and re-run 'auto_agents init' or update the project config."
+            )
 
         providers = {
             str(kind): ProviderConfig.from_dict(dict(raw))

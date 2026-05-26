@@ -588,6 +588,10 @@ def validate_project_config_payload(payload: object) -> List[str]:
     project_name = payload.get("project_name")
     if not isinstance(project_name, str) or not project_name.strip():
         errors.append("project_name must be a non-empty string")
+    if "agent_instructions" in payload:
+        errors.append(
+            "agent_instructions is no longer supported; use efforts.sync-agent-instructions instead"
+        )
 
     providers = payload.get("providers")
     if not isinstance(providers, dict) or not providers:

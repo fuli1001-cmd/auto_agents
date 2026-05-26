@@ -494,17 +494,18 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertEqual(config.efforts["provider_research"], "deep")
         self.assertEqual(config.efforts["sync-agent-instructions"], "deep")
 
-    def test_project_config_ignores_legacy_agent_instructions_node(self) -> None:
+    def test_project_config_rejects_legacy_agent_instructions_node(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
         payload["agent_instructions"] = {
             "normalize_with_llm": False,
             "normalization_effort_stage": "design",
         }
 
-        config = ProjectConfig.from_dict(payload)
+        errors = validate_project_config_payload(payload)
+        self.assertTrue(any("agent_instructions is no longer supported" in item for item in errors))
 
-        self.assertEqual(config.efforts["sync-agent-instructions"], "deep")
-        self.assertNotIn("agent_instructions", config.to_dict())
+        with self.assertRaisesRegex(ValueError, "agent_instructions"):
+            ProjectConfig.from_dict(payload)
 
     def test_validate_project_config_payload_still_requires_other_effort_stages(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
