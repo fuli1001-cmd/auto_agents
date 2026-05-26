@@ -859,8 +859,8 @@ class Orchestrator:
         )
         result = self._run_agent_with_retries(
             state=None,
-            stage="normalize_project_rules",
-            stage_key="normalize-project-rules",
+            stage="sync-agent-instructions",
+            stage_key="sync-agent-instructions",
             prompt=prompt,
             validation_feedback=lambda result: self._normalized_project_rules_validation_feedback(
                 result,

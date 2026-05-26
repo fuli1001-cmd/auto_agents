@@ -197,7 +197,7 @@ class AgentInstructionSyncTests(unittest.TestCase):
 
             self.assertTrue(result.synced)
             self.assertEqual(len(adapter.requests), 1)
-            self.assertEqual(adapter.requests[0].stage, "normalize_project_rules")
+            self.assertEqual(adapter.requests[0].stage, "sync-agent-instructions")
             self.assertEqual(adapter.requests[0].effort, "max")
             self.assertIn("Preserve source identifiers", adapter.requests[0].prompt)
             self.assertIn("Never replace a source identifier", adapter.requests[0].prompt)

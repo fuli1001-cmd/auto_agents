@@ -107,7 +107,7 @@ class ProjectValidationTests(unittest.TestCase):
                 "default_max_attempts": 0,
                 "per_stage": {
                     "plan": 2,
-                    "normalize_project_rules": 2,
+                    "sync-agent-instructions": 2,
                     "unknown": 1,
                 },
             },
@@ -1365,7 +1365,7 @@ class ProjectValidationTests(unittest.TestCase):
 
             config = load_project_config(project_root)
             self.assertEqual(config.retries.per_stage["implement"], 4)
-            self.assertEqual(config.retries.per_stage["normalize_project_rules"], 2)
+            self.assertEqual(config.retries.per_stage["sync-agent-instructions"], 2)
 
     def test_copilot_cli_adapter_builds_command_with_profile_config_dir(self) -> None:
         from auto_agents.adapters.copilot_cli import CopilotCliAdapter, DEFAULT_PROFILES_ROOT

@@ -762,7 +762,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     "clarify",
                     "design",
                     "plan",
-                    "normalize_project_rules",
+                    "sync-agent-instructions",
                     "provider_research",
                     "implement",
                     "review",

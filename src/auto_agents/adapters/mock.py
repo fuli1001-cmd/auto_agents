@@ -15,7 +15,7 @@ class MockAdapter(AgentAdapter):
         content = f"MOCK stage={request.stage} effort={request.effort}\n"
         if request.stage == "clarify":
             content += "READY_TO_GENERATE\n"
-        elif request.stage == "normalize_project_rules":
+        elif request.stage == "sync-agent-instructions":
             hard_rules = []
             if "Default output review pass must proceed to export" in request.prompt:
                 hard_rules.append("Default output review pass must proceed to export.")

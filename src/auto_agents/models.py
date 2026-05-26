@@ -39,7 +39,7 @@ DEFAULT_RETRY_PER_STAGE = {
     "clarify": 2,
     "design": 2,
     "plan": 3,
-    "normalize_project_rules": 2,
+    "sync-agent-instructions": 2,
     "provider_research": 2,
     "implement": 4,
     "review": 2,
