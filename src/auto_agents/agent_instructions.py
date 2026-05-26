@@ -13,7 +13,7 @@ from .io_utils import read_json, read_text, write_json, write_text
 
 MAX_ROOT_AGENTS_CHARS = 2800
 MAX_COPILOT_ROOT_CHARS = 1800
-MAX_PROJECT_INSTRUCTIONS_CHARS = 3600
+MAX_PROJECT_INSTRUCTIONS_CHARS = 5200
 MAX_RULE_CHARS = 220
 NORMALIZED_RULE_KEYS = (
     "hard_rules",
@@ -24,8 +24,6 @@ NORMALIZED_RULE_KEYS = (
 
 
 DEFAULT_ENGINEERING_RULES = """# Project Agent Instructions
-
-These instructions apply to Codex, GitHub Copilot CLI, and other coding agents working in this repository.
 
 ## Working Rules
 
@@ -56,8 +54,6 @@ applyTo: "app/**,tests/**,specs/**"
 ---
 
 # Product Contract Rules
-
-Follow the repository rules in `AGENTS.md`. These project-specific rules are extracted from `.auto-agents/project-rules.md`.
 """
 
 
@@ -305,7 +301,6 @@ def _render_generated_files(extracted: Dict[str, List[str]]) -> Dict[str, str]:
     return {
         "AGENTS.md": _limit_markdown(
             _join_sections(
-                GENERATED_NOTICE,
                 DEFAULT_ENGINEERING_RULES.strip(),
                 _agents_project_summary(internal_rules),
             ),
@@ -313,7 +308,6 @@ def _render_generated_files(extracted: Dict[str, List[str]]) -> Dict[str, str]:
         ),
         ".github/copilot-instructions.md": _limit_markdown(
             _join_sections(
-                GENERATED_NOTICE,
                 COPILOT_ROOT_RULES.strip(),
                 _copilot_project_summary(internal_rules),
             ),
@@ -321,7 +315,6 @@ def _render_generated_files(extracted: Dict[str, List[str]]) -> Dict[str, str]:
         ),
         ".github/instructions/product-contract.instructions.md": _limit_markdown(
             _join_sections(
-                GENERATED_NOTICE,
                 PRODUCT_CONTRACT_HEADER.strip(),
                 _product_contract_instructions(internal_rules),
             ),
@@ -351,22 +344,24 @@ def _remove_legacy_generated_files(root: Path) -> None:
 
 def _agents_project_summary(extracted: Dict[str, List[str]]) -> str:
     bullets = _merge_unique(
+        _priority_rules(extracted["must"], limit=7),
+        _priority_rules(extracted["workflow"], limit=4),
+        _priority_rules(extracted["testing"], limit=3),
         extracted["must"],
-        extracted["workflow"][:4],
-        extracted["testing"][:3],
         limit=10,
     )
     if not bullets:
         return "# Project-Specific Rules\n\nNo project-specific rules are currently defined."
-    return _rule_section(
-        "# Project-Specific Rules",
-        bullets,
-        footer="See `.auto-agents/project-rules.md` for the human-readable source.",
-    )
+    return _rule_section("# Project-Specific Rules", bullets)
 
 
 def _copilot_project_summary(extracted: Dict[str, List[str]]) -> str:
-    bullets = _merge_unique(extracted["must"], extracted["workflow"][:3], limit=7)
+    bullets = _merge_unique(
+        _priority_rules(extracted["must"], limit=5),
+        _priority_rules(extracted["workflow"], limit=3),
+        extracted["must"],
+        limit=7,
+    )
     if not bullets:
         return "Project-specific rules are not currently defined."
     return _rule_section("Project-specific rules:", bullets)
@@ -376,12 +371,31 @@ def _product_contract_instructions(extracted: Dict[str, List[str]]) -> str:
     if not any(extracted.values()):
         return "No project-specific product contract is currently defined."
     sections = [
-        _rule_section("## Hard Rules", extracted["must"][:8]),
-        _rule_section("## Workflow Contracts", extracted["workflow"][:8]),
-        _rule_section("## Engineering Validation", extracted["validation"][:6]),
-        _rule_section("## Testing Contracts", extracted["testing"][:6]),
+        _rule_section("## Hard Rules", _priority_rules(extracted["must"], limit=12)),
+        _rule_section("## Workflow Contracts", _priority_rules(extracted["workflow"], limit=12)),
+        _rule_section("## Engineering Validation", _priority_rules(extracted["validation"], limit=10)),
+        _rule_section("## Testing Contracts", _priority_rules(extracted["testing"], limit=8)),
     ]
     return _join_sections(*sections)
+
+
+def _priority_rules(rules: Sequence[str], *, limit: int) -> List[str]:
+    return _merge_unique(
+        [rule for rule in rules if _high_priority_rule(rule)],
+        rules,
+        limit=limit,
+    )
+
+
+def _high_priority_rule(rule: str) -> bool:
+    lowered = rule.lower()
+    markers = (
+        "default", "direct", "transition", "state", "mode", "must", "only",
+        "never", "do not", "enum", "result", "test", "assert", "->",
+        "默认", "直接", "状态", "模式", "必须", "只能", "不要", "不能",
+        "不再", "结果", "测试", "断言",
+    )
+    return any(marker in lowered or marker in rule for marker in markers)
 
 
 def _extract_project_rules(project_rules: str) -> Dict[str, List[str]]:
