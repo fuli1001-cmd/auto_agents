@@ -758,7 +758,16 @@ def validate_project_config_payload(payload: object) -> List[str]:
             errors.append("retries.per_stage must be an object")
         else:
             for key, value in per_stage.items():
-                if key not in ("clarify", "design", "plan", "provider_research", "implement", "review", "arbiter"):
+                if key not in (
+                    "clarify",
+                    "design",
+                    "plan",
+                    "normalize_project_rules",
+                    "provider_research",
+                    "implement",
+                    "review",
+                    "arbiter",
+                ):
                     errors.append(f"retries.per_stage contains unknown stage '{key}'")
                 if not isinstance(value, int) or value < 1:
                     errors.append(f"retries.per_stage.{key} must be an integer >= 1")
