@@ -1387,6 +1387,8 @@ class Orchestrator:
     def _worktree_change_snapshot(self) -> Dict[str, str]:
         snapshot: Dict[str, str] = {}
         for status, path in changed_entries(self.project_root, ignored_prefixes=()):
+            if path.startswith(".antigravitycli/"):
+                continue
             hasher = hashlib.sha256()
             hasher.update(status.encode("utf-8"))
             hasher.update(b"\0")
@@ -1409,7 +1411,7 @@ class Orchestrator:
         candidates = [
             path
             for _, path in changed_entries(self.project_root, ignored_prefixes=())
-            if self._is_ephemeral_tooling_artifact(path)
+            if not path.startswith(".antigravitycli/") and self._is_ephemeral_tooling_artifact(path)
         ]
         for path in candidates:
             file_path = self.project_root / path
@@ -2216,7 +2218,7 @@ class Orchestrator:
             worker_commit_sha = commit_all_except(
                 worktree_path,
                 commit_message,
-                exclude_prefixes=(".auto-agents",),
+                exclude_prefixes=(".auto-agents", ".antigravitycli"),
             )
             return {
                 "ok": True,

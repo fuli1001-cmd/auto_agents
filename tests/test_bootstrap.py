@@ -57,6 +57,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertIn(".data/", gitignore)
             self.assertIn(".tmp/", gitignore)
             self.assertIn(".tmp-tests/", gitignore)
+            self.assertIn(".antigravitycli/", gitignore)
             config = load_project_config(project_root)
             self.assertEqual(config.docs.language, "en")
             self.assertEqual(config.active_provider, "mock")

@@ -86,6 +86,37 @@ class GitOpsWorktreeTests(unittest.TestCase):
                 original_plan,
             )
 
+    def test_antigravitycli_ignored(self) -> None:
+        from auto_agents.git_ops import changed_entries, changed_paths, hard_reset_clean
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            commit_all(project_root, "test: init")
+
+            # Create an untracked file in .antigravitycli and a regular untracked file
+            anti_dir = project_root / ".antigravitycli"
+            anti_dir.mkdir(parents=True, exist_ok=True)
+            (anti_dir / "session.json").write_text('{"history": []}', encoding="utf-8")
+            (project_root / "foo.txt").write_text("untracked", encoding="utf-8")
+
+            # Check changed_entries
+            entries = changed_entries(project_root)
+            paths = [p for _, p in entries]
+            self.assertIn("foo.txt", paths)
+            self.assertNotIn(".antigravitycli/session.json", paths)
+
+            # Check changed_paths
+            all_paths = changed_paths(project_root)
+            self.assertIn("foo.txt", all_paths)
+            self.assertNotIn(".antigravitycli/session.json", all_paths)
+
+            # Check hard_reset_clean preserves .antigravitycli/ but removes foo.txt
+            success = hard_reset_clean(project_root)
+            self.assertTrue(success)
+            self.assertTrue((anti_dir / "session.json").exists())
+            self.assertFalse((project_root / "foo.txt").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

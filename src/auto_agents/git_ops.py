@@ -83,7 +83,7 @@ def changed_files(project_root: Path) -> str:
 
 def changed_entries(
     project_root: Path,
-    ignored_prefixes: tuple[str, ...] = (".auto-agents/",),
+    ignored_prefixes: tuple[str, ...] = (".auto-agents/", ".antigravitycli/"),
 ) -> list[tuple[str, str]]:
     process = _git(project_root, "status", "--porcelain=v1", "-uall")
     if process.returncode != 0:
@@ -101,11 +101,11 @@ def changed_entries(
     return entries
 
 
-def changed_paths(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/",)) -> list[str]:
+def changed_paths(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/", ".antigravitycli/")) -> list[str]:
     return [path for _, path in changed_entries(project_root, ignored_prefixes=ignored_prefixes)]
 
 
-def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/",)) -> str:
+def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/", ".antigravitycli/")) -> str:
     hasher = hashlib.sha256()
     for path in changed_paths(project_root, ignored_prefixes=ignored_prefixes):
         hasher.update(path.encode("utf-8"))
@@ -169,7 +169,7 @@ def abort_cherry_pick(project_root: Path) -> None:
 def hard_reset_clean(
     project_root: Path,
     ref: str = "HEAD",
-    preserve_prefixes: tuple[str, ...] = (".auto-agents/",),
+    preserve_prefixes: tuple[str, ...] = (".auto-agents/", ".antigravitycli/"),
 ) -> bool:
     """Hard-reset tracked files to *ref* and remove untracked files.
 

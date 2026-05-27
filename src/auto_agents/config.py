@@ -34,6 +34,7 @@ node_modules/
 .tmp/
 .tmp-tests/
 .DS_Store
+.antigravitycli/
 """
 AUTO_GITIGNORE_ENTRIES = (
     "runs/",
