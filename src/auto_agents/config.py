@@ -159,6 +159,21 @@ DEFAULT_CONFIG = {
             "timeout_seconds": 3600,
             "idle_timeout_seconds": DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
         },
+        "antigravity": {
+            "kind": "antigravity",
+            "binary": "agy-proxy",
+            "profile_map": {
+                "balanced": "gemini-2.5-flash",
+                "deep": "Claude Opus 4.6 (Thinking)",
+                "max": "Claude Opus 4.6 (Thinking)",
+            },
+            "extra_args": [],
+            "cwd_flag": "",
+            "prompt_via_stdin": True,
+            "output_flag": "",
+            "timeout_seconds": 1800,
+            "idle_timeout_seconds": 3600,
+        },
     },
     "active_provider": "codex",
     "docs": {

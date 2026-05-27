@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, TextIO, Tuple
 
-from .adapters import CodexAdapter, CopilotCliAdapter, MockAdapter, ShellAdapter
+from .adapters import CodexAdapter, CopilotCliAdapter, AntigravityAdapter, MockAdapter, ShellAdapter
 from .agent_instructions import (
     GENERATED_AGENT_INSTRUCTION_PATHS,
     LEGACY_GENERATED_AGENT_INSTRUCTION_PATHS,
@@ -751,6 +751,8 @@ class Orchestrator:
             return CodexAdapter(config.provider)
         if config.provider.kind == "copilot-cli":
             return CopilotCliAdapter(config.provider)
+        if config.provider.kind == "antigravity":
+            return AntigravityAdapter(config.provider)
         if config.provider.kind == "mock":
             return MockAdapter()
         return ShellAdapter(config.provider)
@@ -6022,6 +6024,8 @@ class Orchestrator:
             return CodexAdapter(prov)
         if prov.kind == "copilot-cli":
             return CopilotCliAdapter(prov)
+        if prov.kind == "antigravity":
+            return AntigravityAdapter(prov)
         if prov.kind == "mock":
             return MockAdapter()
         return ShellAdapter(prov)

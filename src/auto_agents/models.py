@@ -16,7 +16,7 @@ SESSION_STALL_THRESHOLD = 3
 SESSION_AGENT_ERROR_THRESHOLD = 5
 SESSION_HARD_CEILING = {"fix": 15, "collab": 25, "provider_resolve": 15}
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
-SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli")
+SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity")
 DEFAULT_EFFORTS = {
     "clarify": "deep",
     "design": "deep",
