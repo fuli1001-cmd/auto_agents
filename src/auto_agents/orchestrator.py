@@ -6094,6 +6094,7 @@ class Orchestrator:
         save_project_config(self.project_root, self.config)
 
     def _set_active_provider(self, provider_kind: str) -> None:
+        self._current_provider = provider_kind
         if self.config.active_provider == provider_kind:
             return
         self.config.set_active_provider(provider_kind)
