@@ -62,6 +62,8 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(config.active_provider, "mock")
             self.assertIn("codex", config.providers)
             self.assertIn("copilot-cli", config.providers)
+            self.assertIn("antigravity-claude", config.providers)
+            self.assertIn("antigravity-gemini", config.providers)
             self.assertIn("mock", config.providers)
 
     def test_init_project_bootstraps_copilot_cli_profile_map(self) -> None:

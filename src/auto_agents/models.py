@@ -412,6 +412,36 @@ class ProjectConfig:
                 timeout_seconds=DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS,
                 idle_timeout_seconds=DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
             ),
+            "antigravity-claude": ProviderConfig(
+                kind="antigravity",
+                binary="agy-proxy",
+                profile_map={
+                    "balanced": "Claude Sonnet 4.6 (Thinking)",
+                    "deep": "Claude Opus 4.6 (Thinking)",
+                    "max": "Claude Opus 4.6 (Thinking)",
+                },
+                extra_args=[],
+                cwd_flag="",
+                prompt_via_stdin=True,
+                output_flag="",
+                timeout_seconds=7200,
+                idle_timeout_seconds=7200,
+            ),
+            "antigravity-gemini": ProviderConfig(
+                kind="antigravity",
+                binary="agy-proxy",
+                profile_map={
+                    "balanced": "Gemini 3.5 Flash (Low)",
+                    "deep": "Gemini 3.5 Flash (Medium)",
+                    "max": "Gemini 3.5 Flash (High)",
+                },
+                extra_args=[],
+                cwd_flag="",
+                prompt_via_stdin=True,
+                output_flag="",
+                timeout_seconds=7200,
+                idle_timeout_seconds=7200,
+            ),
         }
     )
     active_provider: str = "codex"

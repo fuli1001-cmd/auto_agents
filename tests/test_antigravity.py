@@ -58,8 +58,8 @@ def test_antigravity_run_settings_override_and_restoration(tmp_path):
         kind="antigravity",
         binary="agy-proxy",
         profile_map={
-            "balanced": "gemini-2.5-flash",
-            "deep": "Claude Opus 4.6 (Thinking)",
+            "balanced": "Gemini 3.5 Flash (High)",
+            "deep": "Gemini 3.5 Flash (High)",
         },
     )
     adapter = AntigravityAdapter(config)
@@ -87,13 +87,13 @@ def test_antigravity_run_settings_override_and_restoration(tmp_path):
         # Before run, settings has old-model
         assert json.loads(settings_file.read_text(encoding="utf-8"))["model"] == "old-model"
 
-        # Under the hood during run, settings is temporarily overwritten with "Claude Opus 4.6 (Thinking)"
+        # Under the hood during run, settings is temporarily overwritten with "Gemini 3.5 Flash (High)"
         # and restored afterwards. Let's verify that run succeeds and settings is restored.
         result = adapter.run(request)
 
         assert result.ok is True
         assert result.summary == "output from agy"
-        assert result.model == "Claude Opus 4.6 (Thinking)"
+        assert result.model == "Gemini 3.5 Flash (High)"
         
         # After run, settings is restored back to old-model
         assert json.loads(settings_file.read_text(encoding="utf-8"))["model"] == "old-model"
