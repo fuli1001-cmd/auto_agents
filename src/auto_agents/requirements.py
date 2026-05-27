@@ -4,7 +4,7 @@ import datetime as _dt
 import os
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from .config import (
     provider_references_lock_path,
@@ -489,7 +489,12 @@ def validate_task_requirement_proofs(plan_payload: object, trace_payload: dict) 
                 ):
                     errors.append(f"{prefix} {key} must be a list of strings")
             require_verified = str(task.get("status", "")).strip() == "done"
-            for message in _proof_contract_messages(by_req[req_id], proof, require_verified=require_verified):
+            for message in _proof_contract_messages(
+                by_req[req_id],
+                proof,
+                require_verified=require_verified,
+                oracle=matched_oracle[1] if matched_oracle is not None else "",
+            ):
                 errors.append(f"{prefix} {message}")
             proofs_by_requirement.setdefault(req_id, []).append(proof)
 
@@ -575,6 +580,66 @@ def _proof_list_field(proof: dict, key: str) -> List[str]:
     return [str(item).strip() for item in values if str(item).strip()]
 
 
+def _evidence_ref_path(ref: str) -> str:
+    value = str(ref).strip()
+    if "::" in value:
+        value = value.split("::", 1)[0]
+    return value.replace("\\", "/").strip()
+
+
+def _is_executable_test_evidence_ref(ref: str) -> bool:
+    path = _evidence_ref_path(ref)
+    file_name = path.rsplit("/", 1)[-1].lower()
+    if path.endswith(".py"):
+        return (
+            file_name.startswith("test_")
+            or file_name.endswith("_test.py")
+            or "/tests/" in f"/{path}"
+        )
+    return file_name.endswith(
+        (
+            ".test.js",
+            ".test.jsx",
+            ".test.ts",
+            ".test.tsx",
+            ".spec.js",
+            ".spec.jsx",
+            ".spec.ts",
+            ".spec.tsx",
+        )
+    )
+
+
+def _documentation_oracle_messages(oracle: str, proof: dict) -> List[str]:
+    lowered = oracle.lower()
+    documentation_markers = (
+        "document",
+        "documentation",
+        "docs",
+        ".md",
+        "readme",
+        "文档",
+    )
+    if not any(marker in lowered for marker in documentation_markers):
+        return []
+
+    evidence_refs = _proof_list_field(proof, "evidence_refs")
+    messages: List[str] = []
+    if not any(_is_executable_test_evidence_ref(ref) for ref in evidence_refs):
+        messages.append("documentation oracle proof must include an executable test evidence_ref")
+
+    architecture_markers = ("architecture.md", "architecture doc", "架构文档", "架构")
+    if any(marker in lowered for marker in architecture_markers):
+        if not any(
+            _evidence_ref_path(ref).endswith(".auto-agents/docs/architecture.md")
+            or _evidence_ref_path(ref).endswith("architecture.md")
+            for ref in evidence_refs
+        ):
+            messages.append("architecture documentation oracle proof must cite .auto-agents/docs/architecture.md")
+
+    return messages
+
+
 def _rank_meets(value: str, required: str, ranking: Dict[str, int]) -> bool:
     if required not in ranking:
         return True
@@ -588,6 +653,7 @@ def _proof_contract_messages(
     proof: dict,
     *,
     require_verified: bool,
+    oracle: str = "",
 ) -> List[str]:
     required_type = str(requirement.get("oracle_type", "")).strip()
     required_strength = str(requirement.get("oracle_strength", "")).strip()
@@ -634,6 +700,8 @@ def _proof_contract_messages(
     missing_forbidden = sorted(forbidden_proxy_set - recorded_forbidden)
     if missing_forbidden:
         messages.append("does not record forbidden proxy exclusion(s): " + ", ".join(missing_forbidden))
+    if oracle:
+        messages.extend(_documentation_oracle_messages(oracle, proof))
     return messages
 
 
@@ -728,7 +796,12 @@ def validate_done_task_requirement_proofs(task: TaskSpec, trace_payload: dict) -
                         "message": f"{prefix} {message}",
                     }
                 )
-        for message in _proof_contract_messages(requirement, proof, require_verified=True):
+        for message in _proof_contract_messages(
+            requirement,
+            proof,
+            require_verified=True,
+            oracle=matched_oracle[1] if matched_oracle is not None else "",
+        ):
             findings.append(
                 {
                     "kind": "oracle_proof_invalid",
@@ -784,7 +857,12 @@ def _oracle_proof_findings(requirement: dict, proofs: List[Tuple[TaskSpec, dict]
         oracle_ok = False
         proof_messages: List[str] = []
         for task, proof in matching:
-            local_messages = _proof_contract_messages(requirement, proof, require_verified=True)
+            local_messages = _proof_contract_messages(
+                requirement,
+                proof,
+                require_verified=True,
+                oracle=oracle,
+            )
             local_messages.extend(
                 _oracle_preservation_messages(_task_contract_text_from_spec(task), oracle)
             )
@@ -992,7 +1070,12 @@ def audit_requirements(project_root: Path, tasks: Iterable[TaskSpec]) -> Tuple[b
     return bool(result["ok"]), str(result["report"])
 
 
-def _forbidden_pattern_findings(project_root: Path, requirement: dict) -> List[dict]:
+def forbidden_pattern_findings(
+    project_root: Path,
+    requirement: dict,
+    *,
+    include_paths: Optional[Iterable[str]] = None,
+) -> List[dict]:
     status = str(requirement.get("status", "active")).strip()
     if status != "active":
         return []
@@ -1014,6 +1097,11 @@ def _forbidden_pattern_findings(project_root: Path, requirement: dict) -> List[d
         ".auto-agents/state/provider_references.lock.json",
         ".auto-agents/docs/requirements_audit.md",
     }
+    included = {
+        str(path).strip().replace("\\", "/")
+        for path in (include_paths or [])
+        if str(path).strip()
+    }
     for root, dirs, files in os.walk(project_root):
         rel_root = str(Path(root).relative_to(project_root)).replace("\\", "/")
         dirs[:] = [
@@ -1026,6 +1114,8 @@ def _forbidden_pattern_findings(project_root: Path, requirement: dict) -> List[d
             path = Path(root) / filename
             rel = str(path.relative_to(project_root)).replace("\\", "/")
             if rel in ignored_files:
+                continue
+            if included and rel not in included:
                 continue
             if path.suffix.lower() not in {".py", ".md", ".json", ".toml", ".yaml", ".yml", ".ts", ".tsx", ".js", ".jsx"}:
                 continue
@@ -1044,6 +1134,10 @@ def _forbidden_pattern_findings(project_root: Path, requirement: dict) -> List[d
                         }
                     )
     return findings
+
+
+def _forbidden_pattern_findings(project_root: Path, requirement: dict) -> List[dict]:
+    return forbidden_pattern_findings(project_root, requirement)
 
 
 def write_provider_reference_lock(project_root: Path, payload: dict) -> None:

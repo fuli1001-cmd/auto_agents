@@ -658,6 +658,69 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("uses forbidden proxy oracle", report)
 
+    def test_architecture_documentation_oracle_requires_test_and_doc_evidence(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(
+                    acceptance_oracles=[
+                        "architecture.md must not describe process review as a third content review."
+                    ],
+                )
+            ],
+        }
+        task = TaskSpec(
+            task_id="task-001",
+            title="Clean architecture docs",
+            description="Update architecture.md.",
+            acceptance=["architecture.md must not describe process review as a third content review."],
+            requirement_ids=["REQ-001"],
+            requirement_proofs=[
+                _proof(
+                    acceptance_oracle="architecture.md must not describe process review as a third content review.",
+                    evidence_refs=["tests/test_contract_docs.py::test_architecture_contract"],
+                )
+            ],
+            status="done",
+        )
+
+        findings = validate_done_task_requirement_proofs(task, trace)
+
+        self.assertTrue(any("must cite .auto-agents/docs/architecture.md" in item["message"] for item in findings))
+
+    def test_architecture_documentation_oracle_accepts_test_plus_doc_evidence(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(
+                    acceptance_oracles=[
+                        "architecture.md must not describe process review as a third content review."
+                    ],
+                )
+            ],
+        }
+        task = TaskSpec(
+            task_id="task-001",
+            title="Clean architecture docs",
+            description="Update architecture.md.",
+            acceptance=["architecture.md must not describe process review as a third content review."],
+            requirement_ids=["REQ-001"],
+            requirement_proofs=[
+                _proof(
+                    acceptance_oracle="architecture.md must not describe process review as a third content review.",
+                    evidence_refs=[
+                        "tests/test_contract_docs.py::test_architecture_contract",
+                        ".auto-agents/docs/architecture.md",
+                    ],
+                )
+            ],
+            status="done",
+        )
+
+        findings = validate_done_task_requirement_proofs(task, trace)
+
+        self.assertEqual(findings, [])
+
     def test_requirements_trace_rejects_invalid_quality_contract_values(self) -> None:
         trace = {"version": 1, "requirements": [_requirement(
             oracle_type="legacy_gateway",

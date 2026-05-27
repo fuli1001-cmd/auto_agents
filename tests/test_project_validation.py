@@ -1651,6 +1651,66 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(analysis["kind"], "design")
             self.assertIn("Detected spec profile: design", prompt)
             self.assertIn("Treat the input spec as the primary architecture source", prompt)
+            self.assertIn("Read the requirements trace", prompt)
+            self.assertIn("must not contradict any active mandatory requirement", prompt)
+
+    def test_clarify_prompt_requires_forbidden_patterns_for_removed_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\nRemove the legacy process review path.\n")
+
+            prompt = orchestrator._build_prompt("clarify", spec_file)
+
+            self.assertIn("add precise forbidden_patterns regexes", prompt)
+            self.assertIn("stale terms or old semantic claims", prompt)
+
+    def test_design_validation_rejects_architecture_forbidden_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Architecture must remove legacy review semantics.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["architecture.md no longer describes the legacy process review path"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": ["legacy_process_review"],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_text(
+                project_root / ".auto-agents" / "docs" / "architecture.md",
+                "# Architecture\n\n"
+                "## System Boundary\nlegacy_process_review remains in the workflow.\n\n"
+                "## Core Modules\n- API\n\n"
+                "## Data Flow\nRequest to task.\n\n"
+                "## Risks\n- Drift.\n",
+            )
+
+            feedback = orchestrator._design_validation_feedback(
+                AgentResult(ok=True, command=[], output_path=project_root / "out.txt")
+            )
+
+            self.assertIsNotNone(feedback)
+            self.assertIn(".auto-agents/docs/architecture.md violates REQ-001", feedback or "")
 
     def test_spec_analysis_classifies_mixed_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

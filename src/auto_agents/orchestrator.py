@@ -81,6 +81,7 @@ from .models import (
 from .requirements import (
     external_doc_requirements,
     format_requirement_context,
+    forbidden_pattern_findings,
     load_provider_references_lock,
     load_requirements_trace,
     provider_reference_status,
@@ -2043,6 +2044,17 @@ class Orchestrator:
 
         gate_result = self._execute_task_with_retries(state, task, resume_existing=resume_existing)
         if not gate_result["ok"]:
+            rewind_stage = str(gate_result.get("rewind_to_stage", "")).strip()
+            if rewind_stage:
+                rewind_state = self._handle_review_stage_rewind(
+                    state,
+                    task,
+                    tasks,
+                    gate_result,
+                    rewind_stage,
+                )
+                if rewind_state is not None:
+                    return rewind_state
             if gate_result.get("rewind_to_plan"):
                 rewind_state = self._handle_scope_overflow_rewind(
                     state, task, tasks, gate_result
@@ -2269,6 +2281,53 @@ class Orchestrator:
             title=task.title,
         )
         return commit_all(self.project_root, commit_message)
+
+    def _handle_review_stage_rewind(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        tasks: List[TaskSpec],
+        gate_result: Dict[str, object],
+        target_stage: str,
+    ) -> Optional[RunState]:
+        if target_stage not in STAGE_ORDER or STAGE_ORDER.index(target_stage) >= STAGE_ORDER.index("implement"):
+            return None
+
+        baseline_ref = (
+            task.verify_baseline_ref
+            or state.implement_verify_baseline_ref
+            or state.stage_summaries.get("implement_baseline_ref", "")
+        )
+        rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
+        if not hard_reset_clean(self.project_root, rewind_ref):
+            raise RuntimeError(
+                "review-stage rewind failed to restore the baseline before "
+                f"returning task {task.task_id} to {target_stage}. Resolved git ref: {rewind_ref}."
+            )
+
+        task.status = "pending"
+        task.review_summary = str(gate_result.get("review", ""))
+        task.commit_sha = ""
+        self._persist_tasks(tasks)
+
+        state.tasks = tasks
+        reason_lines = [
+            str(gate_result.get("rewind_reason", "")).strip()
+            or f"review feedback points to a {target_stage}-owned artifact",
+            "",
+            "Review feedback:",
+            str(gate_result.get("review", "")).strip(),
+        ]
+        self._rewind_state_from_stage(state, target_stage)
+        state.rejected_stage = target_stage
+        state.rejection_reason = "\n".join(line for line in reason_lines if line is not None).strip()
+        state.last_error = f"review rejected task {task.task_id}; rewinding to {target_stage}"
+        save_run_state(self.project_root, state)
+        self._emit_task_blocked(
+            task,
+            f"review rejected the task; rewinding to {target_stage}",
+        )
+        return state
 
     def _handle_scope_overflow_rewind(
         self,
@@ -2657,6 +2716,27 @@ class Orchestrator:
         return path.replace("\\", "/").strip().endswith(".py")
 
     @staticmethod
+    def _looks_like_supporting_evidence_ref(ref: str) -> bool:
+        path, _ = Orchestrator._split_evidence_ref(ref)
+        normalized = path.replace("\\", "/").strip()
+        if not normalized or " " in normalized:
+            return False
+        return normalized.endswith(
+            (
+                ".py",
+                ".md",
+                ".json",
+                ".toml",
+                ".yaml",
+                ".yml",
+                ".ts",
+                ".tsx",
+                ".js",
+                ".jsx",
+            )
+        )
+
+    @staticmethod
     def _split_evidence_ref(ref: str) -> Tuple[str, str]:
         normalized = str(ref).strip()
         if "::" not in normalized:
@@ -2928,7 +3008,7 @@ class Orchestrator:
         for ref in evidence_refs:
             command = self._build_task_proof_evidence_command_for_ref(ref)
             if not command:
-                if self._looks_like_python_evidence_ref(ref):
+                if self._looks_like_supporting_evidence_ref(ref):
                     supporting_refs.append(ref)
                 else:
                     unsupported_refs.append(ref)
@@ -3861,6 +3941,33 @@ class Orchestrator:
         return refs
 
     @staticmethod
+    def _review_feedback_paths(text: str) -> Set[str]:
+        refs: Set[str] = set()
+        if not text:
+            return refs
+        pattern = re.compile(
+            r"((?:\.?[\w.-]+/)+[^\s`'\"()]+\.(?:py|md|json|toml|ya?ml|tsx?|jsx?))"
+        )
+        for match in pattern.findall(text):
+            normalized = Orchestrator._normalize_audit_blocker_path(match.strip().rstrip(".,):;"))
+            if normalized:
+                refs.add(normalized)
+        return refs
+
+    @classmethod
+    def _review_feedback_rewind_stage(cls, text: str) -> str:
+        owner_order = ["clarify", "design", "plan", "provider_research"]
+        owners: Set[str] = set()
+        for path in cls._review_feedback_paths(text):
+            owner = cls._forbidden_pattern_owner_stage({"path": path})
+            if owner in owner_order:
+                owners.add(owner)
+        for owner in owner_order:
+            if owner in owners:
+                return owner
+        return ""
+
+    @staticmethod
     def _review_feedback_is_obsolete_for_task(task: TaskSpec, text: str) -> bool:
         current_keys = Orchestrator._task_requirement_proof_keys(task)
         if not current_keys:
@@ -4601,6 +4708,7 @@ class Orchestrator:
                 "Use stable IDs like REQ-001. Mark hard requirements as priority='mandatory'. Use status='active', 'deferred', or 'superseded'.",
                 "If a requirement needs an external provider protocol or official API docs, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/.",
                 "Use oracle_type to name the primary proof mechanism (for example deterministic_test, integration_test, runtime_evidence, judge_model, benchmark, human_review, or mixed). Use oracle_strength to record the minimum acceptable fidelity (proxy, behavioral, semantic, or human). Use evidence_boundary to say where proof must come from (internal_state, system_boundary, or external_side_effect). Record any checks that must NOT be treated as sufficient in forbidden_proxy_oracles.",
+                "For requirements that remove, forbid, or replace old behavior, add precise forbidden_patterns regexes for stale terms or old semantic claims so requirements audit can scan code, tests, and docs. Prefer narrow patterns that catch positive stale claims without matching the new negative requirement text.",
                 self._clarify_spec_instruction(spec_kind),
                 self._document_language_instruction(),
             ]
@@ -4629,10 +4737,13 @@ class Orchestrator:
             lines = common + [
                 f"Read the input spec: {spec_file}",
                 f"Read the current project brief: {brief}",
+                f"Read the requirements trace: {requirements_trace}",
                 f"Update this file in place: {architecture}",
                 "Record only top-level architecture decisions and major risks.",
                 "Only update architecture.md in this stage. Do not modify project code, tests, README.md, or .auto-agents state files.",
                 "Preserve the exact top-level and section headings already present in the file.",
+                "Architecture.md must not contradict any active mandatory requirement, acceptance oracle, forbidden proxy oracle, or forbidden_patterns entry in requirements_trace.json.",
+                "For each new or updated active mandatory requirement that changes architecture semantics, remove or rewrite stale architecture text and document the current contract.",
                 self._design_spec_instruction(spec_kind),
                 self._document_language_instruction(),
             ]
@@ -4663,6 +4774,7 @@ class Orchestrator:
                 "Every task that covers requirement_ids must include requirement_proofs. Each proof must include requirement_id, oracle_index (1-based) or exact acceptance_oracle, proof_type, oracle_strength, evidence_boundary, evidence_refs, status='planned', and forbidden_proxy_oracles copied from the bound requirement.",
                 "All active mandatory requirements in requirements_trace.json must be covered by at least one task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
                 "All active mandatory requirement acceptance_oracles must also be covered by at least one task requirement_proofs entry; requirement_ids alone are not sufficient coverage.",
+                "If an acceptance_oracle covers docs or architecture semantics, its evidence_refs must include an executable test that reads/asserts those docs and a supporting ref to the affected document, such as .auto-agents/docs/architecture.md.",
                 "Task acceptance criteria must preserve the bound requirement's concrete acceptance_oracles; do not weaken direct/API/protocol requirements into naming or configuration-only checks.",
                 "For negative contract requirements such as 'must not contain', '不得', '不包含', or '不返回', preserve every concrete field/path/API token from the requirement in the task acceptance. For example, a requirement that forbids `tasks[].result` is NOT covered by only omitting `retry_trace`.",
                 "Preserve each bound requirement's oracle_type, oracle_strength, evidence_boundary, and forbidden_proxy_oracles when slicing tasks. Requirements that demand semantic or human-strength proof are NOT satisfied by proxy checks, internal-state-only checks, config-only checks, or metadata/log snapshots. Requirements that demand system_boundary or external_side_effect evidence are NOT covered unless the task acceptance requires proof at that boundary.",
@@ -5299,6 +5411,19 @@ class Orchestrator:
                 "attempt": attempt,
                 "summary": last_review,
             })
+
+            rewind_stage = self._review_feedback_rewind_stage(last_review)
+            if rewind_stage:
+                return {
+                    "ok": False,
+                    "review": last_review,
+                    "reason": last_reason,
+                    "rewind_to_stage": rewind_stage,
+                    "rewind_reason": (
+                        f"review feedback points to {rewind_stage}-owned artifact; "
+                        "rewinding to the owning stage"
+                    ),
+                }
 
             current_fp = self._review_fingerprint(last_review)
             if current_fp:
@@ -6184,12 +6309,32 @@ class Orchestrator:
     def _design_validation_feedback(self, _: AgentResult) -> Optional[str]:
         path = docs_dir(self.project_root) / "architecture.md"
         errors = validate_required_document(path, "architecture.md")
+        try:
+            trace = load_requirements_trace(self.project_root)
+        except Exception:
+            trace = {}
+        architecture_rel = self._relative_repo_path(path)
+        if isinstance(trace, dict):
+            for requirement in trace.get("requirements", []) or []:
+                if not isinstance(requirement, dict):
+                    continue
+                findings = forbidden_pattern_findings(
+                    self.project_root,
+                    requirement,
+                    include_paths=[architecture_rel],
+                )
+                for finding in findings:
+                    req_id = str(requirement.get("id", "")).strip() or "(unknown requirement)"
+                    pattern = str(finding.get("pattern", "")).strip()
+                    errors.append(
+                        f"{architecture_rel} violates {req_id} forbidden_patterns: {pattern}"
+                    )
         if not errors:
             return None
         bullets = "\n".join(f"- {item}" for item in errors)
         return (
-            "The architecture document is missing required template headings. Rewrite the file in place "
-            "and preserve the exact required headings.\n"
+            "The architecture document failed validation. Rewrite the file in place, preserve the exact "
+            "required headings, and align it with active requirements_trace.json constraints.\n"
             f"{bullets}"
         )
 

@@ -1763,6 +1763,7 @@ class RetryFlowTests(unittest.TestCase):
                             "tests/test_openai_strict_schema_contract.py::OpenAIStrictSchemaContractTests::test_planning_schema_passes_openai_strict_contract",
                             "app/stage_backends/text.py::OpenAICompatiblePlanningBackend._planning_schema",
                             "app/application/openai_strict_schema.py::ensure_openai_strict_json_schema",
+                            ".auto-agents/docs/architecture.md",
                         ],
                     }
                 ],
@@ -1803,6 +1804,7 @@ class RetryFlowTests(unittest.TestCase):
                 [
                     "app/stage_backends/text.py::OpenAICompatiblePlanningBackend._planning_schema",
                     "app/application/openai_strict_schema.py::ensure_openai_strict_json_schema",
+                    ".auto-agents/docs/architecture.md",
                 ],
             )
             self.assertEqual(result["failed_refs"], [])
@@ -3277,6 +3279,7 @@ class RetryFlowTests(unittest.TestCase):
                 "command": "conda run -p ./.conda python -m pytest -q tests/test_public_api.py::test_contract",
                 "raw_output": "",
             }
+            orchestrator._build_task_verify_commands = lambda task: []
 
             state = load_run_state(project_root)
             state.tasks = orchestrator._load_tasks_from_plan()
@@ -3351,6 +3354,15 @@ class RetryFlowTests(unittest.TestCase):
                 )
                 self.assertEqual(stage, expected_stage)
                 self.assertEqual(hard_failure, "")
+
+    def test_review_feedback_rewinds_to_design_for_architecture_owned_artifact(self) -> None:
+        summary = (
+            "DECISION: fail\n"
+            "`.auto-agents/docs/architecture.md:146` still contradicts REQ-087 "
+            "and must be updated before this task can pass."
+        )
+
+        self.assertEqual(Orchestrator._review_feedback_rewind_stage(summary), "design")
 
     def test_misrouted_project_brief_audit_recovery_rewinds_to_clarify_on_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
