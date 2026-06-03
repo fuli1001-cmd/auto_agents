@@ -4636,6 +4636,94 @@ class ScopeOverflowTests(unittest.TestCase):
             # Migration is excluded; baseline failure is also excluded → verify passes.
             self.assertTrue(result["ok"], msg=str(result))
 
+    def test_full_verify_failure_routes_to_implement_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            state = load_run_state(project_root)
+            state.tasks = [
+                TaskSpec(
+                    task_id="task-001",
+                    title="Existing task",
+                    description="Already implemented.",
+                    acceptance=["current contract is implemented"],
+                    status="done",
+                )
+            ]
+            state.stage_summaries = {
+                "clarify": "done",
+                "design": "done",
+                "plan": "done",
+                "implement": "Completed 1 tasks.",
+            }
+            save_run_state(project_root, state)
+            gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command="fake test",
+                        ok=False,
+                        returncode=1,
+                        stdout="FAILED tests/test_api.py::test_old_contract - AssertionError: old field",
+                    )
+                ],
+                summary="FAILED tests/test_api.py::test_old_contract",
+            )
+
+            with patch.object(orchestrator, "_run_gate_commands", return_value=(gate, "")):
+                updated = orchestrator._run_verify(state)
+
+            self.assertEqual(updated.status, "pending")
+            self.assertEqual(updated.current_stage, "implement")
+            self.assertEqual(updated.rejected_stage, "implement")
+            self.assertEqual(updated.agent_attempts["verify_recovery"], 1)
+            self.assertNotIn("verify", updated.stage_summaries)
+            self.assertIn("Failure type: full_verification", updated.rejection_reason)
+            self.assertIn("update repository tests only when they are stale", updated.rejection_reason)
+            self.assertIn("[stage:verify] decision=fail route=implement", stream.getvalue())
+
+    def test_full_verify_recovery_exhaustion_routes_to_clarify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            state = load_run_state(project_root)
+            state.tasks = [
+                TaskSpec(
+                    task_id="task-001",
+                    title="Existing task",
+                    description="Already implemented.",
+                    acceptance=["current contract is implemented"],
+                    status="done",
+                )
+            ]
+            state.stage_summaries = {
+                "clarify": "done",
+                "design": "done",
+                "plan": "done",
+                "implement": "Completed 1 tasks.",
+            }
+            state.agent_attempts["verify_recovery"] = orchestrator._verify_gate_recovery_limit()
+            gate = GateResult(
+                ok=False,
+                commands=[CommandResult(command="fake test", ok=False, returncode=1)],
+                summary="FAILED tests/test_api.py::test_still_fails",
+            )
+
+            with patch.object(orchestrator, "_run_gate_commands", return_value=(gate, "")):
+                updated = orchestrator._run_verify(state)
+
+            self.assertEqual(updated.status, "pending")
+            self.assertEqual(updated.current_stage, "clarify")
+            self.assertEqual(updated.rejected_stage, "clarify")
+            self.assertNotIn("verify_recovery", updated.agent_attempts)
+            self.assertIn("Automatic full verification recovery was exhausted", updated.rejection_reason)
+            self.assertIn("Use the clarify conversation", updated.rejection_reason)
+            self.assertIn("[stage:verify] decision=fail route=clarify", stream.getvalue())
+
 
 class VaryingReviewArbiterAdapter:
     """Implement touches code; review always fails with VARYING wording so the

@@ -105,7 +105,12 @@ silently skipping ahead. When a task falls back to full gate verification and th
 clearly outside the task's owned proof/test surface, auto_agents stops retrying that implementation
 loop and reports the result as a contract or gate-scope mismatch.
 
-The top-level `verify` stage still runs the full configured verification suite before release.
+The top-level `verify` stage still runs the full configured verification suite before release. If
+that full suite fails, auto_agents now treats it as a recovery signal instead of immediately
+terminating: it rewinds to `implement`, creates a focused verification-recovery task, and asks the
+agent to decide whether the failure is implementation code, stale tests, or both. If repeated
+automatic recovery cannot resolve the conflict, the pipeline rewinds to `clarify` so the next run can
+use the normal clarification dialog to ask for user guidance.
 
 Manual approvals are supported at three high-value gates:
 
@@ -601,6 +606,13 @@ run immediately:
 
 When an audit failure rewinds the pipeline, the next `run` also resumes from that rewound stage
 rather than pretending `verify` already completed.
+
+Plain full-suite verification failures use a similar recovery path: the first failures rewind to
+`implement` with structured triage, implicated paths, and evidence excerpts. The recovery task is
+allowed to fix product code, migrate stale tests, or do both, but must stop and surface a
+clarification blocker if active requirements and repository tests disagree in a way the existing
+oracles cannot resolve. After the configured recovery budget is exhausted, auto_agents rewinds to
+`clarify` instead of looping indefinitely.
 
 Implementation resume is task-aware rather than fully transactional:
 

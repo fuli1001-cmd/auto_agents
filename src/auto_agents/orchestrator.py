@@ -543,6 +543,9 @@ class Orchestrator:
             self._max_attempts("provider_research"),
         )
 
+    def _verify_gate_recovery_limit(self) -> int:
+        return self._max_attempts("implement")
+
     def _build_requirements_audit_feedback(self, audit_result: Dict[str, object], target_stage: str) -> str:
         report_path = str(audit_result.get("path", requirements_audit_path(self.project_root)))
         lines = [
@@ -599,6 +602,95 @@ class Orchestrator:
         state.rejected_stage = target_stage
         if self._sanitize_persisted_audit_feedback(state, audit_result) and state.tasks:
             self._persist_tasks(state.tasks)
+        return True
+
+    def _build_verify_gate_recovery_feedback(
+        self,
+        verify_gate: GateResult,
+        raw_output: str,
+        raw_log_path: str,
+        *,
+        attempt: int,
+        limit: int,
+    ) -> str:
+        extraction = extract_failure_info(verify_gate)
+        reason = verify_gate.summary.strip() or "full verification failed"
+        failure_ids = self._normalize_verify_failure_ids(extraction.failure_ids, reason)
+        retry_feedback = self._build_verify_retry_feedback(
+            {
+                "reason": reason,
+                "current_failure_ids": failure_ids,
+                "new_failure_ids": failure_ids,
+                "baseline_failure_ids": [],
+                "raw_output": raw_output,
+                "raw_log_path": raw_log_path,
+                "comparable_failures": extraction.comparable,
+            }
+        )
+        guidance = self._verify_failure_recovery_guidance(
+            failure_ids=failure_ids,
+            reason=reason,
+            implicated_paths=list(retry_feedback.get("implicated_paths", [])),
+            comparable=extraction.comparable,
+        )
+        instructions = [
+            f"Full verification failed after the implementation stage (automatic recovery attempt {attempt}/{limit}).",
+            "Recovery route: rerun implement with a dedicated recovery task.",
+            "Determine from the active requirements, task plan, failing tests, and touched code whether the root cause is implementation code, stale tests, or both.",
+            "Fix implementation code when product behavior is wrong; update repository tests only when they are stale or contradict active requirements/acceptance oracles.",
+            "If the failure exposes an unclear product decision that cannot be resolved from requirements or nearby contracts, leave a concise blocker explaining the ambiguity instead of guessing.",
+        ]
+        if guidance:
+            instructions.extend(["", "Automated triage guidance:", guidance])
+        return self._format_retry_feedback(
+            "full_verification",
+            reason="\n".join(instructions),
+            verification_summary=str(retry_feedback.get("verification_summary", "")),
+            implicated_paths=list(retry_feedback.get("implicated_paths", [])),
+            raw_excerpts=list(retry_feedback.get("raw_excerpts", [])),
+        )
+
+    def _handle_verify_gate_failure(
+        self,
+        state: RunState,
+        verify_gate: GateResult,
+        *,
+        raw_output: str,
+        raw_log_path: str,
+    ) -> bool:
+        attempts = int(state.agent_attempts.get("verify_recovery", 0)) + 1
+        limit = self._verify_gate_recovery_limit()
+        if attempts > limit:
+            feedback = self._build_verify_gate_recovery_feedback(
+                verify_gate,
+                raw_output,
+                raw_log_path,
+                attempt=limit,
+                limit=limit,
+            )
+            self._rewind_state_from_stage(state, "clarify")
+            state.rejected_stage = "clarify"
+            state.rejection_reason = (
+                f"Automatic full verification recovery was exhausted after {limit} attempt(s). "
+                "Use the clarify conversation to ask the user which behavior is intended when "
+                "the active requirements, implementation, and repository tests do not clearly "
+                "agree.\n\n"
+                f"{feedback}"
+            )
+            state.agent_attempts.pop("verify_recovery", None)
+            return True
+
+        feedback = self._build_verify_gate_recovery_feedback(
+            verify_gate,
+            raw_output,
+            raw_log_path,
+            attempt=attempts,
+            limit=limit,
+        )
+        state.agent_attempts["verify_recovery"] = attempts
+        self._rewind_state_from_stage(state, "implement")
+        state.rejected_stage = "implement"
+        state.rejection_reason = feedback
         return True
 
     def run(
@@ -1901,14 +1993,25 @@ class Orchestrator:
 
         if state.rejected_stage == "implement" and state.rejection_reason:
             import time
+            is_full_verify_recovery = "Failure type: full_verification" in state.rejection_reason
             tasks.append(
                 TaskSpec(
                     task_id=f"fix-rejection-{int(time.time()*1000)}",
-                    title="Fix issues after release rejection",
-                    description=f"The release was rejected with the following feedback:\n{state.rejection_reason}\n\nPlease fix these issues.",
+                    title=(
+                        "Fix full verification failure"
+                        if is_full_verify_recovery
+                        else "Fix issues after release rejection"
+                    ),
+                    description=(
+                        "Full verification failed after all planned tasks were implemented."
+                        if is_full_verify_recovery
+                        else "The release was rejected."
+                    )
+                    + f"\n\nFeedback:\n{state.rejection_reason}\n\nPlease fix these issues.",
                     acceptance=[
                         "Feedback is fully addressed",
-                        "Tests pass"
+                        "Business code and repository tests are aligned with active requirements",
+                        "Tests pass",
                     ]
                 )
             )
@@ -3384,6 +3487,15 @@ class Orchestrator:
             summary_lines.append("Likely root causes:")
             summary_lines.extend(f"  - {item}" for item in root_causes)
         implicated_paths = self._extract_verify_implicated_paths(raw_output)
+        guidance = self._verify_failure_recovery_guidance(
+            failure_ids=(new_failure_ids or current_failure_ids),
+            reason=reason,
+            implicated_paths=implicated_paths,
+            comparable=bool(verify_result.get("comparable_failures", True)),
+        )
+        if guidance:
+            summary_lines.append("Recovery guidance:")
+            summary_lines.extend(f"  - {line}" for line in guidance.splitlines())
         raw_excerpts = self._extract_verify_excerpts(raw_output)
         if not raw_excerpts and reason:
             raw_excerpts = [self._truncate_feedback_text(reason, limit=900)]
@@ -3392,6 +3504,66 @@ class Orchestrator:
             "implicated_paths": implicated_paths,
             "raw_excerpts": raw_excerpts,
         }
+
+    def _verify_failure_recovery_guidance(
+        self,
+        *,
+        failure_ids: Iterable[str],
+        reason: str,
+        implicated_paths: Iterable[str],
+        comparable: bool,
+    ) -> str:
+        ids = [str(item).strip() for item in failure_ids if str(item).strip()]
+        paths = [str(item).strip().replace("\\", "/") for item in implicated_paths if str(item).strip()]
+        combined = " ".join([reason, *ids, *paths]).lower()
+        lines: List[str] = []
+
+        if not comparable:
+            lines.append(
+                "Failure identity is unstable; inspect command output, environment setup, and test discovery before changing product behavior."
+            )
+
+        stale_markers = (
+            "stale-plan-coupled-test:",
+            "stale-task-status-test:",
+            "update the repository tests",
+            "stale test",
+            "stale status",
+            "retired task id",
+        )
+        if any(marker in combined for marker in stale_markers):
+            lines.append(
+                "This looks like a stale repository test; align the affected test with the current task plan and active requirements."
+            )
+
+        if ids:
+            id_paths = [
+                self._split_evidence_ref(item)[0].replace("\\", "/")
+                for item in ids
+                if not item.startswith("reason:") and not item.startswith("cmd:")
+            ]
+            if id_paths and all(self._is_test_path(path) for path in id_paths):
+                lines.append(
+                    "Failing IDs are test/proof paths; inspect whether assertions encode outdated expectations before changing implementation."
+                )
+
+        if paths and any(self._is_test_path(path) for path in paths):
+            lines.append(
+                "Implicated paths include tests; compare their assertions with active acceptance oracles and nearby contract tests."
+            )
+        if paths and any(not self._is_test_path(path) for path in paths):
+            lines.append(
+                "Implicated paths include product code; fix implementation when it violates the current public contract."
+            )
+
+        if not lines:
+            lines.append(
+                "Classify the failure as implementation bug, stale test, or mixed by comparing the failing assertion with active requirements."
+            )
+        lines.append(
+            "If requirements and existing tests conflict and no active oracle resolves it, stop and surface a clarification blocker instead of guessing."
+        )
+        return "\n".join(lines)
 
     def _run_provider_research(self, state: RunState, spec_file: Path) -> RunState:
         del spec_file
@@ -4127,8 +4299,27 @@ class Orchestrator:
                         )
                         save_run_state(self.project_root, state)
                         return state
-            self._emit_stage_verify_result("fail", summary.strip())
-            raise RuntimeError("verify stage failed")
+            if self._handle_verify_gate_failure(
+                state,
+                verify_gate,
+                raw_output=raw_output,
+                raw_log_path=raw_log_path,
+            ):
+                route = state.rejected_stage
+                routed_summary = (
+                    "full verification failed; routing to clarify for user guidance"
+                    if route == "clarify"
+                    else "full verification failed; routing to implement recovery"
+                )
+                self._emit_stage_verify_result(
+                    "fail",
+                    routed_summary,
+                    route=route,
+                )
+                save_run_state(self.project_root, state)
+                return state
+            self._emit_stage_verify_result("fail", state.last_error or summary.strip())
+            raise RuntimeError(state.last_error or "verify stage failed")
         if self.config.gates.commands:
             self._gate_baseline_cache.put(
                 self._task_verify_baseline_ref(),
@@ -4158,6 +4349,7 @@ class Orchestrator:
         if "No requirements are currently tracked." not in audit_report:
             state.stage_summaries["requirements_audit"] = audit_report.strip()
         state.agent_attempts.pop("requirements_audit_recovery", None)
+        state.agent_attempts.pop("verify_recovery", None)
         return state
 
     def _load_tasks_from_plan(self) -> List[TaskSpec]:
