@@ -162,7 +162,7 @@ DEFAULT_CONFIG = {
         },
         "antigravity-claude": {
             "kind": "antigravity",
-            "binary": "agy-proxy",
+            "binary": "agy",
             "profile_map": {
                 "balanced": "Claude Sonnet 4.6 (Thinking)",
                 "deep": "Claude Opus 4.6 (Thinking)",
@@ -177,7 +177,7 @@ DEFAULT_CONFIG = {
         },
         "antigravity-gemini": {
             "kind": "antigravity",
-            "binary": "agy-proxy",
+            "binary": "agy",
             "profile_map": {
                 "balanced": "Gemini 3.5 Flash (Low)",
                 "deep": "Gemini 3.5 Flash (Medium)",

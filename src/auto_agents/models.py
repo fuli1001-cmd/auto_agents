@@ -414,7 +414,7 @@ class ProjectConfig:
             ),
             "antigravity-claude": ProviderConfig(
                 kind="antigravity",
-                binary="agy-proxy",
+                binary="agy",
                 profile_map={
                     "balanced": "Claude Sonnet 4.6 (Thinking)",
                     "deep": "Claude Opus 4.6 (Thinking)",
@@ -429,7 +429,7 @@ class ProjectConfig:
             ),
             "antigravity-gemini": ProviderConfig(
                 kind="antigravity",
-                binary="agy-proxy",
+                binary="agy",
                 profile_map={
                     "balanced": "Gemini 3.5 Flash (Low)",
                     "deep": "Gemini 3.5 Flash (Medium)",

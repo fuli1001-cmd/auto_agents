@@ -9,10 +9,10 @@ from auto_agents.models import AgentRequest, AgentResult, ProviderConfig
 
 
 def test_antigravity_available():
-    config = ProviderConfig(kind="antigravity", binary="agy-proxy")
+    config = ProviderConfig(kind="antigravity", binary="agy")
     adapter = AntigravityAdapter(config)
 
-    with patch("shutil.which", return_value="/usr/local/bin/agy-proxy"):
+    with patch("shutil.which", return_value="/usr/local/bin/agy"):
         assert adapter.available() is True
 
     with patch("shutil.which", return_value=None):
@@ -22,7 +22,7 @@ def test_antigravity_available():
 def test_antigravity_build_command():
     config = ProviderConfig(
         kind="antigravity",
-        binary="agy-proxy",
+        binary="agy",
         timeout_seconds=600,
         extra_args=["--sandbox"],
     )
@@ -37,7 +37,7 @@ def test_antigravity_build_command():
 
     command = adapter._build_command(request)
     assert command == [
-        "agy-proxy",
+        "agy",
         "-p",
         "--dangerously-skip-permissions",
         "--add-dir",
@@ -56,7 +56,7 @@ def test_antigravity_run_settings_override_and_restoration(tmp_path):
 
     config = ProviderConfig(
         kind="antigravity",
-        binary="agy-proxy",
+        binary="agy",
         profile_map={
             "balanced": "Gemini 3.5 Flash (High)",
             "deep": "Gemini 3.5 Flash (High)",
