@@ -135,9 +135,9 @@ DEFAULT_CONFIG = {
             "kind": "codex",
             "binary": "codex",
             "profile_map": {
-                "balanced": "m",
-                "deep": "h",
-                "max": "xh",
+                "balanced": "balanced",
+                "deep": "deep",
+                "max": "max",
             },
             "extra_args": [],
             "cwd_flag": "-C",

@@ -207,7 +207,7 @@ class Orchestrator:
                     config.providers[provider_kind] = ProviderConfig(
                         kind="codex",
                         binary="codex",
-                        profile_map={"balanced": "m", "deep": "h", "max": "xh"},
+                        profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
                         extra_args=[],
                         cwd_flag="-C",
                         prompt_via_stdin=True,

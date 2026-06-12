@@ -19,8 +19,8 @@ DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity-claude", "antigravity-gemini")
 DEFAULT_EFFORTS = {
     "clarify": "deep",
-    "design": "deep",
-    "plan": "deep",
+    "design": "max",
+    "plan": "max",
     "sync-agent-instructions": "deep",
     "provider_research": "deep",
     "implement": "deep",
@@ -133,9 +133,9 @@ class ProviderConfig:
     binary: str = "codex"
     profile_map: Dict[str, str] = field(
         default_factory=lambda: {
-            "balanced": "m",
-            "deep": "h",
-            "max": "xh",
+            "balanced": "balanced",
+            "deep": "deep",
+            "max": "max",
         }
     )
     extra_args: List[str] = field(default_factory=list)
@@ -162,7 +162,7 @@ class ProviderConfig:
             kind=kind,
             binary=str(data.get("binary", "codex")),
             profile_map={str(k): str(v) for k, v in dict(data.get("profile_map", {})).items()}
-            or {"balanced": "m", "deep": "h", "max": "xh"},
+            or {"balanced": "balanced", "deep": "deep", "max": "max"},
             extra_args=[str(item) for item in data.get("extra_args", [])],
             cwd_flag=str(data.get("cwd_flag", "-C")),
             prompt_via_stdin=bool(data.get("prompt_via_stdin", True)),
@@ -393,7 +393,7 @@ class ProjectConfig:
             "codex": ProviderConfig(
                 kind="codex",
                 binary="codex",
-                profile_map={"balanced": "m", "deep": "h", "max": "xh"},
+                profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
                 extra_args=[],
                 cwd_flag="-C",
                 prompt_via_stdin=True,

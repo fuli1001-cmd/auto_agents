@@ -323,9 +323,8 @@ Adapters map those labels to provider-specific controls through the `profile_map
 
 ### Codex
 
-For Codex this maps to native config profiles: `balanced` → `m` (medium), `deep` → `h` (high),
-`max` → `xh` (extra-high). All model configuration lives in Codex's own config files — the project
-config only carries the profile name mapping.
+For Codex this maps to native config profiles: `balanced`, `deep`, and `max`.
+All model configuration lives in Codex's own config files, and the project config only carries the profile name mapping.
 
 ### Copilot CLI
 
@@ -351,9 +350,9 @@ Example project config (`providers` and `active_provider` only):
       "kind": "codex",
       "binary": "codex",
       "profile_map": {
-        "balanced": "m",
-        "deep": "h",
-        "max": "xh"
+        "balanced": "balanced",
+        "deep": "deep",
+        "max": "max"
       },
       "extra_args": [],
       "cwd_flag": "-C",
