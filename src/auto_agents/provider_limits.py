@@ -28,6 +28,7 @@ _LIMITS: Dict[str, Dict[str, ProviderLimit]] = {
         "default": ProviderLimit(initial_workers=2, worker_ceiling=2),
         "free": ProviderLimit(initial_workers=1, worker_ceiling=1),
         "pro": ProviderLimit(initial_workers=2, worker_ceiling=3),
+        "pro+": ProviderLimit(initial_workers=2, worker_ceiling=4),
         "business": ProviderLimit(initial_workers=2, worker_ceiling=4),
         "enterprise": ProviderLimit(initial_workers=2, worker_ceiling=5),
     },

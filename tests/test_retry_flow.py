@@ -4129,6 +4129,25 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(orchestrator._record_parallel_success(2), 3)
             self.assertEqual(orchestrator._parallel_worker_count(), 3)
 
+    def test_parallel_tasks_auto_workers_support_copilot_pro_plus_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.active_provider = "copilot-cli"
+            config.providers["copilot-cli"].subscription_tier = "pro+"
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.workers = "auto"
+            config.execution.parallel_tasks.max_auto_workers = 8
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            self.assertEqual(orchestrator._parallel_worker_count(), 2)
+            self.assertEqual(orchestrator._record_parallel_success(2), 3)
+            self.assertEqual(orchestrator._record_parallel_success(3), 4)
+            self.assertEqual(orchestrator._parallel_worker_count(), 4)
+
     def test_parallel_tasks_fixed_workers_do_not_adapt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -4144,6 +4163,47 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(orchestrator._parallel_worker_count(), 2)
             self.assertEqual(orchestrator._record_parallel_pressure(2), 2)
             self.assertEqual(orchestrator._parallel_worker_count(), 2)
+
+    def test_parallel_tasks_logs_auto_resolution_and_single_ready_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            config = orchestrator.config
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.workers = "auto"
+            config.execution.parallel_tasks.max_auto_workers = 3
+            config.gates.require_clean_git_before_task = False
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Only ready task",
+                            "description": "Run one ready task.",
+                            "acceptance": ["done"],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            with patch.object(orchestrator, "_execute_task_in_main_worktree", return_value=None):
+                orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            rendered = stream.getvalue()
+            self.assertIn("auto mode resolved workers=3", rendered)
+            self.assertIn("ready=1 batch=1; executing sequentially task=task-001", rendered)
 
     def test_run_stops_after_implement_when_max_task_budget_is_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

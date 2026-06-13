@@ -464,6 +464,7 @@ In auto mode, auto_agents starts from the active provider's local subscription-t
 caps concurrency at `max_auto_workers`, and lowers concurrency when provider pressure such
 as throttling, quota, timeout, or stalls is detected. Successful batches can gradually raise
 the next batch's worker count within that cap.
+For `copilot-cli`, `subscription_tier` can also be set to `pro+`.
 
 ### Provider auto-failover
 

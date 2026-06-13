@@ -2111,6 +2111,7 @@ class Orchestrator:
 
         processed = 0
         current_workers = self._parallel_worker_count()
+        self._log_parallel_worker_resolution(current_workers)
         while True:
             if not self._has_task_budget(max_tasks, processed):
                 self._task_budget_exhausted = True
@@ -2125,6 +2126,12 @@ class Orchestrator:
             batch_size = min(current_workers, remaining)
             batch = ready[:batch_size]
             if len(batch) < 2:
+                self.logger.info(
+                    "[parallel-tasks] ready=%s batch=%s; executing sequentially task=%s",
+                    len(ready),
+                    len(batch),
+                    batch[0].task_id,
+                )
                 rewind_state = self._execute_task_in_main_worktree(state, tasks, batch[0])
                 if rewind_state is not None:
                     return rewind_state
@@ -2312,6 +2319,23 @@ class Orchestrator:
         tuned = self._parallel_tuning.get_workers(self._parallel_tuning_key())
         initial = tuned if tuned is not None else limit.initial_workers
         return max(1, min(initial, limit.worker_ceiling, config.max_auto_workers))
+
+    def _log_parallel_worker_resolution(self, current_workers: int) -> None:
+        config = self.config.execution.parallel_tasks
+        if config.workers != "auto":
+            return
+        provider = self.config.providers.get(self.config.active_provider, self.config.provider)
+        limit = provider_limit(provider)
+        tuned = self._parallel_tuning.get_workers(self._parallel_tuning_key())
+        tuned_label = str(tuned) if tuned is not None else "none"
+        self.logger.info(
+            "[parallel-tasks] auto mode resolved workers=%s tier=%s tuned=%s ceiling=%s max_auto_workers=%s",
+            current_workers,
+            provider.subscription_tier,
+            tuned_label,
+            limit.worker_ceiling,
+            config.max_auto_workers,
+        )
 
     def _record_parallel_success(self, current_workers: int) -> int:
         config = self.config.execution.parallel_tasks
