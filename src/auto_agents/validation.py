@@ -496,6 +496,18 @@ def validate_task_plan_payload(
             or any(not isinstance(item, str) or not item.strip() for item in requirement_ids)
         ):
             errors.append(f"{prefix} requirement_ids must be a list of non-empty strings")
+        verification_refs = task.get("verification_refs", [])
+        if verification_refs is not None and (
+            not isinstance(verification_refs, list)
+            or any(not isinstance(item, str) or not item.strip() for item in verification_refs)
+        ):
+            errors.append(f"{prefix} verification_refs must be a list of non-empty strings")
+        recovery_history = task.get("recovery_history", [])
+        if recovery_history is not None and (
+            not isinstance(recovery_history, list)
+            or any(not isinstance(item, dict) for item in recovery_history)
+        ):
+            errors.append(f"{prefix} recovery_history must be a list of objects")
 
     errors.extend(
         validate_task_dependencies(
@@ -789,6 +801,17 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 worktree_root = parallel_tasks.get("worktree_root")
                 if not isinstance(worktree_root, str):
                     errors.append("execution.parallel_tasks.worktree_root must be a string")
+            recovery = execution.get("recovery", {})
+            if not isinstance(recovery, dict):
+                errors.append("execution.recovery must be an object")
+            else:
+                enabled = recovery.get("enabled", True)
+                if not isinstance(enabled, bool):
+                    errors.append("execution.recovery.enabled must be a boolean")
+                for key in ("max_rounds", "max_repair_tasks_per_round", "max_refs_per_repair_task"):
+                    value = recovery.get(key, 2 if key == "max_rounds" else 1)
+                    if not isinstance(value, int) or value < 1:
+                        errors.append(f"execution.recovery.{key} must be an integer >= 1")
 
     approvals = payload.get("approvals")
     if not isinstance(approvals, dict):

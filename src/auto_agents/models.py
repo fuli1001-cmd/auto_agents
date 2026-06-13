@@ -73,8 +73,10 @@ class TaskSpec:
     split_depth: int = 0
     expected_test_migrations: List[str] = field(default_factory=list)
     requirement_proofs: List[Dict[str, object]] = field(default_factory=list)
+    verification_refs: List[str] = field(default_factory=list)
     scratchpad: str = ""
     arbitration_history: List[Dict[str, object]] = field(default_factory=list)
+    recovery_history: List[Dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -116,9 +118,14 @@ class TaskSpec:
             split_depth=int(data.get("split_depth", 0) or 0),
             expected_test_migrations=[str(item) for item in data.get("expected_test_migrations", [])],
             requirement_proofs=requirement_proofs,
+            verification_refs=[str(item) for item in data.get("verification_refs", [])],
             scratchpad=str(data.get("scratchpad", "")),
             arbitration_history=[
                 entry for entry in (data.get("arbitration_history", []) or [])
+                if isinstance(entry, dict)
+            ],
+            recovery_history=[
+                entry for entry in (data.get("recovery_history", []) or [])
                 if isinstance(entry, dict)
             ],
         )
@@ -382,17 +389,42 @@ class ParallelTasksConfig:
 
 
 @dataclass
+class RecoveryConfig:
+    enabled: bool = True
+    max_rounds: int = 2
+    max_repair_tasks_per_round: int = 6
+    max_refs_per_repair_task: int = 8
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "RecoveryConfig":
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            max_rounds=int(data.get("max_rounds", 2)),
+            max_repair_tasks_per_round=int(data.get("max_repair_tasks_per_round", 6)),
+            max_refs_per_repair_task=int(data.get("max_refs_per_repair_task", 8)),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class ExecutionConfig:
     parallel_tasks: ParallelTasksConfig = field(default_factory=ParallelTasksConfig)
+    recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ExecutionConfig":
         return cls(
             parallel_tasks=ParallelTasksConfig.from_dict(dict(data.get("parallel_tasks", {}))),
+            recovery=RecoveryConfig.from_dict(dict(data.get("recovery", {}))),
         )
 
     def to_dict(self) -> Dict[str, object]:
-        return {"parallel_tasks": self.parallel_tasks.to_dict()}
+        return {
+            "parallel_tasks": self.parallel_tasks.to_dict(),
+            "recovery": self.recovery.to_dict(),
+        }
 
 
 @dataclass

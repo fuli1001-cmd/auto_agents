@@ -3290,6 +3290,84 @@ class RetryFlowTests(unittest.TestCase):
             retry_feedback = adapter.implement_prompts[0].split("Previous attempt issues:\n", 1)[1]
             self.assertNotIn("Still failing: tests/test_public_api.py::test_contract", retry_feedback)
 
+    def test_blocked_proof_failure_schedules_repair_task_before_retrying_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Parent proof task",
+                            "description": "Parent task failed owned proof evidence.",
+                            "acceptance": ["parent proof passes"],
+                            "status": "blocked",
+                            "commit_message": "",
+                            "review_summary": (
+                                "owned proof evidence failed: "
+                                "tests/test_public_api.py::test_contract"
+                            ),
+                            "verify_history": [
+                                {
+                                    "attempt": 4,
+                                    "decision": "fail",
+                                    "summary": (
+                                        "owned proof evidence failed: "
+                                        "tests/test_public_api.py::test_contract"
+                                    ),
+                                    "failure_ids": ["tests/test_public_api.py::test_contract"],
+                                    "comparable_failures": True,
+                                }
+                            ],
+                            "requirement_ids": ["REQ-001"],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "oracle_index": 1,
+                                    "status": "verified",
+                                    "evidence_refs": ["tests/test_public_api.py::test_contract"],
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(result.current_stage, "implement")
+            self.assertEqual([task.task_id for task in result.tasks], ["repair-task-001-r1-1", "task-001"])
+            repair, parent = result.tasks
+            self.assertEqual(repair.parent_task_id, "task-001")
+            self.assertEqual(repair.verification_refs, ["tests/test_public_api.py::test_contract"])
+            self.assertEqual(parent.status, "pending")
+            self.assertIn("repair-task-001-r1-1", parent.depends_on)
+            self.assertEqual(parent.recovery_history[-1]["result"], "scheduled")
+            self.assertIn("[recovery] scheduled parent=task-001", stream.getvalue())
+
+    def test_run_logger_writes_to_current_run_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            state = load_run_state(project_root)
+
+            orchestrator._attach_run_logger(state.run_id)
+            orchestrator._emit_stage_start("implement")
+
+            log_path = project_root / ".auto-agents" / "runs" / state.run_id / "run.log"
+            self.assertTrue(log_path.exists())
+            self.assertIn("[stage:implement] start", log_path.read_text(encoding="utf-8"))
+            self.assertIn("[stage:implement] start", stream.getvalue())
+
 
     def test_reject_resets_stage_and_injects_feedback(self):
         with tempfile.TemporaryDirectory() as td:
@@ -4109,6 +4187,80 @@ class RetryFlowTests(unittest.TestCase):
                 [task.commit_sha for task in result.tasks],
                 ["main-task-001", "main-task-002"],
             )
+
+    def test_parallel_tasks_aggregate_failed_workers_and_copy_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.gates.require_clean_git_before_task = False
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.workers = 2
+            config.execution.recovery.enabled = False
+            save_project_config(project_root, config)
+            commit_all(project_root, "baseline")
+            orchestrator = Orchestrator(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "First task",
+                            "description": "Finish the first slice.",
+                            "acceptance": ["done"],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "task-002",
+                            "title": "Second task",
+                            "description": "Finish the second slice.",
+                            "acceptance": ["done"],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            def fake_run_task_in_worktree(state_snapshot, tasks_snapshot, task_id):
+                task = next(item for item in tasks_snapshot if item.task_id == task_id)
+                task.review_summary = f"review for {task_id}"
+                task.verify_history.append({
+                    "attempt": 1,
+                    "decision": "fail",
+                    "summary": f"failed {task_id}",
+                    "failure_ids": [f"reason:{task_id}"],
+                })
+                task.requirement_proofs = [{"requirement_id": "REQ-001", "status": "planned"}]
+                return {
+                    "ok": False,
+                    "task": task.to_dict(),
+                    "reason": f"failed {task_id}",
+                    "review": task.review_summary,
+                    "failure_ids": [f"reason:{task_id}"],
+                    "comparable_failures": True,
+                }
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            with patch.object(orchestrator, "_run_task_in_worktree", side_effect=fake_run_task_in_worktree):
+                with self.assertRaises(RuntimeError) as ctx:
+                    orchestrator._run_implementation_loop(state, max_tasks=2)
+
+            self.assertIn("task-001: failed task-001", str(ctx.exception))
+            self.assertIn("task-002: failed task-002", str(ctx.exception))
+            reloaded = orchestrator._load_tasks_from_plan()
+            self.assertEqual([task.status for task in reloaded], ["blocked", "blocked"])
+            self.assertEqual(reloaded[0].review_summary, "review for task-001")
+            self.assertEqual(reloaded[0].requirement_proofs[0]["requirement_id"], "REQ-001")
+            self.assertEqual(reloaded[1].verify_history[-1]["failure_ids"], ["reason:task-002"])
 
     def test_parallel_tasks_auto_workers_adapt_to_success_and_provider_pressure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

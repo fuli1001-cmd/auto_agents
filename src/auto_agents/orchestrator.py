@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, TextIO, Tuple
 
@@ -42,6 +42,7 @@ from .config import (
     load_task_plan,
     provider_references_dir,
     provider_references_lock_path,
+    run_path,
     requirements_audit_path,
     requirements_trace_path,
     review_path,
@@ -66,7 +67,7 @@ from .gates import (
 from .gate_baseline_cache import GateBaselineCache
 from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, ensure_repo, hard_reset_clean, head_ref, is_repo, remove_worktree, worktree_fingerprint
 from .io_utils import read_json, read_text, write_json, write_text
-from .logging_utils import build_run_logger, log_timing
+from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
 from .models import (
     APPROVAL_ORDER,
     APPROVAL_BY_STAGE,
@@ -149,6 +150,7 @@ class Orchestrator:
         self._parallel_tuning = ParallelTuningStore(self.project_root)
         self._max_tasks_remaining: Optional[int] = None
         self._task_budget_exhausted = False
+        self._active_run_log_path: Optional[Path] = None
         self._gate_baseline_cache = GateBaselineCache(
             self.project_root,
             cache_path=gate_baseline_cache_path(self.project_root),
@@ -157,6 +159,12 @@ class Orchestrator:
         # iteration generation; used by _clarify_validation_feedback to
         # detect silent deletion of existing requirements.
         self._clarify_pre_trace_ids: Set[str] = set()
+
+    def _attach_run_logger(self, run_id: str) -> None:
+        if not str(run_id).strip():
+            return
+        path = run_path(self.project_root, run_id) / "run.log"
+        self._active_run_log_path = attach_run_file_logger(self.logger, path)
 
     def _failed_verification_log_dir(self) -> Path:
         return self.project_root / ".auto-agents" / "failed-verification-logs"
@@ -726,6 +734,7 @@ class Orchestrator:
             self._max_tasks_remaining = max_tasks
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
+            self._attach_run_logger(state.run_id)
             if self._normalize_legacy_requirements_audit_resume(state):
                 save_run_state(self.project_root, state)
             resolved_spec_file = spec_file.expanduser().resolve()
@@ -746,10 +755,11 @@ class Orchestrator:
             self._ensure_preconditions(state, spec_file=spec_file, skip_validate=skip_validate)
 
             if state.status == "completed":
-                print("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]", file=sys.stderr)
+                self.logger.info("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]")
                 user_conf = self._prompt_user("").strip().lower()
                 if user_conf in ("y", "yes"):
                     state = self._start_new_iteration(state)
+                    self._attach_run_logger(state.run_id)
                     save_run_state(self.project_root, state)
                 else:
                     return state
@@ -1126,7 +1136,7 @@ class Orchestrator:
                     ),
                 })
             write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-            print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
+            self.logger.info("\nAgent is thinking, please wait...")
 
         if resume_to_confirm:
             # Show the agent's last reply (minus the marker) and re-ask.
@@ -1137,10 +1147,10 @@ class Orchestrator:
                     break
             display = last_agent_content.replace("READY_TO_GENERATE", "").strip()
             if display:
-                print("\n[Resuming previous conversation]", file=sys.stderr)
-                print("\nAgent:", file=sys.stderr)
-                print(display, file=sys.stderr)
-            print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
+                self.logger.info("\n[Resuming previous conversation]")
+                self.logger.info("\nAgent:")
+                self.logger.info(display)
+            self.logger.info("\nAgent is ready to generate project_brief.md.")
             user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
             if user_conf.strip().lower() not in ("n", "no"):
                 confirmed_generation = True
@@ -1166,9 +1176,9 @@ class Orchestrator:
                         break
                 if replay_msg:
                     history.append(replay_msg)
-                    print("\n[Resuming previous conversation]", file=sys.stderr)
-                    print("\nAgent:", file=sys.stderr)
-                    print(replay_msg["content"], file=sys.stderr)
+                    self.logger.info("\n[Resuming previous conversation]")
+                    self.logger.info("\nAgent:")
+                    self.logger.info(replay_msg["content"])
                     user_reply = self._prompt_user("\nYour reply: ", multiline=True)
                     if user_reply.strip():
                         history.append({"role": "user", "content": user_reply})
@@ -1177,7 +1187,7 @@ class Orchestrator:
                 write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
 
         if not confirmed_generation:
-            print("Entering interactive clarify session, please wait for the agent to analyze the spec...", file=sys.stderr, flush=True)
+            self.logger.info("Entering interactive clarify session, please wait for the agent to analyze the spec...")
 
             max_rounds = 15
             rounds = 0
@@ -1239,13 +1249,13 @@ class Orchestrator:
                 if "READY_TO_GENERATE" in reply:
                     display_reply = reply.replace("READY_TO_GENERATE", "").strip()
                     if display_reply:
-                        print("\nAgent:", file=sys.stderr)
-                        print(display_reply, file=sys.stderr)
+                        self.logger.info("\nAgent:")
+                        self.logger.info(display_reply)
                     if post_rejection:
                         confirmed_generation = True
                         post_rejection = False
                         break
-                    print("\nAgent is ready to generate project_brief.md.", file=sys.stderr)
+                    self.logger.info("\nAgent is ready to generate project_brief.md.")
                     user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
 
                     if user_conf.strip().lower() not in ("n", "no"):
@@ -1262,8 +1272,8 @@ class Orchestrator:
                 display_reply = reply.replace("READY_TO_GENERATE", "").strip() if post_rejection else reply
                 post_rejection = False
 
-                print("\nAgent:", file=sys.stderr)
-                print(display_reply, file=sys.stderr)
+                self.logger.info("\nAgent:")
+                self.logger.info(display_reply)
 
                 user_reply = self._prompt_user("\nYour reply: ", multiline=True)
 
@@ -1273,7 +1283,7 @@ class Orchestrator:
                     history.append({"role": "user", "content": "I have nothing to add. Please proceed to generate if you are ready."})
 
                 write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
-                print("\nAgent is thinking, please wait...", file=sys.stderr, flush=True)
+                self.logger.info("\nAgent is thinking, please wait...")
 
         if not confirmed_generation:
             raise RuntimeError(
@@ -1281,7 +1291,7 @@ class Orchestrator:
             )
 
         # Generate the actual project brief
-        print("\nGenerating project_brief.md, please wait...", file=sys.stderr, flush=True)
+        self.logger.info("\nGenerating project_brief.md, please wait...")
         is_iteration = self._is_iteration_run(state)
         # Snapshot active/deferred REQ IDs so _clarify_validation_feedback can
         # detect silent deletion (iteration must use status='superseded' rather
@@ -1337,7 +1347,7 @@ class Orchestrator:
             return default
         if sys.stdin.isatty():
             if multiline:
-                print(prompt + " (Press Ctrl+D or Ctrl+Z to submit):", file=sys.stderr)
+                self.logger.info(prompt + " (Press Ctrl+D or Ctrl+Z to submit):")
                 try:
                     text = sys.stdin.read()
                 except EOFError:
@@ -2067,6 +2077,9 @@ class Orchestrator:
 
     def _run_implementation_loop(self, state: RunState, max_tasks: Optional[int]) -> RunState:
         tasks = self._load_implementation_tasks(state)
+        state.current_stage = "implement"
+        state.tasks = tasks
+        save_run_state(self.project_root, state)
 
         if state.rejected_stage == "implement" and state.rejection_reason:
             import time
@@ -2199,43 +2212,34 @@ class Orchestrator:
                 continue
 
             self._require_clean_tree_excluding_agent_instructions()
-            self.logger.info("[parallel-tasks] batch workers=%s tasks=%s", len(batch), ",".join(task.task_id for task in batch))
+            deferred = self._deferred_parallel_task_reasons(tasks)
+            self.logger.info(
+                "[parallel-tasks] ready=%s deferred=%s workers=%s batch=%s tasks=%s",
+                len(ready),
+                len(deferred),
+                current_workers,
+                len(batch),
+                ",".join(task.task_id for task in batch),
+            )
+            if deferred:
+                preview = "; ".join(deferred[:6])
+                if len(deferred) > 6:
+                    preview += f"; +{len(deferred) - 6} more"
+                self.logger.info("[parallel-tasks] deferred reasons=%s", preview)
             with log_timing(self.logger, f"parallel-batch workers={len(batch)}"):
                 results = self._run_parallel_task_batch(state, tasks, batch)
+            provider_pressure_result: Optional[Tuple[TaskSpec, Dict[str, object]]] = None
+            failed_results: List[Tuple[TaskSpec, Dict[str, object]]] = []
             for task in batch:
                 result = results[task.task_id]
                 if not result["ok"]:
                     if self._parallel_result_is_provider_pressure(result):
-                        if (
-                            self.config.execution.parallel_tasks.workers != "auto"
-                            or not self.config.execution.parallel_tasks.adaptive
-                        ):
-                            raise RuntimeError(
-                                "parallel task execution hit provider pressure with fixed workers; "
-                                f"task={task.task_id} reason={result['reason']}"
-                            )
-                        current_workers = self._record_parallel_pressure(current_workers)
-                        self.logger.info(
-                            "[parallel-tasks] provider pressure task=%s workers=%s reason=%s",
-                            task.task_id,
-                            current_workers,
-                            str(result["reason"])[:200],
-                        )
+                        provider_pressure_result = (task, result)
                         break
-                    updated_task = TaskSpec.from_dict(dict(result["task"]))
-                    task.review_summary = updated_task.review_summary
-                    task.review_history = list(updated_task.review_history)
-                    task.verify_history = list(updated_task.verify_history)
+                    self._apply_parallel_task_failure_snapshot(task, dict(result["task"]))
                     task.status = "blocked"
-                    self._persist_tasks(tasks)
-                    self._emit_task_blocked(task, str(result["reason"]))
-                    raise RuntimeError(
-                        self._format_task_failure_error(
-                            task,
-                            reason=str(result["reason"]),
-                            review_summary=task.review_summary,
-                        )
-                    )
+                    failed_results.append((task, result))
+                    continue
 
                 self._apply_parallel_task_snapshot(task, dict(result["task"]))
                 commit_sha = self._integrate_parallel_task_result(task, tasks, str(result["commit_sha"]))
@@ -2246,6 +2250,34 @@ class Orchestrator:
                 )
                 processed += 1
                 self._consume_task_budget()
+            if provider_pressure_result is not None:
+                task, result = provider_pressure_result
+                if (
+                    self.config.execution.parallel_tasks.workers != "auto"
+                    or not self.config.execution.parallel_tasks.adaptive
+                ):
+                    raise RuntimeError(
+                        "parallel task execution hit provider pressure with fixed workers; "
+                        f"task={task.task_id} reason={result['reason']}"
+                    )
+                current_workers = self._record_parallel_pressure(current_workers)
+                self.logger.info(
+                    "[parallel-tasks] provider pressure task=%s workers=%s reason=%s",
+                    task.task_id,
+                    current_workers,
+                    str(result["reason"])[:200],
+                )
+            elif failed_results:
+                scheduled_recovery = False
+                for failed_task, result in failed_results:
+                    if self._schedule_repair_tasks_for_failure(state, tasks, failed_task, result):
+                        scheduled_recovery = True
+                if scheduled_recovery:
+                    continue
+                self._persist_tasks(tasks)
+                for failed_task, result in failed_results:
+                    self._emit_task_blocked(failed_task, str(result["reason"]))
+                raise RuntimeError(self._format_parallel_batch_failure_error(failed_results))
             else:
                 current_workers = self._record_parallel_success(current_workers)
                 continue
@@ -2265,6 +2297,11 @@ class Orchestrator:
         tasks: List[TaskSpec],
         task: TaskSpec,
     ) -> Optional[RunState]:
+        if task.status == "blocked":
+            payload = self._task_recovery_payload_from_history(task, state)
+            if self._schedule_repair_tasks_for_failure(state, tasks, task, payload):
+                return state
+
         resume_existing = task.status == "in_progress" or self._should_resume_task(state, task)
         allow_dirty_retry = task.status == "blocked"
         if (resume_existing or allow_dirty_retry) and task.status != "in_progress":
@@ -2303,6 +2340,8 @@ class Orchestrator:
                 )
                 if rewind_state is not None:
                     return rewind_state
+            if self._schedule_repair_tasks_for_failure(state, tasks, task, gate_result):
+                return state
             task.status = "blocked"
             task.review_summary = str(gate_result["review"])
             self._persist_tasks(tasks)
@@ -2442,6 +2481,17 @@ class Orchestrator:
             and all(dependency in completed for dependency in task.depends_on)
         ]
 
+    def _deferred_parallel_task_reasons(self, tasks: List[TaskSpec]) -> List[str]:
+        completed = {task.task_id for task in tasks if task.status == "done"}
+        reasons: List[str] = []
+        for task in tasks:
+            if task.status != "pending":
+                continue
+            missing = [dependency for dependency in task.depends_on if dependency not in completed]
+            if missing:
+                reasons.append(f"{task.task_id}: waiting for {', '.join(missing[:4])}")
+        return reasons
+
     def _parallel_worktree_root(self) -> Path:
         configured = self.config.execution.parallel_tasks.worktree_root.strip()
         if not configured:
@@ -2471,7 +2521,8 @@ class Orchestrator:
                 ): task.task_id
                 for task in batch
             }
-            for future, task_id in future_map.items():
+            for future in as_completed(future_map):
+                task_id = future_map[future]
                 results[task_id] = future.result()
         return results
 
@@ -2511,6 +2562,13 @@ class Orchestrator:
                     "task": worker_task.to_dict(),
                     "reason": str(gate_result["reason"]),
                     "review": str(gate_result["review"]),
+                    "failure_ids": list(gate_result.get("failure_ids", [])),
+                    "comparable_failures": bool(gate_result.get("comparable_failures", True)),
+                    "proof_evidence": (
+                        gate_result.get("proof_evidence")
+                        if isinstance(gate_result.get("proof_evidence"), dict)
+                        else {}
+                    ),
                 }
 
             worker_task.status = "done"
@@ -2546,7 +2604,7 @@ class Orchestrator:
             if worktree_created:
                 remove_worktree(self.project_root, worktree_path, force=True)
 
-    def _apply_parallel_task_snapshot(self, task: TaskSpec, payload: Dict[str, object]) -> None:
+    def _copy_parallel_task_snapshot_fields(self, task: TaskSpec, payload: Dict[str, object]) -> None:
         updated = TaskSpec.from_dict(payload)
         task.description = updated.description
         task.acceptance = list(updated.acceptance)
@@ -2560,9 +2618,233 @@ class Orchestrator:
         task.verify_baseline_ref = updated.verify_baseline_ref
         task.expected_test_migrations = list(updated.expected_test_migrations)
         task.requirement_proofs = list(updated.requirement_proofs)
+        task.verification_refs = list(updated.verification_refs)
         task.scratchpad = updated.scratchpad
         task.arbitration_history = list(updated.arbitration_history)
+        task.recovery_history = list(updated.recovery_history)
+
+    def _apply_parallel_task_snapshot(self, task: TaskSpec, payload: Dict[str, object]) -> None:
+        self._copy_parallel_task_snapshot_fields(task, payload)
         task.status = "done"
+
+    def _apply_parallel_task_failure_snapshot(self, task: TaskSpec, payload: Dict[str, object]) -> None:
+        self._copy_parallel_task_snapshot_fields(task, payload)
+        updated = TaskSpec.from_dict(payload)
+        task.status = updated.status if updated.status in {"pending", "in_progress", "blocked"} else "blocked"
+
+    def _format_parallel_batch_failure_error(self, failures: List[Tuple[TaskSpec, Dict[str, object]]]) -> str:
+        if not failures:
+            return "parallel task batch failed"
+        parts = []
+        for task, result in failures:
+            reason = str(result.get("reason", "")).strip() or "unknown failure"
+            parts.append(f"{task.task_id}: {reason}")
+        return "parallel task batch failed: " + " | ".join(parts)
+
+    def _task_recovery_payload_from_history(self, task: TaskSpec, state: RunState) -> Dict[str, object]:
+        failure_ids: List[str] = []
+        comparable = True
+        for entry in reversed(task.verify_history):
+            if not isinstance(entry, dict) or str(entry.get("decision", "")) != "fail":
+                continue
+            raw_ids = entry.get("failure_ids", [])
+            if isinstance(raw_ids, list):
+                failure_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+            comparable = bool(entry.get("comparable_failures", True))
+            break
+        reason = task.review_summary.strip() or state.last_error.strip()
+        return {
+            "reason": reason,
+            "review": task.review_summary,
+            "failure_ids": failure_ids,
+            "comparable_failures": comparable,
+        }
+
+    def _recovery_signature(self, failure_ids: List[str], reason: str) -> str:
+        payload = {
+            "failure_ids": sorted(failure_ids),
+            "reason": " ".join(str(reason or "").split())[:500],
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+    def _candidate_repair_refs(self, task: TaskSpec, result: Dict[str, object]) -> List[str]:
+        comparable = bool(result.get("comparable_failures", True))
+        raw_ids = result.get("failure_ids", [])
+        failure_ids = [str(item).strip() for item in raw_ids if str(item).strip()] if isinstance(raw_ids, list) else []
+        if not comparable:
+            return []
+        refs: List[str] = []
+        for failure_id in failure_ids:
+            if failure_id.startswith("reason:") or failure_id.startswith("cmd:"):
+                continue
+            if self._build_task_proof_evidence_command_for_ref(failure_id):
+                refs.append(failure_id)
+        if refs:
+            return refs
+        proof_evidence = result.get("proof_evidence")
+        if isinstance(proof_evidence, dict):
+            for raw_ref in proof_evidence.get("failed_refs", []) or []:
+                ref = str(raw_ref).strip()
+                if ref and self._build_task_proof_evidence_command_for_ref(ref):
+                    refs.append(ref)
+        return refs
+
+    @staticmethod
+    def _group_repair_refs(refs: List[str], max_refs_per_group: int, max_groups: int) -> List[List[str]]:
+        grouped: Dict[str, List[str]] = {}
+        ordered_paths: List[str] = []
+        for ref in refs:
+            path, _selector = Orchestrator._split_evidence_ref(ref)
+            key = path.replace("\\", "/").strip() or ref
+            if key not in grouped:
+                grouped[key] = []
+                ordered_paths.append(key)
+            if ref not in grouped[key]:
+                grouped[key].append(ref)
+        groups: List[List[str]] = []
+        for path in ordered_paths:
+            items = grouped[path]
+            for index in range(0, len(items), max_refs_per_group):
+                groups.append(items[index : index + max_refs_per_group])
+                if len(groups) >= max_groups:
+                    return groups
+        return groups
+
+    @staticmethod
+    def _repair_task_id(parent_task_id: str, round_number: int, index: int) -> str:
+        safe_parent = re.sub(r"[^a-zA-Z0-9_-]+", "-", parent_task_id).strip("-").lower() or "task"
+        return f"repair-{safe_parent}-r{round_number}-{index}"
+
+    def _schedule_repair_tasks_for_failure(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        result: Dict[str, object],
+    ) -> bool:
+        recovery_config = self.config.execution.recovery
+        if not recovery_config.enabled:
+            return False
+        if task.parent_task_id or task.task_id.startswith("repair-"):
+            return False
+        existing_open_repairs = [
+            item for item in tasks
+            if item.parent_task_id == task.task_id and item.status != "done"
+        ]
+        if existing_open_repairs:
+            self.logger.info(
+                "[recovery] parent=%s waits for existing repair tasks=%s",
+                task.task_id,
+                ",".join(item.task_id for item in existing_open_repairs),
+            )
+            task.status = "pending"
+            for repair in existing_open_repairs:
+                if repair.task_id not in task.depends_on:
+                    task.depends_on.append(repair.task_id)
+            self._persist_tasks(tasks)
+            state.tasks = tasks
+            save_run_state(self.project_root, state)
+            return True
+
+        refs = self._candidate_repair_refs(task, result)
+        if not refs:
+            return False
+        reason = str(result.get("reason", "")).strip()
+        signature = self._recovery_signature(refs, reason)
+        prior_rounds = [
+            entry for entry in task.recovery_history
+            if isinstance(entry, dict) and str(entry.get("signature", "")) == signature
+        ]
+        round_number = len(prior_rounds) + 1
+        if round_number > recovery_config.max_rounds:
+            self.logger.info(
+                "[recovery] exhausted parent=%s signature=%s rounds=%s reason=%s",
+                task.task_id,
+                signature,
+                len(prior_rounds),
+                reason[:300],
+            )
+            task.recovery_history.append({
+                "signature": signature,
+                "round": round_number,
+                "result": "exhausted",
+                "reason": reason,
+                "failure_ids": refs,
+            })
+            return False
+
+        groups = self._group_repair_refs(
+            refs,
+            max_refs_per_group=recovery_config.max_refs_per_repair_task,
+            max_groups=recovery_config.max_repair_tasks_per_round,
+        )
+        if not groups:
+            return False
+        existing_ids = {item.task_id for item in tasks}
+        repair_tasks: List[TaskSpec] = []
+        for index, group in enumerate(groups, start=1):
+            repair_id = self._repair_task_id(task.task_id, round_number, index)
+            suffix = 2
+            while repair_id in existing_ids:
+                repair_id = f"{self._repair_task_id(task.task_id, round_number, index)}-{suffix}"
+                suffix += 1
+            existing_ids.add(repair_id)
+            path, _selector = self._split_evidence_ref(group[0])
+            title = f"Repair {task.task_id} proof evidence"
+            if path:
+                title = f"{title}: {path.rsplit('/', 1)[-1]}"
+            repair_tasks.append(
+                TaskSpec(
+                    task_id=repair_id,
+                    title=title,
+                    description=(
+                        f"Repair failed verification evidence for parent task {task.task_id}.\n\n"
+                        f"Failure reason:\n{reason}\n\n"
+                        "Verification refs:\n" + "\n".join(f"- {ref}" for ref in group)
+                    ),
+                    acceptance=[
+                        "All verification_refs on this repair task pass.",
+                        f"The fix remains scoped to failed evidence for parent task {task.task_id}.",
+                        "No parent requirement_proofs, acceptance criteria, or forbidden proxy oracle constraints are weakened.",
+                    ],
+                    requirement_ids=[],
+                    depends_on=[],
+                    status="pending",
+                    commit_message=f"fix({task.task_id}): repair proof evidence",
+                    parent_task_id=task.task_id,
+                    split_depth=int(task.split_depth) + 1,
+                    verification_refs=list(group),
+                )
+            )
+
+        insert_at = tasks.index(task)
+        tasks[insert_at:insert_at] = repair_tasks
+        task.status = "pending"
+        task.commit_sha = ""
+        for repair in repair_tasks:
+            if repair.task_id not in task.depends_on:
+                task.depends_on.append(repair.task_id)
+        task.recovery_history.append({
+            "signature": signature,
+            "round": round_number,
+            "result": "scheduled",
+            "reason": reason,
+            "failure_ids": refs,
+            "repair_task_ids": [repair.task_id for repair in repair_tasks],
+        })
+        self._persist_tasks(tasks)
+        state.tasks = tasks
+        state.current_stage = "implement"
+        state.last_error = ""
+        save_run_state(self.project_root, state)
+        self.logger.info(
+            "[recovery] scheduled parent=%s round=%s repairs=%s refs=%s",
+            task.task_id,
+            round_number,
+            ",".join(repair.task_id for repair in repair_tasks),
+            len(refs),
+        )
+        return True
 
     def _integrate_parallel_task_result(
         self,
@@ -2992,6 +3274,10 @@ class Orchestrator:
         if task is None:
             return []
         refs: List[str] = []
+        for raw_ref in task.verification_refs:
+            ref = str(raw_ref).strip()
+            if ref and ref not in refs:
+                refs.append(ref)
         for proof in task.requirement_proofs:
             if not isinstance(proof, dict):
                 continue
@@ -4593,7 +4879,7 @@ class Orchestrator:
 
         # First round (or resume): generate initial proposal if no history yet
         if not history:
-            print("Entering README preparation, please wait for the agent to analyze the project...", file=sys.stderr, flush=True)
+            self.logger.info("Entering README preparation, please wait for the agent to analyze the project...")
 
             proposal_prompt = self._build_readme_proposal_prompt(spec_file, history)
             result = self._run_agent_with_retries(
@@ -4619,8 +4905,8 @@ class Orchestrator:
                     last_agent_msg = msg.get("content", "")
                     break
 
-            print("\nAgent:", file=sys.stderr)
-            print(last_agent_msg, file=sys.stderr)
+            self.logger.info("\nAgent:")
+            self.logger.info(last_agent_msg)
 
             answer = self._prompt_user(
                 "\nDo you have anything to add or modify? (y/n) [n]: ", default="n"
@@ -4634,7 +4920,7 @@ class Orchestrator:
             history.append({"role": "user", "content": user_input})
             write_text(history_file, _json.dumps(history, indent=2, ensure_ascii=False))
 
-            print("\nAgent is updating the plan, please wait...", file=sys.stderr, flush=True)
+            self.logger.info("\nAgent is updating the plan, please wait...")
             proposal_prompt = self._build_readme_proposal_prompt(spec_file, history)
             result = self._run_agent_with_retries(
                 state=state,
@@ -4650,7 +4936,7 @@ class Orchestrator:
         user_extras = [msg["content"] for msg in history if msg.get("role") == "user"]
 
         # --- generation phase ---
-        print("\nGenerating README.md, please wait...", file=sys.stderr, flush=True)
+        self.logger.info("\nGenerating README.md, please wait...")
         prompt = self._build_prompt(stage="readme", spec_file=spec_file)
         if user_extras:
             prompt += "\n\nAdditional user instructions for the README:\n" + "\n".join(user_extras)
@@ -5497,6 +5783,8 @@ class Orchestrator:
             "owned requirement-oracle proof pairs. Acceptance oracles from the same requirement "
             "that are absent from this task's requirement_proofs may be covered by other tasks; "
             "do not implement, review-fail, or emit ORACLE_PROOF_UPDATES for those absent pairs.",
+            "If Task JSON includes verification_refs, those refs are the current repair task's "
+            "owned executable proof surface and must pass before the repair can complete.",
         ]
         if requirement_context:
             common.extend(["", requirement_context])
@@ -5618,6 +5906,9 @@ class Orchestrator:
             )
         last_reason = "task failed without a recorded reason"
         last_review = ""
+        last_failure_ids: List[str] = []
+        last_comparable_failures = True
+        last_proof_evidence: Optional[Dict[str, object]] = None
 
         review_fingerprints: List[str] = []
         for entry in task.review_history:
@@ -5717,6 +6008,9 @@ class Orchestrator:
                 last_reason, retryable = quick_failure
                 failure_ids = self._normalize_verify_failure_ids([], last_reason)
                 verify_analysis = self._analyze_verify_failure(task, failure_ids, comparable=False)
+                last_failure_ids = list(failure_ids)
+                last_comparable_failures = False
+                last_proof_evidence = None
                 verify_stats = str(verify_analysis["stats"])
                 self._record_verify_result(
                     task,
@@ -5753,6 +6047,13 @@ class Orchestrator:
                     last_reason,
                 )
                 comparable_failures = bool(verify_result.get("comparable_failures", True))
+                last_failure_ids = list(failure_ids)
+                last_comparable_failures = comparable_failures
+                last_proof_evidence = (
+                    verify_result.get("proof_evidence")
+                    if isinstance(verify_result.get("proof_evidence"), dict)
+                    else None
+                )
                 verify_analysis = self._analyze_verify_failure(
                     task,
                     failure_ids,
@@ -5920,7 +6221,14 @@ class Orchestrator:
                 "arbiter": overflow_arbiter or {},
             }
 
-        return {"ok": False, "review": last_review or feedback, "reason": last_reason}
+        return {
+            "ok": False,
+            "review": last_review or feedback,
+            "reason": last_reason,
+            "failure_ids": list(last_failure_ids),
+            "comparable_failures": bool(last_comparable_failures),
+            "proof_evidence": last_proof_evidence or {},
+        }
 
     def _run_agent_with_retries(
         self,

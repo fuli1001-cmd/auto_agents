@@ -296,6 +296,28 @@
             }
           },
           "additionalProperties": false
+        },
+        "recovery": {
+          "type": "object",
+          "required": ["enabled", "max_rounds", "max_repair_tasks_per_round", "max_refs_per_repair_task"],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "max_rounds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_repair_tasks_per_round": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_refs_per_repair_task": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

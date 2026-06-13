@@ -221,6 +221,12 @@ DEFAULT_CONFIG = {
             "strict": False,
             "worktree_root": "",
         },
+        "recovery": {
+            "enabled": True,
+            "max_rounds": 2,
+            "max_repair_tasks_per_round": 6,
+            "max_refs_per_repair_task": 8,
+        },
     },
     "approvals": {
         "enabled": ["requirements", "architecture", "release"],

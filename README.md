@@ -85,6 +85,8 @@ stays conservative:
   `execution.parallel_tasks.strict=true`
 - each worker still runs implement/verify/review, and the main worktree still integrates task
   results one commit at a time
+- batch logs include ready/deferred counts, dependency reasons for deferred tasks, and all failed
+  workers in the batch instead of only the first failure
 
 For each task, the effective loop is:
 
@@ -103,6 +105,11 @@ retry budget is exhausted, that task is marked `blocked` and the run exits with 
 silently skipping ahead. When a task falls back to full gate verification and the new failures are
 clearly outside the task's owned proof/test surface, auto_agents stops retrying that implementation
 loop and reports the result as a contract or gate-scope mismatch.
+
+For comparable owned proof failures, auto_agents can schedule bounded repair tasks before it gives
+up. A repair task is inserted ahead of the blocked parent, owns only precise `verification_refs`, and
+the parent waits on those repair task IDs before retrying its original proof gate. The default
+recovery budget is two rounds per stable failure signature.
 
 The top-level `verify` stage still runs the full configured verification suite before release. If
 that full suite fails, auto_agents now treats it as a recovery signal instead of immediately
@@ -450,6 +457,12 @@ worktrees. Example:
       "adaptive": true,
       "strict": false,
       "worktree_root": ""
+    },
+    "recovery": {
+      "enabled": true,
+      "max_rounds": 2,
+      "max_repair_tasks_per_round": 6,
+      "max_refs_per_repair_task": 8
     }
   }
 }
@@ -465,6 +478,9 @@ caps concurrency at `max_auto_workers`, and lowers concurrency when provider pre
 as throttling, quota, timeout, or stalls is detected. Successful batches can gradually raise
 the next batch's worker count within that cap.
 For `copilot-cli`, `subscription_tier` can also be set to `pro+`.
+
+Run logs are written both to stderr and to `.auto-agents/runs/<run_id>/run.log`. CLI command results
+remain on stdout for scripts.
 
 ### Provider auto-failover
 
@@ -592,6 +608,8 @@ What resumes depends on the stage:
   `run` continues from the first unfinished stage
 - `implement`: task status is read from `task_plan.json`, so finished tasks are skipped and the next
   unfinished task is resumed
+- `implement` with a blocked proof failure: the next run can insert focused repair tasks and retry
+  the parent task after those repairs pass
 - approval pauses: `approve` clears the pending gate, and the next `run` continues from there
 
 When `provider_research` fails because the remaining provider references still require a user decision
