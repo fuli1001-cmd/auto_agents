@@ -272,6 +272,14 @@ def run_path(project_root: Path, run_id: str) -> Path:
     return runs_dir(project_root) / run_id
 
 
+def archived_task_plan_path(project_root: Path, run_id: str) -> Path:
+    return run_path(project_root, run_id) / "task_plan.final.json"
+
+
+def archived_run_state_path(project_root: Path, run_id: str) -> Path:
+    return run_path(project_root, run_id) / "run_state.final.json"
+
+
 def run_state_path(project_root: Path) -> Path:
     return state_dir(project_root) / "run_state.json"
 

@@ -575,7 +575,46 @@ class ProjectValidationTests(unittest.TestCase):
             report = validation_report(project_root)
 
             self.assertTrue(report["ok"])
-            self.assertTrue(any("contains 30 tasks" in item for item in report["warnings"]))
+            self.assertTrue(any("contains 30 active tasks" in item for item in report["warnings"]))
+
+    def test_validation_report_allows_empty_plan_before_archived_iteration_plan_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(task_plan_path(project_root), {"tasks": []})
+            state = load_run_state(project_root)
+            state.status = "paused"
+            state.current_stage = "clarify"
+            state.resume_context = {
+                "previous_run_id": "oldrun123",
+                "previous_task_plan_archive": str(project_root / ".auto-agents" / "runs" / "oldrun123" / "task_plan.final.json"),
+            }
+            save_run_state(project_root, state)
+
+            report = validation_report(project_root)
+
+            self.assertTrue(report["ok"])
+            self.assertFalse(any("at least one task" in item for item in report["errors"]))
+
+    def test_validation_report_rejects_empty_plan_after_plan_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(task_plan_path(project_root), {"tasks": []})
+            state = load_run_state(project_root)
+            state.status = "pending"
+            state.current_stage = "implement"
+            state.stage_summaries["plan"] = "planned"
+            state.resume_context = {
+                "previous_run_id": "oldrun123",
+                "previous_task_plan_archive": str(project_root / ".auto-agents" / "runs" / "oldrun123" / "task_plan.final.json"),
+            }
+            save_run_state(project_root, state)
+
+            report = validation_report(project_root)
+
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("at least one task" in item for item in report["errors"]))
 
     def test_validation_report_passes_for_bootstrapped_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1806,6 +1845,27 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("Avoid oversized tasks", prompt)
             self.assertIn("verification_steps entries with kind='test' and runner='pytest'", prompt)
             self.assertIn("Do not generate free-form shell verification commands", prompt)
+
+    def test_iteration_plan_prompt_uses_archived_task_plan_as_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            state = load_run_state(project_root)
+            archive_path = project_root / ".auto-agents" / "runs" / "oldrun123" / "task_plan.final.json"
+            state.resume_context = {
+                "previous_run_id": "oldrun123",
+                "previous_task_plan_archive": str(archive_path),
+            }
+            save_run_state(project_root, state)
+            orchestrator = Orchestrator(project_root)
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            prompt = orchestrator._build_prompt("plan", spec_file, is_iteration=True)
+
+            self.assertIn(str(archive_path), prompt)
+            self.assertIn("Do NOT copy archived done tasks back into the active task_plan.json", prompt)
+            self.assertNotIn("APPEND new tasks to the end of the JSON array", prompt)
 
     def test_mock_readme_stage_updates_project_readme(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

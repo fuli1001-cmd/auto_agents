@@ -524,6 +524,12 @@ The plan root can also define:
 Those fields are required for completed plan output and are preserved when task status is updated
 during implementation.
 
+Across iterations, `state/task_plan.json` is the active plan for the current run, not a permanent
+history table. When a completed project starts a new iteration, auto_agents archives the previous
+plan to `.auto-agents/runs/<run_id>/task_plan.final.json`, archives the final run state beside it,
+and resets the active plan to an empty `{ "tasks": [] }` placeholder until the new plan stage
+generates current-iteration tasks.
+
 `state/requirements_trace.json` is also a contract, not scratch metadata. Each active requirement is
 expected to carry:
 

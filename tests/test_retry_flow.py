@@ -11,6 +11,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.config import (
+    archived_run_state_path,
+    archived_task_plan_path,
     gate_baseline_cache_path,
     load_project_config,
     load_run_state,
@@ -4245,8 +4247,7 @@ class RetryFlowTests(unittest.TestCase):
 class IterationAdapter:
     """Adapter that tracks stage calls for iteration testing.
 
-    On the plan stage it writes a task_plan.json that preserves existing
-    done tasks and appends new pending ones.
+    On the plan stage it writes only the new active iteration tasks.
     """
 
     def __init__(self, project_root: Path) -> None:
@@ -4258,16 +4259,9 @@ class IterationAdapter:
         if request.stage == "clarify":
             write_text(request.output_path, "Clarified iteration scope.\nREADY_TO_GENERATE\n")
         elif request.stage == "plan":
-            # Read existing plan so we can preserve done tasks
-            import json
-            existing = {"tasks": []}
             tp = task_plan_path(self.project_root)
-            if tp.exists():
-                existing = json.loads(tp.read_text(encoding="utf-8"))
-
-            done_tasks = [t for t in existing.get("tasks", []) if t.get("status") == "done"]
             new_task = {
-                "task_id": f"task-{len(done_tasks) + 1:03d}",
+                "task_id": "task-002",
                 "title": "New iteration task",
                 "description": "Task added in iteration.",
                 "acceptance": ["new feature works"],
@@ -4278,7 +4272,7 @@ class IterationAdapter:
             write_json(tp, {
                 "test_strategy": "python-pytest",
                 "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
-                "tasks": done_tasks + [new_task],
+                "tasks": [new_task],
             })
             write_text(request.output_path, "iteration plan\n")
         elif request.stage == "implement":
@@ -4387,6 +4381,15 @@ class IterationFlowTests(unittest.TestCase):
 
             self.assertNotEqual(state.run_id, old_run_id, "New run_id should be generated")
             self.assertEqual(state.status, "completed")
+            task_archive = archived_task_plan_path(project_root, old_run_id)
+            state_archive = archived_run_state_path(project_root, old_run_id)
+            self.assertTrue(task_archive.exists())
+            self.assertTrue(state_archive.exists())
+            archived_plan = json.loads(task_archive.read_text(encoding="utf-8"))
+            self.assertEqual(archived_plan["tasks"][0]["task_id"], "task-001")
+            self.assertEqual(archived_plan["tasks"][0]["status"], "done")
+            self.assertEqual(state.resume_context["previous_run_id"], old_run_id)
+            self.assertEqual(state.resume_context["previous_task_plan_archive"], str(task_archive))
             # Old implement-task-001 attempt count should be gone
             self.assertNotIn("implement-task-001", state.agent_attempts,
                              "Old agent_attempts should have been cleared at iteration start")
@@ -4407,10 +4410,9 @@ class IterationFlowTests(unittest.TestCase):
             state = orchestrator.run(spec_file=spec_file, auto_approve=True)
 
             self.assertEqual(state.status, "completed")
-            # The old done task should be preserved
-            done_tasks = [t for t in state.tasks if t.status == "done"]
-            self.assertGreaterEqual(len(done_tasks), 2,
-                                    "Both old and new tasks should be done")
+            self.assertEqual([task.task_id for task in state.tasks], ["task-002"])
+            self.assertEqual(state.tasks[0].title, "New iteration task")
+            self.assertEqual(state.tasks[0].status, "done")
             # implement must have been called
             self.assertIn("implement", adapter.stage_calls,
                           "Implement stage should run for new pending tasks")

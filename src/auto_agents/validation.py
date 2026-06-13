@@ -6,7 +6,7 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Dict, List
 
-from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, task_plan_path
+from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, run_state_path, task_plan_path
 from .io_utils import read_json, read_text
 from .models import APPROVAL_ORDER, DEFAULT_EFFORTS, DOCUMENT_LANGUAGE_OPTIONS
 from .requirements import (
@@ -362,6 +362,7 @@ def validate_task_plan_payload(
     payload: object,
     require_verification: bool = False,
     *,
+    allow_empty_tasks: bool = False,
     require_depends_on_for_pending: bool = False,
     enforce_active_task_granularity: bool = False,
 ) -> List[str]:
@@ -416,6 +417,8 @@ def validate_task_plan_payload(
     if not isinstance(tasks, list):
         return ["task plan must contain a 'tasks' list"]
     if not tasks:
+        if allow_empty_tasks:
+            return errors
         return ["task plan must contain at least one task"]
 
     seen_ids = set()
@@ -606,6 +609,22 @@ def task_plan_warnings(payload: object) -> List[str]:
         )
 
     return warnings
+
+
+def _allow_empty_task_plan_for_iteration(project_root: Path) -> bool:
+    state_payload = read_json(run_state_path(project_root), default=None)
+    if not isinstance(state_payload, dict):
+        return False
+    context = state_payload.get("resume_context", {})
+    if not isinstance(context, dict) or not str(context.get("previous_run_id", "")).strip():
+        return False
+    summaries = state_payload.get("stage_summaries", {})
+    if isinstance(summaries, dict) and "plan" in summaries:
+        return False
+    current_stage = str(state_payload.get("current_stage", "clarify")).strip()
+    if current_stage not in {"clarify", "design", "plan"}:
+        return False
+    return str(state_payload.get("status", "pending")).strip() != "completed"
 
 
 def validate_project_config_payload(payload: object) -> List[str]:
@@ -848,6 +867,7 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         errors.extend(
             validate_task_plan_payload(
                 plan_payload,
+                allow_empty_tasks=_allow_empty_task_plan_for_iteration(root),
                 enforce_active_task_granularity=True,
             )
         )

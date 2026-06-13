@@ -32,6 +32,8 @@ from .agent_instructions import (
 )
 from .repomap import RepoMapBuilder, RepoMapResult
 from .config import (
+    archived_run_state_path,
+    archived_task_plan_path,
     bootstrap_project,
     docs_dir,
     gate_baseline_cache_path,
@@ -63,7 +65,7 @@ from .gates import (
 )
 from .gate_baseline_cache import GateBaselineCache
 from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, ensure_repo, hard_reset_clean, head_ref, is_repo, remove_worktree, worktree_fingerprint
-from .io_utils import read_text, write_text
+from .io_utils import read_json, read_text, write_json, write_text
 from .logging_utils import build_run_logger, log_timing
 from .models import (
     APPROVAL_ORDER,
@@ -747,17 +749,7 @@ class Orchestrator:
                 print("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]", file=sys.stderr)
                 user_conf = self._prompt_user("").strip().lower()
                 if user_conf in ("y", "yes"):
-                    state.run_id = uuid.uuid4().hex[:12]
-                    state.status = "pending"
-                    state.current_stage = "clarify"
-                    for s in ["clarify", "design", "plan", "provider_research", "implement", "verify", "readme"]:
-                        state.stage_summaries.pop(s, None)
-                    state.approved_gates = []
-                    state.agent_attempts = {}
-                    state.task_review_cache = {}
-                    state.implement_verify_baseline_failures = []
-                    state.implement_verify_baseline_ref = ""
-                    state.plan_task_replacements = {}
+                    state = self._start_new_iteration(state)
                     save_run_state(self.project_root, state)
                 else:
                     return state
@@ -831,6 +823,57 @@ class Orchestrator:
             self._max_tasks_remaining = None
             self._task_budget_exhausted = False
 
+    @staticmethod
+    def _json_payload_equal(left: object, right: object) -> bool:
+        return json.dumps(left, sort_keys=True, ensure_ascii=False) == json.dumps(
+            right,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+
+    def _write_archive_json(self, path: Path, payload: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            existing = read_json(path, default=None)
+            if self._json_payload_equal(existing, payload):
+                return
+            raise RuntimeError(f"archive already exists with different content: {path}")
+        write_json(path, payload)
+
+    def _archive_completed_run(self, state: RunState) -> Tuple[Path, Path]:
+        task_archive = archived_task_plan_path(self.project_root, state.run_id)
+        state_archive = archived_run_state_path(self.project_root, state.run_id)
+        run_state_payload = read_json(run_state_path(self.project_root), default=state.to_dict())
+        self._write_archive_json(task_archive, load_task_plan(self.project_root))
+        self._write_archive_json(state_archive, run_state_payload)
+        return task_archive, state_archive
+
+    def _start_new_iteration(self, state: RunState) -> RunState:
+        previous_run_id = state.run_id
+        task_archive, _state_archive = self._archive_completed_run(state)
+        context = dict(state.resume_context)
+        context["previous_run_id"] = previous_run_id
+        context["previous_task_plan_archive"] = str(task_archive)
+
+        state.run_id = uuid.uuid4().hex[:12]
+        state.status = "pending"
+        state.current_stage = "clarify"
+        state.pending_approval = ""
+        state.approved_gates = []
+        state.tasks = []
+        state.stage_summaries = {}
+        state.agent_attempts = {}
+        state.task_review_cache = {}
+        state.implement_verify_baseline_failures = []
+        state.implement_verify_baseline_ref = ""
+        state.plan_task_replacements = {}
+        state.last_error = ""
+        state.rejection_reason = ""
+        state.rejected_stage = ""
+        state.resume_context = context
+        save_task_plan(self.project_root, {"tasks": []})
+        return state
+
     def _ensure_preconditions(self, state: RunState, spec_file: Path, skip_validate: bool) -> None:
         if not spec_file.exists():
             state.status = "failed"
@@ -865,11 +908,27 @@ class Orchestrator:
             return MockAdapter()
         return ShellAdapter(config.provider)
 
+    @staticmethod
+    def _is_iteration_run(state: RunState) -> bool:
+        if any(task.status == "done" for task in state.tasks):
+            return True
+        return bool(str(state.resume_context.get("previous_run_id", "")).strip())
+
+    def _previous_task_plan_archive_for_prompt(self) -> str:
+        try:
+            state = load_run_state(self.project_root)
+        except (FileNotFoundError, KeyError, ValueError):
+            return ""
+        archive = str(state.resume_context.get("previous_task_plan_archive", "")).strip()
+        if not archive:
+            return ""
+        return archive
+
     def _run_agent_stage(self, stage: str, state: RunState, spec_file: Path, auto_approve: bool = False) -> RunState:
         if stage == "clarify":
             return self._run_interactive_clarify(state, spec_file)
 
-        is_iteration = any(t.status == "done" for t in state.tasks)
+        is_iteration = self._is_iteration_run(state)
         prior_tasks = list(state.tasks)
         prompt = self._build_prompt(stage=stage, spec_file=spec_file, is_iteration=is_iteration)
 
@@ -1223,7 +1282,7 @@ class Orchestrator:
 
         # Generate the actual project brief
         print("\nGenerating project_brief.md, please wait...", file=sys.stderr, flush=True)
-        is_iteration = any(t.status == "done" for t in state.tasks)
+        is_iteration = self._is_iteration_run(state)
         # Snapshot active/deferred REQ IDs so _clarify_validation_feedback can
         # detect silent deletion (iteration must use status='superseded' rather
         # than removal). Empty set on first run.
@@ -3888,6 +3947,10 @@ class Orchestrator:
         provider_kind: Optional[str],
         doc_language: Optional[str],
     ) -> None:
+        previous_run_id = str(state.resume_context.get("previous_run_id", "")).strip()
+        previous_task_plan_archive = str(
+            state.resume_context.get("previous_task_plan_archive", "")
+        ).strip()
         state.resume_context = {
             "spec_file": str(spec_file),
             "auto_approve": bool(auto_approve),
@@ -3898,6 +3961,10 @@ class Orchestrator:
             "provider_kind": str(provider_kind).strip() if provider_kind else "",
             "doc_language": str(doc_language).strip() if doc_language else "",
         }
+        if previous_run_id:
+            state.resume_context["previous_run_id"] = previous_run_id
+        if previous_task_plan_archive:
+            state.resume_context["previous_task_plan_archive"] = previous_task_plan_archive
 
     def resume_saved_run(self) -> RunState:
         state = load_run_state(self.project_root)
@@ -5027,6 +5094,7 @@ class Orchestrator:
         architecture = docs_dir(self.project_root) / "architecture.md"
         plan = task_plan_path(self.project_root)
         requirements_trace = requirements_trace_path(self.project_root)
+        archived_plan = self._previous_task_plan_archive_for_prompt()
         analysis = self._analyze_spec(spec_file)
         spec_kind = str(analysis["kind"])
         spec_context = self._spec_context_line(analysis)
@@ -5063,12 +5131,17 @@ class Orchestrator:
                     "Populate it with the requirements derived from the input spec."
                 )
             if is_iteration:
+                historical_plan_line = (
+                    f"Review the archived completed task plan at {archived_plan} to understand what has already been completed."
+                    if archived_plan
+                    else f"Review the existing task plan at {task_plan_path(self.project_root)} to understand what has already been completed."
+                )
                 lines.extend([
                     f"This is an ITERATION run. The project already has completed work and an existing brief at {brief}.",
                     "IMPORTANT: Do NOT discard or rewrite the existing content of the brief.",
                     "ADD or UPDATE sections relevant to the new iteration scope while preserving existing content.",
                     "Extend existing sections in place rather than appending a separate duplicate block at the end.",
-                    f"Review the existing task plan at {task_plan_path(self.project_root)} to understand what has already been completed.",
+                    historical_plan_line,
                     "The existing requirements_trace.json is a CUMULATIVE contract across iterations; downstream task plans reference REQ IDs by value.",
                     "Do NOT delete existing REQ entries and do NOT renumber or reuse REQ IDs from the existing trace.",
                     "Mark requirements that are no longer in scope as status='superseded' (preserve id/text/source/acceptance_oracles) instead of removing them.",
@@ -5093,11 +5166,16 @@ class Orchestrator:
                 self._document_language_instruction(),
             ]
             if is_iteration:
+                historical_plan_line = (
+                    f"Review the archived completed task plan at {archived_plan} to understand what has already been completed."
+                    if archived_plan
+                    else f"Review the existing task plan at {task_plan_path(self.project_root)} to understand what has already been completed."
+                )
                 lines.extend([
                     f"This is an ITERATION run. The project already has completed work and an existing architecture at {architecture}.",
                     "IMPORTANT: Do NOT discard or rewrite the existing architecture decisions.",
                     "ADD or UPDATE sections relevant to the new iteration scope while preserving existing content.",
-                    f"Review the existing task plan at {task_plan_path(self.project_root)} to understand what has already been completed.",
+                    historical_plan_line,
                     "Compare the brief's current iteration requirements against the existing architecture content.",
                     "If the architecture describes a capability as already implemented but the brief's iteration scope explicitly asks for it as new or upgraded scope, ADD a subsection or bullet under the relevant heading that describes the GAP between what exists and what the new iteration requires.",
                     "Do NOT assume that existing architecture descriptions are accurate for the new iteration — the brief's iteration scope takes precedence over existing architecture claims about what is already real or complete.",
@@ -5137,9 +5215,7 @@ class Orchestrator:
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
                 self._plan_spec_instruction(spec_kind),
                 self._plan_language_instruction(),
-                "Review .auto-agents/state/task_plan.json if it exists. DO NOT overwrite or delete existing completed tasks. APPEND new tasks to the end of the JSON array for the new features.",
                 "If future implementation will require test updates, encode that need in task scope, acceptance, and expected_test_migrations. Do NOT pre-edit repository tests in this planning stage.",
-                "When existing completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create tasks for capabilities already delivered by completed tasks.",
                 "CRITICAL — COVERAGE VERIFICATION: when determining whether a done task covers a brief requirement, you MUST compare the requirement against the task's ACCEPTANCE CRITERIA and REVIEW SUMMARY, not its title or description alone. A task titled 'Real X Integration' does NOT cover a requirement for actual real-model output if its acceptance criteria only verify adapter switching, infrastructure patterns, or fixture/stub results rather than actual external API calls producing real output.",
                 "If the brief explicitly states that a capability must be 'real' / 'production' / '真实' / '公网', verify that the done task's acceptance criteria confirm actual external API calls producing real output — not just adapter infrastructure or fixture-based testing.",
                 "Before generating the task list, produce a COVERAGE ANALYSIS in your final summary response (NOT in the JSON file): for each key requirement in the brief's current iteration scope, state which done task covers it (citing the specific acceptance criterion that proves delivery) or mark it as UNCOVERED. Any UNCOVERED requirement MUST result in a new task.",
@@ -5161,6 +5237,20 @@ class Orchestrator:
                 "",
                 "Final response: 3 short bullets summarizing the plan.",
             ]
+            if is_iteration:
+                if archived_plan:
+                    lines.extend([
+                        f"Review the archived completed task plan at: {archived_plan}",
+                        "Use the archived plan only as read-only history for coverage analysis.",
+                        "Do NOT copy archived done tasks back into the active task_plan.json.",
+                        "The active task_plan.json for this iteration must contain only tasks for the current iteration scope.",
+                        "When archived completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create tasks for capabilities already delivered by archived completed tasks.",
+                    ])
+                else:
+                    lines.extend([
+                        "Review .auto-agents/state/task_plan.json if it exists. DO NOT overwrite or delete existing completed tasks. APPEND new tasks to the end of the JSON array for the new features.",
+                        "When existing completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create tasks for capabilities already delivered by completed tasks.",
+                    ])
             if self.config.execution.parallel_tasks.enabled:
                 lines[lines.index("Each task must contain task_id, title, description, acceptance, status, commit_message.")] = (
                     "Each task must contain task_id, title, description, acceptance, status, commit_message, depends_on."
