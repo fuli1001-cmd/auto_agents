@@ -416,7 +416,6 @@ def validate_task_plan_payload(
         return ["task plan must contain at least one task"]
 
     seen_ids = set()
-    seen_titles = set()
     required_fields = {"task_id", "title", "description", "acceptance", "status", "commit_message"}
 
     for index, task in enumerate(tasks, start=1):
@@ -444,11 +443,6 @@ def validate_task_plan_payload(
         title = task.get("title")
         if not isinstance(title, str) or not title.strip():
             errors.append(f"{prefix} has an empty title")
-        else:
-            normalized_title = title.strip().lower()
-            if normalized_title in seen_titles:
-                errors.append(f"{prefix} duplicates title '{title.strip()}'")
-            seen_titles.add(normalized_title)
 
         description = task.get("description")
         if not isinstance(description, str) or not description.strip():
@@ -553,16 +547,28 @@ def task_plan_warnings(payload: object) -> List[str]:
 
     oversized_tasks = []
     verbose_tasks = []
+    duplicate_titles = []
+    seen_titles = set()
     for task in tasks:
         if not isinstance(task, dict):
             continue
         tid = str(task.get("task_id", "?"))
+        title = str(task.get("title", "")).strip()
+        normalized_title = title.lower()
+        if title and normalized_title in seen_titles:
+            duplicate_titles.append(f"{tid} ('{title}')")
+        elif title:
+            seen_titles.add(normalized_title)
         acceptance = task.get("acceptance")
         description = str(task.get("description", ""))
         if isinstance(acceptance, list) and len(acceptance) > 5:
             oversized_tasks.append(f"{tid} ({len(acceptance)} criteria)")
         if len(description) > 500:
             verbose_tasks.append(f"{tid} ({len(description)} chars)")
+    if duplicate_titles:
+        warnings.append(
+            f"tasks with duplicate titles (consider making titles more specific): {', '.join(duplicate_titles)}"
+        )
     if oversized_tasks:
         warnings.append(
             f"tasks with >5 acceptance criteria (consider splitting): {', '.join(oversized_tasks)}"

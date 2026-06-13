@@ -82,6 +82,32 @@ class TaskPlanValidationTests(unittest.TestCase):
         self.assertTrue(any("non-empty acceptance list" in item for item in errors))
         self.assertTrue(any("status must be one of" in item for item in errors))
 
+    def test_duplicate_titles_warn_instead_of_fail(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Fix full verification failure",
+                    "description": "Handle one verification failure bucket.",
+                    "acceptance": ["first slice is covered"],
+                    "status": "pending",
+                    "commit_message": "",
+                },
+                {
+                    "task_id": "task-002",
+                    "title": "Fix full verification failure",
+                    "description": "Handle another verification failure bucket.",
+                    "acceptance": ["second slice is covered"],
+                    "status": "pending",
+                    "commit_message": "",
+                },
+            ]
+        }
+
+        self.assertEqual(validate_task_plan_payload(payload), [])
+        warnings = task_plan_warnings(payload)
+        self.assertTrue(any("duplicate titles" in item for item in warnings))
+
     def test_rejects_python_verification_outside_project_local_conda(self) -> None:
         payload = {
             "test_strategy": "python-unittest",
