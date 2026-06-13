@@ -6,7 +6,7 @@ import re
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 from .models import CommandResult, GateParallelGroup, GateResult, VerificationStep
 
@@ -55,13 +55,17 @@ def _failure_summary(result: CommandResult) -> str:
     return f"command failed: {result.command} ({details})"
 
 
-def command_from_verification_step(step: VerificationStep) -> str:
+def command_from_verification_step(step: VerificationStep, project_root: Optional[Path] = None) -> str:
     runner = step.runner.strip().lower()
     kind = step.kind.strip().lower() or "test"
     targets = [item.strip() for item in step.targets if item.strip()]
     args = [item.strip() for item in step.args if item.strip()]
     if kind == "test" and runner == "pytest":
-        parts = ["conda", "run", "-p", "./.conda", "python", "-m", "pytest", "-q"]
+        local_python = project_root / ".conda" / "bin" / "python" if project_root is not None else None
+        if local_python is not None and local_python.exists():
+            parts = ["./.conda/bin/python", "-m", "pytest", "-q"]
+        else:
+            parts = ["conda", "run", "-p", "./.conda", "python", "-m", "pytest", "-q"]
         parts.extend(args)
         parts.extend(targets or ["tests"])
         return " ".join(parts)
@@ -130,15 +134,20 @@ def _pytest_files_for_target(project_root: Path, target: str) -> List[str]:
         for path in resolved.rglob(pattern)
         if path.is_file()
     }
-    return [
-        path.relative_to(root).as_posix()
-        for path in sorted(files)
-        if path.is_relative_to(root)
-    ]
+    out: List[str] = []
+    for path in sorted(files):
+        try:
+            out.append(path.relative_to(root).as_posix())
+        except ValueError:
+            continue
+    return out
 
 
-def commands_from_verification_steps(steps: Sequence[VerificationStep]) -> List[str]:
-    return [command_from_verification_step(step) for step in steps]
+def commands_from_verification_steps(
+    steps: Sequence[VerificationStep],
+    project_root: Optional[Path] = None,
+) -> List[str]:
+    return [command_from_verification_step(step, project_root=project_root) for step in steps]
 
 
 def build_failure_identity_diagnostic_command(command: str) -> str:

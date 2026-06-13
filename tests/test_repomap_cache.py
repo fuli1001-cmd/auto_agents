@@ -18,6 +18,16 @@ class CountingParser(PythonAstParser):
         return super().parse(project_root, rel_path)
 
 
+class CountingCache(RepoMapCache):
+    def __init__(self, project_root: Path, cache_path: Path) -> None:
+        super().__init__(project_root, cache_path=cache_path)
+        self.writes = 0
+
+    def _write(self, entries):
+        self.writes += 1
+        return super()._write(entries)
+
+
 class RepoMapCacheTests(unittest.TestCase):
     def test_hits_when_files_unchanged_and_reparses_only_changed_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -53,6 +63,17 @@ class RepoMapCacheTests(unittest.TestCase):
             self.assertEqual(parser.calls, ["a.py"])
             symbol_names = [sym.name for sym in third[0].symbols]
             self.assertIn("extra", symbol_names)
+
+    def test_cache_file_is_not_rewritten_on_full_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.py").write_text("def f(): return 1\n", encoding="utf-8")
+            cache = CountingCache(root, root / "cache.json")
+
+            cache.get_or_build(["a.py"], CountingParser())
+            cache.get_or_build(["a.py"], CountingParser())
+
+            self.assertEqual(cache.writes, 1)
 
     def test_invalidate_removes_cache_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

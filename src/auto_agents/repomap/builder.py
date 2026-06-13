@@ -25,6 +25,7 @@ from .config import RepoMapConfig
 from .detector import is_python_project
 from .parser import BaseParser, FileSummary, PythonAstParser, Symbol
 from .ranker import KeywordRanker, RankedFile
+from ..git_ops import tracked_files
 
 
 HEADER = (
@@ -82,16 +83,23 @@ def _discover_files(
     config: RepoMapConfig,
 ) -> List[str]:
     out: List[str] = []
-    for path in project_root.rglob("*"):
-        if not path.is_file():
-            continue
-        try:
-            rel = path.relative_to(project_root).as_posix()
-        except ValueError:
-            continue
+    try:
+        candidates = tracked_files(project_root)
+    except RuntimeError:
+        candidates = []
+        for path in project_root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                candidates.append(path.relative_to(project_root).as_posix())
+            except ValueError:
+                continue
+    for rel in candidates:
         if _matches_globs(rel, config.exclude_globs):
             continue
         if config.include_globs and not _matches_globs(rel, config.include_globs):
+            continue
+        if not (project_root / rel).is_file():
             continue
         out.append(rel)
         if len(out) >= config.max_files_scanned:

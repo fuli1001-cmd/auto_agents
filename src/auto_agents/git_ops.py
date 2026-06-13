@@ -81,6 +81,13 @@ def changed_files(project_root: Path) -> str:
     return process.stdout.strip()
 
 
+def tracked_files(project_root: Path) -> list[str]:
+    process = _git(project_root, "ls-files", "-z")
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.strip() or "git ls-files failed")
+    return [item for item in process.stdout.split("\0") if item]
+
+
 def changed_entries(
     project_root: Path,
     ignored_prefixes: tuple[str, ...] = (".auto-agents/", ".antigravitycli/"),

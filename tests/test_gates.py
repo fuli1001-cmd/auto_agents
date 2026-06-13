@@ -234,6 +234,20 @@ class GateTests(unittest.TestCase):
 
         self.assertEqual(command, "conda run -p ./.conda python -m pytest -q -x tests/test_demo.py")
 
+    def test_verification_step_prefers_project_conda_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local_python = root / ".conda" / "bin" / "python"
+            local_python.parent.mkdir(parents=True)
+            local_python.write_text("", encoding="utf-8")
+
+            command = command_from_verification_step(
+                VerificationStep(kind="test", runner="pytest", targets=["tests/test_demo.py"], args=["-x"]),
+                root,
+            )
+
+            self.assertEqual(command, "./.conda/bin/python -m pytest -q -x tests/test_demo.py")
+
     def test_expand_pytest_directory_steps_splits_existing_test_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

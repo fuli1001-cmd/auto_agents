@@ -1,4 +1,5 @@
 import sys
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -82,6 +83,20 @@ class RepoMapBuilderTests(unittest.TestCase):
             cfg = RepoMapConfig(budget_tokens=50)
             res = RepoMapBuilder(root, cfg).build(task)
             self.assertIn("pkg/foo.py", res.text)
+
+    def test_discovery_prefers_git_tracked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+            (root / "tracked.py").write_text("def tracked(): pass\n", encoding="utf-8")
+            (root / "untracked.py").write_text("def untracked(): pass\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=str(root), check=True, capture_output=True, text=True)
+            subprocess.run(["git", "add", "pyproject.toml", "tracked.py"], cwd=str(root), check=True)
+
+            res = RepoMapBuilder(root, RepoMapConfig()).build(_FakeTask())
+
+            self.assertIn("tracked.py", res.text)
+            self.assertNotIn("untracked.py", res.text)
 
     def test_estimate_tokens_chars_div_4(self) -> None:
         self.assertEqual(estimate_tokens(""), 0)

@@ -122,7 +122,6 @@ class RepoMapCache:
         return {
             "cache_version": int(getattr(parser, "cache_version", 1) or 1),
             "parser": parser.__class__.__name__,
-            "content_hash": _file_content_hash(path),
             "size": size,
             "mtime_ns": mtime_ns,
         }
@@ -138,6 +137,7 @@ class RepoMapCache:
         next_entries: Dict[str, Dict[str, object]] = {}
         hits = 0
         misses = 0
+        dirty = False
 
         for rel_path in rel_paths:
             fingerprint = self._fingerprint(parser, self.project_root / rel_path)
@@ -159,17 +159,21 @@ class RepoMapCache:
                 "summary": _summary_to_json(summary),
             }
             misses += 1
+            dirty = True
 
         for rel_path, cached_entry in entries.items():
             if rel_path in next_entries:
                 continue
             if (self.project_root / rel_path).exists():
                 next_entries[rel_path] = cached_entry
+            else:
+                dirty = True
 
         self.last_hits = hits
         self.last_misses = misses
         self.last_hit = misses == 0 and bool(rel_paths)
-        self._write(next_entries)
+        if dirty or set(next_entries) != set(entries):
+            self._write(next_entries)
         return summaries
 
     def invalidate(self) -> None:
