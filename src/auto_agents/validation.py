@@ -21,6 +21,8 @@ ALLOWED_TASK_STATUS = {"pending", "in_progress", "blocked", "done"}
 ALLOWED_EFFORTS = {"balanced", "deep", "max"}
 REQUIRED_EFFORT_STAGES = tuple(DEFAULT_EFFORTS)
 DEFAULTED_EFFORT_STAGES = {"sync-agent-instructions", "provider_research", "arbiter"}
+MAX_ACCEPTANCE_WITHOUT_SCOPE_RATIONALE = 5
+MAX_ACCEPTANCE_HARD_LIMIT = 7
 REQUIRED_DOC_HEADINGS = {
     "project_brief.md": ("# Project Brief", "## Problem", "## MVP Scope", "## Non-Goals", "## Constraints"),
     "architecture.md": ("# Architecture", "## System Boundary", "## Core Modules", "## Data Flow", "## Risks"),
@@ -361,6 +363,7 @@ def validate_task_plan_payload(
     require_verification: bool = False,
     *,
     require_depends_on_for_pending: bool = False,
+    enforce_active_task_granularity: bool = False,
 ) -> List[str]:
     errors: List[str] = []
     if not isinstance(payload, dict):
@@ -459,6 +462,20 @@ def validate_task_plan_payload(
             ]
             if bad_items:
                 errors.append(f"{prefix} acceptance items must be non-empty strings")
+            if enforce_active_task_granularity and task.get("status") != "done":
+                acceptance_count = len(acceptance)
+                if acceptance_count > MAX_ACCEPTANCE_HARD_LIMIT:
+                    errors.append(
+                        f"{prefix} has {acceptance_count} acceptance criteria; active tasks with more than "
+                        f"{MAX_ACCEPTANCE_HARD_LIMIT} criteria must be split"
+                    )
+                elif acceptance_count > MAX_ACCEPTANCE_WITHOUT_SCOPE_RATIONALE:
+                    scope_boundaries = str(task.get("scope_boundaries", "")).strip()
+                    if not scope_boundaries:
+                        errors.append(
+                            f"{prefix} has {acceptance_count} acceptance criteria; split the active task "
+                            "or add scope_boundaries explaining why it remains one coherent slice"
+                        )
 
         status = task.get("status")
         if not isinstance(status, str) or status not in ALLOWED_TASK_STATUS:
@@ -486,8 +503,17 @@ def validate_task_plan_payload(
     return errors
 
 
-def validate_task_plan_with_requirements(plan_payload: object, trace_payload: object) -> List[str]:
-    errors = validate_task_plan_payload(plan_payload, require_verification=True)
+def validate_task_plan_with_requirements(
+    plan_payload: object,
+    trace_payload: object,
+    *,
+    enforce_active_task_granularity: bool = False,
+) -> List[str]:
+    errors = validate_task_plan_payload(
+        plan_payload,
+        require_verification=True,
+        enforce_active_task_granularity=enforce_active_task_granularity,
+    )
     if isinstance(trace_payload, dict):
         trace_payload = normalize_requirements_trace_payload(trace_payload)
         trace_errors = validate_requirements_trace_payload(trace_payload)
@@ -506,22 +532,25 @@ def task_plan_warnings(payload: object) -> List[str]:
     if not isinstance(tasks, list) or not tasks:
         return warnings
 
-    task_count = len(tasks)
-    if task_count > 25:
+    active_tasks = [
+        task
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("status", "pending")) != "done"
+    ]
+    active_task_count = len(active_tasks)
+    if active_task_count > 25:
         warnings.append(
-            f"task plan contains {task_count} tasks; review whether the work is oversliced into too many tiny tasks"
+            f"task plan contains {active_task_count} active tasks; review whether the work is oversliced into too many tiny tasks"
         )
-    if task_count > 60:
+    if active_task_count > 60:
         warnings.append(
-            "task plan is unusually large; confirm the project truly needs this many independently verified slices"
+            "task plan has an unusually large number of active tasks; confirm the project truly needs this many independently verified slices"
         )
 
     very_short_titles = 0
     very_short_descriptions = 0
     single_acceptance_tasks = 0
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
+    for task in active_tasks:
         title = str(task.get("title", "")).strip()
         description = str(task.get("description", "")).strip()
         acceptance = task.get("acceptance")
@@ -532,26 +561,24 @@ def task_plan_warnings(payload: object) -> List[str]:
         if isinstance(acceptance, list) and len([item for item in acceptance if isinstance(item, str) and item.strip()]) == 1:
             single_acceptance_tasks += 1
 
-    if task_count >= 12 and very_short_titles >= max(4, task_count // 3):
+    if active_task_count >= 12 and very_short_titles >= max(4, active_task_count // 3):
         warnings.append(
-            "many task titles are extremely short; confirm tasks are not split into trivial bookkeeping steps"
+            "many active task titles are extremely short; confirm tasks are not split into trivial bookkeeping steps"
         )
-    if task_count >= 12 and very_short_descriptions >= max(4, task_count // 3):
+    if active_task_count >= 12 and very_short_descriptions >= max(4, active_task_count // 3):
         warnings.append(
-            "many task descriptions are very short; confirm each task is still a meaningful, independently verifiable slice"
+            "many active task descriptions are very short; confirm each task is still a meaningful, independently verifiable slice"
         )
-    if task_count >= 15 and single_acceptance_tasks >= max(6, task_count // 2):
+    if active_task_count >= 15 and single_acceptance_tasks >= max(6, active_task_count // 2):
         warnings.append(
-            "many tasks have only one acceptance criterion; confirm the plan is not over-fragmented"
+            "many active tasks have only one acceptance criterion; confirm the plan is not over-fragmented"
         )
 
     oversized_tasks = []
     verbose_tasks = []
     duplicate_titles = []
     seen_titles = set()
-    for task in tasks:
-        if not isinstance(task, dict):
-            continue
+    for task in active_tasks:
         tid = str(task.get("task_id", "?"))
         title = str(task.get("title", "")).strip()
         normalized_title = title.lower()
@@ -567,15 +594,15 @@ def task_plan_warnings(payload: object) -> List[str]:
             verbose_tasks.append(f"{tid} ({len(description)} chars)")
     if duplicate_titles:
         warnings.append(
-            f"tasks with duplicate titles (consider making titles more specific): {', '.join(duplicate_titles)}"
+            f"active tasks with duplicate titles (consider making titles more specific): {', '.join(duplicate_titles)}"
         )
     if oversized_tasks:
         warnings.append(
-            f"tasks with >5 acceptance criteria (consider splitting): {', '.join(oversized_tasks)}"
+            f"active tasks with >5 acceptance criteria (consider splitting): {', '.join(oversized_tasks)}"
         )
     if verbose_tasks:
         warnings.append(
-            f"tasks with very long descriptions >500 chars (may be too broad): {', '.join(verbose_tasks)}"
+            f"active tasks with very long descriptions >500 chars (may be too broad): {', '.join(verbose_tasks)}"
         )
 
     return warnings
@@ -818,7 +845,12 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
     if plan_payload is None and not any("task plan file is not valid JSON" in item for item in errors):
         errors.append(f"missing task plan file: {task_plan_path(root)}")
     elif plan_payload is not None:
-        errors.extend(validate_task_plan_payload(plan_payload))
+        errors.extend(
+            validate_task_plan_payload(
+                plan_payload,
+                enforce_active_task_granularity=True,
+            )
+        )
         verification_steps = plan_payload.get("verification_steps", [])
         if isinstance(verification_steps, list) and verification_steps:
             for index, step in enumerate(verification_steps, start=1):

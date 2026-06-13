@@ -1264,6 +1264,80 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertIsNone(Orchestrator(project_root)._plan_validation_feedback(result))
 
+    def test_plan_validation_rejects_oversized_active_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "New active capability is covered.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["new active capability works"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Oversized active task",
+                            "description": "Does too much.",
+                            "acceptance": [f"criterion {index}" for index in range(8)],
+                            "requirement_ids": ["REQ-001"],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "oracle_index": 1,
+                                    "proof_type": "deterministic_test",
+                                    "oracle_strength": "behavioral",
+                                    "evidence_boundary": "internal_state",
+                                    "evidence_refs": ["tests/test_demo.py"],
+                                    "status": "planned",
+                                }
+                            ],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir()
+            write_text(tests_dir / "test_demo.py", "def test_demo():\n    assert True\n")
+
+            result = AgentResult(
+                ok=True,
+                command=[],
+                output_path=Path("."),
+                summary="COVERAGE ANALYSIS: REQ-001 is uncovered and assigned to task-001.",
+                stdout="",
+            )
+
+            feedback = Orchestrator(project_root)._plan_validation_feedback(result)
+
+            self.assertIsNotNone(feedback)
+            self.assertIn("more than 7 criteria must be split", feedback)
+
     def test_execute_task_emits_implement_and_review_task_logs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

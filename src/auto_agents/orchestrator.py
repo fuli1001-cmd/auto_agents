@@ -5147,7 +5147,7 @@ class Orchestrator:
                 "A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined.",
                 "",
                 "TASK SPLITTING — ANTI-PATTERNS (avoid these):",
-                "1. God Task: a single task with >5 acceptance criteria or a description exceeding ~500 characters. Split by feature slice.",
+                "1. God Task: a single active task with >5 acceptance criteria or a description exceeding ~500 characters. Split by feature slice.",
                 "2. Cross-cutting Bundle: acceptance criteria that span multiple unrelated subsystems (e.g. 'set up DB schema AND implement API AND write CLI'). Each subsystem should be its own task.",
                 "3. Infra + Feature Combo: mixing infrastructure setup (dependencies, CI, env config) with business logic in one task. Split infra into a prerequisite task.",
                 "4. Vague Acceptance: criteria like 'code is clean' or 'follows best practices'. Every criterion must be objectively verifiable by a test or a command.",
@@ -5157,7 +5157,7 @@ class Orchestrator:
                 "1. Vertical Slice: each task delivers one user-facing or API-facing capability end-to-end (route, logic, test).",
                 "2. Dependency-first: extract shared setup (DB schema, env, config) into an early task, then layer feature tasks on top.",
                 "3. Test-boundary: if a single task would require tests in 3+ unrelated test files, it likely needs splitting.",
-                "4. Acceptance count rule of thumb: aim for 2-4 acceptance criteria per task. >5 is a strong signal to split.",
+                "4. Acceptance count rule: aim for 2-4 acceptance criteria per active task. If a task has 6-7 criteria, add scope_boundaries explaining why it remains one coherent slice. Tasks with more than 7 criteria are invalid and must be split.",
                 "",
                 "Final response: 3 short bullets summarizing the plan.",
             ]
@@ -6464,7 +6464,11 @@ class Orchestrator:
     def _plan_validation_feedback(self, result: AgentResult) -> Optional[str]:
         payload = load_task_plan(self.project_root)
         trace = load_requirements_trace(self.project_root)
-        errors = validate_task_plan_with_requirements(payload, trace)
+        errors = validate_task_plan_with_requirements(
+            payload,
+            trace,
+            enforce_active_task_granularity=True,
+        )
         raw_steps = payload.get("verification_steps", [])
         if isinstance(raw_steps, list) and raw_steps:
             steps = [

@@ -178,7 +178,7 @@ class TaskPlanValidationTests(unittest.TestCase):
         }
 
         warnings = task_plan_warnings(payload)
-        self.assertTrue(any("contains 30 tasks" in item for item in warnings))
+        self.assertTrue(any("contains 30 active tasks" in item for item in warnings))
         self.assertTrue(any("over-fragmented" in item or "oversliced" in item for item in warnings))
 
     def test_warns_when_task_has_too_many_acceptance_criteria(self) -> None:
@@ -198,6 +198,64 @@ class TaskPlanValidationTests(unittest.TestCase):
         warnings = task_plan_warnings(payload)
         self.assertTrue(any(">5 acceptance criteria" in item for item in warnings))
         self.assertIn("task-001", " ".join(warnings))
+
+    def test_done_tasks_do_not_emit_task_size_warnings(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": f"task-{index:03d}",
+                    "title": "Fix full verification failure" if index in (1, 2) else f"Historical slice {index}",
+                    "description": "x" * 600,
+                    "acceptance": [f"criterion {i}" for i in range(8)],
+                    "status": "done",
+                    "commit_message": "",
+                }
+                for index in range(1, 31)
+            ]
+        }
+
+        warnings = task_plan_warnings(payload)
+        self.assertEqual(warnings, [])
+
+    def test_active_tasks_require_scope_boundaries_for_six_or_seven_acceptance_criteria(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Wide but coherent task",
+                    "description": "Implement one coherent API behavior.",
+                    "acceptance": [f"criterion {i}" for i in range(6)],
+                    "status": "pending",
+                    "commit_message": "",
+                }
+            ]
+        }
+
+        errors = validate_task_plan_payload(payload, enforce_active_task_granularity=True)
+        self.assertTrue(any("scope_boundaries" in item for item in errors))
+
+        payload["tasks"][0]["scope_boundaries"] = (
+            "All criteria cover the same endpoint contract; persistence and UI are out of scope."
+        )
+        self.assertEqual(validate_task_plan_payload(payload, enforce_active_task_granularity=True), [])
+
+    def test_active_tasks_with_more_than_seven_acceptance_criteria_must_split(self) -> None:
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Oversized active task",
+                    "description": "Does too much.",
+                    "acceptance": [f"criterion {i}" for i in range(8)],
+                    "scope_boundaries": "This is intentionally broad.",
+                    "status": "pending",
+                    "commit_message": "",
+                }
+            ]
+        }
+
+        errors = validate_task_plan_payload(payload, enforce_active_task_granularity=True)
+        self.assertTrue(any("must be split" in item for item in errors))
 
     def test_warns_when_task_description_is_very_long(self) -> None:
         payload = {
