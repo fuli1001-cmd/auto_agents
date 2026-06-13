@@ -64,6 +64,7 @@ from .gates import (
 from .gate_baseline_cache import GateBaselineCache
 from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, ensure_repo, hard_reset_clean, head_ref, is_repo, remove_worktree, worktree_fingerprint
 from .io_utils import read_text, write_text
+from .logging_utils import build_run_logger, log_timing
 from .models import (
     APPROVAL_ORDER,
     APPROVAL_BY_STAGE,
@@ -73,11 +74,13 @@ from .models import (
     DOCUMENT_LANGUAGE_OPTIONS,
     ProviderConfig,
     ProjectConfig,
+    GateParallelGroup,
     RunState,
     STAGE_ORDER,
     TaskSpec,
     VerificationStep,
 )
+from .provider_limits import ParallelTuningStore, provider_limit
 from .requirements import (
     external_doc_requirements,
     format_requirement_context,
@@ -129,6 +132,7 @@ class Orchestrator:
         self.config = load_project_config(self.project_root)
         self.adapter = self._build_adapter(self.config)
         self.agent_output_stream = agent_output_stream or sys.stderr
+        self.logger = build_run_logger(self.agent_output_stream)
         self._print_agent_output = False
         self._active_spec_file: Optional[Path] = None
         self._user_input_fn = user_input_fn
@@ -140,6 +144,9 @@ class Orchestrator:
         self._repo_map_builder: Optional[RepoMapBuilder] = None
         self._last_repo_map_result: Optional[RepoMapResult] = None
         self._task_proof_evidence_cache: Dict[Tuple[str, str], Dict[str, object]] = {}
+        self._parallel_tuning = ParallelTuningStore(self.project_root)
+        self._max_tasks_remaining: Optional[int] = None
+        self._task_budget_exhausted = False
         self._gate_baseline_cache = GateBaselineCache(
             self.project_root,
             cache_path=gate_baseline_cache_path(self.project_root),
@@ -714,6 +721,8 @@ class Orchestrator:
                 self._set_active_provider(provider_kind)
             if doc_language is not None:
                 self._set_document_language(doc_language)
+            self._max_tasks_remaining = max_tasks
+            self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
             if self._normalize_legacy_requirements_audit_resume(state):
                 save_run_state(self.project_root, state)
@@ -771,16 +780,17 @@ class Orchestrator:
                 stage = pending[0]
                 self._emit_stage_start(stage)
                 try:
-                    if stage == "implement":
-                        state = self._run_implementation_loop(state, max_tasks=max_tasks)
-                    elif stage == "provider_research":
-                        state = self._run_provider_research(state, spec_file)
-                    elif stage == "verify":
-                        state = self._run_verify(state)
-                    elif stage == "readme":
-                        state = self._run_readme(state, spec_file)
-                    else:
-                        state = self._run_agent_stage(stage, state, spec_file, auto_approve=auto_approve)
+                    with log_timing(self.logger, f"stage:{stage}"):
+                        if stage == "implement":
+                            state = self._run_implementation_loop(state, max_tasks=max_tasks)
+                        elif stage == "provider_research":
+                            state = self._run_provider_research(state, spec_file)
+                        elif stage == "verify":
+                            state = self._run_verify(state)
+                        elif stage == "readme":
+                            state = self._run_readme(state, spec_file)
+                        else:
+                            state = self._run_agent_stage(stage, state, spec_file, auto_approve=auto_approve)
                 except RuntimeError as error:
                     state.status = "failed"
                     state.last_error = str(error)
@@ -788,6 +798,10 @@ class Orchestrator:
                     raise
 
                 save_run_state(self.project_root, state)
+                if stage == "implement" and self._task_budget_exhausted:
+                    state.status = "pending"
+                    save_run_state(self.project_root, state)
+                    return state
                 pending_gate = APPROVAL_BY_STAGE.get(stage)
                 if pending_gate and pending_gate in self.config.approvals.enabled and stage in state.stage_summaries:
                     if auto_approve or pending_gate in state.approved_gates:
@@ -814,6 +828,8 @@ class Orchestrator:
             self._print_agent_output = False
             self._active_spec_file = None
             self._allow_dirty_tree = False
+            self._max_tasks_remaining = None
+            self._task_budget_exhausted = False
 
     def _ensure_preconditions(self, state: RunState, spec_file: Path, skip_validate: bool) -> None:
         if not spec_file.exists():
@@ -1687,12 +1703,13 @@ class Orchestrator:
         self._apply_generated_verification_config()
         before_snapshot = self._worktree_change_snapshot()
         commands = self._default_gate_commands()
-        gate = run_gate_plan(
-            commands,
-            self.config.gates.parallel_groups,
-            self.project_root,
-            collect_all=collect_all,
-        )
+        with log_timing(self.logger, f"gate:{context} commands={len(commands)} groups={len(self.config.gates.parallel_groups)}"):
+            gate = run_gate_plan(
+                commands,
+                self.config.gates.parallel_groups,
+                self.project_root,
+                collect_all=collect_all,
+            )
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
         changed = self._snapshot_delta_paths(before_snapshot, after_snapshot)
@@ -1713,12 +1730,13 @@ class Orchestrator:
     ):
         self._apply_generated_verification_config()
         before_snapshot = self._worktree_change_snapshot()
-        gate = run_gate_plan(
-            commands,
-            [],
-            self.project_root,
-            collect_all=collect_all,
-        )
+        with log_timing(self.logger, f"gate:{context} commands={len(commands)}"):
+            gate = run_gate_plan(
+                commands,
+                [],
+                self.project_root,
+                collect_all=collect_all,
+            )
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
         changed = self._snapshot_delta_paths(before_snapshot, after_snapshot)
@@ -1732,7 +1750,7 @@ class Orchestrator:
 
     def _default_gate_commands(self) -> List[str]:
         return (
-            commands_from_verification_steps(self.config.gates.steps)
+            commands_from_verification_steps(self.config.gates.steps, self.project_root)
             if self.config.gates.steps
             else self.config.gates.commands
         )
@@ -2047,18 +2065,36 @@ class Orchestrator:
         for task in tasks:
             if task.status == "done":
                 continue
-            if max_tasks is not None and processed >= max_tasks:
+            if not self._has_task_budget(max_tasks, processed):
+                self._task_budget_exhausted = True
                 break
             rewind_state = self._execute_task_in_main_worktree(state, tasks, task)
             if rewind_state is not None:
                 return rewind_state
             processed += 1
+            self._consume_task_budget()
 
         state.tasks = tasks
         state.current_stage = "implement"
         state.stage_summaries["implement"] = f"Completed {sum(task.status == 'done' for task in tasks)} tasks."
         state.last_error = ""
         return state
+
+    def _has_task_budget(self, local_max_tasks: Optional[int], local_processed: int) -> bool:
+        if self._max_tasks_remaining is not None:
+            return self._max_tasks_remaining > 0
+        return local_max_tasks is None or local_processed < local_max_tasks
+
+    def _remaining_task_budget(self, local_max_tasks: Optional[int], local_processed: int, ready_count: int) -> int:
+        if self._max_tasks_remaining is not None:
+            return min(ready_count, max(0, self._max_tasks_remaining))
+        if local_max_tasks is None:
+            return ready_count
+        return min(ready_count, max(0, local_max_tasks - local_processed))
+
+    def _consume_task_budget(self) -> None:
+        if self._max_tasks_remaining is not None:
+            self._max_tasks_remaining = max(0, self._max_tasks_remaining - 1)
 
     def _run_parallel_implementation_loop(
         self,
@@ -2070,30 +2106,56 @@ class Orchestrator:
         if fallback_reason:
             if self.config.execution.parallel_tasks.strict:
                 raise RuntimeError(fallback_reason)
-            print(f"[parallel-tasks] fallback to sequential: {fallback_reason}", file=self.agent_output_stream)
+            self.logger.info(f"[parallel-tasks] fallback to sequential: {fallback_reason}")
             return self._run_sequential_implementation_loop(state, tasks, max_tasks)
 
         processed = 0
+        current_workers = self._parallel_worker_count()
         while True:
-            if max_tasks is not None and processed >= max_tasks:
+            if not self._has_task_budget(max_tasks, processed):
+                self._task_budget_exhausted = True
                 break
             ready = self._ready_parallel_tasks(tasks)
             if not ready:
                 break
-            remaining = (max_tasks - processed) if max_tasks is not None else len(ready)
-            batch = ready[: min(self.config.execution.parallel_tasks.max_workers, remaining)]
+            remaining = self._remaining_task_budget(max_tasks, processed, len(ready))
+            if remaining <= 0:
+                self._task_budget_exhausted = True
+                break
+            batch_size = min(current_workers, remaining)
+            batch = ready[:batch_size]
             if len(batch) < 2:
                 rewind_state = self._execute_task_in_main_worktree(state, tasks, batch[0])
                 if rewind_state is not None:
                     return rewind_state
                 processed += 1
+                self._consume_task_budget()
                 continue
 
             self._require_clean_tree_excluding_agent_instructions()
-            results = self._run_parallel_task_batch(state, tasks, batch)
+            self.logger.info("[parallel-tasks] batch workers=%s tasks=%s", len(batch), ",".join(task.task_id for task in batch))
+            with log_timing(self.logger, f"parallel-batch workers={len(batch)}"):
+                results = self._run_parallel_task_batch(state, tasks, batch)
             for task in batch:
                 result = results[task.task_id]
                 if not result["ok"]:
+                    if self._parallel_result_is_provider_pressure(result):
+                        if (
+                            self.config.execution.parallel_tasks.workers != "auto"
+                            or not self.config.execution.parallel_tasks.adaptive
+                        ):
+                            raise RuntimeError(
+                                "parallel task execution hit provider pressure with fixed workers; "
+                                f"task={task.task_id} reason={result['reason']}"
+                            )
+                        current_workers = self._record_parallel_pressure(current_workers)
+                        self.logger.info(
+                            "[parallel-tasks] provider pressure task=%s workers=%s reason=%s",
+                            task.task_id,
+                            current_workers,
+                            str(result["reason"])[:200],
+                        )
+                        break
                     updated_task = TaskSpec.from_dict(dict(result["task"]))
                     task.review_summary = updated_task.review_summary
                     task.review_history = list(updated_task.review_history)
@@ -2117,6 +2179,13 @@ class Orchestrator:
                     failure_ids=result.get("verify_current_failure_ids", []),
                 )
                 processed += 1
+                self._consume_task_budget()
+            else:
+                current_workers = self._record_parallel_success(current_workers)
+                continue
+
+            if current_workers < 2:
+                raise RuntimeError("parallel task execution paused due to provider pressure; retry later")
 
         state.tasks = tasks
         state.current_stage = "implement"
@@ -2188,19 +2257,16 @@ class Orchestrator:
         )
         self._persist_tasks(tasks)
         save_run_state(self.project_root, state)
-        if self.config.git.commit_each_task:
-            task.commit_sha = commit_all(self.project_root, commit_message)
-            self._warm_clean_head_verify_baseline(
-                state,
-                failure_ids=gate_result.get("verify_current_failure_ids", []),
-            )
+        task.commit_sha = commit_all(self.project_root, commit_message)
+        self._warm_clean_head_verify_baseline(
+            state,
+            failure_ids=gate_result.get("verify_current_failure_ids", []),
+        )
         return None
 
     def _parallel_execution_fallback_reason(self, tasks: List[TaskSpec]) -> str:
-        if not self.config.git.commit_each_task:
-            return "parallel task execution requires git.commit_each_task=true"
-        if self.config.execution.parallel_tasks.max_workers < 2:
-            return "parallel task execution requires execution.parallel_tasks.max_workers >= 2"
+        if self._parallel_worker_count() < 2:
+            return "parallel task execution requires at least 2 workers"
         if any(task.status not in {"pending", "done"} for task in tasks):
             return "parallel task execution only supports fresh pending/done task sets; resume and blocked retries stay sequential"
         raw_plan = load_task_plan(self.project_root)
@@ -2230,6 +2296,59 @@ class Orchestrator:
         except RuntimeError as error:
             return str(error)
         return ""
+
+    def _parallel_tuning_key(self) -> str:
+        provider = self.config.providers.get(self.config.active_provider, self.config.provider)
+        profile = provider.profile_map.get(self.config.efforts.get("implement", "deep"), "")
+        return f"{provider.kind}:{provider.subscription_tier}:{profile}"
+
+    def _parallel_worker_count(self) -> int:
+        config = self.config.execution.parallel_tasks
+        workers = config.workers
+        if isinstance(workers, int):
+            return max(1, workers)
+        provider = self.config.providers.get(self.config.active_provider, self.config.provider)
+        limit = provider_limit(provider)
+        tuned = self._parallel_tuning.get_workers(self._parallel_tuning_key())
+        initial = tuned if tuned is not None else limit.initial_workers
+        return max(1, min(initial, limit.worker_ceiling, config.max_auto_workers))
+
+    def _record_parallel_success(self, current_workers: int) -> int:
+        config = self.config.execution.parallel_tasks
+        if config.workers != "auto" or not config.adaptive:
+            return current_workers
+        provider = self.config.providers.get(self.config.active_provider, self.config.provider)
+        limit = provider_limit(provider)
+        next_workers = min(current_workers + 1, limit.worker_ceiling, config.max_auto_workers)
+        self._parallel_tuning.put_workers(self._parallel_tuning_key(), next_workers, event="success")
+        return next_workers
+
+    def _record_parallel_pressure(self, current_workers: int) -> int:
+        config = self.config.execution.parallel_tasks
+        if config.workers != "auto" or not config.adaptive:
+            return current_workers
+        next_workers = max(1, current_workers // 2)
+        self._parallel_tuning.put_workers(self._parallel_tuning_key(), next_workers, event="provider_pressure")
+        return next_workers
+
+    @staticmethod
+    def _parallel_result_is_provider_pressure(result: Dict[str, object]) -> bool:
+        text = f"{result.get('reason', '')}\n{result.get('review', '')}".lower()
+        return any(
+            token in text
+            for token in (
+                "rate limit",
+                "rate-limit",
+                "429",
+                "quota",
+                "throttl",
+                "timed out",
+                "timeout",
+                "stall",
+                "provider availability",
+                "all providers exhausted",
+            )
+        )
 
     def _ready_parallel_tasks(self, tasks: List[TaskSpec]) -> List[TaskSpec]:
         completed = {task.task_id for task in tasks if task.status == "done"}
@@ -2891,7 +3010,7 @@ class Orchestrator:
                 if isinstance(item, dict)
             ]
             try:
-                step_commands = commands_from_verification_steps(steps)
+                step_commands = commands_from_verification_steps(steps, self.project_root)
             except ValueError:
                 step_commands = []
             for command in step_commands:
@@ -2902,7 +3021,7 @@ class Orchestrator:
             if command and command not in commands:
                 commands.append(command)
         try:
-            gate_step_commands = commands_from_verification_steps(self.config.gates.steps)
+            gate_step_commands = commands_from_verification_steps(self.config.gates.steps, self.project_root)
         except ValueError:
             gate_step_commands = []
         for command in gate_step_commands:
@@ -3145,7 +3264,13 @@ class Orchestrator:
             return result
 
         commands = [command for _, command in command_pairs]
-        gate_result = run_commands_collect_all(commands, self.project_root)
+        with log_timing(self.logger, f"proof-evidence commands={len(commands)}"):
+            gate_result = run_gate_plan(
+                [],
+                [GateParallelGroup(name="proof-evidence", commands=commands)],
+                self.project_root,
+                collect_all=True,
+            )
         raw_output = self._gate_raw_output(gate_result)
         failed_refs = [
             ref
@@ -3314,7 +3439,7 @@ class Orchestrator:
         state.implement_verify_baseline_ref = baseline_ref
         state.implement_verify_baseline_failures = list(normalized)
         gate_commands = (
-            commands_from_verification_steps(self.config.gates.steps)
+            commands_from_verification_steps(self.config.gates.steps, self.project_root)
             if self.config.gates.steps
             else self.config.gates.commands
         )
@@ -4269,7 +4394,7 @@ class Orchestrator:
             raw_output = self._gate_raw_output(verify_gate)
             raw_log_path = self._persist_failed_verification_log(raw_output, label="verify-stage")
             gate_commands = (
-                commands_from_verification_steps(self.config.gates.steps)
+                commands_from_verification_steps(self.config.gates.steps, self.project_root)
                 if self.config.gates.steps
                 else self.config.gates.commands
             )
@@ -5225,11 +5350,12 @@ class Orchestrator:
             return ""
         config = self.config.repo_map
         budget = config.review_budget_tokens if stage in ("review", "fix") else config.budget_tokens
-        result = builder.build(
-            task,
-            budget_tokens=budget,
-            extra_anchor_paths=list(extra_anchor_paths),
-        )
+        with log_timing(self.logger, f"repo-map:{stage}"):
+            result = builder.build(
+                task,
+                budget_tokens=budget,
+                extra_anchor_paths=list(extra_anchor_paths),
+            )
         self._last_repo_map_result = result
         return result.text or ""
 
@@ -5724,7 +5850,8 @@ class Orchestrator:
                     output_path=output_path,
                     stream_output=self._stream_agent_output_callback(artifact_stage) if self._print_agent_output else None,
                 )
-                result = self._call_with_failover(request)
+                with log_timing(self.logger, f"agent:{artifact_stage} attempt={attempt}"):
+                    result = self._call_with_failover(request)
                 if result.usage is not None:
                     cumulative_usage = (cumulative_usage or AgentUsage()).plus(result.usage)
                     usage_available = True
@@ -5816,11 +5943,11 @@ class Orchestrator:
             sections.append(result.summary.strip())
         if result.stderr and not result.streamed_stderr:
             sections.append(f"[stderr]\n{result.stderr.strip()}")
-        print("\n\n".join(sections), file=self.agent_output_stream, flush=True)
+        self.logger.info("\n\n".join(sections))
 
     def _emit_stage_start(self, stage: str) -> None:
         model = self._model_label_for_top_level_stage(stage)
-        print(f"[stage:{stage}] start provider={self._current_provider} model={model}", file=self.agent_output_stream, flush=True)
+        self.logger.info(f"[stage:{stage}] start provider={self._current_provider} model={model}")
 
     def _emit_stage_verify_result(self, decision: str, summary: str, route: str = "") -> None:
         header = f"[stage:verify] decision={decision}"
@@ -5829,15 +5956,11 @@ class Orchestrator:
         sections = [header]
         if summary.strip():
             sections.append(summary.strip())
-        print(
-            "\n".join(sections),
-            file=self.agent_output_stream,
-            flush=True,
-        )
+        self.logger.info("\n".join(sections))
 
     def _emit_plan_task_count(self, tasks: Iterable[TaskSpec]) -> None:
         task_list = list(tasks)
-        print(f"[stage:plan] tasks={len(task_list)}", file=self.agent_output_stream, flush=True)
+        self.logger.info(f"[stage:plan] tasks={len(task_list)}")
 
     def _emit_agent_metrics(
         self,
@@ -5865,41 +5988,27 @@ class Orchestrator:
                 f" repo_map_cache_hits={rm.cache_hits}"
                 f" repo_map_cache_misses={rm.cache_misses}"
             )
-        print(
+        self.logger.info(
             (
                 f"[agent:{stage_key}] completed ok={str(result.ok).lower()} "
                 f"returncode={result.returncode} attempts={attempts} "
                 f"provider={self._current_provider} model={model or 'unknown'} "
                 f"tokens={usage_text}"
                 f"{repo_map_text}"
-            ),
-            file=self.agent_output_stream,
-            flush=True,
+            )
         )
 
     def _emit_task_activity(self, task: TaskSpec, action: str, attempt: int) -> None:
-        print(
-            f"[task:{task.task_id}] {action} attempt={attempt} title={task.title}",
-            file=self.agent_output_stream,
-            flush=True,
-        )
+        self.logger.info(f"[task:{task.task_id}] {action} attempt={attempt} title={task.title}")
 
     def _emit_task_blocked(self, task: TaskSpec, reason: str) -> None:
-        print(
-            f"[task:{task.task_id}] blocked reason={reason}",
-            file=self.agent_output_stream,
-            flush=True,
-        )
+        self.logger.info(f"[task:{task.task_id}] blocked reason={reason}")
 
     def _emit_task_review_result(self, task: TaskSpec, decision: str, summary: str) -> None:
         sections = [f"[task:{task.task_id}] review decision={decision}"]
         if summary.strip():
             sections.append(summary.strip())
-        print(
-            "\n".join(sections),
-            file=self.agent_output_stream,
-            flush=True,
-        )
+        self.logger.info("\n".join(sections))
 
     @staticmethod
     def _normalize_verify_failure_ids(failure_ids: Iterable[str], reason: str) -> List[str]:
@@ -6114,11 +6223,7 @@ class Orchestrator:
         sections = [header]
         if summary.strip():
             sections.append(summary.strip())
-        print(
-            "\n".join(sections),
-            file=self.agent_output_stream,
-            flush=True,
-        )
+        self.logger.info("\n".join(sections))
 
     def _format_task_failure_error(self, task: TaskSpec, reason: str, review_summary: str) -> str:
         message = f"Task {task.task_id} failed gates: {reason}"
@@ -6240,10 +6345,7 @@ class Orchestrator:
             available_fn = getattr(adapter, "available", None)
             if available_fn is not None and not available_fn():
                 self._failed_providers.add(kind)
-                print(
-                    f"[failover] provider={kind} binary not found, skipping",
-                    file=self.agent_output_stream, flush=True,
-                )
+                self.logger.info(f"[failover] provider={kind} binary not found, skipping")
                 tried.append(kind)
                 continue
 
@@ -6255,10 +6357,7 @@ class Orchestrator:
                 self._last_successful_provider = kind
                 self._failed_providers.discard(kind)
                 if kind != self.config.active_provider:
-                    print(
-                        f"[failover] using provider={kind}",
-                        file=self.agent_output_stream, flush=True,
-                    )
+                    self.logger.info(f"[failover] using provider={kind}")
                 return result
 
             if not self._is_failover_error(result):
@@ -6267,10 +6366,7 @@ class Orchestrator:
             self._failed_providers.add(kind)
             snippet = (result.stderr or "")[:120]
             label = self._failover_error_label(result)
-            print(
-                f"[failover] provider={kind} {label} ({snippet}), trying next...",
-                file=self.agent_output_stream, flush=True,
-            )
+            self.logger.info(f"[failover] provider={kind} {label} ({snippet}), trying next...")
             last_error = result.stderr or result.summary or "unknown error"
 
         raise RuntimeError(
@@ -6353,7 +6449,7 @@ class Orchestrator:
                 if isinstance(item, dict)
             ]
             try:
-                step_commands = commands_from_verification_steps(steps)
+                step_commands = commands_from_verification_steps(steps, self.project_root)
             except ValueError as error:
                 errors.append(str(error))
             else:
@@ -6568,7 +6664,7 @@ class Orchestrator:
             if not self.config.gates.allow_agent_updates:
                 return
             try:
-                commands = commands_from_verification_steps(steps)
+                commands = commands_from_verification_steps(steps, self.project_root)
             except ValueError as error:
                 raise RuntimeError(f"generated verification steps are invalid:\n- {error}") from error
             errors = validate_verification_command_paths(

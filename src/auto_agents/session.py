@@ -72,7 +72,7 @@ class Session:
 
     def _gate_commands(self) -> List[str]:
         if self.config.gates.steps:
-            return commands_from_verification_steps(self.config.gates.steps)
+            return commands_from_verification_steps(self.config.gates.steps, self.project_root)
         return list(self.config.gates.commands)
 
     # ── Public entry points ──────────────────────────────────────
@@ -1446,10 +1446,7 @@ class Session:
         return self._normalize_commit_subject(state.goal.replace("\n", " ")) or "verified update"
 
     def _git_commit(self, state: SessionState, prefix: str, reply: str = "") -> bool:
-        """Persist current state, then commit current changes if auto-commit is enabled."""
-        if not self.config.git.commit_each_task:
-            self._save(state)
-            return False
+        """Persist current state, then commit current changes."""
         summary = self._session_commit_summary(state, reply)
         message = f"{prefix}: {summary}"
         state.execution_log.append({

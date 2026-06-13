@@ -97,7 +97,6 @@ class ProjectValidationTests(unittest.TestCase):
             },
             "git": {
                 "auto_init_repo": True,
-                "commit_each_task": True,
                 "commit_message_template": "feat: missing placeholders",
             },
             "approvals": {
@@ -164,7 +163,6 @@ class ProjectValidationTests(unittest.TestCase):
             },
             "git": {
                 "auto_init_repo": True,
-                "commit_each_task": True,
                 "commit_message_template": "feat({task_id}): {title}",
             },
             "approvals": {
@@ -231,7 +229,6 @@ class ProjectValidationTests(unittest.TestCase):
             },
             "git": {
                 "auto_init_repo": True,
-                "commit_each_task": True,
                 "commit_message_template": "feat({task_id}): {title}",
             },
             "approvals": {
@@ -303,7 +300,6 @@ class ProjectValidationTests(unittest.TestCase):
             },
             "git": {
                 "auto_init_repo": True,
-                "commit_each_task": True,
                 "commit_message_template": "feat({task_id}): {title}",
             },
             "approvals": {"enabled": ["requirements", "architecture", "release"]},
@@ -365,7 +361,6 @@ class ProjectValidationTests(unittest.TestCase):
             },
             "git": {
                 "auto_init_repo": True,
-                "commit_each_task": True,
                 "commit_message_template": "feat({task_id}): {title}",
             },
             "approvals": {"enabled": ["requirements", "architecture", "release"]},
@@ -391,7 +386,9 @@ class ProjectValidationTests(unittest.TestCase):
         payload["execution"] = {
             "parallel_tasks": {
                 "enabled": True,
-                "max_workers": 3,
+                "workers": "auto",
+                "max_auto_workers": 3,
+                "adaptive": True,
                 "strict": False,
                 "worktree_root": "",
             }
@@ -399,20 +396,21 @@ class ProjectValidationTests(unittest.TestCase):
 
         self.assertEqual(validate_project_config_payload(payload), [])
 
-    def test_validate_project_config_payload_rejects_parallel_tasks_without_commits(self) -> None:
+    def test_validate_project_config_payload_rejects_invalid_parallel_workers(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
-        payload["git"]["commit_each_task"] = False
         payload["execution"] = {
             "parallel_tasks": {
                 "enabled": True,
-                "max_workers": 2,
+                "workers": "many",
+                "max_auto_workers": 2,
+                "adaptive": True,
                 "strict": True,
                 "worktree_root": "",
             }
         }
 
         errors = validate_project_config_payload(payload)
-        self.assertTrue(any("requires git.commit_each_task=true" in item for item in errors))
+        self.assertTrue(any("execution.parallel_tasks.workers" in item for item in errors))
 
     def test_validate_project_config_payload_rejects_invalid_sync_agent_instructions_effort(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
@@ -463,7 +461,6 @@ class ProjectValidationTests(unittest.TestCase):
             },
             "git": {
                 "auto_init_repo": True,
-                "commit_each_task": True,
                 "commit_message_template": "feat({task_id}): {title}",
             },
             "approvals": {
@@ -1585,7 +1582,7 @@ class ProjectValidationTests(unittest.TestCase):
             )
             self.assertEqual(
                 gitignore_show.stdout,
-                "runs/\nstate/gate_baseline_cache.json\nstate/repomap_cache.json\n",
+                "runs/\nstate/gate_baseline_cache.json\nstate/repomap_cache.json\nstate/parallel_tuning.json\n",
             )
 
     def test_clarify_prompt_uses_selected_document_language(self) -> None:

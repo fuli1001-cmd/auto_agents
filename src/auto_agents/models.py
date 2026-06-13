@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from .repomap.config import RepoMapConfig
 
@@ -144,6 +144,7 @@ class ProviderConfig:
     output_flag: str = "-o"
     timeout_seconds: int = DEFAULT_PROVIDER_TIMEOUT_SECONDS
     idle_timeout_seconds: int = DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS
+    subscription_tier: str = "default"
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProviderConfig":
@@ -169,6 +170,7 @@ class ProviderConfig:
             output_flag=str(data.get("output_flag", "-o")),
             timeout_seconds=cls._timeout_seconds_from_dict(data, timeout_default),
             idle_timeout_seconds=int(data.get("idle_timeout_seconds", idle_timeout_default)),
+            subscription_tier=str(data.get("subscription_tier", "default")),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -291,14 +293,12 @@ class GateConfig:
 @dataclass
 class GitConfig:
     auto_init_repo: bool = True
-    commit_each_task: bool = True
     commit_message_template: str = "feat({task_id}): {title}"
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "GitConfig":
         return cls(
             auto_init_repo=bool(data.get("auto_init_repo", True)),
-            commit_each_task=bool(data.get("commit_each_task", True)),
             commit_message_template=str(
                 data.get("commit_message_template", "feat({task_id}): {title}")
             ),
@@ -354,15 +354,25 @@ class RetryConfig:
 @dataclass
 class ParallelTasksConfig:
     enabled: bool = False
-    max_workers: int = 2
+    workers: Union[int, str] = "auto"
+    max_auto_workers: int = 4
+    adaptive: bool = True
     strict: bool = False
     worktree_root: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ParallelTasksConfig":
+        workers: Union[int, str]
+        raw_workers = data.get("workers", "auto")
+        if isinstance(raw_workers, int):
+            workers = raw_workers
+        else:
+            workers = str(raw_workers)
         return cls(
             enabled=bool(data.get("enabled", False)),
-            max_workers=int(data.get("max_workers", 2)),
+            workers=workers,
+            max_auto_workers=int(data.get("max_auto_workers", 4)),
+            adaptive=bool(data.get("adaptive", True)),
             strict=bool(data.get("strict", False)),
             worktree_root=str(data.get("worktree_root", "")),
         )

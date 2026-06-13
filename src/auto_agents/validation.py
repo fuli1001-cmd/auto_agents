@@ -695,7 +695,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
     if not isinstance(git, dict):
         errors.append("git must be an object")
     else:
-        for key in ("auto_init_repo", "commit_each_task"):
+        for key in ("auto_init_repo",):
             if not isinstance(git.get(key), bool):
                 errors.append(f"git.{key} must be a boolean")
         template = git.get("commit_message_template")
@@ -719,17 +719,24 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 enabled = parallel_tasks.get("enabled")
                 if not isinstance(enabled, bool):
                     errors.append("execution.parallel_tasks.enabled must be a boolean")
-                max_workers = parallel_tasks.get("max_workers")
-                if not isinstance(max_workers, int) or max_workers < 1:
-                    errors.append("execution.parallel_tasks.max_workers must be an integer >= 1")
+                workers = parallel_tasks.get("workers")
+                if not (
+                    workers == "auto"
+                    or (isinstance(workers, int) and workers >= 1)
+                ):
+                    errors.append("execution.parallel_tasks.workers must be 'auto' or an integer >= 1")
+                max_auto_workers = parallel_tasks.get("max_auto_workers")
+                if not isinstance(max_auto_workers, int) or max_auto_workers < 1:
+                    errors.append("execution.parallel_tasks.max_auto_workers must be an integer >= 1")
+                adaptive = parallel_tasks.get("adaptive")
+                if not isinstance(adaptive, bool):
+                    errors.append("execution.parallel_tasks.adaptive must be a boolean")
                 strict = parallel_tasks.get("strict")
                 if not isinstance(strict, bool):
                     errors.append("execution.parallel_tasks.strict must be a boolean")
                 worktree_root = parallel_tasks.get("worktree_root")
                 if not isinstance(worktree_root, str):
                     errors.append("execution.parallel_tasks.worktree_root must be a string")
-                if enabled is True and isinstance(git, dict) and git.get("commit_each_task") is not True:
-                    errors.append("execution.parallel_tasks.enabled requires git.commit_each_task=true")
 
     approvals = payload.get("approvals")
     if not isinstance(approvals, dict):

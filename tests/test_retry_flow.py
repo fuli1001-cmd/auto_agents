@@ -2431,7 +2431,6 @@ class RetryFlowTests(unittest.TestCase):
                     "raise SystemExit(1)\""
                 )
             ]
-            config.git.commit_each_task = False
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
             orchestrator.adapter = BlockedRetryAdapter(project_root)
@@ -2480,7 +2479,6 @@ class RetryFlowTests(unittest.TestCase):
                     "raise SystemExit(1 if done else 0)\""
                 )
             ]
-            config.git.commit_each_task = True
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
             orchestrator.adapter = SequentialArtifactAdapter(project_root)
@@ -2533,7 +2531,6 @@ class RetryFlowTests(unittest.TestCase):
 
             config = orchestrator.config
             config.gates.commands = ["python -c \"print('ok')\""]
-            config.git.commit_each_task = True
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
             orchestrator.adapter = SequentialArtifactAdapter(project_root)
@@ -3231,7 +3228,6 @@ class RetryFlowTests(unittest.TestCase):
 
             config = orchestrator.config
             config.gates.commands = ["python -c \"print('ok')\""]
-            config.git.commit_each_task = False
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root)
             adapter = PromptCaptureAdapter(project_root)
@@ -3956,7 +3952,7 @@ class RetryFlowTests(unittest.TestCase):
             config.gates.commands = ["python3 -c \"print('ok')\""]
             config.gates.require_clean_git_before_task = False
             config.execution.parallel_tasks.enabled = True
-            config.execution.parallel_tasks.max_workers = 2
+            config.execution.parallel_tasks.workers = 2
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
             orchestrator.adapter = SequentialArtifactAdapter(project_root)
@@ -4002,7 +3998,7 @@ class RetryFlowTests(unittest.TestCase):
             config.gates.require_clean_git_before_task = False
             config.execution.parallel_tasks.enabled = True
             config.execution.parallel_tasks.strict = True
-            config.execution.parallel_tasks.max_workers = 2
+            config.execution.parallel_tasks.workers = 2
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root)
 
@@ -4046,7 +4042,7 @@ class RetryFlowTests(unittest.TestCase):
             config = orchestrator.config
             config.gates.require_clean_git_before_task = False
             config.execution.parallel_tasks.enabled = True
-            config.execution.parallel_tasks.max_workers = 2
+            config.execution.parallel_tasks.workers = 2
             save_project_config(project_root, config)
             commit_all(project_root, "baseline")
             orchestrator = Orchestrator(project_root)
@@ -4111,6 +4107,79 @@ class RetryFlowTests(unittest.TestCase):
                 [task.commit_sha for task in result.tasks],
                 ["main-task-001", "main-task-002"],
             )
+
+    def test_parallel_tasks_auto_workers_adapt_to_success_and_provider_pressure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.workers = "auto"
+            config.execution.parallel_tasks.max_auto_workers = 3
+            config.execution.parallel_tasks.adaptive = True
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            self.assertEqual(orchestrator._parallel_worker_count(), 3)
+            self.assertEqual(orchestrator._record_parallel_pressure(3), 1)
+            self.assertEqual(orchestrator._parallel_worker_count(), 1)
+            self.assertEqual(orchestrator._record_parallel_success(1), 2)
+            self.assertEqual(orchestrator._parallel_worker_count(), 2)
+            self.assertEqual(orchestrator._record_parallel_success(2), 3)
+            self.assertEqual(orchestrator._parallel_worker_count(), 3)
+
+    def test_parallel_tasks_fixed_workers_do_not_adapt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.workers = 2
+            config.execution.parallel_tasks.max_auto_workers = 8
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            self.assertEqual(orchestrator._parallel_worker_count(), 2)
+            self.assertEqual(orchestrator._record_parallel_pressure(2), 2)
+            self.assertEqual(orchestrator._parallel_worker_count(), 2)
+
+    def test_run_stops_after_implement_when_max_task_budget_is_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec = project_root / "SPEC.md"
+            spec.write_text("# demo\n", encoding="utf-8")
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.approvals.enabled = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "pending"
+            state.current_stage = "implement"
+            state.stage_summaries = {
+                "clarify": "done",
+                "design": "done",
+                "plan": "done",
+                "provider_research": "done",
+            }
+            save_run_state(project_root, state)
+
+            def exhaust_budget(run_state, max_tasks=None):
+                orchestrator._task_budget_exhausted = True
+                run_state.stage_summaries["implement"] = "Processed 1 task(s)."
+                return run_state
+
+            with patch.object(orchestrator, "_run_implementation_loop", side_effect=exhaust_budget):
+                with patch.object(orchestrator, "_run_verify") as verify_mock:
+                    result = orchestrator.run(spec, auto_approve=True, max_tasks=1, skip_validate=True)
+
+            self.assertEqual(result.status, "pending")
+            self.assertEqual(result.current_stage, "implement")
+            self.assertIn("implement", result.stage_summaries)
+            verify_mock.assert_not_called()
 
 
 class IterationAdapter:

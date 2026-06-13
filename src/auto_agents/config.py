@@ -40,6 +40,7 @@ AUTO_GITIGNORE_ENTRIES = (
     "runs/",
     "state/gate_baseline_cache.json",
     "state/repomap_cache.json",
+    "state/parallel_tuning.json",
 )
 LEGACY_AUTO_GITIGNORE_ENTRIES = {"state/run_state.json"}
 
@@ -144,6 +145,7 @@ DEFAULT_CONFIG = {
             "prompt_via_stdin": True,
             "output_flag": "-o",
             "idle_timeout_seconds": DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
+            "subscription_tier": "default",
         },
         "copilot-cli": {
             "kind": "copilot-cli",
@@ -159,6 +161,7 @@ DEFAULT_CONFIG = {
             "output_flag": "",
             "timeout_seconds": 3600,
             "idle_timeout_seconds": DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
+            "subscription_tier": "default",
         },
         "antigravity-claude": {
             "kind": "antigravity",
@@ -174,6 +177,7 @@ DEFAULT_CONFIG = {
             "output_flag": "",
             "timeout_seconds": 7200,
             "idle_timeout_seconds": 7200,
+            "subscription_tier": "default",
         },
         "antigravity-gemini": {
             "kind": "antigravity",
@@ -189,6 +193,7 @@ DEFAULT_CONFIG = {
             "output_flag": "",
             "timeout_seconds": 7200,
             "idle_timeout_seconds": 7200,
+            "subscription_tier": "default",
         },
     },
     "active_provider": "codex",
@@ -205,13 +210,14 @@ DEFAULT_CONFIG = {
     },
     "git": {
         "auto_init_repo": True,
-        "commit_each_task": True,
         "commit_message_template": "feat({task_id}): {title}",
     },
     "execution": {
         "parallel_tasks": {
             "enabled": False,
-            "max_workers": 2,
+            "workers": "auto",
+            "max_auto_workers": 4,
+            "adaptive": True,
             "strict": False,
             "worktree_root": "",
         },

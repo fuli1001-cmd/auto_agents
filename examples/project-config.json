@@ -12,7 +12,8 @@
       "extra_args": [],
       "cwd_flag": "-C",
       "prompt_via_stdin": true,
-      "output_flag": "-o"
+      "output_flag": "-o",
+      "subscription_tier": "default"
     },
     "copilot-cli": {
       "kind": "copilot-cli",
@@ -25,7 +26,8 @@
       "extra_args": [],
       "cwd_flag": "",
       "prompt_via_stdin": true,
-      "output_flag": ""
+      "output_flag": "",
+      "subscription_tier": "default"
     }
   },
   "active_provider": "codex",
@@ -52,13 +54,14 @@
   },
   "git": {
     "auto_init_repo": true,
-    "commit_each_task": true,
     "commit_message_template": "feat({task_id}): {title}"
   },
   "execution": {
     "parallel_tasks": {
       "enabled": false,
-      "max_workers": 2,
+      "workers": "auto",
+      "max_auto_workers": 4,
+      "adaptive": true,
       "strict": false,
       "worktree_root": ""
     }

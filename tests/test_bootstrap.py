@@ -48,7 +48,7 @@ class BootstrapTests(unittest.TestCase):
             auto_gitignore = (auto_dir(project_root) / ".gitignore").read_text(encoding="utf-8")
             self.assertEqual(
                 auto_gitignore,
-                "runs/\nstate/gate_baseline_cache.json\nstate/repomap_cache.json\n",
+                "runs/\nstate/gate_baseline_cache.json\nstate/repomap_cache.json\nstate/parallel_tuning.json\n",
             )
             gitignore = (project_root / ".gitignore").read_text(encoding="utf-8")
             self.assertIn(".conda/", gitignore)

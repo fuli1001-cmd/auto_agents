@@ -80,7 +80,6 @@ An experimental opt-in path can parallelize independent tasks in separate git wo
 stays conservative:
 
 - `execution.parallel_tasks.enabled` must be true
-- `git.commit_each_task` must stay true
 - every non-done task must carry planner-generated `depends_on`
 - malformed or missing dependency metadata falls back to sequential mode, or fails fast when
   `execution.parallel_tasks.strict=true`
@@ -446,7 +445,9 @@ worktrees. Example:
   "execution": {
     "parallel_tasks": {
       "enabled": true,
-      "max_workers": 2,
+      "workers": "auto",
+      "max_auto_workers": 4,
+      "adaptive": true,
       "strict": false,
       "worktree_root": ""
     }
@@ -457,6 +458,12 @@ worktrees. Example:
 When that mode is enabled, the planner should emit `depends_on` arrays in
 `.auto-agents/state/task_plan.json`, for example `[]` for an independent task or
 `["task-001"]` for a dependent slice.
+
+`workers` may be an integer for fixed concurrency or `"auto"` for local adaptive scheduling.
+In auto mode, auto_agents starts from the active provider's local subscription-tier limit,
+caps concurrency at `max_auto_workers`, and lowers concurrency when provider pressure such
+as throttling, quota, timeout, or stalls is detected. Successful batches can gradually raise
+the next batch's worker count within that cap.
 
 ### Provider auto-failover
 

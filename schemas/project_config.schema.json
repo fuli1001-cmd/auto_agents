@@ -31,7 +31,8 @@
             "extra_args",
             "cwd_flag",
             "prompt_via_stdin",
-            "output_flag"
+            "output_flag",
+            "subscription_tier"
           ],
           "properties": {
             "kind": {
@@ -64,6 +65,10 @@
             "output_flag": {
               "type": "string",
               "minLength": 1
+            },
+            "subscription_tier": {
+              "type": "string",
+              "minLength": 1
             }
           },
           "additionalProperties": true
@@ -77,7 +82,8 @@
             "extra_args",
             "cwd_flag",
             "prompt_via_stdin",
-            "output_flag"
+            "output_flag",
+            "subscription_tier"
           ],
           "properties": {
             "kind": {
@@ -107,6 +113,9 @@
               "type": "boolean"
             },
             "output_flag": {
+              "type": "string"
+            },
+            "subscription_tier": {
               "type": "string",
               "minLength": 1
             }
@@ -114,11 +123,13 @@
           "additionalProperties": true
         }
       },
-      "additionalProperties": false
+      "additionalProperties": {
+        "type": "object"
+      }
     },
     "active_provider": {
       "type": "string",
-      "enum": ["codex", "copilot-cli"]
+      "enum": ["codex", "copilot-cli", "antigravity-claude", "antigravity-gemini"]
     },
     "docs": {
       "type": "object",
@@ -235,14 +246,10 @@
       "type": "object",
       "required": [
         "auto_init_repo",
-        "commit_each_task",
         "commit_message_template"
       ],
       "properties": {
         "auto_init_repo": {
-          "type": "boolean"
-        },
-        "commit_each_task": {
           "type": "boolean"
         },
         "commit_message_template": {
@@ -257,14 +264,29 @@
       "properties": {
         "parallel_tasks": {
           "type": "object",
-          "required": ["enabled", "max_workers", "strict", "worktree_root"],
+          "required": ["enabled", "workers", "max_auto_workers", "adaptive", "strict", "worktree_root"],
           "properties": {
             "enabled": {
               "type": "boolean"
             },
-            "max_workers": {
+            "workers": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "const": "auto"
+                },
+                {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              ]
+            },
+            "max_auto_workers": {
               "type": "integer",
               "minimum": 1
+            },
+            "adaptive": {
+              "type": "boolean"
             },
             "strict": {
               "type": "boolean"
