@@ -4188,6 +4188,90 @@ class RetryFlowTests(unittest.TestCase):
                 ["main-task-001", "main-task-002"],
             )
 
+    def test_parallel_tasks_defer_overlapping_worker_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            config = orchestrator.config
+            config.gates.require_clean_git_before_task = False
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.workers = 2
+            save_project_config(project_root, config)
+            commit_all(project_root, "baseline")
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "First task",
+                            "description": "Finish the first slice.",
+                            "acceptance": ["done"],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "task-002",
+                            "title": "Second task",
+                            "description": "Finish the second slice.",
+                            "acceptance": ["done"],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            integrated = []
+            sequential = []
+
+            def fake_run_task_in_worktree(state_snapshot, tasks_snapshot, task_id):
+                task = next(item for item in tasks_snapshot if item.task_id == task_id)
+                task.status = "done"
+                task.review_summary = f"review for {task_id}"
+                return {
+                    "ok": True,
+                    "task": task.to_dict(),
+                    "reason": "",
+                    "review": task.review_summary,
+                    "commit_sha": f"worker-{task_id}",
+                    "changed_paths": ["shared.txt"],
+                    "verify_current_failure_ids": [],
+                }
+
+            def fake_integrate(task, tasks, worker_commit_sha):
+                integrated.append((task.task_id, worker_commit_sha))
+                return f"main-{task.task_id}"
+
+            def fake_execute_sequential(state_arg, tasks_arg, task):
+                sequential.append(task.task_id)
+                task.status = "done"
+                task.commit_sha = f"main-{task.task_id}"
+                return None
+
+            with patch.object(orchestrator, "_run_task_in_worktree", side_effect=fake_run_task_in_worktree):
+                with patch.object(orchestrator, "_integrate_parallel_task_result", side_effect=fake_integrate):
+                    with patch.object(
+                        orchestrator,
+                        "_execute_task_in_main_worktree",
+                        side_effect=fake_execute_sequential,
+                    ):
+                        result = orchestrator._run_implementation_loop(state, max_tasks=2)
+
+            self.assertEqual(integrated, [("task-001", "worker-task-001")])
+            self.assertEqual(sequential, ["task-002"])
+            self.assertEqual([task.status for task in result.tasks], ["done", "done"])
+            self.assertIn("defer integration task=task-002", stream.getvalue())
+
     def test_parallel_tasks_aggregate_failed_workers_and_copy_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

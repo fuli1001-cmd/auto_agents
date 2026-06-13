@@ -163,14 +163,24 @@ def list_worktrees(project_root: Path) -> list[str]:
     return paths
 
 
+def commit_changed_paths(project_root: Path, commit_sha: str) -> list[str]:
+    result = _git(project_root, "diff-tree", "--no-commit-id", "--name-only", "-r", commit_sha)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git diff-tree failed")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
 def cherry_pick_no_commit(project_root: Path, commit_sha: str) -> None:
     result = _git(project_root, "cherry-pick", "--no-commit", commit_sha)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git cherry-pick failed")
 
 
-def abort_cherry_pick(project_root: Path) -> None:
-    _git(project_root, "cherry-pick", "--abort")
+def abort_cherry_pick(project_root: Path) -> str:
+    result = _git(project_root, "cherry-pick", "--abort")
+    if result.returncode != 0:
+        return result.stderr.strip() or result.stdout.strip() or "git cherry-pick --abort failed"
+    return ""
 
 
 def hard_reset_clean(

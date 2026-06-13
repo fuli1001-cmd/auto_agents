@@ -65,7 +65,7 @@ from .gates import (
     run_commands_collect_all,
 )
 from .gate_baseline_cache import GateBaselineCache
-from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, ensure_repo, hard_reset_clean, head_ref, is_repo, remove_worktree, worktree_fingerprint
+from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, ensure_repo, hard_reset_clean, head_ref, is_repo, remove_worktree, worktree_fingerprint
 from .io_utils import read_json, read_text, write_json, write_text
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
 from .models import (
@@ -2230,6 +2230,7 @@ class Orchestrator:
                 results = self._run_parallel_task_batch(state, tasks, batch)
             provider_pressure_result: Optional[Tuple[TaskSpec, Dict[str, object]]] = None
             failed_results: List[Tuple[TaskSpec, Dict[str, object]]] = []
+            integrated_paths: Set[str] = set()
             for task in batch:
                 result = results[task.task_id]
                 if not result["ok"]:
@@ -2241,9 +2242,27 @@ class Orchestrator:
                     failed_results.append((task, result))
                     continue
 
+                result_changed_paths = {
+                    str(path).strip()
+                    for path in result.get("changed_paths", [])
+                    if str(path).strip()
+                }
+                overlapping_paths = integrated_paths & result_changed_paths
+                if overlapping_paths:
+                    preview = ", ".join(sorted(overlapping_paths)[:4])
+                    if len(overlapping_paths) > 4:
+                        preview += f", +{len(overlapping_paths) - 4} more"
+                    self.logger.info(
+                        "[parallel-tasks] defer integration task=%s reason=overlapping-worker-paths paths=%s",
+                        task.task_id,
+                        preview,
+                    )
+                    continue
+
                 self._apply_parallel_task_snapshot(task, dict(result["task"]))
                 commit_sha = self._integrate_parallel_task_result(task, tasks, str(result["commit_sha"]))
                 task.commit_sha = commit_sha
+                integrated_paths.update(result_changed_paths)
                 self._warm_clean_head_verify_baseline(
                     state,
                     failure_ids=result.get("verify_current_failure_ids", []),
@@ -2583,12 +2602,14 @@ class Orchestrator:
                 commit_message,
                 exclude_prefixes=(".auto-agents", ".antigravitycli"),
             )
+            worker_changed_paths = commit_changed_paths(worktree_path, worker_commit_sha)
             return {
                 "ok": True,
                 "task": worker_task.to_dict(),
                 "reason": "",
                 "review": str(gate_result["review"]),
                 "commit_sha": worker_commit_sha,
+                "changed_paths": worker_changed_paths,
                 "verify_current_failure_ids": list(gate_result.get("verify_current_failure_ids", [])),
             }
         except Exception as error:
@@ -2852,17 +2873,26 @@ class Orchestrator:
         tasks: List[TaskSpec],
         worker_commit_sha: str,
     ) -> str:
+        pre_integration_ref = head_ref(self.project_root) or "HEAD"
         try:
             cherry_pick_no_commit(self.project_root, worker_commit_sha)
         except RuntimeError as error:
-            abort_cherry_pick(self.project_root)
+            cleanup_notes: List[str] = []
+            abort_error = abort_cherry_pick(self.project_root)
+            if abort_error:
+                cleanup_notes.append(f"cherry-pick abort failed: {abort_error}")
+            if not hard_reset_clean(self.project_root, pre_integration_ref):
+                cleanup_notes.append(f"failed to restore pre-integration ref {pre_integration_ref}")
             task.status = "blocked"
             self._persist_tasks(tasks)
-            self._emit_task_blocked(task, f"merge failed: {error}")
+            reason = str(error)
+            if cleanup_notes:
+                reason = f"{reason}; cleanup notes: {'; '.join(cleanup_notes)}"
+            self._emit_task_blocked(task, f"merge failed: {reason}")
             raise RuntimeError(
                 self._format_task_failure_error(
                     task,
-                    reason=f"parallel integration failed while merging worker commit: {error}",
+                    reason=f"parallel integration failed while merging worker commit: {reason}",
                     review_summary=task.review_summary,
                 )
             )

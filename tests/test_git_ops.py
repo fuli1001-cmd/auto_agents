@@ -11,6 +11,7 @@ from auto_agents.git_ops import (
     cherry_pick_no_commit,
     commit_all,
     commit_all_except,
+    commit_changed_paths,
     list_worktrees,
     remove_worktree,
 )
@@ -77,6 +78,8 @@ class GitOpsWorktreeTests(unittest.TestCase):
                 )
             finally:
                 remove_worktree(project_root, worktree_path)
+
+            self.assertEqual(commit_changed_paths(project_root, worker_sha), ["artifact.txt"])
 
             cherry_pick_no_commit(project_root, worker_sha)
 
