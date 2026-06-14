@@ -1580,17 +1580,27 @@ class Orchestrator:
         return snapshot
 
     @staticmethod
-    def _is_ephemeral_tooling_artifact(path: str) -> bool:
+    def _is_ephemeral_tooling_artifact(
+        path: str,
+        *,
+        tracked: bool = False,
+        include_untracked_build_lib: bool = True,
+    ) -> bool:
         normalized = str(path).replace("\\", "/").lower()
-        return normalized.endswith(".tsbuildinfo")
+        if normalized.endswith(".tsbuildinfo"):
+            return True
+        if (
+            include_untracked_build_lib
+            and not tracked
+            and (normalized.startswith("build/lib/") or normalized.startswith("build/lib."))
+        ):
+            return True
+        return False
 
-    def _cleanup_ephemeral_tooling_artifacts(self) -> None:
-        candidates = [
-            path
-            for _, path in changed_entries(self.project_root, ignored_prefixes=())
-            if not path.startswith(".antigravitycli/") and self._is_ephemeral_tooling_artifact(path)
-        ]
-        for path in candidates:
+    def _cleanup_ephemeral_tooling_artifacts(self, *, include_untracked_build_lib: bool = True) -> None:
+        for _, path in changed_entries(self.project_root, ignored_prefixes=()):
+            if path.startswith(".antigravitycli/"):
+                continue
             file_path = self.project_root / path
             tracked = subprocess.run(
                 ["git", "ls-files", "--error-unmatch", "--", path],
@@ -1599,6 +1609,12 @@ class Orchestrator:
                 encoding="utf-8",
                 capture_output=True,
             ).returncode == 0
+            if not self._is_ephemeral_tooling_artifact(
+                path,
+                tracked=tracked,
+                include_untracked_build_lib=include_untracked_build_lib,
+            ):
+                continue
             if tracked:
                 restore = subprocess.run(
                     ["git", "restore", "--source=HEAD", "--staged", "--worktree", "--", path],
@@ -6318,7 +6334,7 @@ class Orchestrator:
                     cumulative_usage = (cumulative_usage or AgentUsage()).plus(result.usage)
                     usage_available = True
                 self._emit_agent_output(artifact_stage, result)
-                self._cleanup_ephemeral_tooling_artifacts()
+                self._cleanup_ephemeral_tooling_artifacts(include_untracked_build_lib=stage != "implement")
                 if state is not None:
                     state.agent_attempts[stage_key] = attempt
                     save_run_state(self.project_root, state)

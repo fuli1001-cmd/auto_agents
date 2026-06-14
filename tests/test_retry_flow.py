@@ -468,6 +468,34 @@ class ReviewTsBuildInfoAdapter:
         )
 
 
+class ReviewBuildLibAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            write_text(self.project_root / "artifact.txt", "good\n")
+            summary = "implemented good\n"
+        elif request.stage == "review":
+            self.review_calls += 1
+            write_text(
+                self.project_root / "build" / "lib" / "app" / "__init__.py",
+                "# generated build output\n",
+            )
+            summary = "DECISION: pass\nreview passed despite python build output churn\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class OutOfScopeImplementAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
@@ -2074,6 +2102,52 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(tsbuildinfo_path.read_text(encoding="utf-8").strip(), '{"version":"incremental-1"}')
             status = subprocess.run(
                 ["git", "status", "--short", "--", "workbench/tsconfig.tsbuildinfo"],
+                cwd=str(project_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            self.assertEqual(status.stdout.strip(), "")
+
+    def test_review_stage_cleans_untracked_python_build_lib_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.gates.require_clean_git_before_task = False
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = ReviewBuildLibAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains good"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertFalse((project_root / "build" / "lib" / "app" / "__init__.py").exists())
+            status = subprocess.run(
+                ["git", "status", "--short", "--", "build"],
                 cwd=str(project_root),
                 text=True,
                 encoding="utf-8",
