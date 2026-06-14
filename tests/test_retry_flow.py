@@ -2201,6 +2201,46 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.tasks[0].status, "done")
             self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "fixed")
 
+    def test_pending_repair_task_can_run_with_dirty_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = BlockedRetryAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "repair-task-001-r1-1",
+                            "title": "Repair proof evidence",
+                            "description": "Repair failed verification evidence.",
+                            "acceptance": ["artifact.txt contains fixed"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "parent_task_id": "task-001",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+            (project_root / "notes.txt").write_text("dirty parent-task context\n", encoding="utf-8")
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "fixed")
+
     def test_verify_failure_skips_review_and_retries_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

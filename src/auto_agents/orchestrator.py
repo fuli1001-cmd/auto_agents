@@ -2323,12 +2323,18 @@ class Orchestrator:
 
         resume_existing = task.status == "in_progress" or self._should_resume_task(state, task)
         allow_dirty_retry = task.status == "blocked"
+        allow_dirty_repair = self._is_repair_task(task)
         if (resume_existing or allow_dirty_retry) and task.status != "in_progress":
             task.status = "in_progress"
             self._persist_tasks(tasks)
 
         if (
-            not (resume_existing or allow_dirty_retry or self._allow_dirty_tree)
+            not (
+                resume_existing
+                or allow_dirty_retry
+                or allow_dirty_repair
+                or self._allow_dirty_tree
+            )
             and self.config.gates.require_clean_git_before_task
         ):
             self._require_clean_tree_for_task(task)
@@ -3024,6 +3030,10 @@ class Orchestrator:
                 "Commit or stash those changes first, disable "
                 "gates.require_clean_git_before_task, or rerun with --allow-dirty-tree."
             ) from error
+
+    @staticmethod
+    def _is_repair_task(task: TaskSpec) -> bool:
+        return task.task_id.strip().startswith("repair-")
 
     def _require_clean_tree_excluding_agent_instructions(self) -> None:
         changed = self._changed_paths_excluding_agent_instructions()
