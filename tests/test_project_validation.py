@@ -1444,7 +1444,11 @@ class ProjectValidationTests(unittest.TestCase):
                 result = adapter.run(request)
 
             self.assertTrue(result.ok)
-            self.assertEqual(result.model, "profile:h")
+            command = run_mock.call_args.args[0]
+            self.assertIn("--sandbox", command)
+            self.assertIn("workspace-write", command)
+            self.assertNotIn("--full-auto", command)
+            self.assertEqual(result.model, "profile:deep")
             self.assertIsNotNone(result.usage)
             usage = result.usage
             self.assertEqual(usage.input_tokens if usage else None, 200)
