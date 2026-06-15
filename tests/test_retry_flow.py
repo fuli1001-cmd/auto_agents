@@ -4481,6 +4481,47 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(orchestrator._record_parallel_success(2), 3)
             self.assertEqual(orchestrator._parallel_worker_count(), 3)
 
+    def test_parallel_provider_pressure_ignores_owned_proof_rate_limited_test_names(self) -> None:
+        result = {
+            "ok": False,
+            "reason": (
+                "owned proof evidence failed: tests/test_asset_consistency_runtime_api.py::"
+                "AssetConsistencyRuntimeApiTests::"
+                "test_rate_limited_asset_task_consistency_payload_preserves_retry_evidence"
+            ),
+            "review": "",
+            "failure_ids": [
+                "tests/test_asset_consistency_runtime_api.py::"
+                "AssetConsistencyRuntimeApiTests::"
+                "test_rate_limited_asset_task_consistency_payload_preserves_retry_evidence"
+            ],
+            "proof_evidence": {
+                "ok": False,
+                "failed_refs": [
+                    "tests/test_asset_consistency_runtime_api.py::"
+                    "AssetConsistencyRuntimeApiTests::"
+                    "test_rate_limited_asset_task_consistency_payload_preserves_retry_evidence"
+                ],
+            },
+        }
+
+        self.assertFalse(Orchestrator._parallel_result_is_provider_pressure(result))
+
+    def test_parallel_provider_pressure_detects_agent_provider_errors(self) -> None:
+        pressure_reasons = [
+            "All providers exhausted. Tried: codex. Last error: 429 rate limit exceeded",
+            "parallel worktree execution failed: provider availability error",
+            "implementation failed: stalled (no output) after 7200s",
+        ]
+
+        for reason in pressure_reasons:
+            with self.subTest(reason=reason):
+                self.assertTrue(
+                    Orchestrator._parallel_result_is_provider_pressure(
+                        {"ok": False, "reason": reason, "review": ""}
+                    )
+                )
+
     def test_parallel_tasks_auto_workers_support_copilot_pro_plus_tier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

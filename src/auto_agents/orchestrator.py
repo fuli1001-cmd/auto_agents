@@ -118,6 +118,22 @@ _FAILOVER_QUOTA_PATTERN = re.compile(
     r"rate.limit|usage.limit|\b429\b|quota|too many requests|capacity",
     re.IGNORECASE,
 )
+_PARALLEL_PROVIDER_PRESSURE_PATTERN = re.compile(
+    r"\b(?:"
+    r"rate[-\s]?limit(?:ed|s|ing)?"
+    r"|usage[-\s]?limit(?:ed|s|ing)?"
+    r"|429"
+    r"|quota"
+    r"|too many requests"
+    r"|throttl(?:e|ed|ing)?"
+    r"|provider availability"
+    r"|all providers exhausted"
+    r"|timed?\s*out"
+    r"|timeout"
+    r"|stall(?:ed|ing)?"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 class Orchestrator:
@@ -2496,22 +2512,16 @@ class Orchestrator:
 
     @staticmethod
     def _parallel_result_is_provider_pressure(result: Dict[str, object]) -> bool:
-        text = f"{result.get('reason', '')}\n{result.get('review', '')}".lower()
-        return any(
-            token in text
-            for token in (
-                "rate limit",
-                "rate-limit",
-                "429",
-                "quota",
-                "throttl",
-                "timed out",
-                "timeout",
-                "stall",
-                "provider availability",
-                "all providers exhausted",
-            )
-        )
+        failure_ids = result.get("failure_ids", [])
+        if isinstance(failure_ids, list) and any(str(item).strip() for item in failure_ids):
+            return False
+        proof_evidence = result.get("proof_evidence")
+        if isinstance(proof_evidence, dict) and proof_evidence and not bool(proof_evidence.get("ok", True)):
+            return False
+        reason = str(result.get("reason", "")).strip()
+        if not reason:
+            return False
+        return _PARALLEL_PROVIDER_PRESSURE_PATTERN.search(reason) is not None
 
     def _ready_parallel_tasks(self, tasks: List[TaskSpec]) -> List[TaskSpec]:
         completed = {task.task_id for task in tasks if task.status == "done"}
