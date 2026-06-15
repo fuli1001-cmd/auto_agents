@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import datetime as _dt
 import os
 import re
@@ -165,6 +166,90 @@ def _oracle_preservation_messages(task_contract_text: str, oracle: str) -> List[
                 f"missing token(s) {', '.join(missing_tokens)} from oracle clause: {atom['clause']}"
             )
     return messages
+
+
+def preserve_task_plan_negative_oracle_clauses(
+    plan_payload: object,
+    trace_payload: object,
+) -> Tuple[object, List[str]]:
+    """Copy missing negative oracle clauses into task acceptance text.
+
+    Plan validation intentionally rejects tasks that weaken a negative requirement
+    by dropping concrete field/path/API tokens from the task contract. Planner LLMs
+    can still preserve the meaning while changing token formatting, for example
+    writing ``fake` / `fixture`` instead of `fake/fixture`. This helper keeps the
+    strict validator intact while normalizing generated plans before validation.
+    """
+    if not isinstance(plan_payload, dict) or not isinstance(trace_payload, dict):
+        return plan_payload, []
+
+    normalized_trace = normalize_requirements_trace_payload(trace_payload)
+    if not isinstance(normalized_trace, dict):
+        return plan_payload, []
+
+    tasks = plan_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return plan_payload, []
+
+    by_req = {str(item.get("id", "")).strip(): item for item in requirement_records(normalized_trace)}
+    repaired = copy.deepcopy(plan_payload)
+    repaired_tasks = repaired.get("tasks")
+    if not isinstance(repaired_tasks, list):
+        return plan_payload, []
+
+    updates: List[str] = []
+    for task in repaired_tasks:
+        if not isinstance(task, dict):
+            continue
+        proofs = task.get("requirement_proofs")
+        acceptance = task.get("acceptance")
+        if not isinstance(proofs, list) or not isinstance(acceptance, list):
+            continue
+
+        task_contract_text = _task_contract_text_from_payload(task)
+        clauses_to_preserve: List[str] = []
+        for proof in proofs:
+            if not isinstance(proof, dict):
+                continue
+            req_id = str(proof.get("requirement_id", "")).strip()
+            requirement = by_req.get(req_id)
+            if requirement is None:
+                continue
+            matched_oracle = _matched_requirement_oracle(proof, requirement)
+            if matched_oracle is None:
+                continue
+            for atom in _negative_contract_atoms(matched_oracle[1]):
+                missing_tokens = [
+                    token
+                    for token in atom["tokens"]
+                    if not _contract_text_contains_token(task_contract_text, token)
+                ]
+                if missing_tokens and atom["clause"] not in clauses_to_preserve:
+                    clauses_to_preserve.append(atom["clause"])
+
+        if not clauses_to_preserve:
+            continue
+
+        suffix = "Preserved negative acceptance oracle clause(s): " + "；".join(clauses_to_preserve)
+        target_index: Optional[int] = None
+        for index in range(len(acceptance) - 1, -1, -1):
+            if isinstance(acceptance[index], str) and acceptance[index].strip():
+                target_index = index
+                break
+        if target_index is None:
+            acceptance.append(suffix)
+        else:
+            current = str(acceptance[target_index]).rstrip()
+            acceptance[target_index] = f"{current} {suffix}"
+
+        task_id = str(task.get("task_id", "")).strip() or "<unknown>"
+        updates.append(
+            f"task {task_id}: preserved {len(clauses_to_preserve)} negative oracle clause(s)"
+        )
+
+    if not updates:
+        return plan_payload, []
+    return repaired, updates
 
 
 def empty_requirements_trace() -> dict:

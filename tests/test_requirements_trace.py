@@ -17,6 +17,7 @@ from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import (
     audit_requirements,
     load_requirements_trace,
+    preserve_task_plan_negative_oracle_clauses,
     validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
 )
@@ -256,6 +257,82 @@ class RequirementsTraceTests(unittest.TestCase):
         errors = validate_task_plan_with_requirements(plan, trace)
 
         self.assertEqual(errors, [])
+
+    def test_plan_oracle_preservation_repair_copies_missing_negative_tokens(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(
+                    id="REQ-001",
+                    acceptance_oracles=[
+                        "默认审核测试可用 fake/fixture 触发 `pass/review/block`，无需新增外部审核 API 文档。"
+                    ],
+                ),
+                _requirement(
+                    id="REQ-002",
+                    acceptance_oracles=[
+                        "已通过资产在后续局部纠偏中的下一步动作记录为 `reuse_asset`，不会被整批重生覆盖。"
+                    ],
+                ),
+            ],
+        }
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Moderation boundary",
+                    "description": "Keep the default fake moderation flow.",
+                    "acceptance": [
+                        "默认 `fake` / `fixture` 审核 `decision=pass` 自动流转。"
+                    ],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [
+                        _proof(
+                            requirement_id="REQ-001",
+                            oracle_index=1,
+                            acceptance_oracle="",
+                            status="planned",
+                        )
+                    ],
+                },
+                {
+                    "task_id": "task-002",
+                    "title": "Local asset retry",
+                    "description": "Keep passed assets out of local regeneration.",
+                    "acceptance": [
+                        "已通过资产在后续局部纠偏中保持复用，不会被整批重生覆盖。"
+                    ],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-002"],
+                    "requirement_proofs": [
+                        _proof(
+                            requirement_id="REQ-002",
+                            oracle_index=1,
+                            acceptance_oracle="",
+                            status="planned",
+                        )
+                    ],
+                },
+            ],
+        }
+
+        original_errors = validate_task_plan_with_requirements(plan, trace)
+        self.assertTrue(any("/fixture" in item for item in original_errors), original_errors)
+        self.assertTrue(any("reuse_asset" in item for item in original_errors), original_errors)
+
+        repaired, updates = preserve_task_plan_negative_oracle_clauses(plan, trace)
+
+        self.assertEqual(len(updates), 2)
+        self.assertNotIn("fake/fixture", plan["tasks"][0]["acceptance"][0])
+        self.assertIn("fake/fixture", repaired["tasks"][0]["acceptance"][0])
+        self.assertIn("reuse_asset", repaired["tasks"][1]["acceptance"][0])
+        self.assertEqual(validate_task_plan_with_requirements(repaired, trace), [])
 
     def test_plan_validation_rejects_done_task_with_unverified_oracle_proof(self) -> None:
         trace = {"version": 1, "requirements": [_requirement()]}

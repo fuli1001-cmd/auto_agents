@@ -1303,6 +1303,85 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertIsNone(Orchestrator(project_root)._plan_validation_feedback(result))
 
+    def test_plan_validation_feedback_repairs_negative_oracle_token_preservation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Default moderation remains fake fixture based.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": [
+                                "默认审核测试可用 fake/fixture 触发 `pass/review/block`，无需新增外部审核 API 文档。"
+                            ],
+                            "oracle_type": "integration_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Moderation boundary",
+                            "description": "Keep fake moderation available.",
+                            "acceptance": [
+                                "默认 `fake` / `fixture` 审核 `decision=pass` 自动流转。"
+                            ],
+                            "requirement_ids": ["REQ-001"],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "oracle_index": 1,
+                                    "proof_type": "integration_test",
+                                    "oracle_strength": "behavioral",
+                                    "evidence_boundary": "system_boundary",
+                                    "evidence_refs": [
+                                        "tests/test_project_api.py::ProjectApiTests::test_default_moderation_backends_are_fake_pass_and_auto_continue"
+                                    ],
+                                    "forbidden_proxy_oracles": [],
+                                    "status": "planned",
+                                }
+                            ],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir()
+            result = AgentResult(
+                ok=True,
+                command=[],
+                output_path=Path("."),
+                summary="valid plan",
+                stdout="",
+            )
+
+            self.assertIsNone(Orchestrator(project_root)._plan_validation_feedback(result))
+            repaired = json.loads(task_plan_path(project_root).read_text(encoding="utf-8"))
+            self.assertIn("fake/fixture", repaired["tasks"][0]["acceptance"][0])
+
     def test_plan_validation_rejects_oversized_active_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
