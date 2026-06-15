@@ -1382,6 +1382,79 @@ class ProjectValidationTests(unittest.TestCase):
             repaired = json.loads(task_plan_path(project_root).read_text(encoding="utf-8"))
             self.assertIn("fake/fixture", repaired["tasks"][0]["acceptance"][0])
 
+    def test_plan_validation_feedback_normalizes_copied_done_task_with_planned_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Provider output stays normalized.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["The public API returns normalized provider output."],
+                            "oracle_type": "integration_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Copied done task",
+                            "description": "Planner copied a runtime status into a new plan.",
+                            "acceptance": ["The public API returns normalized provider output."],
+                            "requirement_ids": ["REQ-001"],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "oracle_index": 1,
+                                    "proof_type": "integration_test",
+                                    "oracle_strength": "behavioral",
+                                    "evidence_boundary": "system_boundary",
+                                    "evidence_refs": ["tests/test_public_api.py::test_normalized_provider_output"],
+                                    "forbidden_proxy_oracles": [],
+                                    "status": "planned",
+                                }
+                            ],
+                            "status": "done",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir()
+            result = AgentResult(
+                ok=True,
+                command=[],
+                output_path=Path("."),
+                summary="valid plan",
+                stdout="",
+            )
+
+            self.assertIsNone(Orchestrator(project_root)._plan_validation_feedback(result))
+            repaired = json.loads(task_plan_path(project_root).read_text(encoding="utf-8"))
+            self.assertEqual(repaired["tasks"][0]["status"], "pending")
+
     def test_plan_validation_rejects_oversized_active_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

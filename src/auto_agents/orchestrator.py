@@ -90,6 +90,7 @@ from .requirements import (
     forbidden_pattern_findings,
     load_provider_references_lock,
     load_requirements_trace,
+    normalize_generated_task_plan_statuses,
     provider_reference_status,
     preserve_task_plan_negative_oracle_clauses,
     run_requirements_audit,
@@ -6929,13 +6930,15 @@ class Orchestrator:
     def _plan_validation_feedback(self, result: AgentResult) -> Optional[str]:
         payload = load_task_plan(self.project_root)
         trace = load_requirements_trace(self.project_root)
+        payload, status_normalization_updates = normalize_generated_task_plan_statuses(payload)
         payload, oracle_preservation_updates = preserve_task_plan_negative_oracle_clauses(
             payload,
             trace,
         )
-        if oracle_preservation_updates and isinstance(payload, dict):
+        plan_normalization_updates = status_normalization_updates + oracle_preservation_updates
+        if plan_normalization_updates and isinstance(payload, dict):
             save_task_plan(self.project_root, payload)
-            for update in oracle_preservation_updates:
+            for update in plan_normalization_updates:
                 self.logger.info(f"[plan] {update}")
         errors = validate_task_plan_with_requirements(
             payload,

@@ -252,6 +252,58 @@ def preserve_task_plan_negative_oracle_clauses(
     return repaired, updates
 
 
+def normalize_generated_task_plan_statuses(plan_payload: object) -> Tuple[object, List[str]]:
+    """Normalize planner-generated task statuses before strict plan validation.
+
+    The plan stage writes the next executable plan, not a live run snapshot. LLMs
+    can accidentally copy archived or run-state task statuses such as done or
+    in_progress back into task_plan.json. In oracle proof schema mode that makes
+    validation fail before implementation can begin, because done tasks require
+    verified proofs. Keep truly verified done tasks intact, but turn stale copied
+    runtime statuses back into pending work.
+    """
+    if not isinstance(plan_payload, dict):
+        return plan_payload, []
+    try:
+        schema_version = int(plan_payload.get("oracle_proof_schema_version") or 0)
+    except (TypeError, ValueError):
+        schema_version = 0
+    if schema_version < ORACLE_PROOF_SCHEMA_VERSION:
+        return plan_payload, []
+
+    tasks = plan_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return plan_payload, []
+
+    repaired = copy.deepcopy(plan_payload)
+    repaired_tasks = repaired.get("tasks")
+    if not isinstance(repaired_tasks, list):
+        return plan_payload, []
+
+    updates: List[str] = []
+    for task in repaired_tasks:
+        if not isinstance(task, dict):
+            continue
+        status = str(task.get("status", "pending")).strip()
+        if status == "pending":
+            continue
+        proofs = task.get("requirement_proofs")
+        proof_list = proofs if isinstance(proofs, list) else []
+        has_only_verified_proofs = bool(proof_list) and all(
+            isinstance(proof, dict) and str(proof.get("status", "")).strip() == "verified"
+            for proof in proof_list
+        )
+        if status == "done" and has_only_verified_proofs:
+            continue
+        task["status"] = "pending"
+        task_id = str(task.get("task_id", "")).strip() or "<unknown>"
+        updates.append(f"task {task_id}: normalized generated status {status!r} to 'pending'")
+
+    if not updates:
+        return plan_payload, []
+    return repaired, updates
+
+
 def empty_requirements_trace() -> dict:
     return {"version": 1, "requirements": []}
 

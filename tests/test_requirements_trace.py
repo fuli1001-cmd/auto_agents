@@ -17,6 +17,7 @@ from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import (
     audit_requirements,
     load_requirements_trace,
+    normalize_generated_task_plan_statuses,
     preserve_task_plan_negative_oracle_clauses,
     validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
@@ -332,6 +333,35 @@ class RequirementsTraceTests(unittest.TestCase):
         self.assertNotIn("fake/fixture", plan["tasks"][0]["acceptance"][0])
         self.assertIn("fake/fixture", repaired["tasks"][0]["acceptance"][0])
         self.assertIn("reuse_asset", repaired["tasks"][1]["acceptance"][0])
+        self.assertEqual(validate_task_plan_with_requirements(repaired, trace), [])
+
+    def test_plan_status_normalization_converts_stale_done_planned_proofs_to_pending(self) -> None:
+        trace = {"version": 1, "requirements": [_requirement()]}
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Copied done task",
+                    "description": "Planner copied a runtime status into a new plan.",
+                    "acceptance": ["The public API returns normalized provider output."],
+                    "status": "done",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [_proof(status="planned")],
+                }
+            ],
+        }
+
+        original_errors = validate_task_plan_with_requirements(plan, trace)
+        self.assertTrue(any("proof is not verified" in item for item in original_errors), original_errors)
+
+        repaired, updates = normalize_generated_task_plan_statuses(plan)
+
+        self.assertEqual(repaired["tasks"][0]["status"], "pending")
+        self.assertTrue(any("task-001" in item for item in updates), updates)
         self.assertEqual(validate_task_plan_with_requirements(repaired, trace), [])
 
     def test_plan_validation_rejects_done_task_with_unverified_oracle_proof(self) -> None:
