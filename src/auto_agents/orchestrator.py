@@ -1914,6 +1914,38 @@ class Orchestrator:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _normalize_oracle_proof_type(value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        raw = value.strip()
+        if not raw:
+            return value
+        normalized = raw.lower().replace("-", "_")
+        doc_aliases = {"doc", "docs", "documentation", "local_doc", "local_docs"}
+        if normalized in doc_aliases:
+            return "mixed"
+        parts = [
+            part.strip()
+            for part in re.split(r"[+,/|&\s]+", normalized)
+            if part.strip()
+        ]
+        if len(parts) <= 1:
+            return value
+        allowed_or_doc = {
+            "deterministic_test",
+            "integration_test",
+            "runtime_evidence",
+            "human_review",
+            "judge_model",
+            "benchmark",
+            "mixed",
+            *doc_aliases,
+        }
+        if all(part in allowed_or_doc for part in parts):
+            return "mixed"
+        return value
+
     def _apply_oracle_proof_updates_from_text(self, task: TaskSpec, text: str) -> Tuple[bool, str]:
         updates, parse_error = self._extract_oracle_proof_updates(text)
         if parse_error:
@@ -1945,6 +1977,9 @@ class Orchestrator:
         for update_index, update in enumerate(updates, start=1):
             prefix = f"ORACLE_PROOF_UPDATES[{update_index}]"
             local_errors: List[str] = []
+            if "proof_type" in update:
+                update = dict(update)
+                update["proof_type"] = self._normalize_oracle_proof_type(update.get("proof_type"))
             unknown = sorted(set(update) - allowed_keys)
             if unknown:
                 errors.append(f"{prefix} contains unsupported field(s): {', '.join(unknown)}")

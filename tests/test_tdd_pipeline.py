@@ -481,6 +481,48 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("does not match an existing proof", error)
             self.assertEqual(task.requirement_proofs[0]["status"], "planned")
 
+    def test_oracle_proof_updates_normalize_composite_proof_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Write feature",
+                description="Write a feature.",
+                acceptance=["feature works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "planned",
+                        "proof_type": "integration_test",
+                        "oracle_strength": "behavioral",
+                        "evidence_boundary": "system_boundary",
+                        "evidence_refs": ["planned evidence"],
+                        "forbidden_proxy_oracles": [],
+                        "proxy_oracles": [],
+                    }
+                ],
+            )
+
+            applied, error = orchestrator._apply_oracle_proof_updates_from_text(
+                task,
+                (
+                    "ORACLE_PROOF_UPDATES:\n"
+                    "```json\n"
+                    '[{"requirement_id":"REQ-001","oracle_index":1,"status":"verified",'
+                    '"proof_type":"integration_test+local_doc",'
+                    '"evidence_refs":["tests/test_public_api.py::test_normalized_provider_output"]}]\n'
+                    "```"
+                ),
+            )
+
+            self.assertTrue(applied, error)
+            self.assertEqual(task.requirement_proofs[0]["status"], "verified")
+            self.assertEqual(task.requirement_proofs[0]["proof_type"], "mixed")
+
     def test_build_task_prompt_unsupported_stage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
