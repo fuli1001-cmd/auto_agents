@@ -15,7 +15,6 @@ from auto_agents.cli import main
 from auto_agents.adapters.codex import CodexAdapter
 from auto_agents.config import (
     DEFAULT_CONFIG,
-    archived_task_plan_path,
     auto_dir,
     config_path,
     create_session,
@@ -588,7 +587,7 @@ class ProjectValidationTests(unittest.TestCase):
             state.current_stage = "clarify"
             state.resume_context = {
                 "previous_run_id": "oldrun123",
-                "previous_task_plan_archive": str(project_root / ".auto-agents" / "runs" / "oldrun123" / "task_plan.final.json"),
+                "previous_task_plan_archive": str(project_root / ".auto-agents" / "history" / "task_plans" / "oldrun123.json"),
             }
             save_run_state(project_root, state)
 
@@ -608,7 +607,7 @@ class ProjectValidationTests(unittest.TestCase):
             state.stage_summaries["plan"] = "planned"
             state.resume_context = {
                 "previous_run_id": "oldrun123",
-                "previous_task_plan_archive": str(project_root / ".auto-agents" / "runs" / "oldrun123" / "task_plan.final.json"),
+                "previous_task_plan_archive": str(project_root / ".auto-agents" / "history" / "task_plans" / "oldrun123.json"),
             }
             save_run_state(project_root, state)
 
@@ -627,38 +626,6 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(report["errors"], [])
             self.assertIn("project_config", report["schemas"])
             self.assertTrue(Path(report["schemas"]["project_config"]).exists())
-
-    def test_load_run_state_migrates_legacy_task_plan_archive_and_updates_resume_context(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            project_root = Path(tmp) / "demo"
-            Orchestrator.init_project(project_root, "demo", "mock")
-            legacy_archive = project_root / ".auto-agents" / "runs" / "oldrun123" / "task_plan.final.json"
-            state = load_run_state(project_root)
-            state.resume_context = {"previous_task_plan_archive": str(legacy_archive)}
-            save_run_state(project_root, state)
-            legacy_archive.parent.mkdir(parents=True, exist_ok=True)
-            write_json(
-                legacy_archive,
-                {
-                    "tasks": [
-                        {
-                            "task_id": "task-001",
-                            "title": "done",
-                            "description": "",
-                            "acceptance": [],
-                            "status": "done",
-                            "commit_message": "",
-                        }
-                    ]
-                },
-            )
-
-            reloaded = load_run_state(project_root)
-
-            migrated_archive = archived_task_plan_path(project_root, "oldrun123")
-            self.assertTrue(migrated_archive.exists())
-            self.assertFalse(legacy_archive.exists())
-            self.assertEqual(reloaded.resume_context["previous_task_plan_archive"], str(migrated_archive))
 
     def test_validation_report_catches_invalid_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

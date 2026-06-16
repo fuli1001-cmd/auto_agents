@@ -9,7 +9,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from .config import (
     archived_task_plans_dir,
-    migrate_archived_task_plans,
     provider_references_lock_path,
     requirements_audit_path,
     requirements_trace_path,
@@ -522,7 +521,6 @@ def _previous_task_plan_archive_path(project_root: Path) -> Optional[Path]:
 
 
 def _archived_task_plan_paths(project_root: Path) -> List[Path]:
-    migrate_archived_task_plans(project_root)
     paths: List[Path] = []
     previous_archive = _previous_task_plan_archive_path(project_root)
     if previous_archive is not None:
