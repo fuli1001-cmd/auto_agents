@@ -542,9 +542,17 @@ during implementation.
 
 Across iterations, `state/task_plan.json` is the active plan for the current run, not a permanent
 history table. When a completed project starts a new iteration, auto_agents archives the previous
-plan to `.auto-agents/runs/<run_id>/task_plan.final.json`, archives the final run state beside it,
+plan to `.auto-agents/history/task_plans/<run_id>.json`, archives the final run state beside it,
 and resets the active plan to an empty `{ "tasks": [] }` placeholder until the new plan stage
 generates current-iteration tasks.
+
+Archived done tasks from `.auto-agents/history/task_plans/*.json` are still used as historical
+requirement coverage. If an archived task has verified requirement proofs that still satisfy the
+current active requirement oracles, the next iteration does not need to create a regression-lock task
+solely to re-prove that same requirement. The current `task_plan.json` should contain only new or
+changed scope and any requirements whose historical proof no longer satisfies the current trace.
+Run artifacts under `.auto-agents/runs/` remain local-only and can stay ignored; the durable proof
+ledger now lives under `.auto-agents/history/task_plans/`.
 
 `state/requirements_trace.json` is also a contract, not scratch metadata. Each active requirement is
 expected to carry:

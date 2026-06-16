@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -50,6 +51,21 @@ class BootstrapTests(unittest.TestCase):
                 auto_gitignore,
                 "runs/\nstate/gate_baseline_cache.json\nstate/repomap_cache.json\nstate/parallel_tuning.json\n",
             )
+            task_archive_ignore = subprocess.run(
+                ["git", "check-ignore", "-q", ".auto-agents/history/task_plans/run-001.json"],
+                cwd=str(project_root),
+            )
+            run_state_archive_ignore = subprocess.run(
+                ["git", "check-ignore", "-q", ".auto-agents/runs/run-001/run_state.final.json"],
+                cwd=str(project_root),
+            )
+            run_log_ignore = subprocess.run(
+                ["git", "check-ignore", "-q", ".auto-agents/runs/run-001/run.log"],
+                cwd=str(project_root),
+            )
+            self.assertEqual(task_archive_ignore.returncode, 1)
+            self.assertEqual(run_state_archive_ignore.returncode, 0)
+            self.assertEqual(run_log_ignore.returncode, 0)
             gitignore = (project_root / ".gitignore").read_text(encoding="utf-8")
             self.assertIn(".conda/", gitignore)
             self.assertIn(".venv/", gitignore)

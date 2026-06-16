@@ -42,7 +42,13 @@ AUTO_GITIGNORE_ENTRIES = (
     "state/repomap_cache.json",
     "state/parallel_tuning.json",
 )
-LEGACY_AUTO_GITIGNORE_ENTRIES = {"state/run_state.json"}
+LEGACY_AUTO_GITIGNORE_ENTRIES = {
+    "runs/*",
+    "!runs/*/",
+    "runs/*/*",
+    "!runs/*/task_plan.final.json",
+    "state/run_state.json",
+}
 
 
 PROJECT_BRIEF_TEMPLATE = """# Project Brief
@@ -274,12 +280,20 @@ def runs_dir(project_root: Path) -> Path:
     return auto_dir(project_root) / "runs"
 
 
+def history_dir(project_root: Path) -> Path:
+    return auto_dir(project_root) / "history"
+
+
 def run_path(project_root: Path, run_id: str) -> Path:
     return runs_dir(project_root) / run_id
 
 
+def archived_task_plans_dir(project_root: Path) -> Path:
+    return history_dir(project_root) / "task_plans"
+
+
 def archived_task_plan_path(project_root: Path, run_id: str) -> Path:
-    return run_path(project_root, run_id) / "task_plan.final.json"
+    return archived_task_plans_dir(project_root) / f"{run_id}.json"
 
 
 def archived_run_state_path(project_root: Path, run_id: str) -> Path:

@@ -4,7 +4,7 @@ import re
 import shlex
 from json import JSONDecodeError
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, run_state_path, task_plan_path
 from .io_utils import read_json, read_text
@@ -523,6 +523,7 @@ def validate_task_plan_with_requirements(
     trace_payload: object,
     *,
     enforce_active_task_granularity: bool = False,
+    historical_tasks: Iterable[dict] = (),
 ) -> List[str]:
     errors = validate_task_plan_payload(
         plan_payload,
@@ -534,7 +535,13 @@ def validate_task_plan_with_requirements(
         trace_errors = validate_requirements_trace_payload(trace_payload)
         errors.extend(trace_errors)
         if not trace_errors:
-            errors.extend(validate_task_requirement_coverage(plan_payload, trace_payload))
+            errors.extend(
+                validate_task_requirement_coverage(
+                    plan_payload,
+                    trace_payload,
+                    historical_tasks=historical_tasks,
+                )
+            )
     return errors
 
 

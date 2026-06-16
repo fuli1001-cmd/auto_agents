@@ -4788,6 +4788,169 @@ class IterationFlowTests(unittest.TestCase):
             self.assertNotIn("task-001", state.task_review_cache,
                              "Old task_review_cache should have been cleared")
 
+    def test_resume_prunes_historically_covered_pending_tasks_and_repairs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Keep the old capability working.",
+                            "source": "history",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["The old API response still works."],
+                            "oracle_type": "integration_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        },
+                        {
+                            "id": "REQ-002",
+                            "text": "Implement the new behavior.",
+                            "source": "new scope",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["The new API response is strict."],
+                            "oracle_type": "integration_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        },
+                    ],
+                },
+            )
+            old_run_id = "oldrun123"
+            archive_path = archived_task_plan_path(project_root, old_run_id)
+            write_json(
+                archive_path,
+                {
+                    "oracle_proof_schema_version": 1,
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Old capability",
+                            "description": "Previously delivered requirement.",
+                            "acceptance": ["The old API response still works."],
+                            "status": "done",
+                            "commit_message": "",
+                            "requirement_ids": ["REQ-001"],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "oracle_index": 1,
+                                    "proof_type": "integration_test",
+                                    "oracle_strength": "behavioral",
+                                    "evidence_boundary": "system_boundary",
+                                    "evidence_refs": ["tests/test_old_api.py::test_contract"],
+                                    "forbidden_proxy_oracles": [],
+                                    "proxy_oracles": [],
+                                    "status": "verified",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "tasks": [
+                        {
+                            "task_id": "task-stale",
+                            "title": "Lock old capability",
+                            "description": "Stale historical coverage task.",
+                            "acceptance": ["The old API response still works."],
+                            "status": "pending",
+                            "commit_message": "",
+                            "requirement_ids": ["REQ-001"],
+                            "depends_on": [],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "oracle_index": 1,
+                                    "proof_type": "integration_test",
+                                    "oracle_strength": "behavioral",
+                                    "evidence_boundary": "system_boundary",
+                                    "evidence_refs": ["tests/test_old_api.py::test_contract"],
+                                    "forbidden_proxy_oracles": [],
+                                    "proxy_oracles": [],
+                                    "status": "planned",
+                                }
+                            ],
+                        },
+                        {
+                            "task_id": "repair-task-stale-r1-1",
+                            "title": "Repair task-stale proof evidence",
+                            "description": "Stale repair task.",
+                            "acceptance": ["proof passes"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "requirement_ids": [],
+                            "depends_on": [],
+                            "parent_task_id": "task-stale",
+                            "verification_refs": ["tests/test_old_api.py::test_contract"],
+                        },
+                        {
+                            "task_id": "task-new",
+                            "title": "Implement new behavior",
+                            "description": "Current iteration work.",
+                            "acceptance": ["The new API response is strict."],
+                            "status": "pending",
+                            "commit_message": "",
+                            "requirement_ids": ["REQ-002"],
+                            "depends_on": ["repair-task-stale-r1-1"],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-002",
+                                    "oracle_index": 1,
+                                    "proof_type": "integration_test",
+                                    "oracle_strength": "behavioral",
+                                    "evidence_boundary": "system_boundary",
+                                    "evidence_refs": ["tests/test_new_api.py::test_contract"],
+                                    "forbidden_proxy_oracles": [],
+                                    "proxy_oracles": [],
+                                    "status": "planned",
+                                }
+                            ],
+                        },
+                    ],
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.resume_context = {
+                "previous_run_id": old_run_id,
+                "previous_task_plan_archive": str(archive_path),
+            }
+            state.rejected_stage = "implement"
+            state.rejection_reason = "stale requirement coverage"
+
+            changed = orchestrator._normalize_historically_covered_iteration_resume(state)
+
+            self.assertTrue(changed)
+            self.assertEqual([task.task_id for task in state.tasks], ["task-new"])
+            self.assertEqual(state.tasks[0].depends_on, [])
+            self.assertEqual(state.rejected_stage, "")
+            reloaded = orchestrator._load_tasks_from_plan()
+            self.assertEqual([task.task_id for task in reloaded], ["task-new"])
+
     def test_iteration_runs_implement_for_new_tasks(self):
         """After plan appends new pending tasks during iteration, the
         implement stage must execute them (dynamic pending-stages loop)."""

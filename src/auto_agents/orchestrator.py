@@ -88,12 +88,15 @@ from .requirements import (
     external_doc_requirements,
     format_requirement_context,
     forbidden_pattern_findings,
+    historical_verified_proofs_by_requirement,
+    load_archived_done_task_payloads,
     load_provider_references_lock,
     load_requirements_trace,
     normalize_generated_task_plan_statuses,
     provider_reference_status,
     preserve_task_plan_negative_oracle_clauses,
     run_requirements_audit,
+    task_is_fully_historically_covered,
     requirements_for_task,
     validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
@@ -410,6 +413,60 @@ class Orchestrator:
         state.rejected_stage = target_stage
         if self._sanitize_persisted_audit_feedback(state, audit_result) and state.tasks:
             self._persist_tasks(state.tasks)
+        return True
+
+    def _normalize_historically_covered_iteration_resume(self, state: RunState) -> bool:
+        if not self._is_iteration_run(state):
+            return False
+        tasks = list(state.tasks)
+        if not tasks:
+            try:
+                tasks = self._load_tasks_from_plan()
+            except Exception:
+                return False
+        if not tasks:
+            return False
+
+        trace = load_requirements_trace(self.project_root)
+        historical_proofs = historical_verified_proofs_by_requirement(self.project_root, trace)
+        if not historical_proofs:
+            return False
+
+        retired_ids = {
+            task.task_id
+            for task in tasks
+            if task_is_fully_historically_covered(task, trace, historical_proofs)
+        }
+        if not retired_ids:
+            return False
+
+        retained = [
+            task
+            for task in tasks
+            if task.task_id not in retired_ids and task.parent_task_id.strip() not in retired_ids
+        ]
+        remaining_ids = {task.task_id for task in retained if task.task_id.strip()}
+        changed = len(retained) != len(tasks)
+        for task in retained:
+            filtered_depends_on = [dependency for dependency in task.depends_on if dependency in remaining_ids]
+            if filtered_depends_on != task.depends_on:
+                task.depends_on = filtered_depends_on
+                changed = True
+        if not changed:
+            return False
+
+        state.tasks = retained
+        self._persist_tasks(retained)
+        state.last_error = ""
+        if state.rejected_stage == "implement":
+            state.rejected_stage = ""
+            state.rejection_reason = ""
+        if not retained:
+            state.stage_summaries["implement"] = (
+                "Historical coverage normalization removed stale implementation-only tasks; "
+                "no current implementation tasks remain."
+            )
+            state.current_stage = "verify"
         return True
 
     @staticmethod
@@ -768,6 +825,8 @@ class Orchestrator:
                 provider_kind=provider_kind,
                 doc_language=doc_language,
             )
+            if self._normalize_historically_covered_iteration_resume(state):
+                save_run_state(self.project_root, state)
             if self._normalize_blocked_requirements_audit_recovery_resume(state):
                 save_run_state(self.project_root, state)
             self._ensure_preconditions(state, spec_file=spec_file, skip_validate=skip_validate)
@@ -5584,8 +5643,8 @@ class Orchestrator:
                 "At the root of the JSON, set oracle_proof_schema_version to 1 for all new plans.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
                 "Every task that covers requirement_ids must include requirement_proofs. Each proof must include requirement_id, oracle_index (1-based) or exact acceptance_oracle, proof_type, oracle_strength, evidence_boundary, evidence_refs, status='planned', and forbidden_proxy_oracles copied from the bound requirement.",
-                "All active mandatory requirements in requirements_trace.json must be covered by at least one task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
-                "All active mandatory requirement acceptance_oracles must also be covered by at least one task requirement_proofs entry; requirement_ids alone are not sufficient coverage.",
+                "All active mandatory requirements in requirements_trace.json must be covered by either archived verified done-task proof or at least one current task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
+                "All active mandatory requirement acceptance_oracles must also be covered by either archived verified done-task proof or at least one current task requirement_proofs entry; requirement_ids alone are not sufficient coverage.",
                 "If an acceptance_oracle covers docs or architecture semantics, its evidence_refs must include an executable test that reads/asserts those docs and a supporting ref to the affected document, such as .auto-agents/docs/architecture.md.",
                 "Task acceptance criteria must preserve the bound requirement's concrete acceptance_oracles; do not weaken direct/API/protocol requirements into naming or configuration-only checks.",
                 "For negative contract requirements such as 'must not contain', '不得', '不包含', or '不返回', preserve every concrete field/path/API token from the requirement in the task acceptance. For example, a requirement that forbids `tasks[].result` is NOT covered by only omitting `retry_trace`.",
@@ -5630,10 +5689,10 @@ class Orchestrator:
                 if archived_plan:
                     lines.extend([
                         f"Review the archived completed task plan at: {archived_plan}",
-                        "Use the archived plan only as read-only history for coverage analysis.",
+                        "Use the archived plan only as read-only history for coverage analysis; archived done tasks with verified requirement_proofs already count as historical coverage.",
                         "Do NOT copy archived done tasks back into the active task_plan.json.",
                         "The active task_plan.json for this iteration must contain only tasks for the current iteration scope.",
-                        "When archived completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create tasks for capabilities already delivered by archived completed tasks.",
+                        "When archived completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create regression-lock or baseline-preservation tasks solely for capabilities already delivered and verified by archived completed tasks.",
                     ])
                 else:
                     lines.extend([
@@ -6979,6 +7038,7 @@ class Orchestrator:
             payload,
             trace,
             enforce_active_task_granularity=True,
+            historical_tasks=load_archived_done_task_payloads(self.project_root),
         )
         raw_steps = payload.get("verification_steps", [])
         if isinstance(raw_steps, list) and raw_steps:

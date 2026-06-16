@@ -8,9 +8,12 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from .config import (
+    archived_task_plans_dir,
     provider_references_lock_path,
     requirements_audit_path,
     requirements_trace_path,
+    run_state_path,
+    runs_dir,
     task_plan_path,
 )
 from .io_utils import read_json, write_json, write_text
@@ -502,7 +505,102 @@ def mandatory_active_requirement_ids(trace_payload: dict) -> set[str]:
     return ids
 
 
-def validate_task_requirement_coverage(plan_payload: object, trace_payload: dict) -> List[str]:
+def _previous_task_plan_archive_path(project_root: Path) -> Optional[Path]:
+    state = read_json(run_state_path(project_root), default={})
+    if not isinstance(state, dict):
+        return None
+    context = state.get("resume_context", {})
+    if not isinstance(context, dict):
+        return None
+    raw_path = str(context.get("previous_task_plan_archive", "")).strip()
+    if not raw_path:
+        return None
+    archive_path = Path(raw_path)
+    if not archive_path.is_absolute():
+        archive_path = project_root / archive_path
+    return archive_path
+
+
+def _archived_task_plan_paths(project_root: Path) -> List[Path]:
+    paths: List[Path] = []
+    previous_archive = _previous_task_plan_archive_path(project_root)
+    if previous_archive is not None:
+        paths.append(previous_archive)
+    archive_root = archived_task_plans_dir(project_root)
+    if archive_root.exists():
+        paths.extend(sorted(archive_root.glob("*.json")))
+    legacy_runs_root = runs_dir(project_root)
+    if legacy_runs_root.exists():
+        paths.extend(sorted(legacy_runs_root.glob("*/task_plan.final.json")))
+
+    unique_paths: List[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_paths.append(path)
+    return unique_paths
+
+
+def load_archived_done_task_payloads(project_root: Path) -> List[dict]:
+    """Return done task payloads from all iteration archives."""
+    done_tasks: List[dict] = []
+    seen_task_ids: set[str] = set()
+    for archive_path in _archived_task_plan_paths(project_root):
+        if not archive_path.exists():
+            continue
+        payload = read_json(archive_path, default={})
+        if not isinstance(payload, dict):
+            continue
+        tasks = payload.get("tasks", [])
+        if not isinstance(tasks, list):
+            continue
+        for task in tasks:
+            if not isinstance(task, dict) or str(task.get("status", "")).strip() != "done":
+                continue
+            task_id = str(task.get("task_id", "")).strip()
+            if task_id and task_id in seen_task_ids:
+                continue
+            if task_id:
+                seen_task_ids.add(task_id)
+            done_tasks.append(task)
+    return done_tasks
+
+
+def load_archived_done_tasks(project_root: Path) -> List[TaskSpec]:
+    tasks: List[TaskSpec] = []
+    for payload in load_archived_done_task_payloads(project_root):
+        try:
+            tasks.append(TaskSpec.from_dict(payload))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return tasks
+
+
+def _historical_task_requirement_ids(tasks: Iterable[dict], known_ids: set[str]) -> set[str]:
+    covered: set[str] = set()
+    for task in tasks:
+        if not isinstance(task, dict) or str(task.get("status", "")).strip() != "done":
+            continue
+        raw_ids = task.get("requirement_ids", [])
+        if not isinstance(raw_ids, list):
+            continue
+        covered.update(
+            str(item).strip()
+            for item in raw_ids
+            if isinstance(item, str) and str(item).strip() in known_ids
+        )
+    return covered
+
+
+def validate_task_requirement_coverage(
+    plan_payload: object,
+    trace_payload: dict,
+    *,
+    historical_tasks: Iterable[dict] = (),
+) -> List[str]:
     errors: List[str] = []
     if not isinstance(plan_payload, dict):
         return errors
@@ -515,7 +613,7 @@ def validate_task_requirement_coverage(plan_payload: object, trace_payload: dict
     if not known_ids:
         return errors
 
-    covered_ids = set()
+    covered_ids = _historical_task_requirement_ids(historical_tasks, known_ids)
     for index, task in enumerate(tasks, start=1):
         if not isinstance(task, dict):
             continue
@@ -538,7 +636,13 @@ def validate_task_requirement_coverage(plan_payload: object, trace_payload: dict
             "mandatory active requirements are not covered by any task requirement_ids: "
             + ", ".join(missing)
         )
-    errors.extend(validate_task_requirement_proofs(plan_payload, trace_payload))
+    errors.extend(
+        validate_task_requirement_proofs(
+            plan_payload,
+            trace_payload,
+            historical_tasks=historical_tasks,
+        )
+    )
     return errors
 
 
@@ -554,7 +658,108 @@ def _plan_oracle_proof_schema_enabled(plan_payload: dict) -> bool:
     )
 
 
-def validate_task_requirement_proofs(plan_payload: object, trace_payload: dict) -> List[str]:
+def _historical_verified_proofs_by_requirement(
+    tasks: Iterable[dict],
+    trace_payload: dict,
+) -> Dict[str, List[dict]]:
+    by_req = {str(item.get("id", "")).strip(): item for item in requirement_records(trace_payload)}
+    proofs_by_requirement: Dict[str, List[dict]] = {}
+    for task in tasks:
+        if not isinstance(task, dict) or str(task.get("status", "")).strip() != "done":
+            continue
+        requirement_ids = {
+            str(item).strip()
+            for item in task.get("requirement_ids", [])
+            if isinstance(item, str) and str(item).strip()
+        }
+        proofs = task.get("requirement_proofs", [])
+        if not isinstance(proofs, list):
+            continue
+        task_contract_text = _task_contract_text_from_payload(task)
+        for proof in proofs:
+            if not isinstance(proof, dict):
+                continue
+            req_id = str(proof.get("requirement_id", "")).strip()
+            requirement = by_req.get(req_id)
+            if requirement is None or req_id not in requirement_ids:
+                continue
+            matched_oracle = _matched_requirement_oracle(proof, requirement)
+            if matched_oracle is None:
+                continue
+            if str(proof.get("status", "")).strip() != "verified":
+                continue
+            if _oracle_preservation_messages(task_contract_text, matched_oracle[1]):
+                continue
+            if _proof_contract_messages(
+                requirement,
+                proof,
+                require_verified=True,
+                oracle=matched_oracle[1],
+            ):
+                continue
+            proofs_by_requirement.setdefault(req_id, []).append(proof)
+    return proofs_by_requirement
+
+
+def historical_verified_proofs_by_requirement(
+    project_root: Path,
+    trace_payload: Optional[dict] = None,
+) -> Dict[str, List[dict]]:
+    if trace_payload is None:
+        trace_payload = load_requirements_trace(project_root)
+    return _historical_verified_proofs_by_requirement(
+        load_archived_done_task_payloads(project_root),
+        trace_payload,
+    )
+
+
+def task_is_fully_historically_covered(
+    task: TaskSpec,
+    trace_payload: dict,
+    historical_proofs_by_requirement: Dict[str, List[dict]],
+) -> bool:
+    if task.status == "done":
+        return False
+    if task.parent_task_id.strip() or task.task_id.strip().startswith("repair-"):
+        return False
+    requirement_ids = {
+        str(item).strip()
+        for item in task.requirement_ids
+        if isinstance(item, str) and str(item).strip()
+    }
+    if not requirement_ids or not task.requirement_proofs:
+        return False
+    by_req = {str(item.get("id", "")).strip(): item for item in requirement_records(trace_payload)}
+    covered_any = False
+    proved_requirement_ids: set[str] = set()
+    for proof in task.requirement_proofs:
+        if not isinstance(proof, dict):
+            return False
+        req_id = str(proof.get("requirement_id", "")).strip()
+        if req_id not in requirement_ids:
+            return False
+        requirement = by_req.get(req_id)
+        if requirement is None or not _is_active_mandatory_requirement(requirement):
+            return False
+        matched_oracle = _matched_requirement_oracle(proof, requirement)
+        if matched_oracle is None:
+            return False
+        if not any(
+            _proof_matches_oracle(candidate, matched_oracle[1], matched_oracle[0])
+            for candidate in historical_proofs_by_requirement.get(req_id, [])
+        ):
+            return False
+        proved_requirement_ids.add(req_id)
+        covered_any = True
+    return covered_any and proved_requirement_ids == requirement_ids
+
+
+def validate_task_requirement_proofs(
+    plan_payload: object,
+    trace_payload: dict,
+    *,
+    historical_tasks: Iterable[dict] = (),
+) -> List[str]:
     errors: List[str] = []
     if not isinstance(plan_payload, dict):
         return errors
@@ -565,7 +770,10 @@ def validate_task_requirement_proofs(plan_payload: object, trace_payload: dict) 
         return errors
 
     by_req = {str(item.get("id", "")).strip(): item for item in requirement_records(trace_payload)}
-    proofs_by_requirement: Dict[str, List[dict]] = {}
+    proofs_by_requirement: Dict[str, List[dict]] = _historical_verified_proofs_by_requirement(
+        historical_tasks,
+        trace_payload,
+    )
     for index, task in enumerate(tasks, start=1):
         if not isinstance(task, dict):
             continue
@@ -1085,6 +1293,10 @@ def provider_reference_status(lock_payload: dict, reference_path: str) -> str:
 
 def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dict:
     tasks = list(tasks)
+    archived_tasks = load_archived_done_tasks(project_root)
+    if archived_tasks:
+        current_task_ids = {task.task_id for task in tasks}
+        tasks = tasks + [task for task in archived_tasks if task.task_id not in current_task_ids]
     trace = load_requirements_trace(project_root)
     lock = load_provider_references_lock(project_root)
     oracle_proof_audit = _oracle_proof_audit_enabled(project_root, tasks)

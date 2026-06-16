@@ -2007,7 +2007,7 @@ class ProjectValidationTests(unittest.TestCase):
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
             state = load_run_state(project_root)
-            archive_path = project_root / ".auto-agents" / "runs" / "oldrun123" / "task_plan.final.json"
+            archive_path = project_root / ".auto-agents" / "history" / "task_plans" / "oldrun123.json"
             state.resume_context = {
                 "previous_run_id": "oldrun123",
                 "previous_task_plan_archive": str(archive_path),
@@ -2021,6 +2021,8 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertIn(str(archive_path), prompt)
             self.assertIn("Do NOT copy archived done tasks back into the active task_plan.json", prompt)
+            self.assertIn("archived done tasks with verified requirement_proofs already count as historical coverage", prompt)
+            self.assertIn("Do NOT create regression-lock or baseline-preservation tasks", prompt)
             self.assertNotIn("APPEND new tasks to the end of the JSON array", prompt)
 
     def test_mock_readme_stage_updates_project_readme(self) -> None:

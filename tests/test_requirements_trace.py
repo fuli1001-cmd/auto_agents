@@ -9,6 +9,7 @@ from auto_agents.config import (
     load_run_state,
     provider_references_lock_path,
     requirements_trace_path,
+    save_run_state,
     task_plan_path,
 )
 from auto_agents.io_utils import write_json, write_text
@@ -162,6 +163,113 @@ class RequirementsTraceTests(unittest.TestCase):
         errors = validate_task_plan_with_requirements(plan, trace)
 
         self.assertEqual(errors, [])
+
+    def test_plan_validation_counts_archived_verified_done_proofs(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(),
+                _requirement(
+                    id="REQ-002",
+                    text="Implement strict schema validation.",
+                    acceptance_oracles=["The Responses payload uses a strict json_schema."],
+                ),
+            ],
+        }
+        current_plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-002",
+                    "title": "Strict schema",
+                    "description": "Validate the Responses payload schema.",
+                    "acceptance": ["The Responses payload uses a strict json_schema."],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-002"],
+                    "requirement_proofs": [
+                        _proof(
+                            requirement_id="REQ-002",
+                            acceptance_oracle="The Responses payload uses a strict json_schema.",
+                            status="planned",
+                        )
+                    ],
+                }
+            ],
+        }
+        archived_tasks = [
+            {
+                "task_id": "task-001",
+                "title": "Provider output",
+                "description": "Return normalized provider output.",
+                "acceptance": ["The public API returns normalized provider output."],
+                "status": "done",
+                "commit_message": "",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [_proof(status="verified")],
+            }
+        ]
+
+        errors = validate_task_plan_with_requirements(
+            current_plan,
+            trace,
+            historical_tasks=archived_tasks,
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_plan_validation_still_requires_new_unarchived_requirements(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(),
+                _requirement(
+                    id="REQ-002",
+                    text="Implement strict schema validation.",
+                    acceptance_oracles=["The Responses payload uses a strict json_schema."],
+                ),
+            ],
+        }
+        current_plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-999",
+                    "title": "Unrelated",
+                    "description": "Do unrelated work.",
+                    "acceptance": ["works"],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": [],
+                    "requirement_proofs": [],
+                }
+            ],
+        }
+        archived_tasks = [
+            {
+                "task_id": "task-001",
+                "title": "Provider output",
+                "description": "Return normalized provider output.",
+                "acceptance": ["The public API returns normalized provider output."],
+                "status": "done",
+                "commit_message": "",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [_proof(status="verified")],
+            }
+        ]
+
+        errors = validate_task_plan_with_requirements(
+            current_plan,
+            trace,
+            historical_tasks=archived_tasks,
+        )
+
+        self.assertTrue(any("REQ-002" in item for item in errors), errors)
+        self.assertFalse(any("REQ-001" in item for item in errors), errors)
 
     def test_plan_validation_rejects_weakened_negative_contract_atom(self) -> None:
         trace = {
@@ -725,6 +833,122 @@ class RequirementsTraceTests(unittest.TestCase):
 
             self.assertTrue(ok, msg=report)
             self.assertIn("Oracle proof audit: strict", report)
+
+    def test_requirements_audit_counts_archived_verified_done_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(requirements_trace_path(project_root), {"version": 1, "requirements": [_requirement()]})
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "test_strategy": "unit tests",
+                    "verification_commands": ["npm test"],
+                    "tasks": [],
+                },
+            )
+            archive_path = project_root / ".auto-agents" / "runs" / "oldrun123" / "task_plan.final.json"
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(
+                archive_path,
+                {
+                    "oracle_proof_schema_version": 1,
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Provider output",
+                            "description": "Return normalized provider output.",
+                            "acceptance": ["The public API returns normalized provider output."],
+                            "status": "done",
+                            "commit_message": "",
+                            "requirement_ids": ["REQ-001"],
+                            "requirement_proofs": [_proof(status="verified")],
+                        }
+                    ],
+                },
+            )
+            state = load_run_state(project_root)
+            state.resume_context = {"previous_task_plan_archive": str(archive_path)}
+            save_run_state(project_root, state)
+
+            ok, report = audit_requirements(project_root, [])
+
+            self.assertTrue(ok, msg=report)
+            self.assertIn("Oracle proof audit: strict", report)
+            self.assertIn("REQ-001: pass", report)
+
+    def test_requirements_audit_counts_all_archived_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(),
+                        _requirement(
+                            id="REQ-002",
+                            text="Implement strict schema validation.",
+                            acceptance_oracles=["The Responses payload uses a strict json_schema."],
+                        ),
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "test_strategy": "unit tests",
+                    "verification_commands": ["npm test"],
+                    "tasks": [],
+                },
+            )
+            archives = [
+                (
+                    "oldrun001",
+                    {
+                        "task_id": "task-001",
+                        "title": "Provider output",
+                        "description": "Return normalized provider output.",
+                        "acceptance": ["The public API returns normalized provider output."],
+                        "status": "done",
+                        "commit_message": "",
+                        "requirement_ids": ["REQ-001"],
+                        "requirement_proofs": [_proof(status="verified")],
+                    },
+                ),
+                (
+                    "oldrun002",
+                    {
+                        "task_id": "task-002",
+                        "title": "Strict schema",
+                        "description": "Validate the Responses payload schema.",
+                        "acceptance": ["The Responses payload uses a strict json_schema."],
+                        "status": "done",
+                        "commit_message": "",
+                        "requirement_ids": ["REQ-002"],
+                        "requirement_proofs": [
+                            _proof(
+                                requirement_id="REQ-002",
+                                acceptance_oracle="The Responses payload uses a strict json_schema.",
+                                status="verified",
+                            )
+                        ],
+                    },
+                ),
+            ]
+            for run_id, task in archives:
+                archive_path = project_root / ".auto-agents" / "history" / "task_plans" / f"{run_id}.json"
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                write_json(archive_path, {"oracle_proof_schema_version": 1, "tasks": [task]})
+
+            ok, report = audit_requirements(project_root, [])
+
+            self.assertTrue(ok, msg=report)
+            self.assertIn("REQ-001: pass", report)
+            self.assertIn("REQ-002: pass", report)
 
     def test_requirements_audit_fails_forbidden_proxy_oracle_proof(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
