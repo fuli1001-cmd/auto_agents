@@ -4,7 +4,7 @@ import copy
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, Tuple
 from uuid import uuid4
 
 from .io_utils import read_json, read_text, write_if_missing, write_json, write_text
@@ -433,7 +433,53 @@ def create_run(project_root: Path) -> RunState:
     return state
 
 
+def migrate_archived_task_plans(project_root: Path) -> Dict[str, str]:
+    root = project_root.resolve()
+    migrated: Dict[str, str] = {}
+    for legacy_path in sorted(runs_dir(root).glob("*/task_plan.final.json")):
+        run_id = legacy_path.parent.name
+        target_path = archived_task_plan_path(root, run_id)
+        legacy_payload = read_json(legacy_path, default=None)
+        if target_path.exists():
+            existing_payload = read_json(target_path, default=None)
+            if existing_payload != legacy_payload:
+                raise RuntimeError(
+                    f"task plan archive migration conflict: {legacy_path} -> {target_path}"
+                )
+            legacy_path.unlink()
+        else:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy_path), str(target_path))
+        migrated[str(legacy_path.resolve())] = str(target_path.resolve())
+
+    if not migrated:
+        return migrated
+
+    state_payload = read_json(run_state_path(root), default=None)
+    if not isinstance(state_payload, dict):
+        return migrated
+    context = state_payload.get("resume_context", {})
+    if not isinstance(context, dict):
+        return migrated
+    raw_archive = str(context.get("previous_task_plan_archive", "")).strip()
+    if not raw_archive:
+        return migrated
+    archive_path = Path(raw_archive)
+    if not archive_path.is_absolute():
+        archive_path = root / archive_path
+    replacement = migrated.get(str(archive_path.resolve()))
+    if not replacement:
+        return migrated
+    updated_payload = dict(state_payload)
+    updated_context = dict(context)
+    updated_context["previous_task_plan_archive"] = replacement
+    updated_payload["resume_context"] = updated_context
+    write_json(run_state_path(root), updated_payload)
+    return migrated
+
+
 def load_run_state(project_root: Path) -> RunState:
+    migrate_archived_task_plans(project_root)
     data = read_json(run_state_path(project_root), default=None)
     if data is None or not data.get("run_id"):
         return create_run(project_root)

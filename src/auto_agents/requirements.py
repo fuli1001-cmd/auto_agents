@@ -9,11 +9,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from .config import (
     archived_task_plans_dir,
+    migrate_archived_task_plans,
     provider_references_lock_path,
     requirements_audit_path,
     requirements_trace_path,
     run_state_path,
-    runs_dir,
     task_plan_path,
 )
 from .io_utils import read_json, write_json, write_text
@@ -522,6 +522,7 @@ def _previous_task_plan_archive_path(project_root: Path) -> Optional[Path]:
 
 
 def _archived_task_plan_paths(project_root: Path) -> List[Path]:
+    migrate_archived_task_plans(project_root)
     paths: List[Path] = []
     previous_archive = _previous_task_plan_archive_path(project_root)
     if previous_archive is not None:
@@ -529,9 +530,6 @@ def _archived_task_plan_paths(project_root: Path) -> List[Path]:
     archive_root = archived_task_plans_dir(project_root)
     if archive_root.exists():
         paths.extend(sorted(archive_root.glob("*.json")))
-    legacy_runs_root = runs_dir(project_root)
-    if legacy_runs_root.exists():
-        paths.extend(sorted(legacy_runs_root.glob("*/task_plan.final.json")))
 
     unique_paths: List[Path] = []
     seen: set[str] = set()

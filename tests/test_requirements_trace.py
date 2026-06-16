@@ -877,6 +877,9 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertTrue(ok, msg=report)
             self.assertIn("Oracle proof audit: strict", report)
             self.assertIn("REQ-001: pass", report)
+            migrated_path = project_root / ".auto-agents" / "history" / "task_plans" / "oldrun123.json"
+            self.assertTrue(migrated_path.exists())
+            self.assertFalse(archive_path.exists())
 
     def test_requirements_audit_counts_all_archived_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
