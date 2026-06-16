@@ -709,6 +709,13 @@ def historical_verified_proofs_by_requirement(
     )
 
 
+def verified_proofs_by_requirement_from_task_payloads(
+    tasks: Iterable[dict],
+    trace_payload: dict,
+) -> Dict[str, List[dict]]:
+    return _historical_verified_proofs_by_requirement(tasks, trace_payload)
+
+
 def task_is_fully_historically_covered(
     task: TaskSpec,
     trace_payload: dict,

@@ -100,6 +100,7 @@ from .requirements import (
     requirements_for_task,
     validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
+    verified_proofs_by_requirement_from_task_payloads,
 )
 from .validation import (
     PYTEST_VALUE_OPTIONS,
@@ -1017,6 +1018,8 @@ class Orchestrator:
 
         is_iteration = self._is_iteration_run(state)
         prior_tasks = list(state.tasks)
+        if stage == "plan":
+            self._plan_prior_done_task_payloads = self._done_task_payloads(prior_tasks)
         prompt = self._build_prompt(stage=stage, spec_file=spec_file, is_iteration=is_iteration)
 
         if state.rejected_stage == stage and state.rejection_reason:
@@ -1033,18 +1036,23 @@ class Orchestrator:
         if stage == "design":
             analysis = self._analyze_spec(spec_file)
             effort = self._effort_for_spec_stage(stage, str(analysis["kind"]))
-        result = self._run_agent_with_retries(
-            state=state,
-            stage=stage,
-            stage_key=stage,
-            prompt=prompt,
-            validation_feedback=validator,
-            effort=effort,
-        )
+        try:
+            result = self._run_agent_with_retries(
+                state=state,
+                stage=stage,
+                stage_key=stage,
+                prompt=prompt,
+                validation_feedback=validator,
+                effort=effort,
+            )
+        finally:
+            if stage == "plan":
+                self._plan_prior_done_task_payloads = []
         state.current_stage = stage
         state.stage_summaries[stage] = result.summary.strip()
         state.last_error = ""
         if stage == "plan":
+            self._merge_prior_done_tasks_into_generated_plan(prior_tasks)
             self._apply_generated_verification_config()
             state.tasks = self._load_tasks_from_plan()
             state.plan_task_replacements = self._derive_plan_task_replacements(prior_tasks, state.tasks)
@@ -5533,6 +5541,74 @@ class Orchestrator:
             ]
         save_task_plan(self.project_root, next_payload)
 
+    @staticmethod
+    def _done_task_payloads(tasks: Iterable[TaskSpec]) -> List[dict]:
+        payloads: List[dict] = []
+        seen_task_ids: Set[str] = set()
+        for task in tasks:
+            if task.status != "done":
+                continue
+            item = task.to_dict()
+            item.pop("commit_sha", None)
+            task_id = str(item.get("task_id", "")).strip()
+            if task_id and task_id in seen_task_ids:
+                continue
+            if task_id:
+                seen_task_ids.add(task_id)
+            payloads.append(item)
+        return payloads
+
+    def _merge_prior_done_tasks_into_generated_plan(self, prior_tasks: Iterable[TaskSpec]) -> None:
+        prior_done = self._done_task_payloads(prior_tasks)
+        if not prior_done:
+            return
+
+        payload = load_task_plan(self.project_root)
+        raw_tasks = payload.get("tasks") if isinstance(payload, dict) else None
+        if not isinstance(raw_tasks, list):
+            return
+
+        trace = load_requirements_trace(self.project_root)
+        prior_proofs = verified_proofs_by_requirement_from_task_payloads(prior_done, trace)
+        prior_by_id = {
+            str(task.get("task_id", "")).strip(): task
+            for task in prior_done
+            if str(task.get("task_id", "")).strip()
+        }
+
+        retained: List[dict] = []
+        dropped_task_ids: List[str] = []
+        for item in raw_tasks:
+            if not isinstance(item, dict):
+                retained.append(item)
+                continue
+            task_id = str(item.get("task_id", "")).strip()
+            if task_id and task_id in prior_by_id:
+                continue
+            if str(item.get("status", "")).strip() != "done":
+                try:
+                    task = TaskSpec.from_dict(item)
+                except (KeyError, TypeError, ValueError):
+                    task = None
+                if task is not None and task_is_fully_historically_covered(task, trace, prior_proofs):
+                    if task_id:
+                        dropped_task_ids.append(task_id)
+                    continue
+            retained.append(item)
+
+        next_tasks = list(prior_by_id.values()) + retained
+        if next_tasks == raw_tasks:
+            return
+
+        next_payload = dict(payload)
+        next_payload["tasks"] = next_tasks
+        save_task_plan(self.project_root, next_payload)
+        if dropped_task_ids:
+            self.logger.info(
+                "[plan] pruned current-run duplicate tasks already covered by done proof: "
+                + ", ".join(dropped_task_ids)
+            )
+
     def _stage_output_path(self, run_id: str, stage: str) -> Path:
         _, output_path = run_artifact_paths(self.project_root, run_id, stage)
         return output_path
@@ -5689,8 +5765,10 @@ class Orchestrator:
                 if archived_plan:
                     lines.extend([
                         f"Review the archived completed task plan at: {archived_plan}",
+                        f"Also review the current active task plan at: {task_plan_path(self.project_root)}",
                         "Use the archived plan only as read-only history for coverage analysis; archived done tasks with verified requirement_proofs already count as historical coverage.",
                         "Do NOT copy archived done tasks back into the active task_plan.json.",
+                        "If the current active task_plan.json already contains done tasks from this run, preserve those done tasks and do NOT generate replacement tasks for requirement_proofs they already verified.",
                         "The active task_plan.json for this iteration must contain only tasks for the current iteration scope.",
                         "When archived completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create regression-lock or baseline-preservation tasks solely for capabilities already delivered and verified by archived completed tasks.",
                     ])
@@ -7034,11 +7112,16 @@ class Orchestrator:
             save_task_plan(self.project_root, payload)
             for update in plan_normalization_updates:
                 self.logger.info(f"[plan] {update}")
+        prior_done_tasks = [
+            item
+            for item in getattr(self, "_plan_prior_done_task_payloads", [])
+            if isinstance(item, dict)
+        ]
         errors = validate_task_plan_with_requirements(
             payload,
             trace,
             enforce_active_task_granularity=True,
-            historical_tasks=load_archived_done_task_payloads(self.project_root),
+            historical_tasks=load_archived_done_task_payloads(self.project_root) + prior_done_tasks,
         )
         raw_steps = payload.get("verification_steps", [])
         if isinstance(raw_steps, list) and raw_steps:

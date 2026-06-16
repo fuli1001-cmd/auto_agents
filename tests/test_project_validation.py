@@ -2020,10 +2020,250 @@ class ProjectValidationTests(unittest.TestCase):
             prompt = orchestrator._build_prompt("plan", spec_file, is_iteration=True)
 
             self.assertIn(str(archive_path), prompt)
+            self.assertIn(f"Also review the current active task plan at: {task_plan_path(project_root)}", prompt)
             self.assertIn("Do NOT copy archived done tasks back into the active task_plan.json", prompt)
+            self.assertIn("preserve those done tasks", prompt)
             self.assertIn("archived done tasks with verified requirement_proofs already count as historical coverage", prompt)
             self.assertIn("Do NOT create regression-lock or baseline-preservation tasks", prompt)
             self.assertNotIn("APPEND new tasks to the end of the JSON array", prompt)
+
+    def test_plan_merge_preserves_current_run_done_tasks_and_prunes_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Already delivered behavior remains covered.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["The current run already verified behavior A."],
+                            "oracle_type": "integration_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        },
+                        {
+                            "id": "REQ-002",
+                            "text": "New recovery behavior still needs work.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["The recovery task verifies behavior B."],
+                            "oracle_type": "integration_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        },
+                    ],
+                },
+            )
+            done_task = {
+                "task_id": "task-001",
+                "title": "Delivered behavior A",
+                "description": "Already done in this run.",
+                "acceptance": ["The current run already verified behavior A."],
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "proof_type": "integration_test",
+                        "oracle_strength": "behavioral",
+                        "evidence_boundary": "system_boundary",
+                        "evidence_refs": ["tests/test_a.py::test_behavior_a"],
+                        "forbidden_proxy_oracles": [],
+                        "status": "verified",
+                    }
+                ],
+                "status": "done",
+                "commit_message": "",
+            }
+            duplicate_task = {
+                "task_id": "task-002",
+                "title": "Duplicate behavior A",
+                "description": "Planner regenerated a task already covered by task-001.",
+                "acceptance": ["The current run already verified behavior A."],
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "proof_type": "integration_test",
+                        "oracle_strength": "behavioral",
+                        "evidence_boundary": "system_boundary",
+                        "evidence_refs": ["tests/test_a.py::test_behavior_a"],
+                        "forbidden_proxy_oracles": [],
+                        "status": "planned",
+                    }
+                ],
+                "status": "pending",
+                "commit_message": "",
+            }
+            recovery_task = {
+                "task_id": "task-003",
+                "title": "Recovery behavior B",
+                "description": "Still needs implementation.",
+                "acceptance": ["The recovery task verifies behavior B."],
+                "requirement_ids": ["REQ-002"],
+                "requirement_proofs": [
+                    {
+                        "requirement_id": "REQ-002",
+                        "oracle_index": 1,
+                        "proof_type": "integration_test",
+                        "oracle_strength": "behavioral",
+                        "evidence_boundary": "system_boundary",
+                        "evidence_refs": ["tests/test_b.py::test_behavior_b"],
+                        "forbidden_proxy_oracles": [],
+                        "status": "planned",
+                    }
+                ],
+                "status": "pending",
+                "commit_message": "",
+            }
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
+                    "tasks": [duplicate_task, recovery_task],
+                },
+            )
+
+            Orchestrator(project_root)._merge_prior_done_tasks_into_generated_plan(
+                [TaskSpec.from_dict(done_task)]
+            )
+
+            payload = json.loads(task_plan_path(project_root).read_text(encoding="utf-8"))
+            self.assertEqual(
+                [task["task_id"] for task in payload["tasks"]],
+                ["task-001", "task-003"],
+            )
+            self.assertEqual(payload["tasks"][0]["status"], "done")
+
+    def test_plan_validation_uses_current_run_done_tasks_as_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Already verified in the current run.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["Behavior A is verified."],
+                            "oracle_type": "integration_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        },
+                        {
+                            "id": "REQ-002",
+                            "text": "Still uncovered recovery item.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["Behavior B is verified."],
+                            "oracle_type": "integration_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        },
+                    ],
+                },
+            )
+            done_task = {
+                "task_id": "task-001",
+                "title": "Done A",
+                "description": "Already verified.",
+                "acceptance": ["Behavior A is verified."],
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "proof_type": "integration_test",
+                        "oracle_strength": "behavioral",
+                        "evidence_boundary": "system_boundary",
+                        "evidence_refs": ["tests/test_a.py::test_a"],
+                        "forbidden_proxy_oracles": [],
+                        "status": "verified",
+                    }
+                ],
+                "status": "done",
+                "commit_message": "",
+            }
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
+                    "tasks": [
+                        {
+                            "task_id": "task-002",
+                            "title": "Recovery B",
+                            "description": "Still needs work.",
+                            "acceptance": ["Behavior B is verified."],
+                            "requirement_ids": ["REQ-002"],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-002",
+                                    "oracle_index": 1,
+                                    "proof_type": "integration_test",
+                                    "oracle_strength": "behavioral",
+                                    "evidence_boundary": "system_boundary",
+                                    "evidence_refs": ["tests/test_b.py::test_b"],
+                                    "forbidden_proxy_oracles": [],
+                                    "status": "planned",
+                                }
+                            ],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir()
+            orchestrator = Orchestrator(project_root)
+            orchestrator._plan_prior_done_task_payloads = [done_task]
+            result = AgentResult(
+                ok=True,
+                command=[],
+                output_path=Path("."),
+                summary="valid recovery plan",
+                stdout="",
+            )
+
+            self.assertIsNone(orchestrator._plan_validation_feedback(result))
 
     def test_mock_readme_stage_updates_project_readme(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
