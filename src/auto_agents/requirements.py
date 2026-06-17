@@ -591,6 +591,22 @@ def _historical_task_requirement_ids(tasks: Iterable[dict], known_ids: set[str])
     return covered
 
 
+def _current_task_requirement_ids(tasks: Iterable[dict], known_ids: set[str]) -> set[str]:
+    covered: set[str] = set()
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        raw_ids = task.get("requirement_ids", [])
+        if not isinstance(raw_ids, list):
+            continue
+        covered.update(
+            str(item).strip()
+            for item in raw_ids
+            if isinstance(item, str) and str(item).strip() in known_ids
+        )
+    return covered
+
+
 def validate_task_requirement_coverage(
     plan_payload: object,
     trace_payload: dict,
@@ -772,9 +788,13 @@ def validate_task_requirement_proofs(
     if not isinstance(tasks, list):
         return errors
 
+    historical_task_list = [task for task in historical_tasks if isinstance(task, dict)]
     by_req = {str(item.get("id", "")).strip(): item for item in requirement_records(trace_payload)}
+    known_ids = set(by_req)
+    current_requirement_ids = _current_task_requirement_ids(tasks, known_ids)
+    historical_requirement_ids = _historical_task_requirement_ids(historical_task_list, known_ids)
     proofs_by_requirement: Dict[str, List[dict]] = _historical_verified_proofs_by_requirement(
-        historical_tasks,
+        historical_task_list,
         trace_payload,
     )
     for index, task in enumerate(tasks, start=1):
@@ -851,6 +871,8 @@ def validate_task_requirement_proofs(
             continue
         if str(requirement.get("priority", "mandatory")).strip() != "mandatory":
             continue
+        if req_id in historical_requirement_ids and req_id not in current_requirement_ids:
+            continue
         for index, oracle in enumerate(_requirement_acceptance_oracles(requirement)):
             if not any(_proof_matches_oracle(proof, oracle, index) for proof in proofs_by_requirement.get(req_id, [])):
                 errors.append(f"mandatory requirement {req_id} acceptance oracle #{index + 1} is not covered by requirement_proofs")
@@ -916,7 +938,7 @@ def _proof_matches_oracle(proof: dict, oracle: str, zero_based_index: int) -> bo
         index = int(raw_index)
     except (TypeError, ValueError):
         index = None
-    if index in {zero_based_index, zero_based_index + 1}:
+    if index == zero_based_index + 1:
         return True
     return str(proof.get("acceptance_oracle", "")).strip() == oracle
 
@@ -1295,12 +1317,28 @@ def provider_reference_status(lock_payload: dict, reference_path: str) -> str:
 
 
 def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dict:
-    tasks = list(tasks)
+    current_tasks = list(tasks)
     archived_tasks = load_archived_done_tasks(project_root)
+    trace = load_requirements_trace(project_root)
+    known_ids = requirement_ids(trace)
+    current_requirement_ids = {
+        req_id
+        for task in current_tasks
+        if task.status == "done"
+        for req_id in task.requirement_ids
+        if req_id in known_ids
+    }
+    archived_requirement_ids = {
+        req_id
+        for task in archived_tasks
+        if task.status == "done"
+        for req_id in task.requirement_ids
+        if req_id in known_ids
+    }
+    tasks = list(current_tasks)
     if archived_tasks:
         current_task_ids = {task.task_id for task in tasks}
         tasks = tasks + [task for task in archived_tasks if task.task_id not in current_task_ids]
-    trace = load_requirements_trace(project_root)
     lock = load_provider_references_lock(project_root)
     oracle_proof_audit = _oracle_proof_audit_enabled(project_root, tasks)
     lines = [
@@ -1347,7 +1385,8 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
                 )
         blockers.extend(_forbidden_pattern_findings(project_root, item))
 
-        if blockers and status == "active" and priority == "mandatory":
+        historical_only = req_id in archived_requirement_ids and req_id not in current_requirement_ids
+        if blockers and status == "active" and priority == "mandatory" and not historical_only:
             ok = False
             result = "fail"
         elif blockers:
