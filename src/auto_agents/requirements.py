@@ -1484,6 +1484,7 @@ def forbidden_pattern_findings(
         return findings
     ignored_dirs = {".git", ".auto-agents/runs", ".conda", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
     ignored_files = {
+        ".auto-agents/state/gate_baseline_cache.json",
         ".auto-agents/state/requirements_trace.json",
         ".auto-agents/state/provider_references.lock.json",
         ".auto-agents/docs/requirements_audit.md",

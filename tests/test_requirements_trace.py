@@ -838,6 +838,53 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("forbidden pattern 'legacy_gateway'", report)
 
+    def test_requirements_audit_ignores_gate_baseline_cache_for_forbidden_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            forbidden_patterns=["legacy_gateway"],
+                        )
+                    ],
+                },
+            )
+            write_json(
+                project_root / ".auto-agents" / "state" / "gate_baseline_cache.json",
+                {
+                    "entries": [
+                        {
+                            "summary": (
+                                "A previous verification failure mentioned legacy_gateway while "
+                                "explaining stale output."
+                            )
+                        }
+                    ]
+                },
+            )
+
+            ok, report = audit_requirements(
+                project_root,
+                [
+                    TaskSpec(
+                        task_id="task-001",
+                        title="Build",
+                        description="Build it.",
+                        acceptance=["works"],
+                        requirement_ids=["REQ-001"],
+                        requirement_proofs=[_proof()],
+                        status="done",
+                    )
+                ],
+            )
+
+            self.assertTrue(ok, msg=report)
+            self.assertNotIn("gate_baseline_cache.json", report)
+
     def test_requirements_audit_passes_verified_provider_reference(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
