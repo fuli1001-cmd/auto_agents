@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import json
 import os
 import re
 from pathlib import Path
@@ -596,6 +597,8 @@ def _current_task_requirement_ids(tasks: Iterable[dict], known_ids: set[str]) ->
     for task in tasks:
         if not isinstance(task, dict):
             continue
+        if str(task.get("status", "")).strip() == "done":
+            continue
         raw_ids = task.get("requirement_ids", [])
         if not isinstance(raw_ids, list):
             continue
@@ -625,11 +628,22 @@ def validate_task_requirement_coverage(
     if not known_ids:
         return errors
 
-    covered_ids = _historical_task_requirement_ids(historical_tasks, known_ids)
+    historical_task_list = [task for task in historical_tasks if isinstance(task, dict)]
+    current_done_tasks = [
+        task
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("status", "")).strip() == "done"
+    ]
+    covered_ids = _historical_task_requirement_ids(
+        [*historical_task_list, *current_done_tasks],
+        known_ids,
+    )
     for index, task in enumerate(tasks, start=1):
         if not isinstance(task, dict):
             continue
         task_id = str(task.get("task_id", f"#{index}"))
+        if str(task.get("status", "")).strip() == "done":
+            continue
         raw_ids = task.get("requirement_ids")
         if raw_ids is None:
             raw_ids = []
@@ -789,10 +803,16 @@ def validate_task_requirement_proofs(
         return errors
 
     historical_task_list = [task for task in historical_tasks if isinstance(task, dict)]
+    current_done_tasks = [
+        task
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("status", "")).strip() == "done"
+    ]
     by_req = {str(item.get("id", "")).strip(): item for item in requirement_records(trace_payload)}
     known_ids = set(by_req)
-    current_requirement_ids = _current_task_requirement_ids(tasks, known_ids)
     historical_requirement_ids = _historical_task_requirement_ids(historical_task_list, known_ids)
+    current_requirement_ids = _current_task_requirement_ids(tasks, known_ids)
+    current_done_requirement_ids = _historical_task_requirement_ids(current_done_tasks, known_ids)
     proofs_by_requirement: Dict[str, List[dict]] = _historical_verified_proofs_by_requirement(
         historical_task_list,
         trace_payload,
@@ -801,6 +821,8 @@ def validate_task_requirement_proofs(
         if not isinstance(task, dict):
             continue
         task_id = str(task.get("task_id", f"#{index}"))
+        task_status = str(task.get("status", "")).strip()
+        task_done = task_status == "done"
         requirement_ids = {
             str(item).strip()
             for item in task.get("requirement_ids", [])
@@ -826,7 +848,8 @@ def validate_task_requirement_proofs(
                 errors.append(f"{prefix} requirement_id must be a non-empty string")
                 continue
             if req_id not in by_req:
-                errors.append(f"{prefix} references unknown requirement_id: {req_id}")
+                if not task_done:
+                    errors.append(f"{prefix} references unknown requirement_id: {req_id}")
                 continue
             if req_id not in requirement_ids:
                 errors.append(f"{prefix} requirement_id must also appear in task requirement_ids: {req_id}")
@@ -856,11 +879,11 @@ def validate_task_requirement_proofs(
                     or any(not isinstance(item, str) for item in value)
                 ):
                     errors.append(f"{prefix} {key} must be a list of strings")
-            require_verified = str(task.get("status", "")).strip() == "done"
             for message in _proof_contract_messages(
                 by_req[req_id],
                 proof,
-                require_verified=require_verified,
+                require_verified=task_done,
+                require_forbidden_proxy_exclusions=not task_done,
                 oracle=matched_oracle[1] if matched_oracle is not None else "",
             ):
                 errors.append(f"{prefix} {message}")
@@ -871,7 +894,9 @@ def validate_task_requirement_proofs(
             continue
         if str(requirement.get("priority", "mandatory")).strip() != "mandatory":
             continue
-        if req_id in historical_requirement_ids and req_id not in current_requirement_ids:
+        if (
+            req_id in historical_requirement_ids or req_id in current_done_requirement_ids
+        ) and req_id not in current_requirement_ids:
             continue
         for index, oracle in enumerate(_requirement_acceptance_oracles(requirement)):
             if not any(_proof_matches_oracle(proof, oracle, index) for proof in proofs_by_requirement.get(req_id, [])):
@@ -1023,6 +1048,7 @@ def _proof_contract_messages(
     proof: dict,
     *,
     require_verified: bool,
+    require_forbidden_proxy_exclusions: bool = True,
     oracle: str = "",
 ) -> List[str]:
     required_type = str(requirement.get("oracle_type", "")).strip()
@@ -1067,9 +1093,10 @@ def _proof_contract_messages(
     forbidden_used = sorted(proxy_oracles & forbidden_proxy_set)
     if forbidden_used:
         messages.append("uses forbidden proxy oracle(s): " + ", ".join(forbidden_used))
-    missing_forbidden = sorted(forbidden_proxy_set - recorded_forbidden)
-    if missing_forbidden:
-        messages.append("does not record forbidden proxy exclusion(s): " + ", ".join(missing_forbidden))
+    if require_forbidden_proxy_exclusions:
+        missing_forbidden = sorted(forbidden_proxy_set - recorded_forbidden)
+        if missing_forbidden:
+            messages.append("does not record forbidden proxy exclusion(s): " + ", ".join(missing_forbidden))
     if oracle:
         messages.extend(_documentation_oracle_messages(oracle, proof))
     return messages
@@ -1316,12 +1343,37 @@ def provider_reference_status(lock_payload: dict, reference_path: str) -> str:
     return "missing"
 
 
+def _historical_snapshot_advisory_blockers(blockers: List[dict]) -> bool:
+    if not blockers:
+        return False
+    for blocker in blockers:
+        kind = str(blocker.get("kind", "")).strip()
+        message = str(blocker.get("message", "")).strip()
+        if kind == "oracle_proof_missing" and "acceptance oracle #" in message:
+            continue
+        if (
+            kind == "oracle_proof_invalid"
+            and "does not record forbidden proxy exclusion(s)" in message
+            and "uses forbidden proxy oracle(s)" not in message
+        ):
+            continue
+        return False
+    return True
+
+
 def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dict:
     current_tasks = list(tasks)
     archived_tasks = load_archived_done_tasks(project_root)
     trace = load_requirements_trace(project_root)
     known_ids = requirement_ids(trace)
     current_requirement_ids = {
+        req_id
+        for task in current_tasks
+        if task.status != "done"
+        for req_id in task.requirement_ids
+        if req_id in known_ids
+    }
+    current_done_requirement_ids = {
         req_id
         for task in current_tasks
         if task.status == "done"
@@ -1385,8 +1437,11 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
                 )
         blockers.extend(_forbidden_pattern_findings(project_root, item))
 
-        historical_only = req_id in archived_requirement_ids and req_id not in current_requirement_ids
-        if blockers and status == "active" and priority == "mandatory" and not historical_only:
+        historical_only = (
+            req_id in archived_requirement_ids or req_id in current_done_requirement_ids
+        ) and req_id not in current_requirement_ids
+        historical_advisory = historical_only and _historical_snapshot_advisory_blockers(blockers)
+        if blockers and status == "active" and priority == "mandatory" and not historical_advisory:
             ok = False
             result = "fail"
         elif blockers:
@@ -1515,6 +1570,11 @@ def forbidden_pattern_findings(
                 content = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 continue
+            if rel in {
+                ".auto-agents/state/task_plan.json",
+                ".auto-agents/state/run_state.json",
+            }:
+                content = _state_payload_for_forbidden_pattern_scan(content)
             for raw, pattern in compiled:
                 if pattern.search(content):
                     findings.append(
@@ -1526,6 +1586,61 @@ def forbidden_pattern_findings(
                         }
                     )
     return findings
+
+
+def _state_payload_for_forbidden_pattern_scan(content: str) -> str:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return content
+
+    lines: List[str] = []
+
+    def collect_task(task: dict) -> None:
+        for key in (
+            "task_id",
+            "title",
+            "description",
+            "scope_boundaries",
+            "review_summary",
+            "block_reason",
+        ):
+            value = task.get(key)
+            if isinstance(value, str):
+                lines.append(value)
+        for key in ("expected_test_migrations", "verification_refs"):
+            value = task.get(key)
+            if isinstance(value, list):
+                lines.extend(str(item) for item in value if isinstance(item, str))
+        for history_key in ("review_history", "recovery_history"):
+            history = task.get(history_key)
+            if not isinstance(history, list):
+                continue
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                for value in item.values():
+                    if isinstance(value, str):
+                        lines.append(value)
+
+    if isinstance(payload, dict):
+        for key in ("last_error", "rejection_reason"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                lines.append(value)
+        review_cache = payload.get("review_cache")
+        if isinstance(review_cache, dict):
+            for value in review_cache.values():
+                if isinstance(value, dict):
+                    summary = value.get("summary")
+                    if isinstance(summary, str):
+                        lines.append(summary)
+        tasks = payload.get("tasks")
+        if isinstance(tasks, list):
+            for task in tasks:
+                if isinstance(task, dict):
+                    collect_task(task)
+    return "\n".join(lines)
 
 
 def _forbidden_pattern_findings(project_root: Path, requirement: dict) -> List[dict]:

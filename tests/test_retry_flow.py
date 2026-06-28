@@ -16,6 +16,7 @@ from auto_agents.config import (
     gate_baseline_cache_path,
     load_project_config,
     load_run_state,
+    load_task_plan,
     provider_references_lock_path,
     requirements_trace_path,
     save_project_config,
@@ -380,6 +381,51 @@ class OutOfScopePlanAdapter:
         )
 
 
+class PlanWithDiagnosticLogAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+
+    def run(self, request):
+        if request.stage == "plan":
+            write_json(
+                task_plan_path(self.project_root),
+                {
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Plan slice",
+                            "description": "A valid task plan entry.",
+                            "acceptance": ["Plan remains valid."],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            diagnostic = (
+                self.project_root
+                / ".auto-agents"
+                / "failed-verification-logs"
+                / "verify-stage-test.log"
+            )
+            diagnostic.parent.mkdir(parents=True, exist_ok=True)
+            write_text(diagnostic, "FAILED tests/test_demo.py::test_contract\n")
+            summary = "plan with diagnostic log\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class OutOfScopeProviderResearchAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
@@ -686,6 +732,92 @@ class BlockedRetryAdapter:
             summary = f"{request.stage}\n"
             write_text(request.output_path, summary)
 
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class ProviderReferenceRepairAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            reference_path = (
+                self.project_root
+                / ".auto-agents"
+                / "docs"
+                / "provider_references"
+                / "apiyi_gpt_image_2.md"
+            )
+            reference_path.parent.mkdir(parents=True, exist_ok=True)
+            write_text(
+                reference_path,
+                "# APIYI GPT-Image-2 Provider Reference\n\n"
+                "gpt-image-2-vip uses POST /v1/images/generations and "
+                "POST /v1/images/edits.\n",
+            )
+            summary = "updated provider reference\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = "DECISION: pass\nreview passed\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class TaskPlanRepairAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            payload = load_task_plan(self.project_root)
+            for item in payload.get("tasks", []):
+                if not isinstance(item, dict) or item.get("task_id") != "task-001":
+                    continue
+                proofs = item.setdefault("requirement_proofs", [])
+                if not proofs:
+                    proofs.append(
+                        {
+                            "requirement_id": "REQ-001",
+                            "oracle_index": 1,
+                            "status": "verified",
+                            "evidence_refs": [],
+                        }
+                    )
+                proofs[0]["evidence_refs"] = [
+                    ".auto-agents/docs/provider_references/apiyi_gpt_image_2.md"
+                ]
+            write_json(task_plan_path(self.project_root), payload)
+            summary = "updated task plan proof refs\n"
+            write_text(request.output_path, summary)
+        elif request.stage == "review":
+            self.review_calls += 1
+            summary = "DECISION: pass\nreview passed\n"
+            write_text(request.output_path, summary)
+        else:
+            summary = f"{request.stage}\n"
+            write_text(request.output_path, summary)
         return AgentResult(
             ok=True,
             command=["fake"],
@@ -1380,6 +1512,29 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertIn("stage plan modified files outside its ownership", str(ctx.exception))
             self.assertIn("tests/test_stage_leak.py", str(ctx.exception))
+
+    def test_plan_stage_ignores_orchestrator_failed_verification_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = PlanWithDiagnosticLogAdapter(project_root)
+
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            state = load_run_state(project_root)
+
+            state = orchestrator._run_agent_stage("plan", state, spec_file)
+
+            self.assertEqual(state.tasks[0].task_id, "task-001")
+            self.assertTrue(
+                (
+                    project_root
+                    / ".auto-agents"
+                    / "failed-verification-logs"
+                    / "verify-stage-test.log"
+                ).exists()
+            )
 
     def test_provider_research_rejects_out_of_scope_file_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2315,6 +2470,102 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.tasks[0].status, "done")
             self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "fixed")
 
+    def test_repair_task_can_update_provider_reference_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = ProviderReferenceRepairAdapter(project_root)
+
+            task = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair provider reference proof evidence",
+                description="Update the canonical provider reference evidence.",
+                acceptance=["provider reference records gpt-image-2-vip"],
+                status="pending",
+                parent_task_id="task-001",
+                commit_message="",
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+
+            result = orchestrator._execute_task_with_retries(state, task)
+
+            reference_path = (
+                project_root
+                / ".auto-agents"
+                / "docs"
+                / "provider_references"
+                / "apiyi_gpt_image_2.md"
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertIn("gpt-image-2-vip", reference_path.read_text(encoding="utf-8"))
+
+    def test_repair_task_can_update_task_plan_proof_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = TaskPlanRepairAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Parent task",
+                            "description": "Already implemented parent.",
+                            "acceptance": ["proof refs are canonical"],
+                            "status": "done",
+                            "commit_message": "",
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-001",
+                                    "oracle_index": 1,
+                                    "status": "verified",
+                                    "evidence_refs": ["specs/provider_references/old.md"],
+                                }
+                            ],
+                        },
+                        {
+                            "task_id": "repair-task-001-r1-1",
+                            "title": "Repair proof evidence",
+                            "description": "Update parent task proof evidence refs.",
+                            "acceptance": ["task plan proof refs are canonical"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "parent_task_id": "task-001",
+                        },
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            payload = load_task_plan(project_root)
+            parent = next(
+                item for item in payload["tasks"] if item["task_id"] == "task-001"
+            )
+            repair = next(
+                item
+                for item in payload["tasks"]
+                if item["task_id"] == "repair-task-001-r1-1"
+            )
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(repair["status"], "done")
+            self.assertEqual(
+                parent["requirement_proofs"][0]["evidence_refs"],
+                [".auto-agents/docs/provider_references/apiyi_gpt_image_2.md"],
+            )
+
     def test_verify_failure_skips_review_and_retries_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -3098,6 +3349,132 @@ class RetryFlowTests(unittest.TestCase):
                 "unchanged verify failure set repeated from attempt-1 (repeat=2); stopping retries early",
                 rendered,
             )
+
+    def test_missing_owned_pytest_evidence_ref_continues_repair_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            config = orchestrator.config
+            config.retries.per_stage["implement"] = 3
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = SequencedVerifyFailureAdapter(
+                project_root,
+                ["attempt-1", "attempt-2", "attempt-3"],
+            )
+            ref = "tests/test_contract.py::ContractTests::test_missing_contract"
+            task = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair proof evidence",
+                description="Add the missing proof evidence test.",
+                acceptance=["The proof evidence ref exists and passes."],
+                verification_refs=[ref],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            missing_ref = project_root / "tests" / "test_contract.py"
+            missing_node_id = f"{missing_ref}::ContractTests::test_missing_contract"
+
+            def fake_missing_owned_ref(commands, *, collect_all, context):
+                return (
+                    GateResult(
+                        ok=False,
+                        commands=[
+                            CommandResult(
+                                command=commands[0],
+                                ok=False,
+                                returncode=4,
+                                stdout=(
+                                    f"ERROR: not found: {missing_node_id}\n"
+                                    "(no match in any of [<UnitTestCase ContractTests>])\n"
+                                ),
+                                stderr="",
+                            )
+                        ],
+                        summary=f"command failed: {commands[0]}",
+                    ),
+                    "",
+                )
+
+            with patch.object(
+                orchestrator,
+                "_run_gate_commands_for_commands",
+                side_effect=fake_missing_owned_ref,
+            ):
+                result = orchestrator._execute_task_with_retries(state, task)
+
+            rendered = stream.getvalue()
+            self.assertFalse(result["ok"])
+            self.assertEqual(orchestrator.adapter.implement_calls, 3)
+            self.assertIn("action=continue-owned-evidence-repair", rendered)
+            self.assertNotIn("stopping retries early", rendered)
+            self.assertIn(
+                "not found: " + missing_node_id,
+                str(result["reason"]),
+            )
+
+    def test_repair_owned_pytest_evidence_failure_continues_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            config = orchestrator.config
+            config.retries.per_stage["implement"] = 3
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = SequencedVerifyFailureAdapter(
+                project_root,
+                ["attempt-1", "attempt-2", "attempt-3"],
+            )
+            ref = "tests/test_contract.py::ContractTests::test_provider_reference"
+            task = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair proof evidence",
+                description="Fix the proof evidence assertion.",
+                acceptance=["The proof evidence ref passes."],
+                verification_refs=[ref],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+
+            def fake_failing_owned_ref(commands, *, collect_all, context):
+                return (
+                    GateResult(
+                        ok=False,
+                        commands=[
+                            CommandResult(
+                                command=commands[0],
+                                ok=False,
+                                returncode=1,
+                                stdout=f"FAILED {ref} - AssertionError\n",
+                                stderr="",
+                            )
+                        ],
+                        summary=f"command failed: {commands[0]}",
+                    ),
+                    "",
+                )
+
+            with patch.object(
+                orchestrator,
+                "_run_gate_commands_for_commands",
+                side_effect=fake_failing_owned_ref,
+            ):
+                result = orchestrator._execute_task_with_retries(state, task)
+
+            rendered = stream.getvalue()
+            self.assertFalse(result["ok"])
+            self.assertEqual(orchestrator.adapter.implement_calls, 3)
+            self.assertIn("action=continue-owned-evidence-repair", rendered)
+            self.assertNotIn("stopping retries early", rendered)
+            self.assertIn(ref, str(result["reason"]))
 
     def test_verify_failure_logs_changed_and_regression_statistics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4064,6 +4441,28 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(orchestrator.adapter.implement_calls, 1)
             self.assertIn("requirements_audit", state.stage_summaries)
             self.assertNotIn("readme", state.rejected_stage)
+
+    def test_exhausted_requirements_audit_recovery_state_is_rewound_before_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "failed"
+            state.current_stage = ""
+            state.last_error = (
+                "requirements audit failed after 4 automatic recovery attempt(s): "
+                f"{project_root / '.auto-agents' / 'docs' / 'requirements_audit.md'}"
+            )
+            state.agent_attempts["requirements_audit_recovery"] = 4
+
+            changed = orchestrator._normalize_legacy_requirements_audit_resume(state)
+
+            self.assertTrue(changed)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.current_stage, "verify")
+            self.assertEqual(state.last_error, "")
+            self.assertNotIn("requirements_audit_recovery", state.agent_attempts)
 
     def test_requirements_audit_blocked_provider_reference_still_fails_clearly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

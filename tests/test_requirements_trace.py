@@ -117,6 +117,47 @@ class RequirementsTraceTests(unittest.TestCase):
 
         self.assertTrue(any("unknown requirement_ids" in item for item in errors))
 
+    def test_plan_validation_ignores_stale_done_task_requirement_ids(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(
+                    acceptance_oracles=[
+                        "The public API returns normalized provider output.",
+                        "The public API records durable provider evidence.",
+                    ],
+                )
+            ],
+        }
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-old",
+                    "title": "Old completed slice",
+                    "description": "Historical task from a prior trace.",
+                    "acceptance": ["old behavior worked"],
+                    "status": "done",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001", "REQ-404"],
+                    "requirement_proofs": [
+                        _proof(),
+                        _proof(requirement_id="REQ-404"),
+                    ],
+                }
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertFalse(
+            any("unknown requirement" in item for item in errors),
+            msg=str(errors),
+        )
+        self.assertEqual(errors, [])
+
     def test_plan_validation_requires_oracle_proofs_in_strict_mode(self) -> None:
         trace = {"version": 1, "requirements": [_requirement()]}
         plan = {
@@ -607,6 +648,46 @@ class RequirementsTraceTests(unittest.TestCase):
 
         self.assertTrue(any("proof is not verified" in item for item in errors))
 
+    def test_plan_validation_accepts_done_task_missing_later_forbidden_proxy_records(self) -> None:
+        trace = {
+            "version": 1,
+            "requirements": [
+                _requirement(
+                    forbidden_proxy_oracles=[
+                        "Only checking the old model path",
+                        "Only documenting runtime configurability",
+                    ],
+                )
+            ],
+        }
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "test_strategy": "unit tests",
+            "verification_commands": ["npm test"],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Build feature",
+                    "description": "Build it.",
+                    "acceptance": ["works"],
+                    "status": "done",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [
+                        _proof(
+                            status="verified",
+                            forbidden_proxy_oracles=["Only checking the old model path"],
+                        )
+                    ],
+                }
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertFalse(any("does not record forbidden proxy" in item for item in errors), errors)
+        self.assertEqual(errors, [])
+
     def test_done_task_proof_validation_reports_unverified_bound_proof(self) -> None:
         trace = {"version": 1, "requirements": [_requirement()]}
         task = TaskSpec(
@@ -885,6 +966,94 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertTrue(ok, msg=report)
             self.assertNotIn("gate_baseline_cache.json", report)
 
+    def test_requirements_audit_ignores_forbidden_patterns_inside_state_proof_contract_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            pattern = (
+                r"params\.image_size[^\n]{0,120}"
+                r"parameter_template\.size[^\n]{0,120}(不一致|可不同|无需一致)"
+            )
+            forbidden = "只修改 `params.image_size` 或只修改 `parameter_template.size` 导致两者不一致"
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            forbidden_patterns=[pattern],
+                            forbidden_proxy_oracles=[forbidden],
+                        )
+                    ],
+                },
+            )
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Build it.",
+                acceptance=["Runtime size fields remain aligned."],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    _proof(
+                        status="verified",
+                        forbidden_proxy_oracles=[forbidden],
+                    )
+                ],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "tasks": [task.to_dict()],
+                },
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            save_run_state(project_root, state)
+
+            ok, report = audit_requirements(project_root, [task])
+
+            self.assertTrue(ok, msg=report)
+            self.assertNotIn("forbidden pattern", report)
+
+    def test_requirements_audit_still_scans_state_task_narrative_fields_for_forbidden_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            pattern = (
+                r"params\.image_size[^\n]{0,120}"
+                r"parameter_template\.size[^\n]{0,120}(不一致|可不同|无需一致)"
+            )
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [_requirement(forbidden_patterns=[pattern])],
+                },
+            )
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Incorrectly says params.image_size and parameter_template.size 可不同.",
+                acceptance=["works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "tasks": [task.to_dict()],
+                },
+            )
+
+            ok, report = audit_requirements(project_root, [task])
+
+            self.assertFalse(ok)
+            self.assertIn("forbidden pattern", report)
+
     def test_requirements_audit_passes_verified_provider_reference(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -1092,6 +1261,53 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertTrue(ok, msg=report)
             self.assertIn("REQ-001: advisory", report)
             self.assertIn("acceptance oracle #2 has no proof entry", report)
+
+    def test_requirements_audit_marks_current_done_snapshot_missing_new_oracle_as_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            acceptance_oracles=[
+                                "The public API returns normalized provider output.",
+                                "The public API records durable provider evidence.",
+                            ],
+                            forbidden_proxy_oracles=[
+                                "Only checking a metadata-only response",
+                            ],
+                        )
+                    ],
+                },
+            )
+
+            ok, report = audit_requirements(
+                project_root,
+                [
+                    TaskSpec(
+                        task_id="task-001",
+                        title="Historical done snapshot",
+                        description="Completed before the trace gained a second oracle.",
+                        acceptance=["works"],
+                        requirement_ids=["REQ-001"],
+                        requirement_proofs=[
+                            _proof(
+                                status="verified",
+                                forbidden_proxy_oracles=[],
+                            )
+                        ],
+                        status="done",
+                    )
+                ],
+            )
+
+            self.assertTrue(ok, msg=report)
+            self.assertIn("REQ-001: advisory", report)
+            self.assertIn("acceptance oracle #2 has no proof entry", report)
+            self.assertIn("does not record forbidden proxy exclusion", report)
 
     def test_requirements_audit_counts_all_archived_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

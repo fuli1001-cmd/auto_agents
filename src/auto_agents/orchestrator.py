@@ -346,15 +346,17 @@ class Orchestrator:
 
     def _normalize_legacy_requirements_audit_resume(self, state: RunState) -> bool:
         last_error = state.last_error.strip()
-        if not last_error.startswith("requirements audit failed:"):
+        exhausted_recovery = last_error.startswith("requirements audit failed after ")
+        if not exhausted_recovery and not last_error.startswith("requirements audit failed:"):
             return False
         has_stale_verify = "verify" in state.stage_summaries
         has_stale_audit = "requirements_audit" in state.stage_summaries
-        if not (has_stale_verify or has_stale_audit):
+        if not exhausted_recovery and not (has_stale_verify or has_stale_audit):
             return False
         self._rewind_state_from_stage(state, "verify")
         state.rejected_stage = ""
         state.rejection_reason = ""
+        state.agent_attempts.pop("requirements_audit_recovery", None)
         return True
 
     @staticmethod
@@ -1818,8 +1820,33 @@ class Orchestrator:
             return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel, readme_path}
 
         if stage == "implement":
-            allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, "any non-.auto-agents project path"]
-            return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel} or not path.startswith(".auto-agents/")
+            if stage_key.startswith("implement-repair-"):
+                allowed = [
+                    f"{run_prefix}**",
+                    run_state_rel,
+                    auto_gitignore_rel,
+                    plan_path,
+                    provider_lock_path,
+                    f"{provider_refs_prefix}**",
+                    "any non-.auto-agents project path",
+                ]
+                return allowed, (
+                    lambda path: path.startswith(run_prefix)
+                    or path in {run_state_rel, auto_gitignore_rel, plan_path, provider_lock_path}
+                    or path.startswith(provider_refs_prefix)
+                    or not path.startswith(".auto-agents/")
+                )
+            allowed = [
+                f"{run_prefix}**",
+                run_state_rel,
+                auto_gitignore_rel,
+                "any non-.auto-agents project path",
+            ]
+            return allowed, (
+                lambda path: path.startswith(run_prefix)
+                or path in {run_state_rel, auto_gitignore_rel}
+                or not path.startswith(".auto-agents/")
+            )
 
         allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel]
         return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel}
@@ -1856,7 +1883,11 @@ class Orchestrator:
         before_snapshot: Dict[str, str],
     ) -> Optional[Tuple[List[str], List[str]]]:
         after_snapshot = self._worktree_change_snapshot()
-        delta_paths = self._snapshot_delta_paths(before_snapshot, after_snapshot)
+        delta_paths = [
+            path
+            for path in self._snapshot_delta_paths(before_snapshot, after_snapshot)
+            if not self._is_orchestrator_diagnostic_path(path)
+        ]
         if not delta_paths:
             return None
         allowed_scope, is_allowed = self._stage_mutation_policy(
@@ -1868,6 +1899,10 @@ class Orchestrator:
         if not offending:
             return None
         return offending, allowed_scope
+
+    @staticmethod
+    def _is_orchestrator_diagnostic_path(path: str) -> bool:
+        return path.startswith(".auto-agents/failed-verification-logs/")
 
     def _run_gate_commands(self, *, collect_all: bool, context: str):
         self._apply_generated_verification_config()
@@ -1925,7 +1960,7 @@ class Orchestrator:
             else self.config.gates.commands
         )
 
-    def _implement_touched_code(self) -> bool:
+    def _implement_touched_code(self, task: Optional[TaskSpec] = None) -> bool:
         """Return True if the last implement step touched any non-orchestrator file."""
         try:
             paths = changed_paths(
@@ -1934,7 +1969,28 @@ class Orchestrator:
             )
         except TypeError:
             paths = [p for p in changed_paths(self.project_root) if not p.startswith(".auto-agents/")]
-        return bool(paths)
+        if paths:
+            return True
+        if not self._is_repair_task(task):
+            return False
+        provider_refs_prefix = (
+            self._relative_repo_path(provider_references_dir(self.project_root)).rstrip("/") + "/"
+        )
+        provider_lock_path = self._relative_repo_path(
+            provider_references_lock_path(self.project_root)
+        )
+        plan_path = self._relative_repo_path(task_plan_path(self.project_root))
+        auto_agent_paths = [
+            path
+            for path in changed_paths(
+                self.project_root,
+                ignored_prefixes=(".antigravitycli/",),
+            )
+            if path == plan_path
+            or path == provider_lock_path
+            or path.startswith(provider_refs_prefix)
+        ]
+        return bool(auto_agent_paths)
 
     @staticmethod
     def _extract_oracle_proof_updates(text: str) -> Tuple[List[Dict[str, object]], str]:
@@ -3273,6 +3329,24 @@ class Orchestrator:
             )
         if not verify_gate.ok and not baseline_only_reason:
             effective_failure_ids = new_failure_ids or current_failure_ids
+            is_repair_task = self._is_repair_task(task)
+            retryable_missing_owned_evidence = (
+                is_repair_task
+                and self._all_failures_are_missing_owned_pytest_evidence_refs(
+                    task,
+                    effective_failure_ids,
+                )
+            )
+            retryable_owned_evidence = (
+                is_repair_task
+                and (
+                    retryable_missing_owned_evidence
+                    or self._all_failures_are_owned_pytest_evidence_refs(
+                        task,
+                        effective_failure_ids,
+                    )
+                )
+            )
             if diagnostic_identity_only:
                 reason = (
                     "verification failed before a stable full failure summary was emitted; "
@@ -3310,6 +3384,8 @@ class Orchestrator:
                     "raw_output": raw_output,
                     "raw_log_path": raw_log_path,
                     "comparable_failures": extraction.comparable,
+                    "retryable_missing_owned_evidence_refs": retryable_missing_owned_evidence,
+                    "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
                     "contract_scope_issue": True,
                 }
             return {
@@ -3322,6 +3398,8 @@ class Orchestrator:
                 "raw_output": raw_output,
                 "raw_log_path": raw_log_path,
                 "comparable_failures": extraction.comparable,
+                "retryable_missing_owned_evidence_refs": retryable_missing_owned_evidence,
+                "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
             }
         stale_plan_audit = self._run_stale_plan_coupled_test_audit(task, state=state)
         if stale_plan_audit:
@@ -3754,6 +3832,78 @@ class Orchestrator:
         if len(executable) > 4:
             preview = f"{preview}, ..."
         return preview
+
+    def _canonical_project_evidence_ref(self, ref: str) -> str:
+        path, selector = self._split_evidence_ref(ref)
+        normalized_path = path.replace("\\", "/").strip()
+        if normalized_path:
+            candidate = Path(normalized_path)
+            if candidate.is_absolute():
+                try:
+                    normalized_path = str(
+                        candidate.resolve().relative_to(self.project_root.resolve())
+                    )
+                except ValueError:
+                    normalized_path = str(candidate)
+            else:
+                normalized_path = normalized_path.removeprefix("./")
+        if selector:
+            return f"{normalized_path}::{selector.strip()}"
+        return normalized_path
+
+    def _extract_pytest_not_found_ref(self, failure_id: str) -> str:
+        text = str(failure_id).strip()
+        match = re.search(r"\bnot found:\s+(?P<ref>\S+\.py(?:::[^\s]+)*)", text)
+        if not match:
+            return ""
+        return self._canonical_project_evidence_ref(match.group("ref").strip())
+
+    @staticmethod
+    def _is_repair_task(task: Optional[TaskSpec]) -> bool:
+        if task is None:
+            return False
+        return bool(task.parent_task_id.strip() or task.task_id.startswith("repair-"))
+
+    def _owned_pytest_evidence_refs(self, task: Optional[TaskSpec]) -> Set[str]:
+        if task is None:
+            return set()
+        return {
+            self._canonical_project_evidence_ref(ref)
+            for ref in self._task_planned_evidence_refs(task)
+            if self._looks_like_pytest_evidence_ref(ref)
+        }
+
+    def _all_failures_are_owned_pytest_evidence_refs(
+        self,
+        task: Optional[TaskSpec],
+        failure_ids: Iterable[str],
+    ) -> bool:
+        owned_refs = self._owned_pytest_evidence_refs(task)
+        if not owned_refs:
+            return False
+        normalized_failures = [
+            self._canonical_project_evidence_ref(failure_id)
+            for failure_id in failure_ids
+            if str(failure_id).strip()
+        ]
+        return bool(normalized_failures) and all(
+            failure_id in owned_refs for failure_id in normalized_failures
+        )
+
+    def _all_failures_are_missing_owned_pytest_evidence_refs(
+        self,
+        task: Optional[TaskSpec],
+        failure_ids: Iterable[str],
+    ) -> bool:
+        owned_refs = self._owned_pytest_evidence_refs(task)
+        if not owned_refs:
+            return False
+        missing_refs = [
+            self._extract_pytest_not_found_ref(failure_id)
+            for failure_id in failure_ids
+            if str(failure_id).strip()
+        ]
+        return bool(missing_refs) and all(ref in owned_refs for ref in missing_refs)
 
     def _run_task_proof_evidence(self, task: Optional[TaskSpec]) -> Optional[Dict[str, object]]:
         if task is None:
@@ -5031,6 +5181,42 @@ class Orchestrator:
             raise RuntimeError(f"No tasks found in {task_plan_path(self.project_root)}")
         return tasks
 
+    def _sync_allowed_repair_task_plan_edits(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> None:
+        if not self._is_repair_task(task):
+            return
+        plan_rel = self._relative_repo_path(task_plan_path(self.project_root))
+        if plan_rel not in changed_paths(
+            self.project_root,
+            ignored_prefixes=(".antigravitycli/",),
+        ):
+            return
+        try:
+            loaded_tasks = self._load_tasks_from_plan()
+        except Exception:
+            return
+        current_index = next(
+            (
+                index
+                for index, candidate in enumerate(loaded_tasks)
+                if candidate.task_id == task.task_id
+            ),
+            None,
+        )
+        if current_index is not None:
+            self._copy_parallel_task_snapshot_fields(
+                task,
+                loaded_tasks[current_index].to_dict(),
+            )
+            loaded_tasks[current_index] = task
+        if state.tasks:
+            state.tasks[:] = loaded_tasks
+        else:
+            state.tasks = loaded_tasks
+
     def _run_readme(self, state: RunState, spec_file: Path) -> RunState:
         import json as _json
         from .config import run_path as _run_path
@@ -6201,6 +6387,8 @@ class Orchestrator:
                     )
                     continue
 
+                self._sync_allowed_repair_task_plan_edits(state, task)
+
                 proof_updates_applied, proof_update_error = self._apply_oracle_proof_updates_from_text(
                     task,
                     result.summary or result.stdout,
@@ -6223,7 +6411,7 @@ class Orchestrator:
                         continue
                     self._persist_tasks(state.tasks if state.tasks else [task])
 
-                if not self._implement_touched_code() and not proof_updates_applied:
+                if not self._implement_touched_code(task) and not proof_updates_applied:
                     empty_diff_streak += 1
                     last_reason = (
                         "implement step produced no code changes outside .auto-agents/ "
@@ -6299,6 +6487,22 @@ class Orchestrator:
                     failure_ids,
                     comparable=comparable_failures,
                 )
+                if (
+                    (
+                        bool(verify_result.get("retryable_missing_owned_evidence_refs"))
+                        or bool(verify_result.get("retryable_owned_evidence_failure_refs"))
+                    )
+                    and bool(verify_analysis["stop_retry"])
+                ):
+                    verify_analysis = dict(verify_analysis)
+                    verify_analysis["stop_retry"] = False
+                    stats = str(verify_analysis["stats"]).replace(
+                        " action=stop-unchanged-set",
+                        "",
+                    )
+                    verify_analysis["stats"] = (
+                        f"{stats} action=continue-owned-evidence-repair"
+                    )
                 verify_stats = str(verify_analysis["stats"])
                 self._record_verify_result(
                     task,
