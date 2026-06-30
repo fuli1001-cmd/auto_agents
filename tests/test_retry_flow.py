@@ -594,6 +594,35 @@ class RecoveringOutOfScopeImplementAdapter:
         )
 
 
+class RecoveringHistoryMutationImplementAdapter:
+    def __init__(self, project_root: Path, archive_path: Path) -> None:
+        self.project_root = project_root
+        self.archive_path = archive_path
+        self.implement_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            write_text(self.project_root / "artifact.txt", "good\n")
+            if self.implement_calls == 1:
+                write_text(self.archive_path, "{\"tasks\": []}\n")
+                summary = "implemented with first-attempt history mutation\n"
+            else:
+                summary = "implemented clean retry\n"
+        elif request.stage == "review":
+            summary = "DECISION: pass\nLooks good.\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class ReadmeProposalMutationAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
@@ -1693,6 +1722,47 @@ class RetryFlowTests(unittest.TestCase):
                 "\"status\": \"done\"",
                 task_plan_path(project_root).read_text(encoding="utf-8"),
             )
+
+    def test_implement_stage_restores_archived_task_plan_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            archive_path = archived_task_plan_path(project_root, "oldrun123")
+            original_archive = {"tasks": [{"task_id": "archived-task", "status": "done"}]}
+            write_json(archive_path, original_archive)
+
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = RecoveringHistoryMutationImplementAdapter(project_root, archive_path)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains good"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(result.tasks[0].status, "done")
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertEqual(load_task_plan(project_root)["tasks"][0]["status"], "done")
+            self.assertEqual(json.loads(archive_path.read_text(encoding="utf-8")), original_archive)
 
     def test_task_verify_rejects_dirty_command_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

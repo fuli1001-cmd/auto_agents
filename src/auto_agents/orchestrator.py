@@ -1740,6 +1740,7 @@ class Orchestrator:
             ".auto-agents/.gitignore",
             ".auto-agents/state",
             ".auto-agents/docs",
+            ".auto-agents/history",
         ):
             source = self.project_root / relative
             target = restore_root / relative
