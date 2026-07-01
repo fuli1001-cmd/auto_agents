@@ -17,6 +17,8 @@ from .config import (
     task_plan_path,
 )
 from .config import supported_provider_kinds
+from .env import load_dotenv
+from .notifications import notify_run_finished, notify_session_finished
 from .orchestrator import Orchestrator
 from .validation import validation_report
 
@@ -44,6 +46,10 @@ def _display_path(project_root: Path, path: Path) -> str:
 
 def _format_command(*parts: str) -> str:
     return " ".join(shlex.quote(part) for part in parts)
+
+
+def _load_cli_dotenv() -> None:
+    load_dotenv([Path.cwd() / ".env"])
 
 
 def _render_key_files(project_root: Path, state_payload: dict[str, object]) -> list[str]:
@@ -147,6 +153,25 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
     return "\n".join(lines)
 
 
+def _safe_notify(callback, *args, **kwargs) -> None:
+    try:
+        callback(*args, **kwargs)
+    except Exception:
+        pass
+
+
+def _notify_run_failure(project_root: Path, error: object) -> None:
+    try:
+        state_payload = load_run_state(project_root).to_dict()
+    except Exception:
+        state_payload = {
+            "status": "failed",
+            "current_stage": "unknown",
+            "last_error": str(error),
+        }
+    _safe_notify(notify_run_finished, project_root, state_payload, status="failed", error=str(error))
+
+
 def _auto_resolve_provider_blocker(
     project_root: Path,
     orchestrator: Orchestrator,
@@ -168,9 +193,17 @@ def _auto_resolve_provider_blocker(
     try:
         session_state = session.start()
     except (RuntimeError, FileNotFoundError, ValueError) as error:
+        _notify_run_failure(project_root, error)
         print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
         return 1
     if session_state.status != "completed":
+        _notify_run_failure(
+            project_root,
+            (
+                "automatic provider-resolve session did not complete; "
+                f"session_id={session_state.session_id} status={session_state.status}"
+            ),
+        )
         print(
             json.dumps(
                 {
@@ -188,6 +221,7 @@ def _auto_resolve_provider_blocker(
 
     resumed_state = load_run_state(project_root)
     if resumed_state.status == "failed":
+        _notify_run_failure(project_root, resumed_state.last_error or "run failed after automatic provider recovery")
         print(
             json.dumps(
                 {
@@ -200,6 +234,7 @@ def _auto_resolve_provider_blocker(
         )
         return 1
 
+    _safe_notify(notify_run_finished, project_root, resumed_state.to_dict())
     print(_render_run_summary(project_root, resumed_state.to_dict()))
     return 0
 
@@ -397,6 +432,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    _load_cli_dotenv()
 
     if args.command == "init":
         project_root = Path(args.project)
@@ -435,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
                 doc_language=args.doc_language,
                 provider_kind=args.provider,
             )
+            _safe_notify(notify_run_finished, project_root, state.to_dict())
             print(_render_run_summary(project_root, state.to_dict()))
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
@@ -444,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
                     orchestrator,
                     print_agent_output=bool(args.print_agent_output),
                 )
+            project_root = Path(args.project)
+            _notify_run_failure(project_root, error)
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
 
@@ -581,9 +620,27 @@ def main(argv: list[str] | None = None) -> int:
                 state = session.resume(args.session)
             else:
                 state = session.offer_resume_or_new()
+            _safe_notify(
+                notify_session_finished,
+                project_root,
+                state.to_dict(),
+                command=args.command,
+            )
             print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
+            project_root = Path(args.project)
+            _safe_notify(
+                notify_session_finished,
+                project_root,
+                {
+                    "status": "failed",
+                    "mode": "provider_resolve" if args.command == "provider-resolve" else args.command,
+                },
+                command=args.command,
+                status="failed",
+                error=str(error),
+            )
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
 

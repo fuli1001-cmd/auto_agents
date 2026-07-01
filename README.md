@@ -482,6 +482,30 @@ For `copilot-cli`, `subscription_tier` can also be set to `pro+`.
 Run logs are written both to stderr and to `.auto-agents/runs/<run_id>/run.log`. CLI command results
 remain on stdout for scripts.
 
+## Enterprise WeChat notifications
+
+`run`, `fix`, `collab`, and `provider-resolve` can send an Enterprise WeChat group-robot
+notification when the flow completes or fails. The CLI automatically loads `.env` from the current
+working directory, without overriding environment variables that are already set. It does not load
+the target project's `--project/.env`.
+
+Create `.env` from `.env.example` and fill in the webhook:
+
+```bash
+WECHAT_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...
+```
+
+You can also set the variable in the shell:
+
+```bash
+export WECHAT_WEBHOOK_URL='https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...'
+```
+
+If `WECHAT_WEBHOOK_URL` is unset, no notification is sent. Notification delivery failures are
+ignored and do not change the original command output or exit code.
+
+Keep the webhook out of git and out of `.auto-agents/config.json`; it is a secret.
+
 ### Provider auto-failover
 
 When multiple providers are configured, the orchestrator automatically switches to the

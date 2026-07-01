@@ -27,6 +27,7 @@ CONFIG_FILE = "config.json"
 PROJECT_GITIGNORE = """__pycache__/
 *.pyc
 .pytest_cache/
+.env
 .conda/
 .venv/
 node_modules/

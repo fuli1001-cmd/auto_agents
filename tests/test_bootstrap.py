@@ -67,6 +67,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(run_state_archive_ignore.returncode, 0)
             self.assertEqual(run_log_ignore.returncode, 0)
             gitignore = (project_root / ".gitignore").read_text(encoding="utf-8")
+            self.assertIn(".env", gitignore)
             self.assertIn(".conda/", gitignore)
             self.assertIn(".venv/", gitignore)
             self.assertIn("node_modules/", gitignore)

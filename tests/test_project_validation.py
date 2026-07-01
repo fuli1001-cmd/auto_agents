@@ -2,6 +2,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -753,6 +754,7 @@ class ProjectValidationTests(unittest.TestCase):
                 patch.object(Orchestrator, "run", mock_run),
                 patch("auto_agents.session.Session.start", mock_start),
                 patch("auto_agents.session.Session.offer_resume_or_new", fail_offer),
+                patch("auto_agents.cli.notify_run_finished") as notify,
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
             ):
@@ -763,6 +765,85 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(session_calls["offer"], 0)
             self.assertIn("Run completed successfully.", stdout.getvalue())
             self.assertIn("Starting automatic provider recovery", stderr.getvalue())
+            notify.assert_called_once()
+            self.assertEqual(notify.call_args.args[1]["status"], "completed")
+
+    def test_cli_session_commands_notify_completed_state(self) -> None:
+        for command, mode in (
+            ("fix", "fix"),
+            ("collab", "collab"),
+            ("provider-resolve", "provider_resolve"),
+        ):
+            with self.subTest(command=command):
+                with tempfile.TemporaryDirectory() as tmp:
+                    project_root = Path(tmp) / "demo"
+
+                    class FakeOrchestrator:
+                        def __init__(self, project_root, agent_output_stream=None):
+                            self.project_root = project_root
+                            self._print_agent_output = False
+
+                        def _ensure_agent_instructions_synced(self):
+                            return None
+
+                    class FakeSession:
+                        def __init__(self, orchestrator, mode, print_agent_output=False):
+                            self.mode = mode
+
+                        def offer_resume_or_new(self):
+                            return SessionState(
+                                session_id=f"{self.mode}-123",
+                                mode=self.mode,
+                                status="completed",
+                                resolution="done",
+                            )
+
+                    with (
+                        patch("auto_agents.cli.Orchestrator", FakeOrchestrator),
+                        patch("auto_agents.session.Session", FakeSession),
+                        patch("auto_agents.cli.notify_session_finished") as notify,
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        exit_code = main([command, "--project", str(project_root)])
+
+                    self.assertEqual(exit_code, 0)
+                    notify.assert_called_once()
+                    self.assertEqual(notify.call_args.args[0], project_root)
+                    self.assertEqual(notify.call_args.args[1]["status"], "completed")
+                    self.assertEqual(notify.call_args.kwargs["command"], command)
+
+    def test_cli_session_command_notifies_failure_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+
+            class FakeOrchestrator:
+                def __init__(self, project_root, agent_output_stream=None):
+                    self.project_root = project_root
+                    self._print_agent_output = False
+
+                def _ensure_agent_instructions_synced(self):
+                    return None
+
+            class FakeSession:
+                def __init__(self, orchestrator, mode, print_agent_output=False):
+                    pass
+
+                def offer_resume_or_new(self):
+                    raise RuntimeError("session boom")
+
+            with (
+                patch("auto_agents.cli.Orchestrator", FakeOrchestrator),
+                patch("auto_agents.session.Session", FakeSession),
+                patch("auto_agents.cli.notify_session_finished") as notify,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = main(["fix", "--project", str(project_root)])
+
+            self.assertEqual(exit_code, 1)
+            notify.assert_called_once()
+            self.assertEqual(notify.call_args.args[0], project_root)
+            self.assertEqual(notify.call_args.kwargs["status"], "failed")
+            self.assertEqual(notify.call_args.kwargs["error"], "session boom")
 
     def test_cli_init_defaults_name_from_project_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -957,6 +1038,164 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("Run completed successfully.", rendered)
             self.assertIn("python3 -m auto_agents status --project", rendered)
             self.assertTrue(calls["allow_dirty_tree"])
+
+    def test_cli_run_notifies_completed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            spec_file = project_root / "spec.md"
+            spec_file.parent.mkdir(parents=True, exist_ok=True)
+            write_text(spec_file, "# Spec\n")
+
+            class FakeState:
+                def to_dict(self):
+                    return {
+                        "status": "completed",
+                        "run_id": "run-notify",
+                        "current_stage": "readme",
+                    }
+
+            class FakeOrchestrator:
+                def __init__(self, project_root, agent_output_stream=None):
+                    pass
+
+                def run(self, **kwargs):
+                    return FakeState()
+
+            with (
+                patch("auto_agents.cli.Orchestrator", FakeOrchestrator),
+                patch("auto_agents.cli.notify_run_finished") as notify,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = main(["run", "--project", str(project_root), "--spec-file", str(spec_file)])
+
+            self.assertEqual(exit_code, 0)
+            notify.assert_called_once()
+            self.assertEqual(notify.call_args.args[0], project_root)
+            self.assertEqual(notify.call_args.args[1]["status"], "completed")
+
+    def test_cli_run_loads_cwd_dotenv_before_notification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_root = Path(tmp) / "workspace"
+            workspace_root.mkdir()
+            project_root = Path(tmp) / "demo"
+            spec_file = project_root / "spec.md"
+            spec_file.parent.mkdir(parents=True, exist_ok=True)
+            write_text(spec_file, "# Spec\n")
+            write_text(workspace_root / ".env", "WECHAT_WEBHOOK_URL=https://example.test/wechat\n")
+            captured = {}
+
+            class FakeState:
+                def to_dict(self):
+                    return {
+                        "status": "completed",
+                        "run_id": "run-dotenv",
+                        "current_stage": "readme",
+                    }
+
+            class FakeOrchestrator:
+                def __init__(self, project_root, agent_output_stream=None):
+                    pass
+
+                def run(self, **kwargs):
+                    return FakeState()
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def read(self):
+                    return b'{"errcode": 0}'
+
+            def fake_urlopen(request, timeout):
+                captured["url"] = request.full_url
+                captured["payload"] = json.loads(request.data.decode("utf-8"))
+                return FakeResponse()
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch("auto_agents.cli.Orchestrator", FakeOrchestrator),
+                patch("urllib.request.urlopen", fake_urlopen),
+                patch("pathlib.Path.cwd", return_value=workspace_root),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = main(["run", "--project", str(project_root), "--spec-file", str(spec_file)])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(captured["url"], "https://example.test/wechat")
+            self.assertEqual(captured["payload"]["msgtype"], "markdown")
+            self.assertIn("auto-agents run completed", captured["payload"]["markdown"]["content"])
+
+    def test_cli_run_does_not_load_project_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace_root = Path(tmp) / "workspace"
+            workspace_root.mkdir()
+            project_root = Path(tmp) / "demo"
+            spec_file = project_root / "spec.md"
+            spec_file.parent.mkdir(parents=True, exist_ok=True)
+            write_text(spec_file, "# Spec\n")
+            write_text(project_root / ".env", "WECHAT_WEBHOOK_URL=https://example.test/project\n")
+
+            class FakeState:
+                def to_dict(self):
+                    return {
+                        "status": "completed",
+                        "run_id": "run-no-project-dotenv",
+                        "current_stage": "readme",
+                    }
+
+            class FakeOrchestrator:
+                def __init__(self, project_root, agent_output_stream=None):
+                    pass
+
+                def run(self, **kwargs):
+                    return FakeState()
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch("auto_agents.cli.Orchestrator", FakeOrchestrator),
+                patch("urllib.request.urlopen") as urlopen,
+                patch("pathlib.Path.cwd", return_value=workspace_root),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = main(["run", "--project", str(project_root), "--spec-file", str(spec_file)])
+
+            self.assertEqual(exit_code, 0)
+            urlopen.assert_not_called()
+
+    def test_cli_run_notifies_failed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            spec_file = project_root / "spec.md"
+            spec_file.parent.mkdir(parents=True, exist_ok=True)
+            write_text(spec_file, "# Spec\n")
+
+            class FakeOrchestrator:
+                @staticmethod
+                def is_provider_research_blocked_error(message):
+                    return False
+
+                def __init__(self, project_root, agent_output_stream=None):
+                    pass
+
+                def run(self, **kwargs):
+                    raise RuntimeError("boom")
+
+            with (
+                patch("auto_agents.cli.Orchestrator", FakeOrchestrator),
+                patch("auto_agents.cli.load_run_state", side_effect=FileNotFoundError("missing state")),
+                patch("auto_agents.cli.notify_run_finished") as notify,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = main(["run", "--project", str(project_root), "--spec-file", str(spec_file)])
+
+            self.assertEqual(exit_code, 1)
+            notify.assert_called_once()
+            self.assertEqual(notify.call_args.args[0], project_root)
+            self.assertEqual(notify.call_args.kwargs["status"], "failed")
+            self.assertEqual(notify.call_args.kwargs["error"], "boom")
 
     def test_cli_run_passes_document_language_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
