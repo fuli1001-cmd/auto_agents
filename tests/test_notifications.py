@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_agents.notifications import (
     WECHAT_WEBHOOK_ENV,
     notify_flow_finished,
+    notify_flow_started,
     send_wechat_markdown,
 )
 
@@ -103,5 +104,21 @@ class WeChatNotificationTests(unittest.TestCase):
             content = send.call_args.args[0]
             self.assertIn("auto-agents run completed", content)
             self.assertIn("Project: demo-app", content)
+            self.assertIn("Finished:", content)
+            self.assertNotIn("Path:", content)
+            self.assertNotIn("Files", content)
             self.assertIn("ID: run-123", content)
             self.assertIn("Stage: readme", content)
+
+    def test_notify_flow_started_formats_started_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            with patch("auto_agents.notifications.send_wechat_markdown", return_value=True) as send:
+                result = notify_flow_started(project_root, workflow="run")
+
+            self.assertTrue(result)
+            content = send.call_args.args[0]
+            self.assertIn("auto-agents run started", content)
+            self.assertIn("Started:", content)
+            self.assertNotIn("Path:", content)
+            self.assertNotIn("Files", content)

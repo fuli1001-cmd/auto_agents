@@ -5,7 +5,7 @@ import logging
 import os
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
@@ -84,6 +84,10 @@ def notify_run_finished(
     )
 
 
+def notify_run_started(project_root: Path) -> bool:
+    return notify_flow_started(project_root, workflow="run")
+
+
 def notify_session_finished(
     project_root: Path,
     state_payload: Mapping[str, object],
@@ -111,6 +115,42 @@ def notify_session_finished(
         detail=detail,
         paths=paths,
     )
+
+
+def notify_session_started(
+    project_root: Path,
+    *,
+    command: str,
+    session_id: str = "",
+    mode: str = "",
+) -> bool:
+    return notify_flow_started(
+        project_root,
+        workflow=command,
+        identifier=session_id,
+        mode=mode or ("provider_resolve" if command == "provider-resolve" else command),
+    )
+
+
+def notify_flow_started(
+    project_root: Path,
+    *,
+    workflow: str,
+    identifier: str = "",
+    stage: str = "",
+    mode: str = "",
+    detail: str = "",
+) -> bool:
+    content = _format_flow_message(
+        project_root,
+        workflow=workflow,
+        status="started",
+        identifier=identifier,
+        stage=stage,
+        mode=mode,
+        detail=detail,
+    )
+    return send_wechat_markdown(content)
 
 
 def notify_flow_finished(
@@ -152,13 +192,13 @@ def _format_flow_message(
 ) -> str:
     project_root = project_root.expanduser()
     project_name = _project_name(project_root)
-    color = "info" if status == "completed" else "warning"
+    color = "warning" if status == "failed" else "info"
+    time_label = "Started" if status == "started" else "Finished"
     lines = [
         f"<font color=\"{color}\">**auto-agents {workflow} {status}**</font>",
         "",
         f"> Project: {project_name}",
-        f"> Path: {project_root}",
-        f"> Finished: {datetime.now(timezone.utc).isoformat()}",
+        f"> {time_label}: {_format_timestamp()}",
     ]
     if identifier:
         lines.append(f"> ID: {identifier}")
@@ -168,11 +208,11 @@ def _format_flow_message(
         lines.append(f"> Stage: {stage}")
     if detail:
         lines.extend(["", "**Detail**", _truncate_text(detail.strip(), 900)])
-    detail_paths = [str(path) for path in paths]
-    if detail_paths:
-        lines.extend(["", "**Files**"])
-        lines.extend(f"- {item}" for item in detail_paths)
     return "\n".join(lines)
+
+
+def _format_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _project_name(project_root: Path) -> str:

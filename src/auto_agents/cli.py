@@ -18,7 +18,7 @@ from .config import (
 )
 from .config import supported_provider_kinds
 from .env import load_dotenv
-from .notifications import notify_run_finished, notify_session_finished
+from .notifications import notify_run_finished, notify_run_started, notify_session_finished, notify_session_started
 from .orchestrator import Orchestrator
 from .validation import validation_report
 
@@ -172,6 +172,10 @@ def _notify_run_failure(project_root: Path, error: object) -> None:
     _safe_notify(notify_run_finished, project_root, state_payload, status="failed", error=str(error))
 
 
+def _session_mode_for_command(command: str) -> str:
+    return "provider_resolve" if command == "provider-resolve" else command
+
+
 def _auto_resolve_provider_blocker(
     project_root: Path,
     orchestrator: Orchestrator,
@@ -183,6 +187,12 @@ def _auto_resolve_provider_blocker(
     print(
         "Run hit a provider_research blocker. Starting automatic provider recovery...",
         file=sys.stderr,
+    )
+    _safe_notify(
+        notify_session_started,
+        project_root,
+        command="provider-resolve",
+        mode="provider_resolve",
     )
     orchestrator._print_agent_output = bool(print_agent_output)
     session = Session(
@@ -461,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
             if getattr(args, "no_repo_map", False):
                 orchestrator.config.repo_map.enabled = False
+            _safe_notify(notify_run_started, project_root)
             state = orchestrator.run(
                 spec_file=spec_file,
                 auto_approve=bool(args.auto_approve),
@@ -611,9 +622,17 @@ def main(argv: list[str] | None = None) -> int:
             if getattr(args, "provider", None):
                 orchestrator._set_active_provider(args.provider)
             orchestrator._print_agent_output = bool(args.print_agent_output)
+            mode = _session_mode_for_command(args.command)
+            _safe_notify(
+                notify_session_started,
+                project_root,
+                command=args.command,
+                session_id=args.session or "",
+                mode=mode,
+            )
             session = Session(
                 orchestrator,
-                mode="provider_resolve" if args.command == "provider-resolve" else args.command,
+                mode=mode,
                 print_agent_output=bool(args.print_agent_output),
             )
             if args.session:
@@ -635,7 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                 project_root,
                 {
                     "status": "failed",
-                    "mode": "provider_resolve" if args.command == "provider-resolve" else args.command,
+                    "mode": _session_mode_for_command(args.command),
                 },
                 command=args.command,
                 status="failed",
