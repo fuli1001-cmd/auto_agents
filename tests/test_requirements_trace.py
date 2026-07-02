@@ -1205,6 +1205,58 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertIn("Oracle proof audit: strict", report)
             self.assertIn("REQ-001: pass", report)
 
+    def test_requirements_audit_ignores_archived_task_plan_text_for_forbidden_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            forbidden_patterns=["legacy_gateway"],
+                        )
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "test_strategy": "unit tests",
+                    "verification_commands": ["npm test"],
+                    "tasks": [],
+                },
+            )
+            archive_path = project_root / ".auto-agents" / "history" / "task_plans" / "oldrun123.json"
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(
+                archive_path,
+                {
+                    "oracle_proof_schema_version": 1,
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Provider output",
+                            "description": "Old review mentioned legacy_gateway while rejecting stale code.",
+                            "acceptance": ["The public API returns normalized provider output."],
+                            "status": "done",
+                            "commit_message": "",
+                            "requirement_ids": ["REQ-001"],
+                            "requirement_proofs": [_proof(status="verified")],
+                        }
+                    ],
+                },
+            )
+
+            ok, report = audit_requirements(project_root, [])
+
+            self.assertTrue(ok, msg=report)
+            self.assertIn("REQ-001: pass", report)
+            self.assertNotIn(".auto-agents/history/task_plans", report)
+            self.assertNotIn("forbidden pattern", report)
+
     def test_requirements_audit_marks_archived_only_missing_oracle_as_advisory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
