@@ -6213,6 +6213,16 @@ class Orchestrator:
             "If Task JSON includes verification_refs, those refs are the current repair task's "
             "owned executable proof surface and must pass before the repair can complete.",
         ]
+        if task.verification_refs:
+            common.extend(
+                [
+                    "Verification refs command for this task:",
+                    self._build_task_proof_evidence_command(task.verification_refs),
+                    "When checking verification_refs manually, use the command above or the "
+                    "project's configured verification command rewritten to those refs. Do not "
+                    "substitute a bare global pytest executable or a different Python environment.",
+                ]
+            )
         if requirement_context:
             common.extend(["", requirement_context])
         if plan_migration_context.strip():

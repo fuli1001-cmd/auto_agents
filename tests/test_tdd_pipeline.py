@@ -210,6 +210,31 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("collapse distinct semantics", prompt)
             self.assertIn("nearby existing tests", prompt)
 
+    def test_review_prompt_uses_configured_command_for_verification_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            conda_bin = project_root / ".conda" / "bin"
+            conda_bin.mkdir(parents=True)
+            write_text(conda_bin / "python", "")
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="repair-001",
+                title="Repair proof evidence",
+                description="Repair failing proof refs.",
+                acceptance=["All verification refs pass."],
+                verification_refs=["tests/test_api.py::ApiTests::test_contract"],
+            )
+
+            prompt = orchestrator._build_task_prompt(task, "review")
+
+            self.assertIn(
+                "./.conda/bin/python -m pytest -q tests/test_api.py::ApiTests::test_contract",
+                prompt,
+            )
+            self.assertIn("Do not substitute a bare global pytest executable", prompt)
+
     def test_review_prompt_includes_task_status_migration_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
