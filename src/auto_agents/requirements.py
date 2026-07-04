@@ -1617,6 +1617,13 @@ def forbidden_pattern_findings(
         ".git",
         ".auto-agents/history",
         ".auto-agents/runs",
+        # Agent conversation transcripts and per-session scratchpads. These are internal
+        # working memory (like history/ and runs/), not product source-of-truth or planner
+        # decisions, and they routinely quote requirement language (including the forbidden
+        # concepts they were told to remove). Scanning them produces false-positive forbidden
+        # pattern hits that the pipeline cannot resolve because it must not rewrite past
+        # session logs.
+        ".auto-agents/state/sessions",
         ".conda",
         ".venv",
         "node_modules",

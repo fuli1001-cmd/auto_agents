@@ -1087,6 +1087,55 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertTrue(ok, msg=report)
             self.assertNotIn("gate_baseline_cache.json", report)
 
+    def test_requirements_audit_ignores_session_transcripts_for_forbidden_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            forbidden_patterns=["legacy_gateway"],
+                        )
+                    ],
+                },
+            )
+            # Agent session transcripts routinely quote requirement/forbidden language while
+            # doing their work; they are internal working memory, not product source-of-truth.
+            session_dir = (
+                project_root / ".auto-agents" / "state" / "sessions" / "abc123"
+            )
+            (session_dir / "outputs").mkdir(parents=True)
+            write_json(
+                session_dir / "session_state.json",
+                {"conversation": [{"content": "discussed the legacy_gateway removal"}]},
+            )
+            write_text(
+                session_dir / "outputs" / "collab-1.md",
+                "We must remove the legacy_gateway entry from the product.\n",
+            )
+
+            ok, report = audit_requirements(
+                project_root,
+                [
+                    TaskSpec(
+                        task_id="task-001",
+                        title="Build",
+                        description="Build it.",
+                        acceptance=["works"],
+                        requirement_ids=["REQ-001"],
+                        requirement_proofs=[_proof()],
+                        status="done",
+                    )
+                ],
+            )
+
+            self.assertTrue(ok, msg=report)
+            self.assertNotIn("legacy_gateway", report)
+            self.assertNotIn("sessions/", report)
+
     def test_requirements_audit_ignores_forbidden_patterns_inside_state_proof_contract_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
