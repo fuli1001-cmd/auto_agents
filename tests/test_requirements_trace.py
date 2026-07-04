@@ -1342,6 +1342,111 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertTrue(ok, msg=report)
             self.assertIn("advisory: no corroborating authoritative product-file match", report)
 
+    def test_requirements_audit_noncurrent_spec_forbidden_pattern_is_advisory(self) -> None:
+        # A spec from a DIFFERENT iteration is a historical record; its forbidden-pattern hit
+        # is corroboration-only and must not hard-fail or force rewriting history.
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {"version": 1, "requirements": [_requirement(
+                    source="specs/2026-07-02-current.md",
+                    forbidden_patterns=["legacy_detail_page"],
+                )]},
+            )
+            specs = project_root / "specs"
+            specs.mkdir(parents=True, exist_ok=True)
+            write_text(specs / "2026-01-01-old.md", "This old iteration required a legacy_detail_page.\n")
+            write_text(specs / "2026-07-02-current.md", "Current iteration removes it.\n")
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Build it.",
+                acceptance=["works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 1, "tasks": [task.to_dict()]},
+            )
+
+            ok, report = audit_requirements(
+                project_root, [task], current_spec=Path("specs/2026-07-02-current.md")
+            )
+
+            self.assertTrue(ok, msg=report)
+            self.assertIn("advisory: no corroborating authoritative product-file match", report)
+            self.assertIn("specs/2026-01-01-old.md", report)
+
+    def test_requirements_audit_current_spec_forbidden_pattern_hard_fails(self) -> None:
+        # The CURRENT iteration spec is authoritative: a forbidden pattern there hard-fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {"version": 1, "requirements": [_requirement(
+                    source="specs/2026-07-02-current.md",
+                    forbidden_patterns=["legacy_detail_page"],
+                )]},
+            )
+            specs = project_root / "specs"
+            specs.mkdir(parents=True, exist_ok=True)
+            write_text(specs / "2026-07-02-current.md", "This spec still asks for a legacy_detail_page.\n")
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Build it.",
+                acceptance=["works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 1, "tasks": [task.to_dict()]},
+            )
+
+            ok, report = audit_requirements(
+                project_root, [task], current_spec=Path("specs/2026-07-02-current.md")
+            )
+
+            self.assertFalse(ok)
+            self.assertIn("specs/2026-07-02-current.md", report)
+
+    def test_requirements_audit_without_current_spec_keeps_specs_authoritative(self) -> None:
+        # With no current spec (e.g. standalone CLI audit) spec files stay strict/authoritative.
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {"version": 1, "requirements": [_requirement(forbidden_patterns=["legacy_detail_page"])]},
+            )
+            specs = project_root / "specs"
+            specs.mkdir(parents=True, exist_ok=True)
+            write_text(specs / "2026-01-01-old.md", "This spec required a legacy_detail_page.\n")
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Build it.",
+                acceptance=["works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 1, "tasks": [task.to_dict()]},
+            )
+
+            ok, report = audit_requirements(project_root, [task])
+
+            self.assertFalse(ok)
+            self.assertIn("specs/2026-01-01-old.md", report)
 
     def test_requirements_audit_passes_verified_provider_reference(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

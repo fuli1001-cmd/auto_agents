@@ -1479,7 +1479,7 @@ def run_requirements_audit(
                         "reference_status": ref_status,
                     }
                 )
-        blockers.extend(_forbidden_pattern_findings(project_root, item))
+        blockers.extend(_forbidden_pattern_findings(project_root, item, current_spec))
 
         # Design: corroboration rule for forbidden-pattern findings.
         # A forbidden pattern that only appears in auto_agents-internal working memory or
@@ -1624,21 +1624,68 @@ def audit_requirements(
     return bool(result["ok"]), str(result["report"])
 
 
-def _forbidden_pattern_corroboration_only_path(rel: str) -> bool:
-    """Return True for auto_agents-internal working-memory / reference files whose forbidden
-    pattern hits are corroboration-only (not authoritative product source-of-truth).
+def _current_spec_relpath(project_root: Path, current_spec: Optional[Path]) -> Optional[str]:
+    """Return the current iteration spec path relative to project_root (posix), or None."""
+    if current_spec is None:
+        return None
+    raw = str(current_spec).replace("\\", "/").strip()
+    if not raw:
+        return None
+    candidate = Path(current_spec)
+    try:
+        return str(candidate.resolve().relative_to(project_root.resolve())).replace("\\", "/")
+    except (ValueError, OSError):
+        # Not under project_root (or unresolvable). Fall back to a relative literal.
+        if not candidate.is_absolute():
+            return raw
+    return None
+
+
+def _is_noncurrent_spec_file(rel: str, current_spec_rel: Optional[str]) -> bool:
+    """Return True when `rel` is a spec markdown file from a DIFFERENT iteration than the
+    current run's spec.
+
+    Historical spec files are immutable records of past iterations, not the current product
+    contract. Their forbidden-pattern hits (e.g. an old spec that legitimately described a
+    now-forbidden `详情页`) must not hard-fail the current run and must never force rewriting
+    history. They are corroboration-only. The CURRENT spec stays authoritative.
+    """
+    if not current_spec_rel:
+        return False
+    if not rel.lower().endswith(".md"):
+        return False
+    if rel == current_spec_rel:
+        return False
+    spec_dir = current_spec_rel.rsplit("/", 1)[0] if "/" in current_spec_rel else ""
+    # Only treat files inside a real spec directory as specs. A root-level current spec
+    # (spec_dir == "") must not turn README.md and other root docs into "specs".
+    if not spec_dir:
+        return False
+    file_dir = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    return file_dir == spec_dir
+
+
+def _forbidden_pattern_corroboration_only_path(
+    rel: str,
+    current_spec_rel: Optional[str] = None,
+) -> bool:
+    """Return True for files whose forbidden-pattern hits are corroboration-only (not
+    authoritative product source-of-truth).
 
     A forbidden pattern appearing only in these files is usually the orchestrator's own plan,
-    review commentary, or fetched provider reference discussing (or instructing the REMOVAL
-    of) a forbidden concept, not the product implementing it. Such hits must not hard-fail on
-    their own; they only matter when the same pattern also appears in an authoritative product
-    file. Product docs such as project_brief.md and architecture.md are NOT listed here — they
-    remain authoritative.
+    review commentary, fetched provider reference, or a historical spec discussing (or
+    instructing the REMOVAL of) a forbidden concept, not the current product implementing it.
+    Such hits must not hard-fail on their own; they only matter when the same pattern also
+    appears in an authoritative product file. Product docs such as project_brief.md and
+    architecture.md, and the CURRENT iteration spec, are NOT listed here — they remain
+    authoritative.
     """
     normalized = str(rel).replace("\\", "/").strip()
     if normalized.startswith(".auto-agents/state/"):
         return True
     if normalized.startswith(".auto-agents/docs/provider_references/"):
+        return True
+    if _is_noncurrent_spec_file(normalized, current_spec_rel):
         return True
     return False
 
@@ -1648,6 +1695,7 @@ def forbidden_pattern_findings(
     requirement: dict,
     *,
     include_paths: Optional[Iterable[str]] = None,
+    current_spec: Optional[Path] = None,
 ) -> List[dict]:
     status = str(requirement.get("status", "active")).strip()
     if status != "active":
@@ -1692,6 +1740,7 @@ def forbidden_pattern_findings(
         for path in (include_paths or [])
         if str(path).strip()
     }
+    current_spec_rel = _current_spec_relpath(project_root, current_spec)
     for root, dirs, files in os.walk(project_root):
         rel_root = str(Path(root).relative_to(project_root)).replace("\\", "/")
         dirs[:] = [
@@ -1726,7 +1775,9 @@ def forbidden_pattern_findings(
                             "message": f"forbidden pattern '{raw}' found in {rel}",
                             "pattern": raw,
                             "path": rel,
-                            "authoritative": not _forbidden_pattern_corroboration_only_path(rel),
+                            "authoritative": not _forbidden_pattern_corroboration_only_path(
+                                rel, current_spec_rel
+                            ),
                         }
                     )
     return findings
@@ -1787,8 +1838,12 @@ def _state_payload_for_forbidden_pattern_scan(content: str) -> str:
     return "\n".join(lines)
 
 
-def _forbidden_pattern_findings(project_root: Path, requirement: dict) -> List[dict]:
-    return forbidden_pattern_findings(project_root, requirement)
+def _forbidden_pattern_findings(
+    project_root: Path,
+    requirement: dict,
+    current_spec: Optional[Path] = None,
+) -> List[dict]:
+    return forbidden_pattern_findings(project_root, requirement, current_spec=current_spec)
 
 
 def write_provider_reference_lock(project_root: Path, payload: dict) -> None:
