@@ -1481,10 +1481,34 @@ def run_requirements_audit(
                 )
         blockers.extend(_forbidden_pattern_findings(project_root, item))
 
+        # Design: corroboration rule for forbidden-pattern findings.
+        # A forbidden pattern that only appears in auto_agents-internal working memory or
+        # reference material (task_plan.json, run_state.json, provider_references, ...) is not
+        # a real product violation on its own — it is usually the plan discussing or
+        # instructing the REMOVAL of the forbidden concept. It hard-fails only when the SAME
+        # pattern also appears in an authoritative product file; otherwise it is advisory and
+        # stays visible in the report without blocking the run. Genuine product violations
+        # (authoritative-file hits) and non-forbidden-pattern blockers are unaffected.
+        authoritative_patterns = {
+            str(entry.get("pattern"))
+            for entry in blockers
+            if entry.get("kind") == "forbidden_pattern" and entry.get("authoritative")
+        }
+        for entry in blockers:
+            if (
+                entry.get("kind") == "forbidden_pattern"
+                and not entry.get("authoritative")
+                and str(entry.get("pattern")) not in authoritative_patterns
+            ):
+                entry["advisory"] = True
+        blocking_blockers = [entry for entry in blockers if not entry.get("advisory")]
+
         historical_only = (
             req_id in archived_requirement_ids or req_id in current_done_requirement_ids
         ) and req_id not in current_requirement_ids
-        historical_advisory = historical_only and _historical_snapshot_advisory_blockers(blockers)
+        historical_advisory = historical_only and _historical_snapshot_advisory_blockers(
+            blocking_blockers
+        )
         # A requirement whose recorded source does not reference the current iteration's spec
         # is out-of-run-scope backlog: report its gaps as advisory instead of hard-failing the
         # run, so a run for one spec cannot be blocked (or generate 补齐 tasks) for unrelated
@@ -1495,7 +1519,7 @@ def run_requirements_audit(
             and req_id not in current_requirement_ids
         )
         if (
-            blockers
+            blocking_blockers
             and status == "active"
             and priority == "mandatory"
             and not historical_advisory
@@ -1559,7 +1583,15 @@ def run_requirements_audit(
             lines.append("")
         if blockers:
             lines.append("Findings:")
-            lines.extend(f"- {entry['message']}" for entry in blockers)
+            lines.extend(
+                f"- {entry['message']}"
+                + (
+                    " [advisory: no corroborating authoritative product-file match]"
+                    if entry.get("advisory")
+                    else ""
+                )
+                for entry in blockers
+            )
             lines.append("")
 
     if not requirement_records(trace):
@@ -1590,6 +1622,25 @@ def audit_requirements(
         assume_done_task_ids=assume_done_task_ids,
     )
     return bool(result["ok"]), str(result["report"])
+
+
+def _forbidden_pattern_corroboration_only_path(rel: str) -> bool:
+    """Return True for auto_agents-internal working-memory / reference files whose forbidden
+    pattern hits are corroboration-only (not authoritative product source-of-truth).
+
+    A forbidden pattern appearing only in these files is usually the orchestrator's own plan,
+    review commentary, or fetched provider reference discussing (or instructing the REMOVAL
+    of) a forbidden concept, not the product implementing it. Such hits must not hard-fail on
+    their own; they only matter when the same pattern also appears in an authoritative product
+    file. Product docs such as project_brief.md and architecture.md are NOT listed here — they
+    remain authoritative.
+    """
+    normalized = str(rel).replace("\\", "/").strip()
+    if normalized.startswith(".auto-agents/state/"):
+        return True
+    if normalized.startswith(".auto-agents/docs/provider_references/"):
+        return True
+    return False
 
 
 def forbidden_pattern_findings(
@@ -1675,6 +1726,7 @@ def forbidden_pattern_findings(
                             "message": f"forbidden pattern '{raw}' found in {rel}",
                             "pattern": raw,
                             "path": rel,
+                            "authoritative": not _forbidden_pattern_corroboration_only_path(rel),
                         }
                     )
     return findings

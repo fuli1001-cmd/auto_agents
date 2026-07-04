@@ -1187,7 +1187,12 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertTrue(ok, msg=report)
             self.assertNotIn("forbidden pattern", report)
 
-    def test_requirements_audit_still_scans_state_task_narrative_fields_for_forbidden_patterns(self) -> None:
+    def test_requirements_audit_state_only_forbidden_pattern_is_advisory_not_blocking(self) -> None:
+        # Corroboration rule: a forbidden pattern that appears only in auto_agents-internal
+        # orchestration state (here a task description) is advisory, not blocking, because it
+        # has no corroborating authoritative product-file match. This prevents false positives
+        # on correct task descriptions that merely discuss or instruct removing a forbidden
+        # concept.
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -1205,7 +1210,7 @@ class RequirementsTraceTests(unittest.TestCase):
             task = TaskSpec(
                 task_id="task-001",
                 title="Build",
-                description="Incorrectly says params.image_size and parameter_template.size 可不同.",
+                description="Mentions params.image_size and parameter_template.size 可不同 in the plan.",
                 acceptance=["works"],
                 requirement_ids=["REQ-001"],
                 requirement_proofs=[_proof(status="verified")],
@@ -1221,8 +1226,122 @@ class RequirementsTraceTests(unittest.TestCase):
 
             ok, report = audit_requirements(project_root, [task])
 
+            self.assertTrue(ok, msg=report)
+            self.assertIn("advisory: no corroborating authoritative product-file match", report)
+
+    def test_requirements_audit_state_forbidden_pattern_blocks_when_corroborated_by_product_file(self) -> None:
+        # When the SAME forbidden pattern also appears in an authoritative product file, the
+        # state finding is corroborated and the requirement hard-fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            pattern = (
+                r"params\.image_size[^\n]{0,120}"
+                r"parameter_template\.size[^\n]{0,120}(不一致|可不同|无需一致)"
+            )
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [_requirement(forbidden_patterns=[pattern])],
+                },
+            )
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Mentions params.image_size and parameter_template.size 可不同 in the plan.",
+                acceptance=["works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "tasks": [task.to_dict()],
+                },
+            )
+            # Authoritative product doc actually encodes the forbidden approach.
+            write_text(
+                project_root / ".auto-agents" / "docs" / "architecture.md",
+                "The runtime keeps params.image_size and parameter_template.size 可不同.\n",
+            )
+
+            ok, report = audit_requirements(project_root, [task])
+
             self.assertFalse(ok)
-            self.assertIn("forbidden pattern", report)
+            self.assertIn("architecture.md", report)
+
+    def test_requirements_audit_still_hard_fails_forbidden_pattern_in_product_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [_requirement(forbidden_patterns=["legacy_gateway"])],
+                },
+            )
+            write_text(
+                project_root / "src" / "backend.py",
+                "def call():\n    return 'legacy_gateway'\n",
+            )
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Build it.",
+                acceptance=["works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 1, "tasks": [task.to_dict()]},
+            )
+
+            ok, report = audit_requirements(project_root, [task])
+
+            self.assertFalse(ok)
+            self.assertIn("src/backend.py", report)
+
+    def test_requirements_audit_provider_reference_doc_forbidden_pattern_is_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [_requirement(forbidden_patterns=["model_selector_ui"])],
+                },
+            )
+            # Provider reference docs describe external API capabilities, not the product's
+            # user surface; a match there is corroboration-only.
+            ref_dir = project_root / ".auto-agents" / "docs" / "provider_references"
+            ref_dir.mkdir(parents=True, exist_ok=True)
+            write_text(ref_dir / "some_provider.md", "The API exposes a model_selector_ui field.\n")
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Build it.",
+                acceptance=["works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 1, "tasks": [task.to_dict()]},
+            )
+
+            ok, report = audit_requirements(project_root, [task])
+
+            self.assertTrue(ok, msg=report)
+            self.assertIn("advisory: no corroborating authoritative product-file match", report)
+
 
     def test_requirements_audit_passes_verified_provider_reference(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
