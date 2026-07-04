@@ -20,6 +20,7 @@ from auto_agents.requirements import (
     load_requirements_trace,
     normalize_generated_task_plan_statuses,
     preserve_task_plan_negative_oracle_clauses,
+    run_requirements_audit,
     validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
 )
@@ -918,6 +919,126 @@ class RequirementsTraceTests(unittest.TestCase):
 
             self.assertFalse(ok)
             self.assertIn("forbidden pattern 'legacy_gateway'", report)
+
+    def test_requirements_audit_downgrades_out_of_scope_requirement_to_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            id="REQ-CUR",
+                            source="issues.md; specs/2026-07-02-iter-01.md 课题4",
+                        ),
+                        _requirement(
+                            id="REQ-OLD",
+                            source="specs/2026-06-22-iter-01.md; conversation",
+                        ),
+                    ],
+                },
+            )
+
+            result = run_requirements_audit(
+                project_root,
+                [],
+                current_spec=Path("specs/2026-07-02-iter-01.md"),
+            )
+
+            issues = {issue["requirement_id"]: issue for issue in result["issues"]}
+            # In-scope requirement (source references the current spec) still hard-fails.
+            self.assertEqual(issues["REQ-CUR"]["result"], "fail")
+            # Out-of-scope historical requirement is downgraded to advisory backlog.
+            self.assertEqual(issues["REQ-OLD"]["result"], "advisory")
+            self.assertTrue(issues["REQ-OLD"]["out_of_scope_backlog"])
+            self.assertIn("Out-of-scope backlog", str(result["report"]))
+
+    def test_requirements_audit_out_of_scope_requirement_alone_does_not_block_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            id="REQ-OLD",
+                            source="specs/2026-06-22-iter-01.md; conversation",
+                        )
+                    ],
+                },
+            )
+
+            result = run_requirements_audit(
+                project_root,
+                [],
+                current_spec=Path("specs/2026-07-02-iter-01.md"),
+            )
+
+            self.assertTrue(result["ok"])
+
+    def test_requirements_audit_without_current_spec_stays_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            id="REQ-OLD",
+                            source="specs/2026-06-22-iter-01.md; conversation",
+                        )
+                    ],
+                },
+            )
+
+            # The standalone/legacy audit (no current spec) enforces every requirement.
+            result = run_requirements_audit(project_root, [])
+
+            self.assertFalse(result["ok"])
+            issues = {issue["requirement_id"]: issue for issue in result["issues"]}
+            self.assertEqual(issues["REQ-OLD"]["result"], "fail")
+
+    def test_requirements_audit_counts_assume_done_task_proofs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {"version": 1, "requirements": [_requirement()]},
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 1, "tasks": []},
+            )
+            task = TaskSpec(
+                task_id="task-221",
+                title="补齐首页列表公开边界证明",
+                description="Fill the audit boundary proof.",
+                acceptance=["The bound requirement passes the audit."],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="pending",
+            )
+
+            # While the owning task is still pending its proof does not count, so the
+            # requirement fails: this is the deadlock that used to force test-gaming.
+            pending = run_requirements_audit(project_root, [task])
+            pending_issue = {i["requirement_id"]: i for i in pending["issues"]}["REQ-001"]
+            self.assertEqual(pending_issue["result"], "fail")
+
+            # Treating the task as done lets its proof count, so the audit passes honestly.
+            assumed = run_requirements_audit(
+                project_root, [task], assume_done_task_ids={"task-221"}
+            )
+            assumed_issue = {i["requirement_id"]: i for i in assumed["issues"]}["REQ-001"]
+            self.assertEqual(assumed_issue["result"], "pass")
+            self.assertTrue(assumed["ok"])
 
     def test_requirements_audit_ignores_gate_baseline_cache_for_forbidden_patterns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

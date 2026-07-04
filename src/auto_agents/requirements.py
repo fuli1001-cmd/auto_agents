@@ -944,10 +944,15 @@ def _requirement_acceptance_oracles(requirement: dict) -> List[str]:
     return [str(item).strip() for item in values if str(item).strip()]
 
 
-def _proofs_for_requirement(tasks: Iterable[TaskSpec], requirement_id: str) -> List[Tuple[TaskSpec, dict]]:
+def _proofs_for_requirement(
+    tasks: Iterable[TaskSpec],
+    requirement_id: str,
+    assume_done_task_ids: Optional[Iterable[str]] = None,
+) -> List[Tuple[TaskSpec, dict]]:
+    assumed = {str(item).strip() for item in (assume_done_task_ids or []) if str(item).strip()}
     proofs: List[Tuple[TaskSpec, dict]] = []
     for task in tasks:
-        if task.status != "done":
+        if task.status != "done" and str(task.task_id) not in assumed:
             continue
         for proof in task.requirement_proofs:
             if not isinstance(proof, dict):
@@ -1361,22 +1366,57 @@ def _historical_snapshot_advisory_blockers(blockers: List[dict]) -> bool:
     return True
 
 
-def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dict:
+def _current_spec_scope_tokens(current_spec: Optional[Path]) -> set:
+    if not current_spec:
+        return set()
+    name = Path(str(current_spec)).name.strip()
+    if not name:
+        return set()
+    tokens = {name}
+    stem = Path(name).stem.strip()
+    if stem:
+        tokens.add(stem)
+    return tokens
+
+
+def _requirement_in_current_scope(requirement: dict, spec_tokens: set) -> bool:
+    # When no current spec is known (e.g. the standalone CLI audit) every requirement is
+    # treated as in-scope, preserving strict legacy behaviour.
+    if not spec_tokens:
+        return True
+    source = str(requirement.get("source", ""))
+    return any(token and token in source for token in spec_tokens)
+
+
+def run_requirements_audit(
+    project_root: Path,
+    tasks: Iterable[TaskSpec],
+    current_spec: Optional[Path] = None,
+    assume_done_task_ids: Optional[Iterable[str]] = None,
+) -> dict:
     current_tasks = list(tasks)
+    assumed_done = {
+        str(item).strip() for item in (assume_done_task_ids or []) if str(item).strip()
+    }
+
+    def _is_effectively_done(task: TaskSpec) -> bool:
+        return task.status == "done" or str(task.task_id) in assumed_done
+
     archived_tasks = load_archived_done_tasks(project_root)
     trace = load_requirements_trace(project_root)
     known_ids = requirement_ids(trace)
+    spec_tokens = _current_spec_scope_tokens(current_spec)
     current_requirement_ids = {
         req_id
         for task in current_tasks
-        if task.status != "done"
+        if not _is_effectively_done(task)
         for req_id in task.requirement_ids
         if req_id in known_ids
     }
     current_done_requirement_ids = {
         req_id
         for task in current_tasks
-        if task.status == "done"
+        if _is_effectively_done(task)
         for req_id in task.requirement_ids
         if req_id in known_ids
     }
@@ -1404,7 +1444,7 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
     issues: List[dict] = []
     task_requirements = set()
     for task in tasks:
-        if task.status == "done":
+        if _is_effectively_done(task):
             task_requirements.update(task.requirement_ids)
 
     for item in requirement_records(trace):
@@ -1422,7 +1462,11 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
                 }
             )
         if status == "active" and priority == "mandatory" and oracle_proof_audit:
-            blockers.extend(_oracle_proof_findings(item, _proofs_for_requirement(tasks, req_id)))
+            blockers.extend(
+                _oracle_proof_findings(
+                    item, _proofs_for_requirement(tasks, req_id, assumed_done)
+                )
+            )
         if status == "active" and bool(item.get("external_docs_required", False)):
             reference = str(item.get("provider_reference", "")).strip()
             ref_status = provider_reference_status(lock, reference)
@@ -1441,7 +1485,22 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
             req_id in archived_requirement_ids or req_id in current_done_requirement_ids
         ) and req_id not in current_requirement_ids
         historical_advisory = historical_only and _historical_snapshot_advisory_blockers(blockers)
-        if blockers and status == "active" and priority == "mandatory" and not historical_advisory:
+        # A requirement whose recorded source does not reference the current iteration's spec
+        # is out-of-run-scope backlog: report its gaps as advisory instead of hard-failing the
+        # run, so a run for one spec cannot be blocked (or generate 补齐 tasks) for unrelated
+        # historical requirements from earlier iterations.
+        out_of_scope_backlog = (
+            bool(spec_tokens)
+            and not _requirement_in_current_scope(item, spec_tokens)
+            and req_id not in current_requirement_ids
+        )
+        if (
+            blockers
+            and status == "active"
+            and priority == "mandatory"
+            and not historical_advisory
+            and not out_of_scope_backlog
+        ):
             ok = False
             result = "fail"
         elif blockers:
@@ -1462,11 +1521,18 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
                 "priority": priority,
                 "text": text,
                 "blockers": blockers,
+                "out_of_scope_backlog": bool(out_of_scope_backlog and blockers),
             }
         )
 
         lines.append(f"## {req_id}: {result}")
         lines.append("")
+        if out_of_scope_backlog and blockers:
+            lines.append(
+                "Out-of-scope backlog: this requirement's source does not reference the current "
+                "iteration spec; gaps are reported as advisory and do not block this run."
+            )
+            lines.append("")
         if text:
             lines.append(text)
             lines.append("")
@@ -1511,8 +1577,18 @@ def run_requirements_audit(project_root: Path, tasks: Iterable[TaskSpec]) -> dic
     }
 
 
-def audit_requirements(project_root: Path, tasks: Iterable[TaskSpec]) -> Tuple[bool, str]:
-    result = run_requirements_audit(project_root, tasks)
+def audit_requirements(
+    project_root: Path,
+    tasks: Iterable[TaskSpec],
+    current_spec: Optional[Path] = None,
+    assume_done_task_ids: Optional[Iterable[str]] = None,
+) -> Tuple[bool, str]:
+    result = run_requirements_audit(
+        project_root,
+        tasks,
+        current_spec=current_spec,
+        assume_done_task_ids=assume_done_task_ids,
+    )
     return bool(result["ok"]), str(result["report"])
 
 

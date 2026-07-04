@@ -141,6 +141,33 @@ class VerifyFailureClassificationTests(unittest.TestCase):
             self.assertIn("non-comparable", analysis["stats"])
             self.assertIn("stop-unresolved-identity", analysis["stats"])
 
+    def test_recovery_signature_is_stable_across_review_reason_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            refs = [
+                "tests/test_requirements_audit_state.py::A::test_a",
+                "tests/test_requirements_audit_state.py::A::test_b",
+            ]
+
+            # The same failing refs must produce the same signature regardless of the
+            # (volatile) review reason or ordering, so repeated failures accumulate rounds
+            # and hit recovery max_rounds instead of spawning unbounded repair tasks.
+            sig_first = orchestrator._recovery_signature(
+                refs, "review flagged weak assertion around line 10"
+            )
+            sig_second = orchestrator._recovery_signature(
+                list(reversed(refs)), "completely different wording citing line 42"
+            )
+            self.assertEqual(sig_first, sig_second)
+
+            # A genuinely different failing ref set must change the signature.
+            sig_other = orchestrator._recovery_signature(
+                refs + ["tests/test_other.py::B::test_c"], "same wording"
+            )
+            self.assertNotEqual(sig_first, sig_other)
+
     def test_task_verify_commands_follow_owned_proof_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

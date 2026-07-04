@@ -397,7 +397,9 @@ class Orchestrator:
         if not recovery_tasks:
             return False
 
-        audit_result = run_requirements_audit(self.project_root, tasks)
+        audit_result = run_requirements_audit(
+            self.project_root, tasks, current_spec=self._active_spec_file
+        )
         if bool(audit_result.get("ok")):
             return False
 
@@ -2874,10 +2876,13 @@ class Orchestrator:
             "comparable_failures": comparable,
         }
 
-    def _recovery_signature(self, failure_ids: List[str], reason: str) -> str:
+    def _recovery_signature(self, failure_ids: List[str], reason: str = "") -> str:
+        # NOTE: the recovery round counter groups failures by this signature. It must be
+        # stable across rounds for the same set of failing verification refs, otherwise
+        # recovery_config.max_rounds is never reached and repair tasks spawn unbounded.
+        # The free-form review `reason` varies every round, so it is intentionally excluded.
         payload = {
             "failure_ids": sorted(failure_ids),
-            "reason": " ".join(str(reason or "").split())[:500],
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
@@ -3479,26 +3484,106 @@ class Orchestrator:
             "proof_evidence": proof_evidence,
         }
 
+    _REQUIREMENTS_AUDIT_EVIDENCE_MARKERS = (
+        "test_requirements_audit_state",
+        ".auto-agents/docs/requirements_audit",
+    )
+
+    @staticmethod
+    def _task_depends_on_requirements_audit(task: Optional[TaskSpec]) -> bool:
+        if task is None:
+            return False
+        for ref in Orchestrator._task_planned_evidence_refs(task):
+            normalized = str(ref).replace("\\", "/").lower()
+            if any(
+                marker in normalized
+                for marker in Orchestrator._REQUIREMENTS_AUDIT_EVIDENCE_MARKERS
+            ):
+                return True
+        return False
+
+    def _requirements_audit_gate(
+        self,
+        task: Optional[TaskSpec],
+        state: Optional[RunState],
+    ) -> Optional[Tuple[List[str], set]]:
+        """Return (requirement_ids, assume_done_task_ids) for a planner-generated
+        requirements-audit gap task (or a repair of one), or None when the task's
+        verification does not depend on the requirements audit.
+
+        The audit-gap task's proof asserts on the generated requirements_audit.md, but
+        requirement proofs only count once the owning task is done. Treating the owner (and,
+        for a repair, its parent) as done lets the gate recompute the true audit state, which
+        both breaks the completion deadlock and makes the gate impossible to satisfy by
+        weakening the asserting test.
+        """
+        if task is None or not self._task_depends_on_requirements_audit(task):
+            return None
+        tasks = state.tasks if state is not None and state.tasks else self._load_tasks_from_plan()
+        tasks_by_id = {t.task_id: t for t in tasks}
+        owner = task
+        assumed = {task.task_id}
+        if not task.requirement_ids and task.parent_task_id:
+            parent = tasks_by_id.get(task.parent_task_id)
+            if parent is not None and parent.requirement_ids:
+                owner = parent
+                assumed.add(parent.task_id)
+        if not owner.requirement_ids:
+            return None
+        return list(owner.requirement_ids), assumed
+
     def _run_task_requirements_audit_recovery_check(
         self,
         task: Optional[TaskSpec],
         state: Optional[RunState],
     ) -> Optional[Dict[str, object]]:
-        if not self._is_requirements_audit_recovery_task(task):
-            return None
         tasks = state.tasks if state is not None and state.tasks else self._load_tasks_from_plan()
-        audit_result = run_requirements_audit(self.project_root, tasks)
-        if bool(audit_result.get("ok")):
+        # Legacy release-rejection recovery task: the full requirement ledger must pass.
+        if self._is_requirements_audit_recovery_task(task):
+            audit_result = run_requirements_audit(
+                self.project_root, tasks, current_spec=self._active_spec_file
+            )
+            if bool(audit_result.get("ok")):
+                return None
+            failed_requirements = [
+                str(issue.get("requirement_id", "")).strip()
+                for issue in audit_result.get("issues", [])
+                if isinstance(issue, dict) and str(issue.get("result", "")).strip() == "fail"
+            ]
+            failed_requirements = [item for item in failed_requirements if item]
+            return {
+                "reason": f"requirements audit still failed: {audit_result['path']}",
+                "failure_ids": failed_requirements,
+                "raw_output": str(audit_result.get("report", "")),
+            }
+        # Planner-generated audit-gap task (or its repair): deterministic, un-gameable gate
+        # scoped to the task's bound requirements.
+        gate = self._requirements_audit_gate(task, state)
+        if gate is None:
             return None
-        failed_requirements = [
+        gate_requirement_ids, assume_done = gate
+        audit_result = run_requirements_audit(
+            self.project_root,
+            tasks,
+            current_spec=self._active_spec_file,
+            assume_done_task_ids=assume_done,
+        )
+        failed_requirements = {
             str(issue.get("requirement_id", "")).strip()
             for issue in audit_result.get("issues", [])
             if isinstance(issue, dict) and str(issue.get("result", "")).strip() == "fail"
-        ]
-        failed_requirements = [item for item in failed_requirements if item]
+        }
+        gate_failures = [rid for rid in gate_requirement_ids if rid in failed_requirements]
+        if not gate_failures:
+            return None
         return {
-            "reason": f"requirements audit still failed: {audit_result['path']}",
-            "failure_ids": failed_requirements,
+            "reason": (
+                "requirements audit still fails for this task's bound requirement(s) "
+                f"{', '.join(gate_failures)} even with the task treated as done. Fix the real "
+                "proof evidence and source-of-truth so the audit passes; do not weaken the "
+                f"asserting test. See {audit_result['path']}."
+            ),
+            "failure_ids": gate_failures,
             "raw_output": str(audit_result.get("report", "")),
         }
 
@@ -5111,7 +5196,9 @@ class Orchestrator:
             if self._verify_failure_looks_like_oracle_proof_state(f"{verify_gate.summary}\n{raw_output}"):
                 tasks = state.tasks or self._load_tasks_from_plan()
                 state.tasks = tasks
-                audit_result = run_requirements_audit(self.project_root, tasks)
+                audit_result = run_requirements_audit(
+                    self.project_root, tasks, current_spec=self._active_spec_file
+                )
                 if not bool(audit_result["ok"]):
                     state.stage_summaries.pop("verify", None)
                     if self._handle_requirements_audit_failure(state, audit_result):
@@ -5154,7 +5241,9 @@ class Orchestrator:
             )
         tasks = state.tasks or self._load_tasks_from_plan()
         state.tasks = tasks
-        audit_result = run_requirements_audit(self.project_root, tasks)
+        audit_result = run_requirements_audit(
+            self.project_root, tasks, current_spec=self._active_spec_file
+        )
         audit_ok = bool(audit_result["ok"])
         audit_report = str(audit_result["report"])
         if not audit_ok:
