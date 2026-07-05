@@ -1685,7 +1685,69 @@ def _forbidden_pattern_corroboration_only_path(
         return True
     if normalized.startswith(".auto-agents/docs/provider_references/"):
         return True
+    if _is_executable_test_evidence_ref(normalized):
+        return True
     if _is_noncurrent_spec_file(normalized, current_spec_rel):
+        return True
+    return False
+
+
+_NEGATED_FORBIDDEN_PATTERN_MARKERS = (
+    "不得",
+    "不能",
+    "不可",
+    "不再",
+    "不要",
+    "不展示",
+    "不显示",
+    "不暴露",
+    "不适合",
+    "无需",
+    "无须",
+    "移除",
+    "删除",
+    "下线",
+    "禁用",
+    "禁止",
+    "严禁",
+    "避免",
+    "hide",
+    "remove",
+    "removes",
+    "removed",
+    "without",
+    "must not",
+    "should not",
+    "do not",
+    "don't",
+)
+
+
+def _forbidden_pattern_match_is_negated(content: str, start: int, end: int) -> bool:
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    if line_end == -1:
+        line_end = len(content)
+    line = content[line_start:line_end]
+    relative_start = max(start - line_start, 0)
+    relative_end = max(end - line_start, relative_start)
+    before = line[max(0, relative_start - 32) : relative_start]
+    after = line[relative_end : min(len(line), relative_end + 32)]
+    window = f"{before}{line[relative_start:relative_end]}{after}".lower()
+    return any(marker in window for marker in _NEGATED_FORBIDDEN_PATTERN_MARKERS)
+
+
+def _has_actionable_forbidden_pattern_match(
+    content: str,
+    pattern: re.Pattern[str],
+    *,
+    suppress_negated_matches: bool,
+) -> bool:
+    for match in pattern.finditer(content):
+        if suppress_negated_matches and _forbidden_pattern_match_is_negated(
+            content, match.start(), match.end()
+        ):
+            continue
         return True
     return False
 
@@ -1768,18 +1830,24 @@ def forbidden_pattern_findings(
             }:
                 content = _state_payload_for_forbidden_pattern_scan(content)
             for raw, pattern in compiled:
-                if pattern.search(content):
-                    findings.append(
-                        {
-                            "kind": "forbidden_pattern",
-                            "message": f"forbidden pattern '{raw}' found in {rel}",
-                            "pattern": raw,
-                            "path": rel,
-                            "authoritative": not _forbidden_pattern_corroboration_only_path(
-                                rel, current_spec_rel
-                            ),
-                        }
-                    )
+                authoritative = not _forbidden_pattern_corroboration_only_path(
+                    rel, current_spec_rel
+                )
+                if not _has_actionable_forbidden_pattern_match(
+                    content,
+                    pattern,
+                    suppress_negated_matches=authoritative and rel == current_spec_rel,
+                ):
+                    continue
+                findings.append(
+                    {
+                        "kind": "forbidden_pattern",
+                        "message": f"forbidden pattern '{raw}' found in {rel}",
+                        "pattern": raw,
+                        "path": rel,
+                        "authoritative": authoritative,
+                    }
+                )
     return findings
 
 

@@ -1417,6 +1417,84 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("specs/2026-07-02-current.md", report)
 
+    def test_requirements_audit_current_spec_negated_forbidden_pattern_is_not_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            pattern = r"(debug_entry|debug_page)[^\n]{0,80}(homepage|normal users)"
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            source="specs/2026-07-02-current.md",
+                            forbidden_patterns=[pattern],
+                        )
+                    ],
+                },
+            )
+            specs = project_root / "specs"
+            specs.mkdir(parents=True, exist_ok=True)
+            write_text(
+                specs / "2026-07-02-current.md",
+                "Do not expose debug_entry or debug_page to normal users on the homepage.\n",
+            )
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Build it.",
+                acceptance=["works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 1, "tasks": [task.to_dict()]},
+            )
+
+            ok, report = audit_requirements(
+                project_root, [task], current_spec=Path("specs/2026-07-02-current.md")
+            )
+
+            self.assertTrue(ok, msg=report)
+            self.assertNotIn("forbidden pattern", report)
+
+    def test_requirements_audit_test_file_forbidden_pattern_is_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {"version": 1, "requirements": [_requirement(forbidden_patterns=["legacy_filter"])]},
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir(parents=True, exist_ok=True)
+            write_text(
+                tests_dir / "test_homepage.py",
+                "def test_no_legacy_filter():\n    assert 'legacy_filter' not in render_homepage()\n",
+            )
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Build it.",
+                acceptance=["works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 1, "tasks": [task.to_dict()]},
+            )
+
+            ok, report = audit_requirements(project_root, [task])
+
+            self.assertTrue(ok, msg=report)
+            self.assertIn("advisory: no corroborating authoritative product-file match", report)
+            self.assertIn("tests/test_homepage.py", report)
+
     def test_requirements_audit_without_current_spec_keeps_specs_authoritative(self) -> None:
         # With no current spec (e.g. standalone CLI audit) spec files stay strict/authoritative.
         with tempfile.TemporaryDirectory() as tmp:
