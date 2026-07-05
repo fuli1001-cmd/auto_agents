@@ -409,8 +409,9 @@ class OutOfScopePlanAdapter:
 
 
 class PlanWithDiagnosticLogAdapter:
-    def __init__(self, project_root: Path) -> None:
+    def __init__(self, project_root: Path, *, write_requirements_audit: bool = False) -> None:
         self.project_root = project_root
+        self.write_requirements_audit = write_requirements_audit
 
     def run(self, request):
         if request.stage == "plan":
@@ -439,6 +440,11 @@ class PlanWithDiagnosticLogAdapter:
             )
             diagnostic.parent.mkdir(parents=True, exist_ok=True)
             write_text(diagnostic, "FAILED tests/test_demo.py::test_contract\n")
+            if self.write_requirements_audit:
+                write_text(
+                    self.project_root / ".auto-agents" / "docs" / "requirements_audit.md",
+                    "# Requirements Audit\n\nResult: fail\n",
+                )
             summary = "plan with diagnostic log\n"
             write_text(request.output_path, summary)
         else:
@@ -1590,6 +1596,27 @@ class RetryFlowTests(unittest.TestCase):
                     / "failed-verification-logs"
                     / "verify-stage-test.log"
                 ).exists()
+            )
+
+    def test_plan_stage_ignores_orchestrator_requirements_audit_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = PlanWithDiagnosticLogAdapter(
+                project_root,
+                write_requirements_audit=True,
+            )
+
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            state = load_run_state(project_root)
+
+            state = orchestrator._run_agent_stage("plan", state, spec_file)
+
+            self.assertEqual(state.tasks[0].task_id, "task-001")
+            self.assertTrue(
+                (project_root / ".auto-agents" / "docs" / "requirements_audit.md").exists()
             )
 
     def test_provider_research_rejects_out_of_scope_file_mutation(self) -> None:

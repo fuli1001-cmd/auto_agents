@@ -1962,7 +1962,10 @@ class Orchestrator:
 
     @staticmethod
     def _is_orchestrator_diagnostic_path(path: str) -> bool:
-        return path.startswith(".auto-agents/failed-verification-logs/")
+        return (
+            path.startswith(".auto-agents/failed-verification-logs/")
+            or path == ".auto-agents/docs/requirements_audit.md"
+        )
 
     def _run_gate_commands(self, *, collect_all: bool, context: str):
         self._apply_generated_verification_config()
