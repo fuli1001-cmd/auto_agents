@@ -643,13 +643,57 @@ class Orchestrator:
     def _verify_gate_recovery_limit(self) -> int:
         return self._max_attempts("implement")
 
+    def _requirements_audit_recovery_scope_instruction(self, target_stage: str) -> str:
+        if target_stage == "plan":
+            return (
+                f"Fix only the task-planning source of truth at {task_plan_path(self.project_root)}. "
+                "Do not edit input specs, project code, tests, README.md, "
+                ".auto-agents/docs/requirements_audit.md, .auto-agents/docs/review.md, "
+                "project_brief.md, architecture.md, or requirements_trace.json to make the plan pass."
+            )
+        if target_stage == "clarify":
+            return (
+                f"Fix only the requirements source of truth at {docs_dir(self.project_root) / 'project_brief.md'} "
+                f"and {requirements_trace_path(self.project_root)}. Do not edit input specs, project code, "
+                "tests, README.md, or .auto-agents diagnostic reports to make the audit pass."
+            )
+        if target_stage == "design":
+            return (
+                f"Fix only the architecture source of truth at {docs_dir(self.project_root) / 'architecture.md'}. "
+                "Do not edit input specs, project code, tests, README.md, requirements trace, or "
+                ".auto-agents diagnostic reports to make the audit pass."
+            )
+        if target_stage == "provider_research":
+            return (
+                "Fix only provider-reference source files under "
+                f"{provider_references_dir(self.project_root)} and {provider_references_lock_path(self.project_root)}. "
+                "Do not edit input specs, project code, tests, README.md, task plans, or "
+                ".auto-agents diagnostic reports to make the audit pass."
+            )
+        if target_stage == "readme":
+            return (
+                "Fix only README.md. Do not edit input specs, project code, tests, task plans, requirements "
+                "trace, architecture docs, or .auto-agents diagnostic reports to make the audit pass."
+            )
+        if target_stage == "implement":
+            return (
+                "Fix the implementation-owned source files and tests that caused the finding. Do not edit "
+                ".auto-agents docs/state files directly; for requirement proof updates, use the task's "
+                "ORACLE_PROOF_UPDATES mechanism."
+            )
+        return (
+            "Fix the source-of-truth file owned by the routed stage; do not satisfy this by only editing "
+            "tests, excluding the flagged path, editing input specs, or asserting that the current failure "
+            "is expected."
+        )
+
     def _build_requirements_audit_feedback(self, audit_result: Dict[str, object], target_stage: str) -> str:
         report_path = str(audit_result.get("path", requirements_audit_path(self.project_root)))
         lines = [
             f"The requirements audit failed. Use {report_path} as the source of truth.",
             f"Recovery route: rerun from {target_stage}.",
             "Address every failing mandatory requirement before continuing.",
-            "Fix the source-of-truth file reported by each finding; do not satisfy this by only editing tests, excluding the flagged path, or asserting that the current failure is expected.",
+            self._requirements_audit_recovery_scope_instruction(target_stage),
         ]
         for issue in audit_result.get("issues", []):
             if not isinstance(issue, dict) or str(issue.get("result", "")).strip() != "fail":
@@ -1789,6 +1833,19 @@ class Orchestrator:
         provider_refs_prefix = self._relative_repo_path(provider_references_dir(self.project_root)).rstrip("/") + "/"
         run_state_rel = self._relative_repo_path(run_state_path(self.project_root))
         auto_gitignore_rel = ".auto-agents/.gitignore"
+        protected_input_specs = {"spec.md"}
+        if self._active_spec_file is not None:
+            try:
+                protected_input_specs.add(self._relative_repo_path(self._active_spec_file))
+            except ValueError:
+                pass
+
+        def is_implementation_owned_path(path: str) -> bool:
+            return (
+                not path.startswith(".auto-agents/")
+                and not path.startswith("specs/")
+                and path not in protected_input_specs
+            )
 
         if stage == "clarify":
             if stage_key == "clarify-generate":
@@ -1831,24 +1888,24 @@ class Orchestrator:
                     plan_path,
                     provider_lock_path,
                     f"{provider_refs_prefix}**",
-                    "any non-.auto-agents project path",
+                    "any non-.auto-agents project path except input specs (spec.md, specs/**, active spec file)",
                 ]
                 return allowed, (
                     lambda path: path.startswith(run_prefix)
                     or path in {run_state_rel, auto_gitignore_rel, plan_path, provider_lock_path}
                     or path.startswith(provider_refs_prefix)
-                    or not path.startswith(".auto-agents/")
+                    or is_implementation_owned_path(path)
                 )
             allowed = [
                 f"{run_prefix}**",
                 run_state_rel,
                 auto_gitignore_rel,
-                "any non-.auto-agents project path",
+                "any non-.auto-agents project path except input specs (spec.md, specs/**, active spec file)",
             ]
             return allowed, (
                 lambda path: path.startswith(run_prefix)
                 or path in {run_state_rel, auto_gitignore_rel}
-                or not path.startswith(".auto-agents/")
+                or is_implementation_owned_path(path)
             )
 
         allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel]
@@ -5990,7 +6047,11 @@ class Orchestrator:
                 f"Read: {architecture}",
                 f"Read the requirements trace: {requirements_trace}",
                 f"Replace this JSON file with a task plan of minimal verifiable feature slices: {plan}",
-                "Only update .auto-agents/state/task_plan.json in this stage. Do not modify project code, tests, README.md, or other repository files to make the plan pass.",
+                f"Only update {plan} in this stage.",
+                "Do not modify project code, tests, README.md, input specs under specs/, "
+                ".auto-agents/docs/requirements_audit.md, .auto-agents/docs/review.md, "
+                "project_brief.md, architecture.md, requirements_trace.json, or any other "
+                "repository files to make the plan pass.",
                 "At the root of the JSON, also define test_strategy and verification_steps.",
                 "At the root of the JSON, set oracle_proof_schema_version to 1 for all new plans.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
@@ -6345,6 +6406,7 @@ class Orchestrator:
                 "Do not use '.conda' as a generic directory, pip target, virtualenv, or venv path. It must remain a real conda prefix created with 'conda create -p ./.conda ...', including '.conda/conda-meta'.",
                 "Keep mutable local test/runtime artifacts (for example sqlite DBs, temp configs, fixtures, and caches) under ignored temp/data paths such as ./.tmp/, ./.tmp-tests/, or ./.data/ instead of tracked repo-root files.",
                 "For any other stack, keep dependencies and tool state local to the repository and never rely on global installs.",
+                "Do not modify input specification files (spec.md, specs/**, or the active spec file). They are run inputs, not implementation targets.",
                 "Do not modify .auto-agents state files except through ORACLE_PROOF_UPDATES or when explicitly requested.",
                 "Do not modify .auto-agents docs/state files or planning artifacts directly as part of implementation. Keep orchestrator-owned files untouched.",
                 "Final response: 3 short bullets describing what changed.",

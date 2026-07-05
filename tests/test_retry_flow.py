@@ -1706,6 +1706,26 @@ class RetryFlowTests(unittest.TestCase):
                 task_plan_path(project_root).read_text(encoding="utf-8"),
             )
 
+    def test_implement_stage_policy_treats_input_specs_as_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = project_root / "custom-spec.md"
+            state = load_run_state(project_root)
+
+            allowed_scope, is_allowed = orchestrator._stage_mutation_policy(
+                stage="implement",
+                stage_key="implement-task-001",
+                run_id=state.run_id,
+            )
+
+            self.assertTrue(is_allowed("src/app.py"))
+            self.assertFalse(is_allowed("spec.md"))
+            self.assertFalse(is_allowed("specs/2026-07-05-iter-01.md"))
+            self.assertFalse(is_allowed("custom-spec.md"))
+            self.assertIn("except input specs", "; ".join(allowed_scope))
+
     def test_implement_stage_retries_after_auto_agents_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
