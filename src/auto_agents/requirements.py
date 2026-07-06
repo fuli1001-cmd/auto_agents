@@ -1796,6 +1796,7 @@ def forbidden_pattern_findings(
         ".auto-agents/state/requirements_trace.json",
         ".auto-agents/state/provider_references.lock.json",
         ".auto-agents/docs/requirements_audit.md",
+        ".auto-agents/docs/review.md",
     }
     included = {
         str(path).strip().replace("\\", "/")
