@@ -4274,6 +4274,28 @@ class RetryFlowTests(unittest.TestCase):
                 self.assertEqual(stage, expected_stage)
                 self.assertEqual(hard_failure, "")
 
+    def test_requirements_audit_forbidden_pattern_on_protected_inputs_is_not_implement_recovery(self) -> None:
+        paths = [
+            ".auto-agents/docs/requirements_audit.md",
+            ".auto-agents/docs/review.md",
+            "spec.md",
+            "specs/2026-07-05-iter-01.md",
+        ]
+
+        for path in paths:
+            with self.subTest(path=path):
+                blocker = {
+                    "kind": "forbidden_pattern",
+                    "message": f"forbidden pattern found in {path}",
+                    "path": path,
+                }
+
+                stage, hard_failure = Orchestrator._audit_issue_route(blocker)
+
+                self.assertIsNone(stage)
+                self.assertIn("automatic recovery is unsafe", hard_failure)
+                self.assertNotIn("owned by implement", Orchestrator._audit_blocker_feedback(blocker))
+
     def test_review_feedback_rewinds_to_design_for_architecture_owned_artifact(self) -> None:
         summary = (
             "DECISION: fail\n"

@@ -503,10 +503,28 @@ class Orchestrator:
         return "implement"
 
     @classmethod
+    def _unsafe_forbidden_pattern_recovery_reason(cls, blocker: Dict[str, object]) -> str:
+        path = cls._normalize_audit_blocker_path(blocker.get("path"))
+        if path in {
+            ".auto-agents/docs/requirements_audit.md",
+            ".auto-agents/docs/review.md",
+        }:
+            return (
+                f"{path} is an orchestrator diagnostic report, not implementation-owned "
+                "source-of-truth"
+            )
+        if path == "spec.md" or path.startswith("specs/"):
+            return f"{path} is an immutable input specification"
+        return ""
+
+    @classmethod
     def _audit_issue_route(cls, blocker: Dict[str, object]) -> Tuple[Optional[str], str]:
         kind = str(blocker.get("kind", "")).strip()
         message = str(blocker.get("message", "")).strip() or "requirements audit blocker"
         if kind == "forbidden_pattern":
+            unsafe_reason = cls._unsafe_forbidden_pattern_recovery_reason(blocker)
+            if unsafe_reason:
+                return None, f"{message}; automatic recovery is unsafe because {unsafe_reason}"
             return cls._forbidden_pattern_owner_stage(blocker), ""
         if kind == "task_coverage":
             return "plan", ""
@@ -530,6 +548,9 @@ class Orchestrator:
         kind = str(blocker.get("kind", "")).strip()
         if kind == "forbidden_pattern":
             path = str(blocker.get("path", "")).strip() or "unknown path"
+            unsafe_reason = Orchestrator._unsafe_forbidden_pattern_recovery_reason(blocker)
+            if unsafe_reason:
+                return f"forbidden pattern found in {path} (not auto-fixable: {unsafe_reason})"
             owner_stage = Orchestrator._forbidden_pattern_owner_stage(blocker)
             return f"forbidden pattern found in {path} (owned by {owner_stage})"
         return str(blocker.get("message", "")).strip() or "requirements audit blocker"
