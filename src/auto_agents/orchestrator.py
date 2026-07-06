@@ -1782,13 +1782,21 @@ class Orchestrator:
         return preview
 
     def _capture_auto_agents_restore_point(self, restore_root: Path) -> None:
-        for relative in (
+        restore_relatives = [
             ".auto-agents/.gitignore",
             ".auto-agents/config.json",
             ".auto-agents/state",
             ".auto-agents/docs",
             ".auto-agents/history",
-        ):
+            "spec.md",
+            "specs",
+        ]
+        if self._active_spec_file is not None:
+            try:
+                restore_relatives.append(self._relative_repo_path(self._active_spec_file))
+            except ValueError:
+                pass
+        for relative in restore_relatives:
             source = self.project_root / relative
             target = restore_root / relative
             if source.is_dir():
@@ -1813,6 +1821,21 @@ class Orchestrator:
             elif source.exists() or source.is_symlink():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target, follow_symlinks=False)
+
+    def _is_implement_restorable_scope_violation_path(self, path: str) -> bool:
+        normalized = str(path).replace("\\", "/").strip()
+        if not normalized:
+            return False
+        if normalized.startswith(".auto-agents/"):
+            return True
+        if normalized == "spec.md" or normalized.startswith("specs/"):
+            return True
+        if self._active_spec_file is not None:
+            try:
+                return normalized == self._relative_repo_path(self._active_spec_file)
+            except ValueError:
+                return False
+        return False
 
     def _relative_repo_path(self, path: Path) -> str:
         return str(path.relative_to(self.project_root)).replace("\\", "/")
@@ -6908,15 +6931,15 @@ class Orchestrator:
                     if (
                         stage == "implement"
                         and restore_root is not None
-                        and all(path.startswith(".auto-agents/") for path in offending)
+                        and all(self._is_implement_restorable_scope_violation_path(path) for path in offending)
                     ):
                         self._restore_paths_from_restore_point(offending, restore_root)
                         last_error = (
                             f"stage {stage} modified files outside its ownership during {stage_key}. "
                             f"Changed paths: {self._changed_path_preview(offending)}. "
                             f"Allowed scope: {'; '.join(allowed_scope)}. "
-                            "Do not edit orchestrator-owned .auto-agents state, docs, config, or planning files "
-                            "during implementation; update repository tests instead."
+                            "Do not edit orchestrator-owned .auto-agents state, docs, config, planning files, "
+                            "or input specs during implementation; update repository code/tests instead."
                         )
                         feedback = last_error
                         continue

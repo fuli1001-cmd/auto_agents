@@ -655,6 +655,35 @@ class RecoveringConfigMutationImplementAdapter:
         )
 
 
+class RecoveringProtectedInputMutationImplementAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            write_text(self.project_root / "artifact.txt", "good\n")
+            if self.implement_calls == 1:
+                write_text(self.project_root / ".auto-agents" / "docs" / "review.md", "mutated review\n")
+                write_text(self.project_root / "specs" / "2026-05-07-iter-01.md", "mutated spec\n")
+                summary = "implemented with first-attempt protected input mutation\n"
+            else:
+                summary = "implemented clean retry\n"
+        elif request.stage == "review":
+            summary = "DECISION: pass\nLooks good.\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class RecoveringHistoryMutationImplementAdapter:
     def __init__(self, project_root: Path, archive_path: Path) -> None:
         self.project_root = project_root
@@ -1864,6 +1893,53 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(
                 (project_root / ".auto-agents" / "config.json").read_text(encoding="utf-8"),
                 original_config,
+            )
+
+    def test_implement_stage_restores_review_and_spec_mutation_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(project_root / "specs" / "2026-05-07-iter-01.md", "original spec\n")
+            write_text(project_root / ".auto-agents" / "docs" / "review.md", "original review\n")
+            original_review = (project_root / ".auto-agents" / "docs" / "review.md").read_text(encoding="utf-8")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = RecoveringProtectedInputMutationImplementAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains good"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(result.tasks[0].status, "done")
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertEqual(
+                (project_root / ".auto-agents" / "docs" / "review.md").read_text(encoding="utf-8"),
+                original_review,
+            )
+            self.assertEqual(
+                (project_root / "specs" / "2026-05-07-iter-01.md").read_text(encoding="utf-8"),
+                "original spec\n",
             )
 
     def test_implement_stage_restores_archived_task_plan_mutation(self) -> None:
