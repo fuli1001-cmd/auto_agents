@@ -627,6 +627,34 @@ class RecoveringOutOfScopeImplementAdapter:
         )
 
 
+class RecoveringConfigMutationImplementAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            write_text(self.project_root / "artifact.txt", "good\n")
+            if self.implement_calls == 1:
+                write_text(self.project_root / ".auto-agents" / "config.json", "{\"mutated\": true}\n")
+                summary = "implemented with first-attempt config mutation\n"
+            else:
+                summary = "implemented clean retry\n"
+        elif request.stage == "review":
+            summary = "DECISION: pass\nLooks good.\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class RecoveringHistoryMutationImplementAdapter:
     def __init__(self, project_root: Path, archive_path: Path) -> None:
         self.project_root = project_root
@@ -1795,6 +1823,47 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn(
                 "\"status\": \"done\"",
                 task_plan_path(project_root).read_text(encoding="utf-8"),
+            )
+
+    def test_implement_stage_restores_config_mutation_before_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            original_config = (project_root / ".auto-agents" / "config.json").read_text(encoding="utf-8")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = RecoveringConfigMutationImplementAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Write artifact",
+                            "description": "Write the artifact file.",
+                            "acceptance": ["artifact.txt contains good"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(result.tasks[0].status, "done")
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertEqual(
+                (project_root / ".auto-agents" / "config.json").read_text(encoding="utf-8"),
+                original_config,
             )
 
     def test_implement_stage_restores_archived_task_plan_mutation(self) -> None:
@@ -3712,6 +3781,69 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn(".conda/conda-meta", str(raised.exception))
             self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertEqual(orchestrator.adapter.review_calls, 0)
+
+    def test_task_specific_vitest_verification_skips_global_missing_conda_fast_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                project_root / "workbench" / "package.json",
+                {
+                    "scripts": {"test": "vitest run"},
+                    "devDependencies": {"vitest": "^3.0.0"},
+                },
+            )
+            write_text(
+                project_root / "workbench" / "src" / "components" / "video-card-delete.test.tsx",
+                "test('renders', () => {})\n",
+            )
+
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.gates.commands = ["conda run -p ./.conda python -m pytest -q tests"]
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-frontend",
+                title="Frontend",
+                description="",
+                acceptance=[],
+                verification_refs=[
+                    "workbench/src/components/video-card-delete.test.tsx::renders"
+                ],
+            )
+            captured = {}
+
+            def fake_task_commands(commands, *, collect_all, context):
+                captured["commands"] = list(commands)
+                return (
+                    GateResult(
+                        ok=True,
+                        commands=[
+                            CommandResult(
+                                command=list(commands)[0],
+                                ok=True,
+                                returncode=0,
+                                stdout="",
+                                stderr="",
+                            )
+                        ],
+                        summary="all commands passed",
+                    ),
+                    "",
+                )
+
+            with patch("auto_agents.orchestrator.shutil.which", return_value="/usr/bin/npm"):
+                with patch.object(
+                    orchestrator,
+                    "_run_gate_commands_for_commands",
+                    side_effect=fake_task_commands,
+                ):
+                    result = orchestrator._run_task_verify(task)
+
+            self.assertTrue(result["ok"], msg=str(result))
+            self.assertIn("npm --prefix workbench test --", captured["commands"][0])
+            self.assertNotIn(".conda", captured["commands"][0])
 
     def test_missing_pytest_target_fails_without_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

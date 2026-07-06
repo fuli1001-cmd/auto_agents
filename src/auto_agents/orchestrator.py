@@ -1784,6 +1784,7 @@ class Orchestrator:
     def _capture_auto_agents_restore_point(self, restore_root: Path) -> None:
         for relative in (
             ".auto-agents/.gitignore",
+            ".auto-agents/config.json",
             ".auto-agents/state",
             ".auto-agents/docs",
             ".auto-agents/history",
@@ -3304,7 +3305,8 @@ class Orchestrator:
         *,
         state: Optional[RunState] = None,
     ) -> Dict[str, object]:
-        quick_failure = self._quick_verify_failure()
+        task_commands = self._build_task_verify_commands(task)
+        quick_failure = self._quick_verify_failure(task_commands if task_commands else None)
         if quick_failure:
             return {
                 "ok": False,
@@ -3316,7 +3318,6 @@ class Orchestrator:
                 "raw_output": quick_failure,
                 "comparable_failures": False,
             }
-        task_commands = self._build_task_verify_commands(task)
         task_scope_label = self._task_verify_command_scope_label(task)
         if task_commands:
             verify_gate, mutation_error = self._run_gate_commands_for_commands(
@@ -4926,8 +4927,12 @@ class Orchestrator:
                     break
         return "\n".join(lines)
 
-    def _quick_verify_failure_details(self) -> Optional[Tuple[str, bool]]:
+    def _quick_verify_failure_details(
+        self,
+        commands: Optional[Iterable[str]] = None,
+    ) -> Optional[Tuple[str, bool]]:
         conda_meta = self.project_root / ".conda" / "conda-meta"
+        command_list = list(commands) if commands is not None else list(self.config.gates.commands)
         shell_tokens = {"|", "||", "&&", ";", "$(", "`"}
         shell_builtins = {
             ":",
@@ -4959,14 +4964,14 @@ class Orchestrator:
         }
 
         command_path_errors = validate_verification_command_paths(
-            self.config.gates.commands,
+            command_list,
             self.project_root,
-            "gates.commands",
+            "verification commands" if commands is not None else "gates.commands",
         )
         if command_path_errors:
             return command_path_errors[0], False
 
-        for command in self.config.gates.commands:
+        for command in command_list:
             stripped = command.strip()
             if not stripped:
                 continue
@@ -4992,8 +4997,8 @@ class Orchestrator:
                 return f"verification command is not runnable: {command}", True
         return None
 
-    def _quick_verify_failure(self) -> Optional[str]:
-        failure = self._quick_verify_failure_details()
+    def _quick_verify_failure(self, commands: Optional[Iterable[str]] = None) -> Optional[str]:
+        failure = self._quick_verify_failure_details(commands)
         if failure is None:
             return None
         return failure[0]
@@ -6411,7 +6416,7 @@ class Orchestrator:
                 "For any other stack, keep dependencies and tool state local to the repository and never rely on global installs.",
                 "Do not modify input specification files (spec.md, specs/**, or the active spec file). They are run inputs, not implementation targets.",
                 "Do not modify .auto-agents state files except through ORACLE_PROOF_UPDATES or when explicitly requested.",
-                "Do not modify .auto-agents docs/state files or planning artifacts directly as part of implementation. Keep orchestrator-owned files untouched.",
+                "Do not modify .auto-agents docs/state/config files or planning artifacts directly as part of implementation. Keep orchestrator-owned files untouched.",
                 "Final response: 3 short bullets describing what changed.",
             ]
             prompt = "\n".join(lines)
@@ -6596,7 +6601,8 @@ class Orchestrator:
                 empty_diff_streak = 0
 
             self._emit_task_activity(task, "verify", attempt)
-            quick_failure = self._quick_verify_failure_details()
+            task_commands = self._build_task_verify_commands(task)
+            quick_failure = self._quick_verify_failure_details(task_commands if task_commands else None)
             if quick_failure:
                 last_reason, retryable = quick_failure
                 failure_ids = self._normalize_verify_failure_ids([], last_reason)
@@ -6909,7 +6915,7 @@ class Orchestrator:
                             f"stage {stage} modified files outside its ownership during {stage_key}. "
                             f"Changed paths: {self._changed_path_preview(offending)}. "
                             f"Allowed scope: {'; '.join(allowed_scope)}. "
-                            "Do not edit orchestrator-owned .auto-agents state, docs, or planning files "
+                            "Do not edit orchestrator-owned .auto-agents state, docs, config, or planning files "
                             "during implementation; update repository tests instead."
                         )
                         feedback = last_error
