@@ -152,6 +152,38 @@
                     "type": "string"
                   }
                 },
+                "visual_evidence": {
+                  "description": "Optional prototype-vs-actual screenshot pairing for frontend visual fidelity proofs.",
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "required": ["prototype_image_ref", "actual_image_ref"],
+                      "properties": {
+                        "surface": { "type": "string" },
+                        "viewport": { "type": "string" },
+                        "prototype_image_ref": { "type": "string", "minLength": 1 },
+                        "actual_image_ref": { "type": "string", "minLength": 1 },
+                        "prototype_source_ref": { "type": "string" }
+                      },
+                      "additionalProperties": true
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": ["prototype_image_ref", "actual_image_ref"],
+                        "properties": {
+                          "surface": { "type": "string" },
+                          "viewport": { "type": "string" },
+                          "prototype_image_ref": { "type": "string", "minLength": 1 },
+                          "actual_image_ref": { "type": "string", "minLength": 1 },
+                          "prototype_source_ref": { "type": "string" }
+                        },
+                        "additionalProperties": true
+                      }
+                    }
+                  ]
+                },
                 "status": {
                   "type": "string",
                   "enum": ["planned", "verified"]

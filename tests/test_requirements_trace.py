@@ -13,7 +13,7 @@ from auto_agents.config import (
     task_plan_path,
 )
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import TaskSpec
+from auto_agents.models import AgentResult, TaskSpec
 from auto_agents.frontend_fidelity import validate_frontend_fidelity_trace
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import (
@@ -26,6 +26,7 @@ from auto_agents.requirements import (
     validate_requirements_trace_payload,
 )
 from auto_agents.validation import validate_task_plan_with_requirements, validation_report
+from auto_agents.visual_judge import parse_visual_judge_response, visual_evidence_pairs_for_task
 
 
 def _requirement(**overrides):
@@ -74,7 +75,214 @@ def _proof(**overrides):
     return payload
 
 
+def _visual_task() -> TaskSpec:
+    return TaskSpec(
+        task_id="task-visual",
+        title="Home visual fidelity",
+        description="Match the Home page prototype.",
+        acceptance=["Home matches prototype screenshots."],
+        requirement_ids=["REQ-001"],
+        requirement_proofs=[
+            _proof(
+                proof_type="mixed",
+                oracle_strength="semantic",
+                evidence_boundary="system_boundary",
+                evidence_refs=["tests/e2e/home.visual.spec.ts::captures"],
+                status="verified",
+                visual_evidence={
+                    "surface": "Home",
+                    "viewport": "desktop",
+                    "prototype_image_ref": ".auto-agents/runs/run-1/screenshots/prototype-home.png",
+                    "actual_image_ref": ".auto-agents/runs/run-1/screenshots/home.png",
+                    "prototype_source_ref": "specs/frondend_prototype/home.html",
+                },
+            )
+        ],
+    )
+
+
+class _VisualJudgeAdapter:
+    def __init__(self, summary: str) -> None:
+        self.summary = summary
+        self.requests = []
+
+    def available(self) -> bool:
+        return True
+
+    def run(self, request) -> AgentResult:
+        self.requests.append(request)
+        write_text(request.output_path, self.summary + "\n")
+        return AgentResult(
+            ok=True,
+            command=["visual-judge"],
+            output_path=request.output_path,
+            summary=self.summary,
+            model="mock-vision",
+            returncode=0,
+        )
+
+
 class RequirementsTraceTests(unittest.TestCase):
+    def test_visual_judge_extracts_explicit_visual_evidence_pairs(self) -> None:
+        task = TaskSpec(
+            task_id="task-visual",
+            title="Home visual fidelity",
+            description="Match prototype.",
+            acceptance=["Home matches prototype."],
+            requirement_ids=["REQ-001"],
+            requirement_proofs=[
+                _proof(
+                    proof_type="mixed",
+                    evidence_refs=["tests/e2e/home.visual.spec.ts::captures"],
+                    visual_evidence={
+                        "surface": "Home",
+                        "viewport": "desktop",
+                        "prototype_image_ref": ".auto-agents/runs/run/screenshots/prototype-home.png",
+                        "actual_image_ref": ".auto-agents/runs/run/screenshots/home.png",
+                        "prototype_source_ref": "specs/frondend_prototype/home.html",
+                    },
+                )
+            ],
+        )
+        trace = {
+            "version": 1,
+            "frontend_surfaces": [{"name": "Home", "prototype_refs": ["specs/frondend_prototype/home.html"]}],
+            "requirements": [
+                _requirement(
+                    text="Frontend Home page matches the prototype visual surface.",
+                    source="specs/frondend_prototype/home.html",
+                    oracle_type="mixed",
+                    frontend_surface=True,
+                )
+            ],
+        }
+
+        pairs = visual_evidence_pairs_for_task(task, trace, max_pairs=6)
+
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0].surface, "Home")
+        self.assertEqual(pairs[0].viewport, "desktop")
+
+    def test_visual_judge_parse_fails_low_score(self) -> None:
+        report = parse_visual_judge_response(
+            '{"status":"passed","score":70,"findings":[],"summary":"close but not enough"}',
+            threshold=85,
+        )
+
+        self.assertEqual(report.status, "failed")
+        self.assertFalse(report.ok)
+
+    def test_visual_judge_auto_skips_when_all_providers_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_surfaces": [{"name": "Home", "prototype_refs": ["specs/frondend_prototype/home.html"]}],
+                    "requirements": [
+                        _requirement(
+                            text="Frontend Home page matches the prototype visual surface.",
+                            source="specs/frondend_prototype/home.html",
+                            oracle_type="mixed",
+                            frontend_surface=True,
+                        )
+                    ],
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.visual_judge.mode = "auto"
+            for provider in orchestrator.config.providers.values():
+                provider.vision = "disabled"
+            (project_root / ".auto-agents" / "runs" / "run-1" / "screenshots").mkdir(parents=True)
+            for name in ("prototype-home.png", "home.png"):
+                write_text(project_root / ".auto-agents" / "runs" / "run-1" / "screenshots" / name, "fake image")
+            state = load_run_state(project_root)
+            task = _visual_task()
+
+            result = orchestrator._run_task_visual_judge(state, task)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "skipped")
+            self.assertIn("no configured provider", result["reason"])
+
+    def test_visual_judge_pass_appends_report_to_matching_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_surfaces": [{"name": "Home", "prototype_refs": ["specs/frondend_prototype/home.html"]}],
+                    "requirements": [
+                        _requirement(
+                            text="Frontend Home page matches the prototype visual surface.",
+                            source="specs/frondend_prototype/home.html",
+                            oracle_type="mixed",
+                            frontend_surface=True,
+                        )
+                    ],
+                },
+            )
+            (project_root / ".auto-agents" / "runs" / "run-1" / "screenshots").mkdir(parents=True)
+            for name in ("prototype-home.png", "home.png"):
+                write_text(project_root / ".auto-agents" / "runs" / "run-1" / "screenshots" / name, "fake image")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.visual_judge.mode = "required"
+            orchestrator.config.providers[orchestrator.config.active_provider].vision = "enabled"
+            orchestrator.adapter = _VisualJudgeAdapter(
+                '{"status":"passed","score":96,"findings":[],"summary":"matches prototype"}'
+            )
+            state = load_run_state(project_root)
+            task = _visual_task()
+
+            result = orchestrator._run_task_visual_judge(state, task)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "passed")
+            self.assertTrue(result["proofs_updated"])
+            self.assertTrue(
+                any(ref.endswith("visual_judge/task-visual/report.json") for ref in task.requirement_proofs[0]["evidence_refs"])
+            )
+
+    def test_visual_judge_required_fails_on_low_score(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_surfaces": [{"name": "Home", "prototype_refs": ["specs/frondend_prototype/home.html"]}],
+                    "requirements": [
+                        _requirement(
+                            text="Frontend Home page matches the prototype visual surface.",
+                            source="specs/frondend_prototype/home.html",
+                            oracle_type="mixed",
+                            frontend_surface=True,
+                        )
+                    ],
+                },
+            )
+            (project_root / ".auto-agents" / "runs" / "run-1" / "screenshots").mkdir(parents=True)
+            for name in ("prototype-home.png", "home.png"):
+                write_text(project_root / ".auto-agents" / "runs" / "run-1" / "screenshots" / name, "fake image")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.visual_judge.mode = "required"
+            orchestrator.config.providers[orchestrator.config.active_provider].vision = "enabled"
+            orchestrator.adapter = _VisualJudgeAdapter(
+                '{"status":"failed","score":61,"findings":[{"severity":"blocker","surface":"Home","viewport":"desktop","message":"old workbench layout remains"}],"summary":"too different"}'
+            )
+            state = load_run_state(project_root)
+            task = _visual_task()
+
+            result = orchestrator._run_task_visual_judge(state, task)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("old workbench layout remains", result["reason"])
+
     def test_frontend_prototype_spec_requires_surface_contract(self) -> None:
         trace = {"version": 1, "requirements": [_requirement()]}
         spec = "Build a frontend page that must match specs/frondend_prototype/home.html prototype screenshots."

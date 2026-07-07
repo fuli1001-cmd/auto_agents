@@ -69,6 +69,10 @@
             "subscription_tier": {
               "type": "string",
               "minLength": 1
+            },
+            "vision": {
+              "type": "string",
+              "enum": ["auto", "enabled", "disabled"]
             }
           },
           "additionalProperties": true
@@ -118,6 +122,10 @@
             "subscription_tier": {
               "type": "string",
               "minLength": 1
+            },
+            "vision": {
+              "type": "string",
+              "enum": ["auto", "enabled", "disabled"]
             }
           },
           "additionalProperties": true
@@ -152,7 +160,8 @@
         "implement": { "type": "string" },
         "review": { "type": "string" },
         "verify": { "type": "string" },
-        "readme": { "type": "string" }
+        "readme": { "type": "string" },
+        "visual_judge": { "type": "string" }
       },
       "required": [
         "clarify",
@@ -352,6 +361,32 @@
             "type": "integer",
             "minimum": 1
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "visual_judge": {
+      "type": "object",
+      "required": ["mode", "threshold", "provider", "max_pairs_per_task", "require_screenshot_artifacts"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["auto", "off", "required"]
+        },
+        "threshold": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "provider": {
+          "type": "string"
+        },
+        "max_pairs_per_task": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "require_screenshot_artifacts": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false

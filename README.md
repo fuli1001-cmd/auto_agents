@@ -602,6 +602,16 @@ such as Playwright visual tests are the baseline. A vision judge can be added wh
 is supplemental; route-existence checks, payload-only tests, or internal-state assertions are not
 sufficient proof that a generated frontend matches a prototype.
 
+`visual_judge` is an optional completion gate for those frontend surface proofs. In the default
+`auto` mode, auto_agents runs it only when a task has frontend prototype proof evidence, screenshot
+pairs are available through `visual_evidence`, and at least one configured provider is not marked
+`vision: "disabled"`. The judge compares prototype screenshots with actual browser-rendered
+screenshots using a fixed visual fidelity rubric and writes a JSON report under
+`.auto-agents/runs/<run_id>/visual_judge/<task_id>/`. If the judge runs and returns a low score or a
+blocker finding, the task is retried before it can be marked done. If the provider or screenshot
+artifacts are unavailable in `auto` mode, auto_agents records a skipped report and still relies on
+the deterministic screenshot/DOM/CSS proof requirements.
+
 New task plans set `oracle_proof_schema_version: 1` and use `requirement_proofs` on every task
 that declares `requirement_ids`. A proof entry maps one requirement oracle to concrete evidence:
 

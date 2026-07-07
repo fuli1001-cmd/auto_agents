@@ -21,7 +21,7 @@ TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALLOWED_TASK_STATUS = {"pending", "in_progress", "blocked", "done"}
 ALLOWED_EFFORTS = {"balanced", "deep", "max"}
 REQUIRED_EFFORT_STAGES = tuple(DEFAULT_EFFORTS)
-DEFAULTED_EFFORT_STAGES = {"sync-agent-instructions", "provider_research", "arbiter"}
+DEFAULTED_EFFORT_STAGES = {"sync-agent-instructions", "provider_research", "arbiter", "visual_judge"}
 MAX_ACCEPTANCE_WITHOUT_SCOPE_RATIONALE = 5
 MAX_ACCEPTANCE_HARD_LIMIT = 7
 REQUIRED_DOC_HEADINGS = {
@@ -710,6 +710,9 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 errors.append(
                     f"providers.{provider_name}.profile_map must be an object of string keys and string values"
                 )
+            vision = str(provider.get("vision", "auto"))
+            if vision not in {"auto", "enabled", "disabled"}:
+                errors.append(f"providers.{provider_name}.vision must be one of: auto, enabled, disabled")
 
     active_provider = payload.get("active_provider")
     if not isinstance(active_provider, str) or not active_provider.strip():
@@ -864,10 +867,34 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     "implement",
                     "review",
                     "arbiter",
+                    "visual_judge",
                 ):
                     errors.append(f"retries.per_stage contains unknown stage '{key}'")
                 if not isinstance(value, int) or value < 1:
                     errors.append(f"retries.per_stage.{key} must be an integer >= 1")
+
+    visual_judge = payload.get("visual_judge")
+    if visual_judge is not None:
+        if not isinstance(visual_judge, dict):
+            errors.append("visual_judge must be an object")
+        else:
+            mode = visual_judge.get("mode", "auto")
+            if mode not in {"auto", "off", "required"}:
+                errors.append("visual_judge.mode must be one of: auto, off, required")
+            threshold = visual_judge.get("threshold", 85)
+            if not isinstance(threshold, int) or threshold < 0 or threshold > 100:
+                errors.append("visual_judge.threshold must be an integer from 0 to 100")
+            provider = visual_judge.get("provider", "")
+            if not isinstance(provider, str):
+                errors.append("visual_judge.provider must be a string")
+            elif provider and isinstance(payload.get("providers"), dict) and provider not in payload["providers"]:
+                errors.append("visual_judge.provider must be one of providers keys when set")
+            max_pairs = visual_judge.get("max_pairs_per_task", 6)
+            if not isinstance(max_pairs, int) or max_pairs < 1:
+                errors.append("visual_judge.max_pairs_per_task must be an integer >= 1")
+            require_artifacts = visual_judge.get("require_screenshot_artifacts", True)
+            if not isinstance(require_artifacts, bool):
+                errors.append("visual_judge.require_screenshot_artifacts must be a boolean")
 
     return errors
 

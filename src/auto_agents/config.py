@@ -147,6 +147,7 @@ DEFAULT_CONFIG = {
             "output_flag": "-o",
             "idle_timeout_seconds": DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
             "subscription_tier": "default",
+            "vision": "auto",
         },
         "copilot-cli": {
             "kind": "copilot-cli",
@@ -163,6 +164,7 @@ DEFAULT_CONFIG = {
             "timeout_seconds": 3600,
             "idle_timeout_seconds": DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
             "subscription_tier": "default",
+            "vision": "disabled",
         },
         "antigravity-claude": {
             "kind": "antigravity",
@@ -179,6 +181,7 @@ DEFAULT_CONFIG = {
             "timeout_seconds": 7200,
             "idle_timeout_seconds": 7200,
             "subscription_tier": "default",
+            "vision": "auto",
         },
         "antigravity-gemini": {
             "kind": "antigravity",
@@ -195,6 +198,7 @@ DEFAULT_CONFIG = {
             "timeout_seconds": 7200,
             "idle_timeout_seconds": 7200,
             "subscription_tier": "default",
+            "vision": "auto",
         },
     },
     "active_provider": "codex",
@@ -235,6 +239,13 @@ DEFAULT_CONFIG = {
     "retries": {
         "default_max_attempts": 2,
         "per_stage": dict(DEFAULT_RETRY_PER_STAGE),
+    },
+    "visual_judge": {
+        "mode": "auto",
+        "threshold": 85,
+        "provider": "",
+        "max_pairs_per_task": 6,
+        "require_screenshot_artifacts": True,
     },
 }
 

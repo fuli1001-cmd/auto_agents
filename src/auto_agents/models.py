@@ -7,7 +7,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from .repomap.config import RepoMapConfig
 
 
-STAGE_ORDER = ["clarify", "design", "plan", "provider_research", "implement", "verify", "readme"]
+STAGE_ORDER = ["clarify", "design", "plan", "provider_research", "implement", "visual_judge", "verify", "readme"]
 APPROVAL_ORDER = ["requirements", "architecture", "release"]
 SESSION_MODES = ("fix", "collab", "provider_resolve")
 SESSION_STATUSES = ("conversing", "executing", "verifying", "waiting_user", "completed", "failed")
@@ -25,6 +25,7 @@ DEFAULT_EFFORTS = {
     "provider_research": "deep",
     "implement": "deep",
     "review": "balanced",
+    "visual_judge": "balanced",
     "verify": "balanced",
     "readme": "balanced",
     "arbiter": "balanced",
@@ -152,6 +153,7 @@ class ProviderConfig:
     timeout_seconds: int = DEFAULT_PROVIDER_TIMEOUT_SECONDS
     idle_timeout_seconds: int = DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS
     subscription_tier: str = "default"
+    vision: str = "auto"
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProviderConfig":
@@ -178,6 +180,7 @@ class ProviderConfig:
             timeout_seconds=cls._timeout_seconds_from_dict(data, timeout_default),
             idle_timeout_seconds=int(data.get("idle_timeout_seconds", idle_timeout_default)),
             subscription_tier=str(data.get("subscription_tier", "default")),
+            vision=str(data.get("vision", "auto")),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -359,6 +362,28 @@ class RetryConfig:
 
 
 @dataclass
+class VisualJudgeConfig:
+    mode: str = "auto"
+    threshold: int = 85
+    provider: str = ""
+    max_pairs_per_task: int = 6
+    require_screenshot_artifacts: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "VisualJudgeConfig":
+        return cls(
+            mode=str(data.get("mode", "auto")),
+            threshold=int(data.get("threshold", 85)),
+            provider=str(data.get("provider", "")),
+            max_pairs_per_task=int(data.get("max_pairs_per_task", 6)),
+            require_screenshot_artifacts=bool(data.get("require_screenshot_artifacts", True)),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class ParallelTasksConfig:
     enabled: bool = False
     workers: Union[int, str] = "auto"
@@ -494,6 +519,7 @@ class ProjectConfig:
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     approvals: ApprovalConfig = field(default_factory=ApprovalConfig)
     retries: RetryConfig = field(default_factory=RetryConfig)
+    visual_judge: VisualJudgeConfig = field(default_factory=VisualJudgeConfig)
     repo_map: RepoMapConfig = field(default_factory=RepoMapConfig)
 
     @classmethod
@@ -544,6 +570,7 @@ class ProjectConfig:
                 )
             ),
             retries=RetryConfig.from_dict(dict(data.get("retries", {}))),
+            visual_judge=VisualJudgeConfig.from_dict(dict(data.get("visual_judge", {}))),
             repo_map=RepoMapConfig.from_dict(dict(data.get("repo_map", {}))),
         )
 
@@ -559,6 +586,7 @@ class ProjectConfig:
             "execution": self.execution.to_dict(),
             "approvals": self.approvals.to_dict(),
             "retries": self.retries.to_dict(),
+            "visual_judge": self.visual_judge.to_dict(),
             "repo_map": self.repo_map.to_dict(),
         }
 
@@ -741,6 +769,7 @@ class AgentRequest:
     cwd: Path
     output_path: Path
     stream_output: Optional[Callable[[str, str], None]] = None
+    attachments: List[Path] = field(default_factory=list)
 
 
 @dataclass
