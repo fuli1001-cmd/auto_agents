@@ -590,6 +590,18 @@ expected to carry:
 This lets downstream planning and review distinguish proxy checks from behavioral/semantic oracles
 and distinguish internal-state evidence from system-boundary or external-side-effect proof.
 
+When the input spec references frontend pages together with prototype artifacts such as HTML
+mockups, screenshots, Figma files, or design images, the clarify stage records an optional
+`frontend_surfaces` array in `state/requirements_trace.json`. Each surface names the page/screen,
+the source prototype refs, known viewports, and the expected visual fidelity level. Projects without
+frontend surfaces or without prototype artifacts can omit the field or leave it empty.
+
+For those frontend surface requirements, task planning must create page-level work and proof entries
+that use rendered-surface evidence. Deterministic DOM/CSS checks and browser screenshot evidence
+such as Playwright visual tests are the baseline. A vision judge can be added when available, but it
+is supplemental; route-existence checks, payload-only tests, or internal-state assertions are not
+sufficient proof that a generated frontend matches a prototype.
+
 New task plans set `oracle_proof_schema_version: 1` and use `requirement_proofs` on every task
 that declares `requirement_ids`. A proof entry maps one requirement oracle to concrete evidence:
 

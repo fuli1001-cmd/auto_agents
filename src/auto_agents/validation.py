@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List
 
 from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, run_state_path, task_plan_path
+from .frontend_fidelity import validate_frontend_fidelity_task_plan
 from .io_utils import read_json, read_text
 from .models import APPROVAL_ORDER, DEFAULT_EFFORTS, DOCUMENT_LANGUAGE_OPTIONS
 from .requirements import (
@@ -537,6 +538,13 @@ def validate_task_plan_with_requirements(
         if not trace_errors:
             errors.extend(
                 validate_task_requirement_coverage(
+                    plan_payload,
+                    trace_payload,
+                    historical_tasks=historical_tasks,
+                )
+            )
+            errors.extend(
+                validate_frontend_fidelity_task_plan(
                     plan_payload,
                     trace_payload,
                     historical_tasks=historical_tasks,

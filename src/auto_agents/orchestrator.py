@@ -65,6 +65,7 @@ from .gates import (
     run_commands_collect_all,
 )
 from .gate_baseline_cache import GateBaselineCache
+from .frontend_fidelity import validate_frontend_fidelity_trace
 from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, ensure_repo, hard_reset_clean, head_ref, is_repo, remove_worktree, worktree_fingerprint
 from .io_utils import read_json, read_text, write_json, write_text
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
@@ -6028,6 +6029,9 @@ class Orchestrator:
                 "The requirements trace is the downstream execution contract. It must be valid JSON with version=1 and a requirements list.",
                 "Every active requirement must have id, text, source, status, priority, acceptance_oracles, oracle_type, oracle_strength, evidence_boundary, forbidden_proxy_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields.",
                 "Use stable IDs like REQ-001. Mark hard requirements as priority='mandatory'. Use status='active', 'deferred', or 'superseded'.",
+                "If the spec references frontend pages together with prototypes, screenshots, Figma files, mockups, or prototype HTML, add a top-level frontend_surfaces array to requirements_trace.json. Each entry must name the surface, route/screen when known, prototype_refs, viewports when known, and the intended fidelity level.",
+                "For every frontend_surfaces entry, create active mandatory requirements that preserve the page-level visual contract from the prototype, including layout, copy, component hierarchy, and explicit forbidden old UI/style patterns. Use oracle_type='mixed' unless a stronger single oracle is clearly appropriate, and require deterministic DOM/CSS evidence plus screenshot/runtime visual evidence; optional judge_model evidence may supplement but must not be the only proof.",
+                "If the project has no frontend surface or the spec has no prototype/design artifact, omit frontend_surfaces or set it to an empty array; do not invent visual fidelity requirements.",
                 "If a requirement needs an external provider protocol or official API docs, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/.",
                 "Use oracle_type to name the primary proof mechanism (for example deterministic_test, integration_test, runtime_evidence, judge_model, benchmark, human_review, or mixed). Use oracle_strength to record the minimum acceptable fidelity (proxy, behavioral, semantic, or human). Use evidence_boundary to say where proof must come from (internal_state, system_boundary, or external_side_effect). Record any checks that must NOT be treated as sufficient in forbidden_proxy_oracles.",
                 "For requirements that remove, forbid, or replace old behavior, add precise forbidden_patterns regexes for stale terms or old semantic claims so requirements audit can scan code, tests, and docs. Prefer narrow patterns that catch positive stale claims without matching the new negative requirement text.",
@@ -6112,6 +6116,8 @@ class Orchestrator:
                 "All active mandatory requirement acceptance_oracles must also be covered by either archived verified done-task proof or at least one current task requirement_proofs entry; requirement_ids alone are not sufficient coverage.",
                 "If an acceptance_oracle covers docs or architecture semantics, its evidence_refs must include an executable test that reads/asserts those docs and a supporting ref to the affected document, such as .auto-agents/docs/architecture.md.",
                 "Task acceptance criteria must preserve the bound requirement's concrete acceptance_oracles; do not weaken direct/API/protocol requirements into naming or configuration-only checks.",
+                "If requirements_trace.json contains frontend_surfaces or frontend/prototype fidelity requirements, create or preserve at least one page-level task per affected surface. The task must implement the whole visible surface against the prototype, not only isolated components or payload behavior.",
+                "Frontend prototype fidelity task acceptance must require deterministic DOM/CSS/static checks and screenshot/runtime visual evidence such as Playwright screenshots. A vision judge may be added when available, but it supplements deterministic and screenshot evidence rather than replacing them. Payload-only tests, route-existence checks, or component count checks are forbidden as the sole proof for visual fidelity.",
                 "For negative contract requirements such as 'must not contain', '不得', '不包含', or '不返回', preserve every concrete field/path/API token from the requirement in the task acceptance. For example, a requirement that forbids `tasks[].result` is NOT covered by only omitting `retry_trace`.",
                 "Preserve each bound requirement's oracle_type, oracle_strength, evidence_boundary, and forbidden_proxy_oracles when slicing tasks. Requirements that demand semantic or human-strength proof are NOT satisfied by proxy checks, internal-state-only checks, config-only checks, or metadata/log snapshots. Requirements that demand system_boundary or external_side_effect evidence are NOT covered unless the task acceptance requires proof at that boundary.",
                 "If a requirement has external_docs_required=true, create at least one implementation task that consumes its provider_reference and tests against that protocol reference.",
@@ -6441,6 +6447,7 @@ class Orchestrator:
                 "When the task has requirement_proofs, do NOT edit .auto-agents/state/task_plan.json directly. Instead, include an ORACLE_PROOF_UPDATES JSON block in your final response.",
                 "Each ORACLE_PROOF_UPDATES entry must update an existing current-task proof by requirement_id and oracle_index, set status='verified', and include concrete evidence_refs plus proof_type/oracle_strength/evidence_boundary/proxy_oracles when relevant.",
                 "Do not submit proof updates for proxy evidence listed in forbidden_proxy_oracles, for final-status-only checks, or for config/metadata-only checks when the requirement demands behavioral/system-boundary proof.",
+                "For frontend/prototype visual fidelity proofs, evidence_refs must include page-level visual evidence such as Playwright screenshot tests, screenshot artifacts, visual snapshots, or equivalent browser-rendered checks, plus deterministic DOM/CSS assertions where practical. Do not mark these proofs verified using payload-only tests or internal-state checks.",
                 "Example final response block:\nORACLE_PROOF_UPDATES:\n```json\n[{\"requirement_id\":\"REQ-001\",\"oracle_index\":1,\"status\":\"verified\",\"proof_type\":\"integration_test\",\"oracle_strength\":\"behavioral\",\"evidence_boundary\":\"system_boundary\",\"evidence_refs\":[\"tests/test_public_api.py::test_behavior\"],\"proxy_oracles\":[]}]\n```",
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
@@ -6496,6 +6503,7 @@ class Orchestrator:
                 "issue 'DECISION: pass' with those concerns listed as '[NON-BLOCKING]' notes.",
                 "For external provider integrations, verify the code and tests against the provider_reference file. Fail if the implementation invents protocol fields, reuses a legacy private gateway payload, or tests only mock an internal gateway contract.",
                 "Also fail when the implementation uses a weaker oracle than the requirement allows (for example: proxy-only checks for semantic/human requirements, internal-state-only checks for system_boundary/external_side_effect requirements, or any check explicitly listed in forbidden_proxy_oracles).",
+                "Also fail frontend/prototype visual fidelity proofs when evidence_refs lack page-level visual evidence such as browser screenshots, visual snapshots, Playwright checks, or equivalent rendered-surface validation. Payload-only tests, route existence, or component-count checks cannot be the sole proof for matching a prototype.",
                 "Also fail if a negative requirement was weakened by dropping a concrete forbidden field/path/API token from the task acceptance or proof. Example: if the requirement says default project detail must not include `tasks[].result`, tests that only prove `retry_trace` was removed are insufficient.",
                 "Use the supplied changed-file and diff context first. Only inspect the rest of the repository when the diff is insufficient.",
                 "This stage is read-only. Do not modify any repository files; return only the review result.",
@@ -7654,6 +7662,11 @@ class Orchestrator:
         errors = validate_required_document(path, "project_brief.md")
         trace = load_requirements_trace(self.project_root, normalize=False)
         errors.extend(validate_requirements_trace_payload(trace))
+        spec_text = ""
+        active_spec_file = getattr(self, "_active_spec_file", None)
+        if isinstance(active_spec_file, Path) and active_spec_file.exists():
+            spec_text = read_text(active_spec_file)
+        errors.extend(validate_frontend_fidelity_trace(trace, spec_text=spec_text))
 
         # Iteration safety: detect silent deletion of pre-existing REQ IDs.
         # The pre-snapshot is captured in _run_interactive_clarify before

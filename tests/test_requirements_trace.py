@@ -14,6 +14,7 @@ from auto_agents.config import (
 )
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import TaskSpec
+from auto_agents.frontend_fidelity import validate_frontend_fidelity_trace
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import (
     audit_requirements,
@@ -74,6 +75,154 @@ def _proof(**overrides):
 
 
 class RequirementsTraceTests(unittest.TestCase):
+    def test_frontend_prototype_spec_requires_surface_contract(self) -> None:
+        trace = {"version": 1, "requirements": [_requirement()]}
+        spec = "Build a frontend page that must match specs/frondend_prototype/home.html prototype screenshots."
+
+        errors = validate_frontend_fidelity_trace(trace, spec_text=spec)
+
+        self.assertTrue(any("frontend prototype fidelity" in item for item in errors))
+        self.assertTrue(any("frontend_surfaces" in item for item in errors))
+
+    def test_frontend_surface_requires_active_visual_requirement(self) -> None:
+        trace = {
+            "version": 1,
+            "frontend_surfaces": [
+                {
+                    "name": "Home",
+                    "route": "/",
+                    "prototype_refs": ["specs/frontend_prototype/home.html"],
+                    "viewports": ["desktop"],
+                }
+            ],
+            "requirements": [_requirement()],
+        }
+
+        errors = validate_frontend_fidelity_trace(trace)
+
+        self.assertTrue(any("no active mandatory requirement" in item for item in errors))
+
+    def test_plan_validation_rejects_payload_only_frontend_visual_proof(self) -> None:
+        trace = {
+            "version": 1,
+            "frontend_surfaces": [
+                {
+                    "name": "Home",
+                    "route": "/",
+                    "prototype_refs": ["specs/frontend_prototype/home.html"],
+                    "viewports": ["desktop"],
+                }
+            ],
+            "requirements": [
+                _requirement(
+                    text="The frontend Home page must match the referenced prototype visual layout.",
+                    source="specs/frontend_prototype/home.html",
+                    acceptance_oracles=[
+                        "Rendered Home page preserves prototype layout, copy, component hierarchy, and visual styling."
+                    ],
+                    oracle_type="mixed",
+                    oracle_strength="semantic",
+                    evidence_boundary="system_boundary",
+                    forbidden_proxy_oracles=["payload-only tests", "route exists"],
+                    notes="frontend_surface: Home",
+                    frontend_surface=True,
+                )
+            ],
+        }
+        plan = {
+            "test_strategy": "vitest",
+            "verification_commands": ["npm test"],
+            "oracle_proof_schema_version": 1,
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Build home",
+                    "description": "Implement home data wiring.",
+                    "acceptance": ["Home route returns provider payload."],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [
+                        _proof(
+                            proof_type="integration_test",
+                            oracle_strength="semantic",
+                            evidence_boundary="system_boundary",
+                            evidence_refs=["tests/test_home_payload.ts::returns_payload"],
+                            forbidden_proxy_oracles=["payload-only tests", "route exists"],
+                            proxy_oracles=[],
+                            status="planned",
+                        )
+                    ],
+                }
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertTrue(any("page-level visual evidence" in item for item in errors))
+
+    def test_plan_validation_accepts_frontend_visual_evidence(self) -> None:
+        trace = {
+            "version": 1,
+            "frontend_surfaces": [
+                {
+                    "name": "Home",
+                    "route": "/",
+                    "prototype_refs": ["specs/frontend_prototype/home.html"],
+                    "viewports": ["desktop"],
+                }
+            ],
+            "requirements": [
+                _requirement(
+                    text="The frontend Home page must match the referenced prototype visual layout.",
+                    source="specs/frontend_prototype/home.html",
+                    acceptance_oracles=[
+                        "Rendered Home page preserves prototype layout, copy, component hierarchy, and visual styling."
+                    ],
+                    oracle_type="mixed",
+                    oracle_strength="semantic",
+                    evidence_boundary="system_boundary",
+                    forbidden_proxy_oracles=["payload-only tests", "route exists"],
+                    notes="frontend_surface: Home",
+                    frontend_surface=True,
+                )
+            ],
+        }
+        plan = {
+            "test_strategy": "vitest plus playwright",
+            "verification_commands": ["npm test"],
+            "oracle_proof_schema_version": 1,
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Build home visual surface",
+                    "description": "Implement the full Home page visual surface against the prototype.",
+                    "acceptance": [
+                        "Playwright captures desktop screenshot evidence against the prototype.",
+                        "DOM/CSS checks preserve the prototype copy and layout hierarchy.",
+                    ],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [
+                        _proof(
+                            proof_type="mixed",
+                            oracle_strength="semantic",
+                            evidence_boundary="system_boundary",
+                            evidence_refs=["tests/e2e/home.visual.spec.ts::matches_prototype_screenshot"],
+                            forbidden_proxy_oracles=["payload-only tests", "route exists"],
+                            proxy_oracles=[],
+                            status="planned",
+                        )
+                    ],
+                }
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertEqual(errors, [])
+
     def test_plan_validation_requires_mandatory_requirement_coverage(self) -> None:
         trace = {"version": 1, "requirements": [_requirement()]}
         plan = {
