@@ -2277,9 +2277,11 @@ class RetryFlowTests(unittest.TestCase):
             )
 
             captured_commands = []
+            captured_parallel_groups = []
 
             def fake_run(commands, parallel_groups, cwd, *, collect_all):
                 all_commands = list(commands)
+                captured_parallel_groups.extend(parallel_groups)
                 for group in parallel_groups:
                     all_commands.extend(group.commands)
                 captured_commands.extend(all_commands)
@@ -2302,6 +2304,7 @@ class RetryFlowTests(unittest.TestCase):
                 result = orchestrator._run_task_proof_evidence(task)
 
             self.assertTrue(result["ok"])
+            self.assertEqual(captured_parallel_groups, [])
             self.assertEqual(
                 result["passed_refs"],
                 ["tests/test_public_api.py::test_contract", vitest_ref],

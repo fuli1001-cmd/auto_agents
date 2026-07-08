@@ -4180,8 +4180,8 @@ class Orchestrator:
         commands = [command for _, command in command_pairs]
         with log_timing(self.logger, f"proof-evidence commands={len(commands)}"):
             gate_result = run_gate_plan(
+                commands,
                 [],
-                [GateParallelGroup(name="proof-evidence", commands=commands)],
                 self.project_root,
                 collect_all=True,
             )
