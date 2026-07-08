@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
-from .frontend_fidelity import requirement_is_frontend_fidelity, trace_frontend_surfaces
+from .frontend_fidelity import frontend_fidelity_requirement_ids, trace_frontend_surfaces
 from .models import TaskSpec
 
 
@@ -69,14 +69,7 @@ def task_needs_visual_judge(task: TaskSpec, trace_payload: object) -> bool:
         return False
     if not isinstance(trace_payload, Mapping):
         return False
-    requirements = trace_payload.get("requirements")
-    if not isinstance(requirements, list):
-        return False
-    frontend_ids = {
-        str(item.get("id", "")).strip()
-        for item in requirements
-        if isinstance(item, Mapping) and requirement_is_frontend_fidelity(item)
-    }
+    frontend_ids = set(frontend_fidelity_requirement_ids(trace_payload))
     if not frontend_ids:
         return False
     return any(str(req_id).strip() in frontend_ids for req_id in task.requirement_ids)

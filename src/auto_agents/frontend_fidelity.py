@@ -108,10 +108,26 @@ def trace_frontend_surfaces(trace_payload: object) -> List[Mapping[str, object]]
     return [item for item in raw if isinstance(item, Mapping)]
 
 
+def frontend_surface_requirement_ids(trace_payload: object) -> List[str]:
+    ids: List[str] = []
+    for surface in trace_frontend_surfaces(trace_payload):
+        raw_ids = surface.get("requirement_ids")
+        if not isinstance(raw_ids, list):
+            continue
+        for item in raw_ids:
+            req_id = str(item).strip()
+            if req_id and req_id not in ids:
+                ids.append(req_id)
+    return ids
+
+
 def requirement_is_frontend_fidelity(requirement: object) -> bool:
     if not isinstance(requirement, Mapping):
         return False
     if requirement.get("frontend_surface") is True:
+        return True
+    notes = str(requirement.get("notes", "")).lower()
+    if "frontend_surface" in notes:
         return True
     fields: List[str] = [
         str(requirement.get("id", "")),
@@ -131,6 +147,50 @@ def requirement_is_frontend_fidelity(requirement: object) -> bool:
     return has_prototype and (has_frontend or has_visual)
 
 
+def frontend_fidelity_requirement_ids(trace_payload: object) -> List[str]:
+    if not isinstance(trace_payload, Mapping):
+        return []
+    requirements = trace_payload.get("requirements") if isinstance(trace_payload.get("requirements"), list) else []
+    known_ids = {
+        str(item.get("id", "")).strip()
+        for item in requirements
+        if isinstance(item, Mapping)
+    }
+
+    explicit_ids = [
+        req_id
+        for req_id in frontend_surface_requirement_ids(trace_payload)
+        if req_id in known_ids
+    ]
+    tagged_ids = [
+        str(item.get("id", "")).strip()
+        for item in requirements
+        if isinstance(item, Mapping)
+        and (
+            item.get("frontend_surface") is True
+            or "frontend_surface" in str(item.get("notes", "")).lower()
+        )
+        and str(item.get("id", "")).strip()
+    ]
+    scoped_ids: List[str] = []
+    for req_id in (*explicit_ids, *tagged_ids):
+        if req_id and req_id not in scoped_ids:
+            scoped_ids.append(req_id)
+    if scoped_ids:
+        return scoped_ids
+
+    # Legacy fallback for traces that predate frontend_surfaces.requirement_ids.
+    return [
+        str(item.get("id", "")).strip()
+        for item in requirements
+        if isinstance(item, Mapping)
+        and item.get("status") == "active"
+        and item.get("priority") == "mandatory"
+        and requirement_is_frontend_fidelity(item)
+        and str(item.get("id", "")).strip()
+    ]
+
+
 def validate_frontend_fidelity_trace(trace_payload: object, *, spec_text: str = "") -> List[str]:
     errors: List[str] = []
     if not isinstance(trace_payload, Mapping):
@@ -140,13 +200,14 @@ def validate_frontend_fidelity_trace(trace_payload: object, *, spec_text: str = 
     raw_surfaces = trace_payload.get(FRONTEND_SURFACES_FIELD)
     surfaces = trace_frontend_surfaces(trace_payload)
     requirements = trace_payload.get("requirements") if isinstance(trace_payload.get("requirements"), list) else []
+    scoped_fidelity_ids = set(frontend_fidelity_requirement_ids(trace_payload))
     active_fidelity_requirements = [
         item
         for item in requirements
         if isinstance(item, Mapping)
         and item.get("status") == "active"
         and item.get("priority") == "mandatory"
-        and requirement_is_frontend_fidelity(item)
+        and str(item.get("id", "")).strip() in scoped_fidelity_ids
     ]
 
     if signals and not surfaces:
@@ -196,13 +257,14 @@ def validate_frontend_fidelity_task_plan(
         return []
 
     requirements = trace_payload.get("requirements") if isinstance(trace_payload.get("requirements"), list) else []
+    scoped_fidelity_ids = set(frontend_fidelity_requirement_ids(trace_payload))
     required_ids = [
         str(item.get("id", "")).strip()
         for item in requirements
         if isinstance(item, Mapping)
         and item.get("status") == "active"
         and item.get("priority") == "mandatory"
-        and requirement_is_frontend_fidelity(item)
+        and str(item.get("id", "")).strip() in scoped_fidelity_ids
         and str(item.get("id", "")).strip()
     ]
     if not required_ids:

@@ -319,6 +319,7 @@ class RequirementsTraceTests(unittest.TestCase):
                     "route": "/",
                     "prototype_refs": ["specs/frontend_prototype/home.html"],
                     "viewports": ["desktop"],
+                    "requirement_ids": ["REQ-001"],
                 }
             ],
             "requirements": [
@@ -369,6 +370,90 @@ class RequirementsTraceTests(unittest.TestCase):
 
         self.assertTrue(any("page-level visual evidence" in item for item in errors))
 
+    def test_frontend_fidelity_validation_uses_explicit_surface_requirement_scope(self) -> None:
+        trace = {
+            "version": 1,
+            "frontend_surfaces": [
+                {
+                    "name": "Home",
+                    "route": "/",
+                    "prototype_refs": ["specs/frontend_prototype/home.html"],
+                    "viewports": ["desktop"],
+                    "requirement_ids": ["REQ-200"],
+                }
+            ],
+            "requirements": [
+                _requirement(
+                    id="REQ-034",
+                    text=(
+                        "Asset generation uses real visual scoring, runtime snapshot evidence, "
+                        "and visual_contract.retry_guidance for corrective retries."
+                    ),
+                    source="legacy asset generation spec",
+                    acceptance_oracles=["Runtime snapshot records provider-visible retry guidance."],
+                    oracle_type="integration_test",
+                ),
+                _requirement(
+                    id="REQ-200",
+                    text="The frontend Home page must match the referenced prototype visual layout.",
+                    source="specs/frontend_prototype/home.html",
+                    acceptance_oracles=["Rendered Home page matches prototype screenshot evidence."],
+                    oracle_type="mixed",
+                    oracle_strength="semantic",
+                    evidence_boundary="system_boundary",
+                    notes="frontend_surface: Home",
+                ),
+            ],
+        }
+        plan = {
+            "test_strategy": "vitest plus playwright",
+            "verification_commands": ["npm test"],
+            "oracle_proof_schema_version": 1,
+            "tasks": [
+                {
+                    "task_id": "task-legacy",
+                    "title": "Keep visual scoring retry guidance",
+                    "description": "Validate provider-visible retry guidance.",
+                    "acceptance": ["Runtime snapshot records retry guidance."],
+                    "status": "done",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-034"],
+                    "requirement_proofs": [
+                        _proof(
+                            requirement_id="REQ-034",
+                            acceptance_oracle="Runtime snapshot records provider-visible retry guidance.",
+                            proof_type="integration_test",
+                            evidence_refs=["tests/test_assets.py::test_retry_guidance_snapshot"],
+                            status="verified",
+                        )
+                    ],
+                },
+                {
+                    "task_id": "task-home",
+                    "title": "Build home visual surface",
+                    "description": "Implement Home against the prototype.",
+                    "acceptance": ["Playwright captures Home screenshot evidence."],
+                    "status": "pending",
+                    "commit_message": "",
+                    "requirement_ids": ["REQ-200"],
+                    "requirement_proofs": [
+                        _proof(
+                            requirement_id="REQ-200",
+                            acceptance_oracle="Rendered Home page matches prototype screenshot evidence.",
+                            proof_type="mixed",
+                            oracle_strength="semantic",
+                            evidence_refs=["tests/e2e/home.visual.spec.ts::matches_prototype_screenshot"],
+                            status="planned",
+                        )
+                    ],
+                },
+            ],
+        }
+
+        errors = validate_task_plan_with_requirements(plan, trace)
+
+        self.assertEqual(errors, [])
+
     def test_plan_validation_accepts_frontend_visual_evidence(self) -> None:
         trace = {
             "version": 1,
@@ -378,6 +463,7 @@ class RequirementsTraceTests(unittest.TestCase):
                     "route": "/",
                     "prototype_refs": ["specs/frontend_prototype/home.html"],
                     "viewports": ["desktop"],
+                    "requirement_ids": ["REQ-001"],
                 }
             ],
             "requirements": [
