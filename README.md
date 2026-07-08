@@ -705,7 +705,8 @@ classification error produced by the orchestrator itself, the CLI can start an a
 auto_agents self-repair pass. That pass edits and verifies the auto_agents repository only, commits
 the generic repair, sends an Enterprise WeChat summary when notifications are configured, and then
 restarts the original `run` command in a fresh process. It does not edit the target project and is
-limited to one nested self-repair attempt to avoid loops.
+allowed to continue across different auto_agents-owned failures. It stops automatic self-repair only
+when the same error fingerprint appears three consecutive times without being fixed.
 
 Implementation resume is task-aware rather than fully transactional:
 

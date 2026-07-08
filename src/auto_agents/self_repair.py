@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -15,10 +16,11 @@ from .io_utils import write_text
 from .models import AgentRequest, AgentResult, RunState
 
 
-SELF_REPAIR_DEPTH_ENV = "AUTO_AGENTS_SELF_REPAIR_DEPTH"
+SELF_REPAIR_LAST_FINGERPRINT_ENV = "AUTO_AGENTS_SELF_REPAIR_LAST_FINGERPRINT"
+SELF_REPAIR_REPEAT_COUNT_ENV = "AUTO_AGENTS_SELF_REPAIR_REPEAT_COUNT"
 SELF_REPAIR_DISABLED_ENV = "AUTO_AGENTS_SELF_REPAIR_DISABLED"
 SELF_REPAIR_VERIFY_ENV = "AUTO_AGENTS_SELF_REPAIR_VERIFY"
-SELF_REPAIR_MAX_DEPTH = 1
+SELF_REPAIR_MAX_CONSECUTIVE_SAME_ERROR = 3
 
 
 @dataclass
@@ -26,6 +28,8 @@ class SelfRepairDecision:
     eligible: bool
     category: str = ""
     reason: str = ""
+    fingerprint: str = ""
+    repeat_count: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -49,8 +53,8 @@ def auto_agents_repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def self_repair_depth(env: Optional[dict[str, str]] = None) -> int:
-    raw = (env or os.environ).get(SELF_REPAIR_DEPTH_ENV, "0")
+def self_repair_repeat_count(env: Optional[dict[str, str]] = None) -> int:
+    raw = (env or os.environ).get(SELF_REPAIR_REPEAT_COUNT_ENV, "0")
     try:
         return max(0, int(str(raw).strip() or "0"))
     except ValueError:
@@ -66,8 +70,6 @@ def classify_auto_agents_error(
     values = env or os.environ
     if str(values.get(SELF_REPAIR_DISABLED_ENV, "")).strip().lower() in {"1", "true", "yes"}:
         return SelfRepairDecision(False, reason="self repair is disabled by environment")
-    if self_repair_depth(values) >= SELF_REPAIR_MAX_DEPTH:
-        return SelfRepairDecision(False, reason="self repair depth limit reached")
 
     text = str(error or "")
     if not text.strip():
@@ -87,13 +89,17 @@ def classify_auto_agents_error(
         "verification scope mismatch: new failures are outside this task's owned test/proof surface"
         in lowered
     ):
-        return SelfRepairDecision(
-            True,
-            category="verification_scope_mismatch",
-            reason=(
-                "task verification stopped on an auto_agents gate-scope classification; "
-                "this is eligible for generic orchestrator repair"
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="verification_scope_mismatch",
+                reason=(
+                    "task verification stopped on an auto_agents gate-scope classification; "
+                    "this is eligible for generic orchestrator repair"
+                ),
             ),
+            text,
+            values,
         )
 
     if (
@@ -102,31 +108,76 @@ def classify_auto_agents_error(
         and "forbidden pattern" in lowered
         and "immutable input specification" in lowered
     ):
-        return SelfRepairDecision(
-            True,
-            category="requirements_audit_immutable_input_scope",
-            reason=(
-                "requirements audit blocked on immutable input specifications; "
-                "this is eligible for generic audit-scope repair in auto_agents"
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="requirements_audit_immutable_input_scope",
+                reason=(
+                    "requirements audit blocked on immutable input specifications; "
+                    "this is eligible for generic audit-scope repair in auto_agents"
+                ),
             ),
+            text,
+            values,
         )
 
     if _looks_like_auto_agents_traceback(text):
-        return SelfRepairDecision(
-            True,
-            category="auto_agents_traceback",
-            reason="exception traceback points at auto_agents runtime code",
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="auto_agents_traceback",
+                reason="exception traceback points at auto_agents runtime code",
+            ),
+            text,
+            values,
         )
 
     if state is not None and str(state.current_stage).strip() in {"implement", "verify"}:
         if "generated verification commands are invalid" in lowered:
-            return SelfRepairDecision(
-                True,
-                category="generated_verification_contract",
-                reason="auto_agents generated invalid verification command configuration",
+            return _with_repetition_guard(
+                SelfRepairDecision(
+                    True,
+                    category="generated_verification_contract",
+                    reason="auto_agents generated invalid verification command configuration",
+                ),
+                text,
+                values,
             )
 
     return SelfRepairDecision(False, reason="error is not classified as auto_agents-owned")
+
+
+def self_repair_error_fingerprint(error: object, category: str) -> str:
+    normalized = " ".join(str(error or "").lower().split())
+    normalized = re.sub(r"/[^\s:]+/\.auto-agents/[^\s]+", "<auto-agents-path>", normalized)
+    normalized = re.sub(r"\b[0-9a-f]{8,}\b", "<hex>", normalized)
+    payload = f"{category}\0{normalized}".encode("utf-8", errors="replace")
+    return hashlib.sha256(payload).hexdigest()[:24]
+
+
+def _with_repetition_guard(
+    decision: SelfRepairDecision,
+    error_text: str,
+    env: Optional[dict[str, str]],
+) -> SelfRepairDecision:
+    fingerprint = self_repair_error_fingerprint(error_text, decision.category)
+    previous_fingerprint = str((env or os.environ).get(SELF_REPAIR_LAST_FINGERPRINT_ENV, "")).strip()
+    previous_count = self_repair_repeat_count(env)
+    repeat_count = previous_count + 1 if previous_fingerprint == fingerprint else 1
+    if repeat_count >= SELF_REPAIR_MAX_CONSECUTIVE_SAME_ERROR:
+        return SelfRepairDecision(
+            False,
+            category=decision.category,
+            reason=(
+                "same self-repair error repeated "
+                f"{SELF_REPAIR_MAX_CONSECUTIVE_SAME_ERROR} consecutive times without repair"
+            ),
+            fingerprint=fingerprint,
+            repeat_count=repeat_count,
+        )
+    decision.fingerprint = fingerprint
+    decision.repeat_count = repeat_count
+    return decision
 
 
 def _looks_like_auto_agents_traceback(text: str) -> bool:
@@ -375,7 +426,12 @@ def _clean_commit_subject(value: str) -> str:
     return subject[:72].rstrip(" .,:;!?")
 
 
-def append_self_repair_depth(env: Optional[dict[str, str]] = None) -> dict[str, str]:
+def append_self_repair_history(
+    decision: SelfRepairDecision,
+    env: Optional[dict[str, str]] = None,
+) -> dict[str, str]:
     merged = dict(os.environ if env is None else env)
-    merged[SELF_REPAIR_DEPTH_ENV] = str(self_repair_depth(merged) + 1)
+    if decision.fingerprint:
+        merged[SELF_REPAIR_LAST_FINGERPRINT_ENV] = decision.fingerprint
+        merged[SELF_REPAIR_REPEAT_COUNT_ENV] = str(max(1, decision.repeat_count))
     return merged

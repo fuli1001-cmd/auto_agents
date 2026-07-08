@@ -30,7 +30,7 @@ from .orchestrator import Orchestrator
 from .self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
-    append_self_repair_depth,
+    append_self_repair_history,
     auto_agents_repo_root,
     classify_auto_agents_error,
 )
@@ -341,7 +341,7 @@ def _auto_repair_auto_agents_and_resume(
     process = subprocess.run(
         _run_command_for_self_repair_resume(args),
         cwd=str(auto_agents_repo_root()),
-        env=append_self_repair_depth(),
+        env=append_self_repair_history(decision),
         text=True,
     )
     return process.returncode

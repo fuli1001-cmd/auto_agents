@@ -31,7 +31,14 @@ from auto_agents.git_ops import working_tree_clean
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentRequest, AgentResult, AgentUsage, ProjectConfig, ProviderConfig, SessionState, TaskSpec
 from auto_agents.orchestrator import Orchestrator
-from auto_agents.self_repair import AutoAgentsSelfRepairRunner, SelfRepairDecision, SelfRepairResult, classify_auto_agents_error
+from auto_agents.self_repair import (
+    SELF_REPAIR_LAST_FINGERPRINT_ENV,
+    SELF_REPAIR_REPEAT_COUNT_ENV,
+    AutoAgentsSelfRepairRunner,
+    SelfRepairDecision,
+    SelfRepairResult,
+    classify_auto_agents_error,
+)
 from auto_agents.validation import (
     validate_required_document,
     validate_project_config_payload,
@@ -732,17 +739,62 @@ class ProjectValidationTests(unittest.TestCase):
         )
         self.assertFalse(review_decision.eligible)
 
-    def test_self_repair_classifier_honors_depth_limit(self) -> None:
+    def test_self_repair_classifier_stops_after_same_error_repeats_three_times(self) -> None:
         scope_error = (
             "Task task-224 failed gates: verification scope mismatch: new failures are outside "
             "this task's owned test/proof surface."
         )
-        decision = classify_auto_agents_error(
+        first = classify_auto_agents_error(scope_error, env={})
+        self.assertTrue(first.eligible)
+        self.assertEqual(first.repeat_count, 1)
+        self.assertTrue(first.fingerprint)
+
+        second = classify_auto_agents_error(
             scope_error,
-            env={"AUTO_AGENTS_SELF_REPAIR_DEPTH": "1"},
+            env={
+                SELF_REPAIR_LAST_FINGERPRINT_ENV: first.fingerprint,
+                SELF_REPAIR_REPEAT_COUNT_ENV: "1",
+            },
         )
-        self.assertFalse(decision.eligible)
-        self.assertIn("depth limit", decision.reason)
+        self.assertTrue(second.eligible)
+        self.assertEqual(second.repeat_count, 2)
+        self.assertEqual(second.fingerprint, first.fingerprint)
+
+        third = classify_auto_agents_error(
+            scope_error,
+            env={
+                SELF_REPAIR_LAST_FINGERPRINT_ENV: first.fingerprint,
+                SELF_REPAIR_REPEAT_COUNT_ENV: "2",
+            },
+        )
+        self.assertFalse(third.eligible)
+        self.assertEqual(third.repeat_count, 3)
+        self.assertIn("3 consecutive", third.reason)
+
+    def test_self_repair_classifier_resets_count_for_different_error(self) -> None:
+        scope_error = (
+            "Task task-224 failed gates: verification scope mismatch: new failures are outside "
+            "this task's owned test/proof surface."
+        )
+        first = classify_auto_agents_error(scope_error, env={})
+        self.assertTrue(first.eligible)
+
+        audit_error = (
+            "requirements audit failed: /tmp/demo/.auto-agents/docs/requirements_audit.md\n"
+            "Automatic recovery is unsafe for at least one blocker:\n"
+            "- REQ-125: forbidden pattern 'detail entry' found in specs/iter.md; automatic "
+            "recovery is unsafe because specs/iter.md is an immutable input specification"
+        )
+        changed = classify_auto_agents_error(
+            audit_error,
+            env={
+                SELF_REPAIR_LAST_FINGERPRINT_ENV: first.fingerprint,
+                SELF_REPAIR_REPEAT_COUNT_ENV: "2",
+            },
+        )
+        self.assertTrue(changed.eligible)
+        self.assertEqual(changed.repeat_count, 1)
+        self.assertNotEqual(changed.fingerprint, first.fingerprint)
 
     def test_self_repair_runner_uses_dedicated_effort(self) -> None:
         class FakeConfig:
@@ -898,10 +950,9 @@ class ProjectValidationTests(unittest.TestCase):
             resumed_command = resume_run.call_args.args[0]
             self.assertIn("run", resumed_command)
             self.assertIn("--auto-approve", resumed_command)
-            self.assertEqual(
-                resume_run.call_args.kwargs["env"]["AUTO_AGENTS_SELF_REPAIR_DEPTH"],
-                "1",
-            )
+            resume_env = resume_run.call_args.kwargs["env"]
+            self.assertIn(SELF_REPAIR_LAST_FINGERPRINT_ENV, resume_env)
+            self.assertEqual(resume_env[SELF_REPAIR_REPEAT_COUNT_ENV], "1")
 
     def test_cli_session_commands_notify_completed_state(self) -> None:
         for command, mode in (
