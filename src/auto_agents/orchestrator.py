@@ -944,6 +944,8 @@ class Orchestrator:
                             state = self._run_implementation_loop(state, max_tasks=max_tasks)
                         elif stage == "provider_research":
                             state = self._run_provider_research(state, spec_file)
+                        elif stage == "visual_judge":
+                            state = self._run_visual_judge_stage(state)
                         elif stage == "verify":
                             state = self._run_verify(state)
                         elif stage == "readme":
@@ -1136,6 +1138,21 @@ class Orchestrator:
             state.tasks = self._load_tasks_from_plan()
             state.plan_task_replacements = self._derive_plan_task_replacements(prior_tasks, state.tasks)
             self._emit_plan_task_count(state.tasks)
+        return state
+
+    def _run_visual_judge_stage(self, state: RunState) -> RunState:
+        report_refs = [
+            ref
+            for task in state.tasks
+            for proof in task.requirement_proofs
+            for ref in proof.get("evidence_refs", []) or []
+            if isinstance(ref, str) and "/visual_judge/" in ref
+        ]
+        state.current_stage = "visual_judge"
+        state.stage_summaries["visual_judge"] = (
+            f"Visual judge already executed per task during implement; reports={len(set(report_refs))}."
+        )
+        state.last_error = ""
         return state
 
     def _ensure_agent_instructions_synced(self) -> AgentInstructionSyncResult:

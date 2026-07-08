@@ -26,7 +26,7 @@ from auto_agents.config import (
 from auto_agents.gates import FailureExtraction
 from auto_agents.git_ops import changed_paths, commit_all, worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentResult, CommandResult, GateParallelGroup, GateResult, TaskSpec
+from auto_agents.models import AgentResult, CommandResult, GateParallelGroup, GateResult, RunState, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.validation import validation_report
 
@@ -2507,6 +2507,36 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(len(captured_commands), 2)
             self.assertIn("tests/test_public_api.py::test_first", captured_commands[0])
             self.assertIn("tests/test_public_api.py::test_second", captured_commands[1])
+
+    def test_visual_judge_top_level_stage_records_task_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-visual",
+                title="Visual task",
+                description="Task with task-level visual judge evidence.",
+                acceptance=["visual judge is recorded"],
+                status="done",
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "verified",
+                        "evidence_refs": [
+                            ".auto-agents/runs/run-1/visual_judge/task-visual/report.json",
+                        ],
+                    }
+                ],
+            )
+            state = RunState(run_id="run-1", tasks=[task], last_error="Unsupported stage: visual_judge")
+
+            updated = orchestrator._run_visual_judge_stage(state)
+
+            self.assertEqual(updated.current_stage, "visual_judge")
+            self.assertEqual(updated.last_error, "")
+            self.assertIn("reports=1", updated.stage_summaries["visual_judge"])
 
     def test_persisted_tasks_keep_generated_verification_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
