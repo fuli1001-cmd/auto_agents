@@ -1862,6 +1862,45 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertIn("advisory: no corroborating authoritative product-file match", report)
             self.assertIn("specs/2026-01-01-old.md", report)
 
+    def test_orchestrator_audit_uses_resume_context_spec_for_historical_specs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {"version": 1, "requirements": [_requirement(
+                    source="specs/2026-07-02-current.md",
+                    forbidden_patterns=["legacy_detail_page"],
+                )]},
+            )
+            specs = project_root / "specs"
+            specs.mkdir(parents=True, exist_ok=True)
+            write_text(specs / "2026-01-01-old.md", "This old iteration required a legacy_detail_page.\n")
+            write_text(specs / "2026-07-02-current.md", "Current iteration removes it.\n")
+            task = TaskSpec(
+                task_id="task-001",
+                title="Build",
+                description="Build it.",
+                acceptance=["works"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[_proof(status="verified")],
+                status="done",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 1, "tasks": [task.to_dict()]},
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            state.resume_context["spec_file"] = str(specs / "2026-07-02-current.md")
+            save_run_state(project_root, state)
+
+            result = Orchestrator(project_root).audit_requirements()
+
+            self.assertTrue(result["ok"], msg=result["summary"])
+            self.assertIn("advisory: no corroborating authoritative product-file match", result["summary"])
+            self.assertIn("specs/2026-01-01-old.md", result["summary"])
+
     def test_requirements_audit_current_spec_forbidden_pattern_hard_fails(self) -> None:
         # The CURRENT iteration spec is authoritative: a forbidden pattern there hard-fails.
         with tempfile.TemporaryDirectory() as tmp:

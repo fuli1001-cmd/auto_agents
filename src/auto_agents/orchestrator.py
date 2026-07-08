@@ -408,7 +408,7 @@ class Orchestrator:
             return False
 
         audit_result = run_requirements_audit(
-            self.project_root, tasks, current_spec=self._active_spec_file
+            self.project_root, tasks, current_spec=self._current_audit_spec(state)
         )
         if bool(audit_result.get("ok")):
             return False
@@ -1139,6 +1139,22 @@ class Orchestrator:
             state.plan_task_replacements = self._derive_plan_task_replacements(prior_tasks, state.tasks)
             self._emit_plan_task_count(state.tasks)
         return state
+
+    def _current_audit_spec(self, state: Optional[RunState] = None) -> Optional[Path]:
+        if self._active_spec_file is not None:
+            return self._active_spec_file
+        if state is None:
+            try:
+                state = load_run_state(self.project_root)
+            except (FileNotFoundError, KeyError, ValueError):
+                return None
+        raw_spec = str(state.resume_context.get("spec_file", "")).strip()
+        if not raw_spec:
+            return None
+        candidate = Path(raw_spec).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.project_root / candidate
+        return candidate.resolve()
 
     def _run_visual_judge_stage(self, state: RunState) -> RunState:
         report_refs = [
@@ -3676,7 +3692,7 @@ class Orchestrator:
         # Legacy release-rejection recovery task: the full requirement ledger must pass.
         if self._is_requirements_audit_recovery_task(task):
             audit_result = run_requirements_audit(
-                self.project_root, tasks, current_spec=self._active_spec_file
+                self.project_root, tasks, current_spec=self._current_audit_spec(state)
             )
             if bool(audit_result.get("ok")):
                 return None
@@ -3700,7 +3716,7 @@ class Orchestrator:
         audit_result = run_requirements_audit(
             self.project_root,
             tasks,
-            current_spec=self._active_spec_file,
+            current_spec=self._current_audit_spec(state),
             assume_done_task_ids=assume_done,
         )
         failed_requirements = {
@@ -5357,7 +5373,7 @@ class Orchestrator:
                 tasks = state.tasks or self._load_tasks_from_plan()
                 state.tasks = tasks
                 audit_result = run_requirements_audit(
-                    self.project_root, tasks, current_spec=self._active_spec_file
+                    self.project_root, tasks, current_spec=self._current_audit_spec(state)
                 )
                 if not bool(audit_result["ok"]):
                     state.stage_summaries.pop("verify", None)
@@ -5402,7 +5418,7 @@ class Orchestrator:
         tasks = state.tasks or self._load_tasks_from_plan()
         state.tasks = tasks
         audit_result = run_requirements_audit(
-            self.project_root, tasks, current_spec=self._active_spec_file
+            self.project_root, tasks, current_spec=self._current_audit_spec(state)
         )
         audit_ok = bool(audit_result["ok"])
         audit_report = str(audit_result["report"])
@@ -8167,7 +8183,9 @@ class Orchestrator:
     def audit_requirements(self) -> Dict[str, object]:
         state = load_run_state(self.project_root)
         tasks = state.tasks or self._load_tasks_from_plan()
-        result = run_requirements_audit(self.project_root, tasks)
+        result = run_requirements_audit(
+            self.project_root, tasks, current_spec=self._current_audit_spec(state)
+        )
         return {
             "ok": bool(result["ok"]),
             "path": str(result["path"]),
