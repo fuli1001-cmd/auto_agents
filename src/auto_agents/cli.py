@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import shlex
 import sys
 from pathlib import Path
@@ -18,8 +19,21 @@ from .config import (
 )
 from .config import supported_provider_kinds
 from .env import load_dotenv
-from .notifications import notify_run_finished, notify_run_started, notify_session_finished, notify_session_started
+from .notifications import (
+    notify_run_finished,
+    notify_run_started,
+    notify_self_repair_finished,
+    notify_session_finished,
+    notify_session_started,
+)
 from .orchestrator import Orchestrator
+from .self_repair import (
+    AutoAgentsSelfRepairRunner,
+    SelfRepairDecision,
+    append_self_repair_depth,
+    auto_agents_repo_root,
+    classify_auto_agents_error,
+)
 from .validation import validation_report
 
 
@@ -172,6 +186,13 @@ def _notify_run_failure(project_root: Path, error: object) -> None:
     _safe_notify(notify_run_finished, project_root, state_payload, status="failed", error=str(error))
 
 
+def _try_load_run_state(project_root: Path):
+    try:
+        return load_run_state(project_root)
+    except Exception:
+        return None
+
+
 def _session_mode_for_command(command: str) -> str:
     return "provider_resolve" if command == "provider-resolve" else command
 
@@ -247,6 +268,83 @@ def _auto_resolve_provider_blocker(
     _safe_notify(notify_run_finished, project_root, resumed_state.to_dict())
     print(_render_run_summary(project_root, resumed_state.to_dict()))
     return 0
+
+
+def _run_command_for_self_repair_resume(args) -> list[str]:
+    command = [
+        sys.executable,
+        str(auto_agents_repo_root() / "auto_agents.py"),
+        "run",
+        "--project",
+        str(args.project),
+    ]
+    if getattr(args, "spec_file", None):
+        command.extend(["--spec-file", str(args.spec_file)])
+    if bool(getattr(args, "auto_approve", False)):
+        command.append("--auto-approve")
+    if bool(getattr(args, "allow_dirty_tree", False)):
+        command.append("--allow-dirty-tree")
+    if getattr(args, "max_tasks", None) is not None:
+        command.extend(["--max-tasks", str(args.max_tasks)])
+    if bool(getattr(args, "skip_validate", False)):
+        command.append("--skip-validate")
+    if bool(getattr(args, "print_agent_output", False)):
+        command.append("--print-agent-output")
+    if getattr(args, "provider", None):
+        command.extend(["--provider", str(args.provider)])
+    if getattr(args, "doc_language", None):
+        command.extend(["--doc-language", str(args.doc_language)])
+    if bool(getattr(args, "no_repo_map", False)):
+        command.append("--no-repo-map")
+    return command
+
+
+def _auto_repair_auto_agents_and_resume(
+    project_root: Path,
+    orchestrator: Orchestrator,
+    error: object,
+    decision: SelfRepairDecision,
+    args,
+) -> int:
+    print(
+        "Run hit an auto_agents-owned failure. Starting automatic auto_agents self-repair...",
+        file=sys.stderr,
+    )
+    runner = AutoAgentsSelfRepairRunner(
+        orchestrator,
+        target_project_root=project_root,
+        error=error,
+        decision=decision,
+        print_agent_output=bool(getattr(args, "print_agent_output", False)),
+    )
+    result = runner.run()
+    _safe_notify(
+        notify_self_repair_finished,
+        project_root,
+        auto_agents_root=runner.repo_root,
+        status=result.status,
+        reason=str(error),
+        commit_sha=result.commit_sha,
+        summary=result.summary or result.reason,
+        verification=result.verification,
+    )
+    if not result.ok:
+        message = f"automatic auto_agents self-repair failed: {result.reason}"
+        _notify_run_failure(project_root, message)
+        print(json.dumps({"ok": False, "error": message}, indent=2, ensure_ascii=False))
+        return 1
+
+    print(
+        f"auto_agents self-repair committed {result.commit_sha[:12]}. Resuming run with repaired code...",
+        file=sys.stderr,
+    )
+    process = subprocess.run(
+        _run_command_for_self_repair_resume(args),
+        cwd=str(auto_agents_repo_root()),
+        env=append_self_repair_depth(),
+        text=True,
+    )
+    return process.returncode
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -493,6 +591,18 @@ def main(argv: list[str] | None = None) -> int:
                     print_agent_output=bool(args.print_agent_output),
                 )
             project_root = Path(args.project)
+            decision = classify_auto_agents_error(
+                error,
+                state=_try_load_run_state(project_root),
+            )
+            if orchestrator is not None and decision.eligible:
+                return _auto_repair_auto_agents_and_resume(
+                    project_root,
+                    orchestrator,
+                    error,
+                    decision,
+                    args,
+                )
             _notify_run_failure(project_root, error)
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1

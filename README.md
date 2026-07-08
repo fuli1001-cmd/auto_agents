@@ -421,6 +421,7 @@ configuration balances quality and token usage:
 | implement | `deep` | `deep` | Stronger reasoning reduces review rejections |
 | review | `balanced` | auto-escalated | Automatically escalated to `deep` for risky diffs |
 | verify | `balanced` | `balanced` | Runs local commands, no LLM reasoning needed |
+| self_repair | `max` | `max` | Repairs auto_agents itself after eligible orchestrator-owned failures |
 | readme | `balanced` | `balanced` | Interactive README generation from finalized repo |
 
 Review auto-escalation triggers (when configured as `balanced`):
@@ -698,6 +699,13 @@ allowed to fix product code, migrate stale tests, or do both, but must stop and 
 clarification blocker if active requirements and repository tests disagree in a way the existing
 oracles cannot resolve. After the configured recovery budget is exhausted, auto_agents rewinds to
 `clarify` instead of looping indefinitely.
+
+When a `run` fails with a conservative auto_agents-owned signal, such as a gate-scope
+classification error produced by the orchestrator itself, the CLI can start an automatic
+auto_agents self-repair pass. That pass edits and verifies the auto_agents repository only, commits
+the generic repair, sends an Enterprise WeChat summary when notifications are configured, and then
+restarts the original `run` command in a fresh process. It does not edit the target project and is
+limited to one nested self-repair attempt to avoid loops.
 
 Implementation resume is task-aware rather than fully transactional:
 

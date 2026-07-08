@@ -161,7 +161,8 @@
         "review": { "type": "string" },
         "verify": { "type": "string" },
         "readme": { "type": "string" },
-        "visual_judge": { "type": "string" }
+        "visual_judge": { "type": "string" },
+        "self_repair": { "type": "string" }
       },
       "required": [
         "clarify",

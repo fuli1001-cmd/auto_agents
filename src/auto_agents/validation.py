@@ -21,7 +21,13 @@ TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 ALLOWED_TASK_STATUS = {"pending", "in_progress", "blocked", "done"}
 ALLOWED_EFFORTS = {"balanced", "deep", "max"}
 REQUIRED_EFFORT_STAGES = tuple(DEFAULT_EFFORTS)
-DEFAULTED_EFFORT_STAGES = {"sync-agent-instructions", "provider_research", "arbiter", "visual_judge"}
+DEFAULTED_EFFORT_STAGES = {
+    "sync-agent-instructions",
+    "provider_research",
+    "arbiter",
+    "visual_judge",
+    "self_repair",
+}
 MAX_ACCEPTANCE_WITHOUT_SCOPE_RATIONALE = 5
 MAX_ACCEPTANCE_HARD_LIMIT = 7
 REQUIRED_DOC_HEADINGS = {

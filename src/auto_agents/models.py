@@ -26,6 +26,7 @@ DEFAULT_EFFORTS = {
     "implement": "deep",
     "review": "balanced",
     "visual_judge": "balanced",
+    "self_repair": "max",
     "verify": "balanced",
     "readme": "balanced",
     "arbiter": "balanced",

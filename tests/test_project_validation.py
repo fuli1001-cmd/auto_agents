@@ -31,6 +31,7 @@ from auto_agents.git_ops import working_tree_clean
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentRequest, AgentResult, AgentUsage, ProjectConfig, ProviderConfig, SessionState, TaskSpec
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.self_repair import AutoAgentsSelfRepairRunner, SelfRepairDecision, SelfRepairResult, classify_auto_agents_error
 from auto_agents.validation import (
     validate_required_document,
     validate_project_config_payload,
@@ -486,12 +487,14 @@ class ProjectValidationTests(unittest.TestCase):
         payload = copy.deepcopy(DEFAULT_CONFIG)
         del payload["efforts"]["provider_research"]
         del payload["efforts"]["sync-agent-instructions"]
+        del payload["efforts"]["self_repair"]
 
         self.assertEqual(validate_project_config_payload(payload), [])
 
         config = ProjectConfig.from_dict(payload)
         self.assertEqual(config.efforts["provider_research"], "deep")
         self.assertEqual(config.efforts["sync-agent-instructions"], "deep")
+        self.assertEqual(config.efforts["self_repair"], "max")
 
     def test_project_config_rejects_legacy_agent_instructions_node(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
@@ -701,6 +704,51 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertFalse(payload["ok"])
             self.assertIn("Expecting property name enclosed in double quotes", payload["error"])
 
+    def test_self_repair_classifier_accepts_gate_scope_mismatch_only(self) -> None:
+        scope_error = (
+            "Task task-224 failed gates: verification scope mismatch: new failures are outside "
+            "this task's owned test/proof surface. Owned scope: cmd:npm test. "
+            "New failure paths: tests/test_requirements_audit_state.py. Treat this as a "
+            "product-contract or gate-scope issue instead of retrying implementation."
+        )
+        decision = classify_auto_agents_error(scope_error, env={})
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.category, "verification_scope_mismatch")
+
+        review_decision = classify_auto_agents_error(
+            "Task task-001 failed gates: review rejected the task",
+            env={},
+        )
+        self.assertFalse(review_decision.eligible)
+
+    def test_self_repair_classifier_honors_depth_limit(self) -> None:
+        scope_error = (
+            "Task task-224 failed gates: verification scope mismatch: new failures are outside "
+            "this task's owned test/proof surface."
+        )
+        decision = classify_auto_agents_error(
+            scope_error,
+            env={"AUTO_AGENTS_SELF_REPAIR_DEPTH": "1"},
+        )
+        self.assertFalse(decision.eligible)
+        self.assertIn("depth limit", decision.reason)
+
+    def test_self_repair_runner_uses_dedicated_effort(self) -> None:
+        class FakeConfig:
+            efforts = {"self_repair": "balanced", "implement": "max"}
+
+        class FakeOrchestrator:
+            config = FakeConfig()
+
+        runner = AutoAgentsSelfRepairRunner(
+            FakeOrchestrator(),
+            target_project_root=Path("/tmp/demo"),
+            error="boom",
+            decision=SelfRepairDecision(True, category="auto_agents_traceback", reason="traceback"),
+        )
+
+        self.assertEqual(runner._effort(), "balanced")
+
     def test_cli_run_auto_starts_fresh_provider_resolve_for_current_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -767,6 +815,82 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("Starting automatic provider recovery", stderr.getvalue())
             notify.assert_called_once()
             self.assertEqual(notify.call_args.args[1]["status"], "completed")
+
+    def test_cli_run_auto_repairs_auto_agents_and_resumes_current_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            scope_error = (
+                "Task task-224 failed gates: verification scope mismatch: new failures are outside "
+                "this task's owned test/proof surface. Owned scope: cmd:npm test. "
+                "New failure paths: tests/test_requirements_audit_state.py. Treat this as a "
+                "product-contract or gate-scope issue instead of retrying implementation."
+            )
+
+            def mock_run(_self, *args, **kwargs):
+                state = load_run_state(project_root)
+                state.status = "failed"
+                state.current_stage = "implement"
+                state.last_error = scope_error
+                save_run_state(project_root, state)
+                raise RuntimeError(scope_error)
+
+            runner_calls = {"count": 0}
+
+            class FakeSelfRepairRunner:
+                repo_root = Path("/tmp/auto_agents_repo")
+
+                def __init__(self, orchestrator, **kwargs):
+                    runner_calls["count"] += 1
+                    self.kwargs = kwargs
+
+                def run(self):
+                    return SelfRepairResult(
+                        ok=True,
+                        status="completed",
+                        reason="repaired",
+                        category="verification_scope_mismatch",
+                        commit_sha="abc123456789",
+                        summary="generic fix\nCOMMIT_MESSAGE: repair gate scope handling",
+                        verification="tests passed",
+                    )
+
+            completed = subprocess.CompletedProcess(args=["python"], returncode=0)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch.object(Orchestrator, "run", mock_run),
+                patch("auto_agents.cli.AutoAgentsSelfRepairRunner", FakeSelfRepairRunner),
+                patch("auto_agents.cli.subprocess.run", return_value=completed) as resume_run,
+                patch("auto_agents.cli.notify_self_repair_finished") as notify_self_repair,
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                exit_code = main([
+                    "run",
+                    "--project",
+                    str(project_root),
+                    "--spec-file",
+                    str(spec_file),
+                    "--auto-approve",
+                ])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(runner_calls["count"], 1)
+            self.assertIn("Starting automatic auto_agents self-repair", stderr.getvalue())
+            self.assertIn("Resuming run with repaired code", stderr.getvalue())
+            notify_self_repair.assert_called_once()
+            resume_run.assert_called_once()
+            resumed_command = resume_run.call_args.args[0]
+            self.assertIn("run", resumed_command)
+            self.assertIn("--auto-approve", resumed_command)
+            self.assertEqual(
+                resume_run.call_args.kwargs["env"]["AUTO_AGENTS_SELF_REPAIR_DEPTH"],
+                "1",
+            )
 
     def test_cli_session_commands_notify_completed_state(self) -> None:
         for command, mode in (

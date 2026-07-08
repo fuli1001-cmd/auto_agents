@@ -132,6 +132,38 @@ def notify_session_started(
     )
 
 
+def notify_self_repair_finished(
+    target_project_root: Path,
+    *,
+    auto_agents_root: Path,
+    status: str,
+    reason: str,
+    commit_sha: str = "",
+    summary: str = "",
+    verification: str = "",
+) -> bool:
+    if status not in {"completed", "failed"}:
+        return False
+    detail_lines = []
+    if reason.strip():
+        detail_lines.extend(["**Trigger**", _truncate_text(reason.strip(), 700)])
+    if summary.strip():
+        detail_lines.extend(["", "**Repair Summary**", _truncate_text(summary.strip(), 700)])
+    if commit_sha.strip():
+        detail_lines.extend(["", f"> Commit: {commit_sha.strip()}"])
+    if verification.strip():
+        detail_lines.extend(["", "**Verification**", _truncate_text(verification.strip(), 700)])
+    detail_lines.extend(["", f"> auto_agents: {auto_agents_root.expanduser()}"])
+    return notify_flow_finished(
+        target_project_root,
+        workflow="self-repair",
+        status=status,
+        identifier=commit_sha[:12] if commit_sha else "",
+        detail="\n".join(detail_lines).strip(),
+        paths=(auto_agents_root,),
+    )
+
+
 def notify_flow_started(
     project_root: Path,
     *,
