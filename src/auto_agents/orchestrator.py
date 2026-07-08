@@ -527,11 +527,22 @@ class Orchestrator:
             return f"{path} is an immutable input specification"
         return ""
 
+    @staticmethod
+    def _is_non_authoritative_forbidden_pattern_blocker(blocker: Dict[str, object]) -> bool:
+        authoritative = blocker.get("authoritative")
+        if isinstance(authoritative, bool):
+            return not authoritative
+        if isinstance(authoritative, str):
+            return authoritative.strip().lower() in {"false", "0", "no"}
+        return False
+
     @classmethod
     def _audit_issue_route(cls, blocker: Dict[str, object]) -> Tuple[Optional[str], str]:
         kind = str(blocker.get("kind", "")).strip()
         message = str(blocker.get("message", "")).strip() or "requirements audit blocker"
         if kind == "forbidden_pattern":
+            if cls._is_non_authoritative_forbidden_pattern_blocker(blocker):
+                return None, ""
             unsafe_reason = cls._unsafe_forbidden_pattern_recovery_reason(blocker)
             if unsafe_reason:
                 return None, f"{message}; automatic recovery is unsafe because {unsafe_reason}"
@@ -558,6 +569,8 @@ class Orchestrator:
         kind = str(blocker.get("kind", "")).strip()
         if kind == "forbidden_pattern":
             path = str(blocker.get("path", "")).strip() or "unknown path"
+            if Orchestrator._is_non_authoritative_forbidden_pattern_blocker(blocker):
+                return f"forbidden pattern found in {path} (corroboration-only; not a recovery target)"
             unsafe_reason = Orchestrator._unsafe_forbidden_pattern_recovery_reason(blocker)
             if unsafe_reason:
                 return f"forbidden pattern found in {path} (not auto-fixable: {unsafe_reason})"

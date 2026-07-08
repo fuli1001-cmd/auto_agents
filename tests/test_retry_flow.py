@@ -4499,6 +4499,39 @@ class RetryFlowTests(unittest.TestCase):
                 self.assertIn("automatic recovery is unsafe", hard_failure)
                 self.assertNotIn("owned by implement", Orchestrator._audit_blocker_feedback(blocker))
 
+    def test_requirements_audit_route_ignores_non_authoritative_immutable_spec_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            audit_result = {
+                "issues": [
+                    {
+                        "requirement_id": "REQ-001",
+                        "result": "fail",
+                        "blockers": [
+                            {
+                                "kind": "forbidden_pattern",
+                                "message": "forbidden pattern found in specs/2026-01-01-old.md",
+                                "path": "specs/2026-01-01-old.md",
+                                "authoritative": False,
+                            },
+                            {
+                                "kind": "forbidden_pattern",
+                                "message": "forbidden pattern found in app/service.py",
+                                "path": "app/service.py",
+                                "authoritative": True,
+                            },
+                        ],
+                    }
+                ]
+            }
+
+            target_stage, hard_failures = orchestrator._requirements_audit_route(audit_result)
+
+            self.assertEqual(target_stage, "implement")
+            self.assertEqual(hard_failures, [])
+
     def test_requirements_audit_route_ignores_advisory_blockers_on_failed_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -4764,6 +4797,72 @@ class RetryFlowTests(unittest.TestCase):
             run_state_text = (project_root / ".auto-agents" / "state" / "run_state.json").read_text(encoding="utf-8")
             self.assertNotIn("legacy_gateway still exists", task_plan_text)
             self.assertNotIn("legacy_gateway still exists", run_state_text)
+
+    def test_requirements_audit_historical_spec_corroboration_does_not_block_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            specs = project_root / "specs"
+            specs.mkdir()
+            spec_file = specs / "2026-07-02-current.md"
+            spec_file.write_text("# Current spec\n", encoding="utf-8")
+            write_text(specs / "2026-01-01-old.md", "Old iteration required legacy_gateway.\n")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Do not keep the legacy backend path.",
+                            "source": "specs/2026-07-02-current.md",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["artifact is modernized"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": ["legacy_gateway"],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "done",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            (project_root / "app").mkdir()
+            write_text(project_root / "app" / "service.py", "legacy_gateway = True\n")
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = AuditRecoveryAdapter(project_root)
+            self._seed_verify_ready_state(project_root, orchestrator)
+
+            state = orchestrator.run(spec_file=spec_file, auto_approve=True)
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(
+                (project_root / "app" / "service.py").read_text(encoding="utf-8").strip(),
+                "modern_backend = True",
+            )
 
     def test_requirements_audit_recovery_emits_verify_failure_before_rewind(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
