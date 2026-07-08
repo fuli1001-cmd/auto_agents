@@ -715,6 +715,17 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(decision.eligible)
         self.assertEqual(decision.category, "verification_scope_mismatch")
 
+        audit_error = (
+            "requirements audit failed: /tmp/demo/.auto-agents/docs/requirements_audit.md\n"
+            "Automatic recovery is unsafe for at least one blocker:\n"
+            "- REQ-116: forbidden pattern 'old contract' found in specs/2026-06-29-iter-01.md; "
+            "automatic recovery is unsafe because specs/2026-06-29-iter-01.md is an immutable "
+            "input specification"
+        )
+        audit_decision = classify_auto_agents_error(audit_error, env={})
+        self.assertTrue(audit_decision.eligible)
+        self.assertEqual(audit_decision.category, "requirements_audit_immutable_input_scope")
+
         review_decision = classify_auto_agents_error(
             "Task task-001 failed gates: review rejected the task",
             env={},

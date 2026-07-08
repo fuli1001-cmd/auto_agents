@@ -96,6 +96,21 @@ def classify_auto_agents_error(
             ),
         )
 
+    if (
+        "requirements audit failed:" in lowered
+        and "automatic recovery is unsafe" in lowered
+        and "forbidden pattern" in lowered
+        and "immutable input specification" in lowered
+    ):
+        return SelfRepairDecision(
+            True,
+            category="requirements_audit_immutable_input_scope",
+            reason=(
+                "requirements audit blocked on immutable input specifications; "
+                "this is eligible for generic audit-scope repair in auto_agents"
+            ),
+        )
+
     if _looks_like_auto_agents_traceback(text):
         return SelfRepairDecision(
             True,
