@@ -198,6 +198,36 @@ class VerifyFailureClassificationTests(unittest.TestCase):
             self.assertIn("tests/test_public_api.py::test_contract", commands[0])
             self.assertNotIn("app/service.py::build_payload", commands[0])
 
+    def test_task_verify_commands_accept_command_evidence_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-001",
+                title="Frontend fidelity",
+                description="",
+                acceptance=[],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "planned",
+                        "evidence_refs": [
+                            "cmd:npm --prefix workbench test -- src/e2e/home.test.ts -t desktop",
+                            ".tmp-tests/frontend-prototype/home-desktop-1440x900.png",
+                            "specs/frondend_prototype/home.html",
+                        ],
+                    }
+                ],
+            )
+
+            self.assertEqual(
+                orchestrator._build_task_verify_commands(task),
+                ["npm --prefix workbench test -- src/e2e/home.test.ts -t desktop"],
+            )
+
     def test_task_verify_prefers_owned_commands_over_global_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -229,6 +259,70 @@ class VerifyFailureClassificationTests(unittest.TestCase):
             def pass_owned(commands, *, collect_all, context):
                 self.assertTrue(collect_all)
                 self.assertIn("tests/test_public_api.py::test_contract", commands[0])
+                return (
+                    GateResult(
+                        ok=True,
+                        commands=[
+                            CommandResult(
+                                command=commands[0],
+                                ok=True,
+                                returncode=0,
+                                stdout="",
+                                stderr="",
+                            )
+                        ],
+                        summary="all commands passed",
+                    ),
+                    "",
+                )
+
+            with patch.object(orchestrator, "_run_gate_commands", side_effect=fail_global):
+                with patch.object(
+                    orchestrator,
+                    "_run_gate_commands_for_commands",
+                    side_effect=pass_owned,
+                ):
+                    with patch.object(orchestrator, "_quick_verify_failure", return_value=""):
+                        result = orchestrator._run_task_verify(task)
+
+            self.assertTrue(result["ok"], msg=str(result))
+
+    def test_task_verify_prefers_command_evidence_over_global_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.gates.commands = ["conda run -p ./.conda python -m pytest -q tests"]
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            task = TaskSpec(
+                task_id="task-001",
+                title="Owned frontend gate",
+                description="",
+                acceptance=[],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "planned",
+                        "evidence_refs": [
+                            "cmd:npm --prefix workbench test -- src/e2e/home.test.ts -t desktop",
+                        ],
+                    }
+                ],
+            )
+
+            def fail_global(*args, **kwargs):
+                raise AssertionError("global gate should not run for command evidence")
+
+            def pass_owned(commands, *, collect_all, context):
+                self.assertTrue(collect_all)
+                self.assertEqual(
+                    commands,
+                    ["npm --prefix workbench test -- src/e2e/home.test.ts -t desktop"],
+                )
                 return (
                     GateResult(
                         ok=True,
@@ -2184,8 +2278,11 @@ class RetryFlowTests(unittest.TestCase):
 
             captured_commands = []
 
-            def fake_run(commands, cwd):
-                captured_commands.extend(commands)
+            def fake_run(commands, parallel_groups, cwd, *, collect_all):
+                all_commands = list(commands)
+                for group in parallel_groups:
+                    all_commands.extend(group.commands)
+                captured_commands.extend(all_commands)
                 return GateResult(
                     ok=True,
                     commands=[
@@ -2196,12 +2293,12 @@ class RetryFlowTests(unittest.TestCase):
                             stdout="",
                             stderr="",
                         )
-                        for command in commands
+                        for command in all_commands
                     ],
                     summary="all commands passed",
                 )
 
-            with patch("auto_agents.orchestrator.run_commands_collect_all", side_effect=fake_run):
+            with patch("auto_agents.orchestrator.run_gate_plan", side_effect=fake_run):
                 result = orchestrator._run_task_proof_evidence(task)
 
             self.assertTrue(result["ok"])
@@ -2245,8 +2342,11 @@ class RetryFlowTests(unittest.TestCase):
 
             captured_commands = []
 
-            def fake_run(commands, cwd):
-                captured_commands.extend(commands)
+            def fake_run(commands, parallel_groups, cwd, *, collect_all):
+                all_commands = list(commands)
+                for group in parallel_groups:
+                    all_commands.extend(group.commands)
+                captured_commands.extend(all_commands)
                 return GateResult(
                     ok=True,
                     commands=[
@@ -2257,12 +2357,12 @@ class RetryFlowTests(unittest.TestCase):
                             stdout="",
                             stderr="",
                         )
-                        for command in commands
+                        for command in all_commands
                     ],
                     summary="all commands passed",
                 )
 
-            with patch("auto_agents.orchestrator.run_commands_collect_all", side_effect=fake_run):
+            with patch("auto_agents.orchestrator.run_gate_plan", side_effect=fake_run):
                 result = orchestrator._run_task_proof_evidence(task)
 
             self.assertTrue(result["ok"])
@@ -2280,6 +2380,73 @@ class RetryFlowTests(unittest.TestCase):
                     "app/application/openai_strict_schema.py::ensure_openai_strict_json_schema",
                     ".auto-agents/docs/architecture.md",
                 ],
+            )
+            self.assertEqual(result["failed_refs"], [])
+
+    def test_task_proof_evidence_runs_command_refs_and_keeps_frontend_assets_supporting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            command_ref = "cmd:npm --prefix workbench test -- src/e2e/home.test.ts -t desktop"
+            screenshot_ref = ".tmp-tests/frontend-prototype/home-desktop-1440x900.png"
+            prototype_ref = "specs/frondend_prototype/home.html"
+            css_ref = "workbench/app/globals.css"
+            task = TaskSpec(
+                task_id="task-001",
+                title="Verify frontend proof evidence",
+                description="Run owned visual proof command and keep assets as evidence.",
+                acceptance=["proof evidence passes"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "verified",
+                        "evidence_refs": [
+                            command_ref,
+                            screenshot_ref,
+                            prototype_ref,
+                            css_ref,
+                        ],
+                    }
+                ],
+            )
+
+            captured_commands = []
+
+            def fake_run(commands, parallel_groups, cwd, *, collect_all):
+                all_commands = list(commands)
+                for group in parallel_groups:
+                    all_commands.extend(group.commands)
+                captured_commands.extend(all_commands)
+                return GateResult(
+                    ok=True,
+                    commands=[
+                        CommandResult(
+                            command=command,
+                            ok=True,
+                            returncode=0,
+                            stdout="",
+                            stderr="",
+                        )
+                        for command in all_commands
+                    ],
+                    summary="all commands passed",
+                )
+
+            with patch("auto_agents.orchestrator.run_gate_plan", side_effect=fake_run):
+                result = orchestrator._run_task_proof_evidence(task)
+
+            self.assertTrue(result["ok"], msg=str(result))
+            self.assertEqual(
+                captured_commands,
+                ["npm --prefix workbench test -- src/e2e/home.test.ts -t desktop"],
+            )
+            self.assertEqual(
+                result["supporting_refs"],
+                [screenshot_ref, prototype_ref, css_ref],
             )
             self.assertEqual(result["failed_refs"], [])
 
@@ -2307,8 +2474,11 @@ class RetryFlowTests(unittest.TestCase):
 
             captured_commands = []
 
-            def fake_run(commands, cwd):
-                captured_commands.extend(commands)
+            def fake_run(commands, parallel_groups, cwd, *, collect_all):
+                all_commands = list(commands)
+                for group in parallel_groups:
+                    all_commands.extend(group.commands)
+                captured_commands.extend(all_commands)
                 return GateResult(
                     ok=True,
                     commands=[
@@ -2319,12 +2489,12 @@ class RetryFlowTests(unittest.TestCase):
                             stdout="",
                             stderr="",
                         )
-                        for command in commands
+                        for command in all_commands
                     ],
                     summary="all commands passed",
                 )
 
-            with patch("auto_agents.orchestrator.run_commands_collect_all", side_effect=fake_run):
+            with patch("auto_agents.orchestrator.run_gate_plan", side_effect=fake_run):
                 first = orchestrator._run_task_proof_evidence(task)
                 task.requirement_proofs[0]["evidence_refs"] = ["tests/test_public_api.py::test_second"]
                 second = orchestrator._run_task_proof_evidence(task)

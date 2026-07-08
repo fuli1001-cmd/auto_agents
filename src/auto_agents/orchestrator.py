@@ -3763,6 +3763,13 @@ class Orchestrator:
         return path.replace("\\", "/").strip().endswith(".py")
 
     @staticmethod
+    def _command_evidence_ref_command(ref: str) -> str:
+        normalized = str(ref).strip()
+        if not normalized.startswith("cmd:"):
+            return ""
+        return normalized[4:].strip()
+
+    @staticmethod
     def _looks_like_supporting_evidence_ref(ref: str) -> bool:
         path, _ = Orchestrator._split_evidence_ref(ref)
         normalized = path.replace("\\", "/").strip()
@@ -3780,6 +3787,17 @@ class Orchestrator:
                 ".tsx",
                 ".js",
                 ".jsx",
+                ".html",
+                ".htm",
+                ".css",
+                ".scss",
+                ".sass",
+                ".png",
+                ".jpg",
+                ".jpeg",
+                ".webp",
+                ".gif",
+                ".svg",
             )
         )
 
@@ -4008,6 +4026,9 @@ class Orchestrator:
         return shlex.join(command)
 
     def _build_task_proof_evidence_command_for_ref(self, ref: str) -> Optional[str]:
+        command_ref = self._command_evidence_ref_command(ref)
+        if command_ref:
+            return command_ref
         if self._looks_like_pytest_evidence_ref(ref):
             return self._build_task_proof_evidence_command([ref])
         if self._looks_like_vitest_evidence_ref(ref):
