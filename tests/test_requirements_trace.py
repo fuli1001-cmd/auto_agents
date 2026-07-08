@@ -1941,7 +1941,7 @@ class RequirementsTraceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
-            pattern = r"(debug_entry|debug_page)[^\n]{0,80}(homepage|normal users)"
+            pattern = r"(确认规划|确认资产|确认分镜)[^\n]{0,60}(按钮|入口|用户点击|人工确认|页面)"
             write_json(
                 requirements_trace_path(project_root),
                 {
@@ -1958,7 +1958,7 @@ class RequirementsTraceTests(unittest.TestCase):
             specs.mkdir(parents=True, exist_ok=True)
             write_text(
                 specs / "2026-07-02-current.md",
-                "Do not expose debug_entry or debug_page to normal users on the homepage.\n",
+                "首页不出现确认规划、确认资产或确认分镜入口。\n",
             )
             task = TaskSpec(
                 task_id="task-001",

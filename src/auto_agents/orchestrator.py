@@ -579,6 +579,8 @@ class Orchestrator:
                 if not isinstance(blocker, dict):
                     hard_failures.append(f"{req_id}: invalid audit blocker payload")
                     continue
+                if blocker.get("advisory"):
+                    continue
                 candidate, hard_failure = self._audit_issue_route(blocker)
                 if hard_failure:
                     hard_failures.append(f"{req_id}: {hard_failure}")

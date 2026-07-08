@@ -4499,6 +4499,37 @@ class RetryFlowTests(unittest.TestCase):
                 self.assertIn("automatic recovery is unsafe", hard_failure)
                 self.assertNotIn("owned by implement", Orchestrator._audit_blocker_feedback(blocker))
 
+    def test_requirements_audit_route_ignores_advisory_blockers_on_failed_requirement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            audit_result = {
+                "issues": [
+                    {
+                        "requirement_id": "REQ-001",
+                        "result": "fail",
+                        "blockers": [
+                            {
+                                "kind": "task_coverage",
+                                "message": "not covered by any done task",
+                            },
+                            {
+                                "kind": "forbidden_pattern",
+                                "message": "forbidden pattern found in specs/old.md",
+                                "path": "specs/old.md",
+                                "advisory": True,
+                            },
+                        ],
+                    }
+                ]
+            }
+
+            target_stage, hard_failures = orchestrator._requirements_audit_route(audit_result)
+
+            self.assertEqual(target_stage, "plan")
+            self.assertEqual(hard_failures, [])
+
     def test_review_feedback_rewinds_to_design_for_architecture_owned_artifact(self) -> None:
         summary = (
             "DECISION: fail\n"
