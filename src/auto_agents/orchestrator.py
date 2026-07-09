@@ -1942,6 +1942,13 @@ class Orchestrator:
                 return False
         return False
 
+    def _is_clarify_conversation_restorable_scope_violation_path(self, path: str) -> bool:
+        normalized = str(path).replace("\\", "/").strip()
+        return normalized in {
+            self._relative_repo_path(docs_dir(self.project_root) / "project_brief.md"),
+            self._relative_repo_path(requirements_trace_path(self.project_root)),
+        }
+
     def _relative_repo_path(self, path: Path) -> str:
         return str(path.relative_to(self.project_root)).replace("\\", "/")
 
@@ -7272,7 +7279,10 @@ class Orchestrator:
         usage_available = False
         restore_workspace = None
         restore_root: Optional[Path] = None
-        if stage == "implement":
+        restorable_clarify_conversation = (
+            stage == "clarify" and stage_key.startswith("clarify-conv-")
+        )
+        if stage == "implement" or restorable_clarify_conversation:
             restore_workspace = tempfile.TemporaryDirectory(prefix="auto-agents-restore-")
             restore_root = Path(restore_workspace.name)
             self._capture_auto_agents_restore_point(restore_root)
@@ -7324,6 +7334,25 @@ class Orchestrator:
                             f"Allowed scope: {'; '.join(allowed_scope)}. "
                             "Do not edit orchestrator-owned .auto-agents state, docs, config, planning files, "
                             "or input specs during implementation; update repository code/tests instead."
+                        )
+                        feedback = last_error
+                        continue
+                    if (
+                        restorable_clarify_conversation
+                        and restore_root is not None
+                        and all(
+                            self._is_clarify_conversation_restorable_scope_violation_path(path)
+                            for path in offending
+                        )
+                    ):
+                        self._restore_paths_from_restore_point(offending, restore_root)
+                        last_error = (
+                            f"stage {stage} modified files outside its ownership during {stage_key}. "
+                            f"Changed paths: {self._changed_path_preview(offending)}. "
+                            f"Allowed scope: {'; '.join(allowed_scope)}. "
+                            "Do not edit project_brief.md or requirements_trace.json during clarify "
+                            "conversation turns; discuss requirements only. The clarify-generate step "
+                            "will own those files."
                         )
                         feedback = last_error
                         continue

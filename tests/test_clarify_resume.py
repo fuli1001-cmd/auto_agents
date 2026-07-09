@@ -3,16 +3,81 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.config import conversation_history_path, load_run_state, save_run_state
-from auto_agents.io_utils import write_text
+from auto_agents.config import (
+    conversation_history_path,
+    docs_dir,
+    load_run_state,
+    requirements_trace_path,
+)
+from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
+
+
+class RecoveringClarifyConversationMutationAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.conversation_calls = 0
+        self.generate_calls = 0
+        self.retry_prompt = ""
+        self.brief_seen_on_retry = ""
+        self.trace_seen_on_retry = ""
+
+    def run(self, request):
+        name = request.output_path.name
+        if name.startswith("clarify-conv"):
+            self.conversation_calls += 1
+            if self.conversation_calls == 1:
+                write_text(
+                    docs_dir(self.project_root) / "project_brief.md",
+                    "# Premature Brief\n",
+                )
+                write_json(
+                    requirements_trace_path(self.project_root),
+                    {"version": 1, "requirements": [{"id": "REQ-PREMATURE"}]},
+                )
+                summary = "Premature artifact write.\nREADY_TO_GENERATE"
+            else:
+                self.retry_prompt = request.prompt
+                self.brief_seen_on_retry = (
+                    docs_dir(self.project_root) / "project_brief.md"
+                ).read_text(encoding="utf-8")
+                self.trace_seen_on_retry = requirements_trace_path(
+                    self.project_root
+                ).read_text(encoding="utf-8")
+                summary = "Clean conversation result.\nREADY_TO_GENERATE"
+        elif name.startswith("clarify-generate"):
+            self.generate_calls += 1
+            write_text(
+                docs_dir(self.project_root) / "project_brief.md",
+                (
+                    "# Project Brief\n\n"
+                    "## Problem\n\nGenerated problem.\n\n"
+                    "## MVP Scope\n\nGenerated scope.\n\n"
+                    "## Non-Goals\n\nGenerated non-goals.\n\n"
+                    "## Constraints\n\nGenerated constraints.\n"
+                ),
+            )
+            write_json(
+                requirements_trace_path(self.project_root),
+                {"version": 1, "requirements": []},
+            )
+            summary = "Generated brief."
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
 
 
 class ClarifyResumeTests(unittest.TestCase):
@@ -69,7 +134,8 @@ class ClarifyResumeTests(unittest.TestCase):
         """When user rejects at resumed confirmation, the conversation
         loop should start with the user's feedback appended."""
         project_root, spec_file = self._setup_project()
-        orchestrator = Orchestrator(project_root)
+        captured = io.StringIO()
+        orchestrator = Orchestrator(project_root, agent_output_stream=captured)
 
         state = load_run_state(project_root)
 
@@ -97,9 +163,7 @@ class ClarifyResumeTests(unittest.TestCase):
                 ok=True, command=[], output_path=Path("."),
                 summary="READY_TO_GENERATE", stdout="",
             )
-            captured = io.StringIO()
-            with redirect_stderr(captured):
-                state = orchestrator._run_interactive_clarify(state, spec_file)
+            state = orchestrator._run_interactive_clarify(state, spec_file)
 
         # History should have the original 2 messages + user feedback + new agent + generate
         saved_history = json.loads(history_path.read_text(encoding="utf-8"))
@@ -112,7 +176,8 @@ class ClarifyResumeTests(unittest.TestCase):
 
     def test_ready_to_generate_rejection_prints_thinking_indicator(self):
         project_root, spec_file = self._setup_project()
-        orchestrator = Orchestrator(project_root)
+        captured = io.StringIO()
+        orchestrator = Orchestrator(project_root, agent_output_stream=captured)
 
         state = load_run_state(project_root)
 
@@ -140,9 +205,7 @@ class ClarifyResumeTests(unittest.TestCase):
 
         with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
             mock_run.side_effect = [clarify_result, clarify_result, generate_result]
-            captured = io.StringIO()
-            with redirect_stderr(captured):
-                orchestrator._run_interactive_clarify(state, spec_file)
+            orchestrator._run_interactive_clarify(state, spec_file)
 
         output = captured.getvalue()
         self.assertIn("Agent is thinking, please wait...", output)
@@ -213,6 +276,39 @@ class ClarifyResumeTests(unittest.TestCase):
             user_msgs,
         )
         self.assertIn("Add authentication.", user_msgs)
+
+    def test_clarify_conversation_restores_premature_requirements_writes_before_retry(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        adapter = RecoveringClarifyConversationMutationAdapter(project_root)
+        orchestrator.adapter = adapter
+        orchestrator._user_input_fn = lambda _prompt: "y"
+
+        original_brief = (docs_dir(project_root) / "project_brief.md").read_text(
+            encoding="utf-8"
+        )
+        original_trace = requirements_trace_path(project_root).read_text(encoding="utf-8")
+        state = load_run_state(project_root)
+
+        state = orchestrator._run_interactive_clarify(state, spec_file)
+
+        self.assertEqual(adapter.conversation_calls, 2)
+        self.assertEqual(adapter.generate_calls, 1)
+        self.assertIn("Previous attempt issues", adapter.retry_prompt)
+        self.assertIn("Do not edit project_brief.md", adapter.retry_prompt)
+        self.assertEqual(adapter.brief_seen_on_retry, original_brief)
+        self.assertEqual(adapter.trace_seen_on_retry, original_trace)
+        self.assertEqual(state.stage_summaries["clarify"], "Generated brief.")
+        self.assertEqual(
+            (docs_dir(project_root) / "project_brief.md").read_text(encoding="utf-8"),
+            (
+                "# Project Brief\n\n"
+                "## Problem\n\nGenerated problem.\n\n"
+                "## MVP Scope\n\nGenerated scope.\n\n"
+                "## Non-Goals\n\nGenerated non-goals.\n\n"
+                "## Constraints\n\nGenerated constraints.\n"
+            ),
+        )
 
     def test_rejection_reentry_preserves_history_and_appends_feedback(self):
         """Requirements rejection should preserve prior clarify context and
