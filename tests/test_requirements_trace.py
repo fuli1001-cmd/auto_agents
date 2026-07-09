@@ -162,6 +162,108 @@ class RequirementsTraceTests(unittest.TestCase):
         self.assertEqual(len(pairs), 1)
         self.assertEqual(pairs[0].surface, "Home")
         self.assertEqual(pairs[0].viewport, "desktop")
+        self.assertEqual(pairs[0].purpose, "prototype_fidelity")
+
+    def test_visual_judge_skips_non_comparable_visual_evidence_entries(self) -> None:
+        task = TaskSpec(
+            task_id="task-visual",
+            title="Home visual fidelity",
+            description="Match prototype.",
+            acceptance=["Home matches prototype."],
+            requirement_ids=["REQ-001"],
+            requirement_proofs=[
+                _proof(
+                    proof_type="mixed",
+                    evidence_refs=[
+                        "tests/e2e/home.visual.spec.ts::captures",
+                        ".tmp-tests/stability-before.png",
+                        ".tmp-tests/stability-after.png",
+                    ],
+                    visual_evidence=[
+                        {
+                            "surface": "Home",
+                            "viewport": "desktop",
+                            "purpose": "layout_stability",
+                            "visual_judge": False,
+                            "prototype_image_ref": "specs/frondend_prototype/home.html",
+                            "actual_image_ref": ".tmp-tests/stability-home-desktop.png",
+                            "prototype_source_ref": "specs/frondend_prototype/home.html",
+                        },
+                        {
+                            "surface": "Home",
+                            "viewport": "desktop",
+                            "purpose": "prototype_fidelity",
+                            "prototype_image_ref": ".tmp-tests/prototype-home-desktop.png",
+                            "actual_image_ref": ".tmp-tests/home-desktop.png",
+                            "prototype_source_ref": "specs/frondend_prototype/home.html",
+                        },
+                    ],
+                )
+            ],
+        )
+        trace = {
+            "version": 1,
+            "frontend_surfaces": [{"name": "Home", "prototype_refs": ["specs/frondend_prototype/home.html"]}],
+            "requirements": [
+                _requirement(
+                    text="Frontend Home page matches the prototype visual surface.",
+                    source="specs/frondend_prototype/home.html",
+                    oracle_type="mixed",
+                    frontend_surface=True,
+                )
+            ],
+        }
+
+        pairs = visual_evidence_pairs_for_task(task, trace, max_pairs=6)
+
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0].actual_image_ref, ".tmp-tests/home-desktop.png")
+        self.assertEqual(pairs[0].purpose, "prototype_fidelity")
+
+    def test_visual_judge_skips_legacy_state_transition_screenshot_pairs(self) -> None:
+        task = TaskSpec(
+            task_id="task-visual",
+            title="Stage text layout stability",
+            description="Verify dynamic state text does not shift layout.",
+            acceptance=["Stage text is stable."],
+            requirement_ids=["REQ-001"],
+            requirement_proofs=[
+                _proof(
+                    proof_type="mixed",
+                    exact_acceptance_oracle=(
+                        "Desktop and mobile browser evidence proves stage text updates keep "
+                        "card height stable with no text overflow, no element overlap, and no layout jump."
+                    ),
+                    evidence_refs=[
+                        "tests/e2e/home.visual.spec.ts::stage_text_layout_is_stable",
+                        ".tmp-tests/frontend-lightweight/stage-text-desktop-1440x900.png",
+                    ],
+                    visual_evidence={
+                        "surface": "Home",
+                        "viewport": "desktop",
+                        "prototype_image_ref": "specs/frondend_prototype/home.html",
+                        "actual_image_ref": ".tmp-tests/frontend-lightweight/stage-text-desktop-1440x900.png",
+                        "prototype_source_ref": "specs/frondend_prototype/home.html",
+                    },
+                )
+            ],
+        )
+        trace = {
+            "version": 1,
+            "frontend_surfaces": [{"name": "Home", "prototype_refs": ["specs/frondend_prototype/home.html"]}],
+            "requirements": [
+                _requirement(
+                    text="Frontend Home page matches the prototype visual surface.",
+                    source="specs/frondend_prototype/home.html",
+                    oracle_type="mixed",
+                    frontend_surface=True,
+                )
+            ],
+        }
+
+        pairs = visual_evidence_pairs_for_task(task, trace, max_pairs=6)
+
+        self.assertEqual(pairs, [])
 
     def test_visual_judge_parse_fails_low_score(self) -> None:
         report = parse_visual_judge_response(

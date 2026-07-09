@@ -161,6 +161,14 @@
                       "properties": {
                         "surface": { "type": "string" },
                         "viewport": { "type": "string" },
+                        "purpose": {
+                          "type": "string",
+                          "description": "prototype_fidelity for prototype-vs-actual visual judge pairs; layout_stability/state_transition/runtime_evidence for screenshots that should not be compared by visual_judge."
+                        },
+                        "evidence_kind": { "type": "string" },
+                        "comparison_type": { "type": "string" },
+                        "visual_judge": { "type": "boolean" },
+                        "judge": { "type": "boolean" },
                         "prototype_image_ref": { "type": "string", "minLength": 1 },
                         "actual_image_ref": { "type": "string", "minLength": 1 },
                         "prototype_source_ref": { "type": "string" }
@@ -175,6 +183,14 @@
                         "properties": {
                           "surface": { "type": "string" },
                           "viewport": { "type": "string" },
+                          "purpose": {
+                            "type": "string",
+                            "description": "prototype_fidelity for prototype-vs-actual visual judge pairs; layout_stability/state_transition/runtime_evidence for screenshots that should not be compared by visual_judge."
+                          },
+                          "evidence_kind": { "type": "string" },
+                          "comparison_type": { "type": "string" },
+                          "visual_judge": { "type": "boolean" },
+                          "judge": { "type": "boolean" },
                           "prototype_image_ref": { "type": "string", "minLength": 1 },
                           "actual_image_ref": { "type": "string", "minLength": 1 },
                           "prototype_source_ref": { "type": "string" }

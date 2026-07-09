@@ -10,6 +10,60 @@ from .models import TaskSpec
 
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+NON_COMPARABLE_VISUAL_PURPOSES = {
+    "layout_stability",
+    "state_transition",
+    "runtime_evidence",
+    "dom_css_evidence",
+    "evidence_only",
+    "screenshot_evidence",
+    "non_comparable",
+    "none",
+}
+PROTOTYPE_COMPARISON_PURPOSES = {
+    "prototype_fidelity",
+    "prototype_comparison",
+    "visual_fidelity",
+    "visual_regression",
+    "page_fidelity",
+}
+NON_COMPARABLE_PROOF_TERMS = (
+    "layout stability",
+    "layout is stable",
+    "state transition",
+    "state update",
+    "transition screenshot",
+    "no overflow",
+    "no overlap",
+    "no layout jump",
+    "height stable",
+    "stable height",
+    "布局稳定",
+    "状态更新",
+    "状态切换",
+    "阶段变化",
+    "阶段文案更新",
+    "高度稳定",
+    "无文字溢出",
+    "无溢出",
+    "无元素重叠",
+    "无重叠",
+    "布局跳动",
+    "文案溢出",
+)
+PROTOTYPE_COMPARISON_TERMS = (
+    "prototype",
+    "visual fidelity",
+    "matches the prototype",
+    "match prototype",
+    "prototype match",
+    "visual contract",
+    "原型",
+    "视觉一致",
+    "视觉还原",
+    "对齐原型",
+    "匹配原型",
+)
 
 
 @dataclass
@@ -21,6 +75,7 @@ class VisualEvidencePair:
     prototype_image_ref: str
     actual_image_ref: str
     prototype_source_ref: str = ""
+    purpose: str = "prototype_fidelity"
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -31,6 +86,7 @@ class VisualEvidencePair:
             "prototype_image_ref": self.prototype_image_ref,
             "actual_image_ref": self.actual_image_ref,
             "prototype_source_ref": self.prototype_source_ref,
+            "purpose": self.purpose,
         }
 
 
@@ -96,8 +152,8 @@ def visual_evidence_pairs_for_task(
         if not isinstance(proof, Mapping):
             continue
         raw_visual = proof.get("visual_evidence")
-        explicit = _explicit_visual_pairs(proof, raw_visual)
-        if explicit:
+        if raw_visual is not None:
+            explicit = _explicit_visual_pairs(proof, raw_visual)
             pairs.extend(explicit)
         else:
             inferred = _infer_visual_pair(proof, surface_by_name)
@@ -206,10 +262,13 @@ def _explicit_visual_pairs(proof: Mapping[str, object], raw_visual: object) -> L
 
     pairs: List[VisualEvidencePair] = []
     for entry in entries:
+        if _visual_evidence_entry_is_non_comparable(proof, entry):
+            continue
         prototype = str(entry.get("prototype_image_ref", "")).strip()
         actual = str(entry.get("actual_image_ref", "")).strip()
         if not prototype or not actual:
             continue
+        purpose = _visual_evidence_purpose(entry) or "prototype_fidelity"
         pairs.append(
             VisualEvidencePair(
                 requirement_id=str(proof.get("requirement_id", "")).strip(),
@@ -219,15 +278,58 @@ def _explicit_visual_pairs(proof: Mapping[str, object], raw_visual: object) -> L
                 prototype_image_ref=prototype,
                 actual_image_ref=actual,
                 prototype_source_ref=str(entry.get("prototype_source_ref", "")).strip(),
+                purpose=purpose,
             )
         )
     return pairs
+
+
+def _visual_evidence_purpose(entry: Mapping[str, object]) -> str:
+    for key in ("purpose", "evidence_kind", "comparison_type", "visual_judge_purpose"):
+        value = str(entry.get(key, "")).strip().lower()
+        if value:
+            return value
+    return ""
+
+
+def _visual_evidence_entry_is_non_comparable(
+    proof: Mapping[str, object],
+    entry: Mapping[str, object],
+) -> bool:
+    explicit_judge = entry.get("visual_judge", entry.get("judge"))
+    if isinstance(explicit_judge, bool) and not explicit_judge:
+        return True
+
+    purpose = _visual_evidence_purpose(entry)
+    if purpose in PROTOTYPE_COMPARISON_PURPOSES:
+        return False
+    if purpose in NON_COMPARABLE_VISUAL_PURPOSES:
+        return True
+
+    return _proof_oracle_indicates_non_comparable_visual_evidence(proof)
+
+
+def _proof_oracle_indicates_non_comparable_visual_evidence(proof: Mapping[str, object]) -> bool:
+    fields = [
+        str(proof.get("exact_acceptance_oracle", "")),
+        str(proof.get("proof_type", "")),
+        str(proof.get("oracle_type", "")),
+    ]
+    for ref in proof.get("evidence_refs", []) or []:
+        if isinstance(ref, str):
+            fields.append(ref)
+    text = " ".join(fields).lower()
+    if any(term in text for term in PROTOTYPE_COMPARISON_TERMS):
+        return False
+    return any(term in text for term in NON_COMPARABLE_PROOF_TERMS)
 
 
 def _infer_visual_pair(
     proof: Mapping[str, object],
     surface_by_name: Mapping[str, Mapping[str, object]],
 ) -> Optional[VisualEvidencePair]:
+    if _proof_oracle_indicates_non_comparable_visual_evidence(proof):
+        return None
     refs = [
         str(item).strip()
         for item in proof.get("evidence_refs", [])
