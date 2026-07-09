@@ -1298,6 +1298,14 @@ class Orchestrator:
             )
         return None
 
+    @staticmethod
+    def _is_requirements_audit_clarify_rejection(reason: str) -> bool:
+        lowered = str(reason or "").lower()
+        return (
+            "the requirements audit failed" in lowered
+            and "recovery route: rerun from clarify" in lowered
+        )
+
     def _run_interactive_clarify(self, state: RunState, spec_file: Path) -> RunState:
         from .config import conversation_history_path
         import json
@@ -1311,18 +1319,22 @@ class Orchestrator:
                 pass
 
         post_rejection = False
+        direct_generate_from_rejection = False
         if state.rejected_stage == "clarify" and state.rejection_reason:
+            rejection_reason = state.rejection_reason
             history.append({
                 "role": "user",
                 "content": (
                     "The previous requirements output was rejected. Treat this as additional user feedback.\n"
                     "Use the existing conversation and generated files as context, and revise only the affected requirements.\n"
-                    f"Feedback:\n{state.rejection_reason}"
+                    f"Feedback:\n{rejection_reason}"
                 )
             })
             state.rejected_stage = ""
             state.rejection_reason = ""
             post_rejection = True
+            direct_generate_from_rejection = self._is_requirements_audit_clarify_rejection(rejection_reason)
+            write_text(history_path, json.dumps(history, indent=2, ensure_ascii=False))
 
         def _history_role(msg: object) -> str:
             if not isinstance(msg, dict):
@@ -1346,7 +1358,7 @@ class Orchestrator:
                         resume_to_confirm = True
                     break
 
-        confirmed_generation = False
+        confirmed_generation = direct_generate_from_rejection
 
         def _record_clarify_feedback(user_reply: str) -> None:
             feedback = user_reply.strip()

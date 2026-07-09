@@ -121,6 +121,27 @@ def classify_auto_agents_error(
             values,
         )
 
+    if (
+        "stage clarify modified files outside its ownership during clarify-conv-" in lowered
+        and "allowed scope:" in lowered
+        and (
+            ".auto-agents/docs/project_brief.md" in text
+            or ".auto-agents/state/requirements_trace.json" in text
+        )
+    ):
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="clarify_conversation_mutation_scope",
+                reason=(
+                    "clarify conversation mutated requirements-owned artifacts before the "
+                    "clarify generation step; this is eligible for generic orchestrator repair"
+                ),
+            ),
+            text,
+            values,
+        )
+
     if _looks_like_auto_agents_traceback(text):
         return _with_repetition_guard(
             SelfRepairDecision(

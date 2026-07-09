@@ -308,6 +308,52 @@ class ClarifyResumeTests(unittest.TestCase):
         self.assertEqual(call_stage_keys, ["clarify-conv-3", "clarify-generate"])
         self.assertEqual(state.stage_summaries["clarify"], "Generated brief.")
 
+    def test_requirements_audit_rejection_reentry_generates_without_conversation_turn(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+
+        state = load_run_state(project_root)
+        state.rejected_stage = "clarify"
+        state.rejection_reason = (
+            "The requirements audit failed. Use "
+            f"{project_root / '.auto-agents' / 'docs' / 'requirements_audit.md'} "
+            "as the source of truth.\n"
+            "Recovery route: rerun from clarify.\n"
+            "Address every failing mandatory requirement before continuing.\n"
+            "Fix only the requirements source of truth."
+        )
+
+        history_path = conversation_history_path(project_root, state.run_id)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(
+            history_path,
+            json.dumps([{"role": "user", "content": "Original discussion."}], ensure_ascii=False),
+        )
+
+        generate_result = AgentResult(
+            ok=True,
+            command=[],
+            output_path=Path("."),
+            summary="Generated brief.",
+            stdout="",
+        )
+
+        with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+            mock_run.return_value = generate_result
+            state = orchestrator._run_interactive_clarify(state, spec_file)
+
+        call_stage_keys = [call.kwargs["stage_key"] for call in mock_run.call_args_list]
+        self.assertEqual(call_stage_keys, ["clarify-generate"])
+        self.assertEqual(state.stage_summaries["clarify"], "Generated brief.")
+        saved_history = json.loads(history_path.read_text(encoding="utf-8"))
+        self.assertTrue(
+            any(
+                "The requirements audit failed" in item.get("content", "")
+                for item in saved_history
+                if item.get("role") == "user"
+            )
+        )
+
     def test_reject_requirements_keeps_clarify_history_file(self):
         project_root, _spec_file = self._setup_project()
         orchestrator = Orchestrator(project_root)

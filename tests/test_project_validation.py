@@ -733,6 +733,17 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(audit_decision.eligible)
         self.assertEqual(audit_decision.category, "requirements_audit_immutable_input_scope")
 
+        ownership_decision = classify_auto_agents_error(
+            "stage clarify modified files outside its ownership during clarify-conv-4. "
+            "Changed paths: .auto-agents/docs/project_brief.md, "
+            ".auto-agents/state/requirements_trace.json. "
+            "Allowed scope: .auto-agents/runs/e4c4bc2fa90d/**; "
+            ".auto-agents/state/run_state.json; .auto-agents/.gitignore.",
+            env={},
+        )
+        self.assertTrue(ownership_decision.eligible)
+        self.assertEqual(ownership_decision.category, "clarify_conversation_mutation_scope")
+
         review_decision = classify_auto_agents_error(
             "Task task-001 failed gates: review rejected the task",
             env={},
