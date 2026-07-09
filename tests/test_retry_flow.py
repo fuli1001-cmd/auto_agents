@@ -4477,12 +4477,10 @@ class RetryFlowTests(unittest.TestCase):
                 self.assertEqual(stage, expected_stage)
                 self.assertEqual(hard_failure, "")
 
-    def test_requirements_audit_forbidden_pattern_on_protected_inputs_is_not_implement_recovery(self) -> None:
+    def test_requirements_audit_forbidden_pattern_on_diagnostics_is_not_recoverable(self) -> None:
         paths = [
             ".auto-agents/docs/requirements_audit.md",
             ".auto-agents/docs/review.md",
-            "spec.md",
-            "specs/2026-07-05-iter-01.md",
         ]
 
         for path in paths:
@@ -4497,6 +4495,27 @@ class RetryFlowTests(unittest.TestCase):
 
                 self.assertIsNone(stage)
                 self.assertIn("automatic recovery is unsafe", hard_failure)
+                self.assertNotIn("owned by implement", Orchestrator._audit_blocker_feedback(blocker))
+
+    def test_requirements_audit_forbidden_pattern_on_immutable_spec_routes_to_clarify(self) -> None:
+        paths = [
+            "spec.md",
+            "specs/2026-07-05-iter-01.md",
+        ]
+
+        for path in paths:
+            with self.subTest(path=path):
+                blocker = {
+                    "kind": "forbidden_pattern",
+                    "message": f"forbidden pattern found in {path}",
+                    "path": path,
+                }
+
+                stage, hard_failure = Orchestrator._audit_issue_route(blocker)
+
+                self.assertEqual(stage, "clarify")
+                self.assertEqual(hard_failure, "")
+                self.assertIn("immutable input spec", Orchestrator._audit_blocker_feedback(blocker))
                 self.assertNotIn("owned by implement", Orchestrator._audit_blocker_feedback(blocker))
 
     def test_requirements_audit_route_ignores_non_authoritative_immutable_spec_hit(self) -> None:
@@ -4562,6 +4581,54 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertEqual(target_stage, "plan")
             self.assertEqual(hard_failures, [])
+
+    def test_requirements_audit_failure_on_immutable_spec_rewinds_to_clarify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.current_stage = "verify"
+            state.stage_summaries = {
+                "clarify": "done",
+                "design": "done",
+                "plan": "done",
+                "provider_research": "done",
+                "implement": "done",
+                "verify": "done",
+            }
+            audit_result = {
+                "path": str(project_root / ".auto-agents" / "docs" / "requirements_audit.md"),
+                "issues": [
+                    {
+                        "requirement_id": "REQ-001",
+                        "result": "fail",
+                        "blockers": [
+                            {
+                                "kind": "forbidden_pattern",
+                                "message": "forbidden pattern found in specs/current.md",
+                                "pattern": "legacy_detail_page",
+                                "path": "specs/current.md",
+                                "authoritative": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+            recovered = orchestrator._handle_requirements_audit_failure(state, audit_result)
+
+            self.assertTrue(recovered)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.current_stage, "clarify")
+            self.assertEqual(state.rejected_stage, "clarify")
+            self.assertEqual(state.last_error, "")
+            self.assertNotIn("verify", state.stage_summaries)
+            self.assertIn("Recovery route: rerun from clarify", state.rejection_reason)
+            self.assertIn("immutable input spec", state.rejection_reason)
+            self.assertIn("requirements_trace.json", state.rejection_reason)
+            self.assertIn("Do not edit input specs", state.rejection_reason)
+            self.assertNotIn("Automatic recovery is unsafe", state.rejection_reason)
 
     def test_review_feedback_rewinds_to_design_for_architecture_owned_artifact(self) -> None:
         summary = (
@@ -4647,6 +4714,94 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.current_stage, "clarify")
             self.assertEqual(state.rejected_stage, "clarify")
             self.assertIn("owned by clarify", state.rejection_reason)
+            task_ids = [task.task_id for task in state.tasks]
+            self.assertEqual(task_ids, ["task-001"])
+            persisted_task_ids = [
+                item["task_id"]
+                for item in json.loads(task_plan_path(project_root).read_text(encoding="utf-8"))["tasks"]
+            ]
+            self.assertEqual(persisted_task_ids, ["task-001"])
+
+    def test_blocked_requirements_audit_recovery_with_immutable_spec_rewinds_to_clarify(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            specs = project_root / "specs"
+            specs.mkdir(parents=True, exist_ok=True)
+            spec_file = specs / "current.md"
+            write_text(spec_file, "This current spec still asks for a legacy_detail_page.\n")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "Do not keep the legacy detail page contract.",
+                            "source": "specs/current.md",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["artifact is modernized"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": ["legacy_detail_page"],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Existing done task",
+                            "description": "Already finished.",
+                            "acceptance": ["done"],
+                            "requirement_ids": ["REQ-001"],
+                            "status": "done",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "fix-rejection-123",
+                            "title": "Fix issues after release rejection",
+                            "description": (
+                                "The release was rejected with the following feedback:\n"
+                                "The requirements audit failed. Use "
+                                f"{project_root / '.auto-agents' / 'docs' / 'requirements_audit.md'} "
+                                "as the source of truth.\n\nPlease fix these issues."
+                            ),
+                            "acceptance": ["Feedback is fully addressed", "Tests pass"],
+                            "requirement_ids": [],
+                            "status": "blocked",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "failed"
+            state.current_stage = "implement"
+            state.last_error = "Task fix-rejection-123 failed gates: review rejected the task"
+            state.resume_context["spec_file"] = str(spec_file)
+            state.tasks = orchestrator._load_tasks_from_plan()
+
+            changed = orchestrator._normalize_blocked_requirements_audit_recovery_resume(state)
+
+            self.assertTrue(changed)
+            self.assertEqual(state.current_stage, "clarify")
+            self.assertEqual(state.rejected_stage, "clarify")
+            self.assertIn("immutable input spec", state.rejection_reason)
             task_ids = [task.task_id for task in state.tasks]
             self.assertEqual(task_ids, ["task-001"])
             persisted_task_ids = [

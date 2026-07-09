@@ -513,6 +513,11 @@ class Orchestrator:
         return "implement"
 
     @classmethod
+    def _is_immutable_input_spec_path(cls, path: object) -> bool:
+        normalized = cls._normalize_audit_blocker_path(path)
+        return normalized == "spec.md" or normalized.startswith("specs/")
+
+    @classmethod
     def _unsafe_forbidden_pattern_recovery_reason(cls, blocker: Dict[str, object]) -> str:
         path = cls._normalize_audit_blocker_path(blocker.get("path"))
         if path in {
@@ -523,8 +528,6 @@ class Orchestrator:
                 f"{path} is an orchestrator diagnostic report, not implementation-owned "
                 "source-of-truth"
             )
-        if path == "spec.md" or path.startswith("specs/"):
-            return f"{path} is an immutable input specification"
         return ""
 
     @staticmethod
@@ -543,6 +546,8 @@ class Orchestrator:
         if kind == "forbidden_pattern":
             if cls._is_non_authoritative_forbidden_pattern_blocker(blocker):
                 return None, ""
+            if cls._is_immutable_input_spec_path(blocker.get("path")):
+                return "clarify", ""
             unsafe_reason = cls._unsafe_forbidden_pattern_recovery_reason(blocker)
             if unsafe_reason:
                 return None, f"{message}; automatic recovery is unsafe because {unsafe_reason}"
@@ -571,6 +576,11 @@ class Orchestrator:
             path = str(blocker.get("path", "")).strip() or "unknown path"
             if Orchestrator._is_non_authoritative_forbidden_pattern_blocker(blocker):
                 return f"forbidden pattern found in {path} (corroboration-only; not a recovery target)"
+            if Orchestrator._is_immutable_input_spec_path(path):
+                return (
+                    f"forbidden pattern found in {path} "
+                    "(immutable input spec; repair the derived requirements trace via clarify)"
+                )
             unsafe_reason = Orchestrator._unsafe_forbidden_pattern_recovery_reason(blocker)
             if unsafe_reason:
                 return f"forbidden pattern found in {path} (not auto-fixable: {unsafe_reason})"
@@ -701,7 +711,10 @@ class Orchestrator:
             return (
                 f"Fix only the requirements source of truth at {docs_dir(self.project_root) / 'project_brief.md'} "
                 f"and {requirements_trace_path(self.project_root)}. Do not edit input specs, project code, "
-                "tests, README.md, or .auto-agents diagnostic reports to make the audit pass."
+                "tests, README.md, or .auto-agents diagnostic reports to make the audit pass. "
+                "If the finding is in an immutable input spec, reconcile the derived requirement "
+                "text/source/status/forbidden_patterns so they encode the current contract without "
+                "matching the spec itself."
             )
         if target_stage == "design":
             return (
