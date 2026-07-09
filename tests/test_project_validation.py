@@ -733,6 +733,21 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(audit_decision.eligible)
         self.assertEqual(audit_decision.category, "requirements_audit_immutable_input_scope")
 
+        diagnostic_audit_decision = classify_auto_agents_error(
+            "requirements audit failed: /tmp/demo/.auto-agents/docs/requirements_audit.md\n"
+            "Automatic recovery is unsafe for at least one blocker:\n"
+            "- REQ-001: forbidden pattern 'old wording' found in "
+            ".auto-agents/docs/requirements_audit.md; automatic recovery is unsafe because "
+            ".auto-agents/docs/requirements_audit.md is an orchestrator diagnostic report, "
+            "not implementation-owned source-of-truth",
+            env={},
+        )
+        self.assertTrue(diagnostic_audit_decision.eligible)
+        self.assertEqual(
+            diagnostic_audit_decision.category,
+            "requirements_audit_diagnostic_scope",
+        )
+
         ownership_decision = classify_auto_agents_error(
             "stage clarify modified files outside its ownership during clarify-conv-4. "
             "Changed paths: .auto-agents/docs/project_brief.md, "
@@ -743,6 +758,41 @@ class ProjectValidationTests(unittest.TestCase):
         )
         self.assertTrue(ownership_decision.eligible)
         self.assertEqual(ownership_decision.category, "clarify_conversation_mutation_scope")
+
+        readme_proposal_decision = classify_auto_agents_error(
+            "stage readme modified files outside its ownership during readme-propose. "
+            "Changed paths: README.md. Allowed scope: .auto-agents/runs/demo/**; "
+            ".auto-agents/state/run_state.json; .auto-agents/.gitignore.",
+            env={},
+        )
+        self.assertTrue(readme_proposal_decision.eligible)
+        self.assertEqual(readme_proposal_decision.category, "readme_proposal_mutation_scope")
+
+        verification_steps_decision = classify_auto_agents_error(
+            "generated verification steps are invalid:\n"
+            "- unsupported verification step runner: custom-shell",
+            env={},
+        )
+        self.assertTrue(verification_steps_decision.eligible)
+        self.assertEqual(verification_steps_decision.category, "generated_verification_contract")
+
+        verification_commands_decision = classify_auto_agents_error(
+            "generated verification commands are invalid:\n"
+            "- task plan verification_commands references a path outside the project",
+            env={},
+        )
+        self.assertTrue(verification_commands_decision.eligible)
+        self.assertEqual(verification_commands_decision.category, "generated_verification_contract")
+
+        implement_config_decision = classify_auto_agents_error(
+            "stage implement modified files outside its ownership during implement-task-225. "
+            "Changed paths: .auto-agents/config.json. "
+            "Allowed scope: .auto-agents/runs/52d7c48bd1f2/**; "
+            ".auto-agents/state/run_state.json; .auto-agents/.gitignore; "
+            "any non-.auto-agents project path except input specs.",
+            env={},
+        )
+        self.assertFalse(implement_config_decision.eligible)
 
         review_decision = classify_auto_agents_error(
             "Task task-001 failed gates: review rejected the task",

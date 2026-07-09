@@ -122,6 +122,25 @@ def classify_auto_agents_error(
         )
 
     if (
+        "requirements audit failed:" in lowered
+        and "automatic recovery is unsafe" in lowered
+        and "forbidden pattern" in lowered
+        and "orchestrator diagnostic report" in lowered
+    ):
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="requirements_audit_diagnostic_scope",
+                reason=(
+                    "requirements audit blocked on an orchestrator diagnostic artifact; "
+                    "this is eligible for generic audit-scope repair in auto_agents"
+                ),
+            ),
+            text,
+            values,
+        )
+
+    if (
         "stage clarify modified files outside its ownership during clarify-conv-" in lowered
         and "allowed scope:" in lowered
         and (
@@ -142,6 +161,38 @@ def classify_auto_agents_error(
             values,
         )
 
+    if (
+        "stage readme modified files outside its ownership during readme-propose" in lowered
+        and "allowed scope:" in lowered
+        and "readme.md" in lowered
+    ):
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="readme_proposal_mutation_scope",
+                reason=(
+                    "README proposal mutated the final README before the write step; "
+                    "this is eligible for generic orchestrator repair"
+                ),
+            ),
+            text,
+            values,
+        )
+
+    if (
+        "generated verification commands are invalid" in lowered
+        or "generated verification steps are invalid" in lowered
+    ):
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="generated_verification_contract",
+                reason="auto_agents generated invalid verification command configuration",
+            ),
+            text,
+            values,
+        )
+
     if _looks_like_auto_agents_traceback(text):
         return _with_repetition_guard(
             SelfRepairDecision(
@@ -152,18 +203,6 @@ def classify_auto_agents_error(
             text,
             values,
         )
-
-    if state is not None and str(state.current_stage).strip() in {"implement", "verify"}:
-        if "generated verification commands are invalid" in lowered:
-            return _with_repetition_guard(
-                SelfRepairDecision(
-                    True,
-                    category="generated_verification_contract",
-                    reason="auto_agents generated invalid verification command configuration",
-                ),
-                text,
-                values,
-            )
 
     return SelfRepairDecision(False, reason="error is not classified as auto_agents-owned")
 
