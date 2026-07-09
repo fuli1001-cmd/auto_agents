@@ -94,6 +94,7 @@ from .requirements import (
     load_provider_references_lock,
     load_requirements_trace,
     normalize_generated_task_plan_statuses,
+    provider_reference_paths,
     provider_reference_status,
     preserve_task_plan_negative_oracle_clauses,
     run_requirements_audit,
@@ -4692,9 +4693,13 @@ class Orchestrator:
         lock = load_provider_references_lock(self.project_root)
         unresolved = []
         for requirement in docs_required:
-            reference = str(requirement.get("provider_reference", "")).strip()
-            status = provider_reference_status(lock, reference)
-            if not self._is_resolved_provider_reference_status(status):
+            references = provider_reference_paths(requirement)
+            if not references or any(
+                not self._is_resolved_provider_reference_status(
+                    provider_reference_status(lock, reference)
+                )
+                for reference in references
+            ):
                 unresolved.append(requirement)
         if not unresolved:
             summary = "Provider references already verified; research reused from local lock."
@@ -4751,8 +4756,8 @@ class Orchestrator:
         blockers: List[Dict[str, str]] = []
         for requirement in external_doc_requirements(trace):
             req_id = str(requirement.get("id", "")).strip() or "(unknown requirement)"
-            reference = str(requirement.get("provider_reference", "")).strip()
-            if not reference:
+            references = provider_reference_paths(requirement)
+            if not references:
                 blockers.append(
                     {
                         "requirement_id": req_id,
@@ -4762,28 +4767,29 @@ class Orchestrator:
                     }
                 )
                 continue
-            ref_path = self.project_root / reference
-            status = provider_reference_status(lock, reference)
-            normalized_status = status or "missing"
-            if not ref_path.exists():
-                blockers.append(
-                    {
-                        "requirement_id": req_id,
-                        "reference": reference,
-                        "status": "missing",
-                        "reason": f"missing provider reference file {reference}",
-                    }
-                )
-                continue
-            if not self._is_resolved_provider_reference_status(normalized_status):
-                blockers.append(
-                    {
-                        "requirement_id": req_id,
-                        "reference": reference,
-                        "status": normalized_status,
-                        "reason": f"{reference} is {normalized_status}",
-                    }
-                )
+            for reference in references:
+                ref_path = self.project_root / reference
+                status = provider_reference_status(lock, reference)
+                normalized_status = status or "missing"
+                if not ref_path.exists():
+                    blockers.append(
+                        {
+                            "requirement_id": req_id,
+                            "reference": reference,
+                            "status": "missing",
+                            "reason": f"missing provider reference file {reference}",
+                        }
+                    )
+                    continue
+                if not self._is_resolved_provider_reference_status(normalized_status):
+                    blockers.append(
+                        {
+                            "requirement_id": req_id,
+                            "reference": reference,
+                            "status": normalized_status,
+                            "reason": f"{reference} is {normalized_status}",
+                        }
+                    )
         return blockers
 
     def provider_research_resolution_report(self, state: Optional[RunState] = None) -> Dict[str, object]:
@@ -5998,7 +6004,7 @@ class Orchestrator:
             "Do not implement product code in this stage.",
             "Only modify provider reference markdown files under .auto-agents/docs/provider_references/ and .auto-agents/state/provider_references.lock.json.",
             "Do not modify project code, tests, README.md, or task-planning artifacts in this stage.",
-            "For each requirement below, create or update the provider_reference markdown file named in the trace.",
+            "For each requirement below, create or update every provider reference markdown file named in the trace.",
             "Each reference must include: Status, Retrieved at, Official sources, Authentication, Request, Response, Errors, Contract Test Requirements, Unknowns / Ambiguities.",
             "If official docs are unavailable or ambiguous, write a blocked/needs_user_input reference with the exact missing information and recovery options.",
             "Update provider_references.lock.json with one entry per provider reference. Each entry must include path, status, retrieved_at, source_urls, and notes.",
@@ -6133,12 +6139,12 @@ class Orchestrator:
                 "Only update project_brief.md and requirements_trace.json in this stage; do not modify project code, tests, or other repository documents.",
                 "Preserve the exact top-level and section headings already present in the file.",
                 "The requirements trace is the downstream execution contract. It must be valid JSON with version=1 and a requirements list.",
-                "Every active requirement must have id, text, source, status, priority, acceptance_oracles, oracle_type, oracle_strength, evidence_boundary, forbidden_proxy_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields.",
+                "Every active requirement must have id, text, source, status, priority, acceptance_oracles, oracle_type, oracle_strength, evidence_boundary, forbidden_proxy_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields. If a requirement needs multiple provider documents, also set provider_references to a list of local provider reference paths; do not join multiple paths into provider_reference with punctuation.",
                 "Use stable IDs like REQ-001. Mark hard requirements as priority='mandatory'. Use status='active', 'deferred', or 'superseded'.",
                 "If the spec references frontend pages together with prototypes, screenshots, Figma files, mockups, or prototype HTML, add a top-level frontend_surfaces array to requirements_trace.json. Each entry must name the surface, route/screen when known, prototype_refs, viewports when known, and the intended fidelity level.",
                 "For every frontend_surfaces entry, create active mandatory requirements that preserve the page-level visual contract from the prototype, including layout, copy, component hierarchy, and explicit forbidden old UI/style patterns. Use oracle_type='mixed' unless a stronger single oracle is clearly appropriate, and require deterministic DOM/CSS evidence plus screenshot/runtime visual evidence; optional judge_model evidence may supplement but must not be the only proof.",
                 "If the project has no frontend surface or the spec has no prototype/design artifact, omit frontend_surfaces or set it to an empty array; do not invent visual fidelity requirements.",
-                "If a requirement needs an external provider protocol or official API docs, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/.",
+                "If a requirement needs one external provider protocol or official API doc, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/. If it needs several provider docs, set provider_references to local paths under that directory and keep provider_reference empty or set to the primary path.",
                 "Use oracle_type to name the primary proof mechanism (for example deterministic_test, integration_test, runtime_evidence, judge_model, benchmark, human_review, or mixed). Use oracle_strength to record the minimum acceptable fidelity (proxy, behavioral, semantic, or human). Use evidence_boundary to say where proof must come from (internal_state, system_boundary, or external_side_effect). Record any checks that must NOT be treated as sufficient in forbidden_proxy_oracles.",
                 "For requirements that remove, forbid, or replace old behavior, add precise forbidden_patterns regexes for stale terms or old semantic claims so requirements audit can scan code, tests, and docs. Prefer narrow patterns that catch positive stale claims without matching the new negative requirement text.",
                 self._clarify_spec_instruction(spec_kind),
@@ -6226,7 +6232,7 @@ class Orchestrator:
                 "Frontend prototype fidelity task acceptance must require deterministic DOM/CSS/static checks and screenshot/runtime visual evidence such as Playwright screenshots. A vision judge may be added when available, but it supplements deterministic and screenshot evidence rather than replacing them. Payload-only tests, route-existence checks, or component count checks are forbidden as the sole proof for visual fidelity.",
                 "For negative contract requirements such as 'must not contain', '不得', '不包含', or '不返回', preserve every concrete field/path/API token from the requirement in the task acceptance. For example, a requirement that forbids `tasks[].result` is NOT covered by only omitting `retry_trace`.",
                 "Preserve each bound requirement's oracle_type, oracle_strength, evidence_boundary, and forbidden_proxy_oracles when slicing tasks. Requirements that demand semantic or human-strength proof are NOT satisfied by proxy checks, internal-state-only checks, config-only checks, or metadata/log snapshots. Requirements that demand system_boundary or external_side_effect evidence are NOT covered unless the task acceptance requires proof at that boundary.",
-                "If a requirement has external_docs_required=true, create at least one implementation task that consumes its provider_reference and tests against that protocol reference.",
+                "If a requirement has external_docs_required=true, create at least one implementation task that consumes its provider_reference/provider_references and tests against those protocol references.",
                 "Choose the smallest practical automated verification strategy for this stack.",
                 "If this is a Python project, require a project-local conda env at ./.conda.",
                 "If tests or runtime helpers need mutable local artifacts (for example sqlite DBs, temp configs, fixtures, caches, or downloaded samples), place them under ignored temp/data paths such as ./.tmp/, ./.tmp-tests/, or ./.data/ rather than tracked repo-root files.",
@@ -6566,7 +6572,7 @@ class Orchestrator:
                 "Python proof tests must be deterministic under the project's configured verification command. Do not rely on pytest-only or unittest-only ambient state; explicitly configure test adapters, environment variables, and dependency injection needed by the test.",
                 "Python tests must not contact real external services by accident. Use explicit fakes/mocks or test adapters for object storage, providers, databases, and network clients.",
                 "Use per-test unique temp paths for mutable artifacts such as sqlite databases, object-storage roots, caches, and generated fixtures so repeated, resumed, or mixed-runner verification cannot reuse stale state.",
-                "For external provider integrations, use the listed provider_reference files as the source of truth. Do not search for alternate docs or invent protocol details unless the reference is marked insufficient; stop and report missing documentation instead.",
+                "For external provider integrations, use the listed provider_reference/provider_references files as the source of truth. Do not search for alternate docs or invent protocol details unless the reference is marked insufficient; stop and report missing documentation instead.",
                 "For protocol/direct-integration tasks, add contract tests that verify outbound request shape, auth/header behavior, response normalization, and forbidden legacy payloads where applicable.",
                 "If this is a Python project, create and use a project-local conda env at ./.conda and install packages only inside it.",
                 "Do not use '.conda' as a generic directory, pip target, virtualenv, or venv path. It must remain a real conda prefix created with 'conda create -p ./.conda ...', including '.conda/conda-meta'.",
@@ -6608,7 +6614,7 @@ class Orchestrator:
                 "When issuing 'DECISION: fail', you MUST cite the specific acceptance criterion (by index or text) "
                 "or requirement ID/oracle/proof entry that is not satisfied. If no acceptance criterion or requirement oracle is violated but you have advisory concerns, "
                 "issue 'DECISION: pass' with those concerns listed as '[NON-BLOCKING]' notes.",
-                "For external provider integrations, verify the code and tests against the provider_reference file. Fail if the implementation invents protocol fields, reuses a legacy private gateway payload, or tests only mock an internal gateway contract.",
+                "For external provider integrations, verify the code and tests against the provider_reference/provider_references files. Fail if the implementation invents protocol fields, reuses a legacy private gateway payload, or tests only mock an internal gateway contract.",
                 "Also fail when the implementation uses a weaker oracle than the requirement allows (for example: proxy-only checks for semantic/human requirements, internal-state-only checks for system_boundary/external_side_effect requirements, or any check explicitly listed in forbidden_proxy_oracles).",
                 "Also fail frontend/prototype visual fidelity proofs when evidence_refs lack page-level visual evidence such as browser screenshots, visual snapshots, Playwright checks, or equivalent rendered-surface validation. Payload-only tests, route existence, or component-count checks cannot be the sole proof for matching a prototype.",
                 "If visual_evidence is present, check that it pairs prototype_image_ref and actual_image_ref for the same surface/viewport; incorrect or missing screenshot pairs are blocking for visual fidelity requirements.",
@@ -7967,16 +7973,17 @@ class Orchestrator:
         if not isinstance(refs, dict):
             return "provider_references.lock.json must contain a 'references' object"
         for requirement in external_doc_requirements(trace):
-            reference = str(requirement.get("provider_reference", "")).strip()
-            if not reference:
+            references = provider_reference_paths(requirement)
+            if not references:
                 missing.append(f"{requirement.get('id')}: missing provider_reference")
                 continue
-            status = provider_reference_status(lock, reference)
-            if status == "missing":
-                missing.append(f"{requirement.get('id')}: no lock entry for {reference}")
-            ref_path = self.project_root / reference
-            if not ref_path.exists():
-                missing.append(f"{requirement.get('id')}: missing provider reference file {reference}")
+            for reference in references:
+                status = provider_reference_status(lock, reference)
+                if status == "missing":
+                    missing.append(f"{requirement.get('id')}: no lock entry for {reference}")
+                ref_path = self.project_root / reference
+                if not ref_path.exists():
+                    missing.append(f"{requirement.get('id')}: missing provider reference file {reference}")
         if missing:
             bullets = "\n".join(f"- {item}" for item in missing)
             return (

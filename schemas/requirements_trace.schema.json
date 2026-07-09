@@ -135,6 +135,12 @@
           "provider_reference": {
             "type": "string"
           },
+          "provider_references": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "notes": {
             "type": "string"
           }

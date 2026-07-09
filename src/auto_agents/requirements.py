@@ -338,6 +338,32 @@ def _normalize_requirement_record(item: dict) -> dict:
     return normalized
 
 
+def provider_reference_paths(requirement: dict) -> List[str]:
+    """Return all local provider reference paths required by one requirement."""
+    raw_list = requirement.get("provider_references")
+    paths: List[str] = []
+    if isinstance(raw_list, list):
+        paths.extend(str(item).strip() for item in raw_list if str(item).strip())
+
+    raw_single = requirement.get("provider_reference", "")
+    if isinstance(raw_single, str) and raw_single.strip():
+        # Backward-compatible parsing for historical traces that encoded several
+        # local paths in the legacy singular field.
+        for item in re.split(r"[;\n]+", raw_single):
+            value = item.strip()
+            if value:
+                paths.append(value)
+
+    seen = set()
+    deduped: List[str] = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(path)
+    return deduped
+
+
 def normalize_requirements_trace_payload(payload: object) -> object:
     if not isinstance(payload, dict):
         return payload
@@ -461,10 +487,17 @@ def validate_requirements_trace_payload(payload: object) -> List[str]:
         provider_reference = item.get("provider_reference", "")
         if not isinstance(provider_reference, str):
             errors.append(f"{prefix} provider_reference must be a string")
+        provider_references = item.get("provider_references", [])
+        if not isinstance(provider_references, list):
+            errors.append(f"{prefix} provider_references must be a list of strings")
+        elif isinstance(provider_references, list) and any(
+            not isinstance(entry, str) for entry in provider_references
+        ):
+            errors.append(f"{prefix} provider_references must be a list of strings")
         if external_docs_required:
-            if not provider_reference.strip():
+            if not provider_reference_paths(item):
                 errors.append(
-                    f"{prefix} provider_reference must be a non-empty string when external_docs_required is true"
+                    f"{prefix} provider_reference or provider_references must be non-empty when external_docs_required is true"
                 )
 
         notes = item.get("notes")
@@ -1322,8 +1355,9 @@ def format_requirement_context(requirements: Iterable[dict]) -> str:
             lines.append("  Forbidden patterns:")
             lines.extend(f"  - {str(pattern).strip()}" for pattern in forbidden if str(pattern).strip())
         if bool(item.get("external_docs_required", False)):
-            reference = str(item.get("provider_reference", "")).strip()
-            lines.append(f"  External docs required: yes; provider reference: {reference or '(missing)'}")
+            references = provider_reference_paths(item)
+            rendered = "; ".join(references) if references else "(missing)"
+            lines.append(f"  External docs required: yes; provider references: {rendered}")
     return "\n".join(lines)
 
 
@@ -1468,17 +1502,27 @@ def run_requirements_audit(
                 )
             )
         if status == "active" and bool(item.get("external_docs_required", False)):
-            reference = str(item.get("provider_reference", "")).strip()
-            ref_status = provider_reference_status(lock, reference)
-            if ref_status not in PASSING_REFERENCE_STATUSES:
+            references = provider_reference_paths(item)
+            if not references:
                 blockers.append(
                     {
                         "kind": "provider_reference",
-                        "message": f"provider reference is {ref_status}",
-                        "reference": reference,
-                        "reference_status": ref_status,
+                        "message": "provider reference is missing",
+                        "reference": "",
+                        "reference_status": "missing",
                     }
                 )
+            for reference in references:
+                ref_status = provider_reference_status(lock, reference)
+                if ref_status not in PASSING_REFERENCE_STATUSES:
+                    blockers.append(
+                        {
+                            "kind": "provider_reference",
+                            "message": f"provider reference is {ref_status}",
+                            "reference": reference,
+                            "reference_status": ref_status,
+                        }
+                    )
         blockers.extend(_forbidden_pattern_findings(project_root, item, current_spec))
 
         # Design: corroboration rule for forbidden-pattern findings.

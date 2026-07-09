@@ -784,6 +784,21 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(verification_commands_decision.eligible)
         self.assertEqual(verification_commands_decision.category, "generated_verification_contract")
 
+        provider_reference_validation_decision = classify_auto_agents_error(
+            "provider_research exhausted retries: Provider research output is incomplete. "
+            "Update the local provider references and lock file.\n"
+            "- REQ-131: no lock entry for .auto-agents/docs/provider_references/a.md; "
+            ".auto-agents/docs/provider_references/b.md\n"
+            "- REQ-131: missing provider reference file .auto-agents/docs/provider_references/a.md; "
+            ".auto-agents/docs/provider_references/b.md",
+            env={},
+        )
+        self.assertTrue(provider_reference_validation_decision.eligible)
+        self.assertEqual(
+            provider_reference_validation_decision.category,
+            "provider_research_reference_validation",
+        )
+
         implement_config_decision = classify_auto_agents_error(
             "stage implement modified files outside its ownership during implement-task-225. "
             "Changed paths: .auto-agents/config.json. "

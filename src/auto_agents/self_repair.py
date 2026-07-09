@@ -193,6 +193,28 @@ def classify_auto_agents_error(
             values,
         )
 
+    if (
+        "provider_research exhausted retries" in lowered
+        and "provider research output is incomplete" in lowered
+        and (
+            "no lock entry for" in lowered
+            or "missing provider reference file" in lowered
+            or "missing provider_reference" in lowered
+        )
+    ):
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="provider_research_reference_validation",
+                reason=(
+                    "provider_research retry exhaustion came from local provider-reference "
+                    "validation; this is eligible for generic orchestrator repair"
+                ),
+            ),
+            text,
+            values,
+        )
+
     if _looks_like_auto_agents_traceback(text):
         return _with_repetition_guard(
             SelfRepairDecision(

@@ -2096,6 +2096,114 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertIn("REQ-001: pass", report)
 
+    def test_requirements_audit_passes_verified_provider_references_array(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            first = ".auto-agents/docs/provider_references/first.md"
+            second = ".auto-agents/docs/provider_references/second.md"
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            external_docs_required=True,
+                            provider_reference="",
+                            provider_references=[first, second],
+                        )
+                    ],
+                },
+            )
+            write_json(
+                provider_references_lock_path(project_root),
+                {
+                    "version": 1,
+                    "references": {
+                        "first": {
+                            "path": first,
+                            "status": "verified",
+                            "retrieved_at": "2026-04-11T00:00:00Z",
+                            "source_urls": ["https://example.com/first"],
+                            "notes": "",
+                        },
+                        "second": {
+                            "path": second,
+                            "status": "verified",
+                            "retrieved_at": "2026-04-11T00:00:00Z",
+                            "source_urls": ["https://example.com/second"],
+                            "notes": "",
+                        },
+                    },
+                },
+            )
+
+            ok, report = audit_requirements(
+                project_root,
+                [
+                    TaskSpec(
+                        task_id="task-001",
+                        title="Build",
+                        description="Build it.",
+                        acceptance=["works"],
+                        requirement_ids=["REQ-001"],
+                        status="done",
+                    )
+                ],
+            )
+
+            self.assertTrue(ok)
+            self.assertIn("REQ-001: pass", report)
+
+    def test_provider_research_validation_accepts_legacy_semicolon_references(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            first = ".auto-agents/docs/provider_references/first.md"
+            second = ".auto-agents/docs/provider_references/second.md"
+            write_text(project_root / first, "# First\n")
+            write_text(project_root / second, "# Second\n")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            external_docs_required=True,
+                            provider_reference=f"{first}; {second}",
+                        )
+                    ],
+                },
+            )
+            write_json(
+                provider_references_lock_path(project_root),
+                {
+                    "version": 1,
+                    "references": {
+                        "first": {
+                            "path": first,
+                            "status": "verified",
+                            "retrieved_at": "2026-04-11T00:00:00Z",
+                            "source_urls": ["https://example.com/first"],
+                            "notes": "",
+                        },
+                        "second": {
+                            "path": second,
+                            "status": "verified",
+                            "retrieved_at": "2026-04-11T00:00:00Z",
+                            "source_urls": ["https://example.com/second"],
+                            "notes": "",
+                        },
+                    },
+                },
+            )
+
+            feedback = Orchestrator(project_root)._provider_research_validation_feedback(
+                AgentResult(ok=True, command=[], output_path=project_root / "out.md", summary="")
+            )
+
+            self.assertIsNone(feedback)
+
     def test_requirements_audit_fails_missing_oracle_proof_in_strict_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
