@@ -625,6 +625,7 @@ class RunState:
     rejection_reason: str = ""
     rejected_stage: str = ""
     resume_context: Dict[str, object] = field(default_factory=dict)
+    recovery_loop_events: List[Dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -658,6 +659,10 @@ class RunState:
             rejection_reason=str(data.get("rejection_reason", "")),
             rejected_stage=str(data.get("rejected_stage", "")),
             resume_context=dict(data.get("resume_context", {})),
+            recovery_loop_events=[
+                entry for entry in (data.get("recovery_loop_events", []) or [])
+                if isinstance(entry, dict)
+            ],
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -683,6 +688,7 @@ class RunState:
             "rejection_reason": self.rejection_reason,
             "rejected_stage": self.rejected_stage,
             "resume_context": dict(self.resume_context),
+            "recovery_loop_events": list(self.recovery_loop_events),
         }
 
 

@@ -76,6 +76,19 @@ def classify_auto_agents_error(
         return SelfRepairDecision(False, reason="empty error")
 
     lowered = text.lower()
+    if "recovery loop orchestration no-op" in lowered:
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="recovery_loop_orchestration_noop",
+                reason=(
+                    "automatic recovery selected an owning stage repeatedly but "
+                    "auto_agents did not produce an effective recovery action"
+                ),
+            ),
+            text,
+            values,
+        )
     if "provider research is blocked" in lowered:
         return SelfRepairDecision(False, reason="provider_research blocker has its own recovery path")
     if "preflight validation failed" in lowered:

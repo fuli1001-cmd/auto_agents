@@ -157,6 +157,8 @@ class Orchestrator:
     MAX_SPLIT_DEPTH = 2
     SPLIT_TASK_MARKER = "SPLIT_TASK:"
     ARBITER_MIN_REVIEW_FAILS = 2
+    MAX_RECOVERY_LOOP_EVENTS = 20
+    RECOVERY_LOOP_REPEAT_THRESHOLD = 2
 
     def __init__(
         self,
@@ -1639,6 +1641,181 @@ class Orchestrator:
         if not normalized:
             return ""
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _normalize_relative_artifact_path(path: object) -> str:
+        normalized = str(path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized
+
+    def _active_provider_reference_paths(self) -> Set[str]:
+        trace = load_requirements_trace(self.project_root)
+        paths: Set[str] = set()
+        for requirement in external_doc_requirements(trace):
+            for reference in provider_reference_paths(requirement):
+                normalized = self._normalize_relative_artifact_path(reference)
+                if normalized.startswith(".auto-agents/docs/provider_references/"):
+                    paths.add(normalized)
+        return paths
+
+    def _provider_reference_paths_from_review(self, review_text: str) -> Set[str]:
+        active_paths = self._active_provider_reference_paths()
+        if not active_paths:
+            return set()
+        found: Set[str] = set()
+        for match in re.finditer(
+            r"(?:^|[^\w./-])(\.auto-agents/docs/provider_references/[^\s`'\"\])}:;,]+\.md)",
+            review_text or "",
+        ):
+            normalized = self._normalize_relative_artifact_path(match.group(1))
+            if normalized in active_paths:
+                found.add(normalized)
+
+        req_ids = {
+            match.group(0).upper()
+            for match in re.finditer(r"\bREQ-\d+\b", review_text or "", flags=re.IGNORECASE)
+        }
+        if req_ids:
+            trace = load_requirements_trace(self.project_root)
+            for requirement in external_doc_requirements(trace):
+                req_id = str(requirement.get("id", "")).strip().upper()
+                if req_id not in req_ids:
+                    continue
+                for reference in provider_reference_paths(requirement):
+                    normalized = self._normalize_relative_artifact_path(reference)
+                    if normalized in active_paths:
+                        found.add(normalized)
+        return found
+
+    @staticmethod
+    def _provider_reference_lock_key(reference: str, existing: Dict[str, object]) -> str:
+        base = Path(reference).stem.replace(".", "_").replace("-", "_") or "provider_reference"
+        candidate = base
+        suffix = 2
+        while candidate in existing:
+            value = existing.get(candidate)
+            if isinstance(value, dict) and str(value.get("path", "")).strip() == reference:
+                return candidate
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    def _mark_provider_references_needs_refresh(
+        self,
+        references: Iterable[str],
+        *,
+        reason: str,
+    ) -> List[str]:
+        normalized_refs = sorted({
+            self._normalize_relative_artifact_path(reference)
+            for reference in references
+            if self._normalize_relative_artifact_path(reference)
+        })
+        if not normalized_refs:
+            return []
+        lock = load_provider_references_lock(self.project_root)
+        refs = lock.get("references", {})
+        if not isinstance(refs, dict):
+            refs = {}
+            lock["references"] = refs
+        changed: List[str] = []
+        for reference in normalized_refs:
+            key = ""
+            for candidate_key, value in refs.items():
+                if isinstance(value, dict) and str(value.get("path", "")).strip() == reference:
+                    key = str(candidate_key)
+                    break
+            if not key:
+                key = self._provider_reference_lock_key(reference, refs)
+                refs[key] = {
+                    "path": reference,
+                    "retrieved_at": "",
+                    "source_urls": [],
+                    "notes": "",
+                }
+            entry = refs.get(key)
+            if not isinstance(entry, dict):
+                entry = {"path": reference}
+                refs[key] = entry
+            previous_status = str(entry.get("status", "")).strip()
+            if previous_status == "needs_refresh":
+                continue
+            entry["path"] = reference
+            entry["status"] = "needs_refresh"
+            entry.setdefault("retrieved_at", "")
+            entry.setdefault("source_urls", [])
+            previous_notes = str(entry.get("notes", "")).strip()
+            marker = f"Needs refresh: {reason}".strip()
+            entry["notes"] = f"{previous_notes}\n{marker}".strip() if previous_notes else marker
+            changed.append(reference)
+        if changed:
+            write_json(provider_references_lock_path(self.project_root), lock)
+        return changed
+
+    def _artifact_fingerprints(self, relative_paths: Iterable[str]) -> Dict[str, str]:
+        fingerprints: Dict[str, str] = {}
+        for relative_path in sorted({
+            self._normalize_relative_artifact_path(path)
+            for path in relative_paths
+            if self._normalize_relative_artifact_path(path)
+        }):
+            path = self.project_root / relative_path
+            if not path.exists() or not path.is_file():
+                fingerprints[relative_path] = "missing"
+                continue
+            try:
+                fingerprints[relative_path] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                fingerprints[relative_path] = "unreadable"
+        return fingerprints
+
+    def _owner_artifact_paths_for_stage(self, stage: str, review_text: str) -> List[str]:
+        if stage == "provider_research":
+            references = sorted(self._provider_reference_paths_from_review(review_text))
+            if references:
+                return references + [".auto-agents/state/provider_references.lock.json"]
+            return [".auto-agents/state/provider_references.lock.json"]
+        if stage == "clarify":
+            return [".auto-agents/docs/project_brief.md", ".auto-agents/state/requirements_trace.json"]
+        if stage == "design":
+            return [".auto-agents/docs/architecture.md"]
+        if stage == "plan":
+            return [".auto-agents/state/task_plan.json"]
+        return []
+
+    def _record_recovery_loop_event(
+        self,
+        state: RunState,
+        *,
+        task: TaskSpec,
+        target_stage: str,
+        review_text: str,
+    ) -> bool:
+        review_fp = self._review_fingerprint(review_text)
+        artifact_paths = self._owner_artifact_paths_for_stage(target_stage, review_text)
+        fingerprints = self._artifact_fingerprints(artifact_paths)
+        event = {
+            "task_id": task.task_id,
+            "target_stage": target_stage,
+            "review_fingerprint": review_fp,
+            "artifact_fingerprints": fingerprints,
+        }
+        history = [
+            entry for entry in state.recovery_loop_events
+            if isinstance(entry, dict)
+        ]
+        history.append(event)
+        state.recovery_loop_events = history[-self.MAX_RECOVERY_LOOP_EVENTS:]
+        if not review_fp:
+            return False
+        matches = [
+            entry for entry in state.recovery_loop_events
+            if str(entry.get("target_stage", "")) == target_stage
+            and str(entry.get("review_fingerprint", "")) == review_fp
+            and entry.get("artifact_fingerprints") == fingerprints
+        ]
+        return len(matches) >= self.RECOVERY_LOOP_REPEAT_THRESHOLD
 
     def _build_arbiter_prompt(self, task: TaskSpec, last_review: str) -> str:
         history_lines: List[str] = []
@@ -3323,8 +3500,10 @@ class Orchestrator:
                 f"returning task {task.task_id} to {target_stage}. Resolved git ref: {rewind_ref}."
             )
 
+        review_text = str(gate_result.get("review", ""))
+
         task.status = "pending"
-        task.review_summary = str(gate_result.get("review", ""))
+        task.review_summary = review_text
         task.commit_sha = ""
         self._persist_tasks(tasks)
 
@@ -3334,12 +3513,37 @@ class Orchestrator:
             or f"review feedback points to a {target_stage}-owned artifact",
             "",
             "Review feedback:",
-            str(gate_result.get("review", "")).strip(),
+            review_text.strip(),
         ]
         self._rewind_state_from_stage(state, target_stage)
         state.rejected_stage = target_stage
         state.rejection_reason = "\n".join(line for line in reason_lines if line is not None).strip()
         state.last_error = f"review rejected task {task.task_id}; rewinding to {target_stage}"
+        refreshed_refs: List[str] = []
+        if target_stage == "provider_research":
+            references = self._provider_reference_paths_from_review(state.rejection_reason)
+            refreshed_refs = self._mark_provider_references_needs_refresh(
+                references,
+                reason=f"review rejected task {task.task_id} and requested provider_research recovery",
+            )
+            if refreshed_refs:
+                self.logger.info(
+                    "[provider-research] marked reference(s) needs_refresh after review rewind: %s",
+                    ", ".join(refreshed_refs),
+                )
+        loop_detected = self._record_recovery_loop_event(
+            state,
+            task=task,
+            target_stage=target_stage,
+            review_text=state.rejection_reason,
+        )
+        if loop_detected and target_stage == "provider_research" and not refreshed_refs:
+            state.last_error = (
+                "recovery loop orchestration no-op: review repeatedly rewound to provider_research "
+                "but auto_agents could not identify or refresh an owning provider reference artifact"
+            )
+            save_run_state(self.project_root, state)
+            raise RuntimeError(state.last_error)
         save_run_state(self.project_root, state)
         self._emit_task_blocked(
             task,
@@ -4698,10 +4902,29 @@ class Orchestrator:
             return state
 
         lock = load_provider_references_lock(self.project_root)
+        rejected_provider_research = (
+            state.rejected_stage == "provider_research"
+            and bool(state.rejection_reason.strip())
+        )
+        forced_refresh_refs: Set[str] = set()
+        if rejected_provider_research:
+            forced_refresh_refs = self._provider_reference_paths_from_review(state.rejection_reason)
+            refreshed = self._mark_provider_references_needs_refresh(
+                forced_refresh_refs,
+                reason="provider_research was rejected by review feedback",
+            )
+            if refreshed:
+                lock = load_provider_references_lock(self.project_root)
+                self.logger.info(
+                    "[provider-research] forced refresh for rejected reference(s): %s",
+                    ", ".join(refreshed),
+                )
         unresolved = []
         for requirement in docs_required:
             references = provider_reference_paths(requirement)
             if not references or any(
+                self._normalize_relative_artifact_path(reference) in forced_refresh_refs
+                or
                 not self._is_resolved_provider_reference_status(
                     provider_reference_status(lock, reference)
                 )
@@ -4709,6 +4932,14 @@ class Orchestrator:
             ):
                 unresolved.append(requirement)
         if not unresolved:
+            if rejected_provider_research:
+                state.last_error = (
+                    "recovery loop orchestration no-op: provider_research was rejected, "
+                    "but all provider references are still considered verified and no refresh "
+                    "target could be identified"
+                )
+                save_run_state(self.project_root, state)
+                raise RuntimeError(state.last_error)
             summary = "Provider references already verified; research reused from local lock."
             write_text(self._stage_output_path(state.run_id, "provider_research"), summary + "\n")
             state.current_stage = "provider_research"

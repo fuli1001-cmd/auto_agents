@@ -799,6 +799,18 @@ class ProjectValidationTests(unittest.TestCase):
             "provider_research_reference_validation",
         )
 
+        recovery_loop_decision = classify_auto_agents_error(
+            "recovery loop orchestration no-op: provider_research was rejected, "
+            "but all provider references are still considered verified and no refresh "
+            "target could be identified",
+            env={},
+        )
+        self.assertTrue(recovery_loop_decision.eligible)
+        self.assertEqual(
+            recovery_loop_decision.category,
+            "recovery_loop_orchestration_noop",
+        )
+
         implement_config_decision = classify_auto_agents_error(
             "stage implement modified files outside its ownership during implement-task-225. "
             "Changed paths: .auto-agents/config.json. "

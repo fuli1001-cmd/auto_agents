@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -2791,6 +2792,134 @@ class RequirementsTraceTests(unittest.TestCase):
 
             self.assertEqual(state.current_stage, "provider_research")
             self.assertIn("already verified", state.stage_summaries["provider_research"])
+
+    def test_rejected_provider_research_refreshes_verified_lock(self) -> None:
+        class RefreshAdapter:
+            def __init__(self, project_root: Path, reference: str) -> None:
+                self.project_root = project_root
+                self.reference = reference
+                self.calls = 0
+
+            def run(self, request):
+                self.calls += 1
+                write_text(self.project_root / self.reference, "# Provider\n\nrefreshed\n")
+                write_json(
+                    provider_references_lock_path(self.project_root),
+                    {
+                        "version": 1,
+                        "references": {
+                            "provider": {
+                                "path": self.reference,
+                                "status": "verified",
+                                "retrieved_at": "2026-04-11T00:00:00Z",
+                                "source_urls": ["https://example.com/official"],
+                                "notes": "refreshed after review",
+                            }
+                        },
+                    },
+                )
+                summary = "provider reference refreshed\n"
+                write_text(request.output_path, summary)
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=summary.strip(),
+                    returncode=0,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            reference = ".auto-agents/docs/provider_references/provider.md"
+            write_text(project_root / reference, "# Provider\n\nstale\n")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            id="REQ-102",
+                            external_docs_required=True,
+                            provider_reference=reference,
+                        )
+                    ],
+                },
+            )
+            write_json(
+                provider_references_lock_path(project_root),
+                {
+                    "version": 1,
+                    "references": {
+                        "provider": {
+                            "path": reference,
+                            "status": "verified",
+                            "retrieved_at": "2026-04-11T00:00:00Z",
+                            "source_urls": ["https://example.com/official"],
+                            "notes": "",
+                        }
+                    },
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+            adapter = RefreshAdapter(project_root, reference)
+            orchestrator.adapter = adapter
+            state = load_run_state(project_root)
+            state.rejected_stage = "provider_research"
+            state.rejection_reason = (
+                "Review feedback: REQ-102 still lacks canonical provider reference details."
+            )
+
+            state = orchestrator._run_provider_research(state, project_root / "spec.md")
+
+            self.assertEqual(adapter.calls, 1)
+            self.assertEqual(state.current_stage, "provider_research")
+            self.assertIn("refreshed", state.stage_summaries["provider_research"])
+            lock = json.loads(provider_references_lock_path(project_root).read_text(encoding="utf-8"))
+            self.assertEqual(lock["references"]["provider"]["status"], "verified")
+
+    def test_rejected_provider_research_without_refresh_target_is_self_repair_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            reference = ".auto-agents/docs/provider_references/provider.md"
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            id="REQ-001",
+                            external_docs_required=True,
+                            provider_reference=reference,
+                        )
+                    ],
+                },
+            )
+            write_json(
+                provider_references_lock_path(project_root),
+                {
+                    "version": 1,
+                    "references": {
+                        "provider": {
+                            "path": reference,
+                            "status": "verified",
+                            "retrieved_at": "2026-04-11T00:00:00Z",
+                            "source_urls": ["https://example.com/official"],
+                            "notes": "",
+                        }
+                    },
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.rejected_stage = "provider_research"
+            state.rejection_reason = "Review feedback points to provider_research but names no reference."
+
+            with self.assertRaises(RuntimeError) as ctx:
+                orchestrator._run_provider_research(state, project_root / "spec.md")
+
+            self.assertIn("recovery loop orchestration no-op", str(ctx.exception))
 
 
 if __name__ == "__main__":
