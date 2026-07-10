@@ -23,21 +23,37 @@ from auto_agents.config import (
     load_run_state,
     save_session_state,
     requirements_trace_path,
+    run_path,
     save_project_config,
     save_run_state,
     task_plan_path,
 )
 from auto_agents.git_ops import working_tree_clean
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentRequest, AgentResult, AgentUsage, ProjectConfig, ProviderConfig, SessionState, TaskSpec
+from auto_agents.models import (
+    AgentRequest,
+    AgentResult,
+    AgentUsage,
+    ProjectConfig,
+    ProviderConfig,
+    RunState,
+    SessionState,
+    TaskSpec,
+)
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.self_repair import (
+    SELF_REPAIR_DISABLED_ENV,
     SELF_REPAIR_LAST_FINGERPRINT_ENV,
+    SELF_REPAIR_PROVIDER_CONFIDENCE_THRESHOLD,
     SELF_REPAIR_REPEAT_COUNT_ENV,
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
+    SelfRepairJudgment,
     SelfRepairResult,
+    SelfRepairTriageResult,
+    adjudicate_auto_agents_error,
     classify_auto_agents_error,
+    parse_self_repair_judgment,
 )
 from auto_agents.validation import (
     validate_required_document,
@@ -827,6 +843,236 @@ class ProjectValidationTests(unittest.TestCase):
         )
         self.assertFalse(review_decision.eligible)
 
+    def test_provider_self_repair_judgment_requires_high_confidence_composite_gate(self) -> None:
+        payload = {
+            "decision": "SELF_REPAIR",
+            "owner": "auto_agents",
+            "generic": True,
+            "safe_to_self_repair": True,
+            "confidence": SELF_REPAIR_PROVIDER_CONFIDENCE_THRESHOLD,
+            "category": "generated_artifact_lifecycle",
+            "reason": "verification was invalidated by an orchestrator-owned rewrite",
+            "evidence": ["verification passed before the generated artifact was rewritten"],
+        }
+        judgment = parse_self_repair_judgment(json.dumps(payload))
+        self.assertTrue(judgment.approved)
+
+        for field, value in (
+            ("decision", "DO_NOT_REPAIR"),
+            ("owner", "target_project"),
+            ("generic", False),
+            ("safe_to_self_repair", False),
+            ("confidence", SELF_REPAIR_PROVIDER_CONFIDENCE_THRESHOLD - 0.01),
+            ("evidence", []),
+        ):
+            with self.subTest(field=field):
+                candidate = dict(payload)
+                candidate[field] = value
+                self.assertFalse(
+                    parse_self_repair_judgment(json.dumps(candidate)).approved
+                )
+
+    def test_provider_self_repair_judgment_rejects_invalid_structured_output(self) -> None:
+        with self.assertRaisesRegex(ValueError, "JSON object"):
+            parse_self_repair_judgment("DECISION: SELF_REPAIR")
+        with self.assertRaisesRegex(ValueError, "confidence"):
+            parse_self_repair_judgment(
+                json.dumps(
+                    {
+                        "decision": "SELF_REPAIR",
+                        "owner": "auto_agents",
+                        "generic": True,
+                        "safe_to_self_repair": True,
+                        "confidence": "high",
+                        "category": "generic_orchestrator_bug",
+                        "reason": "reason",
+                        "evidence": ["evidence"],
+                    }
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "unknown fields"):
+            parse_self_repair_judgment(
+                json.dumps(
+                    {
+                        "decision": "DO_NOT_REPAIR",
+                        "owner": "target_project",
+                        "generic": False,
+                        "safe_to_self_repair": False,
+                        "confidence": 0.99,
+                        "category": "target_contract_failure",
+                        "reason": "reason",
+                        "evidence": ["evidence"],
+                        "extra": "not allowed",
+                    }
+                )
+            )
+
+    def test_provider_judgment_can_approve_review_failure_rejected_by_heuristic(self) -> None:
+        review_error = "Task repair-task failed gates: review rejected the task"
+        payload = {
+            "decision": "SELF_REPAIR",
+            "owner": "auto_agents",
+            "generic": True,
+            "safe_to_self_repair": True,
+            "confidence": 0.96,
+            "category": "generated_artifact_lifecycle",
+            "reason": "orchestrator rewrote verified evidence before review",
+            "evidence": ["four verify passes were followed by the same review rejection"],
+        }
+
+        class FakeConfig:
+            efforts = {"self_repair": "max"}
+
+        class FakeOrchestrator:
+            config = FakeConfig()
+
+            def _call_with_failover(self, request):
+                self.request = request
+                return AgentResult(
+                    ok=True,
+                    command=[],
+                    output_path=request.output_path,
+                    summary=json.dumps(payload),
+                )
+
+        orchestrator = FakeOrchestrator()
+        task = TaskSpec(
+            task_id="repair-task",
+            title="Repair generated evidence",
+            description="",
+            acceptance=["verification ref passes"],
+            review_history=[
+                {"attempt": 2, "summary": "REQ-102 audit paragraph is still stale"},
+                {"attempt": 3, "summary": "REQ-102 audit paragraph is still stale"},
+            ],
+            verify_history=[
+                {"attempt": 2, "decision": "pass", "summary": "all commands passed"},
+                {"attempt": 3, "decision": "pass", "summary": "all commands passed"},
+            ],
+        )
+        state = RunState(run_id="triage-run", status="failed", tasks=[task])
+        result = adjudicate_auto_agents_error(
+            orchestrator,
+            target_project_root=Path("/tmp/demo"),
+            error=review_error,
+            state=state,
+            traceback_text="Traceback evidence",
+            env={},
+        )
+
+        self.assertTrue(result.decision.eligible)
+        self.assertEqual(result.source, "provider")
+        self.assertEqual(result.decision.category, "generated_artifact_lifecycle")
+        self.assertEqual(orchestrator.request.stage, "self_repair_triage")
+        self.assertIn("review rejected the task", orchestrator.request.prompt)
+        self.assertIn("REQ-102 audit paragraph is still stale", orchestrator.request.prompt)
+        self.assertIn("all commands passed", orchestrator.request.prompt)
+
+        payload["category"] = "orchestrator_state_lifecycle"
+        repeated = adjudicate_auto_agents_error(
+            orchestrator,
+            target_project_root=Path("/tmp/demo"),
+            error=review_error,
+            state=state,
+            env={
+                SELF_REPAIR_LAST_FINGERPRINT_ENV: result.decision.fingerprint,
+                SELF_REPAIR_REPEAT_COUNT_ENV: "1",
+            },
+        )
+        self.assertTrue(repeated.decision.eligible)
+        self.assertEqual(repeated.decision.repeat_count, 2)
+        self.assertEqual(repeated.decision.fingerprint, result.decision.fingerprint)
+
+    def test_valid_provider_rejection_overrides_eligible_heuristic(self) -> None:
+        scope_error = (
+            "Task task-224 failed gates: verification scope mismatch: new failures are outside "
+            "this task's owned test/proof surface"
+        )
+        payload = {
+            "decision": "DO_NOT_REPAIR",
+            "owner": "target_project",
+            "generic": False,
+            "safe_to_self_repair": False,
+            "confidence": 0.98,
+            "category": "target_contract_failure",
+            "reason": "the target test exposes a product contract failure",
+            "evidence": ["the failure is confined to target project behavior"],
+        }
+
+        class FakeOrchestrator:
+            config = type("Config", (), {"efforts": {"self_repair": "max"}})()
+
+            def _call_with_failover(self, request):
+                return AgentResult(
+                    ok=True,
+                    command=[],
+                    output_path=request.output_path,
+                    summary=json.dumps(payload),
+                )
+
+        result = adjudicate_auto_agents_error(
+            FakeOrchestrator(),
+            target_project_root=Path("/tmp/demo"),
+            error=scope_error,
+            env={},
+        )
+
+        self.assertFalse(result.decision.eligible)
+        self.assertEqual(result.source, "provider")
+        self.assertEqual(result.judgment.owner, "target_project")
+
+    def test_provider_triage_failure_uses_conservative_heuristic_fallback(self) -> None:
+        scope_error = (
+            "Task task-224 failed gates: verification scope mismatch: new failures are outside "
+            "this task's owned test/proof surface"
+        )
+
+        class InvalidProviderOrchestrator:
+            config = type("Config", (), {"efforts": {"self_repair": "max"}})()
+
+            def _call_with_failover(self, request):
+                return AgentResult(
+                    ok=True,
+                    command=[],
+                    output_path=request.output_path,
+                    summary="not json",
+                )
+
+        result = adjudicate_auto_agents_error(
+            InvalidProviderOrchestrator(),
+            target_project_root=Path("/tmp/demo"),
+            error=scope_error,
+            env={},
+        )
+
+        self.assertTrue(result.decision.eligible)
+        self.assertEqual(result.source, "heuristic_fallback")
+        self.assertIn("JSON object", result.provider_error)
+
+        rejected = adjudicate_auto_agents_error(
+            InvalidProviderOrchestrator(),
+            target_project_root=Path("/tmp/demo"),
+            error="Task task-001 failed gates: review rejected the task",
+            env={},
+        )
+        self.assertFalse(rejected.decision.eligible)
+        self.assertEqual(rejected.source, "heuristic_fallback")
+
+    def test_self_repair_disabled_skips_provider_triage(self) -> None:
+        class ProviderMustNotRun:
+            def _call_with_failover(self, request):
+                raise AssertionError("provider must not run when self-repair is disabled")
+
+        result = adjudicate_auto_agents_error(
+            ProviderMustNotRun(),
+            target_project_root=Path("/tmp/demo"),
+            error="Task task-001 failed gates: review rejected the task",
+            env={SELF_REPAIR_DISABLED_ENV: "true"},
+        )
+
+        self.assertFalse(result.decision.eligible)
+        self.assertEqual(result.source, "disabled")
+
     def test_self_repair_classifier_stops_after_same_error_repeats_three_times(self) -> None:
         scope_error = (
             "Task task-224 failed gates: verification scope mismatch: new failures are outside "
@@ -974,20 +1220,15 @@ class ProjectValidationTests(unittest.TestCase):
             spec_file = project_root / "spec.md"
             write_text(spec_file, "# Spec\n")
 
-            scope_error = (
-                "Task task-224 failed gates: verification scope mismatch: new failures are outside "
-                "this task's owned test/proof surface. Owned scope: cmd:npm test. "
-                "New failure paths: tests/test_requirements_audit_state.py. Treat this as a "
-                "product-contract or gate-scope issue instead of retrying implementation."
-            )
+            review_error = "Task repair-task failed gates: review rejected the task"
 
             def mock_run(_self, *args, **kwargs):
                 state = load_run_state(project_root)
                 state.status = "failed"
                 state.current_stage = "implement"
-                state.last_error = scope_error
+                state.last_error = review_error
                 save_run_state(project_root, state)
-                raise RuntimeError(scope_error)
+                raise RuntimeError(review_error)
 
             runner_calls = {"count": 0}
 
@@ -1003,17 +1244,39 @@ class ProjectValidationTests(unittest.TestCase):
                         ok=True,
                         status="completed",
                         reason="repaired",
-                        category="verification_scope_mismatch",
+                        category="generated_artifact_lifecycle",
                         commit_sha="abc123456789",
                         summary="generic fix\nCOMMIT_MESSAGE: repair gate scope handling",
                         verification="tests passed",
                     )
 
             completed = subprocess.CompletedProcess(args=["python"], returncode=0)
+            triage = SelfRepairTriageResult(
+                decision=SelfRepairDecision(
+                    True,
+                    category="generated_artifact_lifecycle",
+                    reason="orchestrator rewrote verified evidence before review",
+                    fingerprint="triage-fingerprint",
+                    repeat_count=1,
+                ),
+                source="provider",
+                reason="provider approved self-repair",
+                judgment=SelfRepairJudgment(
+                    decision="SELF_REPAIR",
+                    owner="auto_agents",
+                    generic=True,
+                    safe_to_self_repair=True,
+                    confidence=0.96,
+                    category="generated_artifact_lifecycle",
+                    reason="orchestrator rewrote verified evidence before review",
+                    evidence=["verification passed before review observed stale evidence"],
+                ),
+            )
             stdout = io.StringIO()
             stderr = io.StringIO()
             with (
                 patch.object(Orchestrator, "run", mock_run),
+                patch("auto_agents.cli.adjudicate_auto_agents_error", return_value=triage),
                 patch("auto_agents.cli.AutoAgentsSelfRepairRunner", FakeSelfRepairRunner),
                 patch("auto_agents.cli.subprocess.run", return_value=completed) as resume_run,
                 patch("auto_agents.cli.notify_self_repair_finished") as notify_self_repair,
@@ -1041,6 +1304,50 @@ class ProjectValidationTests(unittest.TestCase):
             resume_env = resume_run.call_args.kwargs["env"]
             self.assertIn(SELF_REPAIR_LAST_FINGERPRINT_ENV, resume_env)
             self.assertEqual(resume_env[SELF_REPAIR_REPEAT_COUNT_ENV], "1")
+
+    def test_cli_run_sends_unexpected_exception_to_provider_triage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            def mock_run(_self, *args, **kwargs):
+                raise TypeError("unexpected state shape")
+
+            triage = SelfRepairTriageResult(
+                decision=SelfRepairDecision(False, reason="provider rejected self-repair"),
+                source="provider",
+                reason="provider judgment did not satisfy the composite gate",
+            )
+            with (
+                patch.object(Orchestrator, "run", mock_run),
+                patch(
+                    "auto_agents.cli.adjudicate_auto_agents_error",
+                    return_value=triage,
+                ) as adjudicate,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main(
+                    ["run", "--project", str(project_root), "--spec-file", str(spec_file)]
+                )
+
+            self.assertEqual(exit_code, 1)
+            adjudicate.assert_called_once()
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["error"], "unexpected state shape")
+            state = load_run_state(project_root)
+            triage_artifact = (
+                run_path(project_root, state.run_id)
+                / "outputs"
+                / "self-repair-triage.json"
+            )
+            self.assertTrue(triage_artifact.exists())
+            self.assertEqual(
+                json.loads(triage_artifact.read_text(encoding="utf-8"))["source"],
+                "provider",
+            )
 
     def test_cli_session_commands_notify_completed_state(self) -> None:
         for command, mode in (
@@ -1171,7 +1478,15 @@ class ProjectValidationTests(unittest.TestCase):
             Orchestrator.init_project(project_root, "demo", "mock")
 
             buffer = io.StringIO()
-            with contextlib.redirect_stdout(buffer):
+            triage = SelfRepairTriageResult(
+                decision=SelfRepairDecision(False, reason="target project input failure"),
+                source="provider",
+                reason="provider rejected self-repair",
+            )
+            with (
+                patch("auto_agents.cli.adjudicate_auto_agents_error", return_value=triage),
+                contextlib.redirect_stdout(buffer),
+            ):
                 exit_code = main(["run", "--project", str(project_root)])
 
             payload = json.loads(buffer.getvalue())
@@ -1187,7 +1502,20 @@ class ProjectValidationTests(unittest.TestCase):
             write_text(spec_file, "# Spec\n")
 
             buffer = io.StringIO()
-            with contextlib.redirect_stdout(buffer):
+            triage = SelfRepairTriageResult(
+                decision=SelfRepairDecision(False, reason="provider availability failure"),
+                source="heuristic_fallback",
+                reason="provider triage unavailable",
+            )
+            with (
+                patch.object(
+                    Orchestrator,
+                    "_call_with_failover",
+                    side_effect=RuntimeError("provider unavailable"),
+                ),
+                patch("auto_agents.cli.adjudicate_auto_agents_error", return_value=triage),
+                contextlib.redirect_stdout(buffer),
+            ):
                 exit_code = main(
                     [
                         "run",

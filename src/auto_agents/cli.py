@@ -5,7 +5,9 @@ import json
 import subprocess
 import shlex
 import sys
+import traceback
 from pathlib import Path
+from typing import Optional
 
 from .config import (
     architecture_path,
@@ -19,6 +21,7 @@ from .config import (
 )
 from .config import supported_provider_kinds
 from .env import load_dotenv
+from .io_utils import write_json
 from .notifications import (
     notify_run_finished,
     notify_run_started,
@@ -30,6 +33,8 @@ from .orchestrator import Orchestrator
 from .self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
+    SelfRepairTriageResult,
+    adjudicate_auto_agents_error,
     append_self_repair_history,
     auto_agents_repo_root,
     classify_auto_agents_error,
@@ -347,6 +352,51 @@ def _auto_repair_auto_agents_and_resume(
     return process.returncode
 
 
+def _triage_terminal_run_error(
+    project_root: Path,
+    orchestrator: Optional[Orchestrator],
+    error: object,
+) -> SelfRepairTriageResult:
+    state = _try_load_run_state(project_root)
+    if orchestrator is None:
+        fallback = classify_auto_agents_error(error, state=state)
+        return SelfRepairTriageResult(
+            decision=fallback,
+            source="heuristic_fallback",
+            reason="provider triage is unavailable before orchestrator initialization",
+            provider_error="orchestrator initialization did not complete",
+        )
+    result = adjudicate_auto_agents_error(
+        orchestrator,
+        target_project_root=project_root,
+        error=error,
+        state=state,
+        traceback_text=traceback.format_exc(),
+    )
+    if state is not None and state.run_id.strip():
+        try:
+            write_json(
+                run_path(project_root, state.run_id) / "outputs" / "self-repair-triage.json",
+                result.to_dict(),
+            )
+        except Exception:
+            pass
+    judgment = result.judgment
+    detail = (
+        f" owner={judgment.owner} confidence={judgment.confidence:.2f}"
+        if judgment is not None
+        else ""
+    )
+    print(
+        f"Self-repair triage source={result.source} eligible={result.decision.eligible}"
+        f" category={result.decision.category or '-'}{detail}: {result.reason}",
+        file=sys.stderr,
+    )
+    if result.provider_error:
+        print(f"Self-repair triage provider error: {result.provider_error}", file=sys.stderr)
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Quality-first orchestration for AI-assisted project delivery.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -583,7 +633,7 @@ def main(argv: list[str] | None = None) -> int:
             _safe_notify(notify_run_finished, project_root, state.to_dict())
             print(_render_run_summary(project_root, state.to_dict()))
             return 0
-        except (RuntimeError, FileNotFoundError, ValueError) as error:
+        except Exception as error:
             if orchestrator is not None and orchestrator.is_provider_research_blocked_error(str(error)):
                 return _auto_resolve_provider_blocker(
                     project_root,
@@ -591,10 +641,8 @@ def main(argv: list[str] | None = None) -> int:
                     print_agent_output=bool(args.print_agent_output),
                 )
             project_root = Path(args.project)
-            decision = classify_auto_agents_error(
-                error,
-                state=_try_load_run_state(project_root),
-            )
+            triage = _triage_terminal_run_error(project_root, orchestrator, error)
+            decision = triage.decision
             if orchestrator is not None and decision.eligible:
                 return _auto_repair_auto_agents_and_resume(
                     project_root,
