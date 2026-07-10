@@ -3660,6 +3660,32 @@ class Orchestrator:
                 "raw_output": quick_failure,
                 "comparable_failures": False,
             }
+        audit_regenerated = False
+        audit_before = ""
+        if self._task_depends_on_requirements_audit(task) or self._is_requirements_audit_recovery_task(task):
+            audit_before = read_text(requirements_audit_path(self.project_root))
+            requirements_audit_check = self._run_task_requirements_audit_recovery_check(task, state)
+            audit_after = read_text(requirements_audit_path(self.project_root))
+            audit_regenerated = (
+                self._requirements_audit_stable_content(audit_before)
+                != self._requirements_audit_stable_content(audit_after)
+            )
+            if requirements_audit_check:
+                audit_failure_ids = self._normalize_verify_failure_ids(
+                    requirements_audit_check.get("failure_ids", []),
+                    str(requirements_audit_check.get("reason", "")),
+                )
+                return {
+                    "ok": False,
+                    "reason": str(requirements_audit_check["reason"]),
+                    "failure_ids": audit_failure_ids,
+                    "current_failure_ids": audit_failure_ids,
+                    "baseline_failure_ids": (
+                        list(task.verify_baseline_failures) if task is not None else []
+                    ),
+                    "new_failure_ids": audit_failure_ids,
+                    "raw_output": str(requirements_audit_check.get("raw_output", "")),
+                }
         task_scope_label = self._task_verify_command_scope_label(task)
         if task_commands:
             verify_gate, mutation_error = self._run_gate_commands_for_commands(
@@ -3726,12 +3752,19 @@ class Orchestrator:
         if not verify_gate.ok:
             raw_log_path = self._persist_failed_verification_log(raw_output, label="task-verify")
         baseline_only_reason = ""
+        absolute_repair_verification = bool(
+            task is not None
+            and self._is_repair_task(task)
+            and task.verification_refs
+        )
         if (
             task is not None
             and extraction.comparable
             and not diagnostic_identity_only
             and current_failure_ids
             and not new_failure_ids
+            and not absolute_repair_verification
+            and not audit_regenerated
         ):
             baseline_only_reason = (
                 f"task baseline only: {len(current_failure_ids)} pre-existing failure(s) remain"
@@ -3797,7 +3830,7 @@ class Orchestrator:
                     "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
                     "contract_scope_issue": True,
                 }
-            return {
+            failure_result = {
                 "ok": False,
                 "reason": reason,
                 "failure_ids": effective_failure_ids,
@@ -3810,6 +3843,23 @@ class Orchestrator:
                 "retryable_missing_owned_evidence_refs": retryable_missing_owned_evidence,
                 "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
             }
+            if (
+                audit_regenerated
+                and task is not None
+                and self._task_depends_on_requirements_audit(task)
+                and extraction.comparable
+                and current_failure_ids
+            ):
+                rewind_reason = (
+                    "The requirements audit failed verification after auto_agents materialized "
+                    "the derived report before running its evidence checks. "
+                    "Recovery route: rerun from clarify so the owning requirements trace is "
+                    "revised; do not edit .auto-agents/docs/requirements_audit.md directly."
+                )
+                failure_result["reason"] = f"{rewind_reason}\nVerification failure: {reason}"
+                failure_result["rewind_to_stage"] = "clarify"
+                failure_result["rewind_reason"] = rewind_reason
+            return failure_result
         stale_plan_audit = self._run_stale_plan_coupled_test_audit(task, state=state)
         if stale_plan_audit:
             stale_failure_ids = self._normalize_verify_failure_ids(
@@ -3842,21 +3892,6 @@ class Orchestrator:
                 "baseline_failure_ids": baseline_failure_ids,
                 "new_failure_ids": stale_failure_ids,
                 "raw_output": str(stale_status_audit.get("raw_output", "")),
-            }
-        requirements_audit_check = self._run_task_requirements_audit_recovery_check(task, state)
-        if requirements_audit_check:
-            audit_failure_ids = self._normalize_verify_failure_ids(
-                requirements_audit_check.get("failure_ids", []),
-                str(requirements_audit_check.get("reason", "")),
-            )
-            return {
-                "ok": False,
-                "reason": str(requirements_audit_check["reason"]),
-                "failure_ids": audit_failure_ids,
-                "current_failure_ids": audit_failure_ids,
-                "baseline_failure_ids": baseline_failure_ids,
-                "new_failure_ids": audit_failure_ids,
-                "raw_output": str(requirements_audit_check.get("raw_output", "")),
             }
         proof_evidence = self._run_task_proof_evidence(task)
         if proof_evidence is not None and not bool(proof_evidence.get("ok")):
@@ -3891,6 +3926,14 @@ class Orchestrator:
         "test_requirements_audit_state",
         ".auto-agents/docs/requirements_audit",
     )
+
+    @staticmethod
+    def _requirements_audit_stable_content(report: str) -> str:
+        return "\n".join(
+            line
+            for line in str(report or "").splitlines()
+            if not line.startswith("Generated at: ")
+        )
 
     @staticmethod
     def _task_depends_on_requirements_audit(task: Optional[TaskSpec]) -> bool:
@@ -5509,6 +5552,22 @@ class Orchestrator:
         for owner in owner_order:
             if owner in owners:
                 return owner
+        lowered = str(text or "").lower()
+        requirements_audit_wording = (
+            bool(re.search(r"REQ-\d+", str(text or ""), flags=re.IGNORECASE))
+            and (
+                "requirements audit section" in lowered
+                or "requirements audit paragraph" in lowered
+                or "审计段" in str(text or "")
+            )
+            and (
+                "wording" in lowered
+                or "contract statement" in lowered
+                or "表述" in str(text or "")
+            )
+        )
+        if requirements_audit_wording:
+            return "clarify"
         return ""
 
     @staticmethod
@@ -7057,6 +7116,26 @@ class Orchestrator:
                     if isinstance(verify_result.get("proof_evidence"), dict)
                     else None
                 )
+                rewind_stage = str(verify_result.get("rewind_to_stage", "")).strip()
+                if rewind_stage:
+                    self._record_verify_result(
+                        task,
+                        attempt,
+                        "fail",
+                        last_reason,
+                        failure_ids,
+                        comparable_failures=comparable_failures,
+                    )
+                    self._emit_task_verify_result(task, "fail", last_reason)
+                    return {
+                        "ok": False,
+                        "review": last_reason,
+                        "reason": last_reason,
+                        "rewind_to_stage": rewind_stage,
+                        "rewind_reason": str(
+                            verify_result.get("rewind_reason", last_reason)
+                        ),
+                    }
                 verify_analysis = self._analyze_verify_failure(
                     task,
                     failure_ids,

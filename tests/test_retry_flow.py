@@ -3321,6 +3321,100 @@ class RetryFlowTests(unittest.TestCase):
             ])
             self.assertIn("task baseline only: 1 pre-existing failure(s) remain", stream.getvalue())
 
+    def test_repair_verification_refs_are_not_accepted_as_baseline_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            ref = "tests/test_contract.py::ContractTests::test_provider_reference"
+            (project_root / "tests").mkdir()
+            write_text(
+                project_root / "tests" / "test_contract.py",
+                "import unittest\n\n"
+                "class ContractTests(unittest.TestCase):\n"
+                "    def test_provider_reference(self):\n"
+                "        self.assertTrue(False)\n",
+            )
+            task = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair proof evidence",
+                description="Fix the proof evidence assertion.",
+                acceptance=["The proof evidence ref passes."],
+                verification_refs=[ref],
+                verify_baseline_failures=[ref],
+            )
+
+            def fake_failing_owned_ref(commands, *, collect_all, context):
+                return (
+                    GateResult(
+                        ok=False,
+                        commands=[
+                            CommandResult(
+                                command=commands[0],
+                                ok=False,
+                                returncode=1,
+                                stdout=f"FAILED {ref} - AssertionError\n",
+                                stderr="",
+                            )
+                        ],
+                        summary=f"command failed: {commands[0]}",
+                    ),
+                    "",
+                )
+
+            with patch.object(
+                orchestrator,
+                "_run_gate_commands_for_commands",
+                side_effect=fake_failing_owned_ref,
+            ):
+                result = orchestrator._run_task_verify(task)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["failure_ids"], [ref])
+            self.assertNotIn("task baseline only", str(result["reason"]))
+
+    def test_task_verify_rewind_is_propagated_before_retrying_implement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-102",
+                title="Document provider terminology",
+                description="Clarify the public request contract.",
+                acceptance=["The requirements audit contains explicit contract wording."],
+                status="in_progress",
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            verify_result = {
+                "ok": False,
+                "reason": "derived audit evidence failed",
+                "failure_ids": ["REQ-102"],
+                "comparable_failures": True,
+                "rewind_to_stage": "clarify",
+                "rewind_reason": "requirements trace owns the missing wording",
+            }
+
+            with patch.object(
+                orchestrator,
+                "_run_task_verify",
+                return_value=verify_result,
+            ):
+                result = orchestrator._execute_task_with_retries(
+                    state,
+                    task,
+                    resume_existing=True,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["rewind_to_stage"], "clarify")
+            self.assertEqual(
+                result["rewind_reason"],
+                "requirements trace owns the missing wording",
+            )
+            self.assertEqual(len(task.verify_history), 1)
+
     def test_task_verify_baseline_does_not_absorb_failures_from_prior_done_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -4639,6 +4733,14 @@ class RetryFlowTests(unittest.TestCase):
 
         self.assertEqual(Orchestrator._review_feedback_rewind_stage(summary), "design")
 
+    def test_review_feedback_rewinds_to_clarify_for_requirements_audit_wording(self) -> None:
+        summary = (
+            "DECISION: fail\n"
+            "验收标准 1 未满足：REQ-102 审计段依然缺少明确契约表述。"
+        )
+
+        self.assertEqual(Orchestrator._review_feedback_rewind_stage(summary), "clarify")
+
     def test_misrouted_project_brief_audit_recovery_rewinds_to_clarify_on_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -4884,6 +4986,113 @@ class RetryFlowTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("requirements audit still failed", str(result["reason"]))
             self.assertIn("REQ-001", result["failure_ids"])
+
+    def test_task_verify_regenerates_requirements_audit_before_running_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-102",
+                            "text": "Provider terminology is documented.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["contract wording is explicit"],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            (project_root / "tests").mkdir()
+            required_wording = (
+                "referenceImages and referenceBlobs are provider-internal error wording, "
+                "not public /v1/images/edits request fields"
+            )
+            write_text(
+                project_root / "tests" / "test_requirements_audit_state.py",
+                "from pathlib import Path\n\n"
+                "def test_req_102_contract_wording():\n"
+                "    report = Path('.auto-agents/docs/requirements_audit.md').read_text(encoding='utf-8')\n"
+                f"    assert {required_wording!r} in report\n",
+            )
+            audit_path = project_root / ".auto-agents" / "docs" / "requirements_audit.md"
+            write_text(audit_path, f"# Requirements Audit\n\n{required_wording}\n")
+            ref = "tests/test_requirements_audit_state.py::test_req_102_contract_wording"
+            task = TaskSpec(
+                task_id="task-102",
+                title="Document provider terminology",
+                description="Clarify the public request contract.",
+                acceptance=["The requirements audit contains explicit contract wording."],
+                requirement_ids=["REQ-102"],
+                verification_refs=[ref],
+                status="in_progress",
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            orchestrator = Orchestrator(project_root)
+
+            def fake_contract_check(commands, *, collect_all, context):
+                self.assertNotIn(required_wording, audit_path.read_text(encoding="utf-8"))
+                return (
+                    GateResult(
+                        ok=False,
+                        commands=[
+                            CommandResult(
+                                command=commands[0],
+                                ok=False,
+                                returncode=1,
+                                stdout=f"FAILED {ref} - AssertionError\n",
+                                stderr="",
+                            )
+                        ],
+                        summary=f"command failed: {commands[0]}",
+                    ),
+                    "",
+                )
+
+            with patch.object(
+                orchestrator,
+                "_run_gate_commands_for_commands",
+                side_effect=fake_contract_check,
+            ):
+                result = orchestrator._run_task_verify(task, state=state)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("rewind_to_stage", result, result)
+            self.assertEqual(result["rewind_to_stage"], "clarify")
+            self.assertIn("materialized the derived report", str(result["reason"]))
+            self.assertIn("Recovery route: rerun from clarify", str(result["reason"]))
+            regenerated = audit_path.read_text(encoding="utf-8")
+            self.assertIn("Provider terminology is documented.", regenerated)
+            self.assertNotIn(required_wording, regenerated)
+
+    def test_requirements_audit_content_comparison_ignores_generation_time(self) -> None:
+        first = (
+            "# Requirements Audit\n\nGenerated at: 2026-07-10T01:00:00Z\n\n"
+            "## REQ-102: pass\n"
+        )
+        second = (
+            "# Requirements Audit\n\nGenerated at: 2026-07-10T02:00:00Z\n\n"
+            "## REQ-102: pass\n"
+        )
+
+        self.assertEqual(
+            Orchestrator._requirements_audit_stable_content(first),
+            Orchestrator._requirements_audit_stable_content(second),
+        )
 
     def test_requirements_audit_forbidden_pattern_routes_back_to_implement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
