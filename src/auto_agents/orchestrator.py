@@ -3675,7 +3675,7 @@ class Orchestrator:
                     requirements_audit_check.get("failure_ids", []),
                     str(requirements_audit_check.get("reason", "")),
                 )
-                return {
+                failure_result = {
                     "ok": False,
                     "reason": str(requirements_audit_check["reason"]),
                     "failure_ids": audit_failure_ids,
@@ -3685,7 +3685,13 @@ class Orchestrator:
                     ),
                     "new_failure_ids": audit_failure_ids,
                     "raw_output": str(requirements_audit_check.get("raw_output", "")),
+                    "comparable_failures": True,
                 }
+                for key in ("rewind_to_stage", "rewind_reason"):
+                    value = str(requirements_audit_check.get(key, "")).strip()
+                    if value:
+                        failure_result[key] = value
+                return failure_result
         task_scope_label = self._task_verify_command_scope_label(task)
         if task_commands:
             verify_gate, mutation_error = self._run_gate_commands_for_commands(
@@ -3997,11 +4003,11 @@ class Orchestrator:
                 if isinstance(issue, dict) and str(issue.get("result", "")).strip() == "fail"
             ]
             failed_requirements = [item for item in failed_requirements if item]
-            return {
-                "reason": f"requirements audit still failed: {audit_result['path']}",
-                "failure_ids": failed_requirements,
-                "raw_output": str(audit_result.get("report", "")),
-            }
+            return self._task_requirements_audit_failure_result(
+                audit_result,
+                failed_requirements,
+                reason=f"requirements audit still failed: {audit_result['path']}",
+            )
         # Planner-generated audit-gap task (or its repair): deterministic, un-gameable gate
         # scoped to the task's bound requirements.
         gate = self._requirements_audit_gate(task, state)
@@ -4022,16 +4028,57 @@ class Orchestrator:
         gate_failures = [rid for rid in gate_requirement_ids if rid in failed_requirements]
         if not gate_failures:
             return None
-        return {
-            "reason": (
+        return self._task_requirements_audit_failure_result(
+            audit_result,
+            gate_failures,
+            reason=(
                 "requirements audit still fails for this task's bound requirement(s) "
                 f"{', '.join(gate_failures)} even with the task treated as done. Fix the real "
                 "proof evidence and source-of-truth so the audit passes; do not weaken the "
                 f"asserting test. See {audit_result['path']}."
             ),
-            "failure_ids": gate_failures,
+        )
+
+    def _task_requirements_audit_failure_result(
+        self,
+        audit_result: Dict[str, object],
+        failed_requirements: List[str],
+        *,
+        reason: str,
+    ) -> Dict[str, object]:
+        failed_ids = {str(item).strip() for item in failed_requirements if str(item).strip()}
+        scoped_audit_result = dict(audit_result)
+        scoped_audit_result["issues"] = [
+            issue
+            for issue in audit_result.get("issues", [])
+            if isinstance(issue, dict)
+            and str(issue.get("result", "")).strip() == "fail"
+            and str(issue.get("requirement_id", "")).strip() in failed_ids
+        ]
+        target_stage, hard_failures = self._requirements_audit_route(scoped_audit_result)
+        result: Dict[str, object] = {
+            "reason": reason,
+            "failure_ids": sorted(failed_ids),
             "raw_output": str(audit_result.get("report", "")),
         }
+        if hard_failures:
+            detail = "\n".join(f"- {entry}" for entry in hard_failures[:8])
+            result["reason"] = (
+                f"{reason}\nAutomatic recovery is unsafe for at least one blocker:\n{detail}"
+            )
+            return result
+        if (
+            target_stage
+            and STAGE_ORDER.index(target_stage) < STAGE_ORDER.index("implement")
+        ):
+            rewind_reason = self._build_requirements_audit_feedback(
+                scoped_audit_result,
+                target_stage,
+            )
+            result["reason"] = f"{reason}\n{rewind_reason}"
+            result["rewind_to_stage"] = target_stage
+            result["rewind_reason"] = rewind_reason
+        return result
 
     @staticmethod
     def _task_requirement_evidence_refs(task: Optional[TaskSpec]) -> List[str]:

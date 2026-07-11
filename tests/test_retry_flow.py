@@ -5094,6 +5094,73 @@ class RetryFlowTests(unittest.TestCase):
             Orchestrator._requirements_audit_stable_content(second),
         )
 
+    def test_task_requirements_audit_proof_failure_rewinds_to_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._disable_gates_and_approvals(project_root)
+            task = TaskSpec(
+                task_id="task-236",
+                title="Bind requirement proofs",
+                description="Complete the REQ-102 proof contract.",
+                acceptance=["REQ-102 proof metadata is complete."],
+                requirement_ids=["REQ-102"],
+                verification_refs=[".auto-agents/docs/requirements_audit.md"],
+                status="in_progress",
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            audit_result = {
+                "ok": False,
+                "path": str(
+                    project_root / ".auto-agents" / "docs" / "requirements_audit.md"
+                ),
+                "report": (
+                    "# Requirements Audit\n\n## REQ-102: fail\n\nFindings:\n"
+                    "- REQ-102 acceptance oracle #3 has no valid verified proof\n"
+                ),
+                "issues": [
+                    {
+                        "requirement_id": "REQ-102",
+                        "result": "fail",
+                        "blockers": [
+                            {
+                                "kind": "oracle_proof_invalid",
+                                "message": (
+                                    "REQ-102 acceptance oracle #3 has no valid verified proof"
+                                ),
+                            }
+                        ],
+                    },
+                    {
+                        "requirement_id": "REQ-999",
+                        "result": "fail",
+                        "blockers": [
+                            {
+                                "kind": "forbidden_pattern",
+                                "message": "unrelated implementation blocker",
+                                "path": "app/unrelated.py",
+                                "authoritative": True,
+                            }
+                        ],
+                    },
+                ],
+            }
+            orchestrator = Orchestrator(project_root)
+
+            with patch(
+                "auto_agents.orchestrator.run_requirements_audit",
+                return_value=audit_result,
+            ):
+                result = orchestrator._run_task_verify(task, state=state)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["failure_ids"], ["REQ-102"])
+            self.assertEqual(result["rewind_to_stage"], "plan")
+            self.assertIn("Recovery route: rerun from plan", result["rewind_reason"])
+            self.assertIn("no valid verified proof", result["rewind_reason"])
+            self.assertNotIn("unrelated implementation blocker", result["rewind_reason"])
+
     def test_requirements_audit_forbidden_pattern_routes_back_to_implement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

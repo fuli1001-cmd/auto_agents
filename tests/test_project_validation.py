@@ -983,6 +983,75 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertEqual(repeated.decision.repeat_count, 2)
         self.assertEqual(repeated.decision.fingerprint, result.decision.fingerprint)
 
+    def test_provider_triage_includes_referenced_requirements_audit_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            audit_path = project_root / ".auto-agents" / "docs" / "requirements_audit.md"
+            write_text(
+                audit_path,
+                "# Requirements Audit\n\n"
+                "## REQ-102: fail\n\n"
+                "The required public API wording is present.\n\n"
+                "Findings:\n"
+                "- REQ-102 acceptance oracle #3 has no valid verified proof\n\n"
+                "## REQ-103: fail\n\n"
+                "Findings:\n"
+                "- unrelated implementation blocker\n",
+            )
+            payload = {
+                "decision": "DO_NOT_REPAIR",
+                "owner": "target_project",
+                "generic": False,
+                "safe_to_self_repair": False,
+                "confidence": 0.98,
+                "category": "target_contract_failure",
+                "reason": "target proof metadata is incomplete",
+                "evidence": ["REQ-102 audit finding"],
+            }
+
+            class FakeOrchestrator:
+                config = type("Config", (), {"efforts": {"self_repair": "max"}})()
+
+                def _call_with_failover(self, request):
+                    self.request = request
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=json.dumps(payload),
+                    )
+
+            orchestrator = FakeOrchestrator()
+            task = TaskSpec(
+                task_id="task-236",
+                title="Bind requirement proofs",
+                description="",
+                acceptance=[],
+                verify_history=[
+                    {
+                        "attempt": 2,
+                        "decision": "fail",
+                        "failure_ids": ["REQ-102"],
+                    }
+                ],
+            )
+            state = RunState(run_id="triage-run", status="failed", tasks=[task])
+
+            adjudicate_auto_agents_error(
+                orchestrator,
+                target_project_root=project_root,
+                error="Task task-236 failed gates: requirements audit failed for REQ-102",
+                state=state,
+                env={},
+            )
+
+            prompt = orchestrator.request.prompt
+            self.assertIn('"requirements_audit_findings"', prompt)
+            self.assertIn("The required public API wording is present.", prompt)
+            self.assertIn("acceptance oracle #3 has no valid verified proof", prompt)
+            self.assertNotIn("unrelated implementation blocker", prompt)
+
     def test_valid_provider_rejection_overrides_eligible_heuristic(self) -> None:
         scope_error = (
             "Task task-224 failed gates: verification scope mismatch: new failures are outside "

@@ -486,6 +486,7 @@ class AutoAgentsSelfRepairJudge:
             "heuristic_hint": self.heuristic.to_dict(),
             "run_state": _compact_run_state(state_payload),
             "run_log_tail": self._run_log_tail(state_payload),
+            "requirements_audit_findings": self._requirements_audit_evidence(state_payload),
             "target_changed_paths": _safe_changed_paths(self.target_project_root)[:40],
             "auto_agents_changed_paths": _safe_changed_paths(self.repo_root)[:40],
         }
@@ -532,6 +533,39 @@ class AutoAgentsSelfRepairJudge:
 
         log_text = read_text(run_path(self.target_project_root, run_id) / "run.log")
         return log_text[-SELF_REPAIR_TRIAGE_LOG_LIMIT:]
+
+    def _requirements_audit_evidence(self, state_payload: dict[str, object]) -> str:
+        report = read_text(
+            self.target_project_root / ".auto-agents" / "docs" / "requirements_audit.md"
+        )
+        if not report.strip():
+            return ""
+        reference_text = "\n".join(
+            [
+                str(self.error or ""),
+                json.dumps(_compact_run_state(state_payload), ensure_ascii=False),
+            ]
+        )
+        referenced_ids = {
+            item.upper()
+            for item in re.findall(r"\bREQ-\d+\b", reference_text, flags=re.IGNORECASE)
+        }
+        sections = re.finditer(
+            r"(?ms)^## (?P<id>REQ-\d+): (?P<result>[^\n]+)\n.*?(?=^## REQ-\d+: |\Z)",
+            report,
+        )
+        selected: list[str] = []
+        for section in sections:
+            requirement_id = section.group("id")
+            result = section.group("result")
+            if referenced_ids:
+                include = requirement_id.upper() in referenced_ids
+            else:
+                include = result.strip().lower() == "fail"
+            if not include:
+                continue
+            selected.append(section.group(0).strip())
+        return _compact_text("\n\n".join(selected), SELF_REPAIR_TRIAGE_CONTEXT_LIMIT)
 
     @staticmethod
     def _agent_failure_detail(result: AgentResult) -> str:
