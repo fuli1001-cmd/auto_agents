@@ -24,7 +24,7 @@ from auto_agents.config import (
     task_plan_path,
 )
 from auto_agents.gates import FailureExtraction
-from auto_agents.git_ops import changed_files, changed_paths, commit_all, worktree_fingerprint
+from auto_agents.git_ops import changed_files, changed_paths, commit_all, hard_reset_clean, head_ref, worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, CommandResult, GateParallelGroup, GateResult, RunState, TaskSpec
 from auto_agents.orchestrator import Orchestrator
@@ -1517,6 +1517,99 @@ class AuditRecoveryAdapter:
 
 
 class RetryFlowTests(unittest.TestCase):
+    def test_pending_replan_commits_current_contract_with_unrelated_product_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            commit_all(project_root, "test: old planning baseline")
+            old_head = head_ref(project_root)
+
+            current_trace = {
+                "contract_identity_schema_version": 1,
+                "requirements": [
+                    {
+                        "id": "REQ-132",
+                        "status": "active",
+                        "supersedes": ["REQ-102"],
+                    },
+                    {
+                        "id": "REQ-102",
+                        "status": "superseded",
+                        "superseded_by": ["REQ-132"],
+                    },
+                ],
+            }
+            write_text(
+                project_root / ".auto-agents" / "docs" / "project_brief.md",
+                "# Current iteration brief\n",
+            )
+            write_text(
+                project_root / ".auto-agents" / "docs" / "architecture.md",
+                "# Current iteration architecture\n",
+            )
+            write_json(requirements_trace_path(project_root), current_trace)
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-251",
+                            "title": "Implement current contract",
+                            "description": "Cover the replacement requirement.",
+                            "acceptance": ["REQ-132 is implemented"],
+                            "requirement_ids": ["REQ-132"],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            write_text(project_root / "product.py", "PARTIAL = True\n")
+            subprocess.run(
+                ["git", "add", "product.py"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+            orchestrator = Orchestrator(project_root)
+            pending_tasks = orchestrator._load_tasks_from_plan()
+            self.assertTrue(all(task.status == "pending" for task in pending_tasks))
+
+            orchestrator._commit_planning_baseline_if_needed(pending_tasks)
+
+            current_head = head_ref(project_root)
+            self.assertNotEqual(current_head, old_head)
+            self.assertIn("product.py", changed_paths(project_root))
+            committed_paths = subprocess.run(
+                ["git", "show", "--pretty=format:", "--name-only", "HEAD"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.splitlines()
+            self.assertNotIn("product.py", committed_paths)
+            self.assertTrue(hard_reset_clean(project_root, current_head))
+            self.assertFalse((project_root / "product.py").exists())
+            self.assertEqual(
+                json.loads(requirements_trace_path(project_root).read_text(encoding="utf-8")),
+                current_trace,
+            )
+            self.assertIn(
+                "Current iteration brief",
+                (project_root / ".auto-agents" / "docs" / "project_brief.md").read_text(
+                    encoding="utf-8"
+                ),
+            )
+            self.assertIn(
+                "Current iteration architecture",
+                (project_root / ".auto-agents" / "docs" / "architecture.md").read_text(
+                    encoding="utf-8"
+                ),
+            )
+
     def test_pending_task_does_not_resume_from_orchestrator_only_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

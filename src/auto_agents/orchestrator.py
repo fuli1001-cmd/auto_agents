@@ -8940,8 +8940,6 @@ class Orchestrator:
         if any(task.status not in ("pending", "done") for task in task_list):
             return
 
-        is_iteration = any(task.status == "done" for task in task_list)
-
         allowed = {".gitignore", "README.md", "spec.md"}
         if self._active_spec_file is not None:
             try:
@@ -8950,31 +8948,54 @@ class Orchestrator:
                 pass
 
         only_known = True
+        has_planning_changes = False
         for line in changes.splitlines():
             path = line[3:].strip()
             if not path:
                 continue
             if path.startswith(".auto-agents/"):
+                has_planning_changes = True
                 continue
             if path in allowed:
+                has_planning_changes = True
                 continue
             only_known = False
-            break
+
+        if not has_planning_changes:
+            return
 
         if only_known:
             # All changes are planning artifacts — commit everything.
             commit_all(self.project_root, "docs(project): capture planning baseline")
-        elif is_iteration:
-            # Iteration: repo has non-planning changes (e.g. from agents
-            # touching project files).  Stage and commit only .auto-agents/
-            # so that implement's clean-tree check can pass.
+        else:
+            # The task plan is not a reliable iteration marker: replanning can
+            # replace every historical task with new pending tasks.  Always
+            # capture the planning artifacts separately when product changes
+            # are also present.  Otherwise the verify baseline points at the
+            # old HEAD and a later rewind silently discards the current brief,
+            # architecture, requirements contract, and task plan.
             from .git_ops import _git
-            _git(self.project_root, "add", ".auto-agents/")
+            add = _git(self.project_root, "add", ".auto-agents/")
+            if add.returncode != 0:
+                raise RuntimeError(add.stderr.strip() or "git add planning artifacts failed")
+            commit_paths = [".auto-agents/"]
             for extra in allowed:
                 extra_path = self.project_root / extra
                 if extra_path.exists():
-                    _git(self.project_root, "add", extra)
-            _git(self.project_root, "commit", "-m", "docs(project): capture iteration planning baseline")
+                    add = _git(self.project_root, "add", extra)
+                    if add.returncode != 0:
+                        raise RuntimeError(add.stderr.strip() or f"git add {extra} failed")
+                    commit_paths.append(extra)
+            commit = _git(
+                self.project_root,
+                "commit",
+                "-m",
+                "docs(project): capture planning baseline",
+                "--",
+                *commit_paths,
+            )
+            if commit.returncode != 0:
+                raise RuntimeError(commit.stderr.strip() or "git commit planning baseline failed")
 
     def _should_resume_task(self, state: RunState, task: TaskSpec) -> bool:
         if task.status != "pending":
