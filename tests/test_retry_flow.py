@@ -3629,6 +3629,61 @@ class RetryFlowTests(unittest.TestCase):
             )
             self.assertEqual(len(task.verify_history), 1)
 
+    def test_repeated_task_audit_failure_escalates_from_implement_to_clarify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-134",
+                title="Align request evidence",
+                description="Make persisted evidence match the outbound request.",
+                acceptance=["The requirements audit passes."],
+                requirement_ids=["REQ-134"],
+                status="in_progress",
+                verify_history=[
+                    {
+                        "attempt": 1,
+                        "decision": "fail",
+                        "summary": "requirements audit still fails for REQ-134",
+                        "failure_ids": ["REQ-134"],
+                        "comparable_failures": True,
+                    }
+                ],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            verify_result = {
+                "ok": False,
+                "reason": "requirements audit still fails for REQ-134",
+                "failure_ids": ["REQ-134"],
+                "comparable_failures": True,
+                "requirements_audit_failure": True,
+                "audit_no_progress_rewind_stage": "clarify",
+                "audit_no_progress_rewind_reason": "Refine the forbidden pattern.",
+            }
+
+            with patch.object(
+                orchestrator,
+                "_run_task_verify",
+                return_value=verify_result,
+            ):
+                result = orchestrator._execute_task_with_retries(
+                    state,
+                    task,
+                    resume_existing=True,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["rewind_to_stage"], "clarify")
+            self.assertEqual(result["expected_owner_stage"], "clarify")
+            self.assertIn(
+                "Repeated implementation attempts made no progress",
+                result["rewind_reason"],
+            )
+            self.assertIn("Refine the forbidden pattern", result["rewind_reason"])
+            self.assertEqual(len(task.verify_history), 2)
+
     def test_task_verify_baseline_does_not_absorb_failures_from_prior_done_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

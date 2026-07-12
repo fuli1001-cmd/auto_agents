@@ -4160,6 +4160,7 @@ class Orchestrator:
             "reason": reason,
             "failure_ids": sorted(failed_ids),
             "raw_output": str(audit_result.get("report", "")),
+            "requirements_audit_failure": True,
         }
         if hard_failures:
             detail = "\n".join(f"- {entry}" for entry in hard_failures[:8])
@@ -4179,6 +4180,18 @@ class Orchestrator:
             result["rewind_to_stage"] = target_stage
             result["expected_owner_stage"] = target_stage
             result["rewind_reason"] = rewind_reason
+        elif target_stage == "implement":
+            # Give implementation one opportunity to remove a genuine product
+            # violation. If the exact audit failure survives that attempt, the
+            # executor escalates to clarify so the forbidden-pattern contract
+            # and its scope can be re-adjudicated instead of terminally looping.
+            result["audit_no_progress_rewind_stage"] = "clarify"
+            result["audit_no_progress_rewind_reason"] = (
+                self._build_requirements_audit_feedback(
+                    scoped_audit_result,
+                    "clarify",
+                )
+            )
         return result
 
     @staticmethod
@@ -7438,6 +7451,37 @@ class Orchestrator:
                 if bool(verify_result.get("contract_scope_issue")):
                     break
                 if bool(verify_analysis["stop_retry"]):
+                    if bool(verify_result.get("requirements_audit_failure")):
+                        audit_rewind_stage = str(
+                            verify_result.get("audit_no_progress_rewind_stage", "")
+                        ).strip()
+                        if audit_rewind_stage:
+                            audit_rewind_reason = str(
+                                verify_result.get(
+                                    "audit_no_progress_rewind_reason",
+                                    last_reason,
+                                )
+                            ).strip()
+                            last_reason = self._format_repeated_verify_failure_reason(
+                                last_reason,
+                                first_attempt=verify_analysis["first_attempt"],
+                                repeat=verify_analysis["repeat"],
+                            )
+                            return {
+                                "ok": False,
+                                "review": last_reason,
+                                "reason": last_reason,
+                                "failure_ids": list(failure_ids),
+                                "rewind_to_stage": audit_rewind_stage,
+                                "expected_owner_stage": audit_rewind_stage,
+                                "rewind_reason": (
+                                    "Repeated implementation attempts made no progress on "
+                                    "the same requirements-audit failure. Re-adjudicate the "
+                                    "requirement contract, forbidden-pattern precision, and "
+                                    "implementation scope before replanning.\n\n"
+                                    f"{audit_rewind_reason}"
+                                ),
+                            }
                     if not comparable_failures:
                         last_reason = self._format_non_comparable_verify_failure_reason(last_reason)
                     else:

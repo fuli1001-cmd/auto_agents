@@ -176,6 +176,23 @@ def classify_auto_agents_error(
         return SelfRepairDecision(False, reason="provider availability failure")
 
     if (
+        "unchanged verify failure set repeated" in lowered
+        and "requirements audit still fails for this task's bound requirement(s)" in lowered
+    ):
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="requirements_audit_no_progress_route",
+                reason=(
+                    "a repeated task-bound requirements-audit failure escaped the "
+                    "upstream no-progress rewind invariant"
+                ),
+            ),
+            text,
+            values,
+        )
+
+    if (
         "verification scope mismatch: new failures are outside this task's owned test/proof surface"
         in lowered
     ):

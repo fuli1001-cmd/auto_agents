@@ -738,6 +738,18 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(decision.eligible)
         self.assertEqual(decision.category, "verification_scope_mismatch")
 
+        audit_no_progress = classify_auto_agents_error(
+            "Task task-239 failed gates: unchanged verify failure set repeated from "
+            "attempt-1 (repeat=2); stopping retries early\n"
+            "requirements audit still fails for this task's bound requirement(s) REQ-134",
+            env={},
+        )
+        self.assertTrue(audit_no_progress.eligible)
+        self.assertEqual(
+            audit_no_progress.category,
+            "requirements_audit_no_progress_route",
+        )
+
         audit_error = (
             "requirements audit failed: /tmp/demo/.auto-agents/docs/requirements_audit.md\n"
             "Automatic recovery is unsafe for at least one blocker:\n"
