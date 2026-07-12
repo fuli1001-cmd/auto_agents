@@ -6658,6 +6658,24 @@ class IterationFlowTests(unittest.TestCase):
 
         return project_root, spec_file
 
+    def test_readme_auto_approve_never_prompts_for_feedback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, spec_file = self._make_completed_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = IterationAdapter(project_root)
+            orchestrator._user_input_fn = lambda _prompt: (_ for _ in ()).throw(
+                AssertionError("--auto-approve must not read README feedback from stdin")
+            )
+
+            state = orchestrator._run_readme(
+                load_run_state(project_root),
+                spec_file,
+                auto_approve=True,
+            )
+
+            self.assertIn("readme", state.stage_summaries)
+            self.assertTrue((project_root / "README.md").exists())
+
     def test_iteration_resets_state_fields(self):
         """approved_gates, agent_attempts and task_review_cache must be
         cleared when a new iteration starts."""

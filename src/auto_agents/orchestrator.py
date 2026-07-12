@@ -992,7 +992,7 @@ class Orchestrator:
                         elif stage == "verify":
                             state = self._run_verify(state)
                         elif stage == "readme":
-                            state = self._run_readme(state, spec_file)
+                            state = self._run_readme(state, spec_file, auto_approve=auto_approve)
                         else:
                             state = self._run_agent_stage(stage, state, spec_file, auto_approve=auto_approve)
                 except RuntimeError as error:
@@ -6106,7 +6106,13 @@ class Orchestrator:
         else:
             state.tasks = loaded_tasks
 
-    def _run_readme(self, state: RunState, spec_file: Path) -> RunState:
+    def _run_readme(
+        self,
+        state: RunState,
+        spec_file: Path,
+        *,
+        auto_approve: bool = False,
+    ) -> RunState:
         import json as _json
         from .config import run_path as _run_path
 
@@ -6153,7 +6159,7 @@ class Orchestrator:
             self.logger.info("\nAgent:")
             self.logger.info(last_agent_msg)
 
-            answer = self._prompt_user(
+            answer = "n" if auto_approve else self._prompt_user(
                 "\nDo you have anything to add or modify? (y/n) [n]: ", default="n"
             ).strip().lower()
             if answer not in ("y", "yes"):

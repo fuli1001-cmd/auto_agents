@@ -41,6 +41,12 @@ from auto_agents.models import (
     TaskSpec,
 )
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.run_lock import (
+    RUN_LOCK_FD_ENV,
+    RUN_LOCK_KEY_ENV,
+    ProjectRunLock,
+    RunAlreadyActiveError,
+)
 from auto_agents.self_repair import (
     SELF_REPAIR_DISABLED_ENV,
     SELF_REPAIR_LAST_FINGERPRINT_ENV,
@@ -60,6 +66,58 @@ from auto_agents.validation import (
     validate_project_config_payload,
     validation_report,
 )
+
+
+class ProjectRunLockTests(unittest.TestCase):
+    def test_rejects_a_second_external_run_for_same_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            project_root.mkdir()
+            with ProjectRunLock(project_root):
+                with self.assertRaises(RunAlreadyActiveError) as ctx:
+                    ProjectRunLock(project_root, environ={}).acquire()
+
+            self.assertIn("another auto_agents run is already active", str(ctx.exception))
+            self.assertIn(str(project_root.resolve()), str(ctx.exception))
+
+    def test_accepts_explicit_inherited_self_repair_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            project_root.mkdir()
+            with ProjectRunLock(project_root) as parent_lock:
+                inherited_fd = os.dup(parent_lock.fileno)
+                inherited = ProjectRunLock(
+                    project_root,
+                    environ={
+                        RUN_LOCK_FD_ENV: str(inherited_fd),
+                        RUN_LOCK_KEY_ENV: parent_lock.key,
+                    },
+                )
+                try:
+                    inherited.acquire()
+                    self.assertEqual(inherited.fileno, inherited_fd)
+                finally:
+                    inherited.release()
+
+    def test_cli_rejects_duplicate_before_constructing_orchestrator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            project_root.mkdir()
+            stdout = io.StringIO()
+            with (
+                ProjectRunLock(project_root),
+                patch(
+                    "auto_agents.cli.Orchestrator",
+                    side_effect=AssertionError("duplicate run must stop before orchestration"),
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = main(["run", "--project", str(project_root)])
+
+            self.assertEqual(exit_code, 2)
+            payload = json.loads(stdout.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertIn("already active", payload["error"])
 
 
 class ProjectValidationTests(unittest.TestCase):
@@ -1400,6 +1458,12 @@ class ProjectValidationTests(unittest.TestCase):
             resume_env = resume_run.call_args.kwargs["env"]
             self.assertIn(SELF_REPAIR_LAST_FINGERPRINT_ENV, resume_env)
             self.assertEqual(resume_env[SELF_REPAIR_REPEAT_COUNT_ENV], "1")
+            self.assertIn(RUN_LOCK_FD_ENV, resume_env)
+            self.assertIn(RUN_LOCK_KEY_ENV, resume_env)
+            self.assertEqual(
+                resume_run.call_args.kwargs["pass_fds"],
+                (int(resume_env[RUN_LOCK_FD_ENV]),),
+            )
 
     def test_cli_run_sends_unexpected_exception_to_provider_triage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

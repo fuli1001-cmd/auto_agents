@@ -30,6 +30,7 @@ from .notifications import (
     notify_session_started,
 )
 from .orchestrator import Orchestrator
+from .run_lock import ProjectRunLock, RunAlreadyActiveError
 from .self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
@@ -310,6 +311,7 @@ def _auto_repair_auto_agents_and_resume(
     error: object,
     decision: SelfRepairDecision,
     args,
+    run_lock: ProjectRunLock,
 ) -> int:
     print(
         "Run hit an auto_agents-owned failure. Starting automatic auto_agents self-repair...",
@@ -346,7 +348,8 @@ def _auto_repair_auto_agents_and_resume(
     process = subprocess.run(
         _run_command_for_self_repair_resume(args),
         cwd=str(auto_agents_repo_root()),
-        env=append_self_repair_history(decision),
+        env=run_lock.inherited_environment(append_self_repair_history(decision)),
+        pass_fds=(run_lock.fileno,),
         text=True,
     )
     return process.returncode
@@ -613,8 +616,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         orchestrator = None
+        project_root = Path(args.project)
+        run_lock = ProjectRunLock(project_root)
         try:
-            project_root = Path(args.project)
+            run_lock.acquire()
+        except RunAlreadyActiveError as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 2
+        try:
             spec_file = Path(args.spec_file) if args.spec_file else _default_spec_file(project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
             if getattr(args, "no_repo_map", False):
@@ -650,10 +659,13 @@ def main(argv: list[str] | None = None) -> int:
                     error,
                     decision,
                     args,
+                    run_lock,
                 )
             _notify_run_failure(project_root, error)
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
+        finally:
+            run_lock.release()
 
     if args.command == "status":
         orchestrator = Orchestrator(Path(args.project))
