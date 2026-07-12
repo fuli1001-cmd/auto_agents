@@ -1948,7 +1948,15 @@ def run_requirements_audit(
         if _is_effectively_done(task):
             task_requirements.update(task.requirement_ids)
 
-    for item in requirement_records(trace):
+    trace_requirements = requirement_records(trace)
+    forbidden_scan_files: List[Tuple[str, str]] = []
+    if any(
+        item.get("status", "active") == "active" and item.get("forbidden_patterns")
+        for item in trace_requirements
+    ):
+        forbidden_scan_files = _forbidden_pattern_scan_files(project_root)
+
+    for item in trace_requirements:
         req_id = str(item.get("id", "")).strip()
         status = str(item.get("status", "active")).strip()
         priority = str(item.get("priority", "mandatory")).strip()
@@ -1990,7 +1998,14 @@ def run_requirements_audit(
                             "reference_status": ref_status,
                         }
                     )
-        blockers.extend(_forbidden_pattern_findings(project_root, item, current_spec))
+        blockers.extend(
+            forbidden_pattern_findings(
+                project_root,
+                item,
+                current_spec=current_spec,
+                _scan_files=forbidden_scan_files,
+            )
+        )
 
         # Design: corroboration rule for forbidden-pattern findings.
         # A forbidden pattern that only appears in auto_agents-internal working memory or
@@ -2273,6 +2288,7 @@ def forbidden_pattern_findings(
     *,
     include_paths: Optional[Iterable[str]] = None,
     current_spec: Optional[Path] = None,
+    _scan_files: Optional[List[Tuple[str, str]]] = None,
 ) -> List[dict]:
     status = str(requirement.get("status", "active")).strip()
     if status != "active":
@@ -2289,6 +2305,48 @@ def forbidden_pattern_findings(
             continue
     if not compiled:
         return findings
+    scan_files = _scan_files
+    if scan_files is None:
+        scan_files = _forbidden_pattern_scan_files(
+            project_root,
+            include_paths=include_paths,
+        )
+    current_spec_rel = _current_spec_relpath(project_root, current_spec)
+    for rel, content in scan_files:
+        for raw, pattern in compiled:
+            authoritative = not _forbidden_pattern_corroboration_only_path(
+                rel, current_spec_rel
+            )
+            if not _has_actionable_forbidden_pattern_match(
+                content,
+                pattern,
+                suppress_negated_matches=authoritative and rel == current_spec_rel,
+            ):
+                continue
+            findings.append(
+                {
+                    "kind": "forbidden_pattern",
+                    "message": f"forbidden pattern '{raw}' found in {rel}",
+                    "pattern": raw,
+                    "path": rel,
+                    "authoritative": authoritative,
+                }
+            )
+    return findings
+
+
+def _forbidden_pattern_scan_files(
+    project_root: Path,
+    *,
+    include_paths: Optional[Iterable[str]] = None,
+) -> List[Tuple[str, str]]:
+    """Read the forbidden-pattern corpus once for a complete audit.
+
+    A requirements audit may contain hundreds of requirements. Walking and
+    reading the repository once per requirement made every task baseline take
+    many minutes on large projects. Callers can now reuse this immutable
+    corpus while preserving the existing per-requirement matching semantics.
+    """
     ignored_dirs = {
         ".git",
         ".auto-agents/history",
@@ -2305,6 +2363,12 @@ def forbidden_pattern_findings(
         "node_modules",
         "__pycache__",
         ".pytest_cache",
+        ".data",
+        ".next",
+        ".tmp",
+        ".tmp-tests",
+        "build",
+        "dist",
     }
     ignored_files = {
         ".auto-agents/state/gate_baseline_cache.json",
@@ -2318,7 +2382,7 @@ def forbidden_pattern_findings(
         for path in (include_paths or [])
         if str(path).strip()
     }
-    current_spec_rel = _current_spec_relpath(project_root, current_spec)
+    scan_files: List[Tuple[str, str]] = []
     for root, dirs, files in os.walk(project_root):
         rel_root = str(Path(root).relative_to(project_root)).replace("\\", "/")
         dirs[:] = [
@@ -2345,26 +2409,8 @@ def forbidden_pattern_findings(
                 ".auto-agents/state/run_state.json",
             }:
                 content = _state_payload_for_forbidden_pattern_scan(content)
-            for raw, pattern in compiled:
-                authoritative = not _forbidden_pattern_corroboration_only_path(
-                    rel, current_spec_rel
-                )
-                if not _has_actionable_forbidden_pattern_match(
-                    content,
-                    pattern,
-                    suppress_negated_matches=authoritative and rel == current_spec_rel,
-                ):
-                    continue
-                findings.append(
-                    {
-                        "kind": "forbidden_pattern",
-                        "message": f"forbidden pattern '{raw}' found in {rel}",
-                        "pattern": raw,
-                        "path": rel,
-                        "authoritative": authoritative,
-                    }
-                )
-    return findings
+            scan_files.append((rel, content))
+    return scan_files
 
 
 def _state_payload_for_forbidden_pattern_scan(content: str) -> str:

@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -36,6 +37,7 @@ from auto_agents.requirements import (
 )
 from auto_agents.validation import validate_task_plan_with_requirements, validation_report
 from auto_agents.visual_judge import parse_visual_judge_response, visual_evidence_pairs_for_task
+import auto_agents.requirements as requirements_module
 
 
 def _requirement(**overrides):
@@ -1739,6 +1741,43 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertEqual(issues["REQ-OLD"]["result"], "advisory")
             self.assertTrue(issues["REQ-OLD"]["out_of_scope_backlog"])
             self.assertIn("Out-of-scope backlog", str(result["report"]))
+
+    def test_requirements_audit_builds_forbidden_pattern_corpus_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(id="REQ-001", forbidden_patterns=["legacy_one"]),
+                        _requirement(id="REQ-002", forbidden_patterns=["legacy_two"]),
+                    ],
+                },
+            )
+            write_text(
+                project_root / "src" / "backend.py",
+                "legacy_one = True\nlegacy_two = True\n",
+            )
+
+            with patch.object(
+                requirements_module,
+                "_forbidden_pattern_scan_files",
+                wraps=requirements_module._forbidden_pattern_scan_files,
+            ) as scan_files:
+                result = run_requirements_audit(project_root, [])
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(scan_files.call_count, 1)
+            issues = {item["requirement_id"]: item for item in result["issues"]}
+            for req_id in ("REQ-001", "REQ-002"):
+                forbidden = [
+                    item
+                    for item in issues[req_id]["blockers"]
+                    if item.get("kind") == "forbidden_pattern"
+                ]
+                self.assertEqual(forbidden[0]["path"], "src/backend.py")
 
     def test_requirements_audit_out_of_scope_requirement_alone_does_not_block_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
