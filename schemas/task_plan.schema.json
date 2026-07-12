@@ -104,6 +104,10 @@
                   "type": "string",
                   "minLength": 1
                 },
+                "requirement_contract_sha256": {
+                  "type": "string",
+                  "pattern": "^sha256:[0-9a-f]{64}$"
+                },
                 "oracle_index": {
                   "type": "integer",
                   "minimum": 1

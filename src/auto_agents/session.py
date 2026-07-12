@@ -27,7 +27,7 @@ from .gates import (
     run_commands,
     run_commands_collect_all,
 )
-from .git_ops import changed_paths, commit_all, head_ref
+from .git_ops import changed_paths, commit_all, head_ref, worktree_fingerprint
 from .io_utils import read_text, write_text
 from .models import (
     AgentRequest,
@@ -537,6 +537,9 @@ class Session:
             self._print(f"\n--- Provider recovery iteration {state.current_attempt} ---")
 
             prompt = self._build_provider_resolve_prompt(state, feedback)
+            provider_artifacts_before = worktree_fingerprint(
+                self.project_root, ignored_prefixes=(".antigravitycli/",)
+            )
             try:
                 reply = self._call_agent(state, f"provider-resolve-{state.current_attempt}", prompt)
             except RuntimeError as exc:
@@ -584,6 +587,10 @@ class Session:
                 continue
 
             self._print(f"\nAgent:\n{reply.strip()}")
+            if worktree_fingerprint(
+                self.project_root, ignored_prefixes=(".antigravitycli/",)
+            ) != provider_artifacts_before:
+                self.orch.bind_resolved_provider_reference_contracts()
             verify = self.orch.provider_research_resolution_report()
             verify_reason = "" if verify["eligible"] is False and not verify["blockers"] else str(
                 verify.get("reason") or "\n".join(

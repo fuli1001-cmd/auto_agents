@@ -827,6 +827,21 @@ class ProjectValidationTests(unittest.TestCase):
             "recovery_loop_orchestration_noop",
         )
 
+        target_no_progress = classify_auto_agents_error(
+            "recovery no progress: same failure; target_stage=clarify; engine_invariant=none",
+            env={},
+        )
+        self.assertFalse(target_no_progress.eligible)
+        self.assertEqual(target_no_progress.category, "recovery_no_progress")
+
+        routed_no_progress = classify_auto_agents_error(
+            "recovery no progress: same failure; target_stage=clarify; "
+            "engine_invariant=route_owner_mismatch",
+            env={},
+        )
+        self.assertTrue(routed_no_progress.eligible)
+        self.assertEqual(routed_no_progress.category, "recovery_route_invariant")
+
         implement_config_decision = classify_auto_agents_error(
             "stage implement modified files outside its ownership during implement-task-225. "
             "Changed paths: .auto-agents/config.json. "

@@ -1517,6 +1517,78 @@ class AuditRecoveryAdapter:
 
 
 class RetryFlowTests(unittest.TestCase):
+    def test_recovery_loop_uses_failure_and_requirement_scope_not_review_wording_or_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            first = TaskSpec(
+                task_id="task-242",
+                title="First owner",
+                description="Fix contract.",
+                acceptance=["contract passes"],
+                requirement_ids=["REQ-102"],
+            )
+            replacement = TaskSpec(
+                task_id="task-250",
+                title="Replacement owner",
+                description="Fix contract.",
+                acceptance=["contract passes"],
+                requirement_ids=["REQ-102"],
+            )
+
+            detected_first = orchestrator._record_recovery_loop_event(
+                state,
+                task=first,
+                target_stage="clarify",
+                review_text="first wording",
+                failure_ids=["tests/test_contract.py::test_req_102"],
+            )
+            detected_second = orchestrator._record_recovery_loop_event(
+                state,
+                task=replacement,
+                target_stage="clarify",
+                review_text="completely different wording",
+                failure_ids=["tests/test_contract.py::test_req_102"],
+            )
+
+            self.assertFalse(detected_first)
+            self.assertTrue(detected_second)
+            self.assertEqual(state.recovery_loop_events[-1]["requirement_ids"], ["REQ-102"])
+
+    def test_rewind_incident_is_persisted_before_workspace_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            task = TaskSpec(
+                task_id="task-incident",
+                title="Preserve failure evidence",
+                description="Record rewind context.",
+                acceptance=["incident exists"],
+                requirement_ids=["REQ-102"],
+            )
+            write_text(project_root / "attempt.txt", "failed attempt\n")
+
+            relative = orchestrator._persist_rewind_incident(
+                state,
+                task=task,
+                target_stage="clarify",
+                rewind_ref="HEAD",
+                gate_result={
+                    "reason": "contract drift",
+                    "review": "owner is clarify",
+                    "failure_ids": ["tests/test_contract.py::test_req_102"],
+                },
+            )
+
+            incident = json.loads((project_root / relative).read_text(encoding="utf-8"))
+            self.assertEqual(incident["target_stage"], "clarify")
+            self.assertEqual(incident["requirement_ids"], ["REQ-102"])
+            self.assertIn("attempt.txt", incident["changed_paths"])
+
     @staticmethod
     def _configure_git_identity(project_root: Path) -> None:
         subprocess.run(
@@ -4733,13 +4805,13 @@ class RetryFlowTests(unittest.TestCase):
 
         self.assertEqual(Orchestrator._review_feedback_rewind_stage(summary), "design")
 
-    def test_review_feedback_rewinds_to_clarify_for_requirements_audit_wording(self) -> None:
+    def test_review_feedback_does_not_guess_clarify_from_requirements_audit_wording(self) -> None:
         summary = (
             "DECISION: fail\n"
             "验收标准 1 未满足：REQ-102 审计段依然缺少明确契约表述。"
         )
 
-        self.assertEqual(Orchestrator._review_feedback_rewind_stage(summary), "clarify")
+        self.assertEqual(Orchestrator._review_feedback_rewind_stage(summary), "")
 
     def test_misrouted_project_brief_audit_recovery_rewinds_to_clarify_on_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5071,10 +5143,8 @@ class RetryFlowTests(unittest.TestCase):
                 result = orchestrator._run_task_verify(task, state=state)
 
             self.assertFalse(result["ok"])
-            self.assertIn("rewind_to_stage", result, result)
-            self.assertEqual(result["rewind_to_stage"], "clarify")
-            self.assertIn("materialized the derived report", str(result["reason"]))
-            self.assertIn("Recovery route: rerun from clarify", str(result["reason"]))
+            self.assertNotIn("rewind_to_stage", result, result)
+            self.assertIn(ref, result["failure_ids"])
             regenerated = audit_path.read_text(encoding="utf-8")
             self.assertIn("Provider terminology is documented.", regenerated)
             self.assertNotIn(required_wording, regenerated)

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -16,7 +18,7 @@ from .config import (
     run_state_path,
     task_plan_path,
 )
-from .io_utils import read_json, write_json, write_text
+from .io_utils import read_json, read_text, write_json, write_text
 from .models import TaskSpec
 
 
@@ -39,6 +41,8 @@ DEFAULT_ORACLE_TYPE = "mixed"
 DEFAULT_ORACLE_STRENGTH = "behavioral"
 DEFAULT_EVIDENCE_BOUNDARY = "system_boundary"
 ORACLE_PROOF_SCHEMA_VERSION = 1
+LATEST_ORACLE_PROOF_SCHEMA_VERSION = 2
+CONTRACT_IDENTITY_SCHEMA_VERSION = 1
 ORACLE_STRENGTH_ORDER = {"proxy": 0, "behavioral": 1, "semantic": 2, "human": 3}
 EVIDENCE_BOUNDARY_ORDER = {"internal_state": 0, "system_boundary": 1, "external_side_effect": 2}
 NEGATIVE_CONTRACT_MARKERS = (
@@ -85,6 +89,127 @@ CONTRACT_TOKEN_RE = re.compile(
     r"|/[A-Za-z0-9_{}:/?.=&%+~-]+"
     r"|[A-Za-z_][A-Za-z0-9_]*(?:_[A-Za-z0-9]+)+"
 )
+
+
+def _normalized_contract_text(value: object) -> str:
+    text = unicodedata.normalize("NFC", str(value or "")).replace("\r\n", "\n")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalized_string_list(value: object, *, ordered: bool) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    items = [_normalized_contract_text(item) for item in value if _normalized_contract_text(item)]
+    return items if ordered else sorted(set(items))
+
+
+def requirement_contract_payload(requirement: dict) -> dict:
+    """Return the canonical, proof-bearing portion of a requirement record.
+
+    Status and supersession links are lifecycle metadata and notes are explicitly
+    non-normative.  Everything that can change audit scope or proof validity is
+    included in the fingerprint.
+    """
+    return {
+        "id": _normalized_contract_text(requirement.get("id")),
+        "text": _normalized_contract_text(requirement.get("text")),
+        "source": _normalized_contract_text(requirement.get("source")),
+        "priority": _normalized_contract_text(requirement.get("priority", "mandatory")),
+        "acceptance_oracles": _normalized_string_list(
+            requirement.get("acceptance_oracles"), ordered=True
+        ),
+        "oracle_type": _normalized_contract_text(requirement.get("oracle_type")),
+        "oracle_strength": _normalized_contract_text(requirement.get("oracle_strength")),
+        "evidence_boundary": _normalized_contract_text(requirement.get("evidence_boundary")),
+        "forbidden_proxy_oracles": _normalized_string_list(
+            requirement.get("forbidden_proxy_oracles"), ordered=False
+        ),
+        "forbidden_patterns": sorted(
+            str(item).replace("\r\n", "\n").strip()
+            for item in requirement.get("forbidden_patterns", [])
+            if isinstance(item, str) and item.strip()
+        ),
+        "external_docs_required": bool(requirement.get("external_docs_required", False)),
+        "provider_references": sorted(provider_reference_paths(requirement)),
+    }
+
+
+def requirement_contract_sha256(requirement: dict) -> str:
+    encoded = json.dumps(
+        requirement_contract_payload(requirement),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def stamp_requirement_contract_hashes(payload: object) -> Tuple[object, List[str]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("requirements"), list):
+        return payload, []
+    updated = copy.deepcopy(payload)
+    updated["contract_identity_schema_version"] = CONTRACT_IDENTITY_SCHEMA_VERSION
+    changes: List[str] = []
+    for item in updated["requirements"]:
+        if not isinstance(item, dict):
+            continue
+        expected = requirement_contract_sha256(item)
+        if str(item.get("contract_sha256", "")).strip() != expected:
+            item["contract_sha256"] = expected
+            req_id = str(item.get("id", "")).strip() or "<unknown>"
+            changes.append(f"requirement {req_id}: stamped contract_sha256")
+        item.setdefault("supersedes", [])
+        item.setdefault("superseded_by", [])
+    return updated, changes
+
+
+def stamp_task_plan_contract_hashes(
+    plan_payload: object,
+    trace_payload: object,
+) -> Tuple[object, List[str]]:
+    if not isinstance(plan_payload, dict) or not isinstance(trace_payload, dict):
+        return plan_payload, []
+    tasks = plan_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return plan_payload, []
+    # Plans created before proof binding existed are still valid legacy input.
+    # Only upgrade a plan when it actually carries proof records; otherwise the
+    # v2 schema marker would make every legacy task fail strict proof validation.
+    try:
+        declared_version = int(plan_payload.get("oracle_proof_schema_version", 0) or 0)
+    except (TypeError, ValueError):
+        declared_version = 0
+    has_proof_records = any(
+        isinstance(task, dict)
+        and isinstance(task.get("requirement_proofs"), list)
+        and bool(task.get("requirement_proofs"))
+        for task in tasks
+    )
+    if declared_version < LATEST_ORACLE_PROOF_SCHEMA_VERSION and not has_proof_records:
+        return plan_payload, []
+    by_id = {
+        str(item.get("id", "")).strip(): item
+        for item in requirement_records(trace_payload)
+    }
+    updated = copy.deepcopy(plan_payload)
+    updated["oracle_proof_schema_version"] = LATEST_ORACLE_PROOF_SCHEMA_VERSION
+    changes: List[str] = []
+    for task in updated.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id", "")).strip() or "<unknown>"
+        for proof in task.get("requirement_proofs", []) or []:
+            if not isinstance(proof, dict):
+                continue
+            req_id = str(proof.get("requirement_id", "")).strip()
+            requirement = by_id.get(req_id)
+            if requirement is None:
+                continue
+            expected = requirement_contract_sha256(requirement)
+            if str(proof.get("requirement_contract_sha256", "")).strip() != expected:
+                proof["requirement_contract_sha256"] = expected
+                changes.append(f"task {task_id}: bound {req_id} contract hash")
+    return updated, changes
 
 
 def _normalize_contract_token(value: str) -> str:
@@ -334,6 +459,8 @@ def _normalize_requirement_record(item: dict) -> dict:
 
     if "forbidden_proxy_oracles" not in normalized or normalized.get("forbidden_proxy_oracles") is None:
         normalized["forbidden_proxy_oracles"] = []
+    normalized.setdefault("supersedes", [])
+    normalized.setdefault("superseded_by", [])
 
     return normalized
 
@@ -414,6 +541,11 @@ def validate_requirements_trace_payload(payload: object) -> List[str]:
         return errors + ["requirements trace must contain a 'requirements' list"]
 
     seen_ids = set()
+    try:
+        identity_mode = int(payload.get("contract_identity_schema_version", 0) or 0)
+    except (TypeError, ValueError):
+        identity_mode = 0
+        errors.append("contract_identity_schema_version must be an integer when present")
     for index, item in enumerate(requirements, start=1):
         prefix = f"requirement #{index}"
         if not isinstance(item, dict):
@@ -504,6 +636,107 @@ def validate_requirements_trace_payload(payload: object) -> List[str]:
         if not isinstance(notes, str):
             errors.append(f"{prefix} notes must be a string")
 
+        for link_field in ("supersedes", "superseded_by"):
+            links = item.get(link_field, [])
+            if not isinstance(links, list) or any(
+                not isinstance(entry, str) or not entry.strip() for entry in links
+            ):
+                errors.append(f"{prefix} {link_field} must be a list of non-empty strings")
+        if identity_mode >= CONTRACT_IDENTITY_SCHEMA_VERSION:
+            actual_hash = str(item.get("contract_sha256", "")).strip()
+            expected_hash = requirement_contract_sha256(item)
+            if actual_hash != expected_hash:
+                errors.append(
+                    f"{prefix} contract_sha256 is missing or stale; expected {expected_hash}"
+                )
+
+    by_id = {
+        str(item.get("id", "")).strip(): item
+        for item in requirements
+        if isinstance(item, dict) and str(item.get("id", "")).strip()
+    }
+    for req_id, item in by_id.items():
+        supersedes = [str(value).strip() for value in item.get("supersedes", []) or []]
+        superseded_by = [str(value).strip() for value in item.get("superseded_by", []) or []]
+        for old_id in supersedes:
+            old = by_id.get(old_id)
+            if old is None:
+                errors.append(f"requirement {req_id} supersedes unknown requirement {old_id}")
+            elif req_id not in (old.get("superseded_by", []) or []):
+                errors.append(
+                    f"requirement {req_id} supersedes {old_id}, but {old_id}.superseded_by is not reciprocal"
+                )
+        for new_id in superseded_by:
+            new = by_id.get(new_id)
+            if new is None:
+                errors.append(f"requirement {req_id} is superseded_by unknown requirement {new_id}")
+            elif req_id not in (new.get("supersedes", []) or []):
+                errors.append(
+                    f"requirement {req_id} is superseded_by {new_id}, but {new_id}.supersedes is not reciprocal"
+                )
+        if superseded_by and str(item.get("status", "")).strip() != "superseded":
+            errors.append(f"requirement {req_id} with superseded_by must have status='superseded'")
+
+    return errors
+
+
+def validate_requirement_contract_transitions(
+    previous_payload: object,
+    current_payload: object,
+    *,
+    historical_tasks: Iterable[dict] = (),
+) -> List[str]:
+    """Reject in-place mutation of requirement IDs that already represent delivered work."""
+    if not isinstance(previous_payload, dict) or not isinstance(current_payload, dict):
+        return []
+    previous = {
+        str(item.get("id", "")).strip(): item
+        for item in requirement_records(previous_payload)
+    }
+    current = {
+        str(item.get("id", "")).strip(): item
+        for item in requirement_records(current_payload)
+    }
+    proven_ids: set[str] = set()
+    for task in historical_tasks:
+        if not isinstance(task, dict) or str(task.get("status", "")).strip() != "done":
+            continue
+        proven_ids.update(
+            str(value).strip()
+            for value in task.get("requirement_ids", []) or []
+            if isinstance(value, str) and value.strip()
+        )
+        proven_ids.update(
+            str(proof.get("requirement_id", "")).strip()
+            for proof in task.get("requirement_proofs", []) or []
+            if isinstance(proof, dict)
+            and str(proof.get("requirement_id", "")).strip()
+        )
+
+    errors: List[str] = []
+    for req_id, before in previous.items():
+        after = current.get(req_id)
+        if after is None:
+            errors.append(
+                f"iteration trace deleted existing requirement {req_id}; preserve it and use status='superseded'"
+            )
+            continue
+        before_status = str(before.get("status", "active")).strip()
+        after_status = str(after.get("status", "active")).strip()
+        if before_status == "superseded" and after_status != "superseded":
+            errors.append(f"superseded requirement {req_id} cannot be reactivated under the same ID")
+        before_hash = requirement_contract_sha256(before)
+        after_hash = requirement_contract_sha256(after)
+        if req_id in proven_ids and before_hash != after_hash:
+            errors.append(
+                f"requirement contract drift for {req_id}: delivered requirement IDs are immutable; "
+                "restore the previous contract, mark it superseded with reciprocal supersession links, "
+                "and append the replacement under a new unused REQ ID"
+            )
+        if req_id in proven_ids and after_status == "superseded" and not after.get("superseded_by"):
+            errors.append(
+                f"proven requirement {req_id} is superseded but has no superseded_by replacement"
+            )
     return errors
 
 
@@ -834,6 +1067,10 @@ def validate_task_requirement_proofs(
     tasks = plan_payload.get("tasks")
     if not isinstance(tasks, list):
         return errors
+    try:
+        proof_schema_version = int(plan_payload.get("oracle_proof_schema_version") or 0)
+    except (TypeError, ValueError):
+        proof_schema_version = 0
 
     historical_task_list = [task for task in historical_tasks if isinstance(task, dict)]
     current_done_tasks = [
@@ -886,6 +1123,12 @@ def validate_task_requirement_proofs(
                 continue
             if req_id not in requirement_ids:
                 errors.append(f"{prefix} requirement_id must also appear in task requirement_ids: {req_id}")
+            if proof_schema_version >= LATEST_ORACLE_PROOF_SCHEMA_VERSION:
+                expected_contract_hash = requirement_contract_sha256(by_req[req_id])
+                if str(proof.get("requirement_contract_sha256", "")).strip() != expected_contract_hash:
+                    errors.append(
+                        f"{prefix} requirement_contract_sha256 must equal {expected_contract_hash}"
+                    )
             matched_oracle = _matched_requirement_oracle(proof, by_req[req_id])
             if matched_oracle is None:
                 errors.append(f"{prefix} must identify an acceptance oracle by oracle_index or exact acceptance_oracle")
@@ -945,6 +1188,9 @@ def _proof_matches_any_requirement_oracle(proof: dict, requirement: dict) -> boo
 
 
 def _matched_requirement_oracle(proof: dict, requirement: dict) -> Tuple[int, str] | None:
+    proof_hash = str(proof.get("requirement_contract_sha256", "")).strip()
+    if proof_hash and proof_hash != requirement_contract_sha256(requirement):
+        return None
     for index, oracle in enumerate(_requirement_acceptance_oracles(requirement)):
         if _proof_matches_oracle(proof, oracle, index):
             return index, oracle
@@ -1001,9 +1247,12 @@ def _proof_matches_oracle(proof: dict, oracle: str, zero_based_index: int) -> bo
         index = int(raw_index)
     except (TypeError, ValueError):
         index = None
+    exact_oracle = str(proof.get("acceptance_oracle", "")).strip()
     if index == zero_based_index + 1:
+        if str(proof.get("requirement_contract_sha256", "")).strip():
+            return not exact_oracle or exact_oracle == oracle
         return True
-    return str(proof.get("acceptance_oracle", "")).strip() == oracle
+    return exact_oracle == oracle
 
 
 def _proof_list_field(proof: dict, key: str) -> List[str]:
@@ -1275,6 +1524,32 @@ def _oracle_proof_findings(requirement: dict, proofs: List[Tuple[TaskSpec, dict]
         )
         return blockers
 
+    expected_hash = requirement_contract_sha256(requirement)
+    for task, proof in proofs:
+        proof_hash = str(proof.get("requirement_contract_sha256", "")).strip()
+        exact_oracle = str(proof.get("acceptance_oracle", "")).strip()
+        try:
+            proof_index = int(proof.get("oracle_index")) - 1
+        except (TypeError, ValueError):
+            proof_index = -1
+        legacy_oracle_drift = bool(
+            exact_oracle
+            and 0 <= proof_index < len(oracles)
+            and exact_oracle != oracles[proof_index]
+        )
+        if (proof_hash and proof_hash != expected_hash) or legacy_oracle_drift:
+            blockers.append(
+                {
+                    "kind": "requirement_contract_drift",
+                    "task_id": task.task_id,
+                    "message": (
+                        f"{req_id} historical proof from {task.task_id} is bound to a different "
+                        "requirement contract; preserve the delivered requirement as superseded "
+                        "and append the replacement under a new REQ ID"
+                    ),
+                }
+            )
+
     for index, oracle in enumerate(oracles):
         matching = [
             (task, proof)
@@ -1382,6 +1657,141 @@ def provider_reference_status(lock_payload: dict, reference_path: str) -> str:
     return "missing"
 
 
+def provider_reference_consumer_contract_sha256(
+    trace_payload: dict,
+    reference_path: str,
+) -> str:
+    consumers = []
+    for requirement in requirement_records(trace_payload):
+        if str(requirement.get("status", "active")).strip() != "active":
+            continue
+        if reference_path not in provider_reference_paths(requirement):
+            continue
+        consumers.append(
+            {
+                "requirement_id": str(requirement.get("id", "")).strip(),
+                "contract_sha256": requirement_contract_sha256(requirement),
+            }
+        )
+    encoded = json.dumps(
+        sorted(consumers, key=lambda item: (item["requirement_id"], item["contract_sha256"])),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def provider_reference_effective_status(
+    lock_payload: dict,
+    trace_payload: dict,
+    reference_path: str,
+) -> str:
+    refs = lock_payload.get("references", {})
+    if not isinstance(refs, dict):
+        return "missing"
+    for value in refs.values():
+        if not isinstance(value, dict):
+            continue
+        if str(value.get("path", "")).strip() != reference_path:
+            continue
+        status = str(value.get("status", "missing")).strip() or "missing"
+        if status not in {"verified", "assumption_approved", "deferred"}:
+            return status
+        try:
+            identity_mode = int(trace_payload.get("contract_identity_schema_version", 0) or 0)
+        except (TypeError, ValueError):
+            identity_mode = 0
+        if identity_mode < CONTRACT_IDENTITY_SCHEMA_VERSION:
+            return status
+        expected = provider_reference_consumer_contract_sha256(trace_payload, reference_path)
+        recorded = str(value.get("consumer_contract_sha256", "")).strip()
+        return status if recorded == expected else "needs_refresh"
+    return "missing"
+
+
+def stamp_provider_reference_consumer_hashes(
+    lock_payload: object,
+    trace_payload: dict,
+    *,
+    reference_paths: Optional[Iterable[str]] = None,
+) -> Tuple[object, List[str]]:
+    if not isinstance(lock_payload, dict):
+        return lock_payload, []
+    refs = lock_payload.get("references")
+    if not isinstance(refs, dict):
+        return lock_payload, []
+    updated = copy.deepcopy(lock_payload)
+    changes: List[str] = []
+    allowed_paths = (
+        {str(path).strip() for path in reference_paths if str(path).strip()}
+        if reference_paths is not None
+        else None
+    )
+    for key, entry in updated.get("references", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        reference = str(entry.get("path", "")).strip()
+        status = str(entry.get("status", "")).strip()
+        if allowed_paths is not None and reference not in allowed_paths:
+            continue
+        if not reference or status not in {"verified", "assumption_approved", "deferred"}:
+            continue
+        expected = provider_reference_consumer_contract_sha256(trace_payload, reference)
+        if str(entry.get("consumer_contract_sha256", "")).strip() != expected:
+            entry["consumer_contract_sha256"] = expected
+            changes.append(str(key))
+    return updated, changes
+
+
+def migrate_legacy_provider_reference_consumer_hashes(
+    lock_payload: object,
+    previous_trace_payload: object,
+    current_trace_payload: object,
+) -> Tuple[object, List[str]]:
+    """Backfill unchanged legacy locks without forcing unrelated re-research.
+
+    A missing consumer hash means "not migrated", not "contract changed".  The
+    pre-clarify trace is the authoritative comparison point: only references
+    whose aggregate active-consumer contract is identical before and after the
+    clarify pass are grandfathered. Changed contracts remain unbound and will
+    correctly resolve to ``needs_refresh``.
+    """
+    if (
+        not isinstance(lock_payload, dict)
+        or not isinstance(previous_trace_payload, dict)
+        or not isinstance(current_trace_payload, dict)
+    ):
+        return lock_payload, []
+    refs = lock_payload.get("references")
+    if not isinstance(refs, dict):
+        return lock_payload, []
+    updated = copy.deepcopy(lock_payload)
+    changes: List[str] = []
+    for key, entry in updated.get("references", {}).items():
+        if not isinstance(entry, dict):
+            continue
+        reference = str(entry.get("path", "")).strip()
+        status = str(entry.get("status", "")).strip()
+        if (
+            not reference
+            or status not in {"verified", "assumption_approved", "deferred"}
+            or str(entry.get("consumer_contract_sha256", "")).strip()
+        ):
+            continue
+        previous_hash = provider_reference_consumer_contract_sha256(
+            previous_trace_payload, reference
+        )
+        current_hash = provider_reference_consumer_contract_sha256(
+            current_trace_payload, reference
+        )
+        if previous_hash != current_hash:
+            continue
+        entry["consumer_contract_sha256"] = current_hash
+        changes.append(str(key))
+    return updated, changes
+
+
 def _historical_snapshot_advisory_blockers(blockers: List[dict]) -> bool:
     if not blockers:
         return False
@@ -1420,6 +1830,56 @@ def _requirement_in_current_scope(requirement: dict, spec_tokens: set) -> bool:
         return True
     source = str(requirement.get("source", ""))
     return any(token and token in source for token in spec_tokens)
+
+
+def requirements_audit_context_sha256(
+    project_root: Path,
+    tasks: Iterable[TaskSpec],
+    *,
+    current_spec: Optional[Path] = None,
+    assume_done_task_ids: Optional[Iterable[str]] = None,
+) -> str:
+    trace = load_requirements_trace(project_root)
+    references = sorted(
+        {
+            reference
+            for requirement in external_doc_requirements(trace)
+            for reference in provider_reference_paths(requirement)
+        }
+    )
+    file_inputs = {}
+    for relative in [
+        ".auto-agents/docs/project_brief.md",
+        ".auto-agents/docs/architecture.md",
+        *references,
+    ]:
+        file_inputs[relative] = read_text(project_root / relative)
+    spec_value = ""
+    spec_path = ""
+    if current_spec is not None:
+        candidate = Path(current_spec)
+        if not candidate.is_absolute():
+            candidate = project_root / candidate
+        spec_path = str(candidate.resolve())
+        spec_value = read_text(candidate)
+    payload = {
+        "context_schema_version": 1,
+        "trace": trace,
+        "tasks": [task.to_dict() for task in tasks],
+        "assume_done_task_ids": sorted(
+            str(item).strip()
+            for item in (assume_done_task_ids or [])
+            if str(item).strip()
+        ),
+        "current_spec_path": spec_path,
+        "current_spec": spec_value,
+        "provider_lock": load_provider_references_lock(project_root),
+        "source_files": file_inputs,
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def run_requirements_audit(
@@ -1467,9 +1927,16 @@ def run_requirements_audit(
         tasks = tasks + [task for task in archived_tasks if task.task_id not in current_task_ids]
     lock = load_provider_references_lock(project_root)
     oracle_proof_audit = _oracle_proof_audit_enabled(project_root, tasks)
+    context_sha256 = requirements_audit_context_sha256(
+        project_root,
+        current_tasks,
+        current_spec=current_spec,
+        assume_done_task_ids=assumed_done,
+    )
     lines = [
         "# Requirements Audit",
         "",
+        f"Input context: {context_sha256}",
         f"Generated at: {_dt.datetime.utcnow().replace(microsecond=0).isoformat()}Z",
         f"Oracle proof audit: {'strict' if oracle_proof_audit else 'legacy'}",
         "",
@@ -1513,7 +1980,7 @@ def run_requirements_audit(
                     }
                 )
             for reference in references:
-                ref_status = provider_reference_status(lock, reference)
+                ref_status = provider_reference_effective_status(lock, trace, reference)
                 if ref_status not in PASSING_REFERENCE_STATUSES:
                     blockers.append(
                         {
@@ -1650,6 +2117,7 @@ def run_requirements_audit(
         "report": report,
         "issues": issues,
         "path": str(requirements_audit_path(project_root)),
+        "input_context_sha256": context_sha256,
     }
 
 

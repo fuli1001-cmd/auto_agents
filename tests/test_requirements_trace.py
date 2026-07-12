@@ -20,11 +20,19 @@ from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import (
     audit_requirements,
     load_requirements_trace,
+    migrate_legacy_provider_reference_consumer_hashes,
     normalize_generated_task_plan_statuses,
     preserve_task_plan_negative_oracle_clauses,
     run_requirements_audit,
+    requirement_contract_sha256,
+    stamp_requirement_contract_hashes,
+    stamp_task_plan_contract_hashes,
+    provider_reference_consumer_contract_sha256,
+    provider_reference_effective_status,
+    stamp_provider_reference_consumer_hashes,
     validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
+    validate_requirement_contract_transitions,
 )
 from auto_agents.validation import validate_task_plan_with_requirements, validation_report
 from auto_agents.visual_judge import parse_visual_judge_response, visual_evidence_pairs_for_task
@@ -124,6 +132,237 @@ class _VisualJudgeAdapter:
 
 
 class RequirementsTraceTests(unittest.TestCase):
+    def test_requirement_contract_hash_ignores_notes_and_lifecycle_but_not_oracles(self) -> None:
+        original = _requirement(notes="old", status="active")
+        lifecycle_update = _requirement(
+            notes="new",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        changed_oracle = _requirement(acceptance_oracles=["A different behavior is required."])
+
+        self.assertEqual(
+            requirement_contract_sha256(original),
+            requirement_contract_sha256(lifecycle_update),
+        )
+        self.assertNotEqual(
+            requirement_contract_sha256(original),
+            requirement_contract_sha256(changed_oracle),
+        )
+
+    def test_proven_requirement_contract_must_use_new_replacement_id(self) -> None:
+        previous = {"version": 1, "requirements": [_requirement()]}
+        mutated = {
+            "version": 1,
+            "requirements": [_requirement(text="Changed delivered behavior.")],
+        }
+        historical = [
+            {
+                "task_id": "task-old",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+            }
+        ]
+
+        errors = validate_requirement_contract_transitions(
+            previous, mutated, historical_tasks=historical
+        )
+
+        self.assertTrue(any("contract drift" in error for error in errors))
+        self.assertTrue(any("new unused REQ ID" in error for error in errors))
+
+    def test_proof_only_historical_task_also_freezes_requirement_contract(self) -> None:
+        previous = {"version": 1, "requirements": [_requirement()]}
+        mutated = {
+            "version": 1,
+            "requirements": [_requirement(acceptance_oracles=["Changed oracle."])],
+        }
+        historical = [
+            {
+                "task_id": "task-old",
+                "status": "done",
+                "requirement_ids": [],
+                "requirement_proofs": [_proof(status="verified")],
+            }
+        ]
+
+        errors = validate_requirement_contract_transitions(
+            previous, mutated, historical_tasks=historical
+        )
+
+        self.assertTrue(any("contract drift" in error for error in errors))
+
+    def test_proven_requirement_can_be_superseded_with_reciprocal_replacement(self) -> None:
+        previous = {"version": 1, "requirements": [_requirement()]}
+        old = _requirement(status="superseded", superseded_by=["REQ-002"])
+        new = _requirement(
+            id="REQ-002",
+            text="Changed delivered behavior.",
+            supersedes=["REQ-001"],
+        )
+        current, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [old, new]}
+        )
+        historical = [
+            {"task_id": "task-old", "status": "done", "requirement_ids": ["REQ-001"]}
+        ]
+
+        transition_errors = validate_requirement_contract_transitions(
+            previous, current, historical_tasks=historical
+        )
+        schema_errors = validate_requirements_trace_payload(current)
+
+        self.assertEqual(transition_errors, [])
+        self.assertEqual(schema_errors, [])
+
+    def test_new_plan_proofs_are_bound_to_requirement_contract_hash(self) -> None:
+        trace, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [_requirement()]}
+        )
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "requirement_proofs": [_proof(status="planned")],
+                }
+            ],
+        }
+
+        stamped, updates = stamp_task_plan_contract_hashes(plan, trace)
+
+        self.assertEqual(stamped["oracle_proof_schema_version"], 2)
+        self.assertEqual(
+            stamped["tasks"][0]["requirement_proofs"][0]["requirement_contract_sha256"],
+            trace["requirements"][0]["contract_sha256"],
+        )
+        self.assertTrue(updates)
+
+    def test_legacy_plan_with_empty_proof_lists_is_not_silently_upgraded(self) -> None:
+        trace, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [_requirement()]}
+        )
+        legacy = {
+            "tasks": [
+                {
+                    "task_id": "task-legacy",
+                    "requirement_ids": ["REQ-001"],
+                    "requirement_proofs": [],
+                }
+            ]
+        }
+
+        stamped, updates = stamp_task_plan_contract_hashes(legacy, trace)
+
+        self.assertEqual(stamped, legacy)
+        self.assertEqual(updates, [])
+
+    def test_provider_reference_verified_lock_is_invalidated_by_contract_change(self) -> None:
+        reference = ".auto-agents/docs/provider_references/provider.md"
+        trace, _ = stamp_requirement_contract_hashes(
+            {
+                "version": 1,
+                "requirements": [
+                    _requirement(
+                        external_docs_required=True,
+                        provider_reference=reference,
+                    )
+                ],
+            }
+        )
+        lock, _ = stamp_provider_reference_consumer_hashes(
+            {
+                "version": 1,
+                "references": {
+                    "provider": {
+                        "path": reference,
+                        "status": "verified",
+                    }
+                },
+            },
+            trace,
+        )
+        self.assertEqual(
+            provider_reference_effective_status(lock, trace, reference), "verified"
+        )
+
+        changed_trace, _ = stamp_requirement_contract_hashes(
+            {
+                "version": 1,
+                "requirements": [
+                    _requirement(
+                        text="A changed provider contract.",
+                        external_docs_required=True,
+                        provider_reference=reference,
+                    )
+                ],
+            }
+        )
+
+        self.assertNotEqual(
+            provider_reference_consumer_contract_sha256(trace, reference),
+            provider_reference_consumer_contract_sha256(changed_trace, reference),
+        )
+        self.assertEqual(
+            provider_reference_effective_status(lock, changed_trace, reference),
+            "needs_refresh",
+        )
+
+    def test_legacy_provider_lock_migration_backfills_only_unchanged_consumers(self) -> None:
+        unchanged_ref = ".auto-agents/docs/provider_references/unchanged.md"
+        changed_ref = ".auto-agents/docs/provider_references/changed.md"
+        previous = {
+            "version": 1,
+            "requirements": [
+                _requirement(
+                    id="REQ-001",
+                    external_docs_required=True,
+                    provider_reference=unchanged_ref,
+                ),
+                _requirement(
+                    id="REQ-002",
+                    text="Old provider contract.",
+                    external_docs_required=True,
+                    provider_reference=changed_ref,
+                ),
+            ],
+        }
+        current, _ = stamp_requirement_contract_hashes(
+            {
+                "version": 1,
+                "requirements": [
+                    previous["requirements"][0],
+                    _requirement(
+                        id="REQ-002",
+                        text="Changed provider contract.",
+                        external_docs_required=True,
+                        provider_reference=changed_ref,
+                    ),
+                ],
+            }
+        )
+        legacy_lock = {
+            "version": 1,
+            "references": {
+                "unchanged": {"path": unchanged_ref, "status": "verified"},
+                "changed": {"path": changed_ref, "status": "verified"},
+            },
+        }
+
+        migrated, updates = migrate_legacy_provider_reference_consumer_hashes(
+            legacy_lock, previous, current
+        )
+
+        self.assertEqual(updates, ["unchanged"])
+        self.assertEqual(
+            provider_reference_effective_status(migrated, current, unchanged_ref),
+            "verified",
+        )
+        self.assertEqual(
+            provider_reference_effective_status(migrated, current, changed_ref),
+            "needs_refresh",
+        )
+
     def test_visual_judge_extracts_explicit_visual_evidence_pairs(self) -> None:
         task = TaskSpec(
             task_id="task-visual",
@@ -1585,6 +1824,12 @@ class RequirementsTraceTests(unittest.TestCase):
             assumed_issue = {i["requirement_id"]: i for i in assumed["issues"]}["REQ-001"]
             self.assertEqual(assumed_issue["result"], "pass")
             self.assertTrue(assumed["ok"])
+            self.assertNotEqual(
+                pending["input_context_sha256"], assumed["input_context_sha256"]
+            )
+            self.assertIn(
+                f"Input context: {assumed['input_context_sha256']}", assumed["report"]
+            )
 
     def test_requirements_audit_ignores_gate_baseline_cache_for_forbidden_patterns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2792,6 +3037,82 @@ class RequirementsTraceTests(unittest.TestCase):
 
             self.assertEqual(state.current_stage, "provider_research")
             self.assertIn("already verified", state.stage_summaries["provider_research"])
+
+    def test_provider_research_ignores_unrelated_historical_provider_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            current_ref = ".auto-agents/docs/provider_references/current.md"
+            historical_ref = ".auto-agents/docs/provider_references/historical_tts.md"
+            trace, _ = stamp_requirement_contract_hashes(
+                {
+                    "version": 1,
+                    "requirements": [
+                        _requirement(
+                            id="REQ-CURRENT",
+                            external_docs_required=True,
+                            provider_reference=current_ref,
+                        ),
+                        _requirement(
+                            id="REQ-HISTORICAL",
+                            text="Unrelated historical TTS contract.",
+                            external_docs_required=True,
+                            provider_reference=historical_ref,
+                        ),
+                    ],
+                }
+            )
+            write_json(requirements_trace_path(project_root), trace)
+            write_text(project_root / current_ref, "# Current provider\n")
+            write_text(project_root / historical_ref, "# Historical TTS provider\n")
+            lock, _ = stamp_provider_reference_consumer_hashes(
+                {
+                    "version": 1,
+                    "references": {
+                        "current": {"path": current_ref, "status": "verified"},
+                        "historical_tts": {
+                            "path": historical_ref,
+                            "status": "needs_user_input",
+                        },
+                    },
+                },
+                trace,
+                reference_paths={current_ref},
+            )
+            write_json(provider_references_lock_path(project_root), lock)
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-current",
+                            "title": "Current iteration provider work",
+                            "description": "Current scope only.",
+                            "acceptance": ["current provider remains verified"],
+                            "requirement_ids": ["REQ-CURRENT"],
+                            "status": "pending",
+                        }
+                    ]
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+
+            state = orchestrator._run_provider_research(state, project_root / "spec.md")
+
+            self.assertEqual(state.current_stage, "provider_research")
+            self.assertIn("already verified", state.stage_summaries["provider_research"])
+            blockers = orchestrator.provider_research_blockers(
+                requirement_ids={"REQ-CURRENT"}
+            )
+            self.assertEqual(blockers, [])
+            persisted_lock = json.loads(
+                provider_references_lock_path(project_root).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                persisted_lock["references"]["historical_tts"]["status"],
+                "needs_user_input",
+            )
 
     def test_rejected_provider_research_refreshes_verified_lock(self) -> None:
         class RefreshAdapter:

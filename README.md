@@ -587,9 +587,14 @@ expected to carry:
 - `oracle_strength`
 - `evidence_boundary`
 - `forbidden_proxy_oracles`
+- an engine-stamped `contract_sha256`
 
 This lets downstream planning and review distinguish proxy checks from behavioral/semantic oracles
 and distinguish internal-state evidence from system-boundary or external-side-effect proof.
+The hash covers the normative requirement contract, but not lifecycle status or free-form notes.
+Once a done task has claimed or proved a requirement ID, clarify cannot rewrite that contract in
+place. A changed contract must use a new requirement ID and reciprocal `supersedes` /
+`superseded_by` links; the old record remains in the append-only trace with status `superseded`.
 
 When the input spec references frontend pages together with prototype artifacts such as HTML
 mockups, screenshots, Figma files, or design images, the clarify stage records an optional
@@ -613,12 +618,13 @@ blocker finding, the task is retried before it can be marked done. If the provid
 artifacts are unavailable in `auto` mode, auto_agents records a skipped report and still relies on
 the deterministic screenshot/DOM/CSS proof requirements.
 
-New task plans set `oracle_proof_schema_version: 1` and use `requirement_proofs` on every task
+New task plans set `oracle_proof_schema_version: 2` and use `requirement_proofs` on every task
 that declares `requirement_ids`. A proof entry maps one requirement oracle to concrete evidence:
 
 ```json
 {
   "requirement_id": "REQ-057",
+  "requirement_contract_sha256": "sha256:<engine-stamped requirement contract hash>",
   "oracle_index": 1,
   "proof_type": "integration_test",
   "oracle_strength": "behavioral",
@@ -636,6 +642,14 @@ coverage. Every active mandatory acceptance oracle needs a verified done-task pr
 per-asset retry-budget requirement is not proven merely by outputting a retry ledger; the cited proof
 must exercise the retry decision path at the required boundary and exclude ledger-only proxy evidence
 when the requirement forbids that proxy.
+Legacy plans without proof records remain readable, but v2 proofs are accepted only for the exact
+requirement contract hash they were created against. Provider-reference lock entries are bound to
+the aggregate hash of their active consumer requirements, so a contract change automatically makes
+an otherwise verified reference `needs_refresh` until provider research verifies it again.
+On the first contract-identity upgrade, resolved legacy lock entries are backfilled without network
+research only when their pre- and post-clarify consumer contracts are identical. Provider research
+then scopes its checks to requirement IDs in the current task plan (plus explicit review-forced
+references), so unrelated historical provider debt cannot block an iteration that did not change it.
 
 Interrupted implementation work is resumable:
 
@@ -692,6 +706,10 @@ run immediately:
 
 When an audit failure rewinds the pipeline, the next `run` also resumes from that rewound stage
 rather than pretending `verify` already completed.
+Each generated audit records an `Input context` hash over the trace, task ledger, assumed task
+status, current spec, provider lock, architecture/brief, and referenced provider documents. Audit-
+dependent verification materializes that exact context before taking its baseline, preventing a
+fresh audit failure from being hidden as a pre-existing baseline failure.
 
 Plain full-suite verification failures use a similar recovery path: the first failures rewind to
 `implement` with structured triage, implicated paths, and evidence excerpts. The recovery task is
@@ -705,8 +723,13 @@ classification error produced by the orchestrator itself, the CLI can start an a
 auto_agents self-repair pass. That pass edits and verifies the auto_agents repository only, commits
 the generic repair, sends an Enterprise WeChat summary when notifications are configured, and then
 restarts the original `run` command in a fresh process. It does not edit the target project and is
-allowed to continue across different auto_agents-owned failures. It stops automatic self-repair only
-when the same error fingerprint appears three consecutive times without being fixed.
+allowed to continue across different auto_agents-owned failures. Recovery-loop identity is based on
+the owner stage, requirement IDs, stable failure IDs, and owner-artifact fingerprints rather than
+task IDs or changing review prose. A repeated failure with unchanged owner artifacts stops as a
+target-project no-progress condition. Automatic self-repair is attempted only when diagnostics also
+show an auto_agents routing invariant mismatch, and that invariant repair is capped at one attempt.
+Before a destructive review/scope rewind, the engine preserves the task, failure IDs, changed paths,
+owner route, and worktree fingerprint under the run's `recovery_incidents/` directory.
 
 Implementation resume is task-aware rather than fully transactional:
 

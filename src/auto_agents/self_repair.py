@@ -149,6 +149,23 @@ def classify_auto_agents_error(
             text,
             values,
         )
+    if "recovery no progress:" in lowered:
+        if "engine_invariant=none" in lowered or "engine_invariant=" not in lowered:
+            return SelfRepairDecision(
+                False,
+                category="recovery_no_progress",
+                reason="no-progress alone does not prove an auto_agents defect",
+            )
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="recovery_route_invariant",
+                reason="deterministic recovery evidence reports an orchestrator routing invariant violation",
+            ),
+            text,
+            values,
+            max_attempts=1,
+        )
     if "provider research is blocked" in lowered:
         return SelfRepairDecision(False, reason="provider_research blocker has its own recovery path")
     if "preflight validation failed" in lowered:
@@ -316,6 +333,7 @@ def _with_repetition_guard(
     env: Optional[dict[str, str]],
     *,
     fingerprint_category: str = "",
+    max_attempts: int = SELF_REPAIR_MAX_CONSECUTIVE_SAME_ERROR - 1,
 ) -> SelfRepairDecision:
     fingerprint = self_repair_error_fingerprint(
         error_text,
@@ -325,13 +343,13 @@ def _with_repetition_guard(
     previous_fingerprint = str(values.get(SELF_REPAIR_LAST_FINGERPRINT_ENV, "")).strip()
     previous_count = self_repair_repeat_count(env)
     repeat_count = previous_count + 1 if previous_fingerprint == fingerprint else 1
-    if repeat_count >= SELF_REPAIR_MAX_CONSECUTIVE_SAME_ERROR:
+    if repeat_count > max_attempts:
         return SelfRepairDecision(
             False,
             category=decision.category,
             reason=(
                 "same self-repair error repeated "
-                f"{SELF_REPAIR_MAX_CONSECUTIVE_SAME_ERROR} consecutive times without repair"
+                f"{repeat_count} consecutive times without repair; limit={max_attempts}"
             ),
             fingerprint=fingerprint,
             repeat_count=repeat_count,
@@ -384,6 +402,22 @@ def adjudicate_auto_agents_error(
         judgment = judge.run()
     except Exception as exc:
         provider_error = _compact_text(str(exc), limit=1200)
+        if heuristic.category == "recovery_route_invariant":
+            return SelfRepairTriageResult(
+                decision=SelfRepairDecision(
+                    False,
+                    category=heuristic.category,
+                    reason=(
+                        "recovery-loop self-repair requires provider confirmation; "
+                        "triage was unavailable"
+                    ),
+                    fingerprint=heuristic.fingerprint,
+                    repeat_count=heuristic.repeat_count,
+                ),
+                source="provider_required",
+                reason="sensitive recovery-loop triage fails closed",
+                provider_error=provider_error,
+            )
         return SelfRepairTriageResult(
             decision=heuristic,
             source="heuristic_fallback",
@@ -418,6 +452,7 @@ def adjudicate_auto_agents_error(
         str(error or ""),
         values,
         fingerprint_category="provider_judged_auto_agents",
+        max_attempts=(1 if heuristic.category == "recovery_route_invariant" else SELF_REPAIR_MAX_CONSECUTIVE_SAME_ERROR - 1),
     )
     return SelfRepairTriageResult(
         decision=decision,

@@ -93,14 +93,20 @@ from .requirements import (
     load_archived_done_task_payloads,
     load_provider_references_lock,
     load_requirements_trace,
+    migrate_legacy_provider_reference_consumer_hashes,
     normalize_generated_task_plan_statuses,
     provider_reference_paths,
+    provider_reference_effective_status,
     provider_reference_status,
     preserve_task_plan_negative_oracle_clauses,
     run_requirements_audit,
+    stamp_requirement_contract_hashes,
+    stamp_task_plan_contract_hashes,
+    stamp_provider_reference_consumer_hashes,
     task_is_fully_historically_covered,
     requirements_for_task,
     validate_done_task_requirement_proofs,
+    validate_requirement_contract_transitions,
     validate_requirements_trace_payload,
     verified_proofs_by_requirement_from_task_payloads,
 )
@@ -194,6 +200,8 @@ class Orchestrator:
         # iteration generation; used by _clarify_validation_feedback to
         # detect silent deletion of existing requirements.
         self._clarify_pre_trace_ids: Set[str] = set()
+        self._clarify_pre_trace_payload: Dict[str, object] = {}
+        self._clarify_historical_tasks: List[dict] = []
 
     def _attach_run_logger(self, run_id: str) -> None:
         if not str(run_id).strip():
@@ -557,6 +565,8 @@ class Orchestrator:
             return cls._forbidden_pattern_owner_stage(blocker), ""
         if kind == "task_coverage":
             return "plan", ""
+        if kind == "requirement_contract_drift":
+            return "clarify", ""
         if kind == "provider_reference":
             reference = str(blocker.get("reference", "")).strip()
             ref_status = str(blocker.get("reference_status", "")).strip() or "missing"
@@ -1537,11 +1547,27 @@ class Orchestrator:
         # detect silent deletion (iteration must use status='superseded' rather
         # than removal). Empty set on first run.
         if is_iteration:
+            existing_trace = load_requirements_trace(self.project_root, normalize=False)
             self._clarify_pre_trace_ids = self._active_or_deferred_req_ids(
-                load_requirements_trace(self.project_root)
+                existing_trace if isinstance(existing_trace, dict) else {}
             )
+            self._clarify_pre_trace_payload = (
+                json.loads(json.dumps(existing_trace)) if isinstance(existing_trace, dict) else {}
+            )
+            self._clarify_historical_tasks = (
+                load_archived_done_task_payloads(self.project_root)
+                + self._done_task_payloads(state.tasks)
+            )
+            if self._clarify_pre_trace_payload:
+                write_json(
+                    run_path(self.project_root, state.run_id)
+                    / "requirements_trace.pre-clarify.json",
+                    self._clarify_pre_trace_payload,
+                )
         else:
             self._clarify_pre_trace_ids = set()
+            self._clarify_pre_trace_payload = {}
+            self._clarify_historical_tasks = []
         generate_prompt = self._build_prompt(stage="clarify", spec_file=spec_file, is_iteration=is_iteration)
         if history:
             generate_prompt += "\n\n--- Conversation History ---\n"
@@ -1770,6 +1796,47 @@ class Orchestrator:
                 fingerprints[relative_path] = "unreadable"
         return fingerprints
 
+    def _persist_rewind_incident(
+        self,
+        state: RunState,
+        *,
+        task: TaskSpec,
+        target_stage: str,
+        rewind_ref: str,
+        gate_result: Dict[str, object],
+    ) -> str:
+        """Preserve deterministic rewind evidence before a destructive reset."""
+        incident_id = uuid.uuid4().hex[:12]
+        path = (
+            run_path(self.project_root, state.run_id)
+            / "recovery_incidents"
+            / f"{incident_id}.json"
+        )
+        payload = {
+            "schema_version": 1,
+            "incident_id": incident_id,
+            "task_id": task.task_id,
+            "requirement_ids": sorted(set(task.requirement_ids)),
+            "target_stage": target_stage,
+            "rewind_ref": rewind_ref,
+            "head_ref": head_ref(self.project_root),
+            "worktree_fingerprint": worktree_fingerprint(self.project_root),
+            "changed_paths": changed_paths(
+                self.project_root,
+                ignored_prefixes=(".auto-agents/", ".antigravitycli/"),
+            ),
+            "failure_ids": [
+                str(item).strip()
+                for item in gate_result.get("failure_ids", []) or []
+                if str(item).strip()
+            ],
+            "reason": str(gate_result.get("reason", "")).strip(),
+            "review": str(gate_result.get("review", "")).strip(),
+            "rewind_reason": str(gate_result.get("rewind_reason", "")).strip(),
+        }
+        write_json(path, payload)
+        return self._relative_repo_path(path)
+
     def _owner_artifact_paths_for_stage(self, stage: str, review_text: str) -> List[str]:
         if stage == "provider_research":
             references = sorted(self._provider_reference_paths_from_review(review_text))
@@ -1791,14 +1858,36 @@ class Orchestrator:
         task: TaskSpec,
         target_stage: str,
         review_text: str,
+        failure_ids: Iterable[str] = (),
     ) -> bool:
-        review_fp = self._review_fingerprint(review_text)
+        normalized_failures = sorted(
+            {str(item).strip() for item in failure_ids if str(item).strip()}
+        )
+        failure_material = "\n".join(normalized_failures)
+        failure_fp = (
+            hashlib.sha256(failure_material.encode("utf-8")).hexdigest()[:16]
+            if failure_material
+            else self._review_fingerprint(review_text)
+        )
         artifact_paths = self._owner_artifact_paths_for_stage(target_stage, review_text)
         fingerprints = self._artifact_fingerprints(artifact_paths)
+        scope_material = json.dumps(
+            {
+                "target_stage": target_stage,
+                "requirement_ids": sorted(set(task.requirement_ids)),
+                "failure_fingerprint": failure_fp,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        scope_key = hashlib.sha256(scope_material.encode("utf-8")).hexdigest()[:16]
         event = {
             "task_id": task.task_id,
             "target_stage": target_stage,
-            "review_fingerprint": review_fp,
+            "requirement_ids": sorted(set(task.requirement_ids)),
+            "failure_ids": normalized_failures,
+            "failure_fingerprint": failure_fp,
+            "scope_key": scope_key,
             "artifact_fingerprints": fingerprints,
         }
         history = [
@@ -1807,12 +1896,11 @@ class Orchestrator:
         ]
         history.append(event)
         state.recovery_loop_events = history[-self.MAX_RECOVERY_LOOP_EVENTS:]
-        if not review_fp:
+        if not failure_fp:
             return False
         matches = [
             entry for entry in state.recovery_loop_events
-            if str(entry.get("target_stage", "")) == target_stage
-            and str(entry.get("review_fingerprint", "")) == review_fp
+            if str(entry.get("scope_key", "")) == scope_key
             and entry.get("artifact_fingerprints") == fingerprints
         ]
         return len(matches) >= self.RECOVERY_LOOP_REPEAT_THRESHOLD
@@ -2914,7 +3002,7 @@ class Orchestrator:
             task.status = "in_progress"
             self._persist_tasks(tasks)
 
-        if self._ensure_task_verify_baseline(task):
+        if self._ensure_task_verify_baseline(task, state=state):
             self._persist_tasks(tasks)
 
         gate_result = self._execute_task_with_retries(state, task, resume_existing=resume_existing)
@@ -3494,6 +3582,13 @@ class Orchestrator:
             or state.stage_summaries.get("implement_baseline_ref", "")
         )
         rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
+        incident_path = self._persist_rewind_incident(
+            state,
+            task=task,
+            target_stage=target_stage,
+            rewind_ref=rewind_ref,
+            gate_result=gate_result,
+        )
         if not hard_reset_clean(self.project_root, rewind_ref):
             raise RuntimeError(
                 "review-stage rewind failed to restore the baseline before "
@@ -3514,6 +3609,8 @@ class Orchestrator:
             "",
             "Review feedback:",
             review_text.strip(),
+            "",
+            f"Pre-rewind incident: {incident_path}",
         ]
         self._rewind_state_from_stage(state, target_stage)
         state.rejected_stage = target_stage
@@ -3536,11 +3633,19 @@ class Orchestrator:
             task=task,
             target_stage=target_stage,
             review_text=state.rejection_reason,
+            failure_ids=gate_result.get("failure_ids", []) or [],
         )
-        if loop_detected and target_stage == "provider_research" and not refreshed_refs:
+        if loop_detected:
+            expected_owner = str(gate_result.get("expected_owner_stage", "")).strip()
+            engine_invariant = (
+                "route_owner_mismatch"
+                if expected_owner and expected_owner != target_stage
+                else "none"
+            )
             state.last_error = (
-                "recovery loop orchestration no-op: review repeatedly rewound to provider_research "
-                "but auto_agents could not identify or refresh an owning provider reference artifact"
+                "recovery no progress: the same failure recurred after recovery while owner "
+                f"artifacts remained unchanged; target_stage={target_stage}; "
+                f"engine_invariant={engine_invariant}"
             )
             save_run_state(self.project_root, state)
             raise RuntimeError(state.last_error)
@@ -3573,6 +3678,13 @@ class Orchestrator:
             or state.stage_summaries.get("implement_baseline_ref", "")
         )
         rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
+        incident_path = self._persist_rewind_incident(
+            state,
+            task=task,
+            target_stage="plan",
+            rewind_ref=rewind_ref,
+            gate_result=gate_result,
+        )
         if not hard_reset_clean(self.project_root, rewind_ref):
             raise RuntimeError(
                 "scope-overflow rewind failed to restore the baseline before "
@@ -3593,6 +3705,7 @@ class Orchestrator:
             verify_history=list(task.verify_history),
             arbiter=gate_result.get("arbiter") if isinstance(gate_result.get("arbiter"), dict) else None,
         )
+        reason = f"{reason}\n\nPre-rewind incident: {incident_path}".strip()
         self._rewind_state_from_stage(state, "plan")
         state.rejected_stage = "plan"
         state.rejection_reason = reason
@@ -3660,16 +3773,8 @@ class Orchestrator:
                 "raw_output": quick_failure,
                 "comparable_failures": False,
             }
-        audit_regenerated = False
-        audit_before = ""
         if self._task_depends_on_requirements_audit(task) or self._is_requirements_audit_recovery_task(task):
-            audit_before = read_text(requirements_audit_path(self.project_root))
             requirements_audit_check = self._run_task_requirements_audit_recovery_check(task, state)
-            audit_after = read_text(requirements_audit_path(self.project_root))
-            audit_regenerated = (
-                self._requirements_audit_stable_content(audit_before)
-                != self._requirements_audit_stable_content(audit_after)
-            )
             if requirements_audit_check:
                 audit_failure_ids = self._normalize_verify_failure_ids(
                     requirements_audit_check.get("failure_ids", []),
@@ -3687,7 +3792,7 @@ class Orchestrator:
                     "raw_output": str(requirements_audit_check.get("raw_output", "")),
                     "comparable_failures": True,
                 }
-                for key in ("rewind_to_stage", "rewind_reason"):
+                for key in ("rewind_to_stage", "expected_owner_stage", "rewind_reason"):
                     value = str(requirements_audit_check.get(key, "")).strip()
                     if value:
                         failure_result[key] = value
@@ -3758,10 +3863,12 @@ class Orchestrator:
         if not verify_gate.ok:
             raw_log_path = self._persist_failed_verification_log(raw_output, label="task-verify")
         baseline_only_reason = ""
-        absolute_repair_verification = bool(
+        absolute_owned_verification = bool(
             task is not None
-            and self._is_repair_task(task)
-            and task.verification_refs
+            and (
+                (self._is_repair_task(task) and task.verification_refs)
+                or self._task_depends_on_requirements_audit(task)
+            )
         )
         if (
             task is not None
@@ -3769,8 +3876,7 @@ class Orchestrator:
             and not diagnostic_identity_only
             and current_failure_ids
             and not new_failure_ids
-            and not absolute_repair_verification
-            and not audit_regenerated
+            and not absolute_owned_verification
         ):
             baseline_only_reason = (
                 f"task baseline only: {len(current_failure_ids)} pre-existing failure(s) remain"
@@ -3849,22 +3955,6 @@ class Orchestrator:
                 "retryable_missing_owned_evidence_refs": retryable_missing_owned_evidence,
                 "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
             }
-            if (
-                audit_regenerated
-                and task is not None
-                and self._task_depends_on_requirements_audit(task)
-                and extraction.comparable
-                and current_failure_ids
-            ):
-                rewind_reason = (
-                    "The requirements audit failed verification after auto_agents materialized "
-                    "the derived report before running its evidence checks. "
-                    "Recovery route: rerun from clarify so the owning requirements trace is "
-                    "revised; do not edit .auto-agents/docs/requirements_audit.md directly."
-                )
-                failure_result["reason"] = f"{rewind_reason}\nVerification failure: {reason}"
-                failure_result["rewind_to_stage"] = "clarify"
-                failure_result["rewind_reason"] = rewind_reason
             return failure_result
         stale_plan_audit = self._run_stale_plan_coupled_test_audit(task, state=state)
         if stale_plan_audit:
@@ -4077,6 +4167,7 @@ class Orchestrator:
             )
             result["reason"] = f"{reason}\n{rewind_reason}"
             result["rewind_to_stage"] = target_stage
+            result["expected_owner_stage"] = target_stage
             result["rewind_reason"] = rewind_reason
         return result
 
@@ -4608,8 +4699,9 @@ class Orchestrator:
         self._task_proof_evidence_cache[cache_key] = dict(result)
         return result
 
-    def _task_verify_baseline_ref(self) -> str:
-        return f"{head_ref(self.project_root)}:{worktree_fingerprint(self.project_root)}"
+    def _task_verify_baseline_ref(self, verification_context: str = "") -> str:
+        base = f"{head_ref(self.project_root)}:{worktree_fingerprint(self.project_root)}"
+        return f"{base}:{verification_context}" if verification_context else base
 
     @staticmethod
     def _git_ref_from_verify_baseline_ref(baseline_ref: str) -> str:
@@ -4624,8 +4716,24 @@ class Orchestrator:
                 return ""
         return candidate
 
-    def _ensure_task_verify_baseline(self, task: TaskSpec) -> bool:
-        baseline_ref = self._task_verify_baseline_ref()
+    def _ensure_task_verify_baseline(
+        self,
+        task: TaskSpec,
+        *,
+        state: Optional[RunState] = None,
+    ) -> bool:
+        verification_context = ""
+        if self._task_depends_on_requirements_audit(task):
+            tasks = state.tasks if state is not None and state.tasks else self._load_tasks_from_plan()
+            assumed = {task.task_id}
+            audit_result = run_requirements_audit(
+                self.project_root,
+                tasks,
+                current_spec=self._current_audit_spec(state),
+                assume_done_task_ids=assumed,
+            )
+            verification_context = str(audit_result.get("input_context_sha256", ""))
+        baseline_ref = self._task_verify_baseline_ref(verification_context)
         task_commands = self._build_task_verify_commands(task)
         if task.verify_baseline_ref == baseline_ref:
             return False
@@ -4669,7 +4777,15 @@ class Orchestrator:
         state: RunState,
         tasks: Iterable[TaskSpec],
     ) -> bool:
-        baseline_ref = self._task_verify_baseline_ref()
+        task_list = list(tasks)
+        audit_result = run_requirements_audit(
+            self.project_root,
+            task_list,
+            current_spec=self._current_audit_spec(state),
+        )
+        baseline_ref = self._task_verify_baseline_ref(
+            str(audit_result.get("input_context_sha256", ""))
+        )
         changed = False
         if state.implement_verify_baseline_ref != baseline_ref:
             state.implement_verify_baseline_ref = baseline_ref
@@ -4708,7 +4824,7 @@ class Orchestrator:
                     )
             changed = True
         baseline_failures = list(state.implement_verify_baseline_failures)
-        for task in tasks:
+        for task in task_list:
             if task.status == "done":
                 continue
             if task.verify_baseline_failures != baseline_failures:
@@ -4983,14 +5099,13 @@ class Orchestrator:
         del spec_file
         trace = load_requirements_trace(self.project_root)
         docs_required = external_doc_requirements(trace)
-        if not docs_required:
-            summary = "No provider research required by active requirements."
-            write_text(self._stage_output_path(state.run_id, "provider_research"), summary + "\n")
-            state.current_stage = "provider_research"
-            state.stage_summaries["provider_research"] = summary
-            state.last_error = ""
-            return state
-
+        current_requirement_ids = self._current_provider_research_requirement_ids(state)
+        if current_requirement_ids is not None:
+            docs_required = [
+                requirement
+                for requirement in docs_required
+                if str(requirement.get("id", "")).strip() in current_requirement_ids
+            ]
         lock = load_provider_references_lock(self.project_root)
         rejected_provider_research = (
             state.rejected_stage == "provider_research"
@@ -5009,6 +5124,34 @@ class Orchestrator:
                     "[provider-research] forced refresh for rejected reference(s): %s",
                     ", ".join(refreshed),
                 )
+            if forced_refresh_refs:
+                scoped_ids = {
+                    str(requirement.get("id", "")).strip()
+                    for requirement in external_doc_requirements(trace)
+                    if forced_refresh_refs.intersection(provider_reference_paths(requirement))
+                }
+                if current_requirement_ids is None:
+                    current_requirement_ids = set()
+                current_requirement_ids.update(scoped_ids)
+                docs_required = [
+                    requirement
+                    for requirement in external_doc_requirements(trace)
+                    if str(requirement.get("id", "")).strip() in current_requirement_ids
+                ]
+        if not docs_required:
+            if rejected_provider_research:
+                state.last_error = (
+                    "recovery loop orchestration no-op: provider_research was rejected, "
+                    "but the current plan has no matching provider reference owner"
+                )
+                save_run_state(self.project_root, state)
+                raise RuntimeError(state.last_error)
+            summary = "No provider research required by current plan requirements."
+            write_text(self._stage_output_path(state.run_id, "provider_research"), summary + "\n")
+            state.current_stage = "provider_research"
+            state.stage_summaries["provider_research"] = summary
+            state.last_error = ""
+            return state
         unresolved = []
         for requirement in docs_required:
             references = provider_reference_paths(requirement)
@@ -5016,7 +5159,7 @@ class Orchestrator:
                 self._normalize_relative_artifact_path(reference) in forced_refresh_refs
                 or
                 not self._is_resolved_provider_reference_status(
-                    provider_reference_status(lock, reference)
+                    provider_reference_effective_status(lock, trace, reference)
                 )
                 for reference in references
             ):
@@ -5051,12 +5194,34 @@ class Orchestrator:
             stage="provider_research",
             stage_key="provider_research",
             prompt=prompt,
-            validation_feedback=self._provider_research_validation_feedback,
+            validation_feedback=lambda agent_result: self._provider_research_validation_feedback(
+                agent_result,
+                requirement_ids=current_requirement_ids,
+            ),
             effort=self.config.efforts.get("provider_research", "deep"),
         )
+        lock = load_provider_references_lock(self.project_root)
+        scoped_reference_paths = {
+            reference
+            for requirement in docs_required
+            for reference in provider_reference_paths(requirement)
+        }
+        stamped_lock, lock_updates = stamp_provider_reference_consumer_hashes(
+            lock,
+            trace,
+            reference_paths=scoped_reference_paths,
+        )
+        if lock_updates and isinstance(stamped_lock, dict):
+            write_json(provider_references_lock_path(self.project_root), stamped_lock)
+            self.logger.info(
+                "[provider-research] bound consumer contract hash for: %s",
+                ", ".join(lock_updates),
+            )
         still_blocked = [
             f"{item['requirement_id']}: {item['reference'] or '(missing)'} is {item['status']}"
-            for item in self.provider_research_blockers()
+            for item in self.provider_research_blockers(
+                requirement_ids=current_requirement_ids
+            )
         ]
         if still_blocked:
             detail = "\n".join(f"- {item}" for item in still_blocked)
@@ -5078,12 +5243,49 @@ class Orchestrator:
     def is_provider_research_blocked_error(message: str) -> bool:
         return message.strip().startswith("provider research is blocked;")
 
-    def provider_research_blockers(self) -> List[Dict[str, str]]:
+    def _current_provider_research_requirement_ids(
+        self,
+        state: RunState,
+    ) -> Optional[Set[str]]:
+        tasks = list(state.tasks)
+        try:
+            plan = load_task_plan(self.project_root)
+        except Exception:
+            plan = {}
+        raw_tasks = plan.get("tasks", []) if isinstance(plan, dict) else []
+        if isinstance(raw_tasks, list) and raw_tasks:
+            tasks = [
+                TaskSpec.from_dict(item)
+                for item in raw_tasks
+                if isinstance(item, dict)
+            ]
+        if not tasks:
+            return None
+        requirement_ids = {
+            str(requirement_id).strip()
+            for task in tasks
+            for requirement_id in task.requirement_ids
+            if str(requirement_id).strip()
+        }
+        return requirement_ids or None
+
+    def provider_research_blockers(
+        self,
+        *,
+        requirement_ids: Optional[Iterable[str]] = None,
+    ) -> List[Dict[str, str]]:
         trace = load_requirements_trace(self.project_root)
         lock = load_provider_references_lock(self.project_root)
+        allowed_ids = (
+            {str(item).strip() for item in requirement_ids if str(item).strip()}
+            if requirement_ids is not None
+            else None
+        )
         blockers: List[Dict[str, str]] = []
         for requirement in external_doc_requirements(trace):
             req_id = str(requirement.get("id", "")).strip() or "(unknown requirement)"
+            if allowed_ids is not None and req_id not in allowed_ids:
+                continue
             references = provider_reference_paths(requirement)
             if not references:
                 blockers.append(
@@ -5097,7 +5299,7 @@ class Orchestrator:
                 continue
             for reference in references:
                 ref_path = self.project_root / reference
-                status = provider_reference_status(lock, reference)
+                status = provider_reference_effective_status(lock, trace, reference)
                 normalized_status = status or "missing"
                 if not ref_path.exists():
                     blockers.append(
@@ -5119,6 +5321,15 @@ class Orchestrator:
                         }
                     )
         return blockers
+
+    def bind_resolved_provider_reference_contracts(self) -> List[str]:
+        """Bind passing lock entries to the contracts verified by a recovery action."""
+        trace = load_requirements_trace(self.project_root)
+        lock = load_provider_references_lock(self.project_root)
+        stamped, updates = stamp_provider_reference_consumer_hashes(lock, trace)
+        if updates and isinstance(stamped, dict):
+            write_json(provider_references_lock_path(self.project_root), stamped)
+        return updates
 
     def provider_research_resolution_report(self, state: Optional[RunState] = None) -> Dict[str, object]:
         state = state or load_run_state(self.project_root)
@@ -5590,31 +5801,13 @@ class Orchestrator:
 
     @classmethod
     def _review_feedback_rewind_stage(cls, text: str) -> str:
-        owner_order = ["clarify", "design", "plan", "provider_research"]
         owners: Set[str] = set()
         for path in cls._review_feedback_paths(text):
             owner = cls._forbidden_pattern_owner_stage({"path": path})
-            if owner in owner_order:
+            if owner in {"clarify", "design", "plan", "provider_research"}:
                 owners.add(owner)
-        for owner in owner_order:
-            if owner in owners:
-                return owner
-        lowered = str(text or "").lower()
-        requirements_audit_wording = (
-            bool(re.search(r"REQ-\d+", str(text or ""), flags=re.IGNORECASE))
-            and (
-                "requirements audit section" in lowered
-                or "requirements audit paragraph" in lowered
-                or "审计段" in str(text or "")
-            )
-            and (
-                "wording" in lowered
-                or "contract statement" in lowered
-                or "表述" in str(text or "")
-            )
-        )
-        if requirements_audit_wording:
-            return "clarify"
+        if len(owners) == 1:
+            return next(iter(owners))
         return ""
 
     @staticmethod
@@ -6513,9 +6706,10 @@ class Orchestrator:
                     historical_plan_line,
                     "The existing requirements_trace.json is a CUMULATIVE contract across iterations; downstream task plans reference REQ IDs by value.",
                     "Do NOT delete existing REQ entries and do NOT renumber or reuse REQ IDs from the existing trace.",
+                    "A requirement referenced by completed work is immutable. If its contract changes, preserve every contract field, mark the old entry status='superseded', set reciprocal superseded_by/supersedes links, and append the replacement under a new ID.",
                     "Mark requirements that are no longer in scope as status='superseded' (preserve id/text/source/acceptance_oracles) instead of removing them.",
                     "For new iteration scope, append entries with new IDs that continue the existing numbering (e.g., if the highest existing ID is REQ-029, the next new one is REQ-030).",
-                    "Only add a brand-new requirement when it cannot be expressed as an update to an existing active or deferred entry.",
+                    "Only unproven active/deferred entries may be refined in place; never use notes as a normative override for a conflicting active contract.",
                 ])
             lines.append("Final response: 3 short bullets summarizing the clarified scope.")
             return "\n".join(lines)
@@ -6565,7 +6759,7 @@ class Orchestrator:
                 "project_brief.md, architecture.md, requirements_trace.json, or any other "
                 "repository files to make the plan pass.",
                 "At the root of the JSON, also define test_strategy and verification_steps.",
-                "At the root of the JSON, set oracle_proof_schema_version to 1 for all new plans.",
+                "At the root of the JSON, set oracle_proof_schema_version to 2 for all new plans. auto_agents will bind each proof to the current requirement contract hash.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
                 "Every task that covers requirement_ids must include requirement_proofs. Each proof must include requirement_id, oracle_index (1-based) or exact acceptance_oracle, proof_type, oracle_strength, evidence_boundary, evidence_refs, status='planned', and forbidden_proxy_oracles copied from the bound requirement.",
                 "All active mandatory requirements in requirements_trace.json must be covered by either archived verified done-task proof or at least one current task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
@@ -7178,7 +7372,11 @@ class Orchestrator:
                         "ok": False,
                         "review": last_reason,
                         "reason": last_reason,
+                        "failure_ids": list(failure_ids),
                         "rewind_to_stage": rewind_stage,
+                        "expected_owner_stage": str(
+                            verify_result.get("expected_owner_stage", rewind_stage)
+                        ).strip(),
                         "rewind_reason": str(
                             verify_result.get("rewind_reason", last_reason)
                         ),
@@ -7317,7 +7515,9 @@ class Orchestrator:
                     "ok": False,
                     "review": last_review,
                     "reason": last_reason,
+                    "failure_ids": list(last_failure_ids),
                     "rewind_to_stage": rewind_stage,
+                    "expected_owner_stage": rewind_stage,
                     "rewind_reason": (
                         f"review feedback points to {rewind_stage}-owned artifact; "
                         "rewinding to the owning stage"
@@ -8281,7 +8481,12 @@ class Orchestrator:
             payload,
             trace,
         )
-        plan_normalization_updates = status_normalization_updates + oracle_preservation_updates
+        payload, contract_binding_updates = stamp_task_plan_contract_hashes(payload, trace)
+        plan_normalization_updates = (
+            status_normalization_updates
+            + oracle_preservation_updates
+            + contract_binding_updates
+        )
         if plan_normalization_updates and isinstance(payload, dict):
             save_task_plan(self.project_root, payload)
             for update in plan_normalization_updates:
@@ -8351,25 +8556,38 @@ class Orchestrator:
             f"{bullets}"
         )
 
-    def _provider_research_validation_feedback(self, _: AgentResult) -> Optional[str]:
+    def _provider_research_validation_feedback(
+        self,
+        _: AgentResult,
+        *,
+        requirement_ids: Optional[Iterable[str]] = None,
+    ) -> Optional[str]:
         trace = load_requirements_trace(self.project_root)
         lock = load_provider_references_lock(self.project_root)
+        allowed_ids = (
+            {str(item).strip() for item in requirement_ids if str(item).strip()}
+            if requirement_ids is not None
+            else None
+        )
         missing = []
         refs = lock.get("references", {}) if isinstance(lock, dict) else {}
         if not isinstance(refs, dict):
             return "provider_references.lock.json must contain a 'references' object"
         for requirement in external_doc_requirements(trace):
+            req_id = str(requirement.get("id", "")).strip()
+            if allowed_ids is not None and req_id not in allowed_ids:
+                continue
             references = provider_reference_paths(requirement)
             if not references:
-                missing.append(f"{requirement.get('id')}: missing provider_reference")
+                missing.append(f"{req_id}: missing provider_reference")
                 continue
             for reference in references:
                 status = provider_reference_status(lock, reference)
                 if status == "missing":
-                    missing.append(f"{requirement.get('id')}: no lock entry for {reference}")
+                    missing.append(f"{req_id}: no lock entry for {reference}")
                 ref_path = self.project_root / reference
                 if not ref_path.exists():
-                    missing.append(f"{requirement.get('id')}: missing provider reference file {reference}")
+                    missing.append(f"{req_id}: missing provider reference file {reference}")
         if missing:
             bullets = "\n".join(f"- {item}" for item in missing)
             return (
@@ -8408,13 +8626,27 @@ class Orchestrator:
     def _clarify_validation_feedback(self, _: AgentResult) -> Optional[str]:
         path = docs_dir(self.project_root) / "project_brief.md"
         errors = validate_required_document(path, "project_brief.md")
-        trace = load_requirements_trace(self.project_root, normalize=False)
+        raw_trace = load_requirements_trace(self.project_root, normalize=False)
+        trace, stamp_updates = stamp_requirement_contract_hashes(raw_trace)
+        if isinstance(trace, dict) and trace != raw_trace:
+            # Contract identity is engine-owned. Normalize hashes before strict
+            # schema validation so an agent never needs to calculate SHA-256.
+            write_json(requirements_trace_path(self.project_root), trace)
         errors.extend(validate_requirements_trace_payload(trace))
         spec_text = ""
         active_spec_file = getattr(self, "_active_spec_file", None)
         if isinstance(active_spec_file, Path) and active_spec_file.exists():
             spec_text = read_text(active_spec_file)
         errors.extend(validate_frontend_fidelity_trace(trace, spec_text=spec_text))
+        previous_trace = getattr(self, "_clarify_pre_trace_payload", {}) or {}
+        if previous_trace:
+            errors.extend(
+                validate_requirement_contract_transitions(
+                    previous_trace,
+                    trace,
+                    historical_tasks=getattr(self, "_clarify_historical_tasks", []) or [],
+                )
+            )
 
         # Iteration safety: detect silent deletion of pre-existing REQ IDs.
         # The pre-snapshot is captured in _run_interactive_clarify before
@@ -8437,6 +8669,26 @@ class Orchestrator:
                 )
 
         if not errors:
+            for update in stamp_updates:
+                self.logger.info(f"[clarify] {update}")
+            if previous_trace:
+                lock = load_provider_references_lock(self.project_root)
+                migrated_lock, migrated_refs = (
+                    migrate_legacy_provider_reference_consumer_hashes(
+                        lock,
+                        previous_trace,
+                        trace,
+                    )
+                )
+                if migrated_refs and isinstance(migrated_lock, dict):
+                    write_json(
+                        provider_references_lock_path(self.project_root),
+                        migrated_lock,
+                    )
+                    self.logger.info(
+                        "[clarify] migrated unchanged provider contract lock(s): %s",
+                        ", ".join(migrated_refs),
+                    )
             return None
         bullets = "\n".join(f"- {item}" for item in errors)
         return (
