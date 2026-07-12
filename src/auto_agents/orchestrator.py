@@ -2354,11 +2354,7 @@ class Orchestrator:
         before_snapshot: Dict[str, str],
     ) -> Optional[Tuple[List[str], List[str]]]:
         after_snapshot = self._worktree_change_snapshot()
-        delta_paths = [
-            path
-            for path in self._snapshot_delta_paths(before_snapshot, after_snapshot)
-            if not self._is_orchestrator_diagnostic_path(path)
-        ]
+        delta_paths = self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot)
         if not delta_paths:
             return None
         allowed_scope, is_allowed = self._stage_mutation_policy(
@@ -2378,6 +2374,18 @@ class Orchestrator:
             or path == ".auto-agents/docs/requirements_audit.md"
         )
 
+    def _guarded_snapshot_delta_paths(
+        self,
+        before_snapshot: Dict[str, str],
+        after_snapshot: Dict[str, str],
+    ) -> List[str]:
+        """Return mutations that are relevant to orchestrator ownership guards."""
+        return [
+            path
+            for path in self._snapshot_delta_paths(before_snapshot, after_snapshot)
+            if not self._is_orchestrator_diagnostic_path(path)
+        ]
+
     def _run_gate_commands(self, *, collect_all: bool, context: str):
         self._apply_generated_verification_config()
         before_snapshot = self._worktree_change_snapshot()
@@ -2391,7 +2399,7 @@ class Orchestrator:
             )
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
-        changed = self._snapshot_delta_paths(before_snapshot, after_snapshot)
+        changed = self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot)
         reason = ""
         if changed:
             reason = (
@@ -2418,7 +2426,7 @@ class Orchestrator:
             )
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
-        changed = self._snapshot_delta_paths(before_snapshot, after_snapshot)
+        changed = self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot)
         reason = ""
         if changed:
             reason = (

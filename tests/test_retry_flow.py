@@ -1867,6 +1867,58 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual([item.command for item in gate.commands], ["true"])
             self.assertEqual(load_project_config(project_root).gates.commands, ["true"])
 
+    def test_gate_run_ignores_orchestrator_failed_verification_log_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            diagnostic_path = (
+                ".auto-agents/failed-verification-logs/task-verify-default.log"
+            )
+            config = load_project_config(project_root)
+            config.gates.commands = [
+                "python -c \"from pathlib import Path; "
+                f"p = Path('{diagnostic_path}'); "
+                "p.parent.mkdir(parents=True, exist_ok=True); "
+                "p.write_text('failure details', encoding='utf-8')\""
+            ]
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            gate, mutation_error = orchestrator._run_gate_commands(
+                collect_all=False,
+                context="verify stage commands",
+            )
+
+            self.assertTrue(gate.ok, msg=gate.summary)
+            self.assertEqual(mutation_error, "")
+            self.assertTrue((project_root / diagnostic_path).exists())
+
+    def test_explicit_gate_run_filters_only_orchestrator_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            diagnostic_path = (
+                ".auto-agents/failed-verification-logs/task-verify-explicit.log"
+            )
+            command = (
+                "python -c \"from pathlib import Path; "
+                f"p = Path('{diagnostic_path}'); "
+                "p.parent.mkdir(parents=True, exist_ok=True); "
+                "p.write_text('failure details', encoding='utf-8'); "
+                "Path('.auto-agents/verify-leak.txt').write_text('x', encoding='utf-8')\""
+            )
+
+            gate, mutation_error = orchestrator._run_gate_commands_for_commands(
+                [command],
+                collect_all=True,
+                context="task verification commands",
+            )
+
+            self.assertTrue(gate.ok, msg=gate.summary)
+            self.assertIn(".auto-agents/verify-leak.txt", mutation_error)
+            self.assertNotIn(diagnostic_path, mutation_error)
+
     def test_validation_warns_when_gate_commands_drift_from_task_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
