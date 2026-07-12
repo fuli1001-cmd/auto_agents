@@ -5428,6 +5428,59 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("no valid verified proof", result["rewind_reason"])
             self.assertNotIn("unrelated implementation blocker", result["rewind_reason"])
 
+    def test_task_requirements_audit_propagates_implement_no_progress_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            task = TaskSpec(
+                task_id="task-134",
+                title="Align request evidence",
+                description="Make persisted evidence match the outbound request.",
+                acceptance=["The requirements audit passes."],
+                requirement_ids=["REQ-134"],
+                verification_refs=[".auto-agents/docs/requirements_audit.md"],
+                status="in_progress",
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            audit_result = {
+                "ok": False,
+                "path": str(
+                    project_root / ".auto-agents" / "docs" / "requirements_audit.md"
+                ),
+                "report": "# Requirements Audit\n\n## REQ-134: fail\n",
+                "issues": [
+                    {
+                        "requirement_id": "REQ-134",
+                        "result": "fail",
+                        "blockers": [
+                            {
+                                "kind": "forbidden_pattern",
+                                "message": "forbidden pattern found in product code",
+                                "path": "app/application/public_image.py",
+                                "authoritative": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+            orchestrator = Orchestrator(project_root)
+
+            with patch(
+                "auto_agents.orchestrator.run_requirements_audit",
+                return_value=audit_result,
+            ):
+                result = orchestrator._run_task_verify(task, state=state)
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["requirements_audit_failure"])
+            self.assertEqual(result["audit_no_progress_rewind_stage"], "clarify")
+            self.assertIn(
+                "Recovery route: rerun from clarify",
+                result["audit_no_progress_rewind_reason"],
+            )
+            self.assertNotIn("rewind_to_stage", result)
+
     def test_requirements_audit_forbidden_pattern_routes_back_to_implement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

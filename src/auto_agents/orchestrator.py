@@ -3806,6 +3806,15 @@ class Orchestrator:
                     value = str(requirements_audit_check.get(key, "")).strip()
                     if value:
                         failure_result[key] = value
+                if bool(requirements_audit_check.get("requirements_audit_failure")):
+                    failure_result["requirements_audit_failure"] = True
+                for key in (
+                    "audit_no_progress_rewind_stage",
+                    "audit_no_progress_rewind_reason",
+                ):
+                    value = str(requirements_audit_check.get(key, "")).strip()
+                    if value:
+                        failure_result[key] = value
                 return failure_result
         task_scope_label = self._task_verify_command_scope_label(task)
         if task_commands:
