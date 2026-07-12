@@ -24,7 +24,7 @@ from auto_agents.config import (
     task_plan_path,
 )
 from auto_agents.gates import FailureExtraction
-from auto_agents.git_ops import changed_paths, commit_all, worktree_fingerprint
+from auto_agents.git_ops import changed_files, changed_paths, commit_all, worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, CommandResult, GateParallelGroup, GateResult, RunState, TaskSpec
 from auto_agents.orchestrator import Orchestrator
@@ -1517,6 +1517,55 @@ class AuditRecoveryAdapter:
 
 
 class RetryFlowTests(unittest.TestCase):
+    def test_pending_task_does_not_resume_from_orchestrator_only_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            commit_all(project_root, "test: baseline")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            task = TaskSpec(
+                task_id="task-251",
+                title="Replanned task",
+                description="Must implement again after rewind.",
+                acceptance=["implementation runs"],
+                status="pending",
+            )
+            state.agent_attempts["implement-task-251"] = 1
+            write_text(
+                project_root / ".auto-agents/state/resume-marker.txt",
+                "orchestrator state only\n",
+            )
+
+            self.assertTrue(changed_files(project_root))
+            self.assertFalse(orchestrator._should_resume_task(state, task))
+
+            write_text(project_root / "product.py", "VALUE = 1\n")
+            self.assertTrue(orchestrator._should_resume_task(state, task))
+
+    def test_upstream_rewind_and_replan_clear_stale_implement_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.agent_attempts = {
+                "implement-task-251": 2,
+                "implement-task-252": 1,
+                "plan": 3,
+            }
+
+            orchestrator._clear_stale_implementation_resume_markers(
+                state, task_ids={"task-251"}
+            )
+            self.assertNotIn("implement-task-251", state.agent_attempts)
+            self.assertIn("implement-task-252", state.agent_attempts)
+            self.assertEqual(state.agent_attempts["plan"], 3)
+
+            orchestrator._rewind_state_from_stage(state, "plan")
+            self.assertNotIn("implement-task-252", state.agent_attempts)
+            self.assertEqual(state.agent_attempts["plan"], 3)
+
     def test_recovery_loop_uses_failure_and_requirement_scope_not_review_wording_or_task_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

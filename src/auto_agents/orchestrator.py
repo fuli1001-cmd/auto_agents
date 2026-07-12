@@ -364,6 +364,8 @@ class Orchestrator:
         if target_index <= STAGE_ORDER.index("implement"):
             state.implement_verify_baseline_failures = []
             state.implement_verify_baseline_ref = ""
+        if target_index < STAGE_ORDER.index("implement"):
+            self._clear_stale_implementation_resume_markers(state)
 
     def _normalize_legacy_requirements_audit_resume(self, state: RunState) -> bool:
         last_error = state.last_error.strip()
@@ -1177,6 +1179,14 @@ class Orchestrator:
             self._merge_prior_done_tasks_into_generated_plan(prior_tasks)
             self._apply_generated_verification_config()
             state.tasks = self._load_tasks_from_plan()
+            self._clear_stale_implementation_resume_markers(
+                state,
+                task_ids={
+                    task.task_id
+                    for task in state.tasks
+                    if task.status == "pending"
+                },
+            )
             state.plan_task_replacements = self._derive_plan_task_replacements(prior_tasks, state.tasks)
             self._emit_plan_task_count(state.tasks)
         return state
@@ -8969,7 +8979,28 @@ class Orchestrator:
     def _should_resume_task(self, state: RunState, task: TaskSpec) -> bool:
         if task.status != "pending":
             return False
-        if not changed_files(self.project_root):
+        # Orchestrator state is expected to be dirty while a run is active and
+        # is not evidence of partial product implementation. Only resume past
+        # the first implement attempt when real project files remain changed.
+        if not changed_paths(self.project_root):
             return False
         attempt_key = f"implement-{task.task_id}"
         return state.agent_attempts.get(attempt_key, 0) > 0
+
+    @staticmethod
+    def _clear_stale_implementation_resume_markers(
+        state: RunState,
+        *,
+        task_ids: Optional[Iterable[str]] = None,
+    ) -> None:
+        allowed_ids = (
+            {str(task_id).strip() for task_id in task_ids if str(task_id).strip()}
+            if task_ids is not None
+            else None
+        )
+        for key in list(state.agent_attempts):
+            if not key.startswith("implement-"):
+                continue
+            task_id = key.removeprefix("implement-")
+            if allowed_ids is None or task_id in allowed_ids:
+                state.agent_attempts.pop(key, None)
