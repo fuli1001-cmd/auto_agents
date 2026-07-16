@@ -7116,6 +7116,77 @@ class ScopeOverflowTests(unittest.TestCase):
             # fingerprint, attempt 2 matches it).
             self.assertGreaterEqual(orchestrator.adapter.review_calls, 2)
 
+    def test_verify_failure_does_not_count_as_review_failure_for_arbiter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.retries.per_stage["implement"] = 4
+            save_project_config(project_root, config)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=str(project_root), check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(project_root), check=True)
+            commit_all(project_root, "baseline")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = RepeatReviewBlockerAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-big",
+                            "title": "Cross-cutting task",
+                            "description": "Bundles too many concerns.",
+                            "acceptance": ["all layers updated"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "split_depth": 0,
+                        }
+                    ]
+                },
+            )
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            verify_failure = {
+                "ok": False,
+                "reason": "one new verification failure",
+                "failure_ids": ["tests/test_demo.py::test_regression"],
+                "current_failure_ids": ["tests/test_demo.py::test_regression"],
+                "baseline_failure_ids": [],
+                "new_failure_ids": ["tests/test_demo.py::test_regression"],
+                "raw_output": "FAILED tests/test_demo.py::test_regression",
+                "comparable_failures": True,
+            }
+            verify_pass = {
+                "ok": True,
+                "reason": "all commands passed",
+                "current_failure_ids": [],
+                "proof_evidence": {},
+            }
+
+            with patch.object(
+                orchestrator,
+                "_run_task_verify",
+                side_effect=[verify_failure, verify_pass, verify_pass],
+            ), patch.object(
+                orchestrator,
+                "_run_scope_arbiter",
+                return_value={
+                    "decision": "SPLIT",
+                    "rationale": "should require two real review failures",
+                    "split_axis": ["backend", "frontend"],
+                },
+            ) as arbiter:
+                result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 3)
+            self.assertEqual(orchestrator.adapter.review_calls, 2)
+            arbiter.assert_not_called()
+            self.assertEqual(result.rejected_stage, "plan")
+
     def test_scope_overflow_rewind_failure_stops_split(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

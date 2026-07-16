@@ -108,6 +108,104 @@ class RequirementsAuditPerformanceTests(unittest.TestCase):
 
 
 class ParallelTuningTests(unittest.TestCase):
+    def test_parallel_worker_failure_preserves_scope_rewind_metadata(self) -> None:
+        task = TaskSpec(
+            task_id="task-split",
+            title="Split",
+            description="Split this oversized task.",
+            acceptance=["done"],
+        )
+        gate_result = {
+            "ok": False,
+            "reason": "scope_overflow: split required",
+            "review": "two independent slices",
+            "rewind_to_plan": True,
+            "split_task_id": task.task_id,
+            "split_trigger": "two real review failures",
+            "split_fingerprint": "fingerprint",
+            "arbiter": {
+                "decision": "SPLIT",
+                "rationale": "separate audio and cover work",
+                "split_axis": ["audio", "cover"],
+            },
+        }
+
+        result = Orchestrator._parallel_task_failure_result(task, gate_result)
+
+        self.assertTrue(result["rewind_to_plan"])
+        self.assertEqual(result["split_trigger"], "two real review failures")
+        self.assertEqual(result["arbiter"]["decision"], "SPLIT")
+
+    def test_parallel_scope_overflow_routes_to_plan_and_preserves_peer_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            orchestrator.config.execution.parallel_tasks.enabled = True
+            orchestrator.config.execution.parallel_tasks.workers = 2
+            split_task = TaskSpec(
+                task_id="task-split",
+                title="Split",
+                description="Split this oversized task.",
+                acceptance=["done"],
+            )
+            peer_task = TaskSpec(
+                task_id="task-peer",
+                title="Peer",
+                description="Independent successful work.",
+                acceptance=["done"],
+            )
+            tasks = [split_task, peer_task]
+            state = RunState(run_id="test", current_stage="implement", tasks=tasks)
+            split_payload = {**split_task.to_dict(), "status": "blocked"}
+            peer_payload = {**peer_task.to_dict(), "status": "done"}
+            results = {
+                split_task.task_id: {
+                    "ok": False,
+                    "task": split_payload,
+                    "reason": "scope_overflow: split required",
+                    "review": "two independent slices",
+                    "rewind_to_plan": True,
+                    "split_task_id": split_task.task_id,
+                    "split_trigger": "two real review failures",
+                    "split_fingerprint": "fingerprint",
+                    "arbiter": {"decision": "SPLIT"},
+                },
+                peer_task.task_id: {
+                    "ok": True,
+                    "task": peer_payload,
+                    "reason": "",
+                    "review": "passed",
+                    "commit_sha": "a" * 40,
+                    "result_ref": "",
+                    "changed_paths": ["peer.py"],
+                    "verify_current_failure_ids": [],
+                },
+            }
+            orchestrator._parallel_execution_fallback_reason = lambda _tasks: ""
+            orchestrator._parallel_worker_count = lambda: 2
+            orchestrator._log_parallel_worker_resolution = Mock()
+            orchestrator._ensure_evidence_preflight = lambda _state, _task: None
+            orchestrator._require_clean_tree_excluding_agent_instructions = Mock()
+            orchestrator._deferred_parallel_task_reasons = lambda _tasks: []
+            orchestrator._run_parallel_task_batch = Mock(return_value=results)
+            orchestrator._integrate_parallel_task_result = Mock(return_value="b" * 40)
+            orchestrator._warm_clean_head_verify_baseline = Mock()
+            orchestrator._delete_parallel_result_ref = Mock()
+            orchestrator._record_parallel_success = Mock(return_value=2)
+            rewind = Mock(return_value=state)
+            orchestrator._handle_scope_overflow_rewind = rewind
+
+            result = orchestrator._run_parallel_implementation_loop(
+                state, tasks, max_tasks=None
+            )
+
+            self.assertIs(result, state)
+            self.assertEqual(peer_task.status, "done")
+            rewind.assert_called_once()
+            self.assertTrue(rewind.call_args.kwargs["preserve_current_head"])
+            orchestrator._record_parallel_success.assert_not_called()
+
     def test_conflict_aware_batch_packing_skips_predicted_path_overlap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"

@@ -3131,6 +3131,7 @@ class Orchestrator:
             save_run_state(self.project_root, state)
             provider_pressure_result: Optional[Tuple[TaskSpec, Dict[str, object]]] = None
             failed_results: List[Tuple[TaskSpec, Dict[str, object]]] = []
+            scope_rewind_result: Optional[Tuple[TaskSpec, Dict[str, object]]] = None
             integrated_paths: Set[str] = set()
             integrated_verification_commands: List[str] = []
             batch_integrated = 0
@@ -3144,6 +3145,9 @@ class Orchestrator:
                         continue
                     self._apply_parallel_task_failure_snapshot(task, dict(result["task"]))
                     task.status = "blocked"
+                    if result.get("rewind_to_plan") and scope_rewind_result is None:
+                        scope_rewind_result = (task, result)
+                        continue
                     failed_results.append((task, result))
                     continue
 
@@ -3190,6 +3194,18 @@ class Orchestrator:
                 )
                 processed += 1
                 self._consume_task_budget()
+            if scope_rewind_result is not None:
+                rewind_task, rewind_result = scope_rewind_result
+                rewind_state = self._handle_scope_overflow_rewind(
+                    state,
+                    rewind_task,
+                    tasks,
+                    rewind_result,
+                    preserve_current_head=True,
+                )
+                if rewind_state is not None:
+                    return rewind_state
+                failed_results.append((rewind_task, rewind_result))
             if provider_pressure_result is not None:
                 task, result = provider_pressure_result
                 if (
@@ -3766,6 +3782,35 @@ class Orchestrator:
                 results[task_id] = future.result()
         return results
 
+    @staticmethod
+    def _parallel_task_failure_result(
+        worker_task: TaskSpec,
+        gate_result: Dict[str, object],
+    ) -> Dict[str, object]:
+        result: Dict[str, object] = {
+            "ok": False,
+            "task": worker_task.to_dict(),
+            "reason": str(gate_result["reason"]),
+            "review": str(gate_result["review"]),
+            "failure_ids": list(gate_result.get("failure_ids", [])),
+            "comparable_failures": bool(gate_result.get("comparable_failures", True)),
+            "proof_evidence": (
+                gate_result.get("proof_evidence")
+                if isinstance(gate_result.get("proof_evidence"), dict)
+                else {}
+            ),
+        }
+        for key in (
+            "rewind_to_plan",
+            "split_task_id",
+            "split_trigger",
+            "split_fingerprint",
+            "arbiter",
+        ):
+            if key in gate_result:
+                result[key] = gate_result[key]
+        return result
+
     def _run_task_in_worktree(
         self,
         state: RunState,
@@ -3797,19 +3842,7 @@ class Orchestrator:
             if not gate_result["ok"]:
                 worker_task.status = "blocked"
                 worker_task.review_summary = str(gate_result["review"])
-                return {
-                    "ok": False,
-                    "task": worker_task.to_dict(),
-                    "reason": str(gate_result["reason"]),
-                    "review": str(gate_result["review"]),
-                    "failure_ids": list(gate_result.get("failure_ids", [])),
-                    "comparable_failures": bool(gate_result.get("comparable_failures", True)),
-                    "proof_evidence": (
-                        gate_result.get("proof_evidence")
-                        if isinstance(gate_result.get("proof_evidence"), dict)
-                        else {}
-                    ),
-                }
+                return self._parallel_task_failure_result(worker_task, gate_result)
 
             worker_task.status = "done"
             worker_task.review_summary = str(gate_result["review"])
@@ -4461,12 +4494,16 @@ class Orchestrator:
         task: TaskSpec,
         tasks: List[TaskSpec],
         gate_result: Dict[str, object],
+        *,
+        preserve_current_head: bool = False,
     ) -> Optional[RunState]:
         """Route a scope-overflow task back to the plan stage for splitting.
 
         Returns a state to bubble up (plan rewind) or None when rewind is
         refused (e.g. split-depth cap reached) and the caller should fall
-        through to the normal blocked-task path.
+        through to the normal blocked-task path. Parallel workers never
+        modify the main worktree directly, so ``preserve_current_head`` keeps
+        successfully integrated peer tasks while the failed task is replanned.
         """
         if int(task.split_depth) >= self.MAX_SPLIT_DEPTH:
             return None
@@ -4476,7 +4513,10 @@ class Orchestrator:
             or state.implement_verify_baseline_ref
             or state.stage_summaries.get("implement_baseline_ref", "")
         )
-        rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
+        if preserve_current_head:
+            rewind_ref = head_ref(self.project_root) or "HEAD"
+        else:
+            rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
         incident_path = self._persist_rewind_incident(
             state,
             task=task,
@@ -8324,12 +8364,6 @@ class Orchestrator:
                 fp = self._review_fingerprint(str(entry.get("summary", "")))
                 if fp:
                     review_fingerprints.append(fp)
-        # Seed the arbiter trigger counter from persisted history so resumed
-        # blocked tasks consult the arbiter on their FIRST fresh review fail
-        # instead of waiting for new fails to accumulate from zero.
-        prior_review_fails = len([
-            entry for entry in task.review_history if isinstance(entry, dict)
-        ])
         empty_diff_streak = 0
         overflow_trigger = ""
         overflow_fingerprint = ""
@@ -8680,7 +8714,12 @@ class Orchestrator:
                     break
                 review_fingerprints.append(current_fp)
 
-            total_review_fails = prior_review_fails + attempt
+            # Count actual persisted review failures, not implementation attempt
+            # numbers. An earlier verify failure can advance ``attempt`` without
+            # ever reaching review and must not trigger the scope arbiter.
+            total_review_fails = sum(
+                1 for entry in task.review_history if isinstance(entry, dict)
+            )
             if total_review_fails >= self.ARBITER_MIN_REVIEW_FAILS:
                 arbiter_result = self._run_scope_arbiter(
                     state.run_id, task, last_review,
