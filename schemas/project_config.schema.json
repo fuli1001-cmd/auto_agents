@@ -162,7 +162,8 @@
         "verify": { "type": "string" },
         "readme": { "type": "string" },
         "visual_judge": { "type": "string" },
-        "self_repair": { "type": "string" }
+        "self_repair": { "type": "string" },
+        "evidence_preflight": { "type": "string" }
       },
       "required": [
         "clarify",
@@ -216,6 +217,9 @@
                   "type": "string",
                   "minLength": 1
                 }
+              },
+              "parallel_safe": {
+                "type": "boolean"
               }
             },
             "additionalProperties": false
@@ -248,6 +252,16 @@
         },
         "allow_agent_updates": {
           "type": "boolean"
+        },
+        "parallel_workers": {
+          "anyOf": [
+            {"type": "string", "const": "auto"},
+            {"type": "integer", "minimum": 1}
+          ]
+        },
+        "max_auto_workers": {
+          "type": "integer",
+          "minimum": 1
         }
       },
       "additionalProperties": false
@@ -303,6 +317,14 @@
             },
             "worktree_root": {
               "type": "string"
+            },
+            "pressure_cooldown_seconds": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "soft_pressure_threshold": {
+              "type": "integer",
+              "minimum": 1
             }
           },
           "additionalProperties": false
@@ -326,6 +348,22 @@
               "type": "integer",
               "minimum": 1
             }
+          },
+          "additionalProperties": false
+        },
+        "requirements_audit": {
+          "type": "object",
+          "properties": {
+            "pattern_timeout_ms": {"type": "integer", "minimum": 1},
+            "total_timeout_seconds": {"type": "integer", "minimum": 1},
+            "cache_enabled": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "evidence_preflight": {
+          "type": "object",
+          "properties": {
+            "mode": {"type": "string", "enum": ["off", "high_risk", "all"]}
           },
           "additionalProperties": false
         }

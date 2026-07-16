@@ -2852,7 +2852,10 @@ class ProjectValidationTests(unittest.TestCase):
             )
             self.assertEqual(
                 gitignore_show.stdout,
-                "runs/\nstate/gate_baseline_cache.json\nstate/repomap_cache.json\nstate/parallel_tuning.json\n",
+                "runs/\nstate/gate_baseline_cache.json\nstate/gate_baseline_cache.sqlite3\n"
+                "state/gate_baseline_cache.sqlite3-*\nstate/requirements_audit_cache.sqlite3\n"
+                "state/requirements_audit_cache.sqlite3-*\nstate/repomap_cache.json\n"
+                "state/parallel_tuning.json\n",
             )
 
     def test_clarify_prompt_uses_selected_document_language(self) -> None:

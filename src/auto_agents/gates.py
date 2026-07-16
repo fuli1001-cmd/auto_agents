@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import re
 import shlex
 import subprocess
+import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
@@ -101,6 +102,7 @@ def expand_pytest_directory_steps(
                             runner=step.runner,
                             targets=[target],
                             args=list(step.args),
+                            parallel_safe=step.parallel_safe,
                         )
                     )
                     seen_targets.add(target)
@@ -114,6 +116,7 @@ def expand_pytest_directory_steps(
                         runner=step.runner,
                         targets=[test_file],
                         args=list(step.args),
+                        parallel_safe=step.parallel_safe,
                     )
                 )
                 seen_targets.add(test_file)
@@ -148,6 +151,36 @@ def commands_from_verification_steps(
     project_root: Optional[Path] = None,
 ) -> List[str]:
     return [command_from_verification_step(step, project_root=project_root) for step in steps]
+
+
+def gate_plan_from_verification_steps(
+    steps: Sequence[VerificationStep],
+    project_root: Optional[Path] = None,
+) -> tuple[List[str], List[GateParallelGroup]]:
+    """Build a gate plan without inferring concurrency safety.
+
+    Only steps explicitly marked ``parallel_safe`` enter a parallel group.
+    Unmarked and legacy steps remain sequential.
+    """
+    sequential: List[str] = []
+    grouped: dict[str, List[str]] = {}
+    runner_order: List[str] = []
+    for step in steps:
+        command = command_from_verification_step(step, project_root=project_root)
+        if not step.parallel_safe:
+            sequential.append(command)
+            continue
+        runner = step.runner.strip().lower() or "test"
+        if runner not in grouped:
+            grouped[runner] = []
+            runner_order.append(runner)
+        grouped[runner].append(command)
+    groups = [
+        GateParallelGroup(name=f"steps-{runner}", commands=grouped[runner])
+        for runner in runner_order
+        if grouped[runner]
+    ]
+    return sequential, groups
 
 
 def build_failure_identity_diagnostic_command(command: str) -> str:
@@ -195,6 +228,7 @@ def _run_command(command: str, cwd: Path) -> CommandResult:
     env["PYTEST_CURRENT_TEST"] = "auto_agents_gate_run"
     env["AUTO_AGENTS_TEST"] = "True"
     env["TESTING"] = "True"
+    started = time.monotonic()
     process = subprocess.run(
         command,
         shell=True,
@@ -209,17 +243,20 @@ def _run_command(command: str, cwd: Path) -> CommandResult:
         returncode=process.returncode,
         stdout=process.stdout.strip(),
         stderr=process.stderr.strip(),
+        duration_seconds=time.monotonic() - started,
     )
 
 
-def _run_parallel_commands(commands: Sequence[str], cwd: Path) -> List[CommandResult]:
+def _run_parallel_commands(
+    commands: Sequence[str], cwd: Path, *, max_workers: int = 2
+) -> List[CommandResult]:
     if not commands:
         return []
     if len(commands) == 1:
         return [_run_command(commands[0], cwd)]
 
     results: List[CommandResult] = [None] * len(commands)  # type: ignore[list-item]
-    with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, min(len(commands), max_workers))) as executor:
         future_to_index = {
             executor.submit(_run_command, command, cwd): index
             for index, command in enumerate(commands)
@@ -269,6 +306,7 @@ def run_gate_plan(
     cwd: Path,
     *,
     collect_all: bool,
+    parallel_workers: int = 2,
 ) -> GateResult:
     results: List[CommandResult] = []
     summaries: List[str] = []
@@ -285,7 +323,9 @@ def run_gate_plan(
             return GateResult(ok=False, commands=results, summary=summaries[0])
 
     for group in parallel_groups:
-        group_results = _run_parallel_commands(group.commands, cwd)
+        group_results = _run_parallel_commands(
+            group.commands, cwd, max_workers=parallel_workers
+        )
         results.extend(group_results)
         failed = [result for result in group_results if not result.ok]
         if not failed:

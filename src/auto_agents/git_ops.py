@@ -170,6 +170,23 @@ def commit_changed_paths(project_root: Path, commit_sha: str) -> list[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
+def update_ref(project_root: Path, ref_name: str, commit_sha: str) -> None:
+    result = _git(project_root, "update-ref", ref_name, commit_sha)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git update-ref failed")
+
+
+def delete_ref(project_root: Path, ref_name: str) -> None:
+    result = _git(project_root, "update-ref", "-d", ref_name)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "git update-ref -d failed")
+
+
+def ref_exists(project_root: Path, ref_name: str) -> bool:
+    result = _git(project_root, "rev-parse", "--verify", "--quiet", ref_name)
+    return result.returncode == 0
+
+
 def cherry_pick_no_commit(project_root: Path, commit_sha: str) -> None:
     result = _git(project_root, "cherry-pick", "--no-commit", commit_sha)
     if result.returncode != 0:

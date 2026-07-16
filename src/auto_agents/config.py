@@ -40,6 +40,10 @@ node_modules/
 AUTO_GITIGNORE_ENTRIES = (
     "runs/",
     "state/gate_baseline_cache.json",
+    "state/gate_baseline_cache.sqlite3",
+    "state/gate_baseline_cache.sqlite3-*",
+    "state/requirements_audit_cache.sqlite3",
+    "state/requirements_audit_cache.sqlite3-*",
     "state/repomap_cache.json",
     "state/parallel_tuning.json",
 )
@@ -212,6 +216,8 @@ DEFAULT_CONFIG = {
         "parallel_groups": [],
         "require_clean_git_before_task": True,
         "allow_agent_updates": True,
+        "parallel_workers": "auto",
+        "max_auto_workers": 2,
     },
     "git": {
         "auto_init_repo": True,
@@ -225,6 +231,16 @@ DEFAULT_CONFIG = {
             "adaptive": True,
             "strict": False,
             "worktree_root": "",
+            "pressure_cooldown_seconds": 3600,
+            "soft_pressure_threshold": 2,
+        },
+        "requirements_audit": {
+            "pattern_timeout_ms": 250,
+            "total_timeout_seconds": 300,
+            "cache_enabled": True,
+        },
+        "evidence_preflight": {
+            "mode": "high_risk",
         },
         "recovery": {
             "enabled": True,
@@ -335,7 +351,11 @@ def agent_instructions_lock_path(project_root: Path) -> Path:
 
 
 def gate_baseline_cache_path(project_root: Path) -> Path:
-    return state_dir(project_root) / "gate_baseline_cache.json"
+    return state_dir(project_root) / "gate_baseline_cache.sqlite3"
+
+
+def requirements_audit_cache_path(project_root: Path) -> Path:
+    return state_dir(project_root) / "requirements_audit_cache.sqlite3"
 
 
 def review_path(project_root: Path) -> Path:

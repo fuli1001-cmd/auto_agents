@@ -49,7 +49,10 @@ class BootstrapTests(unittest.TestCase):
             auto_gitignore = (auto_dir(project_root) / ".gitignore").read_text(encoding="utf-8")
             self.assertEqual(
                 auto_gitignore,
-                "runs/\nstate/gate_baseline_cache.json\nstate/repomap_cache.json\nstate/parallel_tuning.json\n",
+                "runs/\nstate/gate_baseline_cache.json\nstate/gate_baseline_cache.sqlite3\n"
+                "state/gate_baseline_cache.sqlite3-*\nstate/requirements_audit_cache.sqlite3\n"
+                "state/requirements_audit_cache.sqlite3-*\nstate/repomap_cache.json\n"
+                "state/parallel_tuning.json\n",
             )
             task_archive_ignore = subprocess.run(
                 ["git", "check-ignore", "-q", ".auto-agents/history/task_plans/run-001.json"],

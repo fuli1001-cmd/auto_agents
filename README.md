@@ -85,6 +85,15 @@ stays conservative:
   `execution.parallel_tasks.strict=true`
 - each worker still runs implement/verify/review, and the main worktree still integrates task
   results one commit at a time
+- successful worker commits are retained under run-scoped Git refs until integration completes, so
+  Ctrl+C does not force an expensive worker task to run again
+- results that touch a path already integrated from the same batch are replayed on the latest HEAD
+  in an isolated worktree and jointly verified; only a real merge conflict or combined verification
+  failure falls back to a persistent sequential retry
+- task path history, planned evidence selectors, and declared path hints are used to avoid scheduling
+  likely-conflicting tasks in the same batch
+- high-risk tasks run a read-only evidence preflight in an isolated worktree before implementation;
+  it can return a proof checklist or route an infeasible slice back to plan/clarify
 - batch logs include ready/deferred counts, dependency reasons for deferred tasks, and all failed
   workers in the batch instead of only the first failure
 
@@ -422,11 +431,12 @@ configuration balances quality and token usage:
 | review | `balanced` | auto-escalated | Automatically escalated to `deep` for risky diffs |
 | verify | `balanced` | `balanced` | Runs local commands, no LLM reasoning needed |
 | self_repair | `max` | `max` | Repairs auto_agents itself after eligible orchestrator-owned failures |
+| evidence_preflight | `balanced` | conditional | Checks high-risk proof feasibility before code changes |
 | readme | `balanced` | `balanced` | Interactive README generation from finalized repo |
 
 Review auto-escalation triggers (when configured as `balanced`):
 
-- Prior review failure on the same task → `deep`
+- High-risk evidence contracts or newly changing retry blockers → `deep`
 - Code changes without corresponding test changes → `deep`
 - More than 3 non-test files changed → `deep`
 - High-risk files changed (pyproject.toml, Dockerfile, CI configs) → `deep`
@@ -435,15 +445,22 @@ Review auto-escalation triggers (when configured as `balanced`):
 
 Setting review to `deep` or `max` overrides auto-escalation and uses that effort for every review.
 
-Implementation-stage verification baselines are also cached under
-`.auto-agents/state/gate_baseline_cache.json`, keyed by the effective baseline ref and gate command
-set. After a task passes verification and is committed, the next task can reuse the clean-head
-baseline instead of rerunning identical baseline gates.
+Implementation-stage verification baselines are cached per command in
+`.auto-agents/state/gate_baseline_cache.sqlite3`, keyed by the effective baseline ref, normalized
+command, execution mode, and collect-all behavior. Adding one command therefore runs only the new
+command. The legacy JSON cache is ignored; the first run after upgrading captures one cold baseline.
+Cache corruption disables reuse and falls back to running the real commands.
 
-Gate commands remain sequential by default. To opt into concurrent execution for independent,
-non-mutating checks, declare `gates.parallel_groups`; the runner executes `gates.commands`
-sequentially first, then each parallel group in listed order while preserving command-result order in
-the collected output.
+Gate commands remain sequential by default. A structured `verification_steps` entry is concurrent
+only when it explicitly sets `parallel_safe=true`; safe entries are grouped by runner and capped by
+`gates.max_auto_workers` (default 2). The marker is appropriate only for checks isolated from shared
+databases, ports, mutable fixtures, snapshots, and build output. Existing `gates.parallel_groups`
+remain supported as an explicit opt-in.
+
+Forbidden-pattern requirements use timeout-capable regex matching with per-pattern/file and total
+audit limits. Broad DOTALL wildcards and nested unbounded quantifiers fail closed with a diagnostic;
+use bounded spans such as `[\s\S]{0,500}?`. File match results are cached incrementally in
+`.auto-agents/state/requirements_audit_cache.sqlite3` by pattern set and file-content hash.
 
 Experimental parallel task execution uses planner-generated dependencies plus isolated git
 worktrees. Example:
@@ -457,7 +474,17 @@ worktrees. Example:
       "max_auto_workers": 4,
       "adaptive": true,
       "strict": false,
-      "worktree_root": ""
+      "worktree_root": "",
+      "pressure_cooldown_seconds": 3600,
+      "soft_pressure_threshold": 2
+    },
+    "requirements_audit": {
+      "pattern_timeout_ms": 250,
+      "total_timeout_seconds": 300,
+      "cache_enabled": true
+    },
+    "evidence_preflight": {
+      "mode": "high_risk"
     },
     "recovery": {
       "enabled": true,
@@ -475,9 +502,14 @@ When that mode is enabled, the planner should emit `depends_on` arrays in
 
 `workers` may be an integer for fixed concurrency or `"auto"` for local adaptive scheduling.
 In auto mode, auto_agents starts from the active provider's local subscription-tier limit,
-caps concurrency at `max_auto_workers`, and lowers concurrency when provider pressure such
-as throttling, quota, timeout, or stalls is detected. Successful batches can gradually raise
-the next batch's worker count within that cap.
+caps concurrency at `max_auto_workers`, and lowers concurrency immediately for hard pressure
+(rate limits, quota, throttling) or after repeated soft pressure (timeouts, stalls, availability).
+A persisted one-worker setting stays in the parallel scheduler during the cooldown and automatically
+tries a two-worker canary when `pressure_cooldown_seconds` expires. Successful batches can gradually
+raise the next batch's worker count within the cap. A batch only counts as successful for adaptive
+scaling when every launched worker result is usefully integrated; deferred/replayed results lower
+the next batch's concurrency instead of incorrectly scaling it up. Integration metrics are persisted
+in the run state's `resume_context.parallel_integration_metrics` object.
 For `copilot-cli`, `subscription_tier` can also be set to `pro+`.
 
 Run logs are written both to stderr and to `.auto-agents/runs/<run_id>/run.log`. CLI command results

@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Iterable, Optional
 
 from .models import ProviderConfig
 
@@ -50,23 +50,82 @@ def provider_limit(config: ProviderConfig) -> ProviderLimit:
 
 
 class ParallelTuningStore:
-    def __init__(self, project_root: Path) -> None:
+    def __init__(self, project_root: Path, *, time_fn: Callable[[], float] = time.time) -> None:
         self.path = Path(project_root) / ".auto-agents" / "state" / "parallel_tuning.json"
+        self._time_fn = time_fn
 
     def get_workers(self, key: str) -> Optional[int]:
-        payload = self._read()
-        entry = payload.get(key)
-        if not isinstance(entry, dict):
-            return None
-        workers = entry.get("workers")
+        entry = self.get_entry(key)
+        workers = entry.get("workers") if entry else None
         return workers if isinstance(workers, int) and workers >= 1 else None
 
-    def put_workers(self, key: str, workers: int, *, event: str) -> None:
+    def get_entry(self, key: str, *, legacy_keys: Iterable[str] = ()) -> Optional[Dict[str, object]]:
+        payload = self._read()
+        entry = payload.get(key)
+        source_key = key
+        if not isinstance(entry, dict):
+            for legacy_key in legacy_keys:
+                candidate = payload.get(legacy_key)
+                if isinstance(candidate, dict):
+                    entry = candidate
+                    source_key = legacy_key
+                    break
+        if not isinstance(entry, dict):
+            return None
+        normalized = dict(entry)
+        normalized["source_key"] = source_key
+        return normalized
+
+    def resolve_workers(
+        self,
+        key: str,
+        *,
+        initial_workers: int,
+        cooldown_seconds: int,
+        legacy_keys: Iterable[str] = (),
+    ) -> Dict[str, object]:
+        entry = self.get_entry(key, legacy_keys=legacy_keys)
+        if entry is None:
+            return {
+                "workers": max(1, int(initial_workers)),
+                "event": "default",
+                "cooldown_active": False,
+                "source_key": "",
+                "updated_at": 0,
+            }
+        raw_workers = entry.get("workers")
+        workers = raw_workers if isinstance(raw_workers, int) and raw_workers >= 1 else initial_workers
+        event = str(entry.get("event", "legacy"))
+        updated_at = int(entry.get("updated_at", 0) or 0)
+        pressure_event = event in {"provider_pressure", "hard_pressure", "soft_pressure"}
+        elapsed = max(0, int(self._time_fn()) - updated_at)
+        cooldown_active = pressure_event and workers == 1 and elapsed < cooldown_seconds
+        canary = pressure_event and workers == 1 and not cooldown_active
+        return {
+            "workers": 2 if canary else workers,
+            "stored_workers": workers,
+            "event": "canary" if canary else event,
+            "cooldown_active": cooldown_active,
+            "cooldown_remaining_seconds": max(0, cooldown_seconds - elapsed) if cooldown_active else 0,
+            "source_key": str(entry.get("source_key", "")),
+            "updated_at": updated_at,
+            "soft_pressure_count": int(entry.get("soft_pressure_count", 0) or 0),
+        }
+
+    def put_workers(
+        self,
+        key: str,
+        workers: int,
+        *,
+        event: str,
+        soft_pressure_count: int = 0,
+    ) -> None:
         payload = self._read()
         payload[key] = {
             "workers": max(1, int(workers)),
             "event": event,
-            "updated_at": int(time.time()),
+            "updated_at": int(self._time_fn()),
+            "soft_pressure_count": max(0, int(soft_pressure_count)),
         }
         self._write(payload)
 

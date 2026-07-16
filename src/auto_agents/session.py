@@ -71,8 +71,10 @@ class Session:
         self._prompt_user = orchestrator._prompt_user
 
     def _gate_commands(self) -> List[str]:
-        if self.config.gates.steps:
-            return commands_from_verification_steps(self.config.gates.steps, self.project_root)
+        if self.config.gates.steps and not self.config.gates.parallel_groups:
+            return commands_from_verification_steps(
+                self.config.gates.steps, self.project_root
+            )
         return list(self.config.gates.commands)
 
     # ── Public entry points ──────────────────────────────────────
@@ -1105,6 +1107,7 @@ class Session:
             self.config.gates.parallel_groups,
             self.project_root,
             collect_all=True,
+            parallel_workers=self.orch._gate_parallel_workers(),
         )
         state.baseline_failures = extract_failure_ids(gate)
         state.baseline_git_ref = head_ref(self.project_root)
@@ -1171,13 +1174,14 @@ class Session:
 
         # Layer 2: baseline-diff gate check
         gate_commands = self._gate_commands()
-        if not gate_commands:
+        if not gate_commands and not self.config.gates.parallel_groups:
             return {"ok": True, "reason": "no verification steps or commands configured"}
         gate = run_gate_plan(
             gate_commands,
             self.config.gates.parallel_groups,
             self.project_root,
             collect_all=True,
+            parallel_workers=self.orch._gate_parallel_workers(),
         )
         extraction = extract_failure_info(gate)
         current_failures = extraction.failure_ids

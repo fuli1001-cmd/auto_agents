@@ -27,6 +27,7 @@ DEFAULTED_EFFORT_STAGES = {
     "arbiter",
     "visual_judge",
     "self_repair",
+    "evidence_preflight",
 }
 MAX_ACCEPTANCE_WITHOUT_SCOPE_RATIONALE = 5
 MAX_ACCEPTANCE_HARD_LIMIT = 7
@@ -193,6 +194,8 @@ def validate_verification_steps(steps: object, field_name: str = "verification_s
         command = str(raw_step.get("command", "")).strip()
         if command:
             errors.append(f"{prefix}.command is not allowed for structured test steps")
+        if "parallel_safe" in raw_step and not isinstance(raw_step.get("parallel_safe"), bool):
+            errors.append(f"{prefix}.parallel_safe must be a boolean when provided")
     return errors
 
 
@@ -778,6 +781,15 @@ def validate_project_config_payload(payload: object) -> List[str]:
         allow_agent_updates = gates.get("allow_agent_updates")
         if not isinstance(allow_agent_updates, bool):
             errors.append("gates.allow_agent_updates must be a boolean")
+        parallel_workers = gates.get("parallel_workers", "auto")
+        if not (
+            parallel_workers == "auto"
+            or (isinstance(parallel_workers, int) and parallel_workers >= 1)
+        ):
+            errors.append("gates.parallel_workers must be 'auto' or an integer >= 1")
+        max_auto_workers = gates.get("max_auto_workers", 2)
+        if not isinstance(max_auto_workers, int) or max_auto_workers < 1:
+            errors.append("gates.max_auto_workers must be an integer >= 1")
 
     git = payload.get("git")
     if not isinstance(git, dict):
@@ -825,6 +837,31 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 worktree_root = parallel_tasks.get("worktree_root")
                 if not isinstance(worktree_root, str):
                     errors.append("execution.parallel_tasks.worktree_root must be a string")
+                pressure_cooldown = parallel_tasks.get("pressure_cooldown_seconds", 3600)
+                if not isinstance(pressure_cooldown, int) or pressure_cooldown < 0:
+                    errors.append(
+                        "execution.parallel_tasks.pressure_cooldown_seconds must be an integer >= 0"
+                    )
+                soft_threshold = parallel_tasks.get("soft_pressure_threshold", 2)
+                if not isinstance(soft_threshold, int) or soft_threshold < 1:
+                    errors.append(
+                        "execution.parallel_tasks.soft_pressure_threshold must be an integer >= 1"
+                    )
+            requirements_audit = execution.get("requirements_audit", {})
+            if not isinstance(requirements_audit, dict):
+                errors.append("execution.requirements_audit must be an object")
+            else:
+                for key in ("pattern_timeout_ms", "total_timeout_seconds"):
+                    value = requirements_audit.get(key, 250 if key == "pattern_timeout_ms" else 300)
+                    if not isinstance(value, int) or value < 1:
+                        errors.append(f"execution.requirements_audit.{key} must be an integer >= 1")
+                if not isinstance(requirements_audit.get("cache_enabled", True), bool):
+                    errors.append("execution.requirements_audit.cache_enabled must be a boolean")
+            evidence_preflight = execution.get("evidence_preflight", {})
+            if not isinstance(evidence_preflight, dict):
+                errors.append("execution.evidence_preflight must be an object")
+            elif evidence_preflight.get("mode", "high_risk") not in {"off", "high_risk", "all"}:
+                errors.append("execution.evidence_preflight.mode must be one of: off, high_risk, all")
             recovery = execution.get("recovery", {})
             if not isinstance(recovery, dict):
                 errors.append("execution.recovery must be an object")

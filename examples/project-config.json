@@ -41,16 +41,19 @@
     "provider_research": "deep",
     "implement": "deep",
     "review": "balanced",
+    "evidence_preflight": "balanced",
     "verify": "balanced",
     "readme": "deep"
   },
   "gates": {
     "commands": [
-      "conda run -p ./.conda python -m unittest discover -s tests"
+      "conda run -p ./.conda python -m pytest -q tests"
     ],
     "parallel_groups": [],
     "require_clean_git_before_task": true,
-    "allow_agent_updates": true
+    "allow_agent_updates": true,
+    "parallel_workers": "auto",
+    "max_auto_workers": 2
   },
   "git": {
     "auto_init_repo": true,
@@ -63,7 +66,23 @@
       "max_auto_workers": 4,
       "adaptive": true,
       "strict": false,
-      "worktree_root": ""
+      "worktree_root": "",
+      "pressure_cooldown_seconds": 3600,
+      "soft_pressure_threshold": 2
+    },
+    "requirements_audit": {
+      "pattern_timeout_ms": 250,
+      "total_timeout_seconds": 300,
+      "cache_enabled": true
+    },
+    "evidence_preflight": {
+      "mode": "high_risk"
+    },
+    "recovery": {
+      "enabled": true,
+      "max_rounds": 2,
+      "max_repair_tasks_per_round": 6,
+      "max_refs_per_repair_task": 8
     }
   },
   "approvals": {

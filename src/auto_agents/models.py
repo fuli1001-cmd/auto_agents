@@ -30,6 +30,7 @@ DEFAULT_EFFORTS = {
     "verify": "balanced",
     "readme": "balanced",
     "arbiter": "balanced",
+    "evidence_preflight": "balanced",
 }
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 1800
 DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS = 3600
@@ -79,6 +80,7 @@ class TaskSpec:
     scratchpad: str = ""
     arbitration_history: List[Dict[str, object]] = field(default_factory=list)
     recovery_history: List[Dict[str, object]] = field(default_factory=list)
+    evidence_preflight: Dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -130,6 +132,11 @@ class TaskSpec:
                 entry for entry in (data.get("recovery_history", []) or [])
                 if isinstance(entry, dict)
             ],
+            evidence_preflight=(
+                dict(data.get("evidence_preflight", {}))
+                if isinstance(data.get("evidence_preflight", {}), dict)
+                else {}
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -227,6 +234,7 @@ class VerificationStep:
     targets: List[str] = field(default_factory=list)
     args: List[str] = field(default_factory=list)
     command: str = ""
+    parallel_safe: bool = False
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "VerificationStep":
@@ -236,6 +244,7 @@ class VerificationStep:
             targets=[str(item) for item in data.get("targets", [])],
             args=[str(item) for item in data.get("args", [])],
             command=str(data.get("command", "")),
+            parallel_safe=bool(data.get("parallel_safe", False)),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -244,6 +253,7 @@ class VerificationStep:
             "runner": self.runner,
             "targets": list(self.targets),
             "args": list(self.args),
+            "parallel_safe": self.parallel_safe,
         }
 
 
@@ -270,6 +280,8 @@ class GateConfig:
     parallel_groups: List[GateParallelGroup] = field(default_factory=list)
     require_clean_git_before_task: bool = True
     allow_agent_updates: bool = True
+    parallel_workers: Union[int, str] = "auto"
+    max_auto_workers: int = 2
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "GateConfig":
@@ -289,6 +301,12 @@ class GateConfig:
             ],
             require_clean_git_before_task=bool(data.get("require_clean_git_before_task", True)),
             allow_agent_updates=bool(data.get("allow_agent_updates", True)),
+            parallel_workers=(
+                int(data.get("parallel_workers"))
+                if isinstance(data.get("parallel_workers"), int)
+                else str(data.get("parallel_workers", "auto"))
+            ),
+            max_auto_workers=int(data.get("max_auto_workers", 2)),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -298,6 +316,8 @@ class GateConfig:
             "parallel_groups": [group.to_dict() for group in self.parallel_groups],
             "require_clean_git_before_task": self.require_clean_git_before_task,
             "allow_agent_updates": self.allow_agent_updates,
+            "parallel_workers": self.parallel_workers,
+            "max_auto_workers": self.max_auto_workers,
         }
 
 
@@ -392,6 +412,8 @@ class ParallelTasksConfig:
     adaptive: bool = True
     strict: bool = False
     worktree_root: str = ""
+    pressure_cooldown_seconds: int = 3600
+    soft_pressure_threshold: int = 2
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ParallelTasksConfig":
@@ -408,6 +430,8 @@ class ParallelTasksConfig:
             adaptive=bool(data.get("adaptive", True)),
             strict=bool(data.get("strict", False)),
             worktree_root=str(data.get("worktree_root", "")),
+            pressure_cooldown_seconds=int(data.get("pressure_cooldown_seconds", 3600)),
+            soft_pressure_threshold=int(data.get("soft_pressure_threshold", 2)),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -435,21 +459,61 @@ class RecoveryConfig:
 
 
 @dataclass
+class RequirementsAuditConfig:
+    pattern_timeout_ms: int = 250
+    total_timeout_seconds: int = 300
+    cache_enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "RequirementsAuditConfig":
+        return cls(
+            pattern_timeout_ms=int(data.get("pattern_timeout_ms", 250)),
+            total_timeout_seconds=int(data.get("total_timeout_seconds", 300)),
+            cache_enabled=bool(data.get("cache_enabled", True)),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class EvidencePreflightConfig:
+    mode: str = "high_risk"
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "EvidencePreflightConfig":
+        return cls(mode=str(data.get("mode", "high_risk")))
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class ExecutionConfig:
     parallel_tasks: ParallelTasksConfig = field(default_factory=ParallelTasksConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
+    requirements_audit: RequirementsAuditConfig = field(default_factory=RequirementsAuditConfig)
+    evidence_preflight: EvidencePreflightConfig = field(default_factory=EvidencePreflightConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ExecutionConfig":
         return cls(
             parallel_tasks=ParallelTasksConfig.from_dict(dict(data.get("parallel_tasks", {}))),
             recovery=RecoveryConfig.from_dict(dict(data.get("recovery", {}))),
+            requirements_audit=RequirementsAuditConfig.from_dict(
+                dict(data.get("requirements_audit", {}))
+            ),
+            evidence_preflight=EvidencePreflightConfig.from_dict(
+                dict(data.get("evidence_preflight", {}))
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
         return {
             "parallel_tasks": self.parallel_tasks.to_dict(),
             "recovery": self.recovery.to_dict(),
+            "requirements_audit": self.requirements_audit.to_dict(),
+            "evidence_preflight": self.evidence_preflight.to_dict(),
         }
 
 
@@ -826,6 +890,7 @@ class CommandResult:
     stdout: str = ""
     stderr: str = ""
     comparable_failures: bool = False
+    duration_seconds: float = 0.0
 
 
 @dataclass

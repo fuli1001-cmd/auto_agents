@@ -6,12 +6,16 @@ import hashlib
 import json
 import os
 import re
+import time
 import unicodedata
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import regex as timeout_regex
+
 from .config import (
     archived_task_plans_dir,
+    load_project_config,
     provider_references_lock_path,
     requirements_audit_path,
     requirements_trace_path,
@@ -20,6 +24,7 @@ from .config import (
 )
 from .io_utils import read_json, read_text, write_json, write_text
 from .models import TaskSpec
+from .requirements_audit_cache import RequirementsAuditCache
 
 
 ALLOWED_REQUIREMENT_STATUSES = {"active", "deferred", "superseded"}
@@ -1862,10 +1867,18 @@ def requirements_audit_context_sha256(
             candidate = project_root / candidate
         spec_path = str(candidate.resolve())
         spec_value = read_text(candidate)
+    task_payloads = []
+    for task in tasks:
+        task_payload = task.to_dict()
+        # commit_sha is execution metadata. It is intentionally absent from
+        # task_plan.json and must not invalidate a semantic audit cache when a
+        # completed task is persisted or a process resumes.
+        task_payload.pop("commit_sha", None)
+        task_payloads.append(task_payload)
     payload = {
-        "context_schema_version": 1,
+        "context_schema_version": 2,
         "trace": trace,
-        "tasks": [task.to_dict() for task in tasks],
+        "tasks": task_payloads,
         "assume_done_task_ids": sorted(
             str(item).strip()
             for item in (assume_done_task_ids or [])
@@ -1888,6 +1901,23 @@ def run_requirements_audit(
     current_spec: Optional[Path] = None,
     assume_done_task_ids: Optional[Iterable[str]] = None,
 ) -> dict:
+    audit_started = time.monotonic()
+    try:
+        audit_config = load_project_config(project_root).execution.requirements_audit
+    except (FileNotFoundError, TypeError, ValueError):
+        from .models import RequirementsAuditConfig
+
+        audit_config = RequirementsAuditConfig()
+    deadline = audit_started + audit_config.total_timeout_seconds
+    audit_cache = RequirementsAuditCache(project_root) if audit_config.cache_enabled else None
+    audit_metrics: Dict[str, object] = {
+        "files": 0,
+        "bytes": 0,
+        "patterns": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "matcher_calls": 0,
+    }
     current_tasks = list(tasks)
     assumed_done = {
         str(item).strip() for item in (assume_done_task_ids or []) if str(item).strip()
@@ -1950,11 +1980,87 @@ def run_requirements_audit(
 
     trace_requirements = requirement_records(trace)
     forbidden_scan_files: List[Tuple[str, str]] = []
+    forbidden_content_hashes: Dict[str, str] = {}
+    forbidden_scan_timed_out = False
+    forbidden_findings_by_requirement: Dict[str, List[dict]] = {}
     if any(
         item.get("status", "active") == "active" and item.get("forbidden_patterns")
         for item in trace_requirements
     ):
-        forbidden_scan_files = _forbidden_pattern_scan_files(project_root)
+        try:
+            forbidden_scan_files = _forbidden_pattern_scan_files(
+                project_root, _deadline=deadline
+            )
+        except _ForbiddenPatternTotalTimeout:
+            forbidden_scan_timed_out = True
+        audit_metrics["files"] = len(forbidden_scan_files)
+        audit_metrics["bytes"] = sum(len(content) for _, content in forbidden_scan_files)
+        forbidden_content_hashes = {
+            rel: hashlib.sha256(content.encode("utf-8")).hexdigest()
+            for rel, content in forbidden_scan_files
+        }
+
+    if not forbidden_scan_timed_out:
+        safe_patterns: List[str] = []
+        pattern_owners: Dict[str, List[str]] = {}
+        for item in trace_requirements:
+            req_id = str(item.get("id", "")).strip()
+            if str(item.get("status", "active")).strip() != "active" or not req_id:
+                continue
+            raw_patterns = item.get("forbidden_patterns", [])
+            if not isinstance(raw_patterns, list):
+                continue
+            for raw_value in raw_patterns:
+                raw = str(raw_value)
+                reason = _forbidden_pattern_safety_reason(raw)
+                if not reason:
+                    try:
+                        timeout_regex.compile(raw)
+                    except timeout_regex.error as error:
+                        reason = f"invalid regular expression: {error}"
+                if reason:
+                    forbidden_findings_by_requirement.setdefault(req_id, []).append(
+                        _forbidden_pattern_runtime_finding(
+                            item,
+                            raw,
+                            path=".auto-agents/state/requirements_trace.json",
+                            kind="forbidden_pattern_safety",
+                            reason=reason,
+                        )
+                    )
+                    continue
+                if raw not in pattern_owners:
+                    safe_patterns.append(raw)
+                    pattern_owners[raw] = []
+                if req_id not in pattern_owners[raw]:
+                    pattern_owners[raw].append(req_id)
+        if safe_patterns:
+            global_findings = forbidden_pattern_findings(
+                project_root,
+                {
+                    "id": "requirements-audit",
+                    "status": "active",
+                    "forbidden_patterns": safe_patterns,
+                },
+                current_spec=current_spec,
+                _scan_files=forbidden_scan_files,
+                _cache=audit_cache,
+                _pattern_timeout_ms=audit_config.pattern_timeout_ms,
+                _deadline=deadline,
+                _metrics=audit_metrics,
+                _content_hashes=forbidden_content_hashes,
+            )
+            for finding in global_findings:
+                if finding.get("kind") == "forbidden_pattern":
+                    owners = pattern_owners.get(str(finding.get("pattern", "")), [])
+                else:
+                    # Matching stopped before the global set was fully audited.
+                    # Fail every owner closed; none may assume its pattern ran.
+                    owners = sorted({owner for values in pattern_owners.values() for owner in values})
+                for owner in owners:
+                    forbidden_findings_by_requirement.setdefault(owner, []).append(
+                        dict(finding)
+                    )
 
     for item in trace_requirements:
         req_id = str(item.get("id", "")).strip()
@@ -1963,6 +2069,16 @@ def run_requirements_audit(
         if not req_id:
             continue
         blockers: List[dict] = []
+        if forbidden_scan_timed_out and item.get("forbidden_patterns"):
+            blockers.append(
+                _forbidden_pattern_runtime_finding(
+                    item,
+                    "",
+                    path=".auto-agents/state/requirements_trace.json",
+                    kind="forbidden_pattern_total_timeout",
+                    reason="repository corpus scan exceeded the total audit time limit",
+                )
+            )
         if status == "active" and priority == "mandatory" and req_id not in task_requirements:
             blockers.append(
                 {
@@ -1998,14 +2114,8 @@ def run_requirements_audit(
                             "reference_status": ref_status,
                         }
                     )
-        blockers.extend(
-            forbidden_pattern_findings(
-                project_root,
-                item,
-                current_spec=current_spec,
-                _scan_files=forbidden_scan_files,
-            )
-        )
+        if not forbidden_scan_timed_out:
+            blockers.extend(forbidden_findings_by_requirement.get(req_id, []))
 
         # Design: corroboration rule for forbidden-pattern findings.
         # A forbidden pattern that only appears in auto_agents-internal working memory or
@@ -2124,7 +2234,20 @@ def run_requirements_audit(
         lines.append("No requirements are currently tracked.")
         lines.append("")
 
+    if audit_cache is not None:
+        audit_cache.close()
+
     lines.insert(2, f"Result: {'pass' if ok else 'fail'}")
+    audit_metrics["elapsed_seconds"] = round(time.monotonic() - audit_started, 3)
+    lines.insert(
+        6,
+        "Audit metrics: "
+        f"files={audit_metrics['files']}; bytes={audit_metrics['bytes']}; "
+        f"patterns={audit_metrics['patterns']}; cache_hits={audit_metrics['cache_hits']}; "
+        f"cache_misses={audit_metrics['cache_misses']}; "
+        f"matcher_calls={audit_metrics['matcher_calls']}; "
+        f"elapsed_seconds={audit_metrics['elapsed_seconds']}",
+    )
     report = "\n".join(lines).rstrip() + "\n"
     write_text(requirements_audit_path(project_root), report)
     return {
@@ -2133,6 +2256,7 @@ def run_requirements_audit(
         "issues": issues,
         "path": str(requirements_audit_path(project_root)),
         "input_context_sha256": context_sha256,
+        "metrics": audit_metrics,
     }
 
 
@@ -2267,19 +2391,18 @@ def _forbidden_pattern_match_is_negated(content: str, start: int, end: int) -> b
     return any(marker in window for marker in _NEGATED_FORBIDDEN_PATTERN_MARKERS)
 
 
-def _has_actionable_forbidden_pattern_match(
+def _forbidden_pattern_match_kinds(
     content: str,
-    pattern: re.Pattern[str],
+    pattern: timeout_regex.Pattern,
     *,
-    suppress_negated_matches: bool,
-) -> bool:
-    for match in pattern.finditer(content):
-        if suppress_negated_matches and _forbidden_pattern_match_is_negated(
-            content, match.start(), match.end()
-        ):
-            continue
-        return True
-    return False
+    timeout_seconds: float,
+) -> Tuple[bool, bool]:
+    matched = False
+    for match in pattern.finditer(content, timeout=timeout_seconds):
+        matched = True
+        if not _forbidden_pattern_match_is_negated(content, match.start(), match.end()):
+            return True, True
+    return matched, False
 
 
 def forbidden_pattern_findings(
@@ -2289,6 +2412,11 @@ def forbidden_pattern_findings(
     include_paths: Optional[Iterable[str]] = None,
     current_spec: Optional[Path] = None,
     _scan_files: Optional[List[Tuple[str, str]]] = None,
+    _cache: Optional[RequirementsAuditCache] = None,
+    _pattern_timeout_ms: int = 250,
+    _deadline: Optional[float] = None,
+    _metrics: Optional[Dict[str, object]] = None,
+    _content_hashes: Optional[Dict[str, str]] = None,
 ) -> List[dict]:
     status = str(requirement.get("status", "active")).strip()
     if status != "active":
@@ -2296,15 +2424,37 @@ def forbidden_pattern_findings(
     patterns = requirement.get("forbidden_patterns", [])
     if not isinstance(patterns, list) or not patterns:
         return []
-    findings: List[str] = []
-    compiled = []
-    for raw in patterns:
+    findings: List[dict] = []
+    compiled: List[Tuple[str, timeout_regex.Pattern]] = []
+    for index, raw_value in enumerate(patterns):
+        raw = str(raw_value)
+        safety_reason = _forbidden_pattern_safety_reason(raw)
+        if safety_reason:
+            return [
+                _forbidden_pattern_runtime_finding(
+                    requirement,
+                    raw,
+                    path=".auto-agents/state/requirements_trace.json",
+                    kind="forbidden_pattern_safety",
+                    reason=safety_reason,
+                )
+            ]
         try:
-            compiled.append((str(raw), re.compile(str(raw))))
-        except re.error:
-            continue
+            compiled.append((raw, timeout_regex.compile(raw)))
+        except timeout_regex.error as error:
+            return [
+                _forbidden_pattern_runtime_finding(
+                    requirement,
+                    raw,
+                    path=".auto-agents/state/requirements_trace.json",
+                    kind="forbidden_pattern_safety",
+                    reason=f"invalid regular expression: {error}",
+                )
+            ]
     if not compiled:
         return findings
+    if _metrics is not None:
+        _metrics["patterns"] = int(_metrics.get("patterns", 0)) + len(compiled)
     scan_files = _scan_files
     if scan_files is None:
         scan_files = _forbidden_pattern_scan_files(
@@ -2312,16 +2462,87 @@ def forbidden_pattern_findings(
             include_paths=include_paths,
         )
     current_spec_rel = _current_spec_relpath(project_root, current_spec)
+    pattern_set_hash = hashlib.sha256(
+        json.dumps([raw for raw, _ in compiled], ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
     for rel, content in scan_files:
-        for raw, pattern in compiled:
+        if _deadline is not None and time.monotonic() >= _deadline:
+            return findings + [
+                _forbidden_pattern_runtime_finding(
+                    requirement,
+                    "",
+                    path=rel,
+                    kind="forbidden_pattern_total_timeout",
+                    reason="requirements forbidden-pattern audit exceeded its total time limit",
+                )
+            ]
+        content_sha256 = (
+            _content_hashes.get(rel, "") if _content_hashes is not None else ""
+        ) or hashlib.sha256(content.encode("utf-8")).hexdigest()
+        cached = _cache.get(pattern_set_hash, rel, content_sha256) if _cache else None
+        if cached is not None:
+            matched_indexes, non_negated_indexes = (set(cached[0]), set(cached[1]))
+            if _metrics is not None:
+                _metrics["cache_hits"] = int(_metrics.get("cache_hits", 0)) + 1
+        else:
+            if _metrics is not None:
+                _metrics["cache_misses"] = int(_metrics.get("cache_misses", 0)) + 1
+            matched_indexes = set()
+            non_negated_indexes = set()
+            try:
+                for pattern_index, (_, pattern) in enumerate(compiled):
+                    if _deadline is not None and time.monotonic() >= _deadline:
+                        raise _ForbiddenPatternTotalTimeout
+                    if _metrics is not None:
+                        _metrics["matcher_calls"] = int(_metrics.get("matcher_calls", 0)) + 1
+                    matched, non_negated = _forbidden_pattern_match_kinds(
+                        content,
+                        pattern,
+                        timeout_seconds=max(0.001, _pattern_timeout_ms / 1000.0),
+                    )
+                    if matched:
+                        matched_indexes.add(pattern_index)
+                    if non_negated:
+                        non_negated_indexes.add(pattern_index)
+            except TimeoutError:
+                raw = compiled[pattern_index][0]
+                return findings + [
+                    _forbidden_pattern_runtime_finding(
+                        requirement,
+                        raw,
+                        path=rel,
+                        kind="forbidden_pattern_timeout",
+                        reason=f"pattern exceeded {_pattern_timeout_ms}ms for one file",
+                    )
+                ]
+            except _ForbiddenPatternTotalTimeout:
+                return findings + [
+                    _forbidden_pattern_runtime_finding(
+                        requirement,
+                        "",
+                        path=rel,
+                        kind="forbidden_pattern_total_timeout",
+                        reason="requirements forbidden-pattern audit exceeded its total time limit",
+                    )
+                ]
+            if _cache:
+                _cache.put(
+                    pattern_set_hash,
+                    rel,
+                    content_sha256,
+                    sorted(matched_indexes),
+                    sorted(non_negated_indexes),
+                )
+        for pattern_index, (raw, _) in enumerate(compiled):
             authoritative = not _forbidden_pattern_corroboration_only_path(
                 rel, current_spec_rel
             )
-            if not _has_actionable_forbidden_pattern_match(
-                content,
-                pattern,
-                suppress_negated_matches=authoritative and rel == current_spec_rel,
-            ):
+            matching_indexes = (
+                non_negated_indexes
+                if authoritative and rel == current_spec_rel
+                else matched_indexes
+            )
+            if pattern_index not in matching_indexes:
                 continue
             findings.append(
                 {
@@ -2335,10 +2556,50 @@ def forbidden_pattern_findings(
     return findings
 
 
+class _ForbiddenPatternTotalTimeout(Exception):
+    pass
+
+
+def _forbidden_pattern_safety_reason(pattern: str) -> str:
+    if len(pattern) > 1024:
+        return "pattern exceeds the 1024-character safety limit"
+    dotall = "(?s" in pattern.lower()
+    if dotall and re.search(r"(?<!\\)\.\s*[*+]", pattern):
+        return "DOTALL combined with an unbounded wildcard is unsafe"
+    if re.search(r"\((?:[^()\\]|\\.)*[*+](?:[^()\\]|\\.)*\)\s*[*+]", pattern):
+        return "nested unbounded quantifiers are unsafe"
+    if re.search(r"(?:\.\*|\.\+|\[[^\]]+\][*+])(?:[^|]{0,80})(?:\.\*|\.\+)", pattern):
+        return "multiple unbounded wildcard spans are unsafe; use bounded spans such as [\\s\\S]{0,N}?"
+    return ""
+
+
+def _forbidden_pattern_runtime_finding(
+    requirement: dict,
+    pattern: str,
+    *,
+    path: str,
+    kind: str,
+    reason: str,
+) -> dict:
+    req_id = str(requirement.get("id", "")).strip() or "(unknown requirement)"
+    literal = f" '{pattern}'" if pattern else ""
+    return {
+        "kind": kind,
+        "message": (
+            f"forbidden-pattern audit stopped for {req_id}: pattern{literal} at {path}: {reason}. "
+            "Replace broad wildcards with bounded spans such as [\\s\\S]{0,500}? and rerun."
+        ),
+        "pattern": pattern,
+        "path": path,
+        "authoritative": True,
+    }
+
+
 def _forbidden_pattern_scan_files(
     project_root: Path,
     *,
     include_paths: Optional[Iterable[str]] = None,
+    _deadline: Optional[float] = None,
 ) -> List[Tuple[str, str]]:
     """Read the forbidden-pattern corpus once for a complete audit.
 
@@ -2384,6 +2645,8 @@ def _forbidden_pattern_scan_files(
     }
     scan_files: List[Tuple[str, str]] = []
     for root, dirs, files in os.walk(project_root):
+        if _deadline is not None and time.monotonic() >= _deadline:
+            raise _ForbiddenPatternTotalTimeout
         rel_root = str(Path(root).relative_to(project_root)).replace("\\", "/")
         dirs[:] = [
             directory
@@ -2392,6 +2655,8 @@ def _forbidden_pattern_scan_files(
             and f"{'' if rel_root == '.' else rel_root + '/'}{directory}" not in ignored_dirs
         ]
         for filename in files:
+            if _deadline is not None and time.monotonic() >= _deadline:
+                raise _ForbiddenPatternTotalTimeout
             path = Path(root) / filename
             rel = str(path.relative_to(project_root)).replace("\\", "/")
             if rel in ignored_files:

@@ -59,6 +59,7 @@ from .gates import (
     commands_from_verification_steps,
     extract_failure_ids,
     extract_failure_info,
+    gate_plan_from_verification_steps,
     expand_pytest_directory_steps,
     run_gate_plan,
     run_commands,
@@ -66,7 +67,7 @@ from .gates import (
 )
 from .gate_baseline_cache import GateBaselineCache
 from .frontend_fidelity import validate_frontend_fidelity_trace
-from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, ensure_repo, hard_reset_clean, head_ref, is_repo, remove_worktree, worktree_fingerprint
+from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, ref_exists, remove_worktree, update_ref, worktree_fingerprint
 from .io_utils import read_json, read_text, write_json, write_text
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
 from .models import (
@@ -99,12 +100,14 @@ from .requirements import (
     provider_reference_effective_status,
     provider_reference_status,
     preserve_task_plan_negative_oracle_clauses,
+    requirements_audit_context_sha256,
     run_requirements_audit,
     stamp_requirement_contract_hashes,
     stamp_task_plan_contract_hashes,
     stamp_provider_reference_consumer_hashes,
     task_is_fully_historically_covered,
     requirements_for_task,
+    requirement_contract_payload,
     validate_done_task_requirement_proofs,
     validate_requirement_contract_transitions,
     validate_requirements_trace_payload,
@@ -157,6 +160,15 @@ _PARALLEL_PROVIDER_PRESSURE_PATTERN = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_PARALLEL_HARD_PRESSURE_PATTERN = re.compile(
+    r"\b(?:rate[-\s]?limit(?:ed|s|ing)?|usage[-\s]?limit(?:ed|s|ing)?|429|quota|"
+    r"too many requests|throttl(?:e|ed|ing)?|all providers exhausted)\b",
+    re.IGNORECASE,
+)
+_PARALLEL_SOFT_PRESSURE_PATTERN = re.compile(
+    r"\b(?:provider availability|timed?\s*out|timeout|stall(?:ed|ing)?)\b",
+    re.IGNORECASE,
+)
 
 
 class Orchestrator:
@@ -202,6 +214,25 @@ class Orchestrator:
         self._clarify_pre_trace_ids: Set[str] = set()
         self._clarify_pre_trace_payload: Dict[str, object] = {}
         self._clarify_historical_tasks: List[dict] = []
+
+    def _run_requirements_audit(self, *args, **kwargs) -> Dict[str, object]:
+        self.logger.info("[requirements-audit] start")
+        result = run_requirements_audit(self.project_root, *args, **kwargs)
+        metrics = result.get("metrics", {})
+        if isinstance(metrics, dict):
+            self.logger.info(
+                "[requirements-audit] ok=%s files=%s bytes=%s patterns=%s cache_hits=%s "
+                "cache_misses=%s matcher_calls=%s elapsed_seconds=%s",
+                str(bool(result.get("ok"))).lower(),
+                metrics.get("files", 0),
+                metrics.get("bytes", 0),
+                metrics.get("patterns", 0),
+                metrics.get("cache_hits", 0),
+                metrics.get("cache_misses", 0),
+                metrics.get("matcher_calls", 0),
+                metrics.get("elapsed_seconds", 0),
+            )
+        return result
 
     def _attach_run_logger(self, run_id: str) -> None:
         if not str(run_id).strip():
@@ -420,8 +451,8 @@ class Orchestrator:
         if not recovery_tasks:
             return False
 
-        audit_result = run_requirements_audit(
-            self.project_root, tasks, current_spec=self._current_audit_spec(state)
+        audit_result = self._run_requirements_audit(
+            tasks, current_spec=self._current_audit_spec(state)
         )
         if bool(audit_result.get("ok")):
             return False
@@ -2390,13 +2421,22 @@ class Orchestrator:
         self._apply_generated_verification_config()
         before_snapshot = self._worktree_change_snapshot()
         commands = self._default_gate_commands()
+        self.logger.info(
+            "[gate] start context=%s commands=%s groups=%s collect_all=%s",
+            context,
+            len(commands),
+            len(self.config.gates.parallel_groups),
+            str(collect_all).lower(),
+        )
         with log_timing(self.logger, f"gate:{context} commands={len(commands)} groups={len(self.config.gates.parallel_groups)}"):
             gate = run_gate_plan(
                 commands,
                 self.config.gates.parallel_groups,
                 self.project_root,
                 collect_all=collect_all,
+                parallel_workers=self._gate_parallel_workers(),
             )
+        self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
         changed = self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot)
@@ -2417,13 +2457,21 @@ class Orchestrator:
     ):
         self._apply_generated_verification_config()
         before_snapshot = self._worktree_change_snapshot()
+        self.logger.info(
+            "[gate] start context=%s commands=%s groups=0 collect_all=%s",
+            context,
+            len(commands),
+            str(collect_all).lower(),
+        )
         with log_timing(self.logger, f"gate:{context} commands={len(commands)}"):
             gate = run_gate_plan(
                 commands,
                 [],
                 self.project_root,
                 collect_all=collect_all,
+                parallel_workers=self._gate_parallel_workers(),
             )
+        self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
         changed = self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot)
@@ -2435,12 +2483,89 @@ class Orchestrator:
             )
         return gate, reason
 
-    def _default_gate_commands(self) -> List[str]:
-        return (
-            commands_from_verification_steps(self.config.gates.steps, self.project_root)
-            if self.config.gates.steps
-            else self.config.gates.commands
+    def _run_missing_baseline_commands(
+        self,
+        baseline_ref: str,
+        commands: List[str],
+        parallel_groups: List[GateParallelGroup],
+        *,
+        context: str,
+    ):
+        missing = set(
+            self._gate_baseline_cache.missing_commands(
+                baseline_ref,
+                commands,
+                collect_all=True,
+                parallel_groups=parallel_groups,
+            )
         )
+        pending_commands = [command for command in commands if command in missing]
+        pending_groups = [
+            GateParallelGroup(
+                name=group.name,
+                commands=[command for command in group.commands if command in missing],
+            )
+            for group in parallel_groups
+        ]
+        pending_groups = [group for group in pending_groups if group.commands]
+        if (
+            pending_commands == commands
+            and pending_groups == parallel_groups
+            and commands == self._default_gate_commands()
+            and parallel_groups == self.config.gates.parallel_groups
+        ):
+            return self._run_gate_commands(collect_all=True, context=context)
+        if not pending_groups:
+            return self._run_gate_commands_for_commands(
+                pending_commands,
+                collect_all=True,
+                context=context,
+            )
+        before_snapshot = self._worktree_change_snapshot()
+        with log_timing(
+            self.logger,
+            f"gate:{context} cache_missing={len(missing)} commands={len(pending_commands)} "
+            f"groups={len(pending_groups)}",
+        ):
+            gate = run_gate_plan(
+                pending_commands,
+                pending_groups,
+                self.project_root,
+                collect_all=True,
+                parallel_workers=self._gate_parallel_workers(),
+            )
+        self._log_gate_command_results(context, gate.commands)
+        self._cleanup_ephemeral_tooling_artifacts()
+        after_snapshot = self._worktree_change_snapshot()
+        changed = self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot)
+        reason = ""
+        if changed:
+            reason = (
+                f"{context} modified tracked or unignored files: "
+                f"{self._changed_path_preview(changed)}"
+            )
+        return gate, reason
+
+    def _log_gate_command_results(self, context: str, results: Iterable[object]) -> None:
+        for index, result in enumerate(results, start=1):
+            self.logger.info(
+                "[gate-command] context=%s index=%s ok=%s returncode=%s duration_seconds=%.3f command=%s",
+                context,
+                index,
+                str(bool(getattr(result, "ok", False))).lower(),
+                getattr(result, "returncode", ""),
+                float(getattr(result, "duration_seconds", 0.0) or 0.0),
+                str(getattr(result, "command", ""))[:300],
+            )
+
+    def _default_gate_commands(self) -> List[str]:
+        return list(self.config.gates.commands)
+
+    def _gate_parallel_workers(self) -> int:
+        configured = self.config.gates.parallel_workers
+        if isinstance(configured, int):
+            return max(1, configured)
+        return max(1, min(2, self.config.gates.max_auto_workers))
 
     def _implement_touched_code(self, task: Optional[TaskSpec] = None) -> bool:
         """Return True if the last implement step touched any non-orchestrator file."""
@@ -2796,8 +2921,13 @@ class Orchestrator:
         plan_tasks = self._load_tasks_from_plan()
         if not state.tasks:
             return plan_tasks
-        state_tasks = [task.to_dict() for task in state.tasks]
-        plan_payload = [task.to_dict() for task in plan_tasks]
+        def comparable(task: TaskSpec) -> Dict[str, object]:
+            payload = task.to_dict()
+            payload.pop("commit_sha", None)
+            return payload
+
+        state_tasks = [comparable(task) for task in state.tasks]
+        plan_payload = [comparable(task) for task in plan_tasks]
         if state_tasks == plan_payload:
             return state.tasks
         state.tasks = plan_tasks
@@ -2851,21 +2981,108 @@ class Orchestrator:
         tasks: List[TaskSpec],
         max_tasks: Optional[int],
     ) -> RunState:
-        fallback_reason = self._parallel_execution_fallback_reason(tasks)
-        if fallback_reason:
+        processed = 0
+        while True:
+            fallback_reason = self._parallel_execution_fallback_reason(tasks)
+            if not fallback_reason:
+                break
             if self.config.execution.parallel_tasks.strict:
                 raise RuntimeError(fallback_reason)
-            self.logger.info(f"[parallel-tasks] fallback to sequential: {fallback_reason}")
+
+            recovery_tasks = [
+                task for task in tasks if task.status not in {"pending", "done"}
+            ]
+            if (
+                recovery_tasks
+                and "fresh pending/done task sets" in fallback_reason
+            ):
+                self.logger.info(
+                    "[parallel-tasks] recovery lane tasks=%s; "
+                    "parallel eligibility will be re-evaluated afterwards",
+                    ",".join(task.task_id for task in recovery_tasks),
+                )
+                for task in recovery_tasks:
+                    if not self._has_task_budget(max_tasks, processed):
+                        self._task_budget_exhausted = True
+                        return self._run_sequential_implementation_loop(
+                            state, tasks, max_tasks
+                        )
+                    rewind_state = self._execute_task_in_main_worktree(
+                        state, tasks, task
+                    )
+                    if rewind_state is not None:
+                        return rewind_state
+                    processed += 1
+                    self._consume_task_budget()
+                continue
+
+            self.logger.info(
+                f"[parallel-tasks] fallback to sequential: {fallback_reason}"
+            )
             return self._run_sequential_implementation_loop(state, tasks, max_tasks)
 
-        processed = 0
         current_workers = self._parallel_worker_count()
         self._log_parallel_worker_resolution(current_workers)
         while True:
             if not self._has_task_budget(max_tasks, processed):
                 self._task_budget_exhausted = True
                 break
-            ready = self._ready_parallel_tasks(tasks)
+            pending_outcome = self._process_next_parallel_pending_integration(state, tasks)
+            if pending_outcome == "integrated":
+                processed += 1
+                self._consume_task_budget()
+                continue
+            if pending_outcome == "retry":
+                continue
+
+            retry_ids = self._parallel_sequential_retry_ids(state)
+            tasks_by_id = {task.task_id: task for task in tasks}
+            retained_retry_ids = [
+                task_id
+                for task_id in retry_ids
+                if task_id in tasks_by_id and tasks_by_id[task_id].status != "done"
+            ]
+            if retained_retry_ids != retry_ids:
+                self._set_parallel_sequential_retry_ids(state, retained_retry_ids)
+                self._persist_parallel_runtime_state(state, tasks)
+            completed = {task.task_id for task in tasks if task.status == "done"}
+            retry_task = next(
+                (
+                    tasks_by_id[task_id]
+                    for task_id in retained_retry_ids
+                    if tasks_by_id[task_id].status == "pending"
+                    and all(dep in completed for dep in tasks_by_id[task_id].depends_on)
+                ),
+                None,
+            )
+            if retry_task is not None:
+                self.logger.info(
+                    "[parallel-tasks] sequential retry task=%s reason=retained-result-replay-failed",
+                    retry_task.task_id,
+                )
+                rewind_state = self._execute_task_in_main_worktree(
+                    state, tasks, retry_task
+                )
+                if rewind_state is not None:
+                    return rewind_state
+                retained_retry_ids = [
+                    task_id for task_id in retained_retry_ids
+                    if task_id != retry_task.task_id
+                ]
+                self._set_parallel_sequential_retry_ids(state, retained_retry_ids)
+                self._increment_parallel_metrics(state, sequential_retries=1)
+                self._persist_parallel_runtime_state(state, tasks)
+                processed += 1
+                self._consume_task_budget()
+                continue
+
+            excluded_ids = set(retained_retry_ids) | set(
+                self._parallel_pending_integrations(state)
+            )
+            ready = [
+                task for task in self._ready_parallel_tasks(tasks)
+                if task.task_id not in excluded_ids
+            ]
             if not ready:
                 break
             remaining = self._remaining_task_budget(max_tasks, processed, len(ready))
@@ -2873,7 +3090,11 @@ class Orchestrator:
                 self._task_budget_exhausted = True
                 break
             batch_size = min(current_workers, remaining)
-            batch = ready[:batch_size]
+            batch = self._select_parallel_batch(state, ready, batch_size)
+            for candidate in batch:
+                route = self._ensure_evidence_preflight(state, candidate)
+                if route:
+                    return self._route_evidence_preflight(state, tasks, candidate, route)
             if len(batch) < 2:
                 self.logger.info(
                     "[parallel-tasks] ready=%s batch=%s; executing sequentially task=%s",
@@ -2886,6 +3107,7 @@ class Orchestrator:
                     return rewind_state
                 processed += 1
                 self._consume_task_budget()
+                current_workers = self._parallel_worker_count()
                 continue
 
             self._require_clean_tree_excluding_agent_instructions()
@@ -2905,15 +3127,21 @@ class Orchestrator:
                 self.logger.info("[parallel-tasks] deferred reasons=%s", preview)
             with log_timing(self.logger, f"parallel-batch workers={len(batch)}"):
                 results = self._run_parallel_task_batch(state, tasks, batch)
+            self._increment_parallel_metrics(state, launched=len(batch))
+            save_run_state(self.project_root, state)
             provider_pressure_result: Optional[Tuple[TaskSpec, Dict[str, object]]] = None
             failed_results: List[Tuple[TaskSpec, Dict[str, object]]] = []
             integrated_paths: Set[str] = set()
+            integrated_verification_commands: List[str] = []
+            batch_integrated = 0
+            batch_deferred = 0
             for task in batch:
                 result = results[task.task_id]
                 if not result["ok"]:
                     if self._parallel_result_is_provider_pressure(result):
-                        provider_pressure_result = (task, result)
-                        break
+                        if provider_pressure_result is None:
+                            provider_pressure_result = (task, result)
+                        continue
                     self._apply_parallel_task_failure_snapshot(task, dict(result["task"]))
                     task.status = "blocked"
                     failed_results.append((task, result))
@@ -2934,12 +3162,28 @@ class Orchestrator:
                         task.task_id,
                         preview,
                     )
+                    self._defer_parallel_task_result(
+                        state,
+                        tasks,
+                        task,
+                        result,
+                        overlapping_paths,
+                        integrated_verification_commands,
+                    )
+                    batch_deferred += 1
                     continue
 
                 self._apply_parallel_task_snapshot(task, dict(result["task"]))
                 commit_sha = self._integrate_parallel_task_result(task, tasks, str(result["commit_sha"]))
                 task.commit_sha = commit_sha
                 integrated_paths.update(result_changed_paths)
+                self._record_parallel_task_paths(state, task, result_changed_paths)
+                self._delete_parallel_result_ref(str(result.get("result_ref", "")))
+                self._increment_parallel_metrics(state, integrated=1)
+                batch_integrated += 1
+                for command in self._build_task_verify_commands(task):
+                    if command not in integrated_verification_commands:
+                        integrated_verification_commands.append(command)
                 self._warm_clean_head_verify_baseline(
                     state,
                     failure_ids=result.get("verify_current_failure_ids", []),
@@ -2956,10 +3200,12 @@ class Orchestrator:
                         "parallel task execution hit provider pressure with fixed workers; "
                         f"task={task.task_id} reason={result['reason']}"
                     )
-                current_workers = self._record_parallel_pressure(current_workers)
+                pressure_kind = self._parallel_pressure_kind(result)
+                current_workers = self._record_parallel_pressure(current_workers, pressure_kind)
                 self.logger.info(
-                    "[parallel-tasks] provider pressure task=%s workers=%s reason=%s",
+                    "[parallel-tasks] provider pressure task=%s class=%s workers=%s reason=%s",
                     task.task_id,
+                    pressure_kind,
                     current_workers,
                     str(result["reason"])[:200],
                 )
@@ -2975,11 +3221,22 @@ class Orchestrator:
                     self._emit_task_blocked(failed_task, str(result["reason"]))
                 raise RuntimeError(self._format_parallel_batch_failure_error(failed_results))
             else:
-                current_workers = self._record_parallel_success(current_workers)
+                if batch_deferred:
+                    current_workers = self._record_parallel_inefficiency(
+                        current_workers,
+                        launched=len(batch),
+                        integrated=batch_integrated,
+                    )
+                else:
+                    current_workers = self._record_parallel_success(current_workers)
                 continue
 
             if current_workers < 2:
-                raise RuntimeError("parallel task execution paused due to provider pressure; retry later")
+                if self.config.execution.parallel_tasks.strict:
+                    raise RuntimeError("parallel task execution paused due to provider pressure; retry later")
+                self.logger.info(
+                    "[parallel-tasks] cooldown scheduler remains active with workers=1"
+                )
 
         state.tasks = tasks
         state.current_stage = "implement"
@@ -2993,12 +3250,28 @@ class Orchestrator:
         tasks: List[TaskSpec],
         task: TaskSpec,
     ) -> Optional[RunState]:
+        if (
+            task.status == "blocked"
+            and "references missing pytest target" in task.review_summary
+        ):
+            self.logger.info(
+                "[task:%s] reopening implementation after missing planned pytest target",
+                task.task_id,
+            )
+            task.status = "in_progress"
+            self._set_implementation_ready_marker(state, task, False)
+            self._persist_tasks(tasks)
+            save_run_state(self.project_root, state)
         if task.status == "blocked":
             payload = self._task_recovery_payload_from_history(task, state)
             if self._schedule_repair_tasks_for_failure(state, tasks, task, payload):
                 return state
 
-        resume_existing = task.status == "in_progress" or self._should_resume_task(state, task)
+        resume_existing = (
+            self._in_progress_implementation_is_ready(state, task)
+            if task.status == "in_progress"
+            else self._should_resume_task(state, task)
+        )
         allow_dirty_retry = task.status == "blocked"
         allow_dirty_repair = self._is_repair_task(task)
         if (resume_existing or allow_dirty_retry) and task.status != "in_progress":
@@ -3015,6 +3288,10 @@ class Orchestrator:
             and self.config.gates.require_clean_git_before_task
         ):
             self._require_clean_tree_for_task(task)
+
+        route = self._ensure_evidence_preflight(state, task)
+        if route:
+            return self._route_evidence_preflight(state, tasks, task, route)
 
         if task.status == "pending":
             task.status = "in_progress"
@@ -3057,6 +3334,7 @@ class Orchestrator:
             )
 
         task.status = "done"
+        self._clear_implementation_ready_marker(state, task)
         task.review_summary = str(gate_result["review"])
         commit_message = task.commit_message or self.config.git.commit_message_template.format(
             task_id=task.task_id,
@@ -3072,8 +3350,14 @@ class Orchestrator:
         return None
 
     def _parallel_execution_fallback_reason(self, tasks: List[TaskSpec]) -> str:
-        if self._parallel_worker_count() < 2:
-            return "parallel task execution requires at least 2 workers"
+        workers = self._parallel_worker_count()
+        if workers < 2:
+            config = self.config.execution.parallel_tasks
+            provider = self.config.providers.get(self.config.active_provider, self.config.provider)
+            ceiling = min(provider_limit(provider).worker_ceiling, config.max_auto_workers)
+            recoverable_auto = config.workers == "auto" and config.adaptive and ceiling >= 2
+            if not recoverable_auto or config.strict:
+                return "parallel task execution requires at least 2 workers"
         if any(task.status not in {"pending", "done"} for task in tasks):
             return "parallel task execution only supports fresh pending/done task sets; resume and blocked retries stay sequential"
         raw_plan = load_task_plan(self.project_root)
@@ -3106,8 +3390,34 @@ class Orchestrator:
 
     def _parallel_tuning_key(self) -> str:
         provider = self.config.providers.get(self.config.active_provider, self.config.provider)
-        profile = provider.profile_map.get(self.config.efforts.get("implement", "deep"), "")
-        return f"{provider.kind}:{provider.subscription_tier}:{profile}"
+        effort = self.config.efforts.get("implement", "deep")
+        profile = provider.profile_map.get(effort, "")
+        return (
+            f"{provider.kind}:{self.config.active_provider}:{provider.subscription_tier}:"
+            f"{effort}:{profile}"
+        )
+
+    def _legacy_parallel_tuning_keys(self) -> List[str]:
+        provider = self.config.providers.get(self.config.active_provider, self.config.provider)
+        effort = self.config.efforts.get("implement", "deep")
+        profile = provider.profile_map.get(effort, "")
+        return [f"{provider.kind}:{provider.subscription_tier}:{profile}"]
+
+    def _parallel_worker_resolution(self) -> Dict[str, object]:
+        config = self.config.execution.parallel_tasks
+        provider = self.config.providers.get(self.config.active_provider, self.config.provider)
+        limit = provider_limit(provider)
+        decision = self._parallel_tuning.resolve_workers(
+            self._parallel_tuning_key(),
+            initial_workers=limit.initial_workers,
+            cooldown_seconds=config.pressure_cooldown_seconds,
+            legacy_keys=self._legacy_parallel_tuning_keys(),
+        )
+        decision["workers"] = max(
+            1,
+            min(int(decision["workers"]), limit.worker_ceiling, config.max_auto_workers),
+        )
+        return decision
 
     def _parallel_worker_count(self) -> int:
         config = self.config.execution.parallel_tasks
@@ -3116,9 +3426,7 @@ class Orchestrator:
             return max(1, workers)
         provider = self.config.providers.get(self.config.active_provider, self.config.provider)
         limit = provider_limit(provider)
-        tuned = self._parallel_tuning.get_workers(self._parallel_tuning_key())
-        initial = tuned if tuned is not None else limit.initial_workers
-        return max(1, min(initial, limit.worker_ceiling, config.max_auto_workers))
+        return int(self._parallel_worker_resolution()["workers"])
 
     def _log_parallel_worker_resolution(self, current_workers: int) -> None:
         config = self.config.execution.parallel_tasks
@@ -3126,13 +3434,17 @@ class Orchestrator:
             return
         provider = self.config.providers.get(self.config.active_provider, self.config.provider)
         limit = provider_limit(provider)
-        tuned = self._parallel_tuning.get_workers(self._parallel_tuning_key())
-        tuned_label = str(tuned) if tuned is not None else "none"
+        resolution = self._parallel_worker_resolution()
         self.logger.info(
-            "[parallel-tasks] auto mode resolved workers=%s tier=%s tuned=%s ceiling=%s max_auto_workers=%s",
+            "[parallel-tasks] auto mode resolved workers=%s tier=%s event=%s stored=%s "
+            "cooldown_active=%s cooldown_remaining_seconds=%s source=%s ceiling=%s max_auto_workers=%s",
             current_workers,
             provider.subscription_tier,
-            tuned_label,
+            resolution.get("event"),
+            resolution.get("stored_workers", "none"),
+            resolution.get("cooldown_active", False),
+            resolution.get("cooldown_remaining_seconds", 0),
+            resolution.get("source_key", ""),
             limit.worker_ceiling,
             config.max_auto_workers,
         )
@@ -3147,12 +3459,55 @@ class Orchestrator:
         self._parallel_tuning.put_workers(self._parallel_tuning_key(), next_workers, event="success")
         return next_workers
 
-    def _record_parallel_pressure(self, current_workers: int) -> int:
+    def _record_parallel_inefficiency(
+        self,
+        current_workers: int,
+        *,
+        launched: int,
+        integrated: int,
+    ) -> int:
         config = self.config.execution.parallel_tasks
         if config.workers != "auto" or not config.adaptive:
             return current_workers
+        useful_rate = integrated / max(1, launched)
+        next_workers = max(2, current_workers - 1) if useful_rate < 1.0 else current_workers
+        self._parallel_tuning.put_workers(
+            self._parallel_tuning_key(),
+            next_workers,
+            event="integration_conflict",
+        )
+        self.logger.info(
+            "[parallel-tasks] useful integration rate=%s/%s (%.2f) workers=%s",
+            integrated,
+            launched,
+            useful_rate,
+            next_workers,
+        )
+        return next_workers
+
+    def _record_parallel_pressure(self, current_workers: int, pressure_kind: str = "hard") -> int:
+        config = self.config.execution.parallel_tasks
+        if config.workers != "auto" or not config.adaptive:
+            return current_workers
+        if pressure_kind == "soft":
+            entry = self._parallel_tuning.get_entry(
+                self._parallel_tuning_key(), legacy_keys=self._legacy_parallel_tuning_keys()
+            ) or {}
+            count = int(entry.get("soft_pressure_count", 0) or 0) + 1
+            if count < config.soft_pressure_threshold:
+                self._parallel_tuning.put_workers(
+                    self._parallel_tuning_key(),
+                    current_workers,
+                    event="soft_pressure_observed",
+                    soft_pressure_count=count,
+                )
+                return current_workers
         next_workers = max(1, current_workers // 2)
-        self._parallel_tuning.put_workers(self._parallel_tuning_key(), next_workers, event="provider_pressure")
+        self._parallel_tuning.put_workers(
+            self._parallel_tuning_key(),
+            next_workers,
+            event="hard_pressure" if pressure_kind == "hard" else "soft_pressure",
+        )
         return next_workers
 
     @staticmethod
@@ -3168,6 +3523,15 @@ class Orchestrator:
             return False
         return _PARALLEL_PROVIDER_PRESSURE_PATTERN.search(reason) is not None
 
+    @staticmethod
+    def _parallel_pressure_kind(result: Dict[str, object]) -> str:
+        reason = str(result.get("reason", "")).strip()
+        if _PARALLEL_HARD_PRESSURE_PATTERN.search(reason):
+            return "hard"
+        if _PARALLEL_SOFT_PRESSURE_PATTERN.search(reason):
+            return "soft"
+        return "hard"
+
     def _ready_parallel_tasks(self, tasks: List[TaskSpec]) -> List[TaskSpec]:
         completed = {task.task_id for task in tasks if task.status == "done"}
         return [
@@ -3176,6 +3540,186 @@ class Orchestrator:
             if task.status == "pending"
             and all(dependency in completed for dependency in task.depends_on)
         ]
+
+    @staticmethod
+    def _parallel_task_fingerprint(task: TaskSpec) -> str:
+        payload = task.to_dict()
+        for key in (
+            "status",
+            "commit_sha",
+            "review_summary",
+            "review_history",
+            "verify_history",
+            "verify_baseline_failures",
+            "verify_baseline_ref",
+            "scratchpad",
+            "arbitration_history",
+            "recovery_history",
+        ):
+            payload.pop(key, None)
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _parallel_path_history(self, state: RunState) -> Dict[str, Dict[str, object]]:
+        raw = state.resume_context.get("parallel_task_path_history", {})
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(task_id): dict(entry)
+            for task_id, entry in raw.items()
+            if isinstance(entry, dict)
+        }
+
+    def _record_parallel_task_paths(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        paths: Iterable[str],
+    ) -> None:
+        normalized = sorted({str(path).strip() for path in paths if str(path).strip()})
+        history = self._parallel_path_history(state)
+        history[task.task_id] = {
+            "fingerprint": self._parallel_task_fingerprint(task),
+            "paths": normalized,
+        }
+        state.resume_context["parallel_task_path_history"] = history
+
+    def _parallel_task_footprint(self, state: RunState, task: TaskSpec) -> Set[str]:
+        history = self._parallel_path_history(state).get(task.task_id, {})
+        if str(history.get("fingerprint", "")) == self._parallel_task_fingerprint(task):
+            raw_paths = history.get("paths", [])
+            if isinstance(raw_paths, list):
+                paths = {str(path).strip() for path in raw_paths if str(path).strip()}
+                if paths:
+                    return paths
+
+        footprint: Set[str] = set()
+        for raw_ref in self._task_planned_evidence_refs(task):
+            path, selector = self._split_evidence_ref(raw_ref)
+            normalized_path = path.replace("\\", "/").strip()
+            if not normalized_path:
+                continue
+            footprint.add(
+                f"{normalized_path}::{selector.strip()}"
+                if selector.strip()
+                else normalized_path
+            )
+
+        path_pattern = re.compile(
+            r"(?<![\w.-])((?:[\w.-]+/)+[\w.-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|kt|rb|php|cs|cpp|c|h|sql|json|ya?ml|toml|md))(?![\w-])",
+            re.IGNORECASE,
+        )
+        declared_text = "\n".join(
+            [task.description, task.scope_boundaries, *task.acceptance]
+        )
+        footprint.update(match.group(1).replace("\\", "/") for match in path_pattern.finditer(declared_text))
+        return footprint
+
+    def _select_parallel_batch(
+        self,
+        state: RunState,
+        ready: List[TaskSpec],
+        batch_size: int,
+    ) -> List[TaskSpec]:
+        selected: List[TaskSpec] = []
+        occupied: Set[str] = set()
+        for task in ready:
+            footprint = self._parallel_task_footprint(state, task)
+            if selected and footprint and occupied & footprint:
+                continue
+            selected.append(task)
+            occupied.update(footprint)
+            if len(selected) >= batch_size:
+                break
+        return selected
+
+    @staticmethod
+    def _parallel_pending_integrations(state: RunState) -> Dict[str, Dict[str, object]]:
+        raw = state.resume_context.get("parallel_integration_pending", {})
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(task_id): dict(entry)
+            for task_id, entry in raw.items()
+            if isinstance(entry, dict)
+        }
+
+    @staticmethod
+    def _parallel_sequential_retry_ids(state: RunState) -> List[str]:
+        raw = state.resume_context.get("parallel_sequential_retry_tasks", [])
+        if not isinstance(raw, list):
+            return []
+        return list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))
+
+    @staticmethod
+    def _parallel_metrics(state: RunState) -> Dict[str, int]:
+        raw = state.resume_context.get("parallel_integration_metrics", {})
+        metrics = dict(raw) if isinstance(raw, dict) else {}
+        keys = (
+            "launched",
+            "integrated",
+            "deferred",
+            "replayed",
+            "replay_conflicts",
+            "replay_verify_failures",
+            "sequential_retries",
+        )
+        return {key: max(0, int(metrics.get(key, 0) or 0)) for key in keys}
+
+    def _increment_parallel_metrics(self, state: RunState, **increments: int) -> None:
+        metrics = self._parallel_metrics(state)
+        for key, value in increments.items():
+            if key in metrics:
+                metrics[key] += int(value)
+        state.resume_context["parallel_integration_metrics"] = metrics
+
+    def _set_parallel_pending_integrations(
+        self,
+        state: RunState,
+        pending: Dict[str, Dict[str, object]],
+    ) -> None:
+        if pending:
+            state.resume_context["parallel_integration_pending"] = pending
+        else:
+            state.resume_context.pop("parallel_integration_pending", None)
+
+    def _set_parallel_sequential_retry_ids(
+        self,
+        state: RunState,
+        task_ids: Iterable[str],
+    ) -> None:
+        normalized = list(dict.fromkeys(str(item).strip() for item in task_ids if str(item).strip()))
+        if normalized:
+            state.resume_context["parallel_sequential_retry_tasks"] = normalized
+        else:
+            state.resume_context.pop("parallel_sequential_retry_tasks", None)
+
+    def _persist_parallel_runtime_state(self, state: RunState, tasks: List[TaskSpec]) -> None:
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+
+    @staticmethod
+    def _parallel_result_ref(run_id: str, task_id: str) -> str:
+        def component(value: str) -> str:
+            normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")
+            return normalized or "unknown"
+
+        return (
+            f"refs/auto-agents/runs/{component(run_id)}/tasks/{component(task_id)}"
+        )
+
+    def _delete_parallel_result_ref(self, ref_name: str) -> None:
+        if not ref_name or not ref_exists(self.project_root, ref_name):
+            return
+        try:
+            delete_ref(self.project_root, ref_name)
+        except RuntimeError as error:
+            self.logger.warning(
+                "[parallel-tasks] unable to delete retained result ref=%s reason=%s",
+                ref_name,
+                error,
+            )
 
     def _deferred_parallel_task_reasons(self, tasks: List[TaskSpec]) -> List[str]:
         completed = {task.task_id for task in tasks if task.status == "done"}
@@ -3280,12 +3824,16 @@ class Orchestrator:
                 exclude_prefixes=(".auto-agents", ".antigravitycli"),
             )
             worker_changed_paths = commit_changed_paths(worktree_path, worker_commit_sha)
+            result_ref = self._parallel_result_ref(state.run_id, task_id)
+            update_ref(self.project_root, result_ref, worker_commit_sha)
             return {
                 "ok": True,
                 "task": worker_task.to_dict(),
                 "reason": "",
                 "review": str(gate_result["review"]),
                 "commit_sha": worker_commit_sha,
+                "result_ref": result_ref,
+                "base_ref": base_ref,
                 "changed_paths": worker_changed_paths,
                 "verify_current_failure_ids": list(gate_result.get("verify_current_failure_ids", [])),
             }
@@ -3301,6 +3849,239 @@ class Orchestrator:
         finally:
             if worktree_created:
                 remove_worktree(self.project_root, worktree_path, force=True)
+
+    def _defer_parallel_task_result(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        result: Dict[str, object],
+        overlapping_paths: Set[str],
+        peer_verification_commands: Iterable[str],
+    ) -> None:
+        pending = self._parallel_pending_integrations(state)
+        pending[task.task_id] = {
+            "task": dict(result.get("task", {})),
+            "commit_sha": str(result.get("commit_sha", "")),
+            "result_ref": str(result.get("result_ref", "")),
+            "base_ref": str(result.get("base_ref", "")),
+            "changed_paths": [
+                str(path).strip()
+                for path in result.get("changed_paths", [])
+                if str(path).strip()
+            ],
+            "overlapping_paths": sorted(overlapping_paths),
+            "peer_verification_commands": list(dict.fromkeys(
+                str(command).strip()
+                for command in peer_verification_commands
+                if str(command).strip()
+            )),
+            "verify_current_failure_ids": [
+                str(item).strip()
+                for item in result.get("verify_current_failure_ids", [])
+                if str(item).strip()
+            ],
+        }
+        self._set_parallel_pending_integrations(state, pending)
+        self._record_parallel_task_paths(
+            state,
+            task,
+            result.get("changed_paths", []),
+        )
+        self._increment_parallel_metrics(state, deferred=1)
+        self._persist_parallel_runtime_state(state, tasks)
+
+    def _replay_parallel_pending_result(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        entry: Dict[str, object],
+    ) -> Dict[str, object]:
+        result_ref = str(entry.get("result_ref", "")).strip()
+        commit_sha = str(entry.get("commit_sha", "")).strip()
+        replay_ref = result_ref or commit_sha
+        if not replay_ref or (result_ref and not ref_exists(self.project_root, result_ref)):
+            return {
+                "ok": False,
+                "kind": "missing_ref",
+                "reason": f"retained worker result is unavailable: {replay_ref or '(empty)'}",
+            }
+
+        worktree_path = (
+            self._parallel_worktree_root()
+            / state.run_id
+            / f"integration-{re.sub(r'[^A-Za-z0-9._-]+', '-', task.task_id)}"
+        )
+        worktree_created = False
+        try:
+            latest_ref = head_ref(self.project_root) or "HEAD"
+            add_worktree(self.project_root, worktree_path, ref=latest_ref)
+            worktree_created = True
+            try:
+                cherry_pick_no_commit(worktree_path, replay_ref)
+            except RuntimeError as error:
+                abort_cherry_pick(worktree_path)
+                return {"ok": False, "kind": "conflict", "reason": str(error)}
+
+            worker = self.__class__(
+                worktree_path,
+                agent_output_stream=self.agent_output_stream,
+                user_input_fn=self._user_input_fn,
+            )
+            worker._print_agent_output = self._print_agent_output
+            worker._allow_dirty_tree = True
+            worker_state = RunState.from_dict(state.to_dict())
+            worker_tasks = [TaskSpec.from_dict(item.to_dict()) for item in tasks]
+            task_payload = entry.get("task", {})
+            worker_task = TaskSpec.from_dict(
+                dict(task_payload) if isinstance(task_payload, dict) else task.to_dict()
+            )
+            worker_tasks = [
+                worker_task if item.task_id == task.task_id else item
+                for item in worker_tasks
+            ]
+            worker_state.tasks = worker_tasks
+            save_run_state(worktree_path, worker_state)
+            worker._persist_tasks(worker_tasks)
+
+            verify_result = worker._run_task_verify(worker_task, state=worker_state)
+            if not verify_result["ok"]:
+                return {
+                    "ok": False,
+                    "kind": "verification",
+                    "reason": str(verify_result.get("reason", "replay verification failed")),
+                }
+
+            peer_commands = [
+                str(command).strip()
+                for command in entry.get("peer_verification_commands", [])
+                if str(command).strip()
+            ]
+            if peer_commands:
+                peer_gate, mutation_error = worker._run_gate_commands_for_commands(
+                    peer_commands,
+                    collect_all=True,
+                    context=f"parallel replay peer verification ({task.task_id})",
+                )
+                if mutation_error or not peer_gate.ok:
+                    return {
+                        "ok": False,
+                        "kind": "verification",
+                        "reason": mutation_error or peer_gate.summary,
+                    }
+
+            commit_message = task.commit_message or self.config.git.commit_message_template.format(
+                task_id=task.task_id,
+                title=task.title,
+            )
+            replay_commit_sha = commit_all_except(
+                worktree_path,
+                commit_message,
+                exclude_prefixes=(".auto-agents", ".antigravitycli"),
+            )
+            if result_ref:
+                update_ref(self.project_root, result_ref, replay_commit_sha)
+            return {
+                "ok": True,
+                "kind": "replayed",
+                "commit_sha": replay_commit_sha,
+                "verify_current_failure_ids": list(
+                    verify_result.get("current_failure_ids", [])
+                ),
+            }
+        except Exception as error:
+            return {"ok": False, "kind": "error", "reason": str(error)}
+        finally:
+            if worktree_created:
+                try:
+                    remove_worktree(self.project_root, worktree_path, force=True)
+                except RuntimeError as error:
+                    self.logger.warning(
+                        "[parallel-tasks] replay worktree cleanup failed task=%s reason=%s",
+                        task.task_id,
+                        error,
+                    )
+
+    def _process_next_parallel_pending_integration(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> str:
+        pending = self._parallel_pending_integrations(state)
+        if not pending:
+            return "none"
+
+        tasks_by_id = {task.task_id: task for task in tasks}
+        for task_id in list(pending):
+            task = tasks_by_id.get(task_id)
+            entry = pending[task_id]
+            result_ref = str(entry.get("result_ref", "")).strip()
+            if task is None or task.status == "done":
+                pending.pop(task_id, None)
+                self._delete_parallel_result_ref(result_ref)
+                self._set_parallel_pending_integrations(state, pending)
+                self._persist_parallel_runtime_state(state, tasks)
+                continue
+
+            self.logger.info(
+                "[parallel-tasks] replay retained result task=%s ref=%s latest_head=%s",
+                task_id,
+                result_ref or str(entry.get("commit_sha", "")),
+                head_ref(self.project_root),
+            )
+            replay = self._replay_parallel_pending_result(state, tasks, task, entry)
+            if replay["ok"]:
+                task_payload = entry.get("task", {})
+                if isinstance(task_payload, dict):
+                    self._apply_parallel_task_snapshot(task, task_payload)
+                commit_sha = self._integrate_parallel_task_result(
+                    task,
+                    tasks,
+                    str(replay["commit_sha"]),
+                )
+                task.commit_sha = commit_sha
+                pending.pop(task_id, None)
+                self._set_parallel_pending_integrations(state, pending)
+                self._delete_parallel_result_ref(result_ref)
+                self._increment_parallel_metrics(state, integrated=1, replayed=1)
+                self._warm_clean_head_verify_baseline(
+                    state,
+                    failure_ids=replay.get("verify_current_failure_ids", []),
+                )
+                self._persist_parallel_runtime_state(state, tasks)
+                self.logger.info(
+                    "[parallel-tasks] replay integrated task=%s commit=%s",
+                    task_id,
+                    commit_sha,
+                )
+                return "integrated"
+
+            kind = str(replay.get("kind", "error"))
+            pending.pop(task_id, None)
+            self._set_parallel_pending_integrations(state, pending)
+            retries = self._parallel_sequential_retry_ids(state)
+            if task_id not in retries:
+                retries.append(task_id)
+            self._set_parallel_sequential_retry_ids(state, retries)
+            task_payload = entry.get("task", {})
+            if isinstance(task_payload, dict):
+                self._copy_parallel_task_snapshot_fields(task, task_payload)
+            task.status = "pending"
+            task.commit_sha = ""
+            task.review_summary = ""
+            self._delete_parallel_result_ref(result_ref)
+            metric = "replay_conflicts" if kind == "conflict" else "replay_verify_failures"
+            self._increment_parallel_metrics(state, **{metric: 1})
+            self._persist_parallel_runtime_state(state, tasks)
+            self.logger.info(
+                "[parallel-tasks] replay deferred to sequential retry task=%s kind=%s reason=%s",
+                task_id,
+                kind,
+                str(replay.get("reason", ""))[:300],
+            )
+            return "retry"
+        return "none"
 
     def _copy_parallel_task_snapshot_fields(self, task: TaskSpec, payload: Dict[str, object]) -> None:
         updated = TaskSpec.from_dict(payload)
@@ -4109,8 +4890,8 @@ class Orchestrator:
         tasks = state.tasks if state is not None and state.tasks else self._load_tasks_from_plan()
         # Legacy release-rejection recovery task: the full requirement ledger must pass.
         if self._is_requirements_audit_recovery_task(task):
-            audit_result = run_requirements_audit(
-                self.project_root, tasks, current_spec=self._current_audit_spec(state)
+            audit_result = self._run_requirements_audit(
+                tasks, current_spec=self._current_audit_spec(state)
             )
             if bool(audit_result.get("ok")):
                 return None
@@ -4131,8 +4912,7 @@ class Orchestrator:
         if gate is None:
             return None
         gate_requirement_ids, assume_done = gate
-        audit_result = run_requirements_audit(
-            self.project_root,
+        audit_result = self._run_requirements_audit(
             tasks,
             current_spec=self._current_audit_spec(state),
             assume_done_task_ids=assume_done,
@@ -4766,8 +5546,7 @@ class Orchestrator:
         if self._task_depends_on_requirements_audit(task):
             tasks = state.tasks if state is not None and state.tasks else self._load_tasks_from_plan()
             assumed = {task.task_id}
-            audit_result = run_requirements_audit(
-                self.project_root,
+            audit_result = self._run_requirements_audit(
                 tasks,
                 current_spec=self._current_audit_spec(state),
                 assume_done_task_ids=assumed,
@@ -4789,9 +5568,10 @@ class Orchestrator:
         if cached_failures is not None:
             task.verify_baseline_failures = list(cached_failures)
             return True
-        gate, mutation_error = self._run_gate_commands_for_commands(
+        gate, mutation_error = self._run_missing_baseline_commands(
+            baseline_ref,
             task_commands,
-            collect_all=True,
+            [],
             context=f"task baseline verification commands ({task.task_id})",
         )
         if mutation_error:
@@ -4809,7 +5589,13 @@ class Orchestrator:
             failure_ids=failures,
             summary=gate.summary,
             parallel_groups=[],
+            command_results=gate.commands,
         )
+        cached_failures = self._gate_baseline_cache.get(
+            baseline_ref, task_commands, collect_all=True
+        )
+        if cached_failures is not None:
+            task.verify_baseline_failures = list(cached_failures)
         return True
 
     def _ensure_implement_verify_baseline(
@@ -4818,8 +5604,7 @@ class Orchestrator:
         tasks: Iterable[TaskSpec],
     ) -> bool:
         task_list = list(tasks)
-        audit_result = run_requirements_audit(
-            self.project_root,
+        audit_result = self._run_requirements_audit(
             task_list,
             current_spec=self._current_audit_spec(state),
         )
@@ -4828,9 +5613,27 @@ class Orchestrator:
         )
         changed = False
         if state.implement_verify_baseline_ref != baseline_ref:
+            previous_ref = state.implement_verify_baseline_ref
             state.implement_verify_baseline_ref = baseline_ref
             gate_commands = self._default_gate_commands()
-            if not gate_commands:
+            if previous_ref and any(
+                task.status not in {"pending", "done"} for task in task_list
+            ):
+                promoted = self._gate_baseline_cache.promote(
+                    previous_ref,
+                    baseline_ref,
+                    gate_commands,
+                    collect_all=True,
+                    parallel_groups=self.config.gates.parallel_groups,
+                )
+                self.logger.info(
+                    "[gate-baseline-cache] resume promotion source=%s target=%s "
+                    "commands=%s",
+                    self._git_ref_from_verify_baseline_ref(previous_ref),
+                    self._git_ref_from_verify_baseline_ref(baseline_ref),
+                    promoted,
+                )
+            if not gate_commands and not self.config.gates.parallel_groups:
                 state.implement_verify_baseline_failures = []
             else:
                 cached_failures = self._gate_baseline_cache.get(
@@ -4842,8 +5645,10 @@ class Orchestrator:
                 if cached_failures is not None:
                     state.implement_verify_baseline_failures = list(cached_failures)
                 else:
-                    gate, mutation_error = self._run_gate_commands(
-                        collect_all=True,
+                    gate, mutation_error = self._run_missing_baseline_commands(
+                        baseline_ref,
+                        gate_commands,
+                        list(self.config.gates.parallel_groups),
                         context="implement verify baseline commands",
                     )
                     if mutation_error:
@@ -4861,7 +5666,16 @@ class Orchestrator:
                         failure_ids=failures,
                         summary=gate.summary,
                         parallel_groups=self.config.gates.parallel_groups,
+                        command_results=gate.commands,
                     )
+                    cached_failures = self._gate_baseline_cache.get(
+                        baseline_ref,
+                        gate_commands,
+                        collect_all=True,
+                        parallel_groups=self.config.gates.parallel_groups,
+                    )
+                    if cached_failures is not None:
+                        state.implement_verify_baseline_failures = list(cached_failures)
             changed = True
         baseline_failures = list(state.implement_verify_baseline_failures)
         for task in task_list:
@@ -4878,25 +5692,32 @@ class Orchestrator:
         *,
         failure_ids: Iterable[str],
     ) -> None:
-        baseline_ref = self._task_verify_baseline_ref()
-        failure_list = [str(item).strip() for item in failure_ids if str(item).strip()]
-        normalized = self._normalize_verify_failure_ids(failure_list, "") if failure_list else []
-        state.implement_verify_baseline_ref = baseline_ref
-        state.implement_verify_baseline_failures = list(normalized)
-        gate_commands = (
-            commands_from_verification_steps(self.config.gates.steps, self.project_root)
-            if self.config.gates.steps
-            else self.config.gates.commands
+        # Roll the run-level reference forward while retaining the baseline
+        # captured before implementation. Current-task failures must never be
+        # absorbed as a new baseline, and aggregate data must not populate the
+        # command-level SQLite cache.
+        previous_ref = state.implement_verify_baseline_ref
+        verification_context = requirements_audit_context_sha256(
+            self.project_root,
+            state.tasks,
+            current_spec=self._current_audit_spec(state),
         )
-        if not gate_commands:
-            return
-        self._gate_baseline_cache.put(
-            baseline_ref,
+        next_ref = self._task_verify_baseline_ref(verification_context)
+        gate_commands = self._default_gate_commands()
+        promoted = self._gate_baseline_cache.promote(
+            previous_ref,
+            next_ref,
             gate_commands,
             collect_all=True,
-            failure_ids=normalized,
-            summary="warm clean-head baseline",
             parallel_groups=self.config.gates.parallel_groups,
+        )
+        state.implement_verify_baseline_ref = next_ref
+        save_run_state(self.project_root, state)
+        self.logger.info(
+            "[gate-baseline-cache] warm promotion source=%s target=%s commands=%s",
+            self._git_ref_from_verify_baseline_ref(previous_ref),
+            self._git_ref_from_verify_baseline_ref(next_ref),
+            promoted,
         )
 
     @staticmethod
@@ -5440,6 +6261,17 @@ class Orchestrator:
         previous_task_plan_archive = str(
             state.resume_context.get("previous_task_plan_archive", "")
         ).strip()
+        runtime_context = {
+            key: state.resume_context[key]
+            for key in (
+                "implementation_ready_tasks",
+                "parallel_integration_pending",
+                "parallel_sequential_retry_tasks",
+                "parallel_integration_metrics",
+                "parallel_task_path_history",
+            )
+            if key in state.resume_context
+        }
         state.resume_context = {
             "spec_file": str(spec_file),
             "auto_approve": bool(auto_approve),
@@ -5454,6 +6286,7 @@ class Orchestrator:
             state.resume_context["previous_run_id"] = previous_run_id
         if previous_task_plan_archive:
             state.resume_context["previous_task_plan_archive"] = previous_task_plan_archive
+        state.resume_context.update(runtime_context)
 
     def resume_saved_run(self) -> RunState:
         state = load_run_state(self.project_root)
@@ -5509,12 +6342,226 @@ class Orchestrator:
             return {"ok": False, "review": summary, "reason": "review rejected the task"}
         return {"ok": True, "review": summary}
 
+    def _task_needs_evidence_preflight(self, task: TaskSpec) -> bool:
+        mode = self.config.execution.evidence_preflight.mode
+        if mode == "off":
+            return False
+        if mode == "all":
+            return True
+        requirements = requirements_for_task(self.project_root, task)
+        for requirement in requirements:
+            strength = str(requirement.get("oracle_strength", "")).strip()
+            boundary = str(requirement.get("evidence_boundary", "")).strip()
+            oracle_type = str(requirement.get("oracle_type", "")).strip()
+            forbidden_proxies = requirement.get("forbidden_proxy_oracles", [])
+            if strength in {"semantic", "human"}:
+                return True
+            if boundary in {"system_boundary", "external_side_effect"}:
+                return True
+            if oracle_type in {"human_review", "judge_model", "runtime_evidence", "mixed"}:
+                return True
+            if isinstance(forbidden_proxies, list) and forbidden_proxies:
+                return True
+            if bool(requirement.get("external_docs_required", False)):
+                return True
+        return any(
+            isinstance(proof, dict) and bool(proof.get("visual_evidence"))
+            for proof in task.requirement_proofs
+        )
+
+    def _evidence_preflight_fingerprint(self, task: TaskSpec) -> str:
+        task_payload = task.to_dict()
+        task_payload.pop("evidence_preflight", None)
+        requirements = [
+            requirement_contract_payload(requirement)
+            for requirement in requirements_for_task(self.project_root, task)
+        ]
+        effort = self.config.efforts.get("evidence_preflight", "balanced")
+        payload = {
+            "version": 1,
+            "task": task_payload,
+            "requirements": requirements,
+            "head": head_ref(self.project_root),
+            "provider": self.config.active_provider,
+            "model": self._model_label_for_agent_stage("evidence_preflight", effort),
+            "effort": effort,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _ensure_evidence_preflight(
+        self, state: RunState, task: TaskSpec
+    ) -> Optional[Dict[str, object]]:
+        if task.status == "in_progress" or not self._task_needs_evidence_preflight(task):
+            return None
+        fingerprint = self._evidence_preflight_fingerprint(task)
+        cached = task.evidence_preflight
+        if str(cached.get("fingerprint", "")) == fingerprint:
+            self.logger.info(
+                "[evidence-preflight] task=%s cache=hit decision=%s",
+                task.task_id,
+                cached.get("decision", "READY"),
+            )
+            return cached if str(cached.get("decision", "READY")) != "READY" else None
+
+        prompt = self._build_evidence_preflight_prompt(task)
+        stage_key = f"evidence-preflight-{task.task_id}"
+        output_path = self._stage_output_path(state.run_id, stage_key)
+        write_run_prompt(self.project_root, state.run_id, stage_key, prompt)
+        worktree_path = self._parallel_worktree_root() / state.run_id / f"preflight-{task.task_id}"
+        created = False
+        result: Optional[AgentResult] = None
+        try:
+            add_worktree(self.project_root, worktree_path, ref=head_ref(self.project_root) or "HEAD")
+            created = True
+            request = AgentRequest(
+                stage="evidence_preflight",
+                effort=self.config.efforts.get("evidence_preflight", "balanced"),
+                prompt=prompt.replace(str(self.project_root), str(worktree_path)),
+                cwd=worktree_path,
+                output_path=output_path,
+                stream_output=(
+                    self._stream_agent_output_callback(stage_key)
+                    if self._print_agent_output
+                    else None
+                ),
+            )
+            with log_timing(self.logger, f"agent:{stage_key} attempt=1"):
+                result = self._call_with_failover(request)
+            self._emit_agent_output(stage_key, result)
+            if not result.ok:
+                raise RuntimeError(result.stderr or result.summary or "provider failed")
+            parsed = self._parse_evidence_preflight(result.summary or result.stdout)
+            if parsed is None:
+                raise ValueError("invalid EVIDENCE_PREFLIGHT response")
+            self._emit_agent_metrics(
+                stage_key,
+                result,
+                attempts=1,
+                usage=result.usage,
+                model=(
+                    result.model
+                    or self._model_label_for_agent_stage(
+                        "evidence_preflight",
+                        self.config.efforts.get("evidence_preflight", "balanced"),
+                    )
+                ),
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            self.logger.warning(
+                "[evidence-preflight] task=%s decision=SKIP fail_open=true reason=%s",
+                task.task_id,
+                str(error)[:300],
+            )
+            return None
+        finally:
+            if created:
+                try:
+                    remove_worktree(self.project_root, worktree_path, force=True)
+                except RuntimeError as cleanup_error:
+                    self.logger.warning(
+                        "[evidence-preflight] worktree cleanup failed task=%s reason=%s",
+                        task.task_id,
+                        cleanup_error,
+                    )
+                shutil.rmtree(worktree_path, ignore_errors=True)
+
+        parsed["fingerprint"] = fingerprint
+        task.evidence_preflight = parsed
+        self._persist_tasks(state.tasks if state.tasks else [task])
+        self.logger.info(
+            "[evidence-preflight] task=%s cache=miss decision=%s checklist=%s",
+            task.task_id,
+            parsed["decision"],
+            len(parsed.get("checklist", [])),
+        )
+        return parsed if parsed["decision"] != "READY" else None
+
+    def _build_evidence_preflight_prompt(self, task: TaskSpec) -> str:
+        requirement_context = format_requirement_context(
+            requirements_for_task(self.project_root, task)
+        )
+        return "\n".join(
+            [
+                f"Project root: {self.project_root}",
+                "Perform one read-only evidence feasibility preflight for the task below.",
+                "Do not modify files, install dependencies, start services, or execute mutating commands.",
+                "Inspect the repository and decide whether the required oracle strength and evidence boundary can be proven within this task.",
+                "Choose READY when the task is implementable and provide a concrete proof checklist.",
+                "Choose SPLIT when independently verifiable proof surfaces require separate task slices.",
+                "Choose CLARIFY only when a product decision or external contract is genuinely missing.",
+                "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
+                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY\",\"reason\":\"...\",\"checklist\":[\"...\"]}",
+                f"Task JSON:\n{json.dumps(task.to_dict(), indent=2, ensure_ascii=False)}",
+                requirement_context,
+            ]
+        )
+
+    @staticmethod
+    def _parse_evidence_preflight(text: str) -> Optional[Dict[str, object]]:
+        for line in str(text).splitlines():
+            if not line.strip().startswith("EVIDENCE_PREFLIGHT:"):
+                continue
+            raw = line.split(":", 1)[1].strip()
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(payload, dict):
+                return None
+            decision = str(payload.get("decision", "")).strip().upper()
+            reason = str(payload.get("reason", "")).strip()
+            checklist = payload.get("checklist", [])
+            if (
+                decision not in {"READY", "SPLIT", "CLARIFY"}
+                or not reason
+                or not isinstance(checklist, list)
+                or any(not isinstance(item, str) or not item.strip() for item in checklist)
+            ):
+                return None
+            return {
+                "decision": decision,
+                "reason": reason,
+                "checklist": [str(item).strip() for item in checklist],
+            }
+        return None
+
+    def _route_evidence_preflight(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        result: Dict[str, object],
+    ) -> RunState:
+        decision = str(result.get("decision", "")).strip().upper()
+        target_stage = "plan" if decision == "SPLIT" else "clarify"
+        task.status = "pending"
+        self._persist_tasks(tasks)
+        self._rewind_state_from_stage(state, target_stage)
+        state.rejected_stage = target_stage
+        state.rejection_reason = (
+            f"Evidence preflight requested {decision} for {task.task_id}: "
+            f"{result.get('reason', '')}"
+        )
+        state.last_error = state.rejection_reason
+        save_run_state(self.project_root, state)
+        return state
+
     def _review_effort_for_task(self, task: TaskSpec) -> str:
         default_effort = self.config.efforts.get("review", "balanced")
         if default_effort != "balanced":
             return default_effort
 
-        if task.review_summary.strip():
+        if self._task_needs_evidence_preflight(task):
+            return "deep"
+
+        prior_fingerprints = {
+            self._review_fingerprint(str(entry.get("summary", "")))
+            for entry in task.review_history[-2:]
+            if isinstance(entry, dict) and str(entry.get("summary", "")).strip()
+        }
+        if len(prior_fingerprints) > 1:
             return "deep"
 
         paths = self._changed_paths_excluding_agent_instructions()
@@ -5705,7 +6752,11 @@ class Orchestrator:
             "verification commands" if commands is not None else "gates.commands",
         )
         if command_path_errors:
-            return command_path_errors[0], False
+            reason = command_path_errors[0]
+            return (
+                reason,
+                commands is not None and "references missing pytest target" in reason,
+            )
 
         for command in command_list:
             stripped = command.strip()
@@ -5975,12 +7026,8 @@ class Orchestrator:
             state.status = "failed"
             raw_output = self._gate_raw_output(verify_gate)
             raw_log_path = self._persist_failed_verification_log(raw_output, label="verify-stage")
-            gate_commands = (
-                commands_from_verification_steps(self.config.gates.steps, self.project_root)
-                if self.config.gates.steps
-                else self.config.gates.commands
-            )
-            if gate_commands:
+            gate_commands = self._default_gate_commands()
+            if gate_commands or self.config.gates.parallel_groups:
                 self._gate_baseline_cache.put(
                     self._task_verify_baseline_ref(),
                     gate_commands,
@@ -5991,12 +7038,13 @@ class Orchestrator:
                     ),
                     summary=verify_gate.summary,
                     parallel_groups=self.config.gates.parallel_groups,
+                    command_results=verify_gate.commands,
                 )
             if self._verify_failure_looks_like_oracle_proof_state(f"{verify_gate.summary}\n{raw_output}"):
                 tasks = state.tasks or self._load_tasks_from_plan()
                 state.tasks = tasks
-                audit_result = run_requirements_audit(
-                    self.project_root, tasks, current_spec=self._current_audit_spec(state)
+                audit_result = self._run_requirements_audit(
+                    tasks, current_spec=self._current_audit_spec(state)
                 )
                 if not bool(audit_result["ok"]):
                     state.stage_summaries.pop("verify", None)
@@ -6029,7 +7077,7 @@ class Orchestrator:
                 return state
             self._emit_stage_verify_result("fail", state.last_error or summary.strip())
             raise RuntimeError(state.last_error or "verify stage failed")
-        if self.config.gates.commands:
+        if self.config.gates.commands or self.config.gates.parallel_groups:
             self._gate_baseline_cache.put(
                 self._task_verify_baseline_ref(),
                 self.config.gates.commands,
@@ -6037,11 +7085,12 @@ class Orchestrator:
                 failure_ids=[],
                 summary=verify_gate.summary,
                 parallel_groups=self.config.gates.parallel_groups,
+                command_results=verify_gate.commands,
             )
         tasks = state.tasks or self._load_tasks_from_plan()
         state.tasks = tasks
-        audit_result = run_requirements_audit(
-            self.project_root, tasks, current_spec=self._current_audit_spec(state)
+        audit_result = self._run_requirements_audit(
+            tasks, current_spec=self._current_audit_spec(state)
         )
         audit_ok = bool(audit_result["ok"])
         audit_report = str(audit_result["report"])
@@ -6729,7 +7778,7 @@ class Orchestrator:
                 "If the project has no frontend surface or the spec has no prototype/design artifact, omit frontend_surfaces or set it to an empty array; do not invent visual fidelity requirements.",
                 "If a requirement needs one external provider protocol or official API doc, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/. If it needs several provider docs, set provider_references to local paths under that directory and keep provider_reference empty or set to the primary path.",
                 "Use oracle_type to name the primary proof mechanism (for example deterministic_test, integration_test, runtime_evidence, judge_model, benchmark, human_review, or mixed). Use oracle_strength to record the minimum acceptable fidelity (proxy, behavioral, semantic, or human). Use evidence_boundary to say where proof must come from (internal_state, system_boundary, or external_side_effect). Record any checks that must NOT be treated as sufficient in forbidden_proxy_oracles.",
-                "For requirements that remove, forbid, or replace old behavior, add precise forbidden_patterns regexes for stale terms or old semantic claims so requirements audit can scan code, tests, and docs. Prefer narrow patterns that catch positive stale claims without matching the new negative requirement text.",
+                "For requirements that remove, forbid, or replace old behavior, add precise forbidden_patterns regexes for stale terms or old semantic claims so requirements audit can scan code, tests, and docs. Prefer narrow patterns that catch positive stale claims without matching the new negative requirement text. Never combine DOTALL with unbounded .* or .+ spans; use explicit bounded spans such as [\\s\\S]{0,500}? when cross-line context is required.",
                 self._clarify_spec_instruction(spec_kind),
                 self._document_language_instruction(),
             ]
@@ -6824,7 +7873,7 @@ class Orchestrator:
                 "Keep each task small enough to implement, review, and verify independently, but do not split into trivial housekeeping-only tasks.",
                 "Avoid oversized tasks that bundle multiple loosely related features together.",
                 "Prefer tasks that each deliver one coherent, testable capability or technical slice.",
-                "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist; auto_agents may expand directory targets such as ['tests'] into per-file pytest steps before running gates.",
+                "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist; auto_agents may expand directory targets such as ['tests'] into per-file pytest steps before running gates. Set parallel_safe=true only when a step is isolated from shared databases, ports, mutable fixtures, snapshots, build outputs, and other process-global state; otherwise omit it or set false.",
                 "For JavaScript/TypeScript verification, use verification_steps entries with kind='test', runner='vitest'.",
                 "Do not generate free-form shell verification commands for test steps; auto_agents derives the runnable command from verification_steps.",
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
@@ -7133,6 +8182,19 @@ class Orchestrator:
             common.extend(["", plan_migration_context.strip()])
         if task_status_migration_context.strip():
             common.extend(["", task_status_migration_context.strip()])
+        if (
+            stage == "implement"
+            and str(task.evidence_preflight.get("decision", "")).upper() == "READY"
+        ):
+            checklist = task.evidence_preflight.get("checklist", [])
+            if isinstance(checklist, list) and checklist:
+                common.extend(
+                    [
+                        "",
+                        "Evidence preflight checklist (satisfy these proof surfaces during implementation):",
+                        *[f"- {str(item).strip()}" for item in checklist if str(item).strip()],
+                    ]
+                )
 
         if stage == "implement":
             lines = common + [
@@ -7278,6 +8340,8 @@ class Orchestrator:
             if resume_existing and attempt == 1:
                 result = None
             else:
+                self._set_implementation_ready_marker(state, task, False)
+                save_run_state(self.project_root, state)
                 self._emit_task_activity(task, "implement", attempt)
                 implement_prompt = self._build_task_prompt(
                     task,
@@ -7306,6 +8370,9 @@ class Orchestrator:
                         reason=last_reason,
                     )
                     continue
+
+                self._set_implementation_ready_marker(state, task, True)
+                save_run_state(self.project_root, state)
 
                 self._sync_allowed_repair_task_plan_edits(state, task)
 
@@ -8855,21 +9922,35 @@ class Orchestrator:
             if not self.config.gates.allow_agent_updates:
                 return
             try:
-                commands = commands_from_verification_steps(steps, self.project_root)
+                all_commands = commands_from_verification_steps(steps, self.project_root)
+                commands, generated_groups = gate_plan_from_verification_steps(
+                    steps, self.project_root
+                )
             except ValueError as error:
                 raise RuntimeError(f"generated verification steps are invalid:\n- {error}") from error
             errors = validate_verification_command_paths(
-                commands,
+                all_commands,
                 self.project_root,
                 "task plan verification_steps",
             )
             if errors:
                 bullets = "\n".join(f"- {item}" for item in errors)
                 raise RuntimeError(f"generated verification steps are invalid:\n{bullets}")
-            if self.config.gates.steps == steps and self.config.gates.commands == commands:
+            manual_groups = [
+                group
+                for group in self.config.gates.parallel_groups
+                if not group.name.startswith("steps-")
+            ]
+            next_groups = manual_groups + generated_groups
+            if (
+                self.config.gates.steps == steps
+                and self.config.gates.commands == commands
+                and self.config.gates.parallel_groups == next_groups
+            ):
                 return
             self.config.gates.steps = steps
             self.config.gates.commands = commands
+            self.config.gates.parallel_groups = next_groups
             save_project_config(self.project_root, self.config)
             return
         commands = payload.get("verification_commands", [])
@@ -8945,8 +10026,8 @@ class Orchestrator:
     def audit_requirements(self) -> Dict[str, object]:
         state = load_run_state(self.project_root)
         tasks = state.tasks or self._load_tasks_from_plan()
-        result = run_requirements_audit(
-            self.project_root, tasks, current_spec=self._current_audit_spec(state)
+        result = self._run_requirements_audit(
+            tasks, current_spec=self._current_audit_spec(state)
         )
         return {
             "ok": bool(result["ok"]),
@@ -9070,6 +10151,50 @@ class Orchestrator:
         # Orchestrator state is expected to be dirty while a run is active and
         # is not evidence of partial product implementation. Only resume past
         # the first implement attempt when real project files remain changed.
+        if not changed_paths(self.project_root):
+            return False
+        attempt_key = f"implement-{task.task_id}"
+        return state.agent_attempts.get(attempt_key, 0) > 0
+
+    @staticmethod
+    def _implementation_ready_markers(state: RunState) -> Dict[str, object]:
+        markers = state.resume_context.get("implementation_ready_tasks")
+        return dict(markers) if isinstance(markers, dict) else {}
+
+    def _set_implementation_ready_marker(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        ready: bool,
+    ) -> None:
+        markers = self._implementation_ready_markers(state)
+        markers[task.task_id] = bool(ready)
+        state.resume_context["implementation_ready_tasks"] = markers
+
+    def _clear_implementation_ready_marker(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> None:
+        markers = self._implementation_ready_markers(state)
+        markers.pop(task.task_id, None)
+        if markers:
+            state.resume_context["implementation_ready_tasks"] = markers
+        else:
+            state.resume_context.pop("implementation_ready_tasks", None)
+
+    def _in_progress_implementation_is_ready(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> bool:
+        markers = self._implementation_ready_markers(state)
+        if task.task_id in markers:
+            return bool(markers[task.task_id])
+        # Backward compatibility for runs created before explicit phase
+        # markers existed. Real product changes plus a recorded provider
+        # attempt are the strongest available evidence that implementation
+        # returned before the old process stopped.
         if not changed_paths(self.project_root):
             return False
         attempt_key = f"implement-{task.task_id}"
