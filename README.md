@@ -115,10 +115,20 @@ silently skipping ahead. When a task falls back to full gate verification and th
 clearly outside the task's owned proof/test surface, auto_agents stops retrying that implementation
 loop and reports the result as a contract or gate-scope mismatch.
 
-For comparable owned proof failures, auto_agents can schedule bounded repair tasks before it gives
-up. A repair task is inserted ahead of the blocked parent, owns only precise `verification_refs`, and
-the parent waits on those repair task IDs before retrying its original proof gate. The default
-recovery budget is two rounds per stable failure signature.
+For comparable owned proof failures, auto_agents can schedule bounded evidence-repair tasks before
+it gives up. A repair task is inserted ahead of the blocked parent, owns only precise
+`verification_refs`, and the parent waits on those task IDs before retrying its original proof gate.
+Review rejection recovery is not limited to evidence-repair tasks: planned tasks, scope-split/replan
+children, and stage-recovery tasks all enter the same bounded recovery state machine. Persisted
+`task_origin`, `parent_task_id`, `recovery_epoch`, and `recovery_round` fields define lineage without
+depending on task ID spelling.
+
+Before starting another implementation cycle, an adaptive read-only judge returns `CONTINUE`,
+`REPLAN`, or `STOP`. Deterministic no-progress checks and `execution.recovery.max_rounds` remain hard
+limits even if the judge requests more work. A terminal lineage can open a new epoch only after its
+contract or repository evidence fingerprint changes. Product-code and generated-test failures stay
+owned by the target project; auto_agents self-repair is considered only when structured recovery
+state reports an orchestrator routing invariant violation.
 
 The top-level `verify` stage still runs the full configured verification suite before release. If
 that full suite fails, auto_agents now treats it as a recovery signal instead of immediately
@@ -413,10 +423,34 @@ To use an absolute path instead of the conventional `~/.copilot/profiles/` locat
 }
 ```
 
+### Antigravity CLI
+
+Antigravity CLI 1.1 and later require the non-interactive prompt as the value of `--print`.
+The bundled Antigravity providers therefore set `prompt_via_stdin` to `false`; the adapter places
+all CLI options before `--print <prompt>` and closes stdin. Prompts too large for a safe command-line
+argument are stored under `.auto-agents/runs/provider-prompts/`, and the CLI receives a short
+instruction to read that file instead.
+
 ### Generic shell adapter
 
 If another provider does not support reasoning strength directly, the adapter can ignore the hint
 and still satisfy the interface.
+
+With smart timeout enabled, a generic shell provider must set
+`progress_protocol: "auto-agents-jsonl-v1"`. The wrapper receives
+`AUTO_AGENTS_PROGRESS_PATH`, `AUTO_AGENTS_ATTEMPT_ID`, and
+`AUTO_AGENTS_RESUME_SESSION_ID`; it must append one JSON object per line to the progress path. The
+supported event types are `session.started`, `activity`, `tool.started`, `tool.progress`,
+`tool.completed`, `milestone`, `session.completed`, and `error`. Every event must include the
+protocol field, for example:
+
+```json
+{"protocol":"auto-agents-jsonl-v1","type":"tool.completed","tool_id":"test-1","fingerprint":"sha256-of-command-and-result","detail":"pytest tests/test_api.py"}
+```
+
+`session.started` should include `session_id` when the provider supports exact conversation resume.
+`tool.completed` and `milestone` should include a stable `fingerprint`; repeated equal fingerprints
+without a workspace change are used for loop detection.
 
 Each stage in the `efforts` config block can be set to any of these labels. The default
 configuration balances quality and token usage:
@@ -486,6 +520,15 @@ worktrees. Example:
     "evidence_preflight": {
       "mode": "high_risk"
     },
+    "smart_timeout": {
+      "enabled": true,
+      "provider_idle_seconds": 1800,
+      "tool_idle_seconds": 900,
+      "semantic_stall_seconds": 3600,
+      "safety_ceiling_seconds": 43200,
+      "loop_repeat_limit": 3,
+      "same_provider_resume_limit": 1
+    },
     "recovery": {
       "enabled": true,
       "max_rounds": 2,
@@ -545,6 +588,26 @@ When multiple providers are configured, the orchestrator automatically switches 
 next available provider if the current one returns a **qualifying error** — rate-limit
 (429), quota exhaustion, timeout/stall, service unavailable, or binary not found.
 
+Smart timeout is enabled by default. It replaces a single hard provider deadline with independent
+progress leases:
+
+- `provider_idle_seconds`: no protocol, output, child-process CPU/I/O, or workspace activity
+- `tool_idle_seconds`: a declared tool remains active without tool/process progress
+- `semantic_stall_seconds`: no new tool result, milestone, output artifact, or workspace fingerprint
+- `loop_repeat_limit`: the same completed-tool fingerprint repeats without a workspace change
+- `safety_ceiling_seconds`: final emergency ceiling even when lower-level activity continues
+
+Provider output heartbeats refresh only the provider lease; they do not count as semantic progress.
+Codex and Copilot use native JSONL events, while Antigravity combines its native log with its local
+conversation SQLite state. Checkpoints are written every 30 seconds under the run's
+`provider-attempts/` directory and include the provider session ID and bounded diagnostics.
+
+`provider_idle`, explicit provider errors, and protocol errors switch provider immediately. Tool
+stalls, semantic stalls, loops, and the safety ceiling first resume the same provider once, using
+its exact session when one was captured; a second failure switches provider. Set
+`execution.smart_timeout.enabled` to `false` to restore the legacy `timeout_seconds` and
+`idle_timeout_seconds` hard-deadline behavior.
+
 **How it works**
 
 1. Each agent call tries providers in a prioritized order.
@@ -554,8 +617,9 @@ next available provider if the current one returns a **qualifying error** — ra
    with **the last successful provider**, then untried providers, then
    previously-failed providers (lowest priority, but still attempted in case
    the limit resets).
-4. `active_provider` in `config.json` is **never modified** by failover — a
-   restart always begins with the user's original preference.
+4. `active_provider` in `config.json` is **never modified** by failover. A restart normally begins
+   with the user's preference, except when a matching `running` checkpoint identifies an interrupted
+   fallback-provider session; that exact provider is resumed first.
 5. Only qualifying infrastructure errors trigger a switch; ordinary failures
    (bad code, validation issues) are handled by the normal retry logic.
 6. If **all** providers return qualifying errors for a single agent call, the
@@ -773,19 +837,22 @@ Implementation resume is task-aware rather than fully transactional:
   be reused without spending another review call
 - if a task is marked `blocked`, it can be retried even when the git tree is still dirty
 
-Current limitation: there is no fine-grained checkpoint inside a single agent call. So the system
-can resume from persisted stage/task boundaries, but it cannot guarantee recovery of edits that were
-still in-flight when a process was forcibly interrupted.
+Single agent calls now write provider-attempt checkpoints. If the host is interrupted while a
+checkpoint is still marked `running`, rerunning the same command resumes the newest matching native
+provider session when the provider exposed a session ID and the workspace fingerprint still matches.
+If the old process is still alive, auto_agents refuses to start a duplicate attempt.
 
 In practice, a forced interruption can leave partial files in the workspace:
 
 - if the interruption happened during `clarify`, `design`, or `plan`, the next `run` re-executes the
   same unfinished stage, using whatever files were already left on disk
 - if it happened during `implement`, the current task may still be `in_progress`; the next `run`
-  first tries review/verification against the existing workspace, then falls back to re-running
-  implementation for that same task if needed
-- this means rerun is usually recoverable, but the current task may consume one extra retry cycle,
-  and partial edits may influence the next attempt until they are overwritten or fixed
+  resumes the exact provider conversation when possible; otherwise it first tries
+  review/verification against the existing workspace, then falls back to re-running implementation
+- an in-flight local tool process itself is not resurrected; its completed file changes remain in the
+  workspace, and the resumed provider is instructed to inspect them before choosing a bounded next step
+- if no session ID was captured, or the workspace changed after the checkpoint, recovery falls back to
+  the persisted stage/task boundary rather than risking an incorrect conversation resume
 
 When a forced interruption leaves suspicious partial edits behind, inspect `git status` and the
 persisted state before rerunning:
@@ -849,9 +916,9 @@ need explicit user decisions:
 
 1. **Converse** — the agent summarizes the unresolved provider references and asks only the questions
    needed to decide whether to verify, defer, or assumption-approve them
-2. **Iterate** — the agent edits only provider-research artifacts (`provider_references/*.md`,
-   `provider_references.lock.json`, and tightly coupled trace metadata when needed), then the tool
-   validates the updated reference state locally
+2. **Iterate** — the agent edits provider references and their lock; requirements trace edits are
+   limited to non-normative `notes` and an explicitly user-approved `active` → `deferred` status
+   change, then the tool validates both the trace contract and reference state locally
 3. **Resume** — once the provider references are locally valid, the command reruns the original
    `run` flow from the failed `provider_research` point
 
@@ -863,6 +930,14 @@ If `python3 -m auto_agents run ...` encounters this blocker, it now starts a **f
 provider-recovery session for the current blocked run automatically instead of asking whether to
 resume unrelated historical provider-recovery sessions first. Manual `provider-resolve` invocations
 keep the existing resumable-session chooser behavior.
+
+Provider recovery never rewrites proof-bearing requirement fields such as `source`, requirement
+text, acceptance oracles, forbidden patterns, or provider-reference bindings, and it never stamps
+`contract_sha256` itself. Approval context belongs in provider references, the lock, and `notes`.
+When research reveals that the requirement contract itself must change, provider recovery restores
+the attempt and rewinds the saved run to `clarify`, where normal supersession and proof-preservation
+rules apply. Lock consumer hashes are rebound only after the requirements trace and full project
+preflight pass.
 
 ### Convergence-based stopping
 

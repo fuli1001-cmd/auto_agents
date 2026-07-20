@@ -34,6 +34,7 @@ from auto_agents.requirements import (
     validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
     validate_requirement_contract_transitions,
+    validate_provider_resolve_trace_transition,
 )
 from auto_agents.validation import validate_task_plan_with_requirements, validation_report
 from auto_agents.visual_judge import parse_visual_judge_response, visual_evidence_pairs_for_task
@@ -152,6 +153,50 @@ class RequirementsTraceTests(unittest.TestCase):
             requirement_contract_sha256(changed_oracle),
         )
 
+    def test_provider_resolve_trace_transition_allows_only_notes_and_approved_defer(self) -> None:
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [_requirement()]}
+        )
+        notes_only = json.loads(json.dumps(previous))
+        notes_only["requirements"][0]["notes"] = "User approved the conservative provider assumption."
+        deferred = json.loads(json.dumps(notes_only))
+        deferred["requirements"][0]["status"] = "deferred"
+
+        self.assertEqual(
+            validate_provider_resolve_trace_transition(previous, notes_only),
+            [],
+        )
+        self.assertTrue(
+            any(
+                "without an explicit session-owned defer approval" in error
+                for error in validate_provider_resolve_trace_transition(previous, deferred)
+            )
+        )
+        self.assertEqual(
+            validate_provider_resolve_trace_transition(
+                previous,
+                deferred,
+                deferred_requirement_ids={"REQ-001"},
+            ),
+            [],
+        )
+
+    def test_provider_resolve_trace_transition_rejects_contract_and_shape_changes(self) -> None:
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [_requirement()]}
+        )
+        changed_source = json.loads(json.dumps(previous))
+        changed_source["requirements"][0]["source"] += "; provider conversation"
+        added_requirement = json.loads(json.dumps(previous))
+        added_requirement["requirements"].append(_requirement(id="REQ-002"))
+
+        source_errors = validate_provider_resolve_trace_transition(previous, changed_source)
+        shape_errors = validate_provider_resolve_trace_transition(previous, added_requirement)
+
+        self.assertTrue(any("contract-owned fields" in error for error in source_errors))
+        self.assertTrue(any("proof-bearing contract" in error for error in source_errors))
+        self.assertTrue(any("IDs or ordering" in error for error in shape_errors))
+
     def test_proven_requirement_contract_must_use_new_replacement_id(self) -> None:
         previous = {"version": 1, "requirements": [_requirement()]}
         mutated = {
@@ -216,6 +261,73 @@ class RequirementsTraceTests(unittest.TestCase):
 
         self.assertEqual(transition_errors, [])
         self.assertEqual(schema_errors, [])
+
+    def test_forbidden_pattern_definition_validation_respects_lifecycle(self) -> None:
+        unsafe = r"(?s)for\s+.*check.*(?:retry|attempt)"
+        bounded = r"for\s+[\s\S]{0,500}?check[\s\S]{0,500}?(?:retry|attempt)"
+
+        for status in ("active", "deferred"):
+            with self.subTest(status=status):
+                errors = validate_requirements_trace_payload(
+                    {
+                        "version": 1,
+                        "requirements": [
+                            _requirement(status=status, forbidden_patterns=[unsafe])
+                        ],
+                    }
+                )
+                self.assertTrue(any("definition is unsafe" in error for error in errors))
+
+        bounded_errors = validate_requirements_trace_payload(
+            {
+                "version": 1,
+                "requirements": [_requirement(forbidden_patterns=[bounded])],
+            }
+        )
+        superseded_errors = validate_requirements_trace_payload(
+            {
+                "version": 1,
+                "requirements": [
+                    _requirement(status="superseded", forbidden_patterns=[unsafe])
+                ],
+            }
+        )
+
+        self.assertEqual(bounded_errors, [])
+        self.assertEqual(superseded_errors, [])
+
+    def test_proven_unsafe_pattern_can_be_archived_and_replaced_safely(self) -> None:
+        unsafe = r"(?s)for\s+.*check.*(?:retry|attempt)"
+        previous = {
+            "version": 1,
+            "requirements": [_requirement(forbidden_patterns=[unsafe])],
+        }
+        old = _requirement(
+            status="superseded",
+            forbidden_patterns=[unsafe],
+            superseded_by=["REQ-002"],
+        )
+        new = _requirement(
+            id="REQ-002",
+            forbidden_patterns=[r"for\s+[\s\S]{0,500}?check"],
+            supersedes=["REQ-001"],
+        )
+        current, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [old, new]}
+        )
+        historical = [
+            {"task_id": "task-old", "status": "done", "requirement_ids": ["REQ-001"]}
+        ]
+
+        self.assertEqual(
+            validate_requirement_contract_transitions(
+                previous,
+                current,
+                historical_tasks=historical,
+            ),
+            [],
+        )
+        self.assertEqual(validate_requirements_trace_payload(current), [])
 
     def test_new_plan_proofs_are_bound_to_requirement_contract_hash(self) -> None:
         trace, _ = stamp_requirement_contract_hashes(

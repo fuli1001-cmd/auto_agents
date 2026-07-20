@@ -64,6 +64,7 @@ from auto_agents.self_repair import (
 from auto_agents.validation import (
     validate_required_document,
     validate_project_config_payload,
+    validate_task_plan_payload,
     validation_report,
 )
 
@@ -201,6 +202,25 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(any("default_max_attempts" in item for item in errors))
         self.assertTrue(any("unknown stage" in item for item in errors))
         self.assertTrue(any("docs.language" in item for item in errors))
+
+    def test_task_plan_validation_rejects_invalid_recovery_lineage(self) -> None:
+        task = {
+            "task_id": "task-271b",
+            "title": "Split child",
+            "description": "Implement the split slice.",
+            "acceptance": ["Observable proof passes."],
+            "status": "pending",
+            "commit_message": "",
+            "task_origin": "generated-by-id-guess",
+            "recovery_epoch": -1,
+            "recovery_round": True,
+        }
+
+        errors = validate_task_plan_payload({"tasks": [task]})
+
+        self.assertTrue(any("task_origin must be one of" in item for item in errors))
+        self.assertTrue(any("recovery_epoch must be an integer >= 0" in item for item in errors))
+        self.assertTrue(any("recovery_round must be an integer >= 0" in item for item in errors))
 
     def test_validate_project_config_payload_rejects_non_isolated_python_commands(self) -> None:
         payload = {
@@ -927,6 +947,39 @@ class ProjectValidationTests(unittest.TestCase):
             env={},
         )
         self.assertFalse(review_decision.eligible)
+
+    def test_self_repair_requires_structured_recovery_route_invariant(self) -> None:
+        state = RunState(
+            run_id="run-123",
+            status="failed",
+            last_recovery_route={
+                "task_id": "task-271b",
+                "lineage_id": "task-271b",
+                "outcome": "invariant_violation",
+                "engine_invariant": "review_recovery_route_missing",
+            },
+        )
+
+        invariant = classify_auto_agents_error(
+            "Task task-271b failed gates: review rejected the task",
+            state=state,
+            env={},
+        )
+        self.assertTrue(invariant.eligible)
+        self.assertEqual(invariant.category, "recovery_route_invariant")
+
+        state.last_recovery_route = {
+            "task_id": "task-271b",
+            "lineage_id": "task-271b",
+            "outcome": "judge_stopped",
+            "engine_invariant": "",
+        }
+        product_failure = classify_auto_agents_error(
+            "Task task-271b failed gates: review rejected the task",
+            state=state,
+            env={},
+        )
+        self.assertFalse(product_failure.eligible)
 
     def test_provider_self_repair_judgment_requires_high_confidence_composite_gate(self) -> None:
         payload = {
@@ -2981,6 +3034,123 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertIsNotNone(feedback)
             self.assertIn(".auto-agents/docs/architecture.md violates REQ-001", feedback or "")
+
+    def test_unsafe_pattern_definition_routes_before_design_without_agent_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            unsafe = r"(?s)for\s+.*check.*(?:retry|attempt)"
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-150",
+                            "text": "Checks use a bounded retry policy.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["The policy is enforced."],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [unsafe],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+            state = load_run_state(project_root)
+            state.status = "failed"
+            state.current_stage = "design"
+            state.stage_summaries = {"clarify": "done"}
+            state.last_error = "design exhausted retries"
+
+            class FailingIfCalledAdapter:
+                def run(self, request):
+                    raise AssertionError(f"design adapter must not run: {request.stage}")
+
+            orchestrator.adapter = FailingIfCalledAdapter()
+            returned = orchestrator._run_agent_stage("design", state, spec_file)
+            feedback = orchestrator._design_validation_feedback(
+                AgentResult(ok=True, command=[], output_path=project_root / "out.txt")
+            )
+
+            self.assertIs(returned, state)
+            self.assertEqual(state.current_stage, "clarify")
+            self.assertEqual(state.rejected_stage, "clarify")
+            self.assertEqual(state.status, "pending")
+            self.assertNotIn("design", state.agent_attempts)
+            self.assertIn("Recovery route: rerun from clarify", state.rejection_reason)
+            self.assertNotIn(unsafe, state.rejection_reason)
+            self.assertIn("rerun from clarify", feedback or "")
+            self.assertNotIn("architecture document failed validation", (feedback or "").lower())
+
+    def test_pattern_recovery_validation_relaxes_only_definition_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-150",
+                            "text": "Checks use a bounded retry policy.",
+                            "source": "spec",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["The policy is enforced."],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [r"(?s)for\s+.*check.*retry"],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(task_plan_path(project_root), {"tasks": []})
+
+            strict = validation_report(project_root)
+            recovery = validation_report(
+                project_root,
+                allow_unsafe_forbidden_pattern_definitions=True,
+            )
+
+            self.assertTrue(
+                any("definition is unsafe" in error for error in strict["errors"])
+            )
+            self.assertFalse(
+                any("definition is unsafe" in error for error in recovery["errors"])
+            )
+            self.assertTrue(
+                any("at least one task" in error for error in recovery["errors"])
+            )
+
+    def test_legacy_unsafe_pattern_design_exhaustion_is_self_repairable(self) -> None:
+        unsafe = r"(?s)for\s+.*check.*(?:retry|attempt).*for\s+.*checks"
+        error = (
+            "design exhausted retries: The architecture document failed validation. "
+            "Rewrite the file in place.\n"
+            f"- .auto-agents/docs/architecture.md violates REQ-150 forbidden_patterns: {unsafe}"
+        )
+
+        decision = classify_auto_agents_error(error, env={})
+
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.category, "forbidden_pattern_validation_routing")
 
     def test_spec_analysis_classifies_mixed_input(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -9,7 +9,13 @@ from typing import Dict, Iterable, List
 from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, run_state_path, task_plan_path
 from .frontend_fidelity import validate_frontend_fidelity_task_plan
 from .io_utils import read_json, read_text
-from .models import APPROVAL_ORDER, DEFAULT_EFFORTS, DOCUMENT_LANGUAGE_OPTIONS
+from .models import (
+    APPROVAL_ORDER,
+    DEFAULT_EFFORTS,
+    DOCUMENT_LANGUAGE_OPTIONS,
+    SMART_TIMEOUT_PROGRESS_PROTOCOL,
+    TASK_ORIGINS,
+)
 from .requirements import (
     normalize_requirements_trace_payload,
     validate_requirements_trace_payload,
@@ -518,6 +524,15 @@ def validate_task_plan_payload(
             or any(not isinstance(item, dict) for item in recovery_history)
         ):
             errors.append(f"{prefix} recovery_history must be a list of objects")
+        task_origin = task.get("task_origin", "planned")
+        if not isinstance(task_origin, str) or task_origin not in TASK_ORIGINS:
+            errors.append(
+                f"{prefix} task_origin must be one of: {', '.join(TASK_ORIGINS)}"
+            )
+        for field_name in ("recovery_epoch", "recovery_round"):
+            value = task.get(field_name, 0)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                errors.append(f"{prefix} {field_name} must be an integer >= 0")
 
     errors.extend(
         validate_task_dependencies(
@@ -722,6 +737,12 @@ def validate_project_config_payload(payload: object) -> List[str]:
             vision = str(provider.get("vision", "auto"))
             if vision not in {"auto", "enabled", "disabled"}:
                 errors.append(f"providers.{provider_name}.vision must be one of: auto, enabled, disabled")
+            if "progress_protocol" in provider and not isinstance(
+                provider.get("progress_protocol"), str
+            ):
+                errors.append(
+                    f"providers.{provider_name}.progress_protocol must be a string"
+                )
 
     active_provider = payload.get("active_provider")
     if not isinstance(active_provider, str) or not active_provider.strip():
@@ -862,6 +883,44 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 errors.append("execution.evidence_preflight must be an object")
             elif evidence_preflight.get("mode", "high_risk") not in {"off", "high_risk", "all"}:
                 errors.append("execution.evidence_preflight.mode must be one of: off, high_risk, all")
+            smart_timeout = execution.get("smart_timeout", {})
+            if not isinstance(smart_timeout, dict):
+                errors.append("execution.smart_timeout must be an object")
+            else:
+                if not isinstance(smart_timeout.get("enabled", True), bool):
+                    errors.append("execution.smart_timeout.enabled must be a boolean")
+                timeout_defaults = {
+                    "provider_idle_seconds": 1800,
+                    "tool_idle_seconds": 900,
+                    "semantic_stall_seconds": 3600,
+                    "safety_ceiling_seconds": 43200,
+                }
+                for key, default in timeout_defaults.items():
+                    value = smart_timeout.get(key, default)
+                    if not isinstance(value, int) or isinstance(value, bool) or value < 60:
+                        errors.append(f"execution.smart_timeout.{key} must be an integer >= 60")
+                repeat_limit = smart_timeout.get("loop_repeat_limit", 3)
+                if not isinstance(repeat_limit, int) or isinstance(repeat_limit, bool) or repeat_limit < 2:
+                    errors.append("execution.smart_timeout.loop_repeat_limit must be an integer >= 2")
+                resume_limit = smart_timeout.get("same_provider_resume_limit", 1)
+                if not isinstance(resume_limit, int) or isinstance(resume_limit, bool) or resume_limit < 0:
+                    errors.append(
+                        "execution.smart_timeout.same_provider_resume_limit must be an integer >= 0"
+                    )
+                safety = smart_timeout.get("safety_ceiling_seconds", 43200)
+                leases = [
+                    smart_timeout.get(key, default)
+                    for key, default in timeout_defaults.items()
+                    if key != "safety_ceiling_seconds"
+                ]
+                if (
+                    isinstance(safety, int)
+                    and all(isinstance(value, int) for value in leases)
+                    and safety < max(leases)
+                ):
+                    errors.append(
+                        "execution.smart_timeout.safety_ceiling_seconds must be >= all lease timeouts"
+                    )
             recovery = execution.get("recovery", {})
             if not isinstance(recovery, dict):
                 errors.append("execution.recovery must be an object")
@@ -873,6 +932,22 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     value = recovery.get(key, 2 if key == "max_rounds" else 1)
                     if not isinstance(value, int) or value < 1:
                         errors.append(f"execution.recovery.{key} must be an integer >= 1")
+
+    smart_timeout_enabled = True
+    if isinstance(execution, dict) and isinstance(execution.get("smart_timeout", {}), dict):
+        smart_timeout_enabled = execution.get("smart_timeout", {}).get("enabled", True) is True
+    if smart_timeout_enabled and isinstance(providers, dict):
+        native_kinds = {"codex", "copilot-cli", "antigravity", "mock"}
+        for provider_name, provider in providers.items():
+            if not isinstance(provider, dict):
+                continue
+            if str(provider.get("kind", "")) in native_kinds:
+                continue
+            if provider.get("progress_protocol") != SMART_TIMEOUT_PROGRESS_PROTOCOL:
+                errors.append(
+                    f"providers.{provider_name}.progress_protocol must be "
+                    f"'{SMART_TIMEOUT_PROGRESS_PROTOCOL}' when smart timeout is enabled"
+                )
 
     approvals = payload.get("approvals")
     if not isinstance(approvals, dict):
@@ -942,7 +1017,11 @@ def validate_project_config_payload(payload: object) -> List[str]:
     return errors
 
 
-def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
+def validate_project_root(
+    project_root: Path,
+    *,
+    allow_unsafe_forbidden_pattern_definitions: bool = False,
+) -> Dict[str, List[str]]:
     root = project_root.resolve()
     errors: List[str] = []
     warnings: List[str] = []
@@ -1031,7 +1110,12 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
         errors.append(f"requirements trace file is not valid JSON: {requirements_trace_path(root)} ({error.msg})")
     if trace_payload is not None:
         trace_payload = normalize_requirements_trace_payload(trace_payload)
-        trace_errors = validate_requirements_trace_payload(trace_payload)
+        trace_errors = validate_requirements_trace_payload(
+            trace_payload,
+            validate_forbidden_pattern_definitions=(
+                not allow_unsafe_forbidden_pattern_definitions
+            ),
+        )
         errors.extend(trace_errors)
 
     docs = {
@@ -1081,8 +1165,17 @@ def validate_project_root(project_root: Path) -> Dict[str, List[str]]:
     return {"errors": errors, "warnings": warnings}
 
 
-def validation_report(project_root: Path) -> Dict[str, object]:
-    result = validate_project_root(project_root)
+def validation_report(
+    project_root: Path,
+    *,
+    allow_unsafe_forbidden_pattern_definitions: bool = False,
+) -> Dict[str, object]:
+    result = validate_project_root(
+        project_root,
+        allow_unsafe_forbidden_pattern_definitions=(
+            allow_unsafe_forbidden_pattern_definitions
+        ),
+    )
     return {
         "ok": not result["errors"],
         "errors": result["errors"],

@@ -1,11 +1,20 @@
 import io
+import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.models import AgentRequest, AgentResult
+from auto_agents.models import (
+    AgentRequest,
+    AgentResult,
+    AgentTermination,
+    SmartTimeoutConfig,
+)
 from auto_agents.orchestrator import Orchestrator, _FAILOVER_PATTERN
 
 
@@ -14,7 +23,14 @@ from auto_agents.orchestrator import Orchestrator, _FAILOVER_PATTERN
 # ---------------------------------------------------------------------------
 
 
-def _make_result(ok=True, returncode=0, stderr="", summary="done"):
+def _make_result(
+    ok=True,
+    returncode=0,
+    stderr="",
+    summary="done",
+    termination=None,
+    provider_session_id="",
+):
     return AgentResult(
         ok=ok,
         command=["fake"],
@@ -22,6 +38,8 @@ def _make_result(ok=True, returncode=0, stderr="", summary="done"):
         summary=summary,
         stderr=stderr,
         returncode=returncode,
+        termination=termination,
+        provider_session_id=provider_session_id,
     )
 
 
@@ -58,14 +76,25 @@ class _SequenceAdapter:
         self._results = list(results)
         self._is_available = is_available
         self.calls = 0
+        self.requests = []
 
     def available(self):
         return self._is_available
 
     def run(self, request):
+        self.requests.append(request)
         result = self._results[min(self.calls, len(self._results) - 1)]
         self.calls += 1
         return result
+
+
+class _StreamLogger:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def info(self, message, *args):
+        rendered = message % args if args else message
+        self._stream.write(f"{rendered}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +114,11 @@ def _stub_orchestrator(providers_dict, active_provider, adapters_map):
     cfg = _Cfg()
     cfg.providers = providers_dict
     cfg.active_provider = active_provider
+    cfg.execution = type(
+        "Execution",
+        (),
+        {"smart_timeout": SmartTimeoutConfig()},
+    )()
 
     class _Stub(Orchestrator):
         def __new__(cls):
@@ -97,6 +131,7 @@ def _stub_orchestrator(providers_dict, active_provider, adapters_map):
     stub.config = cfg
     stub.adapter = adapters_map.get(active_provider)
     stub.agent_output_stream = io.StringIO()
+    stub.logger = _StreamLogger(stub.agent_output_stream)
     stub._last_successful_provider = None
     stub._failed_providers = set()
     stub._current_provider = active_provider
@@ -168,6 +203,14 @@ class TestIsFailoverError(unittest.TestCase):
         r = _make_result(ok=False, returncode=1, stderr="empty response from server")
         self.assertTrue(Orchestrator._is_failover_error(r))
 
+    def test_provider_protocol_error(self):
+        r = _make_result(
+            ok=False,
+            returncode=0,
+            stderr="provider protocol error: CLI option was treated as the prompt",
+        )
+        self.assertTrue(Orchestrator._is_failover_error(r))
+
 
 class TestFailoverErrorLabel(unittest.TestCase):
     def test_timeout_label(self):
@@ -181,6 +224,10 @@ class TestFailoverErrorLabel(unittest.TestCase):
     def test_availability_label(self):
         r = _make_result(ok=False, returncode=1, stderr="service unavailable")
         self.assertEqual(Orchestrator._failover_error_label(r), "provider availability error")
+
+    def test_protocol_error_label(self):
+        r = _make_result(ok=False, returncode=0, stderr="provider protocol error")
+        self.assertEqual(Orchestrator._failover_error_label(r), "provider protocol error")
 
 
 class TestFailoverProviderOrder(unittest.TestCase):
@@ -198,6 +245,166 @@ class TestFailoverProviderOrder(unittest.TestCase):
 
 
 class TestCallWithFailover(unittest.TestCase):
+    def test_semantic_stall_resumes_same_session_once(self):
+        stalled = _make_result(
+            ok=False,
+            returncode=-1,
+            stderr="smart timeout: semantic stall",
+            termination=AgentTermination(reason="semantic_stall"),
+            provider_session_id="session-1",
+        )
+        adapter = _SequenceAdapter([stalled, _make_result(ok=True)])
+        stub = _stub_orchestrator({"codex": {}}, "codex", {"codex": adapter})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            request = AgentRequest(
+                stage="implement",
+                effort="deep",
+                prompt="original prompt",
+                cwd=Path(tmp),
+                output_path=Path(tmp) / "out.md",
+                attempt_id="task-1",
+            )
+            result = stub._call_with_failover(request)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(adapter.calls, 2)
+        self.assertEqual(adapter.requests[1].resume_session_id, "session-1")
+        self.assertIn("AUTO-AGENTS TAKEOVER", adapter.requests[1].prompt)
+        self.assertNotIn("original prompt", adapter.requests[1].prompt)
+
+    def test_provider_idle_switches_without_same_provider_resume(self):
+        idle = _make_result(
+            ok=False,
+            returncode=-1,
+            stderr="smart timeout: provider idle",
+            termination=AgentTermination(reason="provider_idle"),
+        )
+        codex = _SequenceAdapter([idle, _make_result(ok=True)])
+        copilot = _FakeAdapter(_make_result(ok=True, summary="fallback"))
+        stub = _stub_orchestrator(
+            {"codex": {}, "copilot-cli": {}},
+            "codex",
+            {"codex": codex, "copilot-cli": copilot},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            request = AgentRequest(
+                stage="review",
+                effort="balanced",
+                prompt="review",
+                cwd=Path(tmp),
+                output_path=Path(tmp) / "out.md",
+                attempt_id="review-task-1",
+            )
+            result = stub._call_with_failover(request)
+
+        self.assertEqual(result.summary, "fallback")
+        self.assertEqual(codex.calls, 1)
+        self.assertEqual(copilot.calls, 1)
+
+    def test_interrupted_resume_uses_latest_running_checkpoint(self):
+        adapter = _FakeAdapter(_make_result(ok=True))
+        stub = _stub_orchestrator({"codex": {}}, "codex", {"codex": adapter})
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            request = AgentRequest(
+                stage="implement",
+                effort="deep",
+                prompt="original",
+                cwd=root,
+                output_path=root / "out.md",
+                attempt_id="task-1",
+            )
+            reports = root / "provider-attempts"
+            reports.mkdir()
+            base = {
+                "status": "running",
+                "provider": "codex",
+                "stage": "implement",
+                "cwd": str(root),
+                "workspace_fingerprint": "fingerprint",
+                "pid": 999999,
+            }
+            first = reports / "task-1-codex-resume-0.json"
+            latest = reports / "task-1-codex-resume-1.json"
+            first.write_text(
+                json.dumps({**base, "session_id": "old-session"}), encoding="utf-8"
+            )
+            latest.write_text(
+                json.dumps({**base, "session_id": "latest-session"}), encoding="utf-8"
+            )
+            os.utime(first, (1, 1))
+            os.utime(latest, (2, 2))
+
+            with patch(
+                "auto_agents.orchestrator.worktree_fingerprint",
+                return_value="fingerprint",
+            ), patch(
+                "auto_agents.orchestrator.process_start_identity",
+                return_value="",
+            ):
+                resumed = stub._provider_request_for_attempt(
+                    request,
+                    provider="codex",
+                    resume_index=0,
+                    allow_interrupted_resume=True,
+                )
+
+        self.assertEqual(resumed.resume_session_id, "latest-session")
+        self.assertEqual(resumed.progress_report_path, latest)
+        self.assertTrue(resumed.attempt_id.endswith(":1"))
+        self.assertIn("HOST-INTERRUPTION RESUME", resumed.prompt)
+
+    def test_interrupted_fallback_provider_is_prioritized_after_restart(self):
+        codex = _FakeAdapter(_make_result(ok=True, summary="wrong provider"))
+        copilot = _SequenceAdapter([_make_result(ok=True, summary="resumed")])
+        stub = _stub_orchestrator(
+            {"codex": {}, "copilot-cli": {}},
+            "codex",
+            {"codex": codex, "copilot-cli": copilot},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            request = AgentRequest(
+                stage="implement",
+                effort="deep",
+                prompt="original",
+                cwd=root,
+                output_path=root / "out.md",
+                attempt_id="task-1",
+            )
+            reports = root / "provider-attempts"
+            reports.mkdir()
+            (reports / "task-1-copilot-cli-resume-0.json").write_text(
+                json.dumps(
+                    {
+                        "status": "running",
+                        "provider": "copilot-cli",
+                        "stage": "implement",
+                        "cwd": str(root),
+                        "workspace_fingerprint": "fingerprint",
+                        "session_id": "copilot-session",
+                        "pid": 999999,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "auto_agents.orchestrator.worktree_fingerprint",
+                return_value="fingerprint",
+            ), patch(
+                "auto_agents.orchestrator.process_start_identity",
+                return_value="",
+            ):
+                result = stub._call_with_failover(request)
+
+        self.assertEqual(result.summary, "resumed")
+        self.assertEqual(codex.calls, 0)
+        self.assertEqual(copilot.calls, 1)
+        self.assertEqual(copilot.requests[0].resume_session_id, "copilot-session")
+
     def test_active_succeeds_no_failover(self):
         ok_result = _make_result(ok=True)
         codex = _FakeAdapter(ok_result)
@@ -225,6 +432,29 @@ class TestCallWithFailover(unittest.TestCase):
         self.assertEqual(result.summary, "from copilot")
         self.assertEqual(codex.calls, 1)
         self.assertEqual(copilot.calls, 1)
+
+    def test_switches_on_provider_protocol_error(self):
+        protocol_error = _make_result(
+            ok=False,
+            returncode=0,
+            stderr="provider protocol error: CLI option was treated as the prompt",
+        )
+        ok_result = _make_result(ok=True, summary="reviewed by fallback")
+        antigravity = _FakeAdapter(protocol_error)
+        codex = _FakeAdapter(ok_result)
+        stub = _stub_orchestrator(
+            {"antigravity": {}, "codex": {}},
+            "antigravity",
+            {"antigravity": antigravity, "codex": codex},
+        )
+
+        result = stub._call_with_failover(_make_request())
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.summary, "reviewed by fallback")
+        self.assertEqual(antigravity.calls, 1)
+        self.assertEqual(codex.calls, 1)
+        self.assertIn("provider protocol error", stub.agent_output_stream.getvalue())
 
     def test_all_providers_exhausted(self):
         quota_result = _make_result(ok=False, returncode=1, stderr="rate limit exceeded")

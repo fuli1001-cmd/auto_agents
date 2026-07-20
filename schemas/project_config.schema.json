@@ -137,7 +137,7 @@
     },
     "active_provider": {
       "type": "string",
-      "enum": ["codex", "copilot-cli", "antigravity-claude", "antigravity-gemini"]
+      "minLength": 1
     },
     "docs": {
       "type": "object",
@@ -364,6 +364,19 @@
           "type": "object",
           "properties": {
             "mode": {"type": "string", "enum": ["off", "high_risk", "all"]}
+          },
+          "additionalProperties": false
+        },
+        "smart_timeout": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "provider_idle_seconds": {"type": "integer", "minimum": 60},
+            "tool_idle_seconds": {"type": "integer", "minimum": 60},
+            "semantic_stall_seconds": {"type": "integer", "minimum": 60},
+            "safety_ceiling_seconds": {"type": "integer", "minimum": 60},
+            "loop_repeat_limit": {"type": "integer", "minimum": 2},
+            "same_provider_resume_limit": {"type": "integer", "minimum": 0}
           },
           "additionalProperties": false
         }

@@ -180,7 +180,7 @@ DEFAULT_CONFIG = {
             },
             "extra_args": [],
             "cwd_flag": "",
-            "prompt_via_stdin": True,
+            "prompt_via_stdin": False,
             "output_flag": "",
             "timeout_seconds": 7200,
             "idle_timeout_seconds": 7200,
@@ -197,7 +197,7 @@ DEFAULT_CONFIG = {
             },
             "extra_args": [],
             "cwd_flag": "",
-            "prompt_via_stdin": True,
+            "prompt_via_stdin": False,
             "output_flag": "",
             "timeout_seconds": 7200,
             "idle_timeout_seconds": 7200,
@@ -241,6 +241,15 @@ DEFAULT_CONFIG = {
         },
         "evidence_preflight": {
             "mode": "high_risk",
+        },
+        "smart_timeout": {
+            "enabled": True,
+            "provider_idle_seconds": 1800,
+            "tool_idle_seconds": 900,
+            "semantic_stall_seconds": 3600,
+            "safety_ceiling_seconds": 43200,
+            "loop_repeat_limit": 3,
+            "same_provider_resume_limit": 1,
         },
         "recovery": {
             "enabled": True,

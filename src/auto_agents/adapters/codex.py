@@ -1,42 +1,131 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 from dataclasses import replace
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 from ..io_utils import read_text, write_text
-from ..models import AgentRequest, AgentResult, AgentUsage, ProviderConfig
+from ..models import (
+    AgentProgressEvent,
+    AgentRequest,
+    AgentResult,
+    AgentUsage,
+    ProviderConfig,
+    SmartTimeoutConfig,
+)
 from .base import AgentAdapter, run_subprocess_with_optional_streaming
+from ..supervision import ProgressDecoder
+
+
+class CodexProgressDecoder(ProgressDecoder):
+    def feed(self, stream_name: str, chunk: str):
+        if stream_name != "stdout":
+            return ()
+        try:
+            event = json.loads(chunk.strip())
+        except (json.JSONDecodeError, AttributeError):
+            if chunk.strip():
+                raise ValueError("Codex JSONL stream emitted invalid JSON")
+            return ()
+        if not isinstance(event, dict):
+            raise ValueError("Codex JSONL event must be an object")
+        event_type = str(event.get("type", ""))
+        if not event_type:
+            raise ValueError("Codex JSONL event is missing type")
+        if event_type == "thread.started":
+            return (
+                AgentProgressEvent(
+                    kind="activity",
+                    session_id=str(event.get("thread_id", "")),
+                    detail=event_type,
+                ),
+            )
+        if event_type in {"error", "turn.failed"}:
+            return (AgentProgressEvent(kind="error", detail=event_type),)
+        if event_type in {"item.started", "item.completed"}:
+            item = event.get("item", {})
+            if not isinstance(item, dict):
+                return (AgentProgressEvent(kind="activity", detail=event_type),)
+            item_type = str(item.get("type", ""))
+            if item_type in {"command_execution", "file_change", "mcp_tool_call", "web_search"}:
+                detail = str(item.get("command") or item.get("name") or item_type)
+                fingerprint = hashlib.sha256(
+                    json.dumps(item, sort_keys=True, ensure_ascii=False).encode("utf-8")
+                ).hexdigest()
+                return (
+                    AgentProgressEvent(
+                        kind=(
+                            "tool_started"
+                            if event_type == "item.started"
+                            else "tool_completed"
+                        ),
+                        tool_id=str(item.get("id", "")),
+                        fingerprint=fingerprint,
+                        detail=detail,
+                        semantic=event_type == "item.completed",
+                    ),
+                )
+            semantic = event_type == "item.completed" and item_type in {"plan", "plan_update"}
+            return (
+                AgentProgressEvent(
+                    kind="milestone" if semantic else "activity",
+                    fingerprint=str(item.get("id", "")),
+                    detail=item_type or event_type,
+                    semantic=semantic,
+                ),
+            )
+        if event_type == "turn.completed":
+            return (AgentProgressEvent(kind="completed", detail=event_type),)
+        return (AgentProgressEvent(kind="activity", detail=event_type),)
 
 
 class CodexAdapter(AgentAdapter):
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(
+        self,
+        config: ProviderConfig,
+        smart_timeout: Optional[SmartTimeoutConfig] = None,
+    ) -> None:
         self.config = config
+        self.smart_timeout = smart_timeout or SmartTimeoutConfig(enabled=False)
 
     def available(self) -> bool:
         return shutil.which(self.config.binary) is not None
 
     def run(self, request: AgentRequest) -> AgentResult:
-        command: List[str] = [
-            self.config.binary,
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "workspace-write",
-            self.config.cwd_flag,
-            str(request.cwd),
-            self.config.output_flag,
-            str(request.output_path),
-        ]
+        if request.resume_session_id:
+            command: List[str] = [
+                self.config.binary,
+                "exec",
+                "resume",
+                "--json",
+                "--skip-git-repo-check",
+                self.config.output_flag,
+                str(request.output_path),
+            ]
+        else:
+            command = [
+                self.config.binary,
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "workspace-write",
+                self.config.cwd_flag,
+                str(request.cwd),
+                self.config.output_flag,
+                str(request.output_path),
+            ]
 
         profile = self.config.profile_map.get(request.effort)
-        if profile:
+        if profile and not request.resume_session_id:
             command.extend(["--profile", profile])
 
         command.extend(self.config.extra_args)
+        if request.resume_session_id:
+            command.extend([request.resume_session_id, "-"])
 
         env = dict(os.environ)
         env["AUTO_AGENTS_STAGE"] = request.stage
@@ -52,13 +141,17 @@ class CodexAdapter(AgentAdapter):
                 stream_output=self._make_json_stream_filter(request.stream_output),
             )
 
-        stdout_raw, stderr, returncode, streamed_stdout, streamed_stderr = (
-            run_subprocess_with_optional_streaming(
-                command, filtered_request, env,
-                timeout=timeout,
-                idle_timeout=self.config.idle_timeout_seconds or None,
-            )
+        process_result = run_subprocess_with_optional_streaming(
+            command,
+            filtered_request,
+            env,
+            timeout=timeout,
+            idle_timeout=self.config.idle_timeout_seconds or None,
+            smart_timeout=self.smart_timeout,
+            progress_decoder=CodexProgressDecoder(),
+            provider="codex",
         )
+        stdout_raw, stderr, returncode, streamed_stdout, streamed_stderr = process_result
 
         visible_stdout, usage, error_messages = self._parse_json_stdout(stdout_raw)
         stderr = stderr.strip()
@@ -83,6 +176,11 @@ class CodexAdapter(AgentAdapter):
             returncode=returncode,
             streamed_stdout=streamed_stdout,
             streamed_stderr=streamed_stderr,
+            provider_session_id=getattr(process_result, "provider_session_id", ""),
+            termination=getattr(process_result, "termination", None),
+            supervision_report_path=(
+                str(request.progress_report_path) if request.progress_report_path else ""
+            ),
         )
 
     def _model_label(self, request: AgentRequest) -> str:

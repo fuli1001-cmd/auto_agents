@@ -1,20 +1,89 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
+from dataclasses import replace
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from ..io_utils import read_text, write_text
-from ..models import AgentRequest, AgentResult, AgentUsage, ProviderConfig
+from ..models import (
+    AgentProgressEvent,
+    AgentRequest,
+    AgentResult,
+    ProviderConfig,
+    SmartTimeoutConfig,
+)
 from .base import AgentAdapter, run_subprocess_with_optional_streaming
+from ..supervision import ProgressDecoder
 
 
 # Default directory for Copilot CLI profile config dirs.
 # Each profile is a subdirectory containing settings that
 # ``copilot --config-dir`` understands.
 DEFAULT_PROFILES_ROOT = Path.home() / ".copilot" / "profiles"
+
+
+class CopilotProgressDecoder(ProgressDecoder):
+    def feed(self, stream_name: str, chunk: str):
+        if stream_name != "stdout":
+            return ()
+        try:
+            event = json.loads(chunk.strip())
+        except (json.JSONDecodeError, AttributeError):
+            if chunk.strip():
+                raise ValueError("Copilot JSONL stream emitted invalid JSON")
+            return ()
+        if not isinstance(event, dict):
+            raise ValueError("Copilot JSONL event must be an object")
+        event_type = str(event.get("type", ""))
+        if not event_type:
+            raise ValueError("Copilot JSONL event is missing type")
+        data = event.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+        if event_type == "session.start":
+            return (
+                AgentProgressEvent(
+                    kind="activity",
+                    session_id=str(data.get("sessionId", "")),
+                    detail=event_type,
+                ),
+            )
+        if event_type == "tool.execution_start":
+            detail = str(data.get("toolName") or "tool")
+            arguments = data.get("arguments", {})
+            fingerprint = hashlib.sha256(
+                json.dumps(arguments, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            return (
+                AgentProgressEvent(
+                    kind="tool_started",
+                    tool_id=str(data.get("toolCallId", "")),
+                    fingerprint=fingerprint,
+                    detail=detail,
+                ),
+            )
+        if event_type == "tool.execution_complete":
+            fingerprint = hashlib.sha256(
+                json.dumps(data, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()
+            return (
+                AgentProgressEvent(
+                    kind="tool_completed",
+                    tool_id=str(data.get("toolCallId", "")),
+                    fingerprint=fingerprint,
+                    detail=str(data.get("toolName") or "tool"),
+                    semantic=True,
+                ),
+            )
+        if event_type in {"session.error", "assistant.error", "error"}:
+            return (AgentProgressEvent(kind="error", detail=event_type),)
+        if event_type in {"session.end", "assistant.turn_end"}:
+            return (AgentProgressEvent(kind="completed", detail=event_type),)
+        return (AgentProgressEvent(kind="activity", detail=event_type),)
 
 
 class CopilotCliAdapter(AgentAdapter):
@@ -28,8 +97,13 @@ class CopilotCliAdapter(AgentAdapter):
     * ``--allow-all-tools`` is the default for headless automation
     """
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(
+        self,
+        config: ProviderConfig,
+        smart_timeout: Optional[SmartTimeoutConfig] = None,
+    ) -> None:
         self.config = config
+        self.smart_timeout = smart_timeout or SmartTimeoutConfig(enabled=False)
 
     def available(self) -> bool:
         return shutil.which(self.config.binary) is not None
@@ -54,16 +128,28 @@ class CopilotCliAdapter(AgentAdapter):
 
         timeout = self.config.timeout_seconds or None
 
-        stdout, stderr, returncode, streamed_stdout, streamed_stderr = (
-            run_subprocess_with_optional_streaming(
-                command, request, env,
-                timeout=timeout,
-                stdin_input=stdin_input,
-                idle_timeout=self.config.idle_timeout_seconds or None,
+        filtered_request = request
+        if request.stream_output is not None:
+            filtered_request = replace(
+                request,
+                stream_output=self._make_json_stream_filter(request.stream_output),
             )
+
+        process_result = run_subprocess_with_optional_streaming(
+            command,
+            filtered_request,
+            env,
+            timeout=timeout,
+            stdin_input=stdin_input,
+            idle_timeout=self.config.idle_timeout_seconds or None,
+            smart_timeout=self.smart_timeout,
+            progress_decoder=CopilotProgressDecoder(),
+            provider="copilot-cli",
         )
+        stdout_raw, stderr, returncode, streamed_stdout, streamed_stderr = process_result
 
         stderr = stderr.strip()
+        stdout = self._parse_json_stdout(stdout_raw)
 
         summary = read_text(request.output_path).strip()
         if not summary and stdout:
@@ -81,6 +167,11 @@ class CopilotCliAdapter(AgentAdapter):
             returncode=returncode,
             streamed_stdout=streamed_stdout,
             streamed_stderr=streamed_stderr,
+            provider_session_id=getattr(process_result, "provider_session_id", ""),
+            termination=getattr(process_result, "termination", None),
+            supervision_report_path=(
+                str(request.progress_report_path) if request.progress_report_path else ""
+            ),
         )
 
     # -- internal helpers --------------------------------------------------
@@ -90,6 +181,7 @@ class CopilotCliAdapter(AgentAdapter):
 
         # Non-interactive flags for clean scripting output.
         command.extend(["--no-color", "-s"])
+        command.extend(["--output-format", "json", "--stream", "on"])
 
         # NOTE: copilot CLI does not support -C or -o flags.
         # Working directory is passed via subprocess.run(cwd=...).
@@ -114,10 +206,51 @@ class CopilotCliAdapter(AgentAdapter):
         # Ensure the agent works fully autonomously.
         command.append("--no-ask-user")
 
+        if request.resume_session_id:
+            command.append(f"--resume={request.resume_session_id}")
+
         # Passthrough extra arguments
         command.extend(self.config.extra_args)
 
         return command
+
+    @staticmethod
+    def _make_json_stream_filter(
+        callback: Callable[[str, str], None],
+    ) -> Callable[[str, str], None]:
+        def filtered(stream_name: str, chunk: str) -> None:
+            if stream_name != "stdout":
+                callback(stream_name, chunk)
+                return
+            try:
+                event = json.loads(chunk.strip())
+            except json.JSONDecodeError:
+                callback(stream_name, chunk)
+                return
+            if not isinstance(event, dict) or event.get("type") != "assistant.message":
+                return
+            data = event.get("data", {})
+            content = data.get("content", "") if isinstance(data, dict) else ""
+            if isinstance(content, str) and content:
+                callback("stdout", content if content.endswith("\n") else content + "\n")
+        return filtered
+
+    @staticmethod
+    def _parse_json_stdout(stdout: str) -> str:
+        messages: List[str] = []
+        for raw_line in stdout.splitlines():
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                messages.append(raw_line + "\n")
+                continue
+            if not isinstance(event, dict) or event.get("type") != "assistant.message":
+                continue
+            data = event.get("data", {})
+            content = data.get("content", "") if isinstance(data, dict) else ""
+            if isinstance(content, str) and content:
+                messages.append(content if content.endswith("\n") else content + "\n")
+        return "".join(messages)
 
     def _resolve_config_dir(self, effort: str) -> Optional[Path]:
         """Map effort → profile name → config directory path.

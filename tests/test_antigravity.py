@@ -4,7 +4,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from auto_agents.adapters.antigravity import AntigravityAdapter, SETTINGS_PATH
+from auto_agents.adapters.antigravity import (
+    INLINE_PROMPT_MAX_BYTES,
+    AntigravityAdapter,
+    SETTINGS_PATH,
+)
 from auto_agents.models import AgentRequest, AgentResult, ProviderConfig
 
 
@@ -17,6 +21,18 @@ def test_antigravity_available():
 
     with patch("shutil.which", return_value=None):
         assert adapter.available() is False
+
+
+def test_antigravity_config_normalizes_legacy_stdin_transport():
+    config = ProviderConfig.from_dict(
+        {
+            "kind": "antigravity",
+            "binary": "agy",
+            "prompt_via_stdin": True,
+        }
+    )
+
+    assert config.prompt_via_stdin is False
 
 
 def test_antigravity_build_command():
@@ -38,14 +54,39 @@ def test_antigravity_build_command():
     command = adapter._build_command(request)
     assert command == [
         "agy",
-        "-p",
         "--dangerously-skip-permissions",
         "--add-dir",
         "/tmp/myproject",
         "--print-timeout",
         "600s",
         "--sandbox",
+        "--print",
+        "Write a python script",
     ]
+
+
+def test_antigravity_build_command_stages_oversized_prompt(tmp_path):
+    config = ProviderConfig(kind="antigravity", binary="agy")
+    adapter = AntigravityAdapter(config)
+    prompt = "x" * (INLINE_PROMPT_MAX_BYTES + 1)
+    request = AgentRequest(
+        stage="review",
+        effort="deep",
+        prompt=prompt,
+        cwd=tmp_path,
+        output_path=tmp_path / "out.md",
+    )
+
+    command = adapter._build_command(request)
+
+    assert command[-2] == "--print"
+    assert prompt not in command
+    staged_files = list(
+        (tmp_path / ".auto-agents" / "runs" / "provider-prompts").glob("*.txt")
+    )
+    assert len(staged_files) == 1
+    assert staged_files[0].read_text(encoding="utf-8") == prompt
+    assert str(staged_files[0]) in command[-1]
 
 
 def test_antigravity_run_settings_override_and_restoration(tmp_path):
@@ -97,3 +138,34 @@ def test_antigravity_run_settings_override_and_restoration(tmp_path):
         
         # After run, settings is restored back to old-model
         assert json.loads(settings_file.read_text(encoding="utf-8"))["model"] == "old-model"
+
+        command = mock_run.call_args.args[0]
+        assert command[-2:] == ["--print", "Write code"]
+        assert mock_run.call_args.kwargs["stdin_input"] == ""
+
+
+def test_antigravity_rejects_response_to_its_own_flag(tmp_path):
+    config = ProviderConfig(kind="antigravity", binary="agy", profile_map={})
+    adapter = AntigravityAdapter(config)
+    request = AgentRequest(
+        stage="review",
+        effort="deep",
+        prompt="Review this task",
+        cwd=tmp_path,
+        output_path=tmp_path / "out.md",
+    )
+    bad_response = (
+        "It looks like you've entered `--dangerously-skip-permissions`, which is a "
+        "CLI startup flag rather than a task."
+    )
+
+    with patch(
+        "auto_agents.adapters.antigravity.run_subprocess_with_optional_streaming",
+        return_value=(bad_response, "", 0, False, False),
+    ):
+        result = adapter.run(request)
+
+    assert result.ok is False
+    assert result.returncode == 0
+    assert result.summary == bad_response
+    assert "provider protocol error" in result.stderr

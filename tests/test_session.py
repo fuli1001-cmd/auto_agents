@@ -28,8 +28,16 @@ from auto_agents.config import (
 )
 from auto_agents.git_ops import commit_all, working_tree_clean
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentResult, RunState, SessionState, DEFAULT_SESSION_MAX_ATTEMPTS, VerificationStep
+from auto_agents.models import (
+    AgentResult,
+    DEFAULT_SESSION_MAX_ATTEMPTS,
+    RunState,
+    SessionState,
+    TaskSpec,
+    VerificationStep,
+)
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.requirements import load_requirements_trace, stamp_requirement_contract_hashes
 from auto_agents.session import Session
 
 
@@ -188,6 +196,13 @@ class RunStateModelTests(unittest.TestCase):
             implement_verify_baseline_failures=["tests/test_demo.py::test_example"],
             implement_verify_baseline_ref="deadbeef:e3b0c442",
             plan_task_replacements={"task-legacy": ["task-child-a", "task-child-b"]},
+            last_recovery_route={
+                "task_id": "task-child-a",
+                "lineage_id": "task-child-a",
+                "outcome": "requeued",
+                "epoch": 1,
+                "round": 2,
+            },
             last_error="provider research is blocked",
             resume_context={
                 "spec_file": "/tmp/demo/spec.md",
@@ -212,12 +227,34 @@ class RunStateModelTests(unittest.TestCase):
             restored.plan_task_replacements,
             {"task-legacy": ["task-child-a", "task-child-b"]},
         )
+        self.assertEqual(restored.last_recovery_route["outcome"], "requeued")
+        self.assertEqual(restored.last_recovery_route["epoch"], 1)
         self.assertEqual(restored.resume_context["spec_file"], "/tmp/demo/spec.md")
         self.assertEqual(restored.resume_context["provider_kind"], "copilot-cli")
 
     def test_resume_context_defaults_to_empty_dict(self) -> None:
         restored = RunState.from_dict({"run_id": "run-456"})
         self.assertEqual(restored.resume_context, {})
+        self.assertEqual(restored.last_recovery_route, {})
+
+    def test_task_recovery_lineage_round_trip(self) -> None:
+        task = TaskSpec(
+            task_id="task-271b",
+            title="Split child",
+            description="Implement the split slice.",
+            acceptance=["The observable proof passes."],
+            parent_task_id="task-271",
+            split_depth=1,
+            task_origin="scope_split",
+            recovery_epoch=2,
+            recovery_round=1,
+        )
+
+        restored = TaskSpec.from_dict(task.to_dict())
+
+        self.assertEqual(restored.task_origin, "scope_split")
+        self.assertEqual(restored.recovery_epoch, 2)
+        self.assertEqual(restored.recovery_round, 1)
 
 
 class SessionConfigTests(unittest.TestCase):
@@ -1161,6 +1198,204 @@ class SessionProviderResolveTests(unittest.TestCase):
                 lock_payload["references"]["provider"]["status"],
                 "assumption_approved",
             )
+
+    def test_provider_resolve_rejects_and_restores_contract_field_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, _reference = _make_provider_blocked_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "")
+            original_trace = load_requirements_trace(project_root, normalize=False)
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                content = "I understand the blocker.\nGOAL_CLEAR\n"
+                if call_count["n"] > 1:
+                    changed = load_requirements_trace(project_root, normalize=False)
+                    changed["requirements"][0]["source"] += "; provider conversation"
+                    write_json(requirements_trace_path(project_root), changed)
+                    content = "Recorded the provider decision in source.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content.strip(),
+                    stdout=content,
+                    returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            resume_calls = {"n": 0}
+            orchestrator.resume_saved_run = lambda: resume_calls.__setitem__("n", resume_calls["n"] + 1)
+            session = Session(orchestrator, mode="provider_resolve")
+            session._should_stop = lambda _state, _reason: "stop after policy rejection"
+
+            state = session.start()
+
+            self.assertEqual(state.status, "failed")
+            self.assertEqual(resume_calls["n"], 0)
+            self.assertEqual(load_requirements_trace(project_root, normalize=False), original_trace)
+            self.assertTrue(
+                any(entry.get("action") == "provider_trace_rejected" for entry in state.execution_log)
+            )
+
+    def test_provider_contract_binding_rejects_a_stale_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, _reference = _make_provider_blocked_project(tmp)
+            trace, _ = stamp_requirement_contract_hashes(
+                load_requirements_trace(project_root, normalize=False)
+            )
+            trace["requirements"][0]["source"] += "; stale mutation"
+            write_json(requirements_trace_path(project_root), trace)
+            orchestrator = Orchestrator(project_root)
+
+            with self.assertRaisesRegex(RuntimeError, "invalid requirements trace"):
+                orchestrator.bind_resolved_provider_reference_contracts()
+
+    def test_provider_resolve_preflight_failure_is_not_marked_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, reference = _make_provider_blocked_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "")
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                content = "I understand the blocker.\nGOAL_CLEAR\n"
+                if call_count["n"] > 1:
+                    write_text(
+                        project_root / reference,
+                        "# Provider Reference\n\n## Status\n\nassumption_approved\n",
+                    )
+                    write_json(
+                        provider_references_lock_path(project_root),
+                        {
+                            "version": 1,
+                            "references": {
+                                "provider": {
+                                    "path": reference,
+                                    "status": "assumption_approved",
+                                    "retrieved_at": "2026-04-24T00:30:00Z",
+                                    "source_urls": ["https://example.com/official"],
+                                    "notes": "User approved assumptions.",
+                                }
+                            },
+                        },
+                    )
+                    content = "Resolved the provider reference.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content.strip(),
+                    stdout=content,
+                    returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            orchestrator.validate = lambda: {
+                "ok": False,
+                "errors": ["requirement #1 contract_sha256 is missing or stale"],
+                "warnings": [],
+            }
+            orchestrator.resume_saved_run = lambda: self.fail("resume must not run")
+            session = Session(orchestrator, mode="provider_resolve")
+
+            with self.assertRaisesRegex(RuntimeError, "run preflight is still blocked"):
+                session.start()
+
+            self.assertIsNotNone(session._current_state)
+            self.assertEqual(session._current_state.status, "failed")
+            self.assertEqual(session._current_state.resolution, "preflight_blocked")
+
+    def test_provider_resolve_allows_only_session_approved_defer_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, _reference = _make_provider_blocked_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "yes")
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I understand the blocker.\nGOAL_CLEAR\n"
+                elif call_count["n"] == 2:
+                    content = "NEED_USER_DEFER: REQ-001 | Defer this provider-dependent requirement?\n"
+                else:
+                    trace = load_requirements_trace(project_root, normalize=False)
+                    trace["requirements"][0]["status"] = "deferred"
+                    trace["requirements"][0]["notes"] = "User explicitly deferred this requirement."
+                    write_json(requirements_trace_path(project_root), trace)
+                    content = "Applied the approved defer decision.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content.strip(),
+                    stdout=content,
+                    returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            orchestrator.validate = lambda: {"ok": True, "errors": [], "warnings": []}
+
+            def mock_resume_saved_run():
+                resumed = load_run_state(project_root)
+                resumed.status = "completed"
+                return resumed
+
+            orchestrator.resume_saved_run = mock_resume_saved_run
+            state = Session(orchestrator, mode="provider_resolve").start()
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(
+                load_requirements_trace(project_root, normalize=False)["requirements"][0]["status"],
+                "deferred",
+            )
+            self.assertTrue(
+                any(entry.get("action") == "provider_defer_approved" for entry in state.execution_log)
+            )
+
+    def test_provider_resolve_contract_change_marker_rewinds_to_clarify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, reference = _make_provider_blocked_project(tmp)
+            original_reference = (project_root / reference).read_text(encoding="utf-8")
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "")
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                content = "I understand the blocker.\nGOAL_CLEAR\n"
+                if call_count["n"] > 1:
+                    write_text(project_root / reference, "partial provider edit\n")
+                    content = "REQUIRES_CLARIFY: The provider duration changes the normative contract.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content.strip(),
+                    stdout=content,
+                    returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+
+            def mock_resume_saved_run():
+                resumed = load_run_state(project_root)
+                resumed.status = "completed"
+                return resumed
+
+            orchestrator.resume_saved_run = mock_resume_saved_run
+            state = Session(orchestrator, mode="provider_resolve").start()
+            routed_run = load_run_state(project_root)
+
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(state.resolution, "routed_to_clarify")
+            self.assertEqual(routed_run.current_stage, "clarify")
+            self.assertEqual(routed_run.rejected_stage, "clarify")
+            self.assertIn("normative contract", routed_run.rejection_reason)
+            self.assertEqual((project_root / reference).read_text(encoding="utf-8"), original_reference)
 
     def test_provider_resolve_requires_blocked_provider_research_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -240,6 +240,19 @@
             },
             "description": "Precise executable verification refs owned by a generated repair task."
           },
+          "task_origin": {
+            "type": "string",
+            "enum": ["planned", "scope_split", "evidence_repair", "stage_recovery"],
+            "description": "Orchestrator-owned task lineage classification."
+          },
+          "recovery_epoch": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "recovery_round": {
+            "type": "integer",
+            "minimum": 0
+          },
           "recovery_history": {
             "type": "array",
             "items": {

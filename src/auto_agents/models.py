@@ -16,6 +16,7 @@ SESSION_STALL_THRESHOLD = 3
 SESSION_AGENT_ERROR_THRESHOLD = 5
 SESSION_HARD_CEILING = {"fix": 15, "collab": 25, "provider_resolve": 15}
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
+TASK_ORIGINS = ("planned", "scope_split", "evidence_repair", "stage_recovery")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity-claude", "antigravity-gemini")
 DEFAULT_EFFORTS = {
     "clarify": "deep",
@@ -38,6 +39,7 @@ LEGACY_PROVIDER_IDLE_TIMEOUT_SECONDS = 300
 DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS = 3600
 DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS = 3600
 DEFAULT_COPILOT_CLI_PROFILE_MAP = {"balanced": "balanced", "deep": "deep", "max": "max"}
+SMART_TIMEOUT_PROGRESS_PROTOCOL = "auto-agents-jsonl-v1"
 DEFAULT_RETRY_PER_STAGE = {
     "clarify": 2,
     "design": 2,
@@ -74,6 +76,9 @@ class TaskSpec:
     verify_baseline_ref: str = ""
     parent_task_id: str = ""
     split_depth: int = 0
+    task_origin: str = "planned"
+    recovery_epoch: int = 0
+    recovery_round: int = 0
     expected_test_migrations: List[str] = field(default_factory=list)
     requirement_proofs: List[Dict[str, object]] = field(default_factory=list)
     verification_refs: List[str] = field(default_factory=list)
@@ -120,6 +125,9 @@ class TaskSpec:
             verify_baseline_ref=str(data.get("verify_baseline_ref", "")),
             parent_task_id=str(data.get("parent_task_id", "")),
             split_depth=int(data.get("split_depth", 0) or 0),
+            task_origin=str(data.get("task_origin", "planned") or "planned"),
+            recovery_epoch=max(0, int(data.get("recovery_epoch", 0) or 0)),
+            recovery_round=max(0, int(data.get("recovery_round", 0) or 0)),
             expected_test_migrations=[str(item) for item in data.get("expected_test_migrations", [])],
             requirement_proofs=requirement_proofs,
             verification_refs=[str(item) for item in data.get("verification_refs", [])],
@@ -162,6 +170,7 @@ class ProviderConfig:
     idle_timeout_seconds: int = DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS
     subscription_tier: str = "default"
     vision: str = "auto"
+    progress_protocol: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProviderConfig":
@@ -183,12 +192,17 @@ class ProviderConfig:
             or {"balanced": "balanced", "deep": "deep", "max": "max"},
             extra_args=[str(item) for item in data.get("extra_args", [])],
             cwd_flag=str(data.get("cwd_flag", "-C")),
-            prompt_via_stdin=bool(data.get("prompt_via_stdin", True)),
+            prompt_via_stdin=(
+                False
+                if kind == "antigravity"
+                else bool(data.get("prompt_via_stdin", True))
+            ),
             output_flag=str(data.get("output_flag", "-o")),
             timeout_seconds=cls._timeout_seconds_from_dict(data, timeout_default),
             idle_timeout_seconds=int(data.get("idle_timeout_seconds", idle_timeout_default)),
             subscription_tier=str(data.get("subscription_tier", "default")),
             vision=str(data.get("vision", "auto")),
+            progress_protocol=str(data.get("progress_protocol", "")),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -489,11 +503,38 @@ class EvidencePreflightConfig:
 
 
 @dataclass
+class SmartTimeoutConfig:
+    enabled: bool = True
+    provider_idle_seconds: int = 1800
+    tool_idle_seconds: int = 900
+    semantic_stall_seconds: int = 3600
+    safety_ceiling_seconds: int = 43200
+    loop_repeat_limit: int = 3
+    same_provider_resume_limit: int = 1
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "SmartTimeoutConfig":
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            provider_idle_seconds=int(data.get("provider_idle_seconds", 1800)),
+            tool_idle_seconds=int(data.get("tool_idle_seconds", 900)),
+            semantic_stall_seconds=int(data.get("semantic_stall_seconds", 3600)),
+            safety_ceiling_seconds=int(data.get("safety_ceiling_seconds", 43200)),
+            loop_repeat_limit=int(data.get("loop_repeat_limit", 3)),
+            same_provider_resume_limit=int(data.get("same_provider_resume_limit", 1)),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class ExecutionConfig:
     parallel_tasks: ParallelTasksConfig = field(default_factory=ParallelTasksConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     requirements_audit: RequirementsAuditConfig = field(default_factory=RequirementsAuditConfig)
     evidence_preflight: EvidencePreflightConfig = field(default_factory=EvidencePreflightConfig)
+    smart_timeout: SmartTimeoutConfig = field(default_factory=SmartTimeoutConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ExecutionConfig":
@@ -506,6 +547,9 @@ class ExecutionConfig:
             evidence_preflight=EvidencePreflightConfig.from_dict(
                 dict(data.get("evidence_preflight", {}))
             ),
+            smart_timeout=SmartTimeoutConfig.from_dict(
+                dict(data.get("smart_timeout", {}))
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -514,6 +558,7 @@ class ExecutionConfig:
             "recovery": self.recovery.to_dict(),
             "requirements_audit": self.requirements_audit.to_dict(),
             "evidence_preflight": self.evidence_preflight.to_dict(),
+            "smart_timeout": self.smart_timeout.to_dict(),
         }
 
 
@@ -554,7 +599,7 @@ class ProjectConfig:
                 },
                 extra_args=[],
                 cwd_flag="",
-                prompt_via_stdin=True,
+                prompt_via_stdin=False,
                 output_flag="",
                 timeout_seconds=7200,
                 idle_timeout_seconds=7200,
@@ -569,7 +614,7 @@ class ProjectConfig:
                 },
                 extra_args=[],
                 cwd_flag="",
-                prompt_via_stdin=True,
+                prompt_via_stdin=False,
                 output_flag="",
                 timeout_seconds=7200,
                 idle_timeout_seconds=7200,
@@ -690,6 +735,7 @@ class RunState:
     rejected_stage: str = ""
     resume_context: Dict[str, object] = field(default_factory=dict)
     recovery_loop_events: List[Dict[str, object]] = field(default_factory=list)
+    last_recovery_route: Dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -727,6 +773,11 @@ class RunState:
                 entry for entry in (data.get("recovery_loop_events", []) or [])
                 if isinstance(entry, dict)
             ],
+            last_recovery_route=(
+                dict(data.get("last_recovery_route", {}))
+                if isinstance(data.get("last_recovery_route", {}), dict)
+                else {}
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -753,6 +804,7 @@ class RunState:
             "rejected_stage": self.rejected_stage,
             "resume_context": dict(self.resume_context),
             "recovery_loop_events": list(self.recovery_loop_events),
+            "last_recovery_route": dict(self.last_recovery_route),
         }
 
 
@@ -841,6 +893,31 @@ class AgentRequest:
     output_path: Path
     stream_output: Optional[Callable[[str, str], None]] = None
     attachments: List[Path] = field(default_factory=list)
+    attempt_id: str = ""
+    progress_report_path: Optional[Path] = None
+    resume_session_id: str = ""
+
+
+@dataclass
+class AgentProgressEvent:
+    kind: str
+    source: str = "provider"
+    session_id: str = ""
+    tool_id: str = ""
+    fingerprint: str = ""
+    detail: str = ""
+    semantic: bool = False
+
+
+@dataclass
+class AgentTermination:
+    reason: str
+    elapsed_seconds: float = 0.0
+    last_provider_activity_seconds: float = 0.0
+    last_semantic_progress_seconds: float = 0.0
+    active_tool: str = ""
+    repeat_count: int = 0
+    report_path: str = ""
 
 
 @dataclass
@@ -880,6 +957,9 @@ class AgentResult:
     returncode: int = 0
     streamed_stdout: bool = False
     streamed_stderr: bool = False
+    provider_session_id: str = ""
+    termination: Optional[AgentTermination] = None
+    supervision_report_path: str = ""
 
 
 @dataclass

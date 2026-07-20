@@ -532,7 +532,64 @@ def load_provider_references_lock(project_root: Path) -> dict:
     return empty_provider_references_lock()
 
 
-def validate_requirements_trace_payload(payload: object) -> List[str]:
+def forbidden_pattern_definition_reason(pattern: str) -> str:
+    """Return why a forbidden-pattern definition is unsafe or invalid."""
+    reason = _forbidden_pattern_safety_reason(pattern)
+    if reason:
+        return reason
+    try:
+        timeout_regex.compile(pattern)
+    except timeout_regex.error as error:
+        return f"invalid regular expression: {error}"
+    return ""
+
+
+def forbidden_pattern_definition_findings(payload: object) -> List[dict]:
+    """Validate executable pattern definitions without scanning project files.
+
+    Superseded requirements are archival contracts. Their original pattern text is
+    preserved for contract identity, but it is never compiled or executed.
+    """
+    if not isinstance(payload, dict):
+        return []
+    requirements = payload.get("requirements")
+    if not isinstance(requirements, list):
+        return []
+
+    findings: List[dict] = []
+    for index, item in enumerate(requirements, start=1):
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "active")).strip()
+        if status not in {"active", "deferred"}:
+            continue
+        patterns = item.get("forbidden_patterns")
+        if not isinstance(patterns, list):
+            continue
+        for pattern_index, raw_value in enumerate(patterns):
+            if not isinstance(raw_value, str):
+                continue
+            reason = forbidden_pattern_definition_reason(raw_value)
+            if not reason:
+                continue
+            finding = _forbidden_pattern_runtime_finding(
+                item,
+                raw_value,
+                path=".auto-agents/state/requirements_trace.json",
+                kind="forbidden_pattern_safety",
+                reason=reason,
+            )
+            finding["requirement_index"] = index
+            finding["pattern_index"] = pattern_index
+            findings.append(finding)
+    return findings
+
+
+def validate_requirements_trace_payload(
+    payload: object,
+    *,
+    validate_forbidden_pattern_definitions: bool = True,
+) -> List[str]:
     errors: List[str] = []
     if not isinstance(payload, dict):
         return ["requirements trace root must be a JSON object"]
@@ -611,12 +668,13 @@ def validate_requirements_trace_payload(payload: object) -> List[str]:
         forbidden = item.get("forbidden_patterns")
         if not isinstance(forbidden, list) or any(not isinstance(entry, str) for entry in forbidden):
             errors.append(f"{prefix} forbidden_patterns must be a list of strings")
-        else:
-            for pattern in forbidden:
-                try:
-                    re.compile(pattern)
-                except re.error as error:
-                    errors.append(f"{prefix} forbidden pattern is not valid regex: {pattern} ({error})")
+        elif validate_forbidden_pattern_definitions and status != "superseded":
+            for pattern_index, pattern in enumerate(forbidden):
+                reason = forbidden_pattern_definition_reason(pattern)
+                if reason:
+                    errors.append(
+                        f"{prefix} forbidden_patterns[{pattern_index}] definition is unsafe: {reason}"
+                    )
 
         external_docs_required = item.get("external_docs_required", False)
         if not isinstance(external_docs_required, bool):
@@ -741,6 +799,98 @@ def validate_requirement_contract_transitions(
         if req_id in proven_ids and after_status == "superseded" and not after.get("superseded_by"):
             errors.append(
                 f"proven requirement {req_id} is superseded but has no superseded_by replacement"
+            )
+    return errors
+
+
+def validate_provider_resolve_trace_transition(
+    previous_payload: object,
+    current_payload: object,
+    *,
+    deferred_requirement_ids: Iterable[str] = (),
+) -> List[str]:
+    """Enforce provider-resolve's deliberately narrow trace ownership.
+
+    Provider recovery may preserve an explicit user decision in ``notes`` and
+    may defer the exact requirements approved by the user.  It must never
+    rewrite the proof-bearing requirement contract, contract identities, or
+    supersession topology; those changes belong to clarify.
+    """
+    if not isinstance(previous_payload, dict) or not isinstance(current_payload, dict):
+        return ["provider-resolve requires requirements trace objects before and after the attempt"]
+
+    errors: List[str] = []
+    previous_root = {key: value for key, value in previous_payload.items() if key != "requirements"}
+    current_root = {key: value for key, value in current_payload.items() if key != "requirements"}
+    if previous_root != current_root:
+        changed = sorted(
+            key
+            for key in set(previous_root) | set(current_root)
+            if previous_root.get(key) != current_root.get(key)
+        )
+        errors.append(
+            "provider-resolve changed requirements trace root metadata: "
+            + ", ".join(changed)
+            + "; preserve it and route schema or contract changes to clarify"
+        )
+
+    previous_requirements = previous_payload.get("requirements")
+    current_requirements = current_payload.get("requirements")
+    if not isinstance(previous_requirements, list) or not isinstance(current_requirements, list):
+        return errors + ["provider-resolve requires a requirements list before and after the attempt"]
+    if any(not isinstance(item, dict) for item in previous_requirements + current_requirements):
+        return errors + ["provider-resolve cannot transition a trace containing non-object requirements"]
+
+    previous_ids = [str(item.get("id", "")).strip() for item in previous_requirements]
+    current_ids = [str(item.get("id", "")).strip() for item in current_requirements]
+    if previous_ids != current_ids:
+        errors.append(
+            "provider-resolve changed requirement IDs or ordering; preserve the trace shape and route "
+            "additions, deletions, or replacements to clarify"
+        )
+        return errors
+
+    approved_deferred_ids = {
+        str(value).strip()
+        for value in deferred_requirement_ids
+        if isinstance(value, str) and str(value).strip()
+    }
+    permitted_fields = {"notes", "status"}
+    for req_id, before, after in zip(previous_ids, previous_requirements, current_requirements):
+        label = req_id or "<unknown requirement>"
+        changed_fields = sorted(
+            key
+            for key in set(before) | set(after)
+            if before.get(key) != after.get(key)
+        )
+        disallowed_fields = [field for field in changed_fields if field not in permitted_fields]
+        if disallowed_fields:
+            errors.append(
+                f"provider-resolve changed contract-owned fields for {label}: "
+                f"{', '.join(disallowed_fields)}; keep approval context in notes or route the change to clarify"
+            )
+        if requirement_contract_payload(before) != requirement_contract_payload(after):
+            errors.append(
+                f"provider-resolve changed the proof-bearing contract for {label}; restore it and route "
+                "the semantic change to clarify"
+            )
+        if before.get("contract_sha256") != after.get("contract_sha256"):
+            errors.append(
+                f"provider-resolve changed engine-owned contract_sha256 for {label}; restore the original value"
+            )
+
+        before_status = str(before.get("status", "active")).strip()
+        after_status = str(after.get("status", "active")).strip()
+        if before_status == after_status:
+            continue
+        if not (
+            before_status == "active"
+            and after_status == "deferred"
+            and label in approved_deferred_ids
+        ):
+            errors.append(
+                f"provider-resolve changed status for {label} from {before_status!r} to {after_status!r} "
+                "without an explicit session-owned defer approval"
             )
     return errors
 
@@ -1024,7 +1174,7 @@ def task_is_fully_historically_covered(
 ) -> bool:
     if task.status == "done":
         return False
-    if task.parent_task_id.strip() or task.task_id.strip().startswith("repair-"):
+    if task.task_origin != "planned":
         return False
     requirement_ids = {
         str(item).strip()
@@ -2012,12 +2162,7 @@ def run_requirements_audit(
                 continue
             for raw_value in raw_patterns:
                 raw = str(raw_value)
-                reason = _forbidden_pattern_safety_reason(raw)
-                if not reason:
-                    try:
-                        timeout_regex.compile(raw)
-                    except timeout_regex.error as error:
-                        reason = f"invalid regular expression: {error}"
+                reason = forbidden_pattern_definition_reason(raw)
                 if reason:
                     forbidden_findings_by_requirement.setdefault(req_id, []).append(
                         _forbidden_pattern_runtime_finding(
@@ -2428,7 +2573,7 @@ def forbidden_pattern_findings(
     compiled: List[Tuple[str, timeout_regex.Pattern]] = []
     for index, raw_value in enumerate(patterns):
         raw = str(raw_value)
-        safety_reason = _forbidden_pattern_safety_reason(raw)
+        safety_reason = forbidden_pattern_definition_reason(raw)
         if safety_reason:
             return [
                 _forbidden_pattern_runtime_finding(
@@ -2439,18 +2584,7 @@ def forbidden_pattern_findings(
                     reason=safety_reason,
                 )
             ]
-        try:
-            compiled.append((raw, timeout_regex.compile(raw)))
-        except timeout_regex.error as error:
-            return [
-                _forbidden_pattern_runtime_finding(
-                    requirement,
-                    raw,
-                    path=".auto-agents/state/requirements_trace.json",
-                    kind="forbidden_pattern_safety",
-                    reason=f"invalid regular expression: {error}",
-                )
-            ]
+        compiled.append((raw, timeout_regex.compile(raw)))
     if not compiled:
         return findings
     if _metrics is not None:
@@ -2585,11 +2719,13 @@ def _forbidden_pattern_runtime_finding(
     literal = f" '{pattern}'" if pattern else ""
     return {
         "kind": kind,
+        "requirement_id": req_id,
         "message": (
             f"forbidden-pattern audit stopped for {req_id}: pattern{literal} at {path}: {reason}. "
             "Replace broad wildcards with bounded spans such as [\\s\\S]{0,500}? and rerun."
         ),
         "pattern": pattern,
+        "reason": reason,
         "path": path,
         "authoritative": True,
     }

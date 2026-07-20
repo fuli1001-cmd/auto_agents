@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +17,9 @@ from .config import (
     docs_dir,
     list_sessions,
     load_session_state,
+    provider_references_dir,
+    provider_references_lock_path,
+    requirements_trace_path,
     save_session_state,
     session_artifact_paths,
     sort_sessions,
@@ -36,11 +41,22 @@ from .models import (
     SESSION_STALL_THRESHOLD,
     SessionState,
 )
+from .requirements import (
+    load_requirements_trace,
+    validate_provider_resolve_trace_transition,
+    validate_requirements_trace_payload,
+)
 from .validation import _looks_like_python_command, _uses_project_local_conda
 
 _GOAL_CLEAR = re.compile(r"^GOAL_CLEAR\s*$", re.MULTILINE)
 _NOT_A_BUG = re.compile(r"^NOT_A_BUG:\s*(.+)$", re.MULTILINE)
 _NEED_USER_ASSIST = re.compile(r"^NEED_USER_ASSIST:\s*(.+)$", re.MULTILINE)
+_NEED_USER_DEFER = re.compile(
+    r"^NEED_USER_DEFER:\s*([^|\n]+)\|\s*(.+)$",
+    re.MULTILINE,
+)
+_REQUIRES_CLARIFY = re.compile(r"^REQUIRES_CLARIFY:\s*(.+)$", re.MULTILINE)
+_REQUIREMENT_ID = re.compile(r"\bREQ-[A-Za-z0-9_-]+\b")
 _BUG_FOUND = re.compile(r"^BUG_FOUND:\s*(.+)$", re.MULTILINE)
 _GOAL_ACHIEVED = re.compile(r"^GOAL_ACHIEVED:\s*(.+)$", re.MULTILINE)
 _FIX_VERIFY = re.compile(r"^FIX_VERIFY:\s*(.+)$", re.MULTILINE)
@@ -538,61 +554,223 @@ class Session:
             state.current_attempt += 1
             self._print(f"\n--- Provider recovery iteration {state.current_attempt} ---")
 
-            prompt = self._build_provider_resolve_prompt(state, feedback)
-            provider_artifacts_before = worktree_fingerprint(
-                self.project_root, ignored_prefixes=(".antigravitycli/",)
-            )
             try:
-                reply = self._call_agent(state, f"provider-resolve-{state.current_attempt}", prompt)
-            except RuntimeError as exc:
-                err_msg = str(exc)
-                state.consecutive_agent_errors += 1
+                trace_before = load_requirements_trace(self.project_root, normalize=False)
+            except Exception as exc:
+                trace_before = None
+                baseline_errors = [f"requirements trace could not be loaded: {exc}"]
+            else:
+                baseline_errors = validate_requirements_trace_payload(trace_before)
+            if baseline_errors:
+                reason = self._format_provider_validation_errors(
+                    "provider-resolve preflight rejected the existing requirements trace",
+                    baseline_errors,
+                )
+                state.status = "failed"
+                state.resolution = "preflight_blocked"
                 state.execution_log.append({
                     "attempt": state.current_attempt,
-                    "action": "agent_error",
-                    "result": err_msg[:500],
+                    "action": "preflight_blocked",
+                    "result": reason[:500],
                     "timestamp": self._now(),
                 })
                 self._save(state)
-                stop = self._should_stop(state, "agent_error")
-                if stop:
-                    self._print(stop)
-                    break
-                feedback = self._build_error_feedback(err_msg)
-                self._print("Will retry on next iteration.")
-                continue
+                raise RuntimeError(reason)
 
-            state.consecutive_agent_errors = 0
-            state.conversation.append({"role": "agent", "content": reply})
-            state.execution_log.append({
-                "attempt": state.current_attempt,
-                "action": "provider_resolve",
-                "result": reply[:500],
-                "timestamp": self._now(),
-            })
-            self._save(state)
+            prompt = self._build_provider_resolve_prompt(state, feedback)
+            approved_defer_ids = self._provider_defer_approved_ids(state)
+            with tempfile.TemporaryDirectory(prefix="auto-agents-provider-restore-") as restore_tmp:
+                restore_root = Path(restore_tmp)
+                self._capture_provider_artifact_restore_point(restore_root)
+                worktree_before = self.orch._worktree_change_snapshot()
+                try:
+                    reply = self._call_agent(
+                        state,
+                        f"provider-resolve-{state.current_attempt}",
+                        prompt,
+                    )
+                except RuntimeError as exc:
+                    self._restore_provider_artifacts(restore_root)
+                    violation = self.orch._stage_mutation_scope_violation(
+                        stage="provider_resolve",
+                        stage_key=f"provider-resolve-{state.current_attempt}",
+                        run_id=state.session_id,
+                        before_snapshot=worktree_before,
+                    )
+                    if violation is not None:
+                        offending, allowed_scope = violation
+                        raise RuntimeError(
+                            "provider-resolve modified files outside its ownership while the agent call failed. "
+                            f"Changed paths: {self.orch._changed_path_preview(offending)}. "
+                            f"Allowed scope: {'; '.join(allowed_scope)}."
+                        ) from exc
+                    err_msg = str(exc)
+                    state.consecutive_agent_errors += 1
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": "agent_error",
+                        "result": err_msg[:500],
+                        "timestamp": self._now(),
+                    })
+                    self._save(state)
+                    stop = self._should_stop(state, "agent_error")
+                    if stop:
+                        self._print(stop)
+                        break
+                    feedback = self._build_error_feedback(err_msg)
+                    self._print("Will retry on next iteration.")
+                    continue
 
-            assist_match = _NEED_USER_ASSIST.search(reply)
-            if assist_match:
-                state.stall_count = 0
-                display = reply.strip()
-                self._print(f"\nAgent:\n{display}")
-                self._print(f"\nAgent needs your assistance: {assist_match.group(1)}")
-                state.status = "waiting_user"
+                state.consecutive_agent_errors = 0
+                state.conversation.append({"role": "agent", "content": reply})
+                state.execution_log.append({
+                    "attempt": state.current_attempt,
+                    "action": "provider_resolve",
+                    "result": reply[:500],
+                    "timestamp": self._now(),
+                })
                 self._save(state)
-                user_reply = self._prompt_user("\nYour response (or decision): ", multiline=True)
-                state.conversation.append({"role": "user", "content": user_reply.strip() or "Done."})
-                state.status = "executing"
-                self._save(state)
-                self._print_agent_thinking()
-                feedback = ""
-                continue
+
+                violation = self.orch._stage_mutation_scope_violation(
+                    stage="provider_resolve",
+                    stage_key=f"provider-resolve-{state.current_attempt}",
+                    run_id=state.session_id,
+                    before_snapshot=worktree_before,
+                )
+                if violation is not None:
+                    self._restore_provider_artifacts(restore_root)
+                    offending, allowed_scope = violation
+                    reason = (
+                        "provider-resolve modified files outside its ownership. "
+                        f"Changed paths: {self.orch._changed_path_preview(offending)}. "
+                        f"Allowed scope: {'; '.join(allowed_scope)}."
+                    )
+                    state.status = "failed"
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": "provider_scope_rejected",
+                        "result": reason[:500],
+                        "timestamp": self._now(),
+                    })
+                    self._save(state)
+                    raise RuntimeError(reason)
+
+                try:
+                    trace_after = load_requirements_trace(self.project_root, normalize=False)
+                except Exception as exc:
+                    trace_errors = [f"requirements trace could not be loaded after the attempt: {exc}"]
+                else:
+                    trace_errors = validate_provider_resolve_trace_transition(
+                        trace_before,
+                        trace_after,
+                        deferred_requirement_ids=approved_defer_ids,
+                    )
+                    trace_errors.extend(validate_requirements_trace_payload(trace_after))
+                trace_errors = list(dict.fromkeys(trace_errors))
+                if trace_errors:
+                    self._restore_provider_artifacts(restore_root)
+                    reason = self._format_provider_validation_errors(
+                        "provider-resolve rejected requirements trace changes and restored the attempt",
+                        trace_errors,
+                    )
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": "provider_trace_rejected",
+                        "result": reason[:500],
+                        "timestamp": self._now(),
+                    })
+                    self._save(state)
+                    diff_hash = self._compute_diff_hash()
+                    verify_sig = self._compute_verify_sig(reason)
+                    self._update_stall_state(state, diff_hash, verify_sig)
+                    self._save(state)
+                    stop = self._should_stop(state, reason)
+                    if stop:
+                        self._print(stop)
+                        break
+                    feedback = reason
+                    self._print(reason)
+                    continue
+
+                clarify_match = _REQUIRES_CLARIFY.search(reply)
+                if clarify_match:
+                    self._restore_provider_artifacts(restore_root)
+                    reason = clarify_match.group(1).strip()
+                    self.orch.route_provider_contract_change_to_clarify(reason)
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": "routed_to_clarify",
+                        "result": reason[:500],
+                        "timestamp": self._now(),
+                    })
+                    self._save(state)
+                    try:
+                        resumed = self.orch.resume_saved_run()
+                    except RuntimeError:
+                        state.status = "failed"
+                        state.resolution = "clarify_handoff_failed"
+                        self._save(state)
+                        raise
+                    if resumed.status == "failed":
+                        state.status = "failed"
+                        state.resolution = "clarify_handoff_failed"
+                        self._save(state)
+                        raise RuntimeError(resumed.last_error or "run failed after clarify handoff")
+                    state.status = "completed"
+                    state.resolution = "routed_to_clarify"
+                    self._save(state)
+                    return state
+
+                defer_match = _NEED_USER_DEFER.search(reply)
+                if defer_match:
+                    requested_ids = sorted(set(_REQUIREMENT_ID.findall(defer_match.group(1))))
+                    if not requested_ids:
+                        feedback = (
+                            "NEED_USER_DEFER must name at least one requirement ID before the '|' separator."
+                        )
+                        continue
+                    state.stall_count = 0
+                    self._print(f"\nAgent:\n{reply.strip()}")
+                    state.status = "waiting_user"
+                    self._save(state)
+                    user_reply = self._prompt_user(
+                        f"\nDefer {', '.join(requested_ids)}? {defer_match.group(2).strip()} (yes/no): ",
+                        multiline=False,
+                    )
+                    approved = self._is_affirmative_provider_decision(user_reply)
+                    state.conversation.append({
+                        "role": "user",
+                        "content": user_reply.strip() or "No.",
+                    })
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": "provider_defer_approved" if approved else "provider_defer_denied",
+                        "result": ",".join(requested_ids),
+                        "timestamp": self._now(),
+                    })
+                    state.status = "executing"
+                    self._save(state)
+                    self._print_agent_thinking()
+                    feedback = "" if approved else "The user did not approve deferring those requirements."
+                    continue
+
+                assist_match = _NEED_USER_ASSIST.search(reply)
+                if assist_match:
+                    state.stall_count = 0
+                    self._print(f"\nAgent:\n{reply.strip()}")
+                    self._print(f"\nAgent needs your assistance: {assist_match.group(1)}")
+                    state.status = "waiting_user"
+                    self._save(state)
+                    user_reply = self._prompt_user("\nYour response (or decision): ", multiline=True)
+                    state.conversation.append({"role": "user", "content": user_reply.strip() or "Done."})
+                    state.status = "executing"
+                    self._save(state)
+                    self._print_agent_thinking()
+                    feedback = ""
+                    continue
 
             self._print(f"\nAgent:\n{reply.strip()}")
-            if worktree_fingerprint(
-                self.project_root, ignored_prefixes=(".antigravitycli/",)
-            ) != provider_artifacts_before:
-                self.orch.bind_resolved_provider_reference_contracts()
+            self.orch.bind_resolved_provider_reference_contracts()
             verify = self.orch.provider_research_resolution_report()
             verify_reason = "" if verify["eligible"] is False and not verify["blockers"] else str(
                 verify.get("reason") or "\n".join(
@@ -611,7 +789,23 @@ class Session:
             self._save(state)
 
             if not verify.get("blockers"):
-                self._print("Provider references now pass local validation. Resuming run...")
+                preflight = self.orch.validate()
+                if not preflight.get("ok"):
+                    reason = self._format_provider_validation_errors(
+                        "provider references pass, but run preflight is still blocked",
+                        [str(item) for item in preflight.get("errors", [])],
+                    )
+                    state.status = "failed"
+                    state.resolution = "preflight_blocked"
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": "preflight_blocked",
+                        "result": reason[:500],
+                        "timestamp": self._now(),
+                    })
+                    self._save(state)
+                    raise RuntimeError(reason)
+                self._print("Provider references and full preflight now pass. Resuming run...")
                 try:
                     resumed = self.orch.resume_saved_run()
                 except RuntimeError as exc:
@@ -640,10 +834,22 @@ class Session:
                             "gap, and apply the minimal additional edits needed."
                         )
                         continue
-                    state.status = "completed"
-                    state.resolution = "provider_research_resolved"
+                    state.status = "failed"
+                    state.resolution = "provider_research_resolved_run_failed"
                     self._save(state)
                     raise
+
+                if resumed.status == "failed":
+                    state.status = "failed"
+                    state.resolution = "provider_research_resolved_run_failed"
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": "resume_run_failed",
+                        "result": (resumed.last_error or "resumed run returned failed")[:500],
+                        "timestamp": self._now(),
+                    })
+                    self._save(state)
+                    raise RuntimeError(resumed.last_error or "resumed run returned failed")
 
                 state.status = "completed"
                 state.resolution = "provider_research_resolved"
@@ -822,7 +1028,9 @@ class Session:
             "2. Discuss the unblock path with the user when a decision is needed.",
             "3. Apply only the minimal edits needed to provider-research artifacts.",
             "4. If you need the user to choose between options, output 'NEED_USER_ASSIST: <question or decision needed>' on a line by itself.",
-            "5. Do not modify product/runtime code, implementation tasks, or unrelated state files.",
+            "5. To ask for an explicit defer decision, output 'NEED_USER_DEFER: REQ-001,REQ-002 | <question>' on a line by itself; do not change status before approval.",
+            "6. If the provider finding requires any normative requirement change, do not edit the trace; output 'REQUIRES_CLARIFY: <reason>' on a line by itself.",
+            "7. Do not modify product/runtime code, implementation tasks, or unrelated state files.",
             "",
             "Success criteria for this mode:",
             "- every required provider reference exists locally",
@@ -833,7 +1041,10 @@ class Session:
             "- keep markdown factual and aligned with the user's decision",
             "- update provider_references.lock.json consistently with the markdown file",
             "- if the user approves assumptions, record assumption_approved explicitly",
-            "- if the user defers a requirement, make only the tightly coupled trace/lock edits needed for that decision",
+            "- requirements_trace.json is read-only except for notes and an explicitly approved active-to-deferred status change",
+            "- record approval context in notes, never in source, text, or another proof-bearing contract field",
+            "- contract_sha256 and provider lock consumer contract hashes are engine-owned; do not calculate or edit them",
+            "- do not add, remove, reorder, reactivate, or supersede requirements in provider-resolve",
             "",
             "Final response: brief status update of what you changed and why.",
         ])
@@ -1033,6 +1244,58 @@ class Session:
         return "\n".join(lines)
 
     # ── Helpers ──────────────────────────────────────────────────
+
+    def _provider_artifact_paths(self) -> List[Path]:
+        return [
+            requirements_trace_path(self.project_root),
+            provider_references_lock_path(self.project_root),
+            provider_references_dir(self.project_root),
+        ]
+
+    def _capture_provider_artifact_restore_point(self, restore_root: Path) -> None:
+        for source in self._provider_artifact_paths():
+            relative = source.relative_to(self.project_root)
+            target = restore_root / relative
+            if source.is_dir():
+                shutil.copytree(source, target, dirs_exist_ok=True)
+            elif source.exists() or source.is_symlink():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target, follow_symlinks=False)
+
+    def _restore_provider_artifacts(self, restore_root: Path) -> None:
+        for target in self._provider_artifact_paths():
+            relative = target.relative_to(self.project_root)
+            source = restore_root / relative
+            if target.is_dir():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+            if source.is_dir():
+                shutil.copytree(source, target, dirs_exist_ok=True)
+            elif source.exists() or source.is_symlink():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target, follow_symlinks=False)
+
+    @staticmethod
+    def _format_provider_validation_errors(title: str, errors: List[str]) -> str:
+        detail = "\n".join(f"- {item}" for item in errors if str(item).strip())
+        return f"{title}:\n{detail}" if detail else title
+
+    @staticmethod
+    def _provider_defer_approved_ids(state: SessionState) -> set[str]:
+        approved: set[str] = set()
+        for entry in state.execution_log:
+            if str(entry.get("action", "")).strip() != "provider_defer_approved":
+                continue
+            approved.update(_REQUIREMENT_ID.findall(str(entry.get("result", ""))))
+        return approved
+
+    @staticmethod
+    def _is_affirmative_provider_decision(value: str) -> bool:
+        normalized = str(value or "").strip().casefold()
+        if normalized in {"y", "yes", "ok", "approve", "approved", "同意", "是", "确认", "暂缓", "延期"}:
+            return True
+        return normalized.startswith(("yes ", "approve ", "同意", "确认"))
 
     def _call_agent(self, state: SessionState, label: str, prompt: str) -> str:
         """Call the AI agent and return its reply text."""

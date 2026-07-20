@@ -753,6 +753,7 @@ class RecoveringProtectedInputMutationImplementAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
         self.implement_calls = 0
+        self.review_input_before_review = ""
 
     def run(self, request):
         if request.stage == "implement":
@@ -765,6 +766,9 @@ class RecoveringProtectedInputMutationImplementAdapter:
             else:
                 summary = "implemented clean retry\n"
         elif request.stage == "review":
+            self.review_input_before_review = (
+                self.project_root / ".auto-agents" / "docs" / "review.md"
+            ).read_text(encoding="utf-8")
             summary = "DECISION: pass\nLooks good.\n"
         else:
             summary = f"{request.stage}\n"
@@ -1409,6 +1413,43 @@ class PermanentReviewFailureAdapter:
         else:
             summary = f"{request.stage}\n"
             write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
+class RepairReviewRecoveryAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.review_calls = 0
+        self.implement_prompts: list[str] = []
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            self.implement_prompts.append(request.prompt)
+            write_text(
+                self.project_root / "artifact.txt",
+                f"implementation round {self.implement_calls}\n",
+            )
+            summary = f"implemented round {self.implement_calls}\n"
+        elif request.stage == "review":
+            self.review_calls += 1
+            if self.review_calls == 1:
+                summary = (
+                    "DECISION: fail\n"
+                    "Acceptance proof is tautological; add two qualified candidates.\n"
+                )
+            else:
+                summary = "DECISION: pass\nreview passed\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
         return AgentResult(
             ok=True,
             command=["fake"],
@@ -2170,6 +2211,19 @@ class RetryFlowTests(unittest.TestCase):
             self.assertFalse(is_allowed("custom-spec.md"))
             self.assertIn("except input specs", "; ".join(allowed_scope))
 
+            _repair_scope, repair_is_allowed = orchestrator._stage_mutation_policy(
+                stage="implement",
+                stage_key="implement-arbitrary-child-id",
+                run_id=state.run_id,
+                task_origin="evidence_repair",
+            )
+            self.assertTrue(repair_is_allowed(".auto-agents/state/task_plan.json"))
+            self.assertTrue(
+                repair_is_allowed(
+                    ".auto-agents/docs/provider_references/provider.md"
+                )
+            )
+
     def test_implement_stage_retries_after_auto_agents_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -2268,6 +2322,9 @@ class RetryFlowTests(unittest.TestCase):
             config.gates.commands = []
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = (
+                project_root / "specs" / "2026-05-07-iter-01.md"
+            ).resolve()
             orchestrator.adapter = RecoveringProtectedInputMutationImplementAdapter(project_root)
 
             write_json(
@@ -2293,9 +2350,10 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertEqual(result.tasks[0].status, "done")
             self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertEqual(orchestrator.adapter.review_input_before_review, original_review)
             self.assertEqual(
                 (project_root / ".auto-agents" / "docs" / "review.md").read_text(encoding="utf-8"),
-                original_review,
+                "Looks good.\n",
             )
             self.assertEqual(
                 (project_root / "specs" / "2026-05-07-iter-01.md").read_text(encoding="utf-8"),
@@ -3212,6 +3270,7 @@ class RetryFlowTests(unittest.TestCase):
                             "status": "pending",
                             "commit_message": "",
                             "parent_task_id": "task-001",
+                            "task_origin": "evidence_repair",
                             "test_generated": True,
                         }
                     ]
@@ -3243,6 +3302,7 @@ class RetryFlowTests(unittest.TestCase):
                 acceptance=["provider reference records gpt-image-2-vip"],
                 status="pending",
                 parent_task_id="task-001",
+                task_origin="evidence_repair",
                 commit_message="",
             )
             state = load_run_state(project_root)
@@ -3298,6 +3358,7 @@ class RetryFlowTests(unittest.TestCase):
                             "status": "pending",
                             "commit_message": "",
                             "parent_task_id": "task-001",
+                            "task_origin": "evidence_repair",
                         },
                     ]
                 },
@@ -3606,6 +3667,7 @@ class RetryFlowTests(unittest.TestCase):
                 title="Repair proof evidence",
                 description="Fix the proof evidence assertion.",
                 acceptance=["The proof evidence ref passes."],
+                task_origin="evidence_repair",
                 verification_refs=[ref],
                 verify_baseline_failures=[ref],
             )
@@ -3753,6 +3815,7 @@ class RetryFlowTests(unittest.TestCase):
                     "raise SystemExit(1 if done else 0)\""
                 )
             ]
+            config.execution.recovery.enabled = False
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
             orchestrator.adapter = SequentialArtifactAdapter(project_root)
@@ -4215,6 +4278,7 @@ class RetryFlowTests(unittest.TestCase):
                 )
             ]
             config.retries.per_stage["implement"] = 4
+            config.execution.recovery.enabled = False
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
             orchestrator.adapter = SequencedVerifyFailureAdapter(project_root, ["bad", "bad"])
@@ -4279,11 +4343,16 @@ class RetryFlowTests(unittest.TestCase):
                 title="Repair proof evidence",
                 description="Add the missing proof evidence test.",
                 acceptance=["The proof evidence ref exists and passes."],
+                task_origin="evidence_repair",
                 verification_refs=[ref],
             )
             state = load_run_state(project_root)
             state.tasks = [task]
             missing_ref = project_root / "tests" / "test_contract.py"
+            write_text(
+                missing_ref,
+                "import unittest\n\nclass ContractTests(unittest.TestCase):\n    pass\n",
+            )
             missing_node_id = f"{missing_ref}::ContractTests::test_missing_contract"
 
             def fake_missing_owned_ref(commands, *, collect_all, context):
@@ -4346,10 +4415,20 @@ class RetryFlowTests(unittest.TestCase):
                 title="Repair proof evidence",
                 description="Fix the proof evidence assertion.",
                 acceptance=["The proof evidence ref passes."],
+                task_origin="evidence_repair",
                 verification_refs=[ref],
             )
             state = load_run_state(project_root)
             state.tasks = [task]
+            write_text(
+                project_root / "tests" / "test_contract.py",
+                (
+                    "import unittest\n\n"
+                    "class ContractTests(unittest.TestCase):\n"
+                    "    def test_provider_reference(self):\n"
+                    "        self.assertTrue(True)\n"
+                ),
+            )
 
             def fake_failing_owned_ref(commands, *, collect_all, context):
                 return (
@@ -4400,6 +4479,7 @@ class RetryFlowTests(unittest.TestCase):
                 )
             ]
             config.retries.per_stage["implement"] = 3
+            config.execution.recovery.enabled = False
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
             orchestrator.adapter = SequencedVerifyFailureAdapter(project_root, ["alpha", "beta", "alpha"])
@@ -4587,6 +4667,7 @@ class RetryFlowTests(unittest.TestCase):
             config = orchestrator.config
             config.gates.commands = []
             config.retries.per_stage["implement"] = 1
+            config.execution.recovery.enabled = False
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root)
             orchestrator.adapter = PermanentReviewFailureAdapter(project_root)
@@ -4628,6 +4709,7 @@ class RetryFlowTests(unittest.TestCase):
             config = orchestrator.config
             config.gates.commands = []
             config.retries.per_stage["implement"] = 1
+            config.execution.recovery.enabled = False
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
             orchestrator.adapter = PermanentReviewFailureAdapter(project_root)
@@ -4813,6 +4895,478 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(parent.recovery_history[-1]["result"], "scheduled")
             self.assertIn("[recovery] scheduled parent=task-001", stream.getvalue())
 
+    def test_review_rejected_repair_is_requeued_with_feedback_before_parent_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.retries.per_stage["implement"] = 1
+            config.execution.parallel_tasks.enabled = False
+            config.execution.recovery.max_rounds = 2
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = RepairReviewRecoveryAdapter(project_root)
+
+            repair_id = "repair-task-001-r1-1"
+            signature = orchestrator._recovery_signature([])
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": repair_id,
+                            "title": "Repair weak acceptance proof",
+                            "description": "Replace the weak proof with observable behavior.",
+                            "acceptance": ["The public API proves the selection rule."],
+                            "status": "pending",
+                            "commit_message": "",
+                            "parent_task_id": "task-001",
+                        },
+                        {
+                            "task_id": "task-001",
+                            "title": "Parent task",
+                            "description": "Implement candidate selection.",
+                            "acceptance": ["The highest qualified candidate is selected."],
+                            "depends_on": [repair_id],
+                            "status": "pending",
+                            "commit_message": "",
+                            "recovery_history": [
+                                {
+                                    "signature": signature,
+                                    "round": 1,
+                                    "result": "scheduled",
+                                    "reason": "review rejected the task",
+                                    "failure_ids": [],
+                                    "repair_task_ids": [repair_id],
+                                }
+                            ],
+                        },
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            first = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            repair, parent = first.tasks
+            self.assertEqual(repair.status, "pending")
+            self.assertEqual(repair.recovery_history[-1]["result"], "requeued")
+            self.assertEqual(repair.recovery_history[-1]["round"], 2)
+            self.assertEqual(parent.recovery_history[-1]["result"], "requeued")
+            self.assertEqual(parent.recovery_history[-1]["round"], 2)
+            self.assertNotIn(f"implement-{repair_id}", first.agent_attempts)
+            self.assertNotIn(
+                repair_id,
+                first.resume_context.get("implementation_ready_tasks", {}),
+            )
+
+            second = orchestrator._run_implementation_loop(first, max_tasks=1)
+
+            self.assertEqual(second.tasks[0].status, "done")
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertEqual(orchestrator.adapter.review_calls, 2)
+            self.assertIn("Previous attempt issues:", orchestrator.adapter.implement_prompts[1])
+            self.assertIn(
+                "Acceptance proof is tautological; add two qualified candidates.",
+                orchestrator.adapter.implement_prompts[1],
+            )
+            self.assertIn(
+                "[recovery] requeued repair=repair-task-001-r1-1 parent=task-001 round=2",
+                stream.getvalue(),
+            )
+
+    def test_review_rejected_scope_split_task_is_requeued_without_id_heuristics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.retries.per_stage["implement"] = 1
+            config.execution.parallel_tasks.enabled = False
+            config.execution.recovery.max_rounds = 2
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = RepairReviewRecoveryAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-271b",
+                            "title": "Select the highest qualified candidate",
+                            "description": "Implement the replanned candidate-selection slice.",
+                            "acceptance": ["The public API selects the highest score."],
+                            "status": "pending",
+                            "commit_message": "",
+                            "parent_task_id": "task-271",
+                            "split_depth": 1,
+                            "task_origin": "scope_split",
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            first = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(first.tasks[0].status, "pending")
+            self.assertEqual(first.tasks[0].task_origin, "scope_split")
+            self.assertEqual(first.tasks[0].recovery_round, 1)
+            self.assertEqual(first.last_recovery_route["outcome"], "requeued")
+            self.assertEqual(first.last_recovery_route["lineage_id"], "task-271b")
+
+            second = orchestrator._run_implementation_loop(first, max_tasks=1)
+
+            self.assertEqual(second.tasks[0].status, "done")
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertIn(
+                "Acceptance proof is tautological; add two qualified candidates.",
+                orchestrator.adapter.implement_prompts[1],
+            )
+
+    def test_recovery_judge_parser_requires_structured_actionable_decisions(self) -> None:
+        cont = Orchestrator._parse_recovery_judge_decision(
+            'RECOVERY_DECISION: {"decision":"CONTINUE","reason":"fixable",'
+            '"actionable_items":["add two candidates"],"split_axis":[]}'
+        )
+        replan = Orchestrator._parse_recovery_judge_decision(
+            '{"decision":"REPLAN","reason":"too broad","actionable_items":[],'
+            '"split_axis":["selection", "proof"]}'
+        )
+        stop = Orchestrator._parse_recovery_judge_decision(
+            '{"decision":"STOP","reason":"external input required",'
+            '"actionable_items":[],"split_axis":[]}'
+        )
+        invalid = Orchestrator._parse_recovery_judge_decision(
+            '{"decision":"CONTINUE","reason":"fixable","actionable_items":[]}'
+        )
+
+        self.assertEqual(cont["decision"], "CONTINUE")
+        self.assertEqual(replan["decision"], "REPLAN")
+        self.assertEqual(stop["decision"], "STOP")
+        self.assertEqual(invalid["decision"], "")
+
+    def test_recovery_judge_stop_is_a_persisted_terminal_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="ordinary-child",
+                title="Ordinary child",
+                description="Implement a split slice.",
+                acceptance=["Observable proof passes."],
+                status="in_progress",
+                task_origin="scope_split",
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+
+            with patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                return_value={
+                    "decision": "STOP",
+                    "reason": "The review requires external clarification.",
+                    "actionable_items": [],
+                    "split_axis": [],
+                    "source": "provider",
+                },
+            ):
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    {
+                        "reason": "review rejected the task",
+                        "review": "Acceptance cannot be proven from the current contract.",
+                    },
+                )
+
+            self.assertFalse(scheduled)
+            self.assertEqual(task.status, "in_progress")
+            self.assertEqual(task.recovery_history[-1]["result"], "judge_stopped")
+            self.assertEqual(state.last_recovery_route["outcome"], "judge_stopped")
+            self.assertEqual(state.last_recovery_route["judge_source"], "provider")
+
+    def test_recovery_judge_replan_routes_scope_split_task_to_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="ordinary-child",
+                title="Ordinary child",
+                description="Implement a split slice.",
+                acceptance=["Observable proof passes."],
+                status="in_progress",
+                task_origin="scope_split",
+                split_depth=1,
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_run_recovery_judge",
+                    return_value={
+                        "decision": "REPLAN",
+                        "reason": "The slice still combines two contracts.",
+                        "actionable_items": [],
+                        "split_axis": ["selection", "proof"],
+                        "source": "provider",
+                    },
+                ),
+                patch.object(
+                    orchestrator,
+                    "_handle_scope_overflow_rewind",
+                    return_value=state,
+                ) as rewind,
+            ):
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    {
+                        "reason": "review rejected the task",
+                        "review": "The task remains too broad.",
+                    },
+                )
+
+            self.assertTrue(scheduled)
+            rewind.assert_called_once()
+            self.assertEqual(state.last_recovery_route["outcome"], "replanned")
+            self.assertEqual(state.last_recovery_route["judge_decision"], "REPLAN")
+
+    def test_review_recovery_hard_cap_applies_to_ordinary_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.execution.recovery.max_rounds = 2
+            task = TaskSpec(
+                task_id="task-271b",
+                title="Ordinary child",
+                description="Implement a split slice.",
+                acceptance=["Observable proof passes."],
+                status="in_progress",
+                task_origin="scope_split",
+                recovery_round=2,
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+
+            with patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                side_effect=AssertionError("hard cap must run before the provider judge"),
+            ):
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    {
+                        "reason": "review rejected the task",
+                        "review": "A third implementation cycle would exceed the hard cap.",
+                    },
+                )
+
+            self.assertFalse(scheduled)
+            self.assertEqual(task.recovery_history[-1]["result"], "exhausted")
+            self.assertEqual(task.recovery_history[-1]["round"], 3)
+            self.assertEqual(state.last_recovery_route["outcome"], "exhausted")
+
+    def test_changed_evidence_reopens_terminal_recovery_in_a_new_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-271b",
+                title="Ordinary child",
+                description="Implement a split slice.",
+                acceptance=["Observable proof passes."],
+                status="in_progress",
+                task_origin="scope_split",
+                recovery_round=2,
+            )
+            terminal_fingerprint = orchestrator._recovery_evidence_fingerprint(task)
+            task.recovery_history.append(
+                {
+                    "epoch": 0,
+                    "round": 3,
+                    "result": "exhausted",
+                    "signature": "old-signature",
+                    "failure_signature": "old-signature",
+                    "evidence_fingerprint": terminal_fingerprint,
+                }
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            state.last_recovery_route = {
+                "task_id": "unrelated-task",
+                "lineage_id": "unrelated-task",
+                "epoch": 0,
+                "outcome": "requeued",
+            }
+            write_text(project_root / "new-evidence.txt", "changed evidence\n")
+
+            with patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                return_value={
+                    "decision": "CONTINUE",
+                    "reason": "New evidence makes another cycle useful.",
+                    "actionable_items": ["Use the new evidence."],
+                    "split_axis": [],
+                    "source": "provider",
+                },
+            ):
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    {
+                        "reason": "review rejected the task",
+                        "review": "Re-evaluate the implementation with the new evidence.",
+                    },
+                )
+
+            self.assertTrue(scheduled)
+            self.assertEqual(task.recovery_epoch, 1)
+            self.assertEqual(task.recovery_round, 1)
+            self.assertEqual(state.last_recovery_route["epoch"], 1)
+            self.assertEqual(state.last_recovery_route["outcome"], "requeued")
+
+    def test_review_rejected_repair_stops_after_configured_recovery_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.execution.recovery.max_rounds = 2
+
+            repair_id = "repair-task-001-r1-1"
+            signature = orchestrator._recovery_signature([])
+            round_two = {
+                "signature": signature,
+                "round": 2,
+                "result": "requeued",
+                "reason": "review rejected the task",
+                "failure_ids": [],
+                "repair_task_ids": [repair_id],
+            }
+            repair = TaskSpec(
+                task_id=repair_id,
+                title="Repair weak acceptance proof",
+                description="Replace the weak proof.",
+                acceptance=["Proof is observable."],
+                status="in_progress",
+                parent_task_id="task-001",
+                recovery_history=[dict(round_two)],
+            )
+            parent = TaskSpec(
+                task_id="task-001",
+                title="Parent task",
+                description="Implement candidate selection.",
+                acceptance=["Highest qualified candidate is selected."],
+                status="pending",
+                recovery_history=[dict(round_two)],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [repair, parent]
+
+            scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                state,
+                state.tasks,
+                repair,
+                {
+                    "reason": "review rejected the task",
+                    "review": "A new actionable proof blocker remains.",
+                },
+            )
+
+            self.assertFalse(scheduled)
+            self.assertEqual(repair.status, "in_progress")
+            self.assertEqual(repair.recovery_history[-1]["result"], "exhausted")
+            self.assertEqual(repair.recovery_history[-1]["round"], 3)
+            self.assertEqual(parent.recovery_history[-1]["result"], "exhausted")
+            self.assertEqual(parent.recovery_history[-1]["round"], 3)
+
+    def test_terminal_in_progress_repair_is_requeued_before_resume_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = PermanentReviewFailureAdapter(project_root)
+
+            repair_id = "repair-task-001-r1-1"
+            signature = orchestrator._recovery_signature([])
+            round_one = {
+                "signature": signature,
+                "round": 1,
+                "result": "scheduled",
+                "reason": "review rejected the task",
+                "failure_ids": [],
+                "repair_task_ids": [repair_id],
+            }
+            review = "Acceptance proof is tautological; add two qualified candidates."
+            repair = TaskSpec(
+                task_id=repair_id,
+                title="Repair weak acceptance proof",
+                description="Replace the weak proof.",
+                acceptance=["Proof is observable."],
+                status="in_progress",
+                parent_task_id="task-001",
+                review_summary=review,
+            )
+            parent = TaskSpec(
+                task_id="task-001",
+                title="Parent task",
+                description="Implement candidate selection.",
+                acceptance=["Highest qualified candidate is selected."],
+                status="pending",
+                depends_on=[repair_id],
+                recovery_history=[round_one],
+            )
+            state = load_run_state(project_root)
+            state.status = "failed"
+            state.last_error = (
+                f"Task {repair_id} failed gates: review rejected the task. "
+                f"Review: {review}"
+            )
+            state.agent_attempts[f"implement-{repair_id}"] = 1
+            state.resume_context["implementation_ready_tasks"] = {repair_id: True}
+            state.tasks = [repair, parent]
+
+            result = orchestrator._execute_task_in_main_worktree(
+                state,
+                state.tasks,
+                repair,
+            )
+
+            self.assertIs(result, state)
+            self.assertEqual(repair.status, "pending")
+            self.assertEqual(repair.recovery_history[-1]["result"], "requeued")
+            self.assertEqual(repair.recovery_history[-1]["round"], 2)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(orchestrator.adapter.implement_calls, 0)
+            self.assertEqual(orchestrator.adapter.review_calls, 0)
+            self.assertNotIn(f"implement-{repair_id}", state.agent_attempts)
+            self.assertNotIn(
+                repair_id,
+                state.resume_context.get("implementation_ready_tasks", {}),
+            )
+
     def test_run_logger_writes_to_current_run_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -4932,6 +5486,24 @@ class RetryFlowTests(unittest.TestCase):
                 self.assertEqual(hard_failure, "")
                 self.assertIn("immutable input spec", Orchestrator._audit_blocker_feedback(blocker))
                 self.assertNotIn("owned by implement", Orchestrator._audit_blocker_feedback(blocker))
+
+    def test_requirements_audit_pattern_definition_failures_route_to_clarify(self) -> None:
+        for kind in ("forbidden_pattern_safety", "forbidden_pattern_timeout"):
+            with self.subTest(kind=kind):
+                blocker = {
+                    "kind": kind,
+                    "message": "unsafe literal must not be repeated",
+                    "reason": "DOTALL combined with an unbounded wildcard is unsafe",
+                    "path": ".auto-agents/state/requirements_trace.json",
+                }
+
+                stage, hard_failure = Orchestrator._audit_issue_route(blocker)
+                feedback = Orchestrator._audit_blocker_feedback(blocker)
+
+                self.assertEqual(stage, "clarify")
+                self.assertEqual(hard_failure, "")
+                self.assertIn("owned by clarify", feedback)
+                self.assertNotIn("unsafe literal must not be repeated", feedback)
 
     def test_requirements_audit_route_ignores_non_authoritative_immutable_spec_hit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5875,7 +6447,7 @@ class RetryFlowTests(unittest.TestCase):
 
         pending = Orchestrator._pending_stages(object.__new__(Orchestrator), state)
 
-        self.assertEqual(pending, ["verify", "readme"])
+        self.assertEqual(pending, ["visual_judge", "verify", "readme"])
 
     def test_legacy_requirements_audit_failure_state_is_rewound_before_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6830,6 +7402,7 @@ class IterationFlowTests(unittest.TestCase):
                             "requirement_ids": [],
                             "depends_on": [],
                             "parent_task_id": "task-stale",
+                            "task_origin": "evidence_repair",
                             "verification_refs": ["tests/test_old_api.py::test_contract"],
                         },
                         {
@@ -7541,6 +8114,7 @@ class ScopeArbiterTests(unittest.TestCase):
     def test_arbiter_continue_lets_loop_exhaust_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root, orchestrator = self._make_project(tmp)
+            orchestrator.config.execution.recovery.enabled = False
             orchestrator.adapter = VaryingReviewArbiterAdapter(project_root, arbiter_decision="CONTINUE")
 
             state = load_run_state(project_root)
@@ -7572,6 +8146,7 @@ class ScopeArbiterTests(unittest.TestCase):
     def test_arbiter_unparseable_output_falls_back_to_continue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root, orchestrator = self._make_project(tmp)
+            orchestrator.config.execution.recovery.enabled = False
             orchestrator.adapter = VaryingReviewArbiterAdapter(
                 project_root, arbiter_text="this is not parseable at all"
             )
