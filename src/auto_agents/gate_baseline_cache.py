@@ -222,6 +222,12 @@ class GateBaselineCache:
                     result_list = results_by_command.get(command, [])
                     if result_list:
                         result = result_list.pop(0)
+                        if result.termination_reason or result.cleanup_incomplete:
+                            connection.execute(
+                                "DELETE FROM command_entries WHERE cache_key = ?",
+                                (_entry_key(baseline_ref, command, mode, collect_all),),
+                            )
+                            continue
                         extraction = extract_failure_info(
                             GateResult(ok=result.ok, commands=[result], summary="")
                         )

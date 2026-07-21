@@ -63,17 +63,30 @@ from .config import (
     write_run_prompt,
 )
 from .gates import (
+    GateCommandTimeoutError,
     build_failure_identity_diagnostic_command,
     commands_from_verification_steps,
     extract_failure_ids,
     extract_failure_info,
     gate_plan_from_verification_steps,
     expand_pytest_directory_steps,
+    first_terminated_command,
     run_gate_plan,
     run_commands,
     run_commands_collect_all,
 )
 from .gate_baseline_cache import GateBaselineCache
+from .execution_recovery import (
+    ExecutionIncident,
+    ExecutionIncidentStore,
+    IncidentDiagnosis,
+    command_incident,
+    deterministic_diagnosis,
+    is_execution_incident_recovery_task,
+    provider_incident,
+    parse_incident_diagnosis,
+    recovery_task_marker,
+)
 from .frontend_fidelity import validate_frontend_fidelity_trace
 from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, ref_exists, remove_worktree, update_ref, worktree_fingerprint
 from .io_utils import read_json, read_text, write_json, write_text
@@ -123,6 +136,7 @@ from .requirements import (
     validate_requirements_trace_payload,
     verified_proofs_by_requirement_from_task_payloads,
 )
+from .run_lock import runtime_status
 from .validation import (
     PYTEST_VALUE_OPTIONS,
     _unwrap_conda_run,
@@ -281,12 +295,21 @@ class Orchestrator:
         for result in verify_gate.commands:
             if result.ok:
                 continue
+            if result.termination_reason:
+                continue
             diagnostic_command = build_failure_identity_diagnostic_command(result.command)
             if diagnostic_command and diagnostic_command not in commands:
                 commands.append(diagnostic_command)
         if not commands:
             return None
-        return run_commands_collect_all(commands, self.project_root)
+        return run_commands_collect_all(
+            commands,
+            self.project_root,
+            command_timeout_seconds=self.config.gates.command_timeout_seconds,
+            adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+            command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+            progress=self._gate_progress_callback("failure identity diagnostic"),
+        )
 
     @staticmethod
     def init_project(
@@ -1040,6 +1063,10 @@ class Orchestrator:
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
             self._attach_run_logger(state.run_id)
+            active_incident = self._incident_store(state).active(state)
+            if active_incident is not None and active_incident.status == "self_repair":
+                state.status = "paused"
+                return state
             if self._normalize_legacy_requirements_audit_resume(state):
                 save_run_state(self.project_root, state)
             resolved_spec_file = spec_file.expanduser().resolve()
@@ -1113,12 +1140,33 @@ class Orchestrator:
                             state = self._run_readme(state, spec_file, auto_approve=auto_approve)
                         else:
                             state = self._run_agent_stage(stage, state, spec_file, auto_approve=auto_approve)
+                except GateCommandTimeoutError as error:
+                    recovered = self._handle_gate_execution_incident(state, stage, error)
+                    save_run_state(self.project_root, state)
+                    if recovered:
+                        continue
+                    return state
                 except RuntimeError as error:
+                    self._merge_persisted_execution_incidents(state)
+                    active_incident = self._incident_store(state).active(state)
+                    if active_incident is not None and (
+                        active_incident.source == "provider"
+                        or active_incident.status == "needs_human"
+                    ):
+                        self._pause_for_execution_incident(
+                            state,
+                            active_incident,
+                            f"automatic execution recovery routes were exhausted: {error}",
+                        )
+                        save_run_state(self.project_root, state)
+                        return state
                     state.status = "failed"
                     state.last_error = str(error)
                     save_run_state(self.project_root, state)
                     raise
 
+                self._merge_persisted_execution_incidents(state)
+                self._resolve_rewound_execution_incident(state, stage)
                 save_run_state(self.project_root, state)
                 if stage == "implement" and self._task_budget_exhausted:
                     state.status = "pending"
@@ -2561,6 +2609,10 @@ class Orchestrator:
                 self.project_root,
                 collect_all=collect_all,
                 parallel_workers=self._gate_parallel_workers(),
+                command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                progress=self._gate_progress_callback(context),
             )
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
@@ -2596,6 +2648,10 @@ class Orchestrator:
                 self.project_root,
                 collect_all=collect_all,
                 parallel_workers=self._gate_parallel_workers(),
+                command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                progress=self._gate_progress_callback(context),
             )
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
@@ -2659,6 +2715,10 @@ class Orchestrator:
                 self.project_root,
                 collect_all=True,
                 parallel_workers=self._gate_parallel_workers(),
+                command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                progress=self._gate_progress_callback(context),
             )
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
@@ -2675,14 +2735,477 @@ class Orchestrator:
     def _log_gate_command_results(self, context: str, results: Iterable[object]) -> None:
         for index, result in enumerate(results, start=1):
             self.logger.info(
-                "[gate-command] context=%s index=%s ok=%s returncode=%s duration_seconds=%.3f command=%s",
+                "[gate-command] context=%s index=%s ok=%s returncode=%s duration_seconds=%.3f termination=%s cleanup_incomplete=%s command=%s",
                 context,
                 index,
                 str(bool(getattr(result, "ok", False))).lower(),
                 getattr(result, "returncode", ""),
                 float(getattr(result, "duration_seconds", 0.0) or 0.0),
+                str(getattr(result, "termination_reason", "") or "none"),
+                str(bool(getattr(result, "cleanup_incomplete", False))).lower(),
                 str(getattr(result, "command", ""))[:300],
             )
+
+    def _gate_progress_callback(self, context: str):
+        def emit(event: str, command: str, elapsed_seconds: float) -> None:
+            if event == "start":
+                self.logger.info(
+                    "[gate-command] context=%s state=start timeout_seconds=%s command=%s",
+                    context,
+                    self.config.gates.command_timeout_seconds,
+                    command[:300],
+                )
+            elif event == "heartbeat":
+                self.logger.info(
+                    "[gate-command] context=%s state=running elapsed_seconds=%.1f command=%s",
+                    context,
+                    elapsed_seconds,
+                    command[:300],
+                )
+
+        return emit
+
+    def _raise_for_baseline_termination(self, gate: GateResult, *, context: str) -> None:
+        result = first_terminated_command(gate)
+        if result is None:
+            return
+        if result.cleanup_incomplete:
+            detail = (
+                "process group cleanup is incomplete; run "
+                f"`python auto_agents.py stop --project {self.project_root}` before retrying"
+            )
+        else:
+            detail = (
+                "fix the hanging target-project check or raise "
+                "gates.command_timeout_seconds before retrying"
+            )
+        raise GateCommandTimeoutError(
+            f"baseline gate command {result.termination_reason} during {context}: "
+            f"{result.command} (timeout={result.timeout_seconds:g}s); {detail}",
+            result=result,
+            context=context,
+            baseline=True,
+        )
+
+    def _incident_store(self, state: RunState) -> ExecutionIncidentStore:
+        return ExecutionIncidentStore(self.project_root, state.run_id)
+
+    def _merge_persisted_execution_incidents(self, state: RunState) -> None:
+        persisted = load_run_state(self.project_root)
+        if persisted.run_id != state.run_id or not persisted.execution_incidents:
+            return
+        state.execution_incidents = list(persisted.execution_incidents)
+        state.active_execution_incident_id = persisted.active_execution_incident_id
+
+    def _merge_or_save_execution_incident(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+    ) -> ExecutionIncident:
+        store = self._incident_store(state)
+        existing = None
+        for summary in reversed(state.execution_incidents):
+            if (
+                str(summary.get("incident_fingerprint", ""))
+                == incident.incident_fingerprint
+                and str(summary.get("status", "")) != "resolved"
+            ):
+                existing = store.load(str(summary.get("incident_id", "")))
+                if existing is not None:
+                    break
+        if existing is not None:
+            existing.occurrence_count += 1
+            existing.elapsed_seconds = incident.elapsed_seconds
+            existing.last_activity_seconds = incident.last_activity_seconds
+            existing.activity_kind = incident.activity_kind
+            existing.stdout_tail = incident.stdout_tail
+            existing.stderr_tail = incident.stderr_tail
+            existing.process_snapshot = incident.process_snapshot
+            existing.cleanup_incomplete = incident.cleanup_incomplete
+            existing.head_ref = incident.head_ref
+            existing.worktree_fingerprint = incident.worktree_fingerprint
+            existing.evidence_fingerprint = incident.evidence_fingerprint
+            incident = existing
+        store.save(incident, state)
+        return incident
+
+    def _pause_for_execution_incident(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+        reason: str,
+    ) -> bool:
+        incident.status = "needs_human"
+        incident.history.append({"event": "paused", "reason": reason})
+        state.status = "paused"
+        state.last_error = (
+            f"execution incident {incident.incident_id} requires intervention: {reason}; "
+            f"run `python auto_agents.py recover --project {self.project_root}` to continue"
+        )
+        self._incident_store(state).save(incident, state)
+        self.logger.error(state.last_error)
+        return False
+
+    def _handle_gate_execution_incident(
+        self,
+        state: RunState,
+        stage: str,
+        error: GateCommandTimeoutError,
+    ) -> bool:
+        result = error.result
+        if result is None:
+            state.status = "paused"
+            state.last_error = str(error)
+            return False
+        incident = command_incident(
+            run_id=state.run_id,
+            stage=stage,
+            context=error.context or stage,
+            result=result,
+            baseline=error.baseline,
+            task_id=error.task_id,
+            head_ref=head_ref(self.project_root),
+            worktree_fingerprint=worktree_fingerprint(self.project_root),
+            idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+        )
+        incident = self._merge_or_save_execution_incident(state, incident)
+        diagnosis = deterministic_diagnosis(incident)
+        if diagnosis is None:
+            diagnosis = self._agent_diagnose_execution_incident(incident)
+        if diagnosis is None:
+            return self._pause_for_execution_incident(state, incident, "automatic diagnosis was inconclusive")
+        return self._apply_execution_incident_diagnosis(state, incident, diagnosis)
+
+    def _record_inline_gate_incident(
+        self,
+        state: RunState,
+        gate: GateResult,
+        *,
+        stage: str,
+        context: str,
+        task_id: str = "",
+    ) -> Optional[ExecutionIncident]:
+        result = first_terminated_command(gate)
+        if result is None:
+            return None
+        incident = command_incident(
+            run_id=state.run_id,
+            stage=stage,
+            context=context,
+            result=result,
+            baseline=False,
+            task_id=task_id,
+            head_ref=head_ref(self.project_root),
+            worktree_fingerprint=worktree_fingerprint(self.project_root),
+            idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+        )
+        incident = self._merge_or_save_execution_incident(state, incident)
+        diagnosis = deterministic_diagnosis(incident)
+        if diagnosis is not None:
+            incident.diagnosis = diagnosis.to_dict()
+        distinct_incidents = {
+            str(entry.get("incident_fingerprint", ""))
+            for entry in state.execution_incidents
+            if str(entry.get("incident_fingerprint", ""))
+        }
+        previous = next(
+            (entry for entry in reversed(incident.history) if entry.get("event") == "route"),
+            None,
+        )
+        exhausted = incident.recovery_round >= self.config.execution.recovery.max_rounds
+        unchanged = bool(
+            previous
+            and str(previous.get("evidence_fingerprint", ""))
+            == incident.evidence_fingerprint
+        )
+        if (
+            not self.config.execution.recovery.enabled
+            or len(distinct_incidents) > self.config.execution.recovery.max_incidents_per_run
+            or result.cleanup_incomplete
+            or exhausted
+            or unchanged
+        ):
+            incident.status = "needs_human"
+            incident.history.append(
+                {
+                    "event": "paused",
+                    "reason": (
+                        "process cleanup incomplete"
+                        if result.cleanup_incomplete
+                        else "inline gate recovery made no progress or exhausted its budget"
+                    ),
+                }
+            )
+        else:
+            incident.recovery_round += 1
+            incident.status = "recovering"
+            incident.history.append(
+                {
+                    "event": "route",
+                    "action": "RETRY",
+                    "mode": "current-task",
+                    "round": incident.recovery_round,
+                    "evidence_fingerprint": incident.evidence_fingerprint,
+                }
+            )
+        self._incident_store(state).save(incident, state)
+        save_run_state(self.project_root, state)
+        return incident
+
+    def _apply_execution_incident_diagnosis(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+        diagnosis: IncidentDiagnosis,
+    ) -> bool:
+        incident.diagnosis = diagnosis.to_dict()
+        incident.history.append(
+            {"event": "diagnosed", "diagnosis": diagnosis.to_dict()}
+        )
+        if not self.config.execution.recovery.enabled:
+            return self._pause_for_execution_incident(
+                state, incident, "automatic execution recovery is disabled"
+            )
+        distinct_incidents = {
+            str(entry.get("incident_fingerprint", ""))
+            for entry in state.execution_incidents
+            if str(entry.get("incident_fingerprint", ""))
+        }
+        if len(distinct_incidents) > self.config.execution.recovery.max_incidents_per_run:
+            return self._pause_for_execution_incident(
+                state, incident, "run-level incident budget was exhausted"
+            )
+        if incident.recovery_round >= self.config.execution.recovery.max_rounds:
+            return self._pause_for_execution_incident(
+                state, incident, "the same incident exhausted its recovery rounds"
+            )
+        previous_route = next(
+            (
+                entry for entry in reversed(incident.history)
+                if str(entry.get("event", "")) == "route"
+            ),
+            None,
+        )
+        if (
+            previous_route is not None
+            and str(previous_route.get("action", "")) == diagnosis.action
+            and str(previous_route.get("evidence_fingerprint", ""))
+            == incident.evidence_fingerprint
+        ):
+            return self._pause_for_execution_incident(
+                state,
+                incident,
+                "the previous recovery route produced no new execution evidence",
+            )
+        if diagnosis.confidence < 0.8 or diagnosis.action in {"ASK_USER", "STOP"}:
+            return self._pause_for_execution_incident(state, incident, diagnosis.reason)
+        if diagnosis.action == "SELF_REPAIR":
+            incident.status = "self_repair"
+            incident.history.append(
+                {"event": "route", "action": "SELF_REPAIR", "owner": diagnosis.owner}
+            )
+            state.status = "paused"
+            state.last_error = (
+                f"execution incident {incident.incident_id} was routed to auto_agents self-repair: "
+                f"{diagnosis.reason}"
+            )
+            self._incident_store(state).save(incident, state)
+            return False
+        incident.recovery_round += 1
+        incident.status = "recovering"
+        incident.history.append(
+            {
+                "event": "route",
+                "round": incident.recovery_round,
+                "action": diagnosis.action,
+                "owner": diagnosis.owner,
+                "evidence_fingerprint": incident.evidence_fingerprint,
+            }
+        )
+        if diagnosis.action == "REWIND_CLARIFY":
+            self._rewind_state_from_stage(state, "clarify")
+        elif diagnosis.action == "REWIND_PLAN":
+            self._rewind_state_from_stage(state, "plan")
+        elif diagnosis.action == "RECOVER_TARGET":
+            self._schedule_prebaseline_recovery_task(state, incident)
+        else:
+            # RETRY is deliberately bounded by the incident recovery counter.
+            state.status = "pending"
+            state.last_error = ""
+        self._incident_store(state).save(incident, state)
+        return True
+
+    def _agent_diagnose_execution_incident(
+        self,
+        incident: ExecutionIncident,
+        *,
+        user_context: str = "",
+    ) -> Optional[IncidentDiagnosis]:
+        prompt = (
+            "You are a read-only execution incident judge. Do not edit files or run unbounded "
+            "commands. Diagnose ownership and choose one safe recovery route. Never recommend "
+            "weakening tests, disabling checks, changing credentials/global environment, or merely "
+            "raising a safety timeout. Return only JSON with keys owner, action, confidence, reason, "
+            "evidence. owner must be one of target_project, verification_contract, requirements, "
+            "external_provider, auto_agents, user_input, unknown. action must be one of RETRY, "
+            "RECOVER_TARGET, REWIND_PLAN, REWIND_CLARIFY, SELF_REPAIR, ASK_USER, STOP.\n\n"
+            f"Incident:\n{json.dumps(incident.to_dict(), ensure_ascii=False, indent=2)}\n"
+            f"User context:\n{user_context or '(none)'}"
+        )
+        output_path = run_path(self.project_root, incident.run_id) / "recovery_incidents" / f"{incident.incident_id}-judge.txt"
+        try:
+            with tempfile.TemporaryDirectory(prefix="auto-agents-incident-judge-") as temp_root:
+                request = AgentRequest(
+                    stage="execution_recovery",
+                    effort=self.config.efforts.get("arbiter", "balanced"),
+                    prompt=prompt,
+                    cwd=Path(temp_root),
+                    output_path=output_path,
+                    attempt_id=f"execution-recovery-{incident.incident_id}-{incident.recovery_round + 1}",
+                )
+                result = self._call_with_failover(request)
+            if not result.ok:
+                return None
+            return parse_incident_diagnosis(result.summary or result.stdout)
+        except (RuntimeError, ValueError, json.JSONDecodeError) as error:
+            self.logger.warning("[execution-recovery] judge failed: %s", error)
+            return None
+
+    def recover_execution_incident(self, *, interactive: bool = True) -> RunState:
+        state = load_run_state(self.project_root)
+        store = self._incident_store(state)
+        incident = store.active(state)
+        if incident is None:
+            raise RuntimeError("no active execution incident to recover")
+        if incident.cleanup_incomplete:
+            self._pause_for_execution_incident(
+                state,
+                incident,
+                "process-group cleanup is still incomplete; run the stop command and verify cleanup first",
+            )
+            save_run_state(self.project_root, state)
+            return state
+        context = ""
+        if interactive:
+            context = self._prompt_user(
+                f"Execution incident {incident.incident_id}: {incident.kind} during "
+                f"{incident.context}. Describe relevant context, or type 'stop': "
+            ).strip()
+            if context.lower() in {"stop", "quit", "abort"}:
+                self._pause_for_execution_incident(state, incident, "user stopped recovery")
+                save_run_state(self.project_root, state)
+                return state
+        diagnosis = self._agent_diagnose_execution_incident(incident, user_context=context)
+        if diagnosis is None:
+            self._pause_for_execution_incident(state, incident, "recovery agent could not establish a safe route")
+        else:
+            self._apply_execution_incident_diagnosis(state, incident, diagnosis)
+        save_run_state(self.project_root, state)
+        return state
+
+    def _schedule_prebaseline_recovery_task(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+    ) -> None:
+        tasks = self._load_tasks_from_plan()
+        if not any(
+            any(
+                str(item.get("execution_incident_id", "")) == incident.incident_id
+                for item in task.recovery_history
+            )
+            and task.status != "done"
+            for task in tasks
+        ):
+            task = TaskSpec(
+                task_id=f"recover-execution-{incident.incident_id}-r{incident.recovery_round}",
+                title="Repair stalled verification command",
+                description=(
+                    "Diagnose and repair the target-project cause of this supervised verification "
+                    "incident. Do not weaken, skip, xfail, or remove verification. Do not increase "
+                    "the timeout as the primary fix. Reproduce the command with a bounded diagnostic "
+                    f"probe of at most {self.config.execution.recovery.diagnostic_probe_timeout_seconds} "
+                    "seconds, identify the root cause, and make the smallest general fix.\n\n"
+                    f"Command: {incident.command}\nContext: {incident.context}\n"
+                    f"Termination: {incident.termination_reason}\n"
+                    f"Last activity: {incident.last_activity_seconds:.1f}s ({incident.activity_kind})\n"
+                    f"stderr tail:\n{incident.stderr_tail[-2000:]}"
+                ),
+                acceptance=[
+                    "The original verification command completes within its configured budgets",
+                    "No test or verification contract is weakened or bypassed",
+                    "The root cause and verification evidence are recorded in the task review",
+                ],
+                status="pending",
+                task_origin="stage_recovery",
+                recovery_round=incident.recovery_round,
+                recovery_history=[recovery_task_marker(incident.incident_id, incident.command)],
+            )
+            tasks.insert(0, task)
+            self._persist_tasks(tasks)
+        self._rewind_state_from_stage(state, "implement")
+        state.tasks = tasks
+        state.status = "pending"
+        state.rejected_stage = ""
+        state.rejection_reason = ""
+        state.last_error = ""
+
+    def _resolve_execution_incident_for_task(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> None:
+        incident_id = next(
+            (
+                str(item.get("execution_incident_id", ""))
+                for item in reversed(task.recovery_history)
+                if str(item.get("kind", "")) == "execution_incident"
+            ),
+            "",
+        )
+        if not incident_id:
+            return
+        store = self._incident_store(state)
+        incident = store.load(incident_id)
+        if incident is None:
+            return
+        incident.status = "resolved"
+        incident.history.append(
+            {"event": "resolved", "task_id": task.task_id, "commit_sha": task.commit_sha}
+        )
+        store.save(incident, state)
+
+    def _resolve_inline_task_incident(self, state: RunState, task: TaskSpec) -> None:
+        store = self._incident_store(state)
+        incident = store.active(state)
+        if (
+            incident is None
+            or incident.source != "gate"
+            or incident.task_id != task.task_id
+            or incident.status not in {"recovering", "needs_human"}
+        ):
+            return
+        incident.status = "resolved"
+        incident.history.append(
+            {"event": "resolved", "task_id": task.task_id, "reason": "task retry succeeded"}
+        )
+        store.save(incident, state)
+
+    def _resolve_rewound_execution_incident(self, state: RunState, stage: str) -> None:
+        store = self._incident_store(state)
+        incident = store.active(state)
+        if incident is None or incident.status != "recovering":
+            return
+        action = str(incident.diagnosis.get("action", ""))
+        expected_stage = {
+            "REWIND_PLAN": "plan",
+            "REWIND_CLARIFY": "clarify",
+        }.get(action, "")
+        if expected_stage != stage or stage not in state.stage_summaries:
+            return
+        incident.status = "resolved"
+        incident.history.append({"event": "resolved", "stage": stage})
+        store.save(incident, state)
 
     def _default_gate_commands(self) -> List[str]:
         return list(self.config.gates.commands)
@@ -3041,6 +3564,26 @@ class Orchestrator:
 
         state.tasks = tasks
         self._commit_planning_baseline_if_needed(tasks)
+        prebaseline_recovery = next(
+            (
+                task for task in tasks
+                if task.status != "done" and is_execution_incident_recovery_task(task)
+            ),
+            None,
+        )
+        if prebaseline_recovery is not None:
+            self.logger.info(
+                "[execution-recovery] pre-baseline lane task=%s",
+                prebaseline_recovery.task_id,
+            )
+            rewind_state = self._execute_task_in_main_worktree(
+                state, tasks, prebaseline_recovery
+            )
+            state.tasks = tasks
+            # End this implementation pass. The next pass must establish a fresh
+            # clean-head baseline before ordinary tasks may resume.
+            state.stage_summaries.pop("implement", None)
+            return rewind_state or state
         self._ensure_implement_verify_baseline(state, tasks)
         if self.config.execution.parallel_tasks.enabled:
             return self._run_parallel_implementation_loop(state, tasks, max_tasks)
@@ -3479,7 +4022,10 @@ class Orchestrator:
             task.status = "in_progress"
             self._persist_tasks(tasks)
 
-        if self._ensure_task_verify_baseline(task, state=state):
+        if (
+            not is_execution_incident_recovery_task(task)
+            and self._ensure_task_verify_baseline(task, state=state)
+        ):
             self._persist_tasks(tasks)
 
         gate_result = self._execute_task_with_retries(state, task, resume_existing=resume_existing)
@@ -3530,6 +4076,10 @@ class Orchestrator:
             state,
             failure_ids=gate_result.get("verify_current_failure_ids", []),
         )
+        if is_execution_incident_recovery_task(task):
+            self._resolve_execution_incident_for_task(state, task)
+        else:
+            self._resolve_inline_task_incident(state, task)
         return None
 
     def _parallel_execution_fallback_reason(self, tasks: List[TaskSpec]) -> str:
@@ -5458,6 +6008,18 @@ class Orchestrator:
                 collect_all=task is not None,
                 context="task verification commands" if task is not None else "verification commands",
             )
+        if state is not None:
+            self._record_inline_gate_incident(
+                state,
+                verify_gate,
+                stage="implement",
+                context=(
+                    f"task verification commands ({task.task_id})"
+                    if task is not None
+                    else "verification commands"
+                ),
+                task_id=task.task_id if task is not None else "",
+            )
         if mutation_error:
             failure_ids = self._normalize_verify_failure_ids([], mutation_error)
             return {
@@ -6307,6 +6869,10 @@ class Orchestrator:
                 [],
                 self.project_root,
                 collect_all=True,
+                command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                progress=self._gate_progress_callback("owned proof evidence"),
             )
         raw_output = self._gate_raw_output(gate_result)
         failed_refs = [
@@ -6411,6 +6977,10 @@ class Orchestrator:
             [],
             context=f"task baseline verification commands ({task.task_id})",
         )
+        self._raise_for_baseline_termination(
+            gate,
+            context=f"task baseline verification commands ({task.task_id})",
+        )
         if mutation_error:
             raise RuntimeError(mutation_error)
         failures = (
@@ -6486,6 +7056,10 @@ class Orchestrator:
                         baseline_ref,
                         gate_commands,
                         list(self.config.gates.parallel_groups),
+                        context="implement verify baseline commands",
+                    )
+                    self._raise_for_baseline_termination(
+                        gate,
                         context="implement verify baseline commands",
                     )
                     if mutation_error:
@@ -7872,6 +8446,14 @@ class Orchestrator:
         )
         if mutation_error:
             raise RuntimeError(mutation_error)
+        terminated = first_terminated_command(verify_gate)
+        if terminated is not None:
+            raise GateCommandTimeoutError(
+                f"verify gate command {terminated.termination_reason}: {terminated.command}",
+                result=terminated,
+                context="verify stage commands",
+                baseline=False,
+            )
         lines = ["# Verify", "", f"Result: {'pass' if verify_gate.ok else 'fail'}", ""]
         for item in verify_gate.commands:
             lines.append(f"- `{item.command}` -> {'ok' if item.ok else 'failed'}")
@@ -10583,6 +11165,9 @@ class Orchestrator:
         while True:
             result = adapter.run(provider_request)
             reason = result.termination.reason if result.termination is not None else ""
+            incident = self._record_provider_execution_incident(
+                request.stage, provider, result
+            )
             resumable = reason in {
                 "tool_stalled",
                 "semantic_stall",
@@ -10614,8 +11199,74 @@ class Orchestrator:
                     reason,
                     session_id or "fresh",
                 )
+                if incident is not None:
+                    incident.history.append(
+                        {"event": "route", "action": "RETRY", "mode": "resume-same"}
+                    )
+                    state = load_run_state(self.project_root)
+                    self._incident_store(state).save(incident, state)
+                    save_run_state(self.project_root, state)
                 continue
+            if result.ok:
+                self._resolve_active_provider_incident()
             return result
+
+    def _record_provider_execution_incident(
+        self,
+        stage: str,
+        provider: str,
+        result: AgentResult,
+    ) -> Optional[ExecutionIncident]:
+        # Lightweight failover test doubles and embedders may intentionally use
+        # the provider scheduler without a project-backed run state.
+        if not hasattr(self, "project_root"):
+            return None
+        incident = provider_incident(
+            run_id=load_run_state(self.project_root).run_id,
+            stage=stage,
+            provider=provider,
+            result=result,
+            head_ref=head_ref(self.project_root),
+            worktree_fingerprint=worktree_fingerprint(self.project_root),
+        )
+        if incident is None:
+            return None
+        state = load_run_state(self.project_root)
+        incident = self._merge_or_save_execution_incident(state, incident)
+        diagnosis = deterministic_diagnosis(incident)
+        if diagnosis is not None:
+            incident.diagnosis = diagnosis.to_dict()
+            incident.history.append(
+                {"event": "diagnosed", "diagnosis": diagnosis.to_dict()}
+            )
+        self._incident_store(state).save(incident, state)
+        save_run_state(self.project_root, state)
+        distinct = {
+            str(entry.get("incident_fingerprint", ""))
+            for entry in state.execution_incidents
+            if str(entry.get("incident_fingerprint", ""))
+        }
+        if len(distinct) > self.config.execution.recovery.max_incidents_per_run:
+            incident.status = "needs_human"
+            incident.history.append(
+                {"event": "paused", "reason": "run-level incident budget was exhausted"}
+            )
+            self._incident_store(state).save(incident, state)
+            save_run_state(self.project_root, state)
+            raise RuntimeError("run-level execution incident budget was exhausted")
+        return incident
+
+    def _resolve_active_provider_incident(self) -> None:
+        if not hasattr(self, "project_root"):
+            return
+        state = load_run_state(self.project_root)
+        incident = self._incident_store(state).active(state)
+        if incident is None or incident.source != "provider":
+            return
+        incident.status = "resolved"
+        incident.history.append({"event": "resolved", "reason": "provider attempt succeeded"})
+        self._incident_store(state).save(incident, state)
+        save_run_state(self.project_root, state)
 
     def _provider_request_for_attempt(
         self,
@@ -11203,8 +11854,11 @@ class Orchestrator:
             "approved_gates": state.approved_gates,
             "agent_attempts": state.agent_attempts,
             "last_error": state.last_error,
+            "active_execution_incident_id": state.active_execution_incident_id,
+            "execution_incidents": list(state.execution_incidents),
             "tasks": [task.to_dict() for task in state.tasks],
             "changed_files": changed_files(self.project_root) if is_repo(self.project_root) else "",
+            "runtime": runtime_status(self.project_root),
         }
 
     def validate(self) -> Dict[str, object]:

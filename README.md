@@ -284,6 +284,18 @@ Inspect persisted progress:
 python3 -m auto_agents status --project /tmp/demo
 ```
 
+The `runtime` section reports whether a validated run owner is active, how many supervised process
+groups are running, the last process-control heartbeat, and whether cleanup is incomplete. To stop
+an active run safely, including its provider and gate subprocess groups, use:
+
+```bash
+python3 -m auto_agents stop --project /tmp/demo
+```
+
+`stop` verifies the project, run token, PID start time, user, and process-group identity before
+signalling anything. It sends `SIGTERM`, waits 10 seconds by default, and then escalates remaining
+validated processes to `SIGKILL`. The grace period can be changed with `--grace-seconds`.
+
 Approve a paused gate:
 
 ```bash
@@ -491,6 +503,31 @@ only when it explicitly sets `parallel_safe=true`; safe entries are grouped by r
 databases, ports, mutable fixtures, snapshots, and build output. Existing `gates.parallel_groups`
 remain supported as an explicit opt-in.
 
+Gate commands use an activity lease plus an absolute wall-clock ceiling. The defaults for new
+projects are 900 seconds without observable output/CPU activity and a 7200-second ceiling:
+
+```json
+{
+  "gates": {
+    "adaptive_timeout_enabled": true,
+    "command_idle_timeout_seconds": 900,
+    "command_timeout_seconds": 7200
+  }
+}
+```
+
+On a stall or ceiling timeout, auto_agents terminates the entire command process group with bounded
+`SIGTERM`/`SIGKILL` cleanup and persists a structured execution incident. Deterministic rules route
+high-confidence incidents to bounded retry, stage rewind, or a pre-baseline target-project repair
+task. The same incident gets at most `execution.recovery.max_rounds` recovery rounds (two by
+default), and a run gets at most `max_incidents_per_run` distinct incidents. Cleanup uncertainty,
+low-confidence diagnosis, or exhausted budgets pause safely instead of mutating blindly.
+
+In an interactive terminal, a paused incident enters a recovery-agent dialogue. Background runs
+persist the incident under `.auto-agents/runs/<run-id>/recovery_incidents/` and exit paused; resume it
+later with `python3 -m auto_agents recover --project /tmp/demo`. Recovery does not automatically
+weaken checks, change credentials/global environment, or raise the absolute safety ceiling.
+
 Forbidden-pattern requirements use timeout-capable regex matching with per-pattern/file and total
 audit limits. Broad DOTALL wildcards and nested unbounded quantifiers fail closed with a diagnostic;
 use bounded spans such as `[\s\S]{0,500}?`. File match results are cached incrementally in
@@ -533,7 +570,9 @@ worktrees. Example:
       "enabled": true,
       "max_rounds": 2,
       "max_repair_tasks_per_round": 6,
-      "max_refs_per_repair_task": 8
+      "max_refs_per_repair_task": 8,
+      "max_incidents_per_run": 6,
+      "diagnostic_probe_timeout_seconds": 300
     }
   }
 }

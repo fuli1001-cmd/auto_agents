@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gate_baseline_cache import GateBaselineCache, make_cache_key
+from auto_agents.models import CommandResult
 
 
 class GateBaselineCacheTests(unittest.TestCase):
@@ -47,6 +48,31 @@ class GateBaselineCacheTests(unittest.TestCase):
         key_a = make_cache_key("abc", ["pytest -q"], collect_all=True)
         key_b = make_cache_key("abc", ["pytest -q"], collect_all=False)
         self.assertNotEqual(key_a, key_b)
+
+    def test_does_not_cache_terminated_command_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            cache = GateBaselineCache(project_root, project_root / "cache.sqlite3")
+            command = "pytest -q"
+
+            cache.put(
+                "abc123",
+                [command],
+                collect_all=True,
+                failure_ids=[f"cmd-timeout:{command}"],
+                summary="timed out",
+                command_results=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=124,
+                        termination_reason="timeout",
+                        timeout_seconds=1,
+                    )
+                ],
+            )
+
+            self.assertIsNone(cache.get("abc123", [command], collect_all=True))
 
 
 if __name__ == "__main__":

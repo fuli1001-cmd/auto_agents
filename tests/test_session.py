@@ -30,7 +30,9 @@ from auto_agents.git_ops import commit_all, working_tree_clean
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import (
     AgentResult,
+    CommandResult,
     DEFAULT_SESSION_MAX_ATTEMPTS,
+    GateResult,
     RunState,
     SessionState,
     TaskSpec,
@@ -2476,19 +2478,30 @@ class BaselineDiffVerifyTests(unittest.TestCase):
             state.fix_verify_command = 'pytest -q tests/test_issue_regressions_api.py -k "bug_case"'
             session._current_state = state
 
-            with patch("subprocess.run") as run_mock:
-                run_mock.return_value = subprocess.CompletedProcess(
-                    args=[],
-                    returncode=0,
-                    stdout="",
-                    stderr="",
+            with patch("auto_agents.session.run_commands") as run_mock:
+                run_mock.return_value = GateResult(
+                    ok=True,
+                    commands=[
+                        CommandResult(
+                            command=(
+                                'conda run -p ./.conda pytest -q '
+                                'tests/test_issue_regressions_api.py -k "bug_case"'
+                            ),
+                            ok=True,
+                            returncode=0,
+                        )
+                    ],
+                    summary="all commands passed",
                 )
                 result = session._run_baseline_diff_verify()
 
             self.assertTrue(result["ok"])
             self.assertEqual(
                 run_mock.call_args.args[0],
-                'conda run -p ./.conda pytest -q tests/test_issue_regressions_api.py -k "bug_case"',
+                [
+                    'conda run -p ./.conda pytest -q '
+                    'tests/test_issue_regressions_api.py -k "bug_case"'
+                ],
             )
 
     def test_fix_converse_prompt_includes_conda_fix_verify_guidance(self) -> None:

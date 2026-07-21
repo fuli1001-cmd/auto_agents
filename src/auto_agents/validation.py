@@ -811,6 +811,36 @@ def validate_project_config_payload(payload: object) -> List[str]:
         max_auto_workers = gates.get("max_auto_workers", 2)
         if not isinstance(max_auto_workers, int) or max_auto_workers < 1:
             errors.append("gates.max_auto_workers must be an integer >= 1")
+        command_timeout_seconds = gates.get("command_timeout_seconds", 7200)
+        if (
+            not isinstance(command_timeout_seconds, int)
+            or isinstance(command_timeout_seconds, bool)
+            or command_timeout_seconds < 1
+        ):
+            errors.append("gates.command_timeout_seconds must be an integer >= 1")
+        adaptive_timeout = gates.get("adaptive_timeout_enabled", True)
+        if not isinstance(adaptive_timeout, bool):
+            errors.append("gates.adaptive_timeout_enabled must be a boolean")
+        idle_timeout = gates.get(
+            "command_idle_timeout_seconds",
+            min(900, command_timeout_seconds)
+            if isinstance(command_timeout_seconds, int) and command_timeout_seconds > 0
+            else 900,
+        )
+        if (
+            not isinstance(idle_timeout, int)
+            or isinstance(idle_timeout, bool)
+            or idle_timeout < 1
+        ):
+            errors.append("gates.command_idle_timeout_seconds must be an integer >= 1")
+        elif (
+            isinstance(command_timeout_seconds, int)
+            and not isinstance(command_timeout_seconds, bool)
+            and idle_timeout > command_timeout_seconds
+        ):
+            errors.append(
+                "gates.command_idle_timeout_seconds must be <= gates.command_timeout_seconds"
+            )
 
     git = payload.get("git")
     if not isinstance(git, dict):
@@ -928,7 +958,13 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 enabled = recovery.get("enabled", True)
                 if not isinstance(enabled, bool):
                     errors.append("execution.recovery.enabled must be a boolean")
-                for key in ("max_rounds", "max_repair_tasks_per_round", "max_refs_per_repair_task"):
+                for key in (
+                    "max_rounds",
+                    "max_repair_tasks_per_round",
+                    "max_refs_per_repair_task",
+                    "max_incidents_per_run",
+                    "diagnostic_probe_timeout_seconds",
+                ):
                     value = recovery.get(key, 2 if key == "max_rounds" else 1)
                     if not isinstance(value, int) or value < 1:
                         errors.append(f"execution.recovery.{key} must be an integer >= 1")

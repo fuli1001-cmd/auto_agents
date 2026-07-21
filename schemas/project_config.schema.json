@@ -262,6 +262,20 @@
         "max_auto_workers": {
           "type": "integer",
           "minimum": 1
+        },
+        "command_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 7200
+        },
+        "adaptive_timeout_enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "command_idle_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 900
         }
       },
       "additionalProperties": false
@@ -347,6 +361,16 @@
             "max_refs_per_repair_task": {
               "type": "integer",
               "minimum": 1
+            },
+            "max_incidents_per_run": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 6
+            },
+            "diagnostic_probe_timeout_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 300
             }
           },
           "additionalProperties": false

@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -40,6 +41,73 @@ class GateTests(unittest.TestCase):
             self.assertEqual(result.commands[1].returncode, 3)
             self.assertIn("command failed:", result.summary)
             self.assertIn("python3 -c \"import sys; sys.exit(3)\"", result.summary)
+
+    def test_run_commands_enforces_hard_timeout_and_preserves_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            started = time.monotonic()
+            result = run_commands(
+                [
+                    "python3 -c \"import time; "
+                    "print('started', flush=True); time.sleep(30)\""
+                ],
+                Path(tmp),
+                command_timeout_seconds=0.2,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertLess(time.monotonic() - started, 3)
+            command = result.commands[0]
+            self.assertEqual(command.termination_reason, "timeout")
+            self.assertEqual(command.timeout_seconds, 0.2)
+            self.assertEqual(command.stdout, "started")
+            self.assertIn("timed out after 0.2s", result.summary)
+
+    def test_collect_all_stops_after_timeout(self) -> None:
+        from auto_agents.gates import run_commands_collect_all
+
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "must-not-run"
+            result = run_commands_collect_all(
+                [
+                    "python3 -c \"import time; time.sleep(30)\"",
+                    f"python3 -c \"from pathlib import Path; Path({str(marker)!r}).touch()\"",
+                ],
+                Path(tmp),
+                command_timeout_seconds=0.2,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(len(result.commands), 1)
+            self.assertFalse(marker.exists())
+
+    def test_adaptive_timeout_detects_an_idle_stall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_commands(
+                ["python3 -c \"import time; time.sleep(30)\""],
+                Path(tmp),
+                command_timeout_seconds=2,
+                adaptive_timeout_enabled=True,
+                command_idle_timeout_seconds=0.2,
+            )
+
+            command = result.commands[0]
+            self.assertEqual(command.termination_reason, "stalled")
+            self.assertIn("stalled without observable activity", result.summary)
+            self.assertTrue(command.process_snapshot)
+
+    def test_cpu_activity_renews_lease_but_absolute_ceiling_still_applies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_commands(
+                ["python3 -c \"while True: pass\""],
+                Path(tmp),
+                command_timeout_seconds=0.5,
+                adaptive_timeout_enabled=True,
+                command_idle_timeout_seconds=0.2,
+            )
+
+            command = result.commands[0]
+            self.assertEqual(command.termination_reason, "timeout")
+            self.assertEqual(command.activity_kind, "cpu")
 
     def test_run_commands_includes_stderr_in_failure_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -385,6 +453,38 @@ class GateTests(unittest.TestCase):
             )
             self.assertFalse(result.ok)
             self.assertEqual([item.stdout for item in result.commands], ["", "peer", "after"])
+
+    def test_parallel_timeout_cancels_peers_and_skips_later_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "later-group-ran"
+            result = run_gate_plan(
+                [],
+                [
+                    GateParallelGroup(
+                        name="hanging",
+                        commands=[
+                            "python3 -c \"import time; time.sleep(30)\"",
+                            "python3 -c \"import time; time.sleep(30)\"",
+                        ],
+                    ),
+                    GateParallelGroup(
+                        name="later",
+                        commands=[
+                            f"python3 -c \"from pathlib import Path; Path({str(marker)!r}).touch()\""
+                        ],
+                    ),
+                ],
+                Path(tmp),
+                collect_all=True,
+                command_timeout_seconds=0.2,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(len(result.commands), 2)
+            self.assertTrue(
+                any(item.termination_reason == "timeout" for item in result.commands)
+            )
+            self.assertFalse(marker.exists())
 
     def test_extract_vitest_failure_ids(self) -> None:
         gate = GateResult(

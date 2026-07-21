@@ -29,11 +29,14 @@ from auto_agents.config import (
     task_plan_path,
 )
 from auto_agents.git_ops import working_tree_clean
+from auto_agents.gates import GateCommandTimeoutError
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import (
     AgentRequest,
     AgentResult,
     AgentUsage,
+    CommandResult,
+    GateResult,
     ProjectConfig,
     ProviderConfig,
     RunState,
@@ -44,8 +47,11 @@ from auto_agents.orchestrator import Orchestrator
 from auto_agents.run_lock import (
     RUN_LOCK_FD_ENV,
     RUN_LOCK_KEY_ENV,
+    RUN_LOCK_TOKEN_ENV,
     ProjectRunLock,
     RunAlreadyActiveError,
+    runtime_status,
+    stop_project_run,
 )
 from auto_agents.self_repair import (
     SELF_REPAIR_DISABLED_ENV,
@@ -92,6 +98,7 @@ class ProjectRunLockTests(unittest.TestCase):
                     environ={
                         RUN_LOCK_FD_ENV: str(inherited_fd),
                         RUN_LOCK_KEY_ENV: parent_lock.key,
+                        RUN_LOCK_TOKEN_ENV: parent_lock.run_token,
                     },
                 )
                 try:
@@ -119,6 +126,94 @@ class ProjectRunLockTests(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             self.assertFalse(payload["ok"])
             self.assertIn("already active", payload["error"])
+
+    def test_runtime_status_and_stop_terminate_external_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            project_root.mkdir()
+            script = Path(tmp) / "owner.py"
+            script.write_text(
+                "import os, subprocess, sys, time\n"
+                f"sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / 'src')!r})\n"
+                "from auto_agents.process_supervision import ACTIVE_PROCESSES\n"
+                "from auto_agents.run_lock import ProjectRunLock\n"
+                "root = __import__('pathlib').Path(sys.argv[1])\n"
+                "with ProjectRunLock(root):\n"
+                "    child = subprocess.Popen(['sleep', '60'], start_new_session=True)\n"
+                "    ACTIVE_PROCESSES.register(child, kind='test-child')\n"
+                "    print('ready', flush=True)\n"
+                "    time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            owner = subprocess.Popen(
+                [sys.executable, str(script), str(project_root)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(owner.stdout.readline().strip(), "ready")
+                status = runtime_status(project_root)
+                self.assertTrue(status["active"])
+                self.assertEqual(status["owner_pid"], owner.pid)
+                self.assertEqual(status["active_process_groups"], 1)
+
+                payload, exit_code = stop_project_run(project_root, grace_seconds=1)
+                owner.wait(timeout=5)
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(payload["status"], "stopped")
+                self.assertFalse(runtime_status(project_root)["active"])
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
+
+    def test_stop_escalates_to_sigkill_for_term_ignoring_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            project_root.mkdir()
+            script = Path(tmp) / "stubborn_owner.py"
+            script.write_text(
+                "import signal, subprocess, sys, time\n"
+                f"sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / 'src')!r})\n"
+                "from auto_agents.process_supervision import ACTIVE_PROCESSES\n"
+                "from auto_agents.run_lock import ProjectRunLock\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "root = __import__('pathlib').Path(sys.argv[1])\n"
+                "with ProjectRunLock(root):\n"
+                "    child = subprocess.Popen([sys.executable, '-c', "
+                "'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'], "
+                "start_new_session=True)\n"
+                "    ACTIVE_PROCESSES.register(child, kind='stubborn-child')\n"
+                "    print('ready', flush=True)\n"
+                "    time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            owner = subprocess.Popen(
+                [sys.executable, str(script), str(project_root)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(owner.stdout.readline().strip(), "ready")
+
+                payload, exit_code = stop_project_run(
+                    project_root,
+                    grace_seconds=0.1,
+                    kill_grace_seconds=2,
+                )
+                owner.wait(timeout=5)
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(payload["status"], "stopped")
+                self.assertTrue(payload["forced"])
+                self.assertFalse(runtime_status(project_root)["active"])
+            finally:
+                if owner.poll() is None:
+                    owner.kill()
+                    owner.wait(timeout=5)
 
 
 class ProjectValidationTests(unittest.TestCase):
@@ -514,6 +609,26 @@ class ProjectValidationTests(unittest.TestCase):
 
         errors = validate_project_config_payload(payload)
         self.assertTrue(any("execution.parallel_tasks.workers" in item for item in errors))
+
+    def test_gate_command_timeout_defaults_to_7200_seconds(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        payload["gates"].pop("command_timeout_seconds", None)
+
+        config = ProjectConfig.from_dict(payload)
+
+        self.assertEqual(config.gates.command_timeout_seconds, 7200)
+        self.assertEqual(config.gates.command_idle_timeout_seconds, 900)
+        self.assertTrue(config.gates.adaptive_timeout_enabled)
+
+    def test_validate_project_config_payload_rejects_invalid_gate_timeout(self) -> None:
+        for invalid in (0, -1, True, "1800"):
+            with self.subTest(value=invalid):
+                payload = copy.deepcopy(DEFAULT_CONFIG)
+                payload["gates"]["command_timeout_seconds"] = invalid
+                errors = validate_project_config_payload(payload)
+                self.assertTrue(
+                    any("gates.command_timeout_seconds" in item for item in errors)
+                )
 
     def test_validate_project_config_payload_rejects_invalid_sync_agent_instructions_effort(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
@@ -1457,7 +1572,6 @@ class ProjectValidationTests(unittest.TestCase):
                         verification="tests passed",
                     )
 
-            completed = subprocess.CompletedProcess(args=["python"], returncode=0)
             triage = SelfRepairTriageResult(
                 decision=SelfRepairDecision(
                     True,
@@ -1485,7 +1599,7 @@ class ProjectValidationTests(unittest.TestCase):
                 patch.object(Orchestrator, "run", mock_run),
                 patch("auto_agents.cli.adjudicate_auto_agents_error", return_value=triage),
                 patch("auto_agents.cli.AutoAgentsSelfRepairRunner", FakeSelfRepairRunner),
-                patch("auto_agents.cli.subprocess.run", return_value=completed) as resume_run,
+                patch("auto_agents.cli._run_self_repair_resume_process", return_value=0) as resume_run,
                 patch("auto_agents.cli.notify_self_repair_finished") as notify_self_repair,
                 contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(stderr),
@@ -1514,9 +1628,35 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn(RUN_LOCK_FD_ENV, resume_env)
             self.assertIn(RUN_LOCK_KEY_ENV, resume_env)
             self.assertEqual(
-                resume_run.call_args.kwargs["pass_fds"],
-                (int(resume_env[RUN_LOCK_FD_ENV]),),
+                resume_run.call_args.kwargs["pass_fd"],
+                int(resume_env[RUN_LOCK_FD_ENV]),
             )
+
+    def test_cli_gate_timeout_fails_without_entering_self_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+            error = GateCommandTimeoutError(
+                "baseline gate command timeout: pytest -q (timeout=1800s)"
+            )
+            stdout = io.StringIO()
+
+            with (
+                patch.object(Orchestrator, "run", side_effect=error),
+                patch(
+                    "auto_agents.cli._triage_terminal_run_error",
+                    side_effect=AssertionError("timeout must not enter self-repair triage"),
+                ),
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = main(
+                    ["run", "--project", str(project_root), "--spec-file", str(spec_file)]
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("baseline gate command timeout", stdout.getvalue())
 
     def test_cli_run_sends_unexpected_exception_to_provider_triage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -10,6 +9,11 @@ from threading import Event, Thread
 from typing import Dict, Iterator, List, Optional, TextIO
 
 from ..models import AgentRequest, AgentResult, AgentTermination, SmartTimeoutConfig
+from ..process_supervision import (
+    ACTIVE_PROCESSES,
+    ProcessTerminationResult,
+    terminate_process_group,
+)
 from ..supervision import ProgressDecoder, ProgressSupervisor
 
 
@@ -48,25 +52,9 @@ class SubprocessRunResult:
         return tuple(iter(self))[index]
 
 
-def _kill_process_group(process: subprocess.Popen) -> None:
+def _kill_process_group(process: subprocess.Popen) -> ProcessTerminationResult:
     """Kill the entire process group so child processes (servers, scripts) are cleaned up."""
-    try:
-        pgid = os.getpgid(process.pid)
-        os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
-            pgid = os.getpgid(process.pid)
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+    return terminate_process_group(process)
 
 
 def _tail_lines(chunks: List[str], n: int) -> str:
@@ -110,6 +98,7 @@ def run_subprocess_with_optional_streaming(
         env=env,
         start_new_session=True,
     )
+    ACTIVE_PROCESSES.register(process, kind=f"provider:{provider or 'agent'}")
 
     smart_enabled = bool(smart_timeout and smart_timeout.enabled)
     if request.stream_output is None and not smart_enabled:
@@ -117,11 +106,15 @@ def run_subprocess_with_optional_streaming(
         try:
             stdout, stderr = process.communicate(input=actual_stdin, timeout=timeout)
         except subprocess.TimeoutExpired:
-            _kill_process_group(process)
+            termination_result = _kill_process_group(process)
             try:
                 stdout, stderr = process.communicate(timeout=10)
             except (subprocess.TimeoutExpired, OSError):
                 stdout, stderr = "", ""
+            ACTIVE_PROCESSES.unregister(
+                process.pid,
+                preserve_if_alive=termination_result.cleanup_incomplete,
+            )
             return SubprocessRunResult(
                 stdout or "",
                 (stderr or "") + f"\ntimed out after {timeout}s",
@@ -129,6 +122,14 @@ def run_subprocess_with_optional_streaming(
                 False,
                 False,
             )
+        except BaseException:
+            termination_result = _kill_process_group(process)
+            ACTIVE_PROCESSES.unregister(
+                process.pid,
+                preserve_if_alive=termination_result.cleanup_incomplete,
+            )
+            raise
+        ACTIVE_PROCESSES.unregister(process.pid)
         return SubprocessRunResult(
             stdout or "", stderr or "", process.returncode, False, False
         )
@@ -139,6 +140,7 @@ def run_subprocess_with_optional_streaming(
     streamed = {"stdout": False, "stderr": False}
     last_activity = [time.monotonic()]  # mutable container for thread-safe updates
     stalled = Event()
+    watchdog_cleanup_incomplete = [False]
     supervisor = (
         ProgressSupervisor(
             config=smart_timeout,
@@ -174,15 +176,25 @@ def run_subprocess_with_optional_streaming(
             elapsed = time.monotonic() - last_activity[0]
             if elapsed >= idle_limit:
                 stalled.set()
-                _kill_process_group(process)
+                watchdog_cleanup_incomplete[0] = _kill_process_group(
+                    process
+                ).cleanup_incomplete
                 return
 
     assert process.stdin is not None
     assert process.stdout is not None
     assert process.stderr is not None
 
-    stdout_thread = Thread(target=forward_output, args=("stdout", stdout_chunks, process.stdout))
-    stderr_thread = Thread(target=forward_output, args=("stderr", stderr_chunks, process.stderr))
+    stdout_thread = Thread(
+        target=forward_output,
+        args=("stdout", stdout_chunks, process.stdout),
+        daemon=True,
+    )
+    stderr_thread = Thread(
+        target=forward_output,
+        args=("stderr", stderr_chunks, process.stderr),
+        daemon=True,
+    )
     stdout_thread.start()
     stderr_thread.start()
 
@@ -193,6 +205,7 @@ def run_subprocess_with_optional_streaming(
         watchdog_thread.start()
 
     termination_reason = ""
+    cleanup_incomplete = watchdog_cleanup_incomplete[0]
     try:
         if actual_stdin:
             process.stdin.write(actual_stdin)
@@ -207,23 +220,40 @@ def run_subprocess_with_optional_streaming(
             elif timeout and time.monotonic() - started_at >= timeout:
                 termination_reason = "timed_out"
             if termination_reason:
-                _kill_process_group(process)
+                cleanup_incomplete = _kill_process_group(process).cleanup_incomplete
                 break
             time.sleep(1)
-    except KeyboardInterrupt:
+    except BaseException:
         termination_reason = "external_interrupt"
-        _kill_process_group(process)
+        termination_result = _kill_process_group(process)
         if supervisor is not None:
             supervisor.finalize("interrupted", reason=termination_reason)
+        ACTIVE_PROCESSES.unregister(
+            process.pid,
+            preserve_if_alive=termination_result.cleanup_incomplete,
+        )
         raise
     finally:
         done_event.set()
 
+    cleanup_incomplete = cleanup_incomplete or watchdog_cleanup_incomplete[0]
+
     stdout_thread.join(timeout=10)
     stderr_thread.join(timeout=10)
+    if watchdog_thread is not None:
+        watchdog_thread.join(timeout=11)
+    cleanup_incomplete = cleanup_incomplete or watchdog_cleanup_incomplete[0]
     if stdout_thread.is_alive() or stderr_thread.is_alive():
-        _kill_process_group(process)
-    returncode = process.wait()
+        cleanup_incomplete = (
+            _kill_process_group(process).cleanup_incomplete or cleanup_incomplete
+        )
+    returncode = process.poll()
+    if returncode is None:
+        termination_result = _kill_process_group(process)
+        cleanup_incomplete = termination_result.cleanup_incomplete or cleanup_incomplete
+        returncode = process.poll()
+    if returncode is None:
+        returncode = -1
 
     # The legacy watchdog can terminate the process between polling iterations.
     if not smart_enabled and not termination_reason and stalled.is_set():
@@ -257,6 +287,11 @@ def run_subprocess_with_optional_streaming(
         returncode = -1
     elif supervisor is not None:
         supervisor.finalize("completed")
+
+    ACTIVE_PROCESSES.unregister(
+        process.pid,
+        preserve_if_alive=cleanup_incomplete,
+    )
 
     return SubprocessRunResult(
         "".join(stdout_chunks),

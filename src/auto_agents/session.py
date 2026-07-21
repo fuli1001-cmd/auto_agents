@@ -1371,6 +1371,14 @@ class Session:
             self.project_root,
             collect_all=True,
             parallel_workers=self.orch._gate_parallel_workers(),
+            command_timeout_seconds=self.config.gates.command_timeout_seconds,
+            adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+            command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+            progress=self.orch._gate_progress_callback("session baseline snapshot"),
+        )
+        self.orch._raise_for_baseline_termination(
+            gate,
+            context="session baseline snapshot",
         )
         state.baseline_failures = extract_failure_ids(gate)
         state.baseline_git_ref = head_ref(self.project_root)
@@ -1409,27 +1417,26 @@ class Session:
 
         # Layer 1: targeted bug verification
         if state.fix_verify_command:
-            import subprocess as _sp
             verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
             try:
-                import os
-                env = dict(os.environ)
-                env["PYTEST_CURRENT_TEST"] = "auto_agents_session_verify"
-                env["AUTO_AGENTS_TEST"] = "True"
-                env["TESTING"] = "True"
-                proc = _sp.run(
-                    verify_command,
-                    shell=True,
-                    text=True,
-                    capture_output=True,
-                    cwd=str(self.project_root),
-                    timeout=120,
-                    env=env,
+                targeted_gate = run_commands(
+                    [verify_command],
+                    self.project_root,
+                    command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                    adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                    command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                    progress=self.orch._gate_progress_callback("session fix verification"),
                 )
             except Exception as exc:
                 return {"ok": False, "reason": f"fix_verify_command error: {exc}"}
-            if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "non-zero exit").strip()
+            if not targeted_gate.ok:
+                command_result = targeted_gate.commands[0]
+                detail = (
+                    command_result.stderr
+                    or command_result.stdout
+                    or targeted_gate.summary
+                    or "non-zero exit"
+                ).strip()
                 return {
                     "ok": False,
                     "reason": f"fix_verify_command failed: {detail[:500]}",
@@ -1445,6 +1452,10 @@ class Session:
             self.project_root,
             collect_all=True,
             parallel_workers=self.orch._gate_parallel_workers(),
+            command_timeout_seconds=self.config.gates.command_timeout_seconds,
+            adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+            command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+            progress=self.orch._gate_progress_callback("session verification"),
         )
         extraction = extract_failure_info(gate)
         current_failures = extraction.failure_ids

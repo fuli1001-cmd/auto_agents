@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import signal
 import subprocess
 import shlex
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Optional
@@ -17,6 +20,7 @@ from .config import (
     requirements_trace_path,
     run_path,
     run_state_path,
+    save_run_state,
     task_plan_path,
 )
 from .config import supported_provider_kinds
@@ -30,7 +34,18 @@ from .notifications import (
     notify_session_started,
 )
 from .orchestrator import Orchestrator
-from .run_lock import ProjectRunLock, RunAlreadyActiveError
+from .gates import GateCommandTimeoutError
+from .process_supervision import (
+    ACTIVE_PROCESSES,
+    RunInterruptedError,
+    process_group_exists,
+    terminate_process_group,
+)
+from .run_lock import (
+    ProjectRunLock,
+    RunAlreadyActiveError,
+    stop_project_run,
+)
 from .self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
@@ -192,6 +207,36 @@ def _notify_run_failure(project_root: Path, error: object) -> None:
     _safe_notify(notify_run_finished, project_root, state_payload, status="failed", error=str(error))
 
 
+def _mark_run_stopped(project_root: Path, reason: str) -> None:
+    try:
+        state = load_run_state(project_root)
+        state.status = "failed"
+        state.last_error = reason
+        save_run_state(project_root, state)
+    except Exception:
+        pass
+
+
+@contextlib.contextmanager
+def _run_signal_scope():
+    previous = {
+        signum: signal.getsignal(signum)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+
+    def handle(signum, _frame):
+        ACTIVE_PROCESSES.terminate_all()
+        raise RunInterruptedError(signum)
+
+    try:
+        for signum in previous:
+            signal.signal(signum, handle)
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
 def _try_load_run_state(project_root: Path):
     try:
         return load_run_state(project_root)
@@ -305,6 +350,40 @@ def _run_command_for_self_repair_resume(args) -> list[str]:
     return command
 
 
+def _run_self_repair_resume_process(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    pass_fd: int,
+) -> int:
+    """Run the repaired CLI under the same bounded process supervision."""
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd),
+        env=env,
+        pass_fds=(pass_fd,),
+        text=True,
+        start_new_session=True,
+    )
+    record = ACTIVE_PROCESSES.register(process, kind="self-repair-resume")
+    cleanup_incomplete = False
+    try:
+        while process.poll() is None:
+            time.sleep(0.1)
+        return int(process.returncode or 0)
+    except BaseException:
+        cleanup_incomplete = terminate_process_group(
+            process, pgid=record.pgid
+        ).cleanup_incomplete
+        raise
+    finally:
+        ACTIVE_PROCESSES.unregister(
+            process.pid,
+            preserve_if_alive=(cleanup_incomplete or process_group_exists(record.pgid)),
+        )
+
+
 def _auto_repair_auto_agents_and_resume(
     project_root: Path,
     orchestrator: Orchestrator,
@@ -345,14 +424,12 @@ def _auto_repair_auto_agents_and_resume(
         f"auto_agents self-repair committed {result.commit_sha[:12]}. Resuming run with repaired code...",
         file=sys.stderr,
     )
-    process = subprocess.run(
+    return _run_self_repair_resume_process(
         _run_command_for_self_repair_resume(args),
-        cwd=str(auto_agents_repo_root()),
+        cwd=auto_agents_repo_root(),
         env=run_lock.inherited_environment(append_self_repair_history(decision)),
-        pass_fds=(run_lock.fileno,),
-        text=True,
+        pass_fd=run_lock.fileno,
     )
-    return process.returncode
 
 
 def _triage_terminal_run_error(
@@ -463,6 +540,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-repo-map",
         action="store_true",
         help="Disable Aider-style repo map injection for this run.",
+    )
+
+    stop_parser = subparsers.add_parser(
+        "stop",
+        help="Stop the active run and its validated subprocess groups.",
+    )
+    stop_parser.add_argument("--project", required=True, help="Target project directory.")
+    stop_parser.add_argument(
+        "--grace-seconds",
+        type=float,
+        default=10.0,
+        help="Seconds to wait after SIGTERM before escalating to SIGKILL.",
+    )
+
+    recover_parser = subparsers.add_parser(
+        "recover",
+        help="Resume a paused execution incident through the recovery agent.",
+    )
+    recover_parser.add_argument("--project", required=True, help="Target project directory.")
+    recover_parser.add_argument(
+        "--provider",
+        choices=supported_provider_kinds(),
+        help="Override provider used by the recovery agent and resumed run.",
+    )
+    recover_parser.add_argument(
+        "--print-agent-output",
+        action="store_true",
+        help="Print recovery and resumed-run agent output.",
     )
 
     approve_parser = subparsers.add_parser("approve", help="Approve a pending manual gate.")
@@ -623,6 +728,8 @@ def main(argv: list[str] | None = None) -> int:
         except RunAlreadyActiveError as error:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 2
+        signal_scope = _run_signal_scope()
+        signal_scope.__enter__()
         try:
             spec_file = Path(args.spec_file) if args.spec_file else _default_spec_file(project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
@@ -639,10 +746,75 @@ def main(argv: list[str] | None = None) -> int:
                 doc_language=args.doc_language,
                 provider_kind=args.provider,
             )
+            if (
+                getattr(state, "active_execution_incident_id", "")
+                and getattr(state, "status", "") == "paused"
+            ):
+                incident_summary = next(
+                    (
+                        item for item in reversed(getattr(state, "execution_incidents", []))
+                        if str(item.get("incident_id", ""))
+                        == str(state.active_execution_incident_id)
+                    ),
+                    {},
+                )
+                diagnosis = (
+                    incident_summary.get("diagnosis", {})
+                    if isinstance(incident_summary, dict)
+                    else {}
+                )
+                if isinstance(diagnosis, dict) and diagnosis.get("action") == "SELF_REPAIR":
+                    decision = SelfRepairDecision(
+                        eligible=True,
+                        category="execution_incident",
+                        reason=str(diagnosis.get("reason", state.last_error)),
+                        fingerprint=str(incident_summary.get("incident_fingerprint", "")),
+                        repeat_count=int(incident_summary.get("recovery_round", 0) or 0),
+                    )
+                    return _auto_repair_auto_agents_and_resume(
+                        project_root,
+                        orchestrator,
+                        RuntimeError(state.last_error),
+                        decision,
+                        args,
+                        run_lock,
+                    )
+                if sys.stdin.isatty():
+                    state = orchestrator.recover_execution_incident(interactive=True)
+                    if state.status == "pending":
+                        state = orchestrator.run(
+                            spec_file=spec_file,
+                            auto_approve=bool(args.auto_approve),
+                            allow_dirty_tree=bool(args.allow_dirty_tree),
+                            max_tasks=args.max_tasks,
+                            skip_validate=bool(args.skip_validate),
+                            print_agent_output=bool(args.print_agent_output),
+                            doc_language=args.doc_language,
+                            provider_kind=args.provider,
+                        )
+                else:
+                    print(_render_run_summary(project_root, state.to_dict()))
+                    return 3
             _safe_notify(notify_run_finished, project_root, state.to_dict())
             print(_render_run_summary(project_root, state.to_dict()))
             return 0
+        except RunInterruptedError as error:
+            _mark_run_stopped(project_root, str(error))
+            _notify_run_failure(project_root, error)
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return error.exit_code
+        except KeyboardInterrupt:
+            reason = "run interrupted by SIGINT"
+            ACTIVE_PROCESSES.terminate_all()
+            _mark_run_stopped(project_root, reason)
+            _notify_run_failure(project_root, reason)
+            print(json.dumps({"ok": False, "error": reason}, indent=2, ensure_ascii=False))
+            return 130
         except Exception as error:
+            if isinstance(error, GateCommandTimeoutError):
+                _notify_run_failure(project_root, error)
+                print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+                return 1
             if orchestrator is not None and orchestrator.is_provider_research_blocked_error(str(error)):
                 return _auto_resolve_provider_blocker(
                     project_root,
@@ -665,7 +837,57 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
         finally:
+            signal_scope.__exit__(None, None, None)
             run_lock.release()
+
+    if args.command == "recover":
+        project_root = Path(args.project)
+        run_lock = ProjectRunLock(project_root)
+        try:
+            run_lock.acquire()
+        except RunAlreadyActiveError as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 2
+        try:
+            orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            if args.provider:
+                orchestrator._set_active_provider(args.provider)
+            state = orchestrator.recover_execution_incident(interactive=sys.stdin.isatty())
+            if state.status != "pending":
+                print(_render_run_summary(project_root, state.to_dict()))
+                return 3
+            context = dict(state.resume_context)
+            spec_file = Path(str(context.get("spec_file") or _default_spec_file(project_root)))
+            state = orchestrator.run(
+                spec_file=spec_file,
+                auto_approve=bool(context.get("auto_approve", False)),
+                allow_dirty_tree=bool(context.get("allow_dirty_tree", False)),
+                max_tasks=context.get("max_tasks") if isinstance(context.get("max_tasks"), int) else None,
+                skip_validate=bool(context.get("skip_validate", False)),
+                print_agent_output=bool(args.print_agent_output or context.get("print_agent_output", False)),
+                doc_language=str(context.get("doc_language") or "") or None,
+                provider_kind=args.provider or (str(context.get("provider_kind") or "") or None),
+            )
+            print(_render_run_summary(project_root, state.to_dict()))
+            return 0 if state.status != "paused" else 3
+        except Exception as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
+        finally:
+            run_lock.release()
+
+    if args.command == "stop":
+        project_root = Path(args.project)
+        if args.grace_seconds < 0:
+            parser.error("--grace-seconds must be >= 0")
+        payload, exit_code = stop_project_run(
+            project_root,
+            grace_seconds=float(args.grace_seconds),
+        )
+        if payload.get("status") == "stopped":
+            _mark_run_stopped(project_root, "run stopped by user")
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return exit_code
 
     if args.command == "status":
         orchestrator = Orchestrator(Path(args.project))

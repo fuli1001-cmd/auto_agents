@@ -218,6 +218,9 @@ DEFAULT_CONFIG = {
         "allow_agent_updates": True,
         "parallel_workers": "auto",
         "max_auto_workers": 2,
+        "command_timeout_seconds": 7200,
+        "adaptive_timeout_enabled": True,
+        "command_idle_timeout_seconds": 900,
     },
     "git": {
         "auto_init_repo": True,
@@ -256,6 +259,8 @@ DEFAULT_CONFIG = {
             "max_rounds": 2,
             "max_repair_tasks_per_round": 6,
             "max_refs_per_repair_task": 8,
+            "max_incidents_per_run": 6,
+            "diagnostic_probe_timeout_seconds": 300,
         },
     },
     "approvals": {

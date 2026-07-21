@@ -591,7 +591,7 @@ class GateOptimizationTests(unittest.TestCase):
         peak = 0
         lock = threading.Lock()
 
-        def fake_run(command: str, cwd: Path) -> CommandResult:
+        def fake_run(command: str, cwd: Path, **_kwargs) -> CommandResult:
             nonlocal active, peak
             with lock:
                 active += 1

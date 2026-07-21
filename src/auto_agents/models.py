@@ -38,6 +38,8 @@ DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS = 3600
 LEGACY_PROVIDER_IDLE_TIMEOUT_SECONDS = 300
 DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS = 3600
 DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS = 3600
+DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS = 7200
+DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS = 900
 DEFAULT_COPILOT_CLI_PROFILE_MAP = {"balanced": "balanced", "deep": "deep", "max": "max"}
 SMART_TIMEOUT_PROGRESS_PROTOCOL = "auto-agents-jsonl-v1"
 DEFAULT_RETRY_PER_STAGE = {
@@ -296,11 +298,17 @@ class GateConfig:
     allow_agent_updates: bool = True
     parallel_workers: Union[int, str] = "auto"
     max_auto_workers: int = 2
+    command_timeout_seconds: int = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS
+    adaptive_timeout_enabled: bool = True
+    command_idle_timeout_seconds: int = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "GateConfig":
         raw_groups = data.get("parallel_groups", [])
         raw_steps = data.get("steps", [])
+        command_timeout_seconds = int(
+            data.get("command_timeout_seconds", DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS)
+        )
         return cls(
             commands=[str(item) for item in data.get("commands", [])],
             steps=[
@@ -321,6 +329,14 @@ class GateConfig:
                 else str(data.get("parallel_workers", "auto"))
             ),
             max_auto_workers=int(data.get("max_auto_workers", 2)),
+            command_timeout_seconds=command_timeout_seconds,
+            adaptive_timeout_enabled=bool(data.get("adaptive_timeout_enabled", True)),
+            command_idle_timeout_seconds=int(
+                data.get(
+                    "command_idle_timeout_seconds",
+                    min(DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS, command_timeout_seconds),
+                )
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -332,6 +348,9 @@ class GateConfig:
             "allow_agent_updates": self.allow_agent_updates,
             "parallel_workers": self.parallel_workers,
             "max_auto_workers": self.max_auto_workers,
+            "command_timeout_seconds": self.command_timeout_seconds,
+            "adaptive_timeout_enabled": self.adaptive_timeout_enabled,
+            "command_idle_timeout_seconds": self.command_idle_timeout_seconds,
         }
 
 
@@ -458,6 +477,8 @@ class RecoveryConfig:
     max_rounds: int = 2
     max_repair_tasks_per_round: int = 6
     max_refs_per_repair_task: int = 8
+    max_incidents_per_run: int = 6
+    diagnostic_probe_timeout_seconds: int = 300
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RecoveryConfig":
@@ -466,6 +487,10 @@ class RecoveryConfig:
             max_rounds=int(data.get("max_rounds", 2)),
             max_repair_tasks_per_round=int(data.get("max_repair_tasks_per_round", 6)),
             max_refs_per_repair_task=int(data.get("max_refs_per_repair_task", 8)),
+            max_incidents_per_run=int(data.get("max_incidents_per_run", 6)),
+            diagnostic_probe_timeout_seconds=int(
+                data.get("diagnostic_probe_timeout_seconds", 300)
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -736,6 +761,8 @@ class RunState:
     resume_context: Dict[str, object] = field(default_factory=dict)
     recovery_loop_events: List[Dict[str, object]] = field(default_factory=list)
     last_recovery_route: Dict[str, object] = field(default_factory=dict)
+    active_execution_incident_id: str = ""
+    execution_incidents: List[Dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -778,6 +805,13 @@ class RunState:
                 if isinstance(data.get("last_recovery_route", {}), dict)
                 else {}
             ),
+            active_execution_incident_id=str(
+                data.get("active_execution_incident_id", "")
+            ),
+            execution_incidents=[
+                entry for entry in (data.get("execution_incidents", []) or [])
+                if isinstance(entry, dict)
+            ],
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -805,6 +839,8 @@ class RunState:
             "resume_context": dict(self.resume_context),
             "recovery_loop_events": list(self.recovery_loop_events),
             "last_recovery_route": dict(self.last_recovery_route),
+            "active_execution_incident_id": self.active_execution_incident_id,
+            "execution_incidents": list(self.execution_incidents),
         }
 
 
@@ -971,6 +1007,12 @@ class CommandResult:
     stderr: str = ""
     comparable_failures: bool = False
     duration_seconds: float = 0.0
+    termination_reason: str = ""
+    timeout_seconds: float = 0.0
+    cleanup_incomplete: bool = False
+    last_activity_seconds: float = 0.0
+    activity_kind: str = ""
+    process_snapshot: Dict[str, object] = field(default_factory=dict)
 
 
 @dataclass

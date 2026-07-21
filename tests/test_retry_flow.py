@@ -2529,7 +2529,7 @@ class RetryFlowTests(unittest.TestCase):
             try:
                 captured = {}
 
-                def _fake_collect(commands, cwd):
+                def _fake_collect(commands, cwd, **_kwargs):
                     captured["commands"] = list(commands)
                     captured["cwd"] = cwd
                     return diagnostic_gate
@@ -2603,7 +2603,7 @@ class RetryFlowTests(unittest.TestCase):
             captured_commands = []
             captured_parallel_groups = []
 
-            def fake_run(commands, parallel_groups, cwd, *, collect_all):
+            def fake_run(commands, parallel_groups, cwd, *, collect_all, **_kwargs):
                 all_commands = list(commands)
                 captured_parallel_groups.extend(parallel_groups)
                 for group in parallel_groups:
@@ -2669,7 +2669,7 @@ class RetryFlowTests(unittest.TestCase):
 
             captured_commands = []
 
-            def fake_run(commands, parallel_groups, cwd, *, collect_all):
+            def fake_run(commands, parallel_groups, cwd, *, collect_all, **_kwargs):
                 all_commands = list(commands)
                 for group in parallel_groups:
                     all_commands.extend(group.commands)
@@ -2743,7 +2743,7 @@ class RetryFlowTests(unittest.TestCase):
 
             captured_commands = []
 
-            def fake_run(commands, parallel_groups, cwd, *, collect_all):
+            def fake_run(commands, parallel_groups, cwd, *, collect_all, **_kwargs):
                 all_commands = list(commands)
                 for group in parallel_groups:
                     all_commands.extend(group.commands)
@@ -2801,7 +2801,7 @@ class RetryFlowTests(unittest.TestCase):
 
             captured_commands = []
 
-            def fake_run(commands, parallel_groups, cwd, *, collect_all):
+            def fake_run(commands, parallel_groups, cwd, *, collect_all, **_kwargs):
                 all_commands = list(commands)
                 for group in parallel_groups:
                     all_commands.extend(group.commands)

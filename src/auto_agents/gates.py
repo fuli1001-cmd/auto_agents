@@ -2,14 +2,22 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+import os
 import re
 import shlex
-import subprocess
-import time
+import threading
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Callable, Iterable, List, Optional, Sequence
 
-from .models import CommandResult, GateParallelGroup, GateResult, VerificationStep
+from .models import (
+    DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS,
+    DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
+    CommandResult,
+    GateParallelGroup,
+    GateResult,
+    VerificationStep,
+)
+from .process_supervision import run_supervised_shell_command
 
 
 _PYTEST_FAILED = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
@@ -18,6 +26,7 @@ _VITEST_FAILED = re.compile(
     re.MULTILINE,
 )
 _UNITTEST_FAILED = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
+GateProgressCallback = Callable[[str, str, float], None]
 
 
 @dataclass
@@ -25,6 +34,32 @@ class FailureExtraction:
     failure_ids: List[str]
     comparable: bool
     non_comparable_ids: List[str]
+
+
+class GateCommandTimeoutError(RuntimeError):
+    """A baseline gate could not produce a finite, cacheable result."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: Optional[CommandResult] = None,
+        context: str = "",
+        baseline: bool = False,
+        task_id: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+        self.context = context
+        self.baseline = baseline
+        self.task_id = task_id
+
+
+def first_terminated_command(gate_result: GateResult) -> Optional[CommandResult]:
+    return next(
+        (item for item in gate_result.commands if item.termination_reason),
+        None,
+    )
 
 
 def _pytest_failure_ids(output: str) -> List[str]:
@@ -51,6 +86,17 @@ def _pytest_failure_ids(output: str) -> List[str]:
 
 
 def _failure_summary(result: CommandResult) -> str:
+    if result.termination_reason == "timeout":
+        suffix = "; process group cleanup incomplete" if result.cleanup_incomplete else ""
+        return (
+            f"command timed out after {result.timeout_seconds:g}s: "
+            f"{result.command}{suffix}"
+        )
+    if result.termination_reason == "stalled":
+        suffix = "; process group cleanup incomplete" if result.cleanup_incomplete else ""
+        return f"command stalled without observable activity: {result.command}{suffix}"
+    if result.termination_reason:
+        return f"command {result.termination_reason}: {result.command}"
     details = result.stderr or result.stdout or f"exit code {result.returncode}"
     details = " ".join(details.split())
     return f"command failed: {result.command} ({details})"
@@ -222,56 +268,129 @@ def build_failure_identity_diagnostic_command(command: str) -> str:
     return ""
 
 
-def _run_command(command: str, cwd: Path) -> CommandResult:
-    import os
+def _run_command(
+    command: str,
+    cwd: Path,
+    *,
+    timeout_seconds: float = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS,
+    adaptive_timeout_enabled: bool = False,
+    idle_timeout_seconds: float = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
+    cancel_event: Optional[threading.Event] = None,
+    progress: Optional[GateProgressCallback] = None,
+) -> CommandResult:
+    if cancel_event is not None and cancel_event.is_set():
+        return CommandResult(
+            command=command,
+            ok=False,
+            returncode=130,
+            stderr="command cancelled because a peer gate command timed out",
+            termination_reason="cancelled",
+            timeout_seconds=float(timeout_seconds),
+        )
     env = dict(os.environ)
     env["PYTEST_CURRENT_TEST"] = "auto_agents_gate_run"
     env["AUTO_AGENTS_TEST"] = "True"
     env["TESTING"] = "True"
-    started = time.monotonic()
-    process = subprocess.run(
+    if progress is not None:
+        progress("start", command, 0.0)
+    process = run_supervised_shell_command(
         command,
-        shell=True,
-        text=True,
-        capture_output=True,
-        cwd=str(cwd),
+        cwd=cwd,
         env=env,
+        timeout_seconds=timeout_seconds,
+        adaptive_timeout_enabled=adaptive_timeout_enabled,
+        idle_timeout_seconds=idle_timeout_seconds,
+        kind="gate",
+        cancel_event=cancel_event,
+        progress=(
+            (lambda event, elapsed: progress(event, command, elapsed))
+            if progress is not None
+            else None
+        ),
     )
-    return CommandResult(
+    result = CommandResult(
         command=command,
-        ok=process.returncode == 0,
+        ok=process.returncode == 0 and not process.termination_reason,
         returncode=process.returncode,
-        stdout=process.stdout.strip(),
-        stderr=process.stderr.strip(),
-        duration_seconds=time.monotonic() - started,
+        stdout=process.stdout,
+        stderr=process.stderr,
+        duration_seconds=process.duration_seconds,
+        termination_reason=process.termination_reason,
+        timeout_seconds=process.timeout_seconds,
+        cleanup_incomplete=process.cleanup_incomplete,
+        last_activity_seconds=process.last_activity_seconds,
+        activity_kind=process.activity_kind,
+        process_snapshot=process.process_snapshot,
     )
+    if progress is not None:
+        progress("finish", command, result.duration_seconds)
+    return result
 
 
 def _run_parallel_commands(
-    commands: Sequence[str], cwd: Path, *, max_workers: int = 2
+    commands: Sequence[str],
+    cwd: Path,
+    *,
+    max_workers: int = 2,
+    timeout_seconds: float = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS,
+    adaptive_timeout_enabled: bool = False,
+    idle_timeout_seconds: float = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
+    progress: Optional[GateProgressCallback] = None,
 ) -> List[CommandResult]:
     if not commands:
         return []
     if len(commands) == 1:
-        return [_run_command(commands[0], cwd)]
+        return [
+            _run_command(
+                commands[0], cwd, timeout_seconds=timeout_seconds,
+                adaptive_timeout_enabled=adaptive_timeout_enabled,
+                idle_timeout_seconds=idle_timeout_seconds, progress=progress
+            )
+        ]
 
     results: List[CommandResult] = [None] * len(commands)  # type: ignore[list-item]
+    cancel_event = threading.Event()
     with ThreadPoolExecutor(max_workers=max(1, min(len(commands), max_workers))) as executor:
         future_to_index = {
-            executor.submit(_run_command, command, cwd): index
+            executor.submit(
+                _run_command,
+                command,
+                cwd,
+                timeout_seconds=timeout_seconds,
+                adaptive_timeout_enabled=adaptive_timeout_enabled,
+                idle_timeout_seconds=idle_timeout_seconds,
+                cancel_event=cancel_event,
+                progress=progress,
+            ): index
             for index, command in enumerate(commands)
         }
         for future in as_completed(future_to_index):
-            results[future_to_index[future]] = future.result()
+            try:
+                results[future_to_index[future]] = future.result()
+            except BaseException:
+                cancel_event.set()
+                raise
     return results
 
 
-def run_commands(commands: Iterable[str], cwd: Path) -> GateResult:
+def run_commands(
+    commands: Iterable[str],
+    cwd: Path,
+    *,
+    command_timeout_seconds: float = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS,
+    adaptive_timeout_enabled: bool = False,
+    command_idle_timeout_seconds: float = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
+    progress: Optional[GateProgressCallback] = None,
+) -> GateResult:
     results: List[CommandResult] = []
     ok = True
     summary = "all commands passed"
     for command in commands:
-        result = _run_command(command, cwd)
+        result = _run_command(
+            command, cwd, timeout_seconds=command_timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            idle_timeout_seconds=command_idle_timeout_seconds, progress=progress
+        )
         results.append(result)
         if not result.ok:
             ok = False
@@ -280,7 +399,15 @@ def run_commands(commands: Iterable[str], cwd: Path) -> GateResult:
     return GateResult(ok=ok, commands=results, summary=summary)
 
 
-def run_commands_collect_all(commands: Iterable[str], cwd: Path) -> GateResult:
+def run_commands_collect_all(
+    commands: Iterable[str],
+    cwd: Path,
+    *,
+    command_timeout_seconds: float = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS,
+    adaptive_timeout_enabled: bool = False,
+    command_idle_timeout_seconds: float = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
+    progress: Optional[GateProgressCallback] = None,
+) -> GateResult:
     """Run *all* commands, collecting results even after failures.
 
     Unlike ``run_commands`` this does **not** short-circuit on the first
@@ -291,11 +418,17 @@ def run_commands_collect_all(commands: Iterable[str], cwd: Path) -> GateResult:
     ok = True
     summaries: List[str] = []
     for command in commands:
-        result = _run_command(command, cwd)
+        result = _run_command(
+            command, cwd, timeout_seconds=command_timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            idle_timeout_seconds=command_idle_timeout_seconds, progress=progress
+        )
         results.append(result)
         if not result.ok:
             ok = False
             summaries.append(_failure_summary(result))
+            if result.termination_reason:
+                break
     summary = "all commands passed" if ok else "; ".join(summaries)
     return GateResult(ok=ok, commands=results, summary=summary)
 
@@ -307,24 +440,38 @@ def run_gate_plan(
     *,
     collect_all: bool,
     parallel_workers: int = 2,
+    command_timeout_seconds: float = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS,
+    adaptive_timeout_enabled: bool = False,
+    command_idle_timeout_seconds: float = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
+    progress: Optional[GateProgressCallback] = None,
 ) -> GateResult:
     results: List[CommandResult] = []
     summaries: List[str] = []
     ok = True
 
     for command in commands:
-        result = _run_command(command, cwd)
+        result = _run_command(
+            command, cwd, timeout_seconds=command_timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            idle_timeout_seconds=command_idle_timeout_seconds, progress=progress
+        )
         results.append(result)
         if result.ok:
             continue
         ok = False
         summaries.append(_failure_summary(result))
-        if not collect_all:
-            return GateResult(ok=False, commands=results, summary=summaries[0])
+        if result.termination_reason or not collect_all:
+            return GateResult(ok=False, commands=results, summary="; ".join(summaries))
 
     for group in parallel_groups:
         group_results = _run_parallel_commands(
-            group.commands, cwd, max_workers=parallel_workers
+            group.commands,
+            cwd,
+            max_workers=parallel_workers,
+            timeout_seconds=command_timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            idle_timeout_seconds=command_idle_timeout_seconds,
+            progress=progress,
         )
         results.extend(group_results)
         failed = [result for result in group_results if not result.ok]
@@ -332,7 +479,7 @@ def run_gate_plan(
             continue
         ok = False
         summaries.extend(_failure_summary(result) for result in failed)
-        if not collect_all:
+        if any(result.termination_reason for result in failed) or not collect_all:
             break
 
     summary = "all commands passed" if ok else "; ".join(summaries)
@@ -351,6 +498,16 @@ def extract_failure_info(gate_result: GateResult) -> FailureExtraction:
     non_comparable: List[str] = []
     for cmd_result in gate_result.commands:
         if cmd_result.ok:
+            continue
+        if cmd_result.termination_reason:
+            prefix = (
+                "cmd-timeout"
+                if cmd_result.termination_reason == "timeout"
+                else "cmd-stalled"
+                if cmd_result.termination_reason == "stalled"
+                else "cmd-terminated"
+            )
+            non_comparable.append(f"{prefix}:{cmd_result.command}")
             continue
         combined = f"{cmd_result.stdout}\n{cmd_result.stderr}"
         pytest_ids = _pytest_failure_ids(combined)

@@ -4,7 +4,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .git_ops import changed_paths, commit_all
+from .gates import run_commands
 from .io_utils import read_text, write_text
 from .models import AgentRequest, AgentResult, RunState
 from .requirements import forbidden_pattern_definition_reason
@@ -936,14 +936,12 @@ class AutoAgentsSelfRepairRunner:
     def _run_verification(self) -> "_VerificationResult":
         summaries = []
         for command in self_repair_verify_commands():
-            process = subprocess.run(
-                command,
-                shell=True,
-                text=True,
-                capture_output=True,
-                cwd=str(self.repo_root),
-                timeout=900,
+            gate = run_commands(
+                [command],
+                self.repo_root,
+                command_timeout_seconds=900,
             )
+            process = gate.commands[0]
             detail = (process.stderr or process.stdout or "").strip()
             summaries.append(
                 f"$ {command}\nexit={process.returncode}\n{detail[:1200]}".strip()
