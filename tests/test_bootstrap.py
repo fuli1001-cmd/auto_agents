@@ -105,6 +105,9 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(copilot.profile_map["max"], "max")
             self.assertEqual(copilot.timeout_seconds, 3600)
             self.assertEqual(copilot.idle_timeout_seconds, 3600)
+            self.assertEqual(copilot.vision, "auto")
+            self.assertEqual(config.providers["antigravity-claude"].vision, "disabled")
+            self.assertEqual(config.providers["antigravity-gemini"].vision, "disabled")
             self.assertEqual(config.providers["codex"].idle_timeout_seconds, 3600)
 
     def test_init_project_writes_idle_timeout_3600_to_config(self) -> None:

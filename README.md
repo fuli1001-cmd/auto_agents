@@ -745,13 +745,37 @@ sufficient proof that a generated frontend matches a prototype.
 
 `visual_judge` is an optional completion gate for those frontend surface proofs. In the default
 `auto` mode, auto_agents runs it only when a task has frontend prototype proof evidence, screenshot
-pairs are available through `visual_evidence`, and at least one configured provider is not marked
-`vision: "disabled"`. The judge compares prototype screenshots with actual browser-rendered
+pairs are available through `visual_evidence`, and at least one configured provider is available,
+not marked `vision: "disabled"`, and able to pass native image attachments to its CLI. The
+`vision` setting is a policy switch, not an assertion that the adapter can transport screenshots;
+setting it to `enabled` cannot force an attachment-incapable provider into the judge. The judge
+compares prototype screenshots with actual browser-rendered
 screenshots using a fixed visual fidelity rubric and writes a JSON report under
 `.auto-agents/runs/<run_id>/visual_judge/<task_id>/`. If the judge runs and returns a low score or a
 blocker finding, the task is retried before it can be marked done. If the provider or screenshot
 artifacts are unavailable in `auto` mode, auto_agents records a skipped report and still relies on
 the deterministic screenshot/DOM/CSS proof requirements.
+
+| Provider adapter | Native visual-judge attachments | Default `vision` |
+| --- | --- | --- |
+| Codex | Yes, repeated `--image` arguments | `auto` |
+| GitHub Copilot CLI | Yes when the installed CLI exposes `--attachment` | `auto` |
+| Antigravity | No native attachment transport | `disabled` |
+| Generic shell / mock | No unless a future adapter implements the capability | provider-specific |
+
+Copilot attachment requests always use its required non-interactive `-p/--prompt` mode and repeat
+`--attachment <path>` in screenshot order. Text-only Copilot requests continue to honor
+`prompt_via_stdin`. Existing project configs retain their explicit `vision` values; the defaults
+above apply to newly initialized projects.
+
+Visual pairs are explicit-only: auto_agents never guesses a prototype/actual pair from ordinary
+`evidence_refs`. Each comparable `visual_evidence` entry must point to two distinct PNG, JPEG, or
+WebP screenshots for the same surface, viewport, and UI state; HTML belongs in
+`prototype_source_ref`. Duplicate declarations are judged once and retain all owning proof records.
+Codex and Copilot receive the ordered screenshots through their native attachment arguments. A
+failed batch judgment is rechecked one pair at a time, and only an isolated below-threshold score or
+blocker finding can block the task. Business-flow success/failure screenshots remain deterministic
+interaction evidence unless they are explicitly paired with a same-state prototype screenshot.
 
 New task plans set `oracle_proof_schema_version: 2` and use `requirement_proofs` on every task
 that declares `requirement_ids`. A proof entry maps one requirement oracle to concrete evidence:

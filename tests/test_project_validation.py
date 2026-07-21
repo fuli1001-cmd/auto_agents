@@ -2773,6 +2773,7 @@ class ProjectValidationTests(unittest.TestCase):
                 prompt="prompt",
                 cwd=project_root,
                 output_path=output_path,
+                attachments=[project_root / "prototype.png", project_root / "actual.png"],
             )
 
             with patch("auto_agents.adapters.codex.run_subprocess_with_optional_streaming") as run_mock:
@@ -2794,6 +2795,15 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("--sandbox", command)
             self.assertIn("workspace-write", command)
             self.assertNotIn("--full-auto", command)
+            image_paths = [
+                command[index + 1]
+                for index, value in enumerate(command[:-1])
+                if value == "--image"
+            ]
+            self.assertEqual(
+                image_paths,
+                [str(project_root / "prototype.png"), str(project_root / "actual.png")],
+            )
             self.assertEqual(result.model, "profile:deep")
             self.assertIsNotNone(result.usage)
             usage = result.usage
@@ -2853,6 +2863,154 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertIn("--no-ask-user", cmd)
         self.assertIn("--no-color", cmd)
         self.assertIn("-s", cmd)
+
+    def test_provider_image_attachment_capabilities_fail_closed(self) -> None:
+        from auto_agents.adapters.antigravity import AntigravityAdapter
+        from auto_agents.adapters.mock import MockAdapter
+        from auto_agents.adapters.shell import ShellAdapter
+
+        self.assertTrue(CodexAdapter(ProviderConfig(kind="codex")).supports_image_attachments())
+        self.assertFalse(
+            AntigravityAdapter(
+                ProviderConfig(kind="antigravity", binary="agy")
+            ).supports_image_attachments()
+        )
+        self.assertFalse(
+            ShellAdapter(
+                ProviderConfig(kind="shell", binary="provider-wrapper")
+            ).supports_image_attachments()
+        )
+        self.assertFalse(MockAdapter().supports_image_attachments())
+
+    def test_copilot_cli_adapter_detects_native_attachment_support(self) -> None:
+        from auto_agents.adapters.copilot_cli import (
+            CopilotCliAdapter,
+            _copilot_cli_supports_image_attachments,
+        )
+
+        config = ProviderConfig(kind="copilot-cli", binary="copilot-test")
+        adapter = CopilotCliAdapter(config)
+        _copilot_cli_supports_image_attachments.cache_clear()
+        try:
+            with (
+                patch(
+                    "auto_agents.adapters.copilot_cli.shutil.which",
+                    return_value="/tmp/copilot-test",
+                ),
+                patch(
+                    "auto_agents.adapters.copilot_cli.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        ["/tmp/copilot-test", "--help"],
+                        0,
+                        stdout="  --attachment <path>  Attach an image\n",
+                        stderr="",
+                    ),
+                ),
+            ):
+                self.assertTrue(adapter.supports_image_attachments())
+        finally:
+            _copilot_cli_supports_image_attachments.cache_clear()
+
+    def test_copilot_cli_adapter_rejects_cli_without_attachment_flag(self) -> None:
+        from auto_agents.adapters.copilot_cli import (
+            CopilotCliAdapter,
+            _copilot_cli_supports_image_attachments,
+        )
+
+        config = ProviderConfig(kind="copilot-cli", binary="copilot-old")
+        adapter = CopilotCliAdapter(config)
+        _copilot_cli_supports_image_attachments.cache_clear()
+        try:
+            with (
+                patch(
+                    "auto_agents.adapters.copilot_cli.shutil.which",
+                    return_value="/tmp/copilot-old",
+                ),
+                patch(
+                    "auto_agents.adapters.copilot_cli.subprocess.run",
+                    return_value=subprocess.CompletedProcess(
+                        ["/tmp/copilot-old", "--help"],
+                        0,
+                        stdout="Usage: copilot-old [options]\n",
+                        stderr="",
+                    ),
+                ),
+            ):
+                self.assertFalse(adapter.supports_image_attachments())
+        finally:
+            _copilot_cli_supports_image_attachments.cache_clear()
+
+    def test_copilot_cli_adapter_attaches_images_with_noninteractive_prompt(self) -> None:
+        from auto_agents.adapters.copilot_cli import CopilotCliAdapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            attachments = [project_root / "prototype.png", project_root / "actual.png"]
+            adapter = CopilotCliAdapter(
+                ProviderConfig(
+                    kind="copilot-cli",
+                    binary="copilot",
+                    profile_map={},
+                    prompt_via_stdin=True,
+                )
+            )
+            request = AgentRequest(
+                stage="visual_judge",
+                effort="balanced",
+                prompt="compare the screenshots",
+                cwd=project_root,
+                output_path=project_root / "judge.md",
+                attachments=attachments,
+            )
+
+            with patch(
+                "auto_agents.adapters.copilot_cli.run_subprocess_with_optional_streaming",
+                return_value=("", "", 0, False, False),
+            ) as run_mock:
+                result = adapter.run(request)
+
+            self.assertTrue(result.ok)
+            command = run_mock.call_args.args[0]
+            attachment_paths = [
+                command[index + 1]
+                for index, value in enumerate(command[:-1])
+                if value == "--attachment"
+            ]
+            self.assertEqual(attachment_paths, [str(path) for path in attachments])
+            self.assertEqual(command[-2:], ["-p", "compare the screenshots"])
+            self.assertEqual(run_mock.call_args.kwargs["stdin_input"], "")
+
+    def test_copilot_cli_adapter_keeps_stdin_for_text_only_request(self) -> None:
+        from auto_agents.adapters.copilot_cli import CopilotCliAdapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            adapter = CopilotCliAdapter(
+                ProviderConfig(
+                    kind="copilot-cli",
+                    binary="copilot",
+                    profile_map={},
+                    prompt_via_stdin=True,
+                )
+            )
+            request = AgentRequest(
+                stage="review",
+                effort="balanced",
+                prompt="review this",
+                cwd=project_root,
+                output_path=project_root / "review.md",
+            )
+
+            with patch(
+                "auto_agents.adapters.copilot_cli.run_subprocess_with_optional_streaming",
+                return_value=("", "", 0, False, False),
+            ) as run_mock:
+                adapter.run(request)
+
+            command = run_mock.call_args.args[0]
+            self.assertNotIn("--attachment", command)
+            self.assertNotIn("-p", command)
+            self.assertEqual(run_mock.call_args.kwargs["stdin_input"], "review this")
 
     def test_copilot_cli_adapter_forwards_model_from_profile_config(self) -> None:
         from auto_agents.adapters.copilot_cli import CopilotCliAdapter

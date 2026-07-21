@@ -15,7 +15,7 @@ from auto_agents.config import (
     task_plan_path,
 )
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentResult, TaskSpec
+from auto_agents.models import AgentResult, ProviderConfig, TaskSpec
 from auto_agents.frontend_fidelity import validate_frontend_fidelity_trace
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import (
@@ -37,7 +37,11 @@ from auto_agents.requirements import (
     validate_provider_resolve_trace_transition,
 )
 from auto_agents.validation import validate_task_plan_with_requirements, validation_report
-from auto_agents.visual_judge import parse_visual_judge_response, visual_evidence_pairs_for_task
+from auto_agents.visual_judge import (
+    collect_visual_evidence_for_task,
+    parse_visual_judge_response,
+    visual_evidence_pairs_for_task,
+)
 import auto_agents.requirements as requirements_module
 
 
@@ -121,6 +125,9 @@ class _VisualJudgeAdapter:
     def available(self) -> bool:
         return True
 
+    def supports_image_attachments(self) -> bool:
+        return True
+
     def run(self, request) -> AgentResult:
         self.requests.append(request)
         write_text(request.output_path, self.summary + "\n")
@@ -132,6 +139,24 @@ class _VisualJudgeAdapter:
             model="mock-vision",
             returncode=0,
         )
+
+
+class _SequencedVisualJudgeAdapter(_VisualJudgeAdapter):
+    def __init__(self, summaries) -> None:
+        super().__init__("")
+        self.summaries = list(summaries)
+
+    def run(self, request) -> AgentResult:
+        self.summary = self.summaries.pop(0)
+        return super().run(request)
+
+
+class _UnsupportedVisualJudgeAdapter(_VisualJudgeAdapter):
+    def supports_image_attachments(self) -> bool:
+        return False
+
+    def run(self, request) -> AgentResult:
+        raise AssertionError("an adapter without image attachments must not be invoked")
 
 
 class RequirementsTraceTests(unittest.TestCase):
@@ -518,6 +543,128 @@ class RequirementsTraceTests(unittest.TestCase):
         self.assertEqual(pairs[0].viewport, "desktop")
         self.assertEqual(pairs[0].purpose, "prototype_fidelity")
 
+    def test_visual_judge_never_infers_success_and_failure_screenshots_from_evidence_refs(self) -> None:
+        task = TaskSpec(
+            task_id="task-visual",
+            title="Create flow behavior",
+            description="Verify success and failure behavior.",
+            acceptance=["Success returns home and failure stays in the dialog."],
+            requirement_ids=["REQ-001"],
+            requirement_proofs=[
+                _proof(
+                    exact_acceptance_oracle=(
+                        "Creation success returns to the generation list and failure remains in the dialog."
+                    ),
+                    evidence_refs=[
+                        ".tmp-tests/frontend-prototype/create-modal-success-home-desktop-1440x900.png",
+                        ".tmp-tests/frontend-prototype/create-modal-failure-desktop-1440x900.png",
+                    ],
+                )
+            ],
+        )
+        trace = {
+            "version": 1,
+            "frontend_surfaces": [{"name": "Create", "prototype_refs": ["create.html"]}],
+            "requirements": [
+                _requirement(
+                    text="Create surface matches the prototype.",
+                    oracle_type="mixed",
+                    frontend_surface=True,
+                )
+            ],
+        }
+
+        self.assertEqual(visual_evidence_pairs_for_task(task, trace, max_pairs=6), [])
+
+    def test_visual_judge_deduplicates_explicit_pairs_and_merges_proof_owners(self) -> None:
+        visual_evidence = {
+            "surface": "create_video_modal",
+            "viewport": "desktop 1440x900 open modal",
+            "purpose": "prototype_fidelity",
+            "prototype_image_ref": ".tmp-tests/frontend-prototype/create-modal-prototype.png",
+            "actual_image_ref": ".tmp-tests/frontend-prototype/create-modal.png",
+        }
+        task = TaskSpec(
+            task_id="task-visual",
+            title="Create modal fidelity",
+            description="Match prototype.",
+            acceptance=["Modal matches."],
+            requirement_ids=["REQ-001"],
+            requirement_proofs=[
+                _proof(oracle_index=index, visual_evidence=dict(visual_evidence))
+                for index in (1, 2, 6)
+            ],
+        )
+        trace = {
+            "version": 1,
+            "frontend_surfaces": [{"name": "Create", "prototype_refs": ["create.html"]}],
+            "requirements": [
+                _requirement(
+                    text="Create surface matches the prototype.",
+                    oracle_type="mixed",
+                    frontend_surface=True,
+                )
+            ],
+        }
+
+        selection = collect_visual_evidence_for_task(task, trace, max_pairs=6)
+
+        self.assertEqual(len(selection.pairs), 1)
+        self.assertEqual(
+            [owner["oracle_index"] for owner in selection.pairs[0].proof_owners],
+            [1, 2, 6],
+        )
+        self.assertTrue(
+            Orchestrator._append_visual_judge_report_to_proofs(
+                task,
+                selection.pairs,
+                ".auto-agents/runs/run/visual_judge/task-visual/report.json",
+            )
+        )
+        self.assertTrue(
+            all(
+                any("/visual_judge/" in ref for ref in proof["evidence_refs"])
+                for proof in task.requirement_proofs
+            )
+        )
+
+    def test_visual_judge_rejects_html_as_prototype_image(self) -> None:
+        task = TaskSpec(
+            task_id="task-visual",
+            title="Home fidelity",
+            description="Match prototype.",
+            acceptance=["Home matches."],
+            requirement_ids=["REQ-001"],
+            requirement_proofs=[
+                _proof(
+                    visual_evidence={
+                        "surface": "Home",
+                        "viewport": "desktop",
+                        "purpose": "prototype_fidelity",
+                        "prototype_image_ref": "specs/frondend_prototype/home.html",
+                        "actual_image_ref": ".tmp-tests/home.png",
+                        "prototype_source_ref": "specs/frondend_prototype/home.html",
+                    }
+                )
+            ],
+        )
+        trace = {
+            "version": 1,
+            "frontend_surfaces": [{"name": "Home", "prototype_refs": ["home.html"]}],
+            "requirements": [
+                _requirement(
+                    text="Home matches the prototype.",
+                    oracle_type="mixed",
+                    frontend_surface=True,
+                )
+            ],
+        }
+
+        selection = collect_visual_evidence_for_task(task, trace, max_pairs=6)
+
+        self.assertEqual(selection.pairs, [])
+        self.assertTrue(any("prototype_image_ref must reference" in item for item in selection.diagnostics))
+
     def test_visual_judge_skips_non_comparable_visual_evidence_entries(self) -> None:
         task = TaskSpec(
             task_id="task-visual",
@@ -628,6 +775,16 @@ class RequirementsTraceTests(unittest.TestCase):
         self.assertEqual(report.status, "failed")
         self.assertFalse(report.ok)
 
+    def test_visual_judge_parse_preserves_inconclusive_for_auto_mode_routing(self) -> None:
+        report = parse_visual_judge_response(
+            '{"status":"inconclusive","score":0,"findings":[],"summary":"image unavailable"}',
+            threshold=85,
+            expected_pair_ids=["pair-1"],
+        )
+
+        self.assertEqual(report.status, "inconclusive")
+        self.assertEqual(report.pair_results[0]["status"], "inconclusive")
+
     def test_visual_judge_auto_skips_when_all_providers_disabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -662,6 +819,152 @@ class RequirementsTraceTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(result["status"], "skipped")
             self.assertIn("no configured provider", result["reason"])
+
+    def test_visual_judge_excludes_provider_without_image_attachments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_surfaces": [
+                        {"name": "Home", "prototype_refs": ["home.html"]}
+                    ],
+                    "requirements": [
+                        _requirement(
+                            text="Frontend Home page matches the prototype visual surface.",
+                            oracle_type="mixed",
+                            frontend_surface=True,
+                        )
+                    ],
+                },
+            )
+            screenshot_dir = project_root / ".auto-agents" / "runs" / "run-1" / "screenshots"
+            screenshot_dir.mkdir(parents=True)
+            for name in ("prototype-home.png", "home.png"):
+                write_text(screenshot_dir / name, "fake image")
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.visual_judge.mode = "auto"
+            for provider in orchestrator.config.providers.values():
+                provider.vision = "disabled"
+            orchestrator.config.providers[orchestrator.config.active_provider].vision = "enabled"
+            orchestrator.adapter = _UnsupportedVisualJudgeAdapter("unused")
+
+            result = orchestrator._run_task_visual_judge(
+                load_run_state(project_root),
+                _visual_task(),
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "skipped")
+            report = json.loads(
+                (project_root / result["report_path"]).read_text(encoding="utf-8")
+            )
+            self.assertTrue(
+                any(
+                    "native image attachments are unsupported" in item
+                    for item in report["diagnostics"]
+                )
+            )
+
+    def test_visual_judge_uses_supported_fallback_after_unsupported_active_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_surfaces": [
+                        {"name": "Home", "prototype_refs": ["home.html"]}
+                    ],
+                    "requirements": [
+                        _requirement(
+                            text="Frontend Home page matches the prototype visual surface.",
+                            oracle_type="mixed",
+                            frontend_surface=True,
+                        )
+                    ],
+                },
+            )
+            screenshot_dir = project_root / ".auto-agents" / "runs" / "run-1" / "screenshots"
+            screenshot_dir.mkdir(parents=True)
+            for name in ("prototype-home.png", "home.png"):
+                write_text(screenshot_dir / name, "fake image")
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.visual_judge.mode = "required"
+            for provider in orchestrator.config.providers.values():
+                provider.vision = "disabled"
+            orchestrator.config.providers[orchestrator.config.active_provider].vision = "enabled"
+            orchestrator.config.providers["copilot-cli"] = ProviderConfig(
+                kind="copilot-cli",
+                binary="copilot",
+                profile_map={},
+                vision="enabled",
+            )
+            orchestrator.adapter = _UnsupportedVisualJudgeAdapter("unused")
+            fallback = _VisualJudgeAdapter(
+                '{"status":"passed","score":97,"findings":[],"summary":"matches"}'
+            )
+
+            with patch.object(
+                orchestrator,
+                "_build_adapter_for_provider",
+                return_value=fallback,
+            ):
+                result = orchestrator._run_task_visual_judge(
+                    load_run_state(project_root),
+                    _visual_task(),
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(len(fallback.requests), 1)
+            self.assertEqual(len(fallback.requests[0].attachments), 2)
+
+    def test_visual_judge_does_not_fallback_from_explicit_unsupported_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_surfaces": [
+                        {"name": "Home", "prototype_refs": ["home.html"]}
+                    ],
+                    "requirements": [
+                        _requirement(
+                            text="Frontend Home page matches the prototype visual surface.",
+                            oracle_type="mixed",
+                            frontend_surface=True,
+                        )
+                    ],
+                },
+            )
+            screenshot_dir = project_root / ".auto-agents" / "runs" / "run-1" / "screenshots"
+            screenshot_dir.mkdir(parents=True)
+            for name in ("prototype-home.png", "home.png"):
+                write_text(screenshot_dir / name, "fake image")
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.visual_judge.mode = "required"
+            orchestrator.config.visual_judge.provider = orchestrator.config.active_provider
+            orchestrator.config.providers[orchestrator.config.active_provider].vision = "enabled"
+            orchestrator.adapter = _UnsupportedVisualJudgeAdapter("unused")
+
+            with patch.object(orchestrator, "_build_adapter_for_provider") as build_adapter:
+                result = orchestrator._run_task_visual_judge(
+                    load_run_state(project_root),
+                    _visual_task(),
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "failed")
+            build_adapter.assert_not_called()
 
     def test_visual_judge_pass_appends_report_to_matching_proof(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -738,6 +1041,128 @@ class RequirementsTraceTests(unittest.TestCase):
 
             self.assertFalse(result["ok"])
             self.assertIn("old workbench layout remains", result["reason"])
+            self.assertEqual(len(orchestrator.adapter.requests), 2)
+
+    def test_visual_judge_batch_failure_is_overturned_by_isolated_pair_recheck(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_surfaces": [{"name": "Home", "prototype_refs": ["home.html"]}],
+                    "requirements": [
+                        _requirement(
+                            text="Home matches the prototype.",
+                            oracle_type="mixed",
+                            frontend_surface=True,
+                        )
+                    ],
+                },
+            )
+            screenshot_dir = project_root / ".auto-agents" / "runs" / "run-1" / "screenshots"
+            screenshot_dir.mkdir(parents=True)
+            for name in ("prototype-home.png", "home.png"):
+                write_text(screenshot_dir / name, "fake image")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.visual_judge.mode = "required"
+            orchestrator.config.providers[orchestrator.config.active_provider].vision = "enabled"
+            orchestrator.adapter = _SequencedVisualJudgeAdapter(
+                [
+                    '{"status":"failed","score":62,"findings":[{"severity":"blocker","message":"wrong layout"}],"summary":"batch mismatch"}',
+                    '{"status":"passed","score":96,"findings":[],"summary":"isolated pair matches"}',
+                ]
+            )
+
+            state = load_run_state(project_root)
+            result = orchestrator._run_task_visual_judge(state, _visual_task())
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(len(orchestrator.adapter.requests), 2)
+            self.assertTrue(all(len(request.attachments) == 2 for request in orchestrator.adapter.requests))
+            self.assertIn("prototype_attachment_index", orchestrator.adapter.requests[0].prompt)
+            report = json.loads(
+                (project_root / ".auto-agents" / "runs" / state.run_id / "visual_judge" / "task-visual" / "report.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual([item["phase"] for item in report["attempts"]], ["batch", "recheck"])
+
+    def test_visual_judge_auto_skips_when_isolated_recheck_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_surfaces": [{"name": "Home", "prototype_refs": ["home.html"]}],
+                    "requirements": [
+                        _requirement(
+                            text="Home matches the prototype.",
+                            oracle_type="mixed",
+                            frontend_surface=True,
+                        )
+                    ],
+                },
+            )
+            screenshot_dir = project_root / ".auto-agents" / "runs" / "run-1" / "screenshots"
+            screenshot_dir.mkdir(parents=True)
+            for name in ("prototype-home.png", "home.png"):
+                write_text(screenshot_dir / name, "fake image")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.visual_judge.mode = "auto"
+            orchestrator.config.providers[orchestrator.config.active_provider].vision = "enabled"
+            response = (
+                '{"status":"inconclusive","score":0,"findings":[],'
+                '"summary":"could not inspect image"}'
+            )
+            orchestrator.adapter = _SequencedVisualJudgeAdapter([response, response])
+
+            result = orchestrator._run_task_visual_judge(
+                load_run_state(project_root),
+                _visual_task(),
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "skipped")
+            self.assertEqual(len(orchestrator.adapter.requests), 2)
+
+    def test_visual_gate_recheck_skips_implementation_on_first_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            task = TaskSpec(
+                task_id="task-visual-resume",
+                title="Resume visual gate",
+                description="Recheck gates without implementation.",
+                acceptance=["Gates pass."],
+                status="in_progress",
+            )
+            verify_result = {
+                "ok": True,
+                "reason": "all commands passed",
+                "current_failure_ids": [],
+                "proof_evidence": {},
+            }
+            review_result = {"ok": True, "review": "DECISION: pass", "reason": "review passed"}
+            with (
+                patch.object(orchestrator, "_run_task_verify", return_value=verify_result),
+                patch.object(orchestrator, "_cached_review_result", return_value=review_result),
+                patch.object(orchestrator, "_run_agent_with_retries") as implement,
+            ):
+                result = orchestrator._execute_task_with_retries(
+                    state,
+                    task,
+                    gate_recheck_first=True,
+                )
+
+            self.assertTrue(result["ok"])
+            implement.assert_not_called()
 
     def test_frontend_prototype_spec_requires_surface_contract(self) -> None:
         trace = {"version": 1, "requirements": [_requirement()]}

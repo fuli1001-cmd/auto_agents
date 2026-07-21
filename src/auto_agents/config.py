@@ -168,7 +168,7 @@ DEFAULT_CONFIG = {
             "timeout_seconds": 3600,
             "idle_timeout_seconds": DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
             "subscription_tier": "default",
-            "vision": "disabled",
+            "vision": "auto",
         },
         "antigravity-claude": {
             "kind": "antigravity",
@@ -185,7 +185,7 @@ DEFAULT_CONFIG = {
             "timeout_seconds": 7200,
             "idle_timeout_seconds": 7200,
             "subscription_tier": "default",
-            "vision": "auto",
+            "vision": "disabled",
         },
         "antigravity-gemini": {
             "kind": "antigravity",
@@ -202,7 +202,7 @@ DEFAULT_CONFIG = {
             "timeout_seconds": 7200,
             "idle_timeout_seconds": 7200,
             "subscription_tier": "default",
-            "vision": "auto",
+            "vision": "disabled",
         },
     },
     "active_provider": "codex",

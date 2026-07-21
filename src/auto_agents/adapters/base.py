@@ -18,6 +18,15 @@ from ..supervision import ProgressDecoder, ProgressSupervisor
 
 
 class AgentAdapter(ABC):
+    def supports_image_attachments(self) -> bool:
+        """Return whether this adapter can attach image files to a request.
+
+        Capability checks fail closed so providers cannot silently receive only
+        attachment paths in the prompt when the request requires native image
+        input.
+        """
+        return False
+
     @abstractmethod
     def available(self) -> bool:
         raise NotImplementedError

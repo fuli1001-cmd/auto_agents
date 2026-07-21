@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -24,6 +26,24 @@ from ..supervision import ProgressDecoder
 # Each profile is a subdirectory containing settings that
 # ``copilot --config-dir`` understands.
 DEFAULT_PROFILES_ROOT = Path.home() / ".copilot" / "profiles"
+
+
+@lru_cache(maxsize=16)
+def _copilot_cli_supports_image_attachments(executable: str) -> bool:
+    """Probe the configured CLI without starting an authenticated model turn."""
+    try:
+        result = subprocess.run(
+            [executable, "--help"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    help_text = f"{result.stdout}\n{result.stderr}"
+    return result.returncode == 0 and "--attachment" in help_text
 
 
 class CopilotProgressDecoder(ProgressDecoder):
@@ -108,6 +128,12 @@ class CopilotCliAdapter(AgentAdapter):
     def available(self) -> bool:
         return shutil.which(self.config.binary) is not None
 
+    def supports_image_attachments(self) -> bool:
+        executable = shutil.which(self.config.binary)
+        if executable is None:
+            return False
+        return _copilot_cli_supports_image_attachments(executable)
+
     def run(self, request: AgentRequest) -> AgentResult:
         command = self._build_command(request)
 
@@ -118,13 +144,13 @@ class CopilotCliAdapter(AgentAdapter):
         env["AUTO_AGENTS_STAGE"] = request.stage
         env["AUTO_AGENTS_EFFORT"] = request.effort
 
-        # When prompt_via_stdin is True, pipe the prompt through stdin.
-        # Otherwise, append it to the command via -p (non-interactive mode).
-        if self.config.prompt_via_stdin:
-            stdin_input = request.prompt
-        else:
+        # Copilot accepts --attachment only with a non-interactive -p prompt.
+        # Preserve the configured stdin transport for ordinary text-only calls.
+        if request.attachments or not self.config.prompt_via_stdin:
             command.extend(["-p", request.prompt])
             stdin_input = ""
+        else:
+            stdin_input = request.prompt
 
         timeout = self.config.timeout_seconds or None
 
@@ -208,6 +234,9 @@ class CopilotCliAdapter(AgentAdapter):
 
         if request.resume_session_id:
             command.append(f"--resume={request.resume_session_id}")
+
+        for attachment in request.attachments:
+            command.extend(["--attachment", str(attachment)])
 
         # Passthrough extra arguments
         command.extend(self.config.extra_args)

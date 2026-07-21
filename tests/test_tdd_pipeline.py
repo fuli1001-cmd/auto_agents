@@ -548,6 +548,51 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertEqual(task.requirement_proofs[0]["status"], "verified")
             self.assertEqual(task.requirement_proofs[0]["proof_type"], "mixed")
 
+    def test_oracle_proof_updates_reject_non_raster_visual_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Match prototype",
+                description="Match the browser surface.",
+                acceptance=["surface matches"],
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 1,
+                        "status": "planned",
+                        "proof_type": "mixed",
+                        "oracle_strength": "human",
+                        "evidence_boundary": "system_boundary",
+                        "evidence_refs": ["tests/e2e/home.spec.ts::captures"],
+                        "forbidden_proxy_oracles": [],
+                        "proxy_oracles": [],
+                    }
+                ],
+            )
+
+            applied, error = orchestrator._apply_oracle_proof_updates_from_text(
+                task,
+                (
+                    "ORACLE_PROOF_UPDATES:\n"
+                    "```json\n"
+                    '[{"requirement_id":"REQ-001","oracle_index":1,"status":"verified",'
+                    '"evidence_refs":["tests/e2e/home.spec.ts::captures"],'
+                    '"visual_evidence":{"purpose":"prototype_fidelity",'
+                    '"prototype_image_ref":"specs/prototype/home.html",'
+                    '"actual_image_ref":".tmp-tests/home.png",'
+                    '"prototype_source_ref":"specs/prototype/home.html"}}]\n'
+                    "```"
+                ),
+            )
+
+            self.assertFalse(applied)
+            self.assertIn("prototype_image_ref must reference", error)
+            self.assertEqual(task.requirement_proofs[0]["status"], "planned")
+
     def test_build_task_prompt_unsupported_stage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

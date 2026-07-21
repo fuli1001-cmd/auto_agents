@@ -160,7 +160,7 @@
                   }
                 },
                 "visual_evidence": {
-                  "description": "Optional prototype-vs-actual screenshot pairing for frontend visual fidelity proofs.",
+                  "description": "Optional explicit same-state prototype-vs-actual raster screenshot pairing for frontend visual fidelity proofs. Ordinary evidence_refs are never inferred as pairs.",
                   "anyOf": [
                     {
                       "type": "object",
@@ -176,9 +176,9 @@
                         "comparison_type": { "type": "string" },
                         "visual_judge": { "type": "boolean" },
                         "judge": { "type": "boolean" },
-                        "prototype_image_ref": { "type": "string", "minLength": 1 },
-                        "actual_image_ref": { "type": "string", "minLength": 1 },
-                        "prototype_source_ref": { "type": "string" }
+                        "prototype_image_ref": { "type": "string", "minLength": 1, "description": "PNG, JPEG, or WebP prototype screenshot; HTML is not an image ref." },
+                        "actual_image_ref": { "type": "string", "minLength": 1, "description": "PNG, JPEG, or WebP browser-rendered screenshot for the same UI state." },
+                        "prototype_source_ref": { "type": "string", "description": "Optional HTML/Figma/source prototype reference; not attached as an image." }
                       },
                       "additionalProperties": true
                     },
@@ -198,9 +198,9 @@
                           "comparison_type": { "type": "string" },
                           "visual_judge": { "type": "boolean" },
                           "judge": { "type": "boolean" },
-                          "prototype_image_ref": { "type": "string", "minLength": 1 },
-                          "actual_image_ref": { "type": "string", "minLength": 1 },
-                          "prototype_source_ref": { "type": "string" }
+                        "prototype_image_ref": { "type": "string", "minLength": 1, "description": "PNG, JPEG, or WebP prototype screenshot; HTML is not an image ref." },
+                        "actual_image_ref": { "type": "string", "minLength": 1, "description": "PNG, JPEG, or WebP browser-rendered screenshot for the same UI state." },
+                        "prototype_source_ref": { "type": "string", "description": "Optional HTML/Figma/source prototype reference; not attached as an image." }
                         },
                         "additionalProperties": true
                       }

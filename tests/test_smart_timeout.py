@@ -242,6 +242,7 @@ def test_native_provider_resume_commands_use_exact_session(tmp_path):
         cwd=tmp_path,
         output_path=tmp_path / "agent.md",
         resume_session_id="session-123",
+        attachments=[tmp_path / "comparison.png"],
     )
     codex = CodexAdapter(
         ProviderConfig(kind="codex", binary="codex", extra_args=["--model", "gpt-x"])
@@ -255,6 +256,9 @@ def test_native_provider_resume_commands_use_exact_session(tmp_path):
     assert codex_command[:3] == ["codex", "exec", "resume"]
     assert codex_command[-2:] == ["session-123", "-"]
     assert codex_command.index("--model") < codex_command.index("session-123")
+    assert codex_command[codex_command.index("--image") + 1] == str(
+        tmp_path / "comparison.png"
+    )
 
     copilot = CopilotCliAdapter(
         ProviderConfig(kind="copilot-cli", binary="copilot", profile_map={})

@@ -613,6 +613,7 @@ class ProjectConfig:
                 output_flag="",
                 timeout_seconds=DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS,
                 idle_timeout_seconds=DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
+                vision="auto",
             ),
             "antigravity-claude": ProviderConfig(
                 kind="antigravity",
@@ -628,6 +629,7 @@ class ProjectConfig:
                 output_flag="",
                 timeout_seconds=7200,
                 idle_timeout_seconds=7200,
+                vision="disabled",
             ),
             "antigravity-gemini": ProviderConfig(
                 kind="antigravity",
@@ -643,6 +645,7 @@ class ProjectConfig:
                 output_flag="",
                 timeout_seconds=7200,
                 idle_timeout_seconds=7200,
+                vision="disabled",
             ),
         }
     )

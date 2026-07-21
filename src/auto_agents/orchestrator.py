@@ -149,9 +149,10 @@ from .validation import (
 from .visual_judge import (
     VisualJudgeReport,
     build_visual_judge_prompt,
+    collect_visual_evidence_for_task,
     parse_visual_judge_response,
     task_needs_visual_judge,
-    visual_evidence_pairs_for_task,
+    visual_evidence_validation_errors,
     visual_judge_failure_summary,
     write_visual_judge_report,
 )
@@ -3404,6 +3405,16 @@ class Orchestrator:
                     local_errors.append(f"{prefix}.{key} must be a non-empty string")
             if "visual_evidence" in update and not isinstance(update.get("visual_evidence"), (dict, list)):
                 local_errors.append(f"{prefix}.visual_evidence must be an object or list of objects")
+            elif "visual_evidence" in update:
+                candidate_proof = dict(match)
+                candidate_proof["visual_evidence"] = update.get("visual_evidence")
+                local_errors.extend(
+                    visual_evidence_validation_errors(
+                        candidate_proof,
+                        update.get("visual_evidence"),
+                        prefix=f"{prefix}.visual_evidence",
+                    )
+                )
             if local_errors:
                 errors.extend(local_errors)
                 continue
@@ -3987,7 +3998,7 @@ class Orchestrator:
             self._set_implementation_ready_marker(state, task, False)
             self._persist_tasks(tasks)
             save_run_state(self.project_root, state)
-        if task.status == "blocked":
+        if task.status == "blocked" and not visual_gate_recheck:
             payload = self._task_recovery_payload_from_history(task, state)
             if self._schedule_repair_tasks_for_failure(state, tasks, task, payload):
                 return state
@@ -4028,7 +4039,12 @@ class Orchestrator:
         ):
             self._persist_tasks(tasks)
 
-        gate_result = self._execute_task_with_retries(state, task, resume_existing=resume_existing)
+        gate_result = self._execute_task_with_retries(
+            state,
+            task,
+            resume_existing=resume_existing,
+            gate_recheck_first=visual_gate_recheck,
+        )
         if not gate_result["ok"]:
             rewind_stage = str(gate_result.get("rewind_to_stage", "")).strip()
             if rewind_stage:
@@ -4081,6 +4097,18 @@ class Orchestrator:
         else:
             self._resolve_inline_task_incident(state, task)
         return None
+
+    @staticmethod
+    def _task_is_blocked_by_visual_judge(task: TaskSpec) -> bool:
+        if task.status != "blocked":
+            return False
+        return bool(
+            re.search(
+                r"failure\s+type\s*:\s*visual_judge|visual judge (?:failed|inconclusive)",
+                task.review_summary,
+                flags=re.IGNORECASE,
+            )
+        )
 
     def _parallel_execution_fallback_reason(self, tasks: List[TaskSpec]) -> str:
         workers = self._parallel_worker_count()
@@ -9738,7 +9766,7 @@ class Orchestrator:
                 "Each ORACLE_PROOF_UPDATES entry must update an existing current-task proof by requirement_id and oracle_index, set status='verified', and include concrete evidence_refs plus proof_type/oracle_strength/evidence_boundary/proxy_oracles when relevant.",
                 "Do not submit proof updates for proxy evidence listed in forbidden_proxy_oracles, for final-status-only checks, or for config/metadata-only checks when the requirement demands behavioral/system-boundary proof.",
                 "For frontend/prototype visual fidelity proofs, evidence_refs must include page-level visual evidence such as Playwright screenshot tests, screenshot artifacts, visual snapshots, or equivalent browser-rendered checks, plus deterministic DOM/CSS assertions where practical. Do not mark these proofs verified using payload-only tests or internal-state checks.",
-                "When a frontend/prototype proof has concrete prototype-comparison screenshot artifacts, include visual_evidence on that proof with surface, viewport, prototype_image_ref, actual_image_ref, prototype_source_ref, and purpose='prototype_fidelity' so auto_agents can run the optional visual_judge gate. If the screenshot only proves layout stability, state transitions, no overflow, no overlap, or runtime DOM/CSS behavior, either omit visual_evidence or set purpose='layout_stability'/'state_transition' and visual_judge=false; do not pair those screenshots with a static prototype for visual_judge.",
+                "When a frontend/prototype proof has concrete prototype-comparison screenshot artifacts, include visual_evidence on that proof with surface, viewport, distinct raster prototype_image_ref and actual_image_ref paths for the same UI state, prototype_source_ref, and purpose='prototype_fidelity' so auto_agents can run the optional visual_judge gate. Put HTML only in prototype_source_ref; ordinary evidence_refs are never inferred into visual pairs. If the screenshot only proves layout stability, state transitions, no overflow, no overlap, or runtime DOM/CSS behavior, either omit visual_evidence or set purpose='layout_stability'/'state_transition' and visual_judge=false; do not pair those screenshots with a static prototype for visual_judge.",
                 "Example final response block:\nORACLE_PROOF_UPDATES:\n```json\n[{\"requirement_id\":\"REQ-001\",\"oracle_index\":1,\"status\":\"verified\",\"proof_type\":\"integration_test\",\"oracle_strength\":\"behavioral\",\"evidence_boundary\":\"system_boundary\",\"evidence_refs\":[\"tests/test_public_api.py::test_behavior\"],\"proxy_oracles\":[]}]\n```",
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
@@ -9832,6 +9860,7 @@ class Orchestrator:
         state: RunState,
         task: TaskSpec,
         resume_existing: bool = False,
+        gate_recheck_first: bool = False,
     ) -> Dict[str, object]:
         max_attempts = self._max_attempts("implement")
         feedback = ""
@@ -9863,7 +9892,7 @@ class Orchestrator:
 
         for attempt in range(1, max_attempts + 1):
             state.current_stage = "implement"
-            if resume_existing and attempt == 1:
+            if (resume_existing or gate_recheck_first) and attempt == 1:
                 result = None
             else:
                 self._set_implementation_ready_marker(state, task, False)
@@ -10156,7 +10185,11 @@ class Orchestrator:
                         ),
                     )
                     continue
-                visual_result = self._run_task_visual_judge(state, task)
+                visual_result = self._run_task_visual_judge(
+                    state,
+                    task,
+                    task_attempt=attempt,
+                )
                 if not visual_result["ok"]:
                     last_reason = str(visual_result["reason"])
                     feedback = self._format_retry_feedback(
@@ -10275,7 +10308,13 @@ class Orchestrator:
             "proof_evidence": last_proof_evidence or {},
         }
 
-    def _run_task_visual_judge(self, state: RunState, task: TaskSpec) -> Dict[str, object]:
+    def _run_task_visual_judge(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        *,
+        task_attempt: Optional[int] = None,
+    ) -> Dict[str, object]:
         config = self.config.visual_judge
         mode = str(config.mode or "auto")
         if mode == "off":
@@ -10287,16 +10326,26 @@ class Orchestrator:
 
         report_path = run_path(self.project_root, state.run_id) / "visual_judge" / task.task_id / "report.json"
         report_rel = self._relative_repo_path(report_path)
-        pairs = visual_evidence_pairs_for_task(
+        selection = collect_visual_evidence_for_task(
             task,
             trace,
             max_pairs=max(1, int(config.max_pairs_per_task or 1)),
         )
+        pairs = selection.pairs
+        if selection.diagnostics and mode == "required":
+            return self._visual_judge_skip_or_fail(
+                mode=mode,
+                report_path=report_path,
+                reason="invalid visual_evidence: " + "; ".join(selection.diagnostics[:6]),
+                pairs=[pair.to_dict() for pair in pairs],
+                diagnostics=selection.diagnostics,
+            )
         if not pairs:
             return self._visual_judge_skip_or_fail(
                 mode=mode,
                 report_path=report_path,
-                reason="no visual_evidence pairs or paired screenshot evidence_refs were found",
+                reason="no valid explicit prototype screenshot pairs were found in visual_evidence",
+                diagnostics=selection.diagnostics,
             )
 
         missing_refs = self._missing_visual_evidence_files(pairs)
@@ -10306,57 +10355,154 @@ class Orchestrator:
                 report_path=report_path,
                 reason="visual evidence files are missing: " + ", ".join(missing_refs[:6]),
                 pairs=[pair.to_dict() for pair in pairs],
+                diagnostics=selection.diagnostics,
             )
 
-        provider_order = self._visual_judge_provider_order()
+        provider_order, provider_diagnostics = self._visual_judge_provider_selection()
+        visual_diagnostics = list(selection.diagnostics) + provider_diagnostics
         if not provider_order:
             return self._visual_judge_skip_or_fail(
                 mode=mode,
                 report_path=report_path,
-                reason="no configured provider has vision support enabled",
+                reason=(
+                    "no configured provider is available with vision enabled and native "
+                    "image attachment support"
+                ),
                 pairs=[pair.to_dict() for pair in pairs],
+                diagnostics=visual_diagnostics,
             )
 
-        prompt = build_visual_judge_prompt(
+        initial_report, provider_error = self._evaluate_visual_pairs(
+            state=state,
             task=task,
             pairs=pairs,
             threshold=int(config.threshold),
-        )
-        attachments = self._visual_judge_attachments(pairs)
-        result = self._call_visual_judge_provider(
-            state=state,
-            task=task,
-            prompt=prompt,
-            attachments=attachments,
             provider_order=provider_order,
+            stage_suffix="batch",
         )
-        if result is None:
+        if initial_report is None:
             return self._visual_judge_skip_or_fail(
                 mode=mode,
                 report_path=report_path,
-                reason="no vision-capable provider was available",
+                reason=provider_error or "no vision-capable provider was available",
                 pairs=[pair.to_dict() for pair in pairs],
-            )
-        if not result.ok:
-            return self._visual_judge_skip_or_fail(
-                mode=mode,
-                report_path=report_path,
-                reason=result.stderr or result.summary or "visual judge provider failed",
-                pairs=[pair.to_dict() for pair in pairs],
+                diagnostics=visual_diagnostics,
             )
 
-        report = parse_visual_judge_response(result.summary or result.stdout, threshold=int(config.threshold))
-        report.provider = self._current_provider
-        report.model = result.model
-        report.pairs = [pair.to_dict() for pair in pairs]
-        report.report_path = report_rel
-        write_visual_judge_report(report_path, report)
+        attempts = [self._visual_judge_attempt_payload("batch", initial_report, pairs)]
+        final_by_pair = {
+            str(item.get("pair_id", "")).strip(): dict(item)
+            for item in initial_report.pair_results
+            if str(item.get("pair_id", "")).strip()
+        }
+        recheck_pairs = []
+        if initial_report.status != "passed":
+            nonpassing_ids = {
+                pair_id
+                for pair_id, item in final_by_pair.items()
+                if str(item.get("status", "")) != "passed"
+            }
+            recheck_pairs = [
+                pair for pair in pairs
+                if not nonpassing_ids or pair.pair_id in nonpassing_ids
+            ]
+
+        for pair in recheck_pairs:
+            recheck_report, recheck_error = self._evaluate_visual_pairs(
+                state=state,
+                task=task,
+                pairs=[pair],
+                threshold=int(config.threshold),
+                provider_order=provider_order,
+                stage_suffix=f"recheck-{pair.pair_id}",
+            )
+            if recheck_report is None:
+                recheck_report = VisualJudgeReport(
+                    status="inconclusive",
+                    threshold=int(config.threshold),
+                    reason=recheck_error or "visual judge pair recheck provider failed",
+                    pair_results=[
+                        {
+                            "pair_id": pair.pair_id,
+                            "status": "inconclusive",
+                            "score": 0,
+                            "findings": [],
+                        }
+                    ],
+                )
+            attempts.append(self._visual_judge_attempt_payload("recheck", recheck_report, [pair]))
+            if recheck_report.pair_results:
+                final_by_pair[pair.pair_id] = dict(recheck_report.pair_results[0])
+            else:
+                final_by_pair[pair.pair_id] = {
+                    "pair_id": pair.pair_id,
+                    "status": "inconclusive",
+                    "score": 0,
+                    "findings": [],
+                }
+
+        pair_results = [
+            final_by_pair.get(
+                pair.pair_id,
+                {
+                    "pair_id": pair.pair_id,
+                    "status": "inconclusive",
+                    "score": 0,
+                    "findings": [],
+                },
+            )
+            for pair in pairs
+        ]
+        statuses = {str(item.get("status", "")) for item in pair_results}
+        if "failed" in statuses:
+            final_status = "failed"
+            final_reason = "isolated pair recheck confirmed a visual mismatch"
+        elif "inconclusive" in statuses:
+            final_status = "failed" if mode == "required" else "skipped"
+            final_reason = "visual judge pair recheck was inconclusive"
+        else:
+            final_status = "passed"
+            final_reason = (
+                "initial batch finding was not confirmed by isolated pair recheck"
+                if recheck_pairs
+                else initial_report.reason
+            )
+
+        findings: List[Dict[str, object]] = []
+        scores: List[int] = []
+        for item in pair_results:
+            try:
+                scores.append(int(item.get("score", 0)))
+            except (TypeError, ValueError):
+                scores.append(0)
+            findings.extend(
+                finding
+                for finding in item.get("findings", []) or []
+                if isinstance(finding, dict)
+            )
+
+        report = VisualJudgeReport(
+            status=final_status,
+            score=min(scores) if scores else 0,
+            threshold=int(config.threshold),
+            provider=initial_report.provider,
+            model=initial_report.model,
+            reason=final_reason,
+            findings=findings,
+            pairs=[pair.to_dict() for pair in pairs],
+            pair_results=pair_results,
+            attempts=attempts,
+            diagnostics=visual_diagnostics,
+            report_path=report_rel,
+        )
+        self._write_task_visual_judge_report(report_path, report, task_attempt=task_attempt)
         if not report.ok:
             return {
                 "ok": False,
                 "status": report.status,
                 "reason": visual_judge_failure_summary(report),
                 "report_path": report_rel,
+                "failure_type": "visual_judge",
             }
 
         proofs_updated = self._append_visual_judge_report_to_proofs(task, pairs, report_rel)
@@ -10368,6 +10514,97 @@ class Orchestrator:
             "proofs_updated": proofs_updated,
         }
 
+    def _evaluate_visual_pairs(
+        self,
+        *,
+        state: RunState,
+        task: TaskSpec,
+        pairs: List[object],
+        threshold: int,
+        provider_order: List[str],
+        stage_suffix: str,
+    ) -> Tuple[Optional[VisualJudgeReport], str]:
+        prompt = build_visual_judge_prompt(
+            task=task,
+            pairs=pairs,
+            threshold=threshold,
+        )
+        result = self._call_visual_judge_provider(
+            state=state,
+            task=task,
+            prompt=prompt,
+            attachments=self._visual_judge_attachments(pairs),
+            provider_order=provider_order,
+            stage_suffix=stage_suffix,
+        )
+        if result is None:
+            return None, "no vision-capable provider was available"
+        if not result.ok:
+            return None, result.stderr or result.summary or "visual judge provider failed"
+
+        report = parse_visual_judge_response(
+            result.summary or result.stdout,
+            threshold=threshold,
+            expected_pair_ids=[pair.pair_id for pair in pairs],
+        )
+        report.provider = self._current_provider
+        report.model = result.model
+        self._enrich_visual_judge_findings(report, pairs)
+        return report, ""
+
+    @staticmethod
+    def _enrich_visual_judge_findings(report: VisualJudgeReport, pairs: Iterable[object]) -> None:
+        pair_by_id = {str(pair.pair_id): pair for pair in pairs}
+        findings: List[Dict[str, object]] = []
+        for pair_result in report.pair_results:
+            pair_id = str(pair_result.get("pair_id", "")).strip()
+            pair = pair_by_id.get(pair_id)
+            normalized_findings: List[Dict[str, object]] = []
+            for raw_finding in pair_result.get("findings", []) or []:
+                if not isinstance(raw_finding, dict):
+                    continue
+                finding = dict(raw_finding)
+                finding["pair_id"] = pair_id
+                if pair is not None:
+                    finding.setdefault("surface", pair.surface)
+                    finding.setdefault("viewport", pair.viewport)
+                normalized_findings.append(finding)
+                findings.append(finding)
+            pair_result["findings"] = normalized_findings
+        report.findings = findings
+
+    @staticmethod
+    def _visual_judge_attempt_payload(
+        phase: str,
+        report: VisualJudgeReport,
+        pairs: Iterable[object],
+    ) -> Dict[str, object]:
+        return {
+            "phase": phase,
+            "pair_ids": [str(pair.pair_id) for pair in pairs],
+            "status": report.status,
+            "score": report.score,
+            "provider": report.provider,
+            "model": report.model,
+            "reason": report.reason,
+            "pair_results": list(report.pair_results),
+            "diagnostics": list(report.diagnostics),
+        }
+
+    @staticmethod
+    def _write_task_visual_judge_report(
+        report_path: Path,
+        report: VisualJudgeReport,
+        *,
+        task_attempt: Optional[int],
+    ) -> None:
+        write_visual_judge_report(report_path, report)
+        if task_attempt is not None and task_attempt > 0:
+            write_visual_judge_report(
+                report_path.parent / f"attempt-{task_attempt}.json",
+                report,
+            )
+
     def _visual_judge_skip_or_fail(
         self,
         *,
@@ -10375,6 +10612,7 @@ class Orchestrator:
         report_path: Path,
         reason: str,
         pairs: Optional[List[Dict[str, object]]] = None,
+        diagnostics: Optional[List[str]] = None,
     ) -> Dict[str, object]:
         status = "failed" if mode == "required" else "skipped"
         report = VisualJudgeReport(
@@ -10382,6 +10620,7 @@ class Orchestrator:
             threshold=int(self.config.visual_judge.threshold),
             reason=reason,
             pairs=pairs or [],
+            diagnostics=diagnostics or [],
         )
         report.report_path = self._relative_repo_path(report_path)
         write_visual_judge_report(report_path, report)
@@ -10392,7 +10631,17 @@ class Orchestrator:
             "report_path": report.report_path,
         }
 
-    def _visual_judge_provider_order(self) -> List[str]:
+    @staticmethod
+    def _adapter_supports_image_attachments(adapter: object) -> bool:
+        capability = getattr(adapter, "supports_image_attachments", None)
+        if not callable(capability):
+            return False
+        try:
+            return bool(capability())
+        except Exception:
+            return False
+
+    def _visual_judge_provider_selection(self) -> Tuple[List[str], List[str]]:
         configured = str(self.config.visual_judge.provider or "").strip()
         if configured:
             candidates = [configured] if configured in self.config.providers else []
@@ -10400,12 +10649,43 @@ class Orchestrator:
             base_order = self._failover_provider_order()
             first = self._last_successful_provider if self._last_successful_provider else self.config.active_provider
             candidates = [first] + [kind for kind in base_order if kind != first]
-        return [
-            kind
-            for kind in candidates
-            if kind in self.config.providers
-            and str(getattr(self.config.providers[kind], "vision", "auto")).strip() != "disabled"
-        ]
+
+        eligible: List[str] = []
+        diagnostics: List[str] = []
+        for kind in candidates:
+            if kind not in self.config.providers:
+                diagnostics.append(f"provider {kind} excluded: provider is not configured")
+                continue
+            vision = str(getattr(self.config.providers[kind], "vision", "auto")).strip()
+            if vision == "disabled":
+                diagnostics.append(f"provider {kind} excluded: vision is disabled")
+                self.logger.info(f"[visual_judge] provider={kind} vision disabled, skipping")
+                continue
+            adapter = (
+                self.adapter
+                if kind == self.config.active_provider
+                else self._build_adapter_for_provider(kind)
+            )
+            available_fn = getattr(adapter, "available", None)
+            if not callable(available_fn) or not available_fn():
+                diagnostics.append(f"provider {kind} excluded: binary is unavailable")
+                self._failed_providers.add(kind)
+                self.logger.info(f"[visual_judge] provider={kind} binary not found, skipping")
+                continue
+            if not self._adapter_supports_image_attachments(adapter):
+                diagnostics.append(
+                    f"provider {kind} excluded: native image attachments are unsupported"
+                )
+                self.logger.info(
+                    f"[visual_judge] provider={kind} image attachments unsupported, skipping"
+                )
+                continue
+            eligible.append(kind)
+        return eligible, diagnostics
+
+    def _visual_judge_provider_order(self) -> List[str]:
+        order, _diagnostics = self._visual_judge_provider_selection()
+        return order
 
     def _call_visual_judge_provider(
         self,
@@ -10415,8 +10695,11 @@ class Orchestrator:
         prompt: str,
         attachments: List[Path],
         provider_order: List[str],
+        stage_suffix: str = "",
     ) -> Optional[AgentResult]:
         stage_key = f"visual_judge-{task.task_id}"
+        if stage_suffix:
+            stage_key = f"{stage_key}-{stage_suffix}"
         effort = self.config.efforts.get("visual_judge", self.config.efforts.get("review", "balanced"))
         output_path = self._stage_output_path(state.run_id, stage_key)
         write_run_prompt(self.project_root, state.run_id, stage_key, prompt)
@@ -10427,6 +10710,11 @@ class Orchestrator:
             if available_fn is not None and not available_fn():
                 self._failed_providers.add(kind)
                 self.logger.info(f"[visual_judge] provider={kind} binary not found, skipping")
+                continue
+            if not self._adapter_supports_image_attachments(adapter):
+                self.logger.info(
+                    f"[visual_judge] provider={kind} image attachments unsupported, skipping"
+                )
                 continue
             request = AgentRequest(
                 stage="visual_judge",
@@ -10455,7 +10743,7 @@ class Orchestrator:
         for pair in pairs:
             for ref in (pair.prototype_image_ref, pair.actual_image_ref):
                 path = self._resolve_visual_ref_path(ref)
-                if path is not None and path.exists() and path not in attachments:
+                if path is not None and path.exists():
                     attachments.append(path)
         return attachments
 
@@ -10479,11 +10767,20 @@ class Orchestrator:
 
     @staticmethod
     def _append_visual_judge_report_to_proofs(task: TaskSpec, pairs: Iterable[object], report_ref: str) -> bool:
-        targets = {
-            (str(pair.requirement_id).strip(), int(pair.oracle_index or 0))
-            for pair in pairs
-            if str(pair.requirement_id).strip()
-        }
+        targets = set()
+        for pair in pairs:
+            owners = getattr(pair, "proof_owners", []) or []
+            if owners:
+                for owner in owners:
+                    if not isinstance(owner, dict):
+                        continue
+                    requirement_id = str(owner.get("requirement_id", "")).strip()
+                    if requirement_id:
+                        targets.add((requirement_id, int(owner.get("oracle_index", 0) or 0)))
+                continue
+            requirement_id = str(pair.requirement_id).strip()
+            if requirement_id:
+                targets.add((requirement_id, int(pair.oracle_index or 0)))
         changed = False
         for proof in task.requirement_proofs:
             if not isinstance(proof, dict):

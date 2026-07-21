@@ -94,6 +94,9 @@ class CodexAdapter(AgentAdapter):
     def available(self) -> bool:
         return shutil.which(self.config.binary) is not None
 
+    def supports_image_attachments(self) -> bool:
+        return True
+
     def run(self, request: AgentRequest) -> AgentResult:
         if request.resume_session_id:
             command: List[str] = [
@@ -122,6 +125,9 @@ class CodexAdapter(AgentAdapter):
         profile = self.config.profile_map.get(request.effort)
         if profile and not request.resume_session_id:
             command.extend(["--profile", profile])
+
+        for attachment in request.attachments:
+            command.extend(["--image", str(attachment)])
 
         command.extend(self.config.extra_args)
         if request.resume_session_id:
