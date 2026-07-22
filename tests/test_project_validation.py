@@ -107,6 +107,32 @@ class ProjectRunLockTests(unittest.TestCase):
                 finally:
                     inherited.release()
 
+    def test_acquire_reports_stale_control_as_interrupted_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            project_root.mkdir()
+            first = ProjectRunLock(project_root)
+            first.acquire()
+            owner_payload = first.owner_payload()
+            control_payload = json.loads(
+                first.control_path.read_text(encoding="utf-8")
+            )
+            control_path = first.control_path
+            first.release()
+            write_json(control_path, control_payload)
+
+            second = ProjectRunLock(project_root, environ={})
+            try:
+                second.acquire()
+                snapshot = second.interrupted_snapshot
+            finally:
+                second.release()
+
+            self.assertEqual(snapshot["owner"]["pid"], owner_payload["pid"])
+            self.assertEqual(
+                snapshot["control"]["project"], str(project_root.resolve())
+            )
+
     def test_cli_rejects_duplicate_before_constructing_orchestrator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

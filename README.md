@@ -523,6 +523,21 @@ task. The same incident gets at most `execution.recovery.max_rounds` recovery ro
 default), and a run gets at most `max_incidents_per_run` distinct incidents. Cleanup uncertainty,
 low-confidence diagnosis, or exhausted budgets pause safely instead of mutating blindly.
 
+A pre-baseline repair task owns the exact command that created the incident; it does not fall back
+to the entire project gate. If that repair needs evidence-repair children, the recovery lane honors
+their `depends_on` graph and runs ready children before retrying the parent. The ordinary clean-head
+baseline is captured only after the incident parent succeeds. Older open recovery tasks created
+without this command scope are migrated conservatively: unstarted generated children are
+superseded, while partially executed children pause for review so worktree changes are not lost.
+
+The project run lock also distinguishes a clean release from an owner process that disappeared.
+When a later `run` finds stale process control with no live process groups, it records a runtime
+interruption and resumes the persisted implementation/provider/verification checkpoint once.
+Repeated interruption at the same HEAD, worktree, stage, and task checkpoint is diagnosed and
+bounded by `execution.recovery.max_rounds`; inconclusive or exhausted recovery pauses instead of
+looping. A host-level `SIGKILL` still requires a later CLI invocation because no in-process code can
+continue after the host has removed the process.
+
 In an interactive terminal, a paused incident enters a recovery-agent dialogue. Background runs
 persist the incident under `.auto-agents/runs/<run-id>/recovery_incidents/` and exit paused; resume it
 later with `python3 -m auto_agents recover --project /tmp/demo`. Recovery does not automatically

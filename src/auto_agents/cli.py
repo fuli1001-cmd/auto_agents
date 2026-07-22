@@ -733,6 +733,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             spec_file = Path(args.spec_file) if args.spec_file else _default_spec_file(project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            if run_lock.interrupted_snapshot:
+                interrupted_state = orchestrator.reconcile_runtime_interruption(
+                    run_lock.interrupted_snapshot
+                )
+                if interrupted_state.status == "paused":
+                    print(_render_run_summary(project_root, interrupted_state.to_dict()))
+                    return 3
             if getattr(args, "no_repo_map", False):
                 orchestrator.config.repo_map.enabled = False
             _safe_notify(notify_run_started, project_root)

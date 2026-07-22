@@ -3028,6 +3028,13 @@ class Orchestrator:
         elif diagnosis.action == "REWIND_PLAN":
             self._rewind_state_from_stage(state, "plan")
         elif diagnosis.action == "RECOVER_TARGET":
+            if not self._safe_execution_recovery_command(incident.command):
+                return self._pause_for_execution_incident(
+                    state,
+                    incident,
+                    "the original verification command contains redacted or missing data and "
+                    "cannot be reproduced safely",
+                )
             self._schedule_prebaseline_recovery_task(state, incident)
         else:
             # RETRY is deliberately bounded by the incident recovery counter.
@@ -3104,6 +3111,167 @@ class Orchestrator:
         save_run_state(self.project_root, state)
         return state
 
+    def reconcile_runtime_interruption(
+        self,
+        snapshot: Dict[str, object],
+    ) -> RunState:
+        """Record an unclean prior owner exit and choose a bounded resume route."""
+        state = load_run_state(self.project_root)
+        if not snapshot:
+            return state
+        control = snapshot.get("control", {})
+        owner = snapshot.get("owner", {})
+        if not isinstance(control, dict) or not isinstance(owner, dict):
+            return state
+        if str(control.get("project", "")) != str(self.project_root):
+            return state
+
+        process_kinds = sorted(
+            {
+                str(item.get("kind", "")).strip()
+                for item in control.get("processes", []) or []
+                if isinstance(item, dict) and str(item.get("kind", "")).strip()
+            }
+        )
+        in_progress = sorted(
+            task.task_id for task in state.tasks if task.status == "in_progress"
+        )
+        fingerprint_payload = {
+            "run_id": state.run_id,
+            "stage": state.current_stage,
+            "in_progress_tasks": in_progress,
+            "implementation_ready_tasks": self._implementation_ready_markers(state),
+            "head": head_ref(self.project_root),
+            "worktree": worktree_fingerprint(self.project_root),
+            "process_kinds": process_kinds,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        prior_events = [
+            entry
+            for entry in state.recovery_loop_events
+            if isinstance(entry, dict)
+            and entry.get("event_type") == "runtime_interruption"
+            and str(entry.get("fingerprint", "")) == fingerprint
+        ]
+        occurrence = len(prior_events) + 1
+        event: Dict[str, object] = {
+            "event_type": "runtime_interruption",
+            "fingerprint": fingerprint,
+            "occurrence_count": occurrence,
+            "detected_at": str(snapshot.get("detected_at", "")),
+            "previous_owner_pid": int(owner.get("pid", 0) or 0),
+            "last_heartbeat_at": str(control.get("updated_at", "")),
+            "stage": state.current_stage,
+            "in_progress_tasks": in_progress,
+            "process_kinds": process_kinds,
+            "action": "resume_checkpoint",
+        }
+
+        max_rounds = max(1, int(self.config.execution.recovery.max_rounds))
+        if occurrence > max_rounds:
+            event["action"] = "pause_repeated_interruption"
+            state.status = "paused"
+            state.last_error = (
+                "the same runtime checkpoint was interrupted repeatedly without progress; "
+                f"fingerprint={fingerprint} occurrences={occurrence} limit={max_rounds}"
+            )
+        elif occurrence > 1:
+            incident = ExecutionIncident(
+                incident_id=f"runtime-{fingerprint[:12]}",
+                run_id=state.run_id,
+                source="runtime",
+                kind="run_interrupted",
+                stage=state.current_stage,
+                context="previous auto_agents owner disappeared without releasing runtime control",
+                termination_reason="owner_disappeared",
+                process_snapshot={
+                    "owner": owner,
+                    "control": control,
+                    "checkpoint": fingerprint_payload,
+                },
+                head_ref=head_ref(self.project_root),
+                worktree_fingerprint=worktree_fingerprint(self.project_root),
+                incident_fingerprint=fingerprint,
+                evidence_fingerprint=fingerprint,
+                occurrence_count=occurrence,
+            )
+            diagnosis = self._agent_diagnose_execution_incident(incident)
+            event["diagnosis"] = diagnosis.to_dict() if diagnosis is not None else {}
+            if diagnosis is None or diagnosis.confidence < 0.8 or diagnosis.action in {"ASK_USER", "STOP"}:
+                event["action"] = "pause_inconclusive_diagnosis"
+                state.status = "paused"
+                state.last_error = (
+                    "repeated runtime interruption could not be diagnosed safely; "
+                    f"fingerprint={fingerprint}"
+                )
+            elif (
+                diagnosis.action == "SELF_REPAIR"
+                and diagnosis.owner == "auto_agents"
+                and diagnosis.confidence >= 0.85
+            ):
+                event["action"] = "self_repair_triage"
+                state.last_recovery_route = {
+                    "outcome": "invariant_violation",
+                    "engine_invariant": "repeated_runtime_interruption",
+                    "failure_kind": "runtime_interruption",
+                    "reason": diagnosis.reason,
+                    "evidence_fingerprint": fingerprint,
+                }
+                state.status = "failed"
+                state.last_error = (
+                    "repeated runtime interruption was attributed to auto_agents; "
+                    "engine_invariant=repeated_runtime_interruption; "
+                    f"fingerprint={fingerprint}"
+                )
+            elif diagnosis.action == "REWIND_PLAN":
+                event["action"] = "rewind_plan"
+                self._rewind_state_from_stage(state, "plan")
+            elif diagnosis.action == "REWIND_CLARIFY":
+                event["action"] = "rewind_clarify"
+                self._rewind_state_from_stage(state, "clarify")
+            elif diagnosis.action in {"RETRY", "RECOVER_TARGET"}:
+                event["action"] = "resume_checkpoint"
+                if state.status == "failed":
+                    state.status = "pending"
+                state.last_error = ""
+            else:
+                event["action"] = "pause_unsupported_diagnosis"
+                state.status = "paused"
+                state.last_error = (
+                    "repeated runtime interruption diagnosis did not produce a safe route; "
+                    f"action={diagnosis.action} owner={diagnosis.owner}"
+                )
+        elif (
+            state.status == "failed"
+            and not state.pending_approval
+            and str(state.last_error).lower().startswith("run interrupted")
+        ):
+            state.status = "pending"
+            state.last_error = ""
+
+        history = [
+            entry for entry in state.recovery_loop_events if isinstance(entry, dict)
+        ]
+        history.append(event)
+        state.recovery_loop_events = history[-self.MAX_RECOVERY_LOOP_EVENTS:]
+        save_run_state(self.project_root, state)
+        self.logger.warning(
+            "[runtime-recovery] detected previous unclean exit fingerprint=%s "
+            "occurrence=%s action=%s",
+            fingerprint,
+            occurrence,
+            event["action"],
+        )
+        if event["action"] == "self_repair_triage":
+            raise RuntimeError(state.last_error)
+        return state
+
     def _schedule_prebaseline_recovery_task(
         self,
         state: RunState,
@@ -3140,7 +3308,14 @@ class Orchestrator:
                 status="pending",
                 task_origin="stage_recovery",
                 recovery_round=incident.recovery_round,
-                recovery_history=[recovery_task_marker(incident.incident_id, incident.command)],
+                recovery_history=[
+                    recovery_task_marker(
+                        incident.incident_id,
+                        incident.command,
+                        recovery_round=incident.recovery_round,
+                    )
+                ],
+                verification_refs=[f"cmd:{incident.command}"],
             )
             tasks.insert(0, task)
             self._persist_tasks(tasks)
@@ -3150,6 +3325,182 @@ class Orchestrator:
         state.rejected_stage = ""
         state.rejection_reason = ""
         state.last_error = ""
+
+    @staticmethod
+    def _execution_recovery_marker(task: TaskSpec) -> Dict[str, object]:
+        for entry in reversed(task.recovery_history):
+            if (
+                isinstance(entry, dict)
+                and str(entry.get("kind", "")) == "execution_incident"
+                and str(entry.get("execution_incident_id", "")).strip()
+            ):
+                return entry
+        return {}
+
+    @staticmethod
+    def _safe_execution_recovery_command(command: object) -> bool:
+        normalized = str(command or "").strip()
+        return bool(normalized and "<redacted>" not in normalized.lower())
+
+    def _normalize_legacy_execution_recovery_tasks(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> bool:
+        """Bind legacy recovery roots to their command and discard unrun bad fan-out."""
+        changed = False
+        remove_ids: Set[str] = set()
+        for root in list(tasks):
+            marker = self._execution_recovery_marker(root)
+            if not marker or root.verification_refs:
+                continue
+            command = str(marker.get("verification_command", "")).strip()
+            if not self._safe_execution_recovery_command(command):
+                state.status = "paused"
+                state.last_error = (
+                    f"execution recovery task {root.task_id} cannot reproduce its original "
+                    "verification command safely; run recover with the missing context"
+                )
+                return changed
+
+            all_legacy_children = [
+                item
+                for item in tasks
+                if item.parent_task_id == root.task_id
+                and item.task_origin == "evidence_repair"
+            ]
+            legacy_children = [
+                item for item in all_legacy_children if item.status != "done"
+            ]
+            completed_children = [
+                item for item in all_legacy_children if item.status == "done"
+            ]
+            ambiguous = [
+                item for item in legacy_children if item.status in {"in_progress", "blocked"}
+            ]
+            if ambiguous:
+                state.status = "paused"
+                state.last_error = (
+                    "legacy execution recovery has partially executed unscoped repair tasks: "
+                    + ", ".join(item.task_id for item in ambiguous)
+                    + "; automatic migration stopped to preserve possible worktree changes"
+                )
+                return changed
+
+            pending_ids = {
+                item.task_id for item in legacy_children if item.status == "pending"
+            }
+            root.verification_refs = [f"cmd:{command}"]
+            changed = True
+            if pending_ids:
+                remove_ids.update(pending_ids)
+                root.depends_on = [
+                    dependency for dependency in root.depends_on
+                    if dependency not in pending_ids
+                ]
+                for entry in root.recovery_history:
+                    if not isinstance(entry, dict):
+                        continue
+                    repair_ids = {
+                        str(item).strip()
+                        for item in entry.get("repair_task_ids", []) or []
+                        if str(item).strip()
+                    }
+                    superseded_ids = sorted(repair_ids & pending_ids)
+                    if superseded_ids:
+                        entry["superseded"] = True
+                        entry["superseded_repair_task_ids"] = superseded_ids
+                        entry["superseded_reason"] = (
+                            "legacy execution recovery fell back to the full gate instead of "
+                            "the original incident command"
+                        )
+                if not completed_children:
+                    incident_id = str(marker.get("execution_incident_id", "")).strip()
+                    incident = self._incident_store(state).load(incident_id) if incident_id else None
+                    initial_round = int(
+                        marker.get(
+                            "initial_recovery_round",
+                            incident.recovery_round if incident is not None else max(0, root.recovery_round - 1),
+                        )
+                        or 0
+                    )
+                    root.recovery_round = max(0, initial_round)
+                root.recovery_history.append(
+                    {
+                        "kind": "execution_recovery_scope_migration",
+                        "result": "superseded_unscoped_repairs",
+                        "repair_task_ids": sorted(pending_ids),
+                    }
+                )
+                self.logger.info(
+                    "[execution-recovery] migrated legacy task=%s command_scope=original "
+                    "discarded_pending_repairs=%s",
+                    root.task_id,
+                    ",".join(sorted(pending_ids)),
+                )
+
+        if remove_ids:
+            tasks[:] = [task for task in tasks if task.task_id not in remove_ids]
+        if changed:
+            state.tasks = tasks
+            self._persist_tasks(tasks)
+            save_run_state(self.project_root, state)
+        return changed
+
+    def _execution_recovery_root(
+        self,
+        task: TaskSpec,
+        tasks_by_id: Dict[str, TaskSpec],
+    ) -> Optional[TaskSpec]:
+        current = task
+        seen: Set[str] = set()
+        while current.task_id not in seen:
+            seen.add(current.task_id)
+            if is_execution_incident_recovery_task(current):
+                return current
+            parent_id = current.parent_task_id.strip()
+            if not parent_id or parent_id not in tasks_by_id:
+                return None
+            current = tasks_by_id[parent_id]
+        return None
+
+    def _ready_prebaseline_recovery_task(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> Tuple[Optional[TaskSpec], bool]:
+        tasks_by_id = {task.task_id: task for task in tasks}
+        unfinished_roots = {
+            task.task_id
+            for task in tasks
+            if task.status != "done" and is_execution_incident_recovery_task(task)
+        }
+        if not unfinished_roots:
+            return None, False
+        completed = {task.task_id for task in tasks if task.status == "done"}
+        for task in tasks:
+            if task.status == "done":
+                continue
+            root = self._execution_recovery_root(task, tasks_by_id)
+            if root is None or root.task_id not in unfinished_roots:
+                continue
+            if all(dependency in completed for dependency in task.depends_on):
+                return task, True
+
+        blocked = sorted(unfinished_roots)
+        owner = tasks_by_id[blocked[0]]
+        self._record_recovery_route(
+            state,
+            owner,
+            outcome="invariant_violation",
+            failure_kind="execution_recovery_scheduler",
+            reason="unfinished execution recovery lineage has no dependency-ready task",
+            engine_invariant="execution_recovery_dependency_deadlock",
+        )
+        raise RuntimeError(
+            "execution recovery scheduler invariant violated: unfinished recovery lineage "
+            f"has no runnable task; roots={','.join(blocked)}"
+        )
 
     def _resolve_execution_incident_for_task(
         self,
@@ -3575,14 +3926,16 @@ class Orchestrator:
 
         state.tasks = tasks
         self._commit_planning_baseline_if_needed(tasks)
-        prebaseline_recovery = next(
-            (
-                task for task in tasks
-                if task.status != "done" and is_execution_incident_recovery_task(task)
-            ),
-            None,
+        self._normalize_legacy_execution_recovery_tasks(state, tasks)
+        if state.status == "paused":
+            return state
+        prebaseline_recovery, recovery_pending = self._ready_prebaseline_recovery_task(
+            state, tasks
         )
-        if prebaseline_recovery is not None:
+        if recovery_pending and prebaseline_recovery is not None:
+            if not self._has_task_budget(max_tasks, 0):
+                self._task_budget_exhausted = True
+                return state
             self.logger.info(
                 "[execution-recovery] pre-baseline lane task=%s",
                 prebaseline_recovery.task_id,
@@ -3591,6 +3944,7 @@ class Orchestrator:
                 state, tasks, prebaseline_recovery
             )
             state.tasks = tasks
+            self._consume_task_budget()
             # End this implementation pass. The next pass must establish a fresh
             # clean-head baseline before ordinary tasks may resume.
             state.stage_summaries.pop("implement", None)
@@ -3958,6 +4312,7 @@ class Orchestrator:
         tasks: List[TaskSpec],
         task: TaskSpec,
     ) -> Optional[RunState]:
+        visual_gate_recheck = self._task_is_blocked_by_visual_judge(task)
         if self._is_terminal_review_rejected_task(state, task):
             if self._schedule_repair_tasks_for_failure(
                 state,
@@ -12143,6 +12498,11 @@ class Orchestrator:
 
     def status(self) -> Dict[str, object]:
         state = load_run_state(self.project_root)
+        runtime_interruptions = [
+            entry
+            for entry in state.recovery_loop_events
+            if isinstance(entry, dict) and entry.get("event_type") == "runtime_interruption"
+        ]
         return {
             "run_id": state.run_id,
             "status": state.status,
@@ -12153,6 +12513,9 @@ class Orchestrator:
             "last_error": state.last_error,
             "active_execution_incident_id": state.active_execution_incident_id,
             "execution_incidents": list(state.execution_incidents),
+            "last_runtime_interruption": (
+                dict(runtime_interruptions[-1]) if runtime_interruptions else {}
+            ),
             "tasks": [task.to_dict() for task in state.tasks],
             "changed_files": changed_files(self.project_root) if is_repo(self.project_root) else "",
             "runtime": runtime_status(self.project_root),

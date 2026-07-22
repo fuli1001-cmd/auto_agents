@@ -376,11 +376,17 @@ def parse_incident_diagnosis(raw: str) -> IncidentDiagnosis:
     return diagnosis
 
 
-def recovery_task_marker(incident_id: str, command: str) -> Dict[str, object]:
+def recovery_task_marker(
+    incident_id: str,
+    command: str,
+    *,
+    recovery_round: int = 0,
+) -> Dict[str, object]:
     return {
         "kind": "execution_incident",
         "execution_incident_id": incident_id,
         "verification_command": redact_incident_text(command),
+        "initial_recovery_round": max(0, int(recovery_round)),
         "result": "scheduled",
     }
 

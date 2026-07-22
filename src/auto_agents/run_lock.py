@@ -40,6 +40,7 @@ class ProjectRunLock:
         self.path = Path(tempfile.gettempdir()) / "auto-agents-run-locks" / f"{self.key}.lock"
         self.control_path = self.path.with_suffix(".processes.json")
         self._fd: Optional[int] = None
+        self._interrupted_snapshot: dict[str, object] = {}
         self.run_token = str(self._environ.get(RUN_LOCK_TOKEN_ENV, "")).strip() or uuid.uuid4().hex
 
     @property
@@ -72,6 +73,8 @@ class ProjectRunLock:
             ) from error
 
         self._fd = fd
+        previous_owner = _read_json_path(self.path)
+        previous_control = read_process_control(self.control_path)
         orphaned = _live_control_processes(self.control_path, expected_project=str(self.project_root))
         if orphaned:
             self.release()
@@ -80,9 +83,22 @@ class ProjectRunLock:
                 f"orphaned auto_agents subprocesses are still active for {self.project_root} "
                 f"({details}); run `python auto_agents.py stop --project {self.project_root}`"
             )
+        if (
+            previous_control
+            and str(previous_control.get("project", "")) == str(self.project_root)
+        ):
+            self._interrupted_snapshot = {
+                "detected_at": datetime.now(timezone.utc).isoformat(),
+                "owner": previous_owner,
+                "control": previous_control,
+            }
         self._write_owner(fd)
         ACTIVE_PROCESSES.configure(self.project_root, self.run_token, self.control_path)
         return self
+
+    @property
+    def interrupted_snapshot(self) -> dict[str, object]:
+        return dict(self._interrupted_snapshot)
 
     def _write_owner(self, fd: int) -> None:
         payload = {
