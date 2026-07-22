@@ -58,6 +58,63 @@ class GitOpsWorktreeTests(unittest.TestCase):
             remove_worktree(project_root, worktree_path)
             self.assertNotIn(str(worktree_path), list_worktrees(project_root))
 
+    def test_parallel_worker_reconciles_stale_registered_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            commit_all(project_root, "test: init")
+
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-stale",
+                title="Resume isolated task",
+                description="Exercise the managed worker lifecycle.",
+                acceptance=["the task reaches its gate"],
+            )
+            state = RunState(
+                run_id="run-resume",
+                current_stage="implement",
+                tasks=[task],
+            )
+            worktree_path = (
+                orchestrator._parallel_worktree_root() / state.run_id / task.task_id
+            )
+            add_worktree(project_root, worktree_path)
+            self.assertIn(str(worktree_path), list_worktrees(project_root))
+
+            gate_result = {
+                "ok": False,
+                "reason": f"planner-owned gap at {worktree_path / 'plan.json'}",
+                "review": f"update {worktree_path / 'plan.json'}",
+                "failure_ids": ["REQ-generic"],
+                "rewind_to_stage": "plan",
+                "expected_owner_stage": "plan",
+                "rewind_reason": f"rerun planning from {worktree_path / 'plan.json'}",
+            }
+            with patch.object(
+                Orchestrator,
+                "_ensure_task_verify_baseline",
+                return_value=False,
+            ), patch.object(
+                Orchestrator,
+                "_execute_task_with_retries",
+                return_value=gate_result,
+            ):
+                result = orchestrator._run_task_in_worktree(
+                    state,
+                    [task],
+                    task.task_id,
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["rewind_to_stage"], "plan")
+            self.assertNotIn("parallel worktree execution failed", str(result["reason"]))
+            self.assertIn(str(project_root / "plan.json"), str(result["rewind_reason"]))
+            self.assertNotIn(str(worktree_path), str(result))
+            self.assertFalse(worktree_path.exists())
+            self.assertNotIn(str(worktree_path), list_worktrees(project_root))
+
     def test_retained_ref_survives_worker_worktree_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

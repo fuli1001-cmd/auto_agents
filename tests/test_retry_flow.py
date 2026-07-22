@@ -6941,6 +6941,114 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(reloaded[0].requirement_proofs[0]["requirement_id"], "REQ-001")
             self.assertEqual(reloaded[1].verify_history[-1]["failure_ids"], ["reason:task-002"])
 
+    def test_parallel_tasks_honor_structured_plan_rewind_before_repair_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.gates.require_clean_git_before_task = False
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.workers = 2
+            save_project_config(project_root, config)
+            commit_all(project_root, "baseline")
+            orchestrator = Orchestrator(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-route",
+                            "title": "Route planner-owned gap",
+                            "description": "Verify structured recovery routing.",
+                            "acceptance": ["the owning stage is rerun"],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                        {
+                            "task_id": "task-peer",
+                            "title": "Complete independent peer",
+                            "description": "Produce an independent artifact.",
+                            "acceptance": ["peer artifact exists"],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                        },
+                    ]
+                },
+            )
+
+            def fake_run_task_in_worktree(state_snapshot, tasks_snapshot, task_id):
+                task = next(item for item in tasks_snapshot if item.task_id == task_id)
+                if task_id == "task-route":
+                    task.status = "blocked"
+                    task.review_summary = "The task plan owns the missing proof mapping."
+                    return orchestrator._parallel_task_failure_result(
+                        task,
+                        {
+                            "reason": "a planner-owned proof mapping is missing",
+                            "review": task.review_summary,
+                            "failure_ids": ["REQ-generic"],
+                            "rewind_to_stage": "plan",
+                            "expected_owner_stage": "plan",
+                            "rewind_reason": "rerun the owning planning stage",
+                        },
+                    )
+                task.status = "done"
+                return {
+                    "ok": True,
+                    "task": task.to_dict(),
+                    "reason": "",
+                    "review": "peer passed",
+                    "commit_sha": "peer-worker-commit",
+                    "changed_paths": ["peer.txt"],
+                    "verify_current_failure_ids": [],
+                }
+
+            def fake_integrate(task, tasks, worker_commit_sha):
+                write_text(project_root / "peer.txt", "integrated peer\n")
+                subprocess.run(
+                    ["git", "add", "peer.txt"],
+                    cwd=str(project_root),
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "commit", "-m", "test: integrate peer"],
+                    cwd=str(project_root),
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                return head_ref(project_root)
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            with patch.object(
+                orchestrator,
+                "_run_task_in_worktree",
+                side_effect=fake_run_task_in_worktree,
+            ), patch.object(
+                orchestrator,
+                "_integrate_parallel_task_result",
+                side_effect=fake_integrate,
+            ):
+                result = orchestrator._run_implementation_loop(state, max_tasks=2)
+
+            self.assertEqual(result.current_stage, "plan")
+            self.assertEqual(result.rejected_stage, "plan")
+            self.assertIn("rerun the owning planning stage", result.rejection_reason)
+            self.assertEqual(result.last_recovery_route, {})
+            self.assertTrue((project_root / "peer.txt").exists())
+            self.assertEqual(
+                {task.task_id: task.status for task in result.tasks},
+                {"task-route": "pending", "task-peer": "done"},
+            )
+
     def test_parallel_tasks_auto_workers_adapt_to_success_and_provider_pressure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

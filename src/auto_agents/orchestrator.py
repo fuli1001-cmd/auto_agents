@@ -111,7 +111,7 @@ from .frontend_design import (
     validate_frontend_scope,
     validate_prototype_manifest,
 )
-from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, ref_exists, remove_worktree, update_ref, worktree_fingerprint
+from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, list_worktrees, ref_exists, remove_worktree, update_ref, worktree_fingerprint
 from .io_utils import read_json, read_text, write_json, write_text
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
 from .models import (
@@ -4644,6 +4644,7 @@ class Orchestrator:
             provider_pressure_result: Optional[Tuple[TaskSpec, Dict[str, object]]] = None
             failed_results: List[Tuple[TaskSpec, Dict[str, object]]] = []
             scope_rewind_result: Optional[Tuple[TaskSpec, Dict[str, object]]] = None
+            stage_rewind_result: Optional[Tuple[TaskSpec, Dict[str, object], str]] = None
             integrated_paths: Set[str] = set()
             integrated_verification_commands: List[str] = []
             batch_integrated = 0
@@ -4657,6 +4658,18 @@ class Orchestrator:
                         continue
                     self._apply_parallel_task_failure_snapshot(task, dict(result["task"]))
                     task.status = "blocked"
+                    rewind_stage = str(result.get("rewind_to_stage", "")).strip()
+                    if (
+                        rewind_stage in STAGE_ORDER
+                        and STAGE_ORDER.index(rewind_stage) < STAGE_ORDER.index("implement")
+                    ):
+                        if (
+                            stage_rewind_result is None
+                            or STAGE_ORDER.index(rewind_stage)
+                            < STAGE_ORDER.index(stage_rewind_result[2])
+                        ):
+                            stage_rewind_result = (task, result, rewind_stage)
+                        continue
                     if result.get("rewind_to_plan") and scope_rewind_result is None:
                         scope_rewind_result = (task, result)
                         continue
@@ -4706,7 +4719,20 @@ class Orchestrator:
                 )
                 processed += 1
                 self._consume_task_budget()
-            if scope_rewind_result is not None:
+            if stage_rewind_result is not None:
+                rewind_task, rewind_result, rewind_stage = stage_rewind_result
+                rewind_state = self._handle_review_stage_rewind(
+                    state,
+                    rewind_task,
+                    tasks,
+                    rewind_result,
+                    rewind_stage,
+                    preserve_current_head=True,
+                )
+                if rewind_state is not None:
+                    return rewind_state
+                failed_results.append((rewind_task, rewind_result))
+            elif scope_rewind_result is not None:
                 rewind_task, rewind_result = scope_rewind_result
                 rewind_state = self._handle_scope_overflow_rewind(
                     state,
@@ -5329,6 +5355,58 @@ class Orchestrator:
             root = (self.project_root.parent / root).resolve()
         return root
 
+    def _reconcile_managed_parallel_worktree(self, worktree_path: Path) -> bool:
+        """Remove a stale registered worktree at an orchestrator-owned path."""
+        managed_root = self._parallel_worktree_root().resolve()
+        resolved_path = worktree_path.resolve()
+        try:
+            relative_path = resolved_path.relative_to(managed_root)
+        except ValueError as error:
+            raise RuntimeError(
+                f"refusing to reconcile worktree outside managed root: {resolved_path}"
+            ) from error
+        if not relative_path.parts or resolved_path == self.project_root:
+            raise RuntimeError(
+                f"refusing to reconcile unsafe managed worktree path: {resolved_path}"
+            )
+
+        registered_paths = {Path(path).resolve() for path in list_worktrees(self.project_root)}
+        if resolved_path not in registered_paths:
+            return False
+
+        self.logger.info(
+            "[parallel-tasks] reconcile stale managed worktree path=%s",
+            resolved_path,
+        )
+        remove_worktree(self.project_root, resolved_path, force=True)
+        remaining_paths = {Path(path).resolve() for path in list_worktrees(self.project_root)}
+        if resolved_path in remaining_paths or resolved_path.exists():
+            raise RuntimeError(
+                f"stale managed worktree cleanup did not remove {resolved_path}"
+            )
+        return True
+
+    def _rebase_parallel_worker_paths(
+        self,
+        payload: object,
+        worker_root: Path,
+    ) -> object:
+        """Rebind worker-local diagnostic paths before returning them to the main run."""
+        worker_prefix = str(worker_root.resolve())
+        project_prefix = str(self.project_root)
+        if isinstance(payload, str):
+            return payload.replace(worker_prefix, project_prefix)
+        if isinstance(payload, dict):
+            return {
+                key: self._rebase_parallel_worker_paths(value, worker_root)
+                for key, value in payload.items()
+            }
+        if isinstance(payload, list):
+            return [self._rebase_parallel_worker_paths(value, worker_root) for value in payload]
+        if isinstance(payload, tuple):
+            return tuple(self._rebase_parallel_worker_paths(value, worker_root) for value in payload)
+        return payload
+
     def _run_parallel_task_batch(
         self,
         state: RunState,
@@ -5373,6 +5451,9 @@ class Orchestrator:
             ),
         }
         for key in (
+            "rewind_to_stage",
+            "expected_owner_stage",
+            "rewind_reason",
             "rewind_to_plan",
             "split_task_id",
             "split_trigger",
@@ -5393,6 +5474,7 @@ class Orchestrator:
         worktree_path = self._parallel_worktree_root() / state.run_id / task_id
         worktree_created = False
         try:
+            self._reconcile_managed_parallel_worktree(worktree_path)
             add_worktree(self.project_root, worktree_path, ref=base_ref)
             worktree_created = True
             worker = self.__class__(
@@ -5414,7 +5496,8 @@ class Orchestrator:
             if not gate_result["ok"]:
                 worker_task.status = "blocked"
                 worker_task.review_summary = str(gate_result["review"])
-                return self._parallel_task_failure_result(worker_task, gate_result)
+                result = self._parallel_task_failure_result(worker_task, gate_result)
+                return dict(self._rebase_parallel_worker_paths(result, worktree_path))
 
             worker_task.status = "done"
             worker_task.review_summary = str(gate_result["review"])
@@ -5431,7 +5514,7 @@ class Orchestrator:
             worker_changed_paths = commit_changed_paths(worktree_path, worker_commit_sha)
             result_ref = self._parallel_result_ref(state.run_id, task_id)
             update_ref(self.project_root, result_ref, worker_commit_sha)
-            return {
+            result = {
                 "ok": True,
                 "task": worker_task.to_dict(),
                 "reason": "",
@@ -5442,6 +5525,7 @@ class Orchestrator:
                 "changed_paths": worker_changed_paths,
                 "verify_current_failure_ids": list(gate_result.get("verify_current_failure_ids", [])),
             }
+            return dict(self._rebase_parallel_worker_paths(result, worktree_path))
         except Exception as error:
             task = next((item for item in tasks if item.task_id == task_id), None)
             task_payload = task.to_dict() if task is not None else {"task_id": task_id}
@@ -5453,7 +5537,14 @@ class Orchestrator:
             }
         finally:
             if worktree_created:
-                remove_worktree(self.project_root, worktree_path, force=True)
+                try:
+                    remove_worktree(self.project_root, worktree_path, force=True)
+                except RuntimeError as error:
+                    self.logger.warning(
+                        "[parallel-tasks] worker worktree cleanup failed task=%s reason=%s",
+                        task_id,
+                        error,
+                    )
 
     def _defer_parallel_task_result(
         self,
@@ -5521,6 +5612,7 @@ class Orchestrator:
         worktree_created = False
         try:
             latest_ref = head_ref(self.project_root) or "HEAD"
+            self._reconcile_managed_parallel_worktree(worktree_path)
             add_worktree(self.project_root, worktree_path, ref=latest_ref)
             worktree_created = True
             try:
@@ -6606,6 +6698,8 @@ class Orchestrator:
         tasks: List[TaskSpec],
         gate_result: Dict[str, object],
         target_stage: str,
+        *,
+        preserve_current_head: bool = False,
     ) -> Optional[RunState]:
         if target_stage not in STAGE_ORDER or STAGE_ORDER.index(target_stage) >= STAGE_ORDER.index("implement"):
             return None
@@ -6615,7 +6709,10 @@ class Orchestrator:
             or state.implement_verify_baseline_ref
             or state.stage_summaries.get("implement_baseline_ref", "")
         )
-        rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
+        if preserve_current_head:
+            rewind_ref = head_ref(self.project_root) or "HEAD"
+        else:
+            rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
         incident_path = self._persist_rewind_incident(
             state,
             task=task,
