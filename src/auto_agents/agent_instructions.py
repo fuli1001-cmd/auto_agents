@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Sequence
 
 from .config import agent_instructions_lock_path, normalized_project_rules_path, project_rules_path
 from .io_utils import read_json, read_text, write_json, write_text
+from .frontend_design import load_frontend_design_lock
 
 
 MAX_ROOT_AGENTS_CHARS = 2800
@@ -232,7 +233,19 @@ def sync_agent_instructions(
         )
     if normalized_rules is None:
         normalized_rules = _extract_project_rules(project_rules if meaningful else "")
-    generated_files = _render_generated_files(normalized_rules)
+    rendered_rules = {key: list(normalized_rules.get(key, [])) for key in NORMALIZED_RULE_KEYS}
+    frontend_lock = load_frontend_design_lock(root)
+    frontend_contract_sha = ""
+    if frontend_lock.get("status") == "approved":
+        frontend_contract_sha = str(frontend_lock.get("contract_sha256", "")).strip()
+        rendered_rules["workflow_contracts"].extend(
+            [
+                "Frontend appearance and interactions must follow the approved DESIGN.md and .auto-agents/docs/frontend_prototype/manifest.json artifacts.",
+                "Do not modify DESIGN.md, the approved frontend prototype artifacts, or .auto-agents/state/frontend_design.lock.json during implementation; use an explicit prototype redesign workflow instead.",
+                "DESIGN.md governs visual appearance only; behavioral scope remains governed by the product spec and requirements trace.",
+            ]
+        )
+    generated_files = _render_generated_files(rendered_rules)
 
     generated_sha256: Dict[str, str] = {}
     for rel_path, content in generated_files.items():
@@ -246,6 +259,7 @@ def sync_agent_instructions(
     source_sha = _sha256_bytes(source.read_bytes() if source.exists() else b"")
     lock_payload = {
         "source_sha256": source_sha,
+        "frontend_design_contract_sha256": frontend_contract_sha,
         "generated_sha256": generated_sha256,
     }
     write_json(agent_instructions_lock_path(root), lock_payload)
@@ -325,6 +339,14 @@ def _agent_instructions_current(project_root: Path) -> bool:
 
     source_sha = _sha256_bytes(source.read_bytes())
     if str(lock.get("source_sha256", "")) != source_sha:
+        return False
+    frontend_lock = load_frontend_design_lock(root)
+    frontend_contract_sha = (
+        str(frontend_lock.get("contract_sha256", "")).strip()
+        if frontend_lock.get("status") == "approved"
+        else ""
+    )
+    if str(lock.get("frontend_design_contract_sha256", "")) != frontend_contract_sha:
         return False
 
     generated = lock.get("generated_sha256", {})

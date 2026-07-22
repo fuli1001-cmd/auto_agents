@@ -120,6 +120,7 @@ PROVIDER_REFERENCES_LOCK_TEMPLATE = {
 
 RUN_STATE_TEMPLATE = {
     "run_id": "",
+    "workflow_version": 2,
     "status": "pending",
     "current_stage": "clarify",
     "pending_approval": "",
@@ -264,7 +265,7 @@ DEFAULT_CONFIG = {
         },
     },
     "approvals": {
-        "enabled": ["requirements", "architecture", "release"],
+        "enabled": ["requirements", "prototype", "architecture", "release"],
     },
     "retries": {
         "default_max_attempts": 2,
@@ -276,6 +277,14 @@ DEFAULT_CONFIG = {
         "provider": "",
         "max_pairs_per_task": 6,
         "require_screenshot_artifacts": True,
+    },
+    "frontend_design": {
+        "mode": "auto",
+        "catalog_repository": "VoltAgent/awesome-design-md",
+        "catalog_ref": "main",
+        "max_pages": 3,
+        "viewports": ["1440x900", "390x844"],
+        "network_timeout_seconds": 30,
     },
 }
 
@@ -346,6 +355,26 @@ def task_plan_path(project_root: Path) -> Path:
 
 def requirements_trace_path(project_root: Path) -> Path:
     return state_dir(project_root) / "requirements_trace.json"
+
+
+def frontend_design_lock_path(project_root: Path) -> Path:
+    return state_dir(project_root) / "frontend_design.lock.json"
+
+
+def frontend_design_docs_dir(project_root: Path) -> Path:
+    return docs_dir(project_root) / "frontend_design"
+
+
+def frontend_prototype_dir(project_root: Path) -> Path:
+    return docs_dir(project_root) / "frontend_prototype"
+
+
+def frontend_design_cache_dir(project_root: Path) -> Path:
+    return auto_dir(project_root) / "cache" / "awesome-design-md"
+
+
+def design_md_path(project_root: Path) -> Path:
+    return project_root / "DESIGN.md"
 
 
 def provider_references_lock_path(project_root: Path) -> Path:

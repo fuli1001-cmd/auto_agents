@@ -7,8 +7,8 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from .repomap.config import RepoMapConfig
 
 
-STAGE_ORDER = ["clarify", "design", "plan", "provider_research", "implement", "visual_judge", "verify", "readme"]
-APPROVAL_ORDER = ["requirements", "architecture", "release"]
+STAGE_ORDER = ["clarify", "prototype", "design", "plan", "provider_research", "implement", "visual_judge", "verify", "readme"]
+APPROVAL_ORDER = ["requirements", "prototype", "architecture", "release"]
 SESSION_MODES = ("fix", "collab", "provider_resolve")
 SESSION_STATUSES = ("conversing", "executing", "verifying", "waiting_user", "completed", "failed")
 DEFAULT_SESSION_MAX_ATTEMPTS = {"fix": 4, "collab": 10, "provider_resolve": 8}
@@ -20,6 +20,7 @@ TASK_ORIGINS = ("planned", "scope_split", "evidence_repair", "stage_recovery")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity-claude", "antigravity-gemini")
 DEFAULT_EFFORTS = {
     "clarify": "deep",
+    "prototype": "max",
     "design": "max",
     "plan": "max",
     "sync-agent-instructions": "deep",
@@ -44,6 +45,7 @@ DEFAULT_COPILOT_CLI_PROFILE_MAP = {"balanced": "balanced", "deep": "deep", "max"
 SMART_TIMEOUT_PROGRESS_PROTOCOL = "auto-agents-jsonl-v1"
 DEFAULT_RETRY_PER_STAGE = {
     "clarify": 2,
+    "prototype": 2,
     "design": 2,
     "plan": 3,
     "sync-agent-instructions": 2,
@@ -54,6 +56,7 @@ DEFAULT_RETRY_PER_STAGE = {
 }
 APPROVAL_BY_STAGE = {
     "clarify": "requirements",
+    "prototype": "prototype",
     "design": "architecture",
     "verify": "release",
 }
@@ -375,7 +378,7 @@ class GitConfig:
 @dataclass
 class ApprovalConfig:
     enabled: List[str] = field(
-        default_factory=lambda: ["requirements", "architecture", "release"]
+        default_factory=lambda: ["requirements", "prototype", "architecture", "release"]
     )
 
     @classmethod
@@ -431,6 +434,32 @@ class VisualJudgeConfig:
             provider=str(data.get("provider", "")),
             max_pairs_per_task=int(data.get("max_pairs_per_task", 6)),
             require_screenshot_artifacts=bool(data.get("require_screenshot_artifacts", True)),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class FrontendDesignConfig:
+    mode: str = "auto"
+    catalog_repository: str = "VoltAgent/awesome-design-md"
+    catalog_ref: str = "main"
+    max_pages: int = 3
+    viewports: List[str] = field(default_factory=lambda: ["1440x900", "390x844"])
+    network_timeout_seconds: int = 30
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "FrontendDesignConfig":
+        return cls(
+            mode=str(data.get("mode", "auto")),
+            catalog_repository=str(
+                data.get("catalog_repository", "VoltAgent/awesome-design-md")
+            ),
+            catalog_ref=str(data.get("catalog_ref", "main")),
+            max_pages=int(data.get("max_pages", 3)),
+            viewports=[str(item) for item in data.get("viewports", ["1440x900", "390x844"])],
+            network_timeout_seconds=int(data.get("network_timeout_seconds", 30)),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -658,6 +687,7 @@ class ProjectConfig:
     approvals: ApprovalConfig = field(default_factory=ApprovalConfig)
     retries: RetryConfig = field(default_factory=RetryConfig)
     visual_judge: VisualJudgeConfig = field(default_factory=VisualJudgeConfig)
+    frontend_design: FrontendDesignConfig = field(default_factory=FrontendDesignConfig)
     repo_map: RepoMapConfig = field(default_factory=RepoMapConfig)
 
     @classmethod
@@ -709,6 +739,9 @@ class ProjectConfig:
             ),
             retries=RetryConfig.from_dict(dict(data.get("retries", {}))),
             visual_judge=VisualJudgeConfig.from_dict(dict(data.get("visual_judge", {}))),
+            frontend_design=FrontendDesignConfig.from_dict(
+                dict(data.get("frontend_design", {}))
+            ),
             repo_map=RepoMapConfig.from_dict(dict(data.get("repo_map", {}))),
         )
 
@@ -725,6 +758,7 @@ class ProjectConfig:
             "approvals": self.approvals.to_dict(),
             "retries": self.retries.to_dict(),
             "visual_judge": self.visual_judge.to_dict(),
+            "frontend_design": self.frontend_design.to_dict(),
             "repo_map": self.repo_map.to_dict(),
         }
 
@@ -747,6 +781,7 @@ class ProjectConfig:
 @dataclass
 class RunState:
     run_id: str
+    workflow_version: int = 1
     status: str = "pending"
     current_stage: str = "clarify"
     pending_approval: str = ""
@@ -771,6 +806,7 @@ class RunState:
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
         return cls(
             run_id=str(data["run_id"]),
+            workflow_version=int(data.get("workflow_version", 1)),
             status=str(data.get("status", "pending")),
             current_stage=str(data.get("current_stage", "clarify")),
             pending_approval=str(data.get("pending_approval", "")),
@@ -820,6 +856,7 @@ class RunState:
     def to_dict(self) -> Dict[str, object]:
         return {
             "run_id": self.run_id,
+            "workflow_version": self.workflow_version,
             "status": self.status,
             "current_stage": self.current_stage,
             "pending_approval": self.pending_approval,

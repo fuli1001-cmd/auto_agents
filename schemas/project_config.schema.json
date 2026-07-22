@@ -466,6 +466,42 @@
         }
       },
       "additionalProperties": false
+    },
+    "frontend_design": {
+      "type": "object",
+      "required": ["mode", "catalog_repository", "catalog_ref", "max_pages", "viewports", "network_timeout_seconds"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "const": "auto"
+        },
+        "catalog_repository": {
+          "const": "VoltAgent/awesome-design-md"
+        },
+        "catalog_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "max_pages": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3
+        },
+        "viewports": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[1-9][0-9]*x[1-9][0-9]*$"
+          }
+        },
+        "network_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

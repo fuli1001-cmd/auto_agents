@@ -210,7 +210,15 @@ def validate_frontend_fidelity_trace(trace_payload: object, *, spec_text: str = 
         and str(item.get("id", "")).strip() in scoped_fidelity_ids
     ]
 
-    if signals and not surfaces:
+    frontend_scope = trace_payload.get("frontend_scope")
+    pending_generated_prototype = (
+        isinstance(frontend_scope, Mapping)
+        and frontend_scope.get("requested") is True
+        and isinstance(frontend_scope.get("surfaces"), list)
+        and bool(frontend_scope.get("surfaces"))
+    )
+
+    if signals and not surfaces and not pending_generated_prototype:
         preview = ", ".join(signals[:5])
         errors.append(
             "input spec appears to require frontend prototype fidelity "

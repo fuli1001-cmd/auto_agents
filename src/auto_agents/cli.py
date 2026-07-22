@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
+import http.server
 import json
 import signal
 import subprocess
@@ -14,6 +16,10 @@ from typing import Optional
 
 from .config import (
     architecture_path,
+    design_md_path,
+    frontend_design_docs_dir,
+    frontend_design_lock_path,
+    frontend_prototype_dir,
     load_run_state,
     project_brief_path,
     requirements_audit_path,
@@ -35,6 +41,7 @@ from .notifications import (
 )
 from .orchestrator import Orchestrator
 from .gates import GateCommandTimeoutError
+from .frontend_design import load_frontend_design_lock, validate_frontend_design_artifacts
 from .process_supervision import (
     ACTIVE_PROCESSES,
     RunInterruptedError,
@@ -99,6 +106,14 @@ def _render_key_files(project_root: Path, state_payload: dict[str, object]) -> l
         ])
     elif pending_approval == "architecture":
         key_files.append(architecture_path(project_root))
+    elif pending_approval == "prototype":
+        prototype_files = [
+            design_md_path(project_root),
+            frontend_design_docs_dir(project_root) / "selection.md",
+            frontend_prototype_dir(project_root) / "index.html",
+            frontend_design_lock_path(project_root),
+        ]
+        key_files.extend(path for path in prototype_files if path.exists())
     elif pending_approval == "release":
         key_files.extend([
             requirements_audit_path(project_root),
@@ -156,6 +171,17 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
             *[f"- {item}" for item in key_files],
             "",
             "Next steps:",
+            *(
+                [
+                    "- Preview prototypes: "
+                    + _format_command(
+                        "python3", "-m", "auto_agents", "prototype-preview",
+                        "--project", str(project_root),
+                    )
+                ]
+                if pending_approval == "prototype"
+                else []
+            ),
             f"- Approve and continue: {approve_cmd} && {run_cmd}",
             f"- Reject and revise: {reject_cmd} && {run_cmd}",
             f"- Inspect persisted status: {status_cmd}",
@@ -183,6 +209,7 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
         *[f"- {item}" for item in key_files],
         "",
         "Next steps:",
+        *([f"- Retry/resume the run: {run_cmd}"] if status == "paused" else []),
         f"- Inspect persisted status: {status_cmd}",
     ]
     return "\n".join(lines)
@@ -503,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--auto-approve",
         action="store_true",
-        help="Automatically pass all manual approval gates.",
+        help="Automatically pass manual gates except the mandatory frontend prototype review.",
     )
     run_parser.add_argument(
         "--allow-dirty-tree",
@@ -588,6 +615,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Reason for rejection. This feedback will be provided to the agent on the next run.",
     )
+    reject_parser.add_argument(
+        "--reselect-design",
+        action="store_true",
+        help="For a prototype rejection, select a new catalog DESIGN.md before regenerating pages.",
+    )
+
+    preview_parser = subparsers.add_parser(
+        "prototype-preview",
+        help="Serve the generated static frontend prototype for local review.",
+    )
+    preview_parser.add_argument("--project", required=True, help="Target project directory.")
+    preview_parser.add_argument("--host", default="127.0.0.1", help="Bind host. Defaults to loopback.")
+    preview_parser.add_argument("--port", type=int, default=0, help="Bind port. Defaults to an available port.")
 
     status_parser = subparsers.add_parser("status", help="Show the current orchestrator state.")
     status_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -715,8 +755,44 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "reject":
         orchestrator = Orchestrator(Path(args.project))
-        state = orchestrator.reject(args.gate, args.reason)
+        state = orchestrator.reject(
+            args.gate,
+            args.reason,
+            reselect_design=bool(args.reselect_design),
+        )
         print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "prototype-preview":
+        project_root = Path(args.project).expanduser().resolve()
+        if args.port < 0 or args.port > 65535:
+            parser.error("--port must be between 0 and 65535")
+        lock = load_frontend_design_lock(project_root)
+        errors = validate_frontend_design_artifacts(
+            project_root,
+            lock,
+            require_approved=False,
+        )
+        if errors:
+            print(
+                json.dumps({"ok": False, "errors": errors}, indent=2, ensure_ascii=False),
+                file=sys.stderr,
+            )
+            return 1
+        prototype_root = frontend_prototype_dir(project_root)
+        handler = functools.partial(
+            http.server.SimpleHTTPRequestHandler,
+            directory=str(prototype_root),
+        )
+        server = http.server.ThreadingHTTPServer((args.host, args.port), handler)
+        host, port = server.server_address[:2]
+        print(f"Prototype preview: http://{host}:{port}/", flush=True)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
         return 0
 
     if args.command == "run":

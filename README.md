@@ -31,11 +31,14 @@ The system optimizes for quality over throughput:
 ## Core workflow
 
 1. `clarify`: interactively refine an idea into a project brief, or extract it automatically if the spec is a detailed design
-2. `design`: create a top-level architecture document
-3. `plan`: generate a JSON task plan with small verifiable feature slices plus a verification strategy
-4. `implement`: execute one feature slice at a time, with per-task verification and independent agent review
-5. `verify`: run a final local gate pass across the full project
-6. `readme`: interactively generate a project README from the finalized repository state
+2. `prototype`: when the scope needs a brand-new frontend, select and pin a design system, generate static prototype pages, and pause for mandatory human approval
+3. `design`: create a top-level architecture document
+4. `plan`: generate a JSON task plan with small verifiable feature slices plus a verification strategy
+5. `provider_research`: resolve required external provider contracts into local pinned references
+6. `implement`: execute one feature slice at a time, with per-task verification and independent agent review
+7. `visual_judge`: optionally compare explicit prototype/actual screenshot pairs
+8. `verify`: run a final local gate pass across the full project
+9. `readme`: interactively generate a project README from the finalized repository state
 
 Review and commit happen inside the `implement` loop for each task, not as separate top-level stages.
 
@@ -137,14 +140,16 @@ agent to decide whether the failure is implementation code, stale tests, or both
 automatic recovery cannot resolve the conflict, the pipeline rewinds to `clarify` so the next run can
 use the normal clarification dialog to ask for user guidance.
 
-Manual approvals are supported at three high-value gates:
+Manual approvals are supported at four high-value gates:
 
 - `requirements`
+- `prototype` (always manual when generated)
 - `architecture`
 - `release`
 
-`run --auto-approve` auto-passes those manual gates only. It does not disable interactive clarify or
-README conversations.
+`run --auto-approve` auto-passes the requirements, architecture, and release gates. It never passes
+the generated frontend prototype gate, and it does not disable interactive clarify or README
+conversations.
 
 ## Repo map (token saver)
 
@@ -306,6 +311,21 @@ Reject a paused gate and provide explicit unstructured feedback for the agent:
 
 ```bash
 python3 -m auto_agents reject --project /tmp/demo --gate requirements --reason "Add a PostgreSQL database."
+```
+
+For a generated frontend prototype, preview it locally before approving:
+
+```bash
+python3 -m auto_agents prototype-preview --project /tmp/demo
+python3 -m auto_agents approve --project /tmp/demo --gate prototype
+```
+
+A normal prototype rejection retains the selected design and regenerates the pages from the
+feedback. Request an explicit catalog redesign with `--reselect-design`:
+
+```bash
+python3 -m auto_agents reject --project /tmp/demo --gate prototype \
+  --reason "Use a quieter editorial direction." --reselect-design
 ```
 
 If the run is currently paused on a manual gate, `approve` and `reject` can infer the gate from the persisted run
@@ -470,6 +490,7 @@ configuration balances quality and token usage:
 | Stage | Default | Effective | Rationale |
 |-------|---------|-----------|-----------|
 | clarify | `deep` | dynamic | Downgraded to `balanced` when spec is already a design doc |
+| prototype | `max` | conditional | Selects a design system and generates approval-quality frontend prototypes |
 | design | `deep` | dynamic | Downgraded to `balanced` when spec is already a design doc |
 | plan | `deep` | `deep` | Task decomposition affects the whole run |
 | provider_research | `deep` | `deep` | Resolves provider-specific requirement references before implementation |
@@ -746,11 +767,26 @@ Once a done task has claimed or proved a requirement ID, clarify cannot rewrite 
 place. A changed contract must use a new requirement ID and reciprocal `supersedes` /
 `superseded_by` links; the old record remains in the append-only trace with status `superseded`.
 
-When the input spec references frontend pages together with prototype artifacts such as HTML
-mockups, screenshots, Figma files, or design images, the clarify stage records an optional
-`frontend_surfaces` array in `state/requirements_trace.json`. Each surface names the page/screen,
-the source prototype refs, known viewports, and the expected visual fidelity level. Projects without
-frontend surfaces or without prototype artifacts can omit the field or leave it empty.
+When clarified scope requests frontend pages, `frontend_scope` records the intended surfaces and
+their requirement IDs. If the repository has no existing frontend page and no approved design
+contract, the `prototype` stage first honors user-supplied `DESIGN.md`, prototype files, or Figma
+references. Otherwise it downloads `VoltAgent/awesome-design-md`, pins the resolved Git commit,
+scores exactly three catalog candidates, and copies the selected upstream `DESIGN.md` byte for
+byte. The catalog snapshot is cached under ignored `.auto-agents/cache/`; if neither GitHub nor a
+complete cache is available, the run pauses without inventing a fallback design.
+
+The stage then generates up to three core, self-contained static HTML pages under
+`.auto-agents/docs/frontend_prototype/`. Remote assets, CDNs, external scripts, and file URLs are
+rejected. Review them with `prototype-preview`; this gate always requires an explicit `approve`,
+even when the run uses `--auto-approve`. Approval stamps artifact hashes and a contract hash in
+`.auto-agents/state/frontend_design.lock.json`. Subsequent architecture, planning, implementation,
+and review prompts must follow the approved prototype and `DESIGN.md`; validation fails if an
+approved artifact is modified. The pinned catalog version remains unchanged across later runs until
+the user explicitly rejects/reselects the design.
+
+After approval, the prototype pages are projected into the existing `frontend_surfaces` array in
+`state/requirements_trace.json`. Each surface names the page/screen, source prototype ref, known
+viewports, and expected visual fidelity level. Projects without frontend scope omit this contract.
 
 For those frontend surface requirements, task planning must create page-level work and proof entries
 that use rendered-surface evidence. Deterministic DOM/CSS checks and browser screenshot evidence

@@ -44,6 +44,10 @@ from .config import (
     archived_task_plan_path,
     bootstrap_project,
     docs_dir,
+    design_md_path,
+    frontend_design_docs_dir,
+    frontend_design_lock_path,
+    frontend_prototype_dir,
     gate_baseline_cache_path,
     load_project_config,
     load_run_state,
@@ -87,7 +91,26 @@ from .execution_recovery import (
     parse_incident_diagnosis,
     recovery_task_marker,
 )
-from .frontend_fidelity import validate_frontend_fidelity_trace
+from .frontend_fidelity import frontend_fidelity_requirement_ids, validate_frontend_fidelity_trace
+from .frontend_design import (
+    AwesomeDesignCatalogClient,
+    FrontendDesignUnavailable,
+    approved_frontend_design,
+    derived_frontend_surfaces,
+    discover_existing_frontend,
+    frontend_design_artifact_hashes,
+    frontend_design_contract_sha256,
+    frontend_scope_requested,
+    load_frontend_design_lock,
+    selected_surface_specs,
+    sha256_file,
+    user_design_assets,
+    utc_now_iso,
+    validate_catalog_selection,
+    validate_frontend_design_artifacts,
+    validate_frontend_scope,
+    validate_prototype_manifest,
+)
 from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, ref_exists, remove_worktree, update_ref, worktree_fingerprint
 from .io_utils import read_json, read_text, write_json, write_text
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
@@ -369,13 +392,31 @@ class Orchestrator:
                 inferred_gate = state.pending_approval
             elif state.status == "paused":
                 candidate = APPROVAL_BY_STAGE.get(state.current_stage, "")
-                if candidate in self.config.approvals.enabled:
+                if candidate == "prototype" or candidate in self.config.approvals.enabled:
                     inferred_gate = candidate
         active_gate = gate or inferred_gate
         if not active_gate:
             raise RuntimeError("No approval gate could be inferred. Pass --gate explicitly.")
-        if active_gate not in self.config.approvals.enabled:
+        if active_gate != "prototype" and active_gate not in self.config.approvals.enabled:
             raise RuntimeError(f"Unknown approval gate: {active_gate}")
+        if active_gate == "prototype":
+            lock = load_frontend_design_lock(self.project_root)
+            errors = validate_frontend_design_artifacts(
+                self.project_root,
+                lock,
+                require_approved=False,
+                max_pages=self.config.frontend_design.max_pages,
+            )
+            if errors:
+                raise RuntimeError(
+                    "Cannot approve the frontend prototype:\n"
+                    + "\n".join(f"- {error}" for error in errors)
+                )
+            lock["status"] = "approved"
+            lock["approved_at"] = utc_now_iso()
+            lock["approval"] = {"method": "cli", "gate": "prototype"}
+            lock["contract_sha256"] = frontend_design_contract_sha256(lock)
+            write_json(frontend_design_lock_path(self.project_root), lock)
         if active_gate not in state.approved_gates:
             state.approved_gates.append(active_gate)
         if state.pending_approval == active_gate:
@@ -384,9 +425,17 @@ class Orchestrator:
         elif not state.pending_approval and inferred_gate == active_gate and state.status == "paused":
             state.status = "pending"
         save_run_state(self.project_root, state)
+        if active_gate == "prototype":
+            sync_agent_instructions(self.project_root)
         return state
 
-    def reject(self, gate: Optional[str] = None, reason: str = "") -> RunState:
+    def reject(
+        self,
+        gate: Optional[str] = None,
+        reason: str = "",
+        *,
+        reselect_design: bool = False,
+    ) -> RunState:
         state = load_run_state(self.project_root)
         inferred_gate = ""
         if not gate:
@@ -394,7 +443,7 @@ class Orchestrator:
                 inferred_gate = state.pending_approval
             elif state.status == "paused":
                 candidate = APPROVAL_BY_STAGE.get(state.current_stage, "")
-                if candidate in self.config.approvals.enabled:
+                if candidate == "prototype" or candidate in self.config.approvals.enabled:
                     inferred_gate = candidate
         active_gate = gate or inferred_gate
         if not active_gate:
@@ -418,6 +467,17 @@ class Orchestrator:
         state.status = "pending"
         state.rejection_reason = reason
         state.rejected_stage = target_stage
+        if active_gate == "prototype":
+            lock = load_frontend_design_lock(self.project_root)
+            if lock:
+                lock["status"] = "pending_approval"
+                lock["rejected_at"] = utc_now_iso()
+                lock["rejection_reason"] = reason
+                lock.pop("approved_at", None)
+                lock.pop("approval", None)
+                lock.pop("contract_sha256", None)
+                write_json(frontend_design_lock_path(self.project_root), lock)
+            state.resume_context["reselect_frontend_design"] = bool(reselect_design)
         save_run_state(self.project_root, state)
         return state
 
@@ -1063,6 +1123,18 @@ class Orchestrator:
             self._max_tasks_remaining = max_tasks
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
+            if state.workflow_version < 2:
+                legacy_progress = any(
+                    stage in state.stage_summaries
+                    for stage in STAGE_ORDER
+                    if stage not in {"clarify", "prototype"}
+                ) or bool(state.tasks)
+                if legacy_progress:
+                    state.stage_summaries["prototype"] = (
+                        "Skipped: this run began before the frontend prototype workflow was introduced."
+                    )
+                state.workflow_version = 2
+                save_run_state(self.project_root, state)
             self._attach_run_logger(state.run_id)
             active_incident = self._incident_store(state).active(state)
             if active_incident is not None and active_incident.status == "self_repair":
@@ -1108,7 +1180,7 @@ class Orchestrator:
                     return state
 
             if state.pending_approval:
-                if auto_approve:
+                if auto_approve and state.pending_approval != "prototype":
                     if state.pending_approval not in state.approved_gates:
                         state.approved_gates.append(state.pending_approval)
                     state.pending_approval = ""
@@ -1131,6 +1203,8 @@ class Orchestrator:
                     with log_timing(self.logger, f"stage:{stage}"):
                         if stage == "implement":
                             state = self._run_implementation_loop(state, max_tasks=max_tasks)
+                        elif stage == "prototype":
+                            state = self._run_prototype_stage(state, spec_file)
                         elif stage == "provider_research":
                             state = self._run_provider_research(state, spec_file)
                         elif stage == "visual_judge":
@@ -1169,13 +1243,21 @@ class Orchestrator:
                 self._merge_persisted_execution_incidents(state)
                 self._resolve_rewound_execution_incident(state, stage)
                 save_run_state(self.project_root, state)
+                if state.status == "paused" and stage not in state.stage_summaries:
+                    return state
                 if stage == "implement" and self._task_budget_exhausted:
                     state.status = "pending"
                     save_run_state(self.project_root, state)
                     return state
                 pending_gate = APPROVAL_BY_STAGE.get(stage)
-                if pending_gate and pending_gate in self.config.approvals.enabled and stage in state.stage_summaries:
-                    if auto_approve or pending_gate in state.approved_gates:
+                gate_enabled = pending_gate == "prototype" or pending_gate in self.config.approvals.enabled
+                if pending_gate == "prototype":
+                    gate_enabled = (
+                        load_frontend_design_lock(self.project_root).get("status")
+                        == "pending_approval"
+                    )
+                if pending_gate and gate_enabled and stage in state.stage_summaries:
+                    if (auto_approve and pending_gate != "prototype") or pending_gate in state.approved_gates:
                         if pending_gate not in state.approved_gates:
                             state.approved_gates.append(pending_gate)
                         state.pending_approval = ""
@@ -1314,6 +1396,365 @@ class Orchestrator:
         if not archive:
             return ""
         return archive
+
+    def _prototype_selection_prompt(
+        self,
+        snapshot: object,
+        selection_path: Path,
+        spec_file: Path,
+        *,
+        rejection_feedback: str = "",
+        excluded_slug: str = "",
+    ) -> str:
+        entries = [entry.to_dict() for entry in snapshot.entries]
+        lines = [
+            "Select the most appropriate visual design system for this project's new frontend.",
+            "This is a selection-only step. Do not edit project code, DESIGN.md, or prototypes.",
+            f"Read the product spec: {spec_file}",
+            f"Read the project brief: {docs_dir(self.project_root) / 'project_brief.md'}",
+            f"Read the requirements trace: {requirements_trace_path(self.project_root)}",
+            f"Catalog snapshot root: {snapshot.root}",
+            f"Write JSON only to: {selection_path}",
+            "The JSON must contain selected_slug and exactly three candidates. Each candidate must contain slug, integer score from 0 to 100, non-empty rationale, and a risks array. selected_slug must be the unique highest-scoring candidate.",
+            "Judge fit from product domain, information density, tone, accessibility, responsive needs, and implementation risk. Inspect the DESIGN.md files for the strongest candidates; do not select by name alone.",
+            "Available catalog entries:",
+            json.dumps(entries, ensure_ascii=False, indent=2),
+        ]
+        if excluded_slug:
+            lines.extend(
+                [
+                    f"The user explicitly rejected the prior catalog design `{excluded_slug}`. Do not select it again.",
+                    "User redesign feedback: " + (rejection_feedback or "select a materially different design direction"),
+                ]
+            )
+        lines.append("Final response: one short sentence naming the selected slug.")
+        return "\n".join(lines)
+
+    def _prototype_generation_prompt(
+        self,
+        *,
+        spec_file: Path,
+        surfaces: List[Dict[str, object]],
+        source_refs: List[str],
+    ) -> str:
+        prototype_root = frontend_prototype_dir(self.project_root)
+        manifest = prototype_root / "manifest.json"
+        index = prototype_root / "index.html"
+        return "\n".join(
+            [
+                "Create approval-ready, standalone static HTML prototypes for this project's new frontend.",
+                f"Read the product spec: {spec_file}",
+                f"Read the project brief: {docs_dir(self.project_root) / 'project_brief.md'}",
+                f"Read the requirements trace: {requirements_trace_path(self.project_root)}",
+                "The visual source(s) of truth are: " + ", ".join(source_refs),
+                f"Create no more than {self.config.frontend_design.max_pages} core pages, using exactly the requested surfaces below when possible:",
+                json.dumps(surfaces, ensure_ascii=False, indent=2),
+                f"Write all output only inside: {prototype_root}",
+                f"Write a gallery/navigation entry page at: {index}",
+                f"Write a manifest at: {manifest}",
+                "manifest.json must be JSON with version=1, index_ref, viewports, and pages. Each page must contain id, title, route, html_ref, and requirement_ids. Paths must be repository-relative.",
+                "Every page must be a self-contained HTML file with inline CSS and, if needed, inline JavaScript. Include a viewport meta tag. Do not use remote URLs, file URLs, external fonts, CDNs, script src, build tools, or network dependencies.",
+                "Make the prototype polished enough for a real design approval: complete layout, representative copy/data, responsive behavior, important states, accessible contrast, focus treatment, and semantic controls.",
+                "Follow DESIGN.md exactly when it is listed as a source. Existing user-provided design/prototype references take precedence over generic conventions.",
+                "Do not edit DESIGN.md, project source code, tests, or any file outside the prototype directory.",
+                "Final response: 3 short bullets listing the prototype pages.",
+            ]
+        )
+
+    def _user_design_derivation_prompt(self, spec_file: Path, assets: List[str]) -> str:
+        return "\n".join(
+            [
+                "Derive a concise project visual design system from the user's existing design/prototype assets.",
+                f"Read the product spec: {spec_file}",
+                f"Read the project brief: {docs_dir(self.project_root) / 'project_brief.md'}",
+                "User-owned visual sources, in precedence order: " + ", ".join(assets),
+                f"Write only: {design_md_path(self.project_root)}",
+                "Preserve the supplied visual direction. Document colors, typography, spacing, layout, components, states, responsive behavior, accessibility, and prohibited visual drift. Do not invent product behavior or override the requirements trace.",
+                "Do not edit prototypes, project code, tests, or any other file.",
+                "Final response: one short sentence confirming DESIGN.md was derived.",
+            ]
+        )
+
+    def _user_design_validation_feedback(self, _: AgentResult) -> Optional[str]:
+        path = design_md_path(self.project_root)
+        if not path.is_file() or len(read_text(path).strip()) < 80:
+            return "Derived DESIGN.md must exist and contain a substantive visual design system."
+        return None
+
+    def _prototype_manifest_validation_feedback(
+        self,
+        _: AgentResult,
+        *,
+        expected_surfaces: Optional[List[Dict[str, object]]] = None,
+    ) -> Optional[str]:
+        manifest_path = frontend_prototype_dir(self.project_root) / "manifest.json"
+        payload = read_json(manifest_path, default={})
+        errors = validate_prototype_manifest(
+            self.project_root,
+            payload,
+            max_pages=self.config.frontend_design.max_pages,
+        )
+        index_ref = str(payload.get("index_ref", "")) if isinstance(payload, dict) else ""
+        if not index_ref or not (self.project_root / index_ref).is_file():
+            errors.append("frontend prototype manifest index_ref must reference the gallery index HTML")
+        expected_viewports = list(self.config.frontend_design.viewports)
+        if isinstance(payload, dict) and payload.get("viewports") != expected_viewports:
+            errors.append(f"frontend prototype manifest viewports must equal {expected_viewports}")
+        if expected_surfaces is not None and isinstance(payload, dict):
+            pages = payload.get("pages", [])
+            actual_by_id = {
+                str(page.get("id", "")): page
+                for page in pages
+                if isinstance(page, dict)
+            } if isinstance(pages, list) else {}
+            expected_ids = [str(surface.get("id", "")) for surface in expected_surfaces]
+            if list(actual_by_id) != expected_ids:
+                errors.append(
+                    "frontend prototype manifest page ids must exactly match the selected core "
+                    f"surfaces in order: {expected_ids}"
+                )
+            for surface in expected_surfaces:
+                surface_id = str(surface.get("id", ""))
+                page = actual_by_id.get(surface_id)
+                if isinstance(page, dict) and page.get("requirement_ids") != surface.get("requirement_ids"):
+                    errors.append(
+                        f"frontend prototype page {surface_id} requirement_ids must match its clarified surface"
+                    )
+        if not errors:
+            return None
+        return "Prototype artifacts are invalid. Fix all issues:\n" + "\n".join(
+            f"- {error}" for error in errors
+        )
+
+    def _write_catalog_selection_report(
+        self,
+        *,
+        snapshot: object,
+        selected: object,
+        candidates: List[Dict[str, object]],
+    ) -> None:
+        output_dir = frontend_design_docs_dir(self.project_root)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "# Frontend design selection",
+            "",
+            f"- Repository: `{snapshot.repository}`",
+            f"- Requested ref: `{snapshot.requested_ref}`",
+            f"- Pinned commit: `{snapshot.commit_sha}`",
+            f"- Selected design: `{selected.slug}` ({selected.name})",
+            f"- Catalog source: `{'cache' if snapshot.from_cache else 'network'}`",
+            "",
+            "## Candidates",
+            "",
+        ]
+        for candidate in sorted(candidates, key=lambda item: int(item["score"]), reverse=True):
+            lines.extend(
+                [
+                    f"### {candidate['slug']} — {candidate['score']}/100",
+                    "",
+                    str(candidate["rationale"]),
+                    "",
+                ]
+            )
+            risks = candidate.get("risks", [])
+            if isinstance(risks, list) and risks:
+                lines.append("Risks: " + "; ".join(str(item) for item in risks))
+                lines.append("")
+        write_text(output_dir / "selection.md", "\n".join(lines).rstrip() + "\n")
+        shutil.copyfile(snapshot.root / "LICENSE", output_dir / "awesome-design-md.LICENSE")
+
+    def _run_prototype_stage(self, state: RunState, spec_file: Path) -> RunState:
+        trace = load_requirements_trace(self.project_root, normalize=False)
+        state.current_stage = "prototype"
+        rejection_feedback = ""
+        if state.rejected_stage == "prototype" and state.rejection_reason:
+            rejection_feedback = state.rejection_reason
+            state.rejected_stage = ""
+            state.rejection_reason = ""
+        if not frontend_scope_requested(trace):
+            state.stage_summaries["prototype"] = "Skipped: the clarified scope does not request frontend work."
+            state.last_error = ""
+            return state
+
+        discovery = discover_existing_frontend(self.project_root)
+        if discovery.existing_frontend:
+            state.stage_summaries["prototype"] = (
+                "Skipped: existing frontend surfaces were discovered: "
+                + ", ".join(discovery.evidence[:5])
+            )
+            state.last_error = ""
+            return state
+        if approved_frontend_design(self.project_root):
+            state.stage_summaries["prototype"] = "Reused the approved, pinned frontend design contract."
+            state.last_error = ""
+            return state
+
+        spec_text = read_text(spec_file)
+        assets = user_design_assets(self.project_root, trace, spec_text=spec_text)
+        prior_lock = load_frontend_design_lock(self.project_root)
+        reselect = bool(state.resume_context.pop("reselect_frontend_design", False))
+        source: Dict[str, object]
+        design_ref = ""
+        selection_ref = ""
+        candidate_records: List[Dict[str, object]] = []
+
+        if assets:
+            derived_design = not design_md_path(self.project_root).is_file()
+            if derived_design:
+                self._run_agent_with_retries(
+                    state=state,
+                    stage="prototype",
+                    stage_key="prototype-user-design",
+                    prompt=self._user_design_derivation_prompt(spec_file, assets),
+                    validation_feedback=self._user_design_validation_feedback,
+                )
+            source = {"kind": "user", "refs": assets, "derived_design": derived_design}
+            design_ref = "DESIGN.md"
+            source_refs = [*assets, design_ref]
+        elif (
+            not reselect
+            and prior_lock.get("status") == "pending_approval"
+            and isinstance(prior_lock.get("source"), dict)
+            and prior_lock.get("source", {}).get("kind") == "awesome-design-md"
+            and design_md_path(self.project_root).is_file()
+        ):
+            source = dict(prior_lock["source"])
+            design_ref = "DESIGN.md"
+            selection_ref = str(prior_lock.get("selection_path", ""))
+            candidate_records = [
+                dict(item)
+                for item in prior_lock.get("candidates", []) or []
+                if isinstance(item, dict)
+            ]
+            source_refs = [design_ref]
+        else:
+            try:
+                snapshot = AwesomeDesignCatalogClient(
+                    self.project_root,
+                    repository=self.config.frontend_design.catalog_repository,
+                    requested_ref=self.config.frontend_design.catalog_ref,
+                    timeout_seconds=self.config.frontend_design.network_timeout_seconds,
+                ).load()
+            except FrontendDesignUnavailable as error:
+                state.status = "paused"
+                state.last_error = str(error)
+                return state
+
+            selection_path = frontend_design_docs_dir(self.project_root) / "selection.json"
+            selection_path.parent.mkdir(parents=True, exist_ok=True)
+            excluded_slug = ""
+            if reselect and isinstance(prior_lock.get("source"), dict):
+                excluded_slug = str(prior_lock.get("source", {}).get("slug", "")).strip()
+            self._run_agent_with_retries(
+                state=state,
+                stage="prototype",
+                stage_key="prototype-select",
+                prompt=self._prototype_selection_prompt(
+                    snapshot,
+                    selection_path,
+                    spec_file,
+                    rejection_feedback=rejection_feedback,
+                    excluded_slug=excluded_slug,
+                ),
+                validation_feedback=lambda _result: self._catalog_selection_feedback(
+                    selection_path,
+                    snapshot,
+                    excluded_slug=excluded_slug,
+                ),
+            )
+            selected, candidates = validate_catalog_selection(read_json(selection_path, default={}), snapshot)
+            candidate_records = candidates
+            shutil.copyfile(snapshot.root / selected.design_path, design_md_path(self.project_root))
+            self._write_catalog_selection_report(
+                snapshot=snapshot,
+                selected=selected,
+                candidates=candidates,
+            )
+            source = {
+                "kind": "awesome-design-md",
+                "repository": snapshot.repository,
+                "requested_ref": snapshot.requested_ref,
+                "commit_sha": snapshot.commit_sha,
+                "slug": selected.slug,
+                "upstream_path": selected.design_path,
+                "content_sha256": sha256_file(design_md_path(self.project_root)),
+                "license_path": ".auto-agents/docs/frontend_design/awesome-design-md.LICENSE",
+                "from_cache": snapshot.from_cache,
+            }
+            design_ref = "DESIGN.md"
+            selection_ref = ".auto-agents/docs/frontend_design/selection.md"
+            source_refs = [design_ref]
+
+        surfaces = selected_surface_specs(
+            trace,
+            max_pages=self.config.frontend_design.max_pages,
+        )
+        generation_prompt = self._prototype_generation_prompt(
+            spec_file=spec_file,
+            surfaces=surfaces,
+            source_refs=source_refs,
+        )
+        if rejection_feedback:
+            generation_prompt += (
+                "\n\nThe previous prototype was rejected. Address this feedback while preserving "
+                f"the selected visual source of truth:\n{rejection_feedback}\n"
+            )
+        self._run_agent_with_retries(
+            state=state,
+            stage="prototype",
+            stage_key="prototype-generate",
+            prompt=generation_prompt,
+            validation_feedback=lambda result: self._prototype_manifest_validation_feedback(
+                result,
+                expected_surfaces=surfaces,
+            ),
+        )
+        manifest_path = frontend_prototype_dir(self.project_root) / "manifest.json"
+        manifest = read_json(manifest_path, default={})
+        lock: Dict[str, object] = {
+            "version": 1,
+            "status": "pending_approval",
+            "created_at": utc_now_iso(),
+            "trigger": {
+                "frontend_requested": True,
+                "existing_frontend": False,
+                "discovery_evidence": list(discovery.evidence),
+            },
+            "source": source,
+            "candidates": candidate_records,
+            "design_path": design_ref,
+            "selection_path": selection_ref,
+            "prototype": {
+                "manifest_ref": ".auto-agents/docs/frontend_prototype/manifest.json",
+                "index_ref": str(manifest.get("index_ref", "")),
+                "viewports": list(self.config.frontend_design.viewports),
+                "pages": list(manifest.get("pages", [])),
+            },
+        }
+        lock["artifact_sha256"] = frontend_design_artifact_hashes(self.project_root)
+        write_json(frontend_design_lock_path(self.project_root), lock)
+        trace["frontend_surfaces"] = derived_frontend_surfaces(lock)
+        write_json(requirements_trace_path(self.project_root), trace)
+        state.stage_summaries["prototype"] = (
+            f"Generated {len(lock['prototype']['pages'])} static prototype page(s); manual approval required."
+        )
+        state.last_error = ""
+        return state
+
+    def _catalog_selection_feedback(
+        self,
+        selection_path: Path,
+        snapshot: object,
+        *,
+        excluded_slug: str = "",
+    ) -> Optional[str]:
+        try:
+            selected, _ = validate_catalog_selection(read_json(selection_path, default={}), snapshot)
+            if excluded_slug and selected.slug == excluded_slug:
+                return f"The rejected catalog design {excluded_slug} must not be selected again."
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            return f"The catalog selection JSON is invalid: {error}"
+        return None
 
     def _run_agent_stage(self, stage: str, state: RunState, spec_file: Path, auto_approve: bool = False) -> RunState:
         if stage == "clarify":
@@ -2038,6 +2479,13 @@ class Orchestrator:
             return [".auto-agents/state/provider_references.lock.json"]
         if stage == "clarify":
             return [".auto-agents/docs/project_brief.md", ".auto-agents/state/requirements_trace.json"]
+        if stage == "prototype":
+            return [
+                "DESIGN.md",
+                ".auto-agents/docs/frontend_design/selection.md",
+                ".auto-agents/docs/frontend_prototype/manifest.json",
+                ".auto-agents/state/frontend_design.lock.json",
+            ]
         if stage == "design":
             return [".auto-agents/docs/architecture.md"]
         if stage == "plan":
@@ -2427,6 +2875,8 @@ class Orchestrator:
         readme_path = "README.md"
         provider_lock_path = self._relative_repo_path(provider_references_lock_path(self.project_root))
         provider_refs_prefix = self._relative_repo_path(provider_references_dir(self.project_root)).rstrip("/") + "/"
+        frontend_docs_prefix = self._relative_repo_path(frontend_design_docs_dir(self.project_root)).rstrip("/") + "/"
+        frontend_prototype_prefix = self._relative_repo_path(frontend_prototype_dir(self.project_root)).rstrip("/") + "/"
         run_state_rel = self._relative_repo_path(run_state_path(self.project_root))
         auto_gitignore_rel = ".auto-agents/.gitignore"
         protected_input_specs = {"spec.md"}
@@ -2441,6 +2891,7 @@ class Orchestrator:
                 not path.startswith(".auto-agents/")
                 and not path.startswith("specs/")
                 and path not in protected_input_specs
+                and path != "DESIGN.md"
             )
 
         if stage == "clarify":
@@ -2449,6 +2900,27 @@ class Orchestrator:
                 return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel, brief_path, trace_path}
             allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel]
             return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel}
+
+        if stage == "prototype":
+            if stage_key == "prototype-select":
+                allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, f"{frontend_docs_prefix}**"]
+                return allowed, (
+                    lambda path: path.startswith(run_prefix)
+                    or path in {run_state_rel, auto_gitignore_rel}
+                    or path.startswith(frontend_docs_prefix)
+                )
+            if stage_key == "prototype-user-design":
+                allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, "DESIGN.md"]
+                return allowed, (
+                    lambda path: path.startswith(run_prefix)
+                    or path in {run_state_rel, auto_gitignore_rel, "DESIGN.md"}
+                )
+            allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, f"{frontend_prototype_prefix}**"]
+            return allowed, (
+                lambda path: path.startswith(run_prefix)
+                or path in {run_state_rel, auto_gitignore_rel}
+                or path.startswith(frontend_prototype_prefix)
+            )
 
         if stage == "design":
             allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, architecture_path]
@@ -8711,7 +9183,7 @@ class Orchestrator:
         owners: Set[str] = set()
         for path in cls._review_feedback_paths(text):
             owner = cls._forbidden_pattern_owner_stage({"path": path})
-            if owner in {"clarify", "design", "plan", "provider_research"}:
+            if owner in {"clarify", "prototype", "design", "plan", "provider_research"}:
                 owners.add(owner)
         if len(owners) == 1:
             return next(iter(owners))
@@ -9657,6 +10129,34 @@ class Orchestrator:
         _, output_path = run_artifact_paths(self.project_root, run_id, stage)
         return output_path
 
+    def _frontend_design_prompt_lines(self) -> List[str]:
+        if (
+            not approved_frontend_design(self.project_root)
+            or not frontend_scope_requested(load_requirements_trace(self.project_root))
+        ):
+            return []
+        lock = load_frontend_design_lock(self.project_root)
+        prototype = lock.get("prototype", {})
+        manifest_ref = (
+            str(prototype.get("manifest_ref", ""))
+            if isinstance(prototype, dict)
+            else ""
+        )
+        lines = [
+            "APPROVED FRONTEND DESIGN CONTRACT: appearance and interaction work must follow the pinned artifacts below.",
+        ]
+        if str(lock.get("design_path", "")).strip():
+            lines.append(f"- Visual design system: {lock['design_path']}")
+        if manifest_ref:
+            lines.append(f"- Approved prototype manifest: {manifest_ref}")
+        lines.extend(
+            [
+                f"- Immutable contract lock: {self._relative_repo_path(frontend_design_lock_path(self.project_root))}",
+                "Do not edit or reinterpret these approved artifacts. DESIGN.md governs visual appearance; the product spec and requirements trace continue to govern behavior and scope.",
+            ]
+        )
+        return lines
+
     def _build_prompt(self, stage: str, spec_file: Path, is_iteration: bool = False) -> str:
         brief = docs_dir(self.project_root) / "project_brief.md"
         architecture = docs_dir(self.project_root) / "architecture.md"
@@ -9675,6 +10175,8 @@ class Orchestrator:
             f"Primary input spec: {spec_file}",
             spec_context,
         ]
+        if stage in {"design", "plan"}:
+            common.extend(self._frontend_design_prompt_lines())
 
         if stage == "clarify":
             lines = common + [
@@ -9687,9 +10189,11 @@ class Orchestrator:
                 "The requirements trace is the downstream execution contract. It must be valid JSON with version=1 and a requirements list.",
                 "Every active requirement must have id, text, source, status, priority, acceptance_oracles, oracle_type, oracle_strength, evidence_boundary, forbidden_proxy_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields. If a requirement needs multiple provider documents, also set provider_references to a list of local provider reference paths; do not join multiple paths into provider_reference with punctuation.",
                 "Use stable IDs like REQ-001. Mark hard requirements as priority='mandatory'. Use status='active', 'deferred', or 'superseded'.",
-                "If the spec references frontend pages together with prototypes, screenshots, Figma files, mockups, or prototype HTML, add a top-level frontend_surfaces array to requirements_trace.json. Each entry must name the surface, route/screen when known, prototype_refs, viewports when known, and the intended fidelity level.",
+                "If the requested scope includes frontend pages or screens, add top-level frontend_scope={requested:true,surfaces:[...]}. Each surface must include a stable id, name, route when known, priority (core/primary/secondary/optional), purpose, key_states, and non-empty requirement_ids. Set requested=false with surfaces=[] when no frontend work is requested.",
+                "When the spec already supplies prototypes, screenshots, Figma files, mockups, or prototype HTML, also add a top-level frontend_surfaces array. Each entry must name the surface, route/screen when known, prototype_refs, viewports when known, and the intended fidelity level. User-supplied design/prototype artifacts take precedence over external catalog selection.",
                 "For every frontend_surfaces entry, create active mandatory requirements that preserve the page-level visual contract from the prototype, including layout, copy, component hierarchy, and explicit forbidden old UI/style patterns. Use oracle_type='mixed' unless a stronger single oracle is clearly appropriate, and require deterministic DOM/CSS evidence plus screenshot/runtime visual evidence; optional judge_model evidence may supplement but must not be the only proof.",
-                "If the project has no frontend surface or the spec has no prototype/design artifact, omit frontend_surfaces or set it to an empty array; do not invent visual fidelity requirements.",
+                "If frontend_scope.requested=true but no prototype/design artifact exists yet, omit frontend_surfaces or set it empty; the next workflow stage will create it. Still create active mandatory visual requirements for the requested surfaces, using acceptance language that requires conformance to the subsequently approved DESIGN.md and static prototype.",
+                "If the project has no frontend scope, set frontend_scope.requested=false and do not invent visual fidelity requirements.",
                 "If a requirement needs one external provider protocol or official API doc, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/. If it needs several provider docs, set provider_references to local paths under that directory and keep provider_reference empty or set to the primary path.",
                 "Use oracle_type to name the primary proof mechanism (for example deterministic_test, integration_test, runtime_evidence, judge_model, benchmark, human_review, or mixed). Use oracle_strength to record the minimum acceptable fidelity (proxy, behavioral, semantic, or human). Use evidence_boundary to say where proof must come from (internal_state, system_boundary, or external_side_effect). Record any checks that must NOT be treated as sufficient in forbidden_proxy_oracles.",
                 "For requirements that remove, forbid, or replace old behavior, add precise forbidden_patterns regexes for stale terms or old semantic claims so requirements audit can scan code, tests, and docs. Prefer narrow patterns that catch positive stale claims without matching the new negative requirement text. Never combine DOTALL with unbounded .* or .+ spans; use explicit bounded spans such as [\\s\\S]{0,500}? when cross-line context is required.",
@@ -10093,6 +10597,15 @@ class Orchestrator:
             )
         if requirement_context:
             common.extend(["", requirement_context])
+        trace_payload = load_requirements_trace(self.project_root)
+        frontend_requirement_ids = set(frontend_fidelity_requirement_ids(trace_payload))
+        if frontend_requirement_ids.intersection(task.requirement_ids):
+            frontend_contract = self._frontend_design_prompt_lines()
+            if not frontend_contract:
+                raise RuntimeError(
+                    f"frontend task {task.task_id} requires an approved frontend design contract"
+                )
+            common.extend(["", *frontend_contract])
         if plan_migration_context.strip():
             common.extend(["", plan_migration_context.strip()])
         if task_status_migration_context.strip():
@@ -12258,6 +12771,7 @@ class Orchestrator:
             # schema validation so an agent never needs to calculate SHA-256.
             write_json(requirements_trace_path(self.project_root), trace)
         errors.extend(validate_requirements_trace_payload(trace))
+        errors.extend(validate_frontend_scope(trace))
         spec_text = ""
         active_spec_file = getattr(self, "_active_spec_file", None)
         if isinstance(active_spec_file, Path) and active_spec_file.exists():
@@ -12546,6 +13060,20 @@ class Orchestrator:
         pending: List[str] = []
         completed = set(state.stage_summaries.keys())
         for stage in STAGE_ORDER:
+            if stage == "prototype" and stage not in completed:
+                has_downstream_progress = any(
+                    item in completed
+                    for item in STAGE_ORDER[STAGE_ORDER.index("prototype") + 1 :]
+                )
+                try:
+                    current_is_downstream = (
+                        STAGE_ORDER.index(state.current_stage)
+                        > STAGE_ORDER.index("prototype")
+                    )
+                except ValueError:
+                    current_is_downstream = False
+                if state.workflow_version < 2 or has_downstream_progress or current_is_downstream:
+                    continue
             if stage == "implement":
                 if state.rejected_stage == "implement" and state.rejection_reason:
                     pending.append(stage)
@@ -12595,7 +13123,7 @@ class Orchestrator:
         if any(task.status not in ("pending", "done") for task in task_list):
             return
 
-        allowed = {".gitignore", "README.md", "spec.md"}
+        allowed = {".gitignore", "README.md", "DESIGN.md", "spec.md"}
         if self._active_spec_file is not None:
             try:
                 allowed.add(str(self._active_spec_file.relative_to(self.project_root)))

@@ -8,6 +8,11 @@ from typing import Dict, Iterable, List
 
 from .config import architecture_path, config_path, project_brief_path, requirements_trace_path, run_state_path, task_plan_path
 from .frontend_fidelity import validate_frontend_fidelity_task_plan
+from .frontend_design import (
+    load_frontend_design_lock,
+    validate_frontend_design_artifacts,
+    validate_frontend_scope,
+)
 from .io_utils import read_json, read_text
 from .models import (
     APPROVAL_ORDER,
@@ -28,6 +33,7 @@ ALLOWED_TASK_STATUS = {"pending", "in_progress", "blocked", "done"}
 ALLOWED_EFFORTS = {"balanced", "deep", "max"}
 REQUIRED_EFFORT_STAGES = tuple(DEFAULT_EFFORTS)
 DEFAULTED_EFFORT_STAGES = {
+    "prototype",
     "sync-agent-instructions",
     "provider_research",
     "arbiter",
@@ -673,7 +679,7 @@ def _allow_empty_task_plan_for_iteration(project_root: Path) -> bool:
     if isinstance(summaries, dict) and "plan" in summaries:
         return False
     current_stage = str(state_payload.get("current_stage", "clarify")).strip()
-    if current_stage not in {"clarify", "design", "plan"}:
+    if current_stage not in {"clarify", "prototype", "design", "plan"}:
         return False
     return str(state_payload.get("status", "pending")).strip() != "completed"
 
@@ -1014,6 +1020,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
             for key, value in per_stage.items():
                 if key not in (
                     "clarify",
+                    "prototype",
                     "design",
                     "plan",
                     "sync-agent-instructions",
@@ -1049,6 +1056,30 @@ def validate_project_config_payload(payload: object) -> List[str]:
             require_artifacts = visual_judge.get("require_screenshot_artifacts", True)
             if not isinstance(require_artifacts, bool):
                 errors.append("visual_judge.require_screenshot_artifacts must be a boolean")
+
+    frontend_design = payload.get("frontend_design")
+    if frontend_design is not None:
+        if not isinstance(frontend_design, dict):
+            errors.append("frontend_design must be an object")
+        else:
+            if frontend_design.get("mode", "auto") != "auto":
+                errors.append("frontend_design.mode must be auto")
+            if frontend_design.get("catalog_repository") != "VoltAgent/awesome-design-md":
+                errors.append("frontend_design.catalog_repository must be VoltAgent/awesome-design-md")
+            if not isinstance(frontend_design.get("catalog_ref"), str) or not str(frontend_design.get("catalog_ref", "")).strip():
+                errors.append("frontend_design.catalog_ref must be a non-empty string")
+            max_pages = frontend_design.get("max_pages", 3)
+            if not isinstance(max_pages, int) or max_pages < 1 or max_pages > 3:
+                errors.append("frontend_design.max_pages must be an integer from 1 to 3")
+            viewports = frontend_design.get("viewports")
+            if not isinstance(viewports, list) or not viewports or any(
+                not isinstance(item, str) or not re.fullmatch(r"[1-9][0-9]*x[1-9][0-9]*", item)
+                for item in (viewports or [])
+            ):
+                errors.append("frontend_design.viewports must be a non-empty list of WIDTHxHEIGHT strings")
+            timeout = frontend_design.get("network_timeout_seconds", 30)
+            if not isinstance(timeout, int) or timeout < 1 or timeout > 300:
+                errors.append("frontend_design.network_timeout_seconds must be an integer from 1 to 300")
 
     return errors
 
@@ -1153,6 +1184,17 @@ def validate_project_root(
             ),
         )
         errors.extend(trace_errors)
+        errors.extend(validate_frontend_scope(trace_payload))
+
+    frontend_lock = load_frontend_design_lock(root)
+    if frontend_lock.get("status") == "approved":
+        errors.extend(
+            validate_frontend_design_artifacts(
+                root,
+                frontend_lock,
+                require_approved=True,
+            )
+        )
 
     docs = {
         "project_brief.md": project_brief_path(root),

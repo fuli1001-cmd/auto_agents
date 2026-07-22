@@ -87,6 +87,7 @@ def _discover_files(
         candidates = tracked_files(project_root)
     except RuntimeError:
         candidates = []
+    if not candidates:
         for path in project_root.rglob("*"):
             if not path.is_file():
                 continue

@@ -13,6 +13,41 @@
       "type": "integer",
       "minimum": 1
     },
+    "frontend_scope": {
+      "type": "object",
+      "required": ["requested", "surfaces"],
+      "properties": {
+        "requested": {"type": "boolean"},
+        "surfaces": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "name", "priority", "requirement_ids"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "name": {"type": "string", "minLength": 1},
+              "route": {"type": "string"},
+              "priority": {
+                "type": "string",
+                "enum": ["core", "primary", "secondary", "optional"]
+              },
+              "purpose": {"type": "string"},
+              "key_states": {
+                "type": "array",
+                "items": {"type": "string"}
+              },
+              "requirement_ids": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1}
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "frontend_surfaces": {
       "type": "array",
       "description": "Optional page/screen-level visual fidelity contracts derived from prototype artifacts. Omit or leave empty for projects without frontend prototype requirements.",

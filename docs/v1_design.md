@@ -24,6 +24,8 @@ V1 supports only greenfield projects. Legacy repository takeover is intentionall
 ## Gate strategy
 
 - Pause after `clarify` for `requirements` approval
+- When a greenfield frontend is requested, run `prototype` after clarify, pin a design contract,
+  generate up to three static HTML pages, and always pause for `prototype` approval
 - Pause after `design` for `architecture` approval
 - Pause after `verify` for `release` approval
 
