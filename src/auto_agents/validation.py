@@ -858,9 +858,18 @@ def validate_project_config_payload(payload: object) -> List[str]:
             or (isinstance(parallel_workers, int) and parallel_workers >= 1)
         ):
             errors.append("gates.parallel_workers must be 'auto' or an integer >= 1")
-        max_auto_workers = gates.get("max_auto_workers", 2)
-        if not isinstance(max_auto_workers, int) or max_auto_workers < 1:
-            errors.append("gates.max_auto_workers must be an integer >= 1")
+        max_auto_workers = gates.get("max_auto_workers", "auto")
+        if not (
+            max_auto_workers == "auto"
+            or (
+                isinstance(max_auto_workers, int)
+                and not isinstance(max_auto_workers, bool)
+                and max_auto_workers >= 1
+            )
+        ):
+            errors.append(
+                "gates.max_auto_workers must be 'auto' or an integer >= 1"
+            )
         command_timeout_seconds = gates.get("command_timeout_seconds", 7200)
         if (
             not isinstance(command_timeout_seconds, int)
@@ -895,7 +904,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
         if not isinstance(isolation, dict):
             errors.append("gates.isolation must be an object")
         else:
-            if not isinstance(isolation.get("enabled", False), bool):
+            if not isinstance(isolation.get("enabled", True), bool):
                 errors.append("gates.isolation.enabled must be a boolean")
             if isolation.get("mode", "git_worktree") != "git_worktree":
                 errors.append("gates.isolation.mode must be 'git_worktree'")
@@ -912,33 +921,43 @@ def validate_project_config_payload(payload: object) -> List[str]:
         if not isinstance(distributed, dict):
             errors.append("gates.distributed must be an object")
         else:
-            enabled = distributed.get("enabled", False)
-            if not isinstance(enabled, bool):
-                errors.append("gates.distributed.enabled must be a boolean")
-            worker_pool = distributed.get("worker_pool", "")
-            environment_id = distributed.get("environment_id", "")
-            if not isinstance(worker_pool, str):
-                errors.append("gates.distributed.worker_pool must be a string")
-            elif enabled and not worker_pool.strip():
+            deprecated_distributed_keys = sorted(
+                {
+                    "worker_pool",
+                    "environment_id",
+                    "fallback",
+                    "connect_timeout_seconds",
+                    "heartbeat_timeout_seconds",
+                }
+                & set(distributed)
+            )
+            if deprecated_distributed_keys:
                 errors.append(
-                    "gates.distributed.worker_pool must be non-empty when enabled"
+                    "gates.distributed no longer supports manually configured "
+                    "SSH pools: "
+                    + ", ".join(deprecated_distributed_keys)
                 )
-            if not isinstance(environment_id, str):
-                errors.append("gates.distributed.environment_id must be a string")
-            elif enabled and not environment_id.strip():
+            if "enabled" in distributed and not isinstance(
+                distributed.get("enabled"), bool
+            ):
+                errors.append("gates.distributed.enabled must be a boolean")
+            mode = distributed.get("mode")
+            if mode is None and "enabled" in distributed:
+                enabled = distributed.get("enabled")
+                mode = "auto" if enabled else "off"
+            mode = mode or "auto"
+            if mode not in {"auto", "off", "required"}:
                 errors.append(
-                    "gates.distributed.environment_id must be non-empty when enabled"
+                    "gates.distributed.mode must be auto, off, or required"
                 )
             if (
-                enabled
+                mode != "off"
                 and isinstance(isolation, dict)
-                and not isolation.get("enabled", False)
+                and not isolation.get("enabled", True)
             ):
                 errors.append(
                     "gates.isolation.enabled must be true when distributed gates are enabled"
                 )
-            if distributed.get("fallback", "local") != "local":
-                errors.append("gates.distributed.fallback must be 'local'")
             if (
                 distributed.get("forward_environment", "all_except_denylist")
                 != "all_except_denylist"
@@ -947,12 +966,22 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     "gates.distributed.forward_environment must be 'all_except_denylist'"
                 )
             for key, default in (
-                ("connect_timeout_seconds", 10),
-                ("heartbeat_timeout_seconds", 90),
+                ("request_timeout_seconds", 15),
             ):
                 value = distributed.get(key, default)
                 if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                     errors.append(f"gates.distributed.{key} must be an integer >= 1")
+            discovery_timeout = distributed.get(
+                "discovery_timeout_seconds", 1.5
+            )
+            if (
+                not isinstance(discovery_timeout, (int, float))
+                or isinstance(discovery_timeout, bool)
+                or discovery_timeout <= 0
+            ):
+                errors.append(
+                    "gates.distributed.discovery_timeout_seconds must be a number > 0"
+                )
             retry_limit = distributed.get("infrastructure_retry_limit", 2)
             if (
                 not isinstance(retry_limit, int)

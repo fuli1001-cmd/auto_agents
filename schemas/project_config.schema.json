@@ -287,8 +287,10 @@
           ]
         },
         "max_auto_workers": {
-          "type": "integer",
-          "minimum": 1
+          "anyOf": [
+            {"type": "string", "const": "auto"},
+            {"type": "integer", "minimum": 1}
+          ]
         },
         "command_timeout_seconds": {
           "type": "integer",
@@ -319,11 +321,15 @@
           "type": "object",
           "properties": {
             "enabled": {"type": "boolean"},
-            "worker_pool": {"type": "string"},
-            "environment_id": {"type": "string"},
-            "fallback": {"type": "string", "const": "local"},
-            "connect_timeout_seconds": {"type": "integer", "minimum": 1},
-            "heartbeat_timeout_seconds": {"type": "integer", "minimum": 1},
+            "mode": {
+              "type": "string",
+              "enum": ["auto", "off", "required"]
+            },
+            "discovery_timeout_seconds": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "request_timeout_seconds": {"type": "integer", "minimum": 1},
             "infrastructure_retry_limit": {"type": "integer", "minimum": 0},
             "forward_environment": {
               "type": "string",
@@ -334,21 +340,6 @@
               "items": {"type": "string", "minLength": 1}
             }
           },
-          "allOf": [
-            {
-              "if": {
-                "properties": {"enabled": {"const": true}},
-                "required": ["enabled"]
-              },
-              "then": {
-                "required": ["worker_pool", "environment_id"],
-                "properties": {
-                  "worker_pool": {"minLength": 1},
-                  "environment_id": {"minLength": 1}
-                }
-              }
-            }
-          ],
           "additionalProperties": false
         }
       },

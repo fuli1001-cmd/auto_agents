@@ -339,25 +339,28 @@ class GateIsolationConfig:
 
 @dataclass
 class DistributedGatesConfig:
-    enabled: bool = False
-    worker_pool: str = ""
-    environment_id: str = ""
-    fallback: str = "local"
-    connect_timeout_seconds: int = 10
-    heartbeat_timeout_seconds: int = 90
+    mode: str = "auto"
+    discovery_timeout_seconds: float = 1.5
+    request_timeout_seconds: int = 15
     infrastructure_retry_limit: int = 2
     forward_environment: str = "all_except_denylist"
     extra_environment_denylist: List[str] = field(default_factory=list)
 
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "off"
+
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "DistributedGatesConfig":
+        raw_mode = data.get("mode")
+        if raw_mode is None and "enabled" in data:
+            raw_mode = "auto" if bool(data.get("enabled")) else "off"
         return cls(
-            enabled=bool(data.get("enabled", False)),
-            worker_pool=str(data.get("worker_pool", "")),
-            environment_id=str(data.get("environment_id", "")),
-            fallback=str(data.get("fallback", "local")),
-            connect_timeout_seconds=int(data.get("connect_timeout_seconds", 10)),
-            heartbeat_timeout_seconds=int(data.get("heartbeat_timeout_seconds", 90)),
+            mode=str(raw_mode or "auto"),
+            discovery_timeout_seconds=float(
+                data.get("discovery_timeout_seconds", 1.5)
+            ),
+            request_timeout_seconds=int(data.get("request_timeout_seconds", 15)),
             infrastructure_retry_limit=int(data.get("infrastructure_retry_limit", 2)),
             forward_environment=str(
                 data.get("forward_environment", "all_except_denylist")
@@ -379,7 +382,7 @@ class GateConfig:
     require_clean_git_before_task: bool = True
     allow_agent_updates: bool = True
     parallel_workers: Union[int, str] = "auto"
-    max_auto_workers: int = 2
+    max_auto_workers: Union[int, str] = "auto"
     command_timeout_seconds: int = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS
     adaptive_timeout_enabled: bool = True
     command_idle_timeout_seconds: int = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS
@@ -412,7 +415,11 @@ class GateConfig:
                 if isinstance(data.get("parallel_workers"), int)
                 else str(data.get("parallel_workers", "auto"))
             ),
-            max_auto_workers=int(data.get("max_auto_workers", 2)),
+            max_auto_workers=(
+                int(data.get("max_auto_workers"))
+                if isinstance(data.get("max_auto_workers"), int)
+                else str(data.get("max_auto_workers", "auto"))
+            ),
             command_timeout_seconds=command_timeout_seconds,
             adaptive_timeout_enabled=bool(data.get("adaptive_timeout_enabled", True)),
             command_idle_timeout_seconds=int(

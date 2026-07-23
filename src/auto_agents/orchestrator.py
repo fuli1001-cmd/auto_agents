@@ -276,7 +276,7 @@ class Orchestrator:
                 if self.config.gates.isolation.enabled
                 else "shared_worktree"
             ),
-            environment_id=self.config.gates.distributed.environment_id,
+            environment_id=self.config.gates.distributed.mode,
             distributed=self.config.gates.distributed.enabled,
             extra_denylist=self.config.gates.distributed.extra_environment_denylist,
         )
@@ -4258,9 +4258,12 @@ class Orchestrator:
         configured = self.config.gates.parallel_workers
         if isinstance(configured, int):
             return max(1, configured)
+        maximum = self.config.gates.max_auto_workers
+        if isinstance(maximum, int):
+            return max(1, maximum)
         if self.config.gates.distributed.enabled:
-            return max(1, self.config.gates.max_auto_workers)
-        return max(1, min(2, self.config.gates.max_auto_workers))
+            return 32
+        return 2
 
     def _implement_touched_code(self, task: Optional[TaskSpec] = None) -> bool:
         """Return True if the last implement step touched any non-orchestrator file."""

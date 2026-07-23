@@ -5,6 +5,7 @@ import contextlib
 import functools
 import http.server
 import json
+import os
 import signal
 import subprocess
 import shlex
@@ -63,18 +64,18 @@ from .self_repair import (
     classify_auto_agents_error,
 )
 from .validation import validation_report
-from .workers import (
-    controller_workers_cleanup,
-    controller_workers_doctor,
-    controller_workers_status,
-    worker_artifacts,
-    worker_cancel,
-    worker_cleanup_plan,
-    worker_execute,
-    worker_gc,
-    worker_probe,
-    worker_query,
-    worker_stage,
+from .worker_cluster import (
+    WORKER_API_PORT,
+    create_pairing_invite,
+    init_cluster,
+    join_cluster,
+    load_cluster_state,
+)
+from .worker_service import (
+    WorkerService,
+    lan_workers_cleanup,
+    lan_workers_doctor,
+    lan_workers_status,
 )
 
 
@@ -745,9 +746,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sessions_clear_parser.add_argument("--project", required=True, help="Target project directory.")
 
+    cluster_parser = subparsers.add_parser(
+        "cluster",
+        help="Initialize and pair trusted LAN worker computers.",
+    )
+    cluster_subparsers = cluster_parser.add_subparsers(
+        dest="cluster_command",
+        required=True,
+    )
+    cluster_init = cluster_subparsers.add_parser("init")
+    cluster_init.add_argument("--name", default="")
+    cluster_pair = cluster_subparsers.add_parser("pair")
+    cluster_pair.add_argument("--host", default="")
+    cluster_pair.add_argument("--port", type=int, default=WORKER_API_PORT)
+    cluster_pair.add_argument("--ttl-seconds", type=int, default=600)
+    cluster_subparsers.add_parser("status")
+
     workers_parser = subparsers.add_parser(
         "workers",
-        help="Inspect and maintain configured gate worker pools.",
+        help="Inspect and maintain automatically discovered LAN workers.",
     )
     workers_subparsers = workers_parser.add_subparsers(
         dest="workers_command",
@@ -757,48 +774,30 @@ def build_parser() -> argparse.ArgumentParser:
         "doctor",
         help="Validate worker connectivity, environment, and capacity.",
     )
-    workers_doctor.add_argument("--pool", required=True)
     workers_doctor.add_argument("--project")
-    workers_doctor.add_argument("--environment-id", default="")
     workers_status = workers_subparsers.add_parser(
         "status",
         help="Show worker pool health and capacity.",
     )
-    workers_status.add_argument("--pool", required=True)
     workers_cleanup = workers_subparsers.add_parser(
         "cleanup",
         help="Remove stale terminal worker job records and artifacts.",
     )
-    workers_cleanup.add_argument("--pool", required=True)
     workers_cleanup.add_argument("--max-age-seconds", type=float, default=86400.0)
 
     worker_parser = subparsers.add_parser(
         "worker",
-        help=argparse.SUPPRESS,
+        help="Run this computer as a foreground LAN gate worker.",
     )
     worker_subparsers = worker_parser.add_subparsers(
         dest="worker_command",
         required=True,
     )
-    worker_probe_parser = worker_subparsers.add_parser("probe")
-    worker_probe_parser.add_argument("--environment-id", default="")
-    worker_stage_parser = worker_subparsers.add_parser("stage")
-    worker_stage_parser.add_argument("--project-key", required=True)
-    worker_stage_parser.add_argument("--snapshot", required=True)
-    worker_stage_parser.add_argument("--source-ref", required=True)
-    worker_subparsers.add_parser("execute")
-    worker_query_parser = worker_subparsers.add_parser("query")
-    worker_query_parser.add_argument("--job-id", required=True)
-    worker_cancel_parser = worker_subparsers.add_parser("cancel")
-    worker_cancel_parser.add_argument("--job-id", required=True)
-    worker_cancel_parser.add_argument("--grace-seconds", type=float, default=5.0)
-    worker_artifacts_parser = worker_subparsers.add_parser("artifacts")
-    worker_artifacts_parser.add_argument("--job-id", required=True)
-    worker_cleanup_plan_parser = worker_subparsers.add_parser("cleanup-plan")
-    worker_cleanup_plan_parser.add_argument("--project-key", required=True)
-    worker_cleanup_plan_parser.add_argument("--plan-id", required=True)
-    worker_gc_parser = worker_subparsers.add_parser("gc")
-    worker_gc_parser.add_argument("--max-age-seconds", type=float, default=86400.0)
+    worker_serve = worker_subparsers.add_parser("serve")
+    worker_serve.add_argument("--join", default="")
+    worker_serve.add_argument("--slots", default="auto")
+    worker_serve.add_argument("--bind", default="0.0.0.0")
+    worker_serve.add_argument("--port", type=int, default=WORKER_API_PORT)
 
     return parser
 
@@ -808,11 +807,44 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _load_cli_dotenv()
 
+    if args.command == "cluster":
+        try:
+            if args.cluster_command == "init":
+                state = init_cluster(name=args.name)
+                payload = {
+                    "ok": True,
+                    "cluster_id": state.cluster_id,
+                    "node_id": state.node_id,
+                    "hostname": state.hostname,
+                }
+            elif args.cluster_command == "pair":
+                payload = {
+                    "ok": True,
+                    "pairing_code": create_pairing_invite(
+                        host=args.host,
+                        port=args.port,
+                        ttl_seconds=args.ttl_seconds,
+                    ),
+                    "expires_in_seconds": max(30, args.ttl_seconds),
+                    "note": "the inviter worker service must be running",
+                }
+            else:
+                state = load_cluster_state()
+                payload = {
+                    "ok": state is not None,
+                    "paired": state is not None,
+                    "cluster_id": state.cluster_id if state else "",
+                    "node_id": state.node_id if state else "",
+                    "hostname": state.hostname if state else "",
+                }
+        except (OSError, RuntimeError, ValueError) as error:
+            payload = {"ok": False, "error": str(error)}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if bool(payload.get("ok")) else 1
+
     if args.command == "workers":
         if args.workers_command == "doctor":
-            payload = controller_workers_doctor(
-                args.pool,
-                environment_id=args.environment_id,
+            payload = lan_workers_doctor(
                 project_root=(
                     Path(args.project).expanduser().resolve()
                     if args.project
@@ -820,57 +852,48 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
         elif args.workers_command == "status":
-            payload = controller_workers_status(args.pool)
+            payload = lan_workers_status()
         else:
-            payload = controller_workers_cleanup(
-                args.pool,
-                max_age_seconds=args.max_age_seconds,
-            )
+            payload = lan_workers_cleanup(args.max_age_seconds)
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if bool(payload.get("ok")) else 1
 
     if args.command == "worker":
-        if args.worker_command == "probe":
-            payload = worker_probe(args.environment_id)
-            print(json.dumps(payload, ensure_ascii=False))
-            return 0 if bool(payload.get("ok")) else 1
-        if args.worker_command == "stage":
-            payload = worker_stage(
-                key=args.project_key,
-                snapshot_sha=args.snapshot,
-                source_ref=args.source_ref,
-                stream=sys.stdin.buffer,
-            )
-            print(json.dumps(payload, ensure_ascii=False))
-            return 0
-        if args.worker_command == "execute":
+        if args.join:
             try:
-                manifest = json.loads(sys.stdin.buffer.read().decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                print(json.dumps({"type": "error", "error": str(error)}))
+                state = join_cluster(args.join)
+            except (OSError, RuntimeError, ValueError) as error:
+                print(f"worker pairing failed: {error}", file=sys.stderr)
                 return 2
-            if not isinstance(manifest, dict):
-                print(json.dumps({"type": "error", "error": "manifest must be an object"}))
-                return 2
-            result = worker_execute(manifest)
-            return 0 if result.ok else max(1, min(125, int(result.returncode or 1)))
-        if args.worker_command == "query":
-            payload = worker_query(args.job_id)
-            print(json.dumps(payload, ensure_ascii=False))
-            return 0 if payload else 1
-        if args.worker_command == "cancel":
-            payload = worker_cancel(args.job_id, args.grace_seconds)
-            print(json.dumps(payload, ensure_ascii=False))
-            return 0 if bool(payload.get("ok")) else 1
-        if args.worker_command == "artifacts":
-            worker_artifacts(args.job_id, sys.stdout.buffer)
-            return 0
-        if args.worker_command == "cleanup-plan":
-            payload = worker_cleanup_plan(args.project_key, args.plan_id)
-            print(json.dumps(payload, ensure_ascii=False))
-            return 0
-        payload = worker_gc(args.max_age_seconds)
-        print(json.dumps(payload, ensure_ascii=False))
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "paired": True,
+                        "cluster_id": state.cluster_id,
+                        "node_id": state.node_id,
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+        elif load_cluster_state() is None:
+            print(
+                "worker is not paired; use --join <pairing-code> or run "
+                "`auto-agents cluster init`",
+                file=sys.stderr,
+            )
+            return 2
+        os.environ["AUTO_AGENTS_WORKER_SLOTS"] = str(args.slots)
+        service = WorkerService(bind=args.bind, port=args.port)
+        print(
+            f"auto_agents worker listening on {args.bind}:{args.port}",
+            file=sys.stderr,
+        )
+        try:
+            service.serve_forever()
+        except KeyboardInterrupt:
+            service.close()
         return 0
 
     if args.command == "init":

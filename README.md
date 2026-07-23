@@ -531,7 +531,8 @@ commands.
 
 Gate commands remain sequential by default. A structured `verification_steps` entry is concurrent
 only when it explicitly sets `parallel_safe=true`; safe entries are grouped by runner and capped by
-`gates.max_auto_workers` (default 2). The marker is appropriate only for checks isolated from shared
+the capacity detected across available workers (`gates.max_auto_workers` defaults to `"auto"`).
+The marker is appropriate only for checks isolated from shared
 databases, ports, mutable fixtures, snapshots, and build output. Existing `gates.parallel_groups`
 remain supported as an explicit opt-in. Identical derived commands are executed once in first-seen
 order; duplicate declarations merge conservatively, so any unsafe occurrence keeps the command
@@ -550,7 +551,7 @@ that changes tracked or unignored source is rejected by the existing mutation gu
 ```json
 {
   "gates": {
-    "max_auto_workers": 5,
+    "max_auto_workers": "auto",
     "isolation": {
       "enabled": true,
       "mode": "git_worktree",
@@ -581,25 +582,57 @@ Gate steps may also declare scheduling and artifact metadata:
 dispatch to workers that advertise every capability. `host:<name>` locks one resource on a worker,
 while `pool:<name>` locks it across the controller's entire pool.
 
-Linux/WSL machines can form an SSH gate pool. Install the same auto_agents version on every worker,
-prepare the environment and dependency directories, and configure key-based, non-interactive SSH.
-The controller reads `~/.config/auto-agents/workers.json`; every machine reads its own
-`~/.config/auto-agents/worker.json`. Starting templates are available in
-`examples/workers.lan.json` and `examples/worker.sdgp.json`. Change worker IDs, SSH aliases, paths,
-slot counts, and lock hashes for each machine; the local endpoint's worker ID must match the local
-`worker.json`. Worker IDs are logical names, not CPU model names; start with conservative slot
-counts and increase them only after observing memory and load during a full gate run.
+Linux/WSL computers can form a trusted LAN worker cluster without SSH, host lists, or per-project
+worker configuration. The computer running `auto-agents run` always executes work locally too.
+Paired computers running `auto-agents worker serve` are discovered automatically, and the
+controller schedules isolated gate commands across their combined capacity. Any paired computer
+can later act as the controller.
+
+Install the same auto_agents version on each computer. On the first computer, initialize a cluster
+and create a one-time pairing code:
+
+```bash
+auto-agents cluster init
+auto-agents cluster pair
+auto-agents worker serve
+```
+
+Keep that worker running. On each additional computer, use the printed code once:
+
+```bash
+auto-agents worker serve --join 'aa-worker-v1....'
+```
+
+After the one-time pairing, normal use only requires starting `auto-agents worker serve` on the
+other computers. No worker service is required on the controller itself; its embedded local worker
+is always available. Check the cluster before a long run with:
+
+```bash
+auto-agents workers status
+auto-agents workers doctor --project /path/to/project
+```
+
+Allow inbound TCP 47322 and UDP 47321 on the private LAN firewall. If the pairing code contains an
+address that another computer cannot reach, create it with
+`auto-agents cluster pair --host <reachable-LAN-IP>`.
+
+Slot counts are chosen automatically from CPU and memory. Use `worker serve --slots N` only to apply
+an explicit per-computer cap. The first job for a new dependency fingerprint may be slower: workers
+create a cached Python environment from the controller's project-local `.conda` package freeze and
+run `npm ci` for discovered `package-lock.json` files. Workers therefore need compatible Linux/WSL
+runtimes and network access to the configured package registries. Later jobs reuse that immutable
+cache.
+
+The default project setting is:
 
 ```json
 {
   "gates": {
+    "max_auto_workers": "auto",
     "distributed": {
-      "enabled": true,
-      "worker_pool": "lan-fast",
-      "environment_id": "sdgp-v1",
-      "fallback": "local",
-      "connect_timeout_seconds": 10,
-      "heartbeat_timeout_seconds": 90,
+      "mode": "auto",
+      "discovery_timeout_seconds": 1.5,
+      "request_timeout_seconds": 15,
       "infrastructure_retry_limit": 2,
       "forward_environment": "all_except_denylist",
       "extra_environment_denylist": ["OPENAI_API_KEY"]
@@ -608,20 +641,12 @@ counts and increase them only after observing memory and load during a full gate
 }
 ```
 
-Before enabling a pool, run:
-
-```bash
-auto-agents workers doctor --pool lan-fast --environment-id sdgp-v1 --project /path/to/project
-auto-agents workers status --pool lan-fast
-```
-
-The doctor checks SSH reachability, protocol version, slots, capabilities, registered dependency
-paths, executable/package fingerprints, and project lock-file hashes. A run transfers one immutable
-Git snapshot per remote worker, then schedules parallel-safe commands by available capacity while
-pinning the sequential lane to one worker. Infrastructure failures are retried on a different
-worker; an accepted job with uncertain remote state is never duplicated. If pool loading or staging
-fails before execution, `fallback=local` uses the same isolated snapshot. Stale terminal records and
-artifacts can be removed with `auto-agents workers cleanup --pool lan-fast`.
+Use `mode: "off"` for local-only execution or `mode: "required"` when a run must fail if no remote
+worker is available. A run transfers one immutable Git snapshot per remote worker, then schedules
+parallel-safe commands by free capacity while pinning sequential producer/consumer lanes to one
+worker. Infrastructure failures before acceptance may be retried elsewhere; a job whose remote
+state becomes uncertain after acceptance is never duplicated. Stale terminal records and artifacts
+can be removed with `auto-agents workers cleanup`.
 
 Gate commands use an activity lease plus an absolute wall-clock ceiling. The defaults for new
 projects are 900 seconds without observable output/CPU activity and a 7200-second ceiling:

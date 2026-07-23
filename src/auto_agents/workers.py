@@ -10,14 +10,17 @@ from importlib import metadata as importlib_metadata
 import json
 import os
 from pathlib import Path, PurePosixPath
+import platform
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
-from typing import BinaryIO, Iterator, Mapping, Optional, Sequence
+from typing import BinaryIO, Mapping, Optional, Sequence
 
 from .gate_execution import (
     _run_git,
@@ -86,13 +89,6 @@ def _safe_identifier(value: object, name: str) -> str:
     return normalized
 
 
-def controller_workers_config_path() -> Path:
-    override = os.environ.get("AUTO_AGENTS_WORKERS_CONFIG", "").strip()
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".config" / "auto-agents" / "workers.json"
-
-
 def local_worker_config_path() -> Path:
     override = os.environ.get("AUTO_AGENTS_WORKER_CONFIG", "").strip()
     if override:
@@ -100,51 +96,28 @@ def local_worker_config_path() -> Path:
     return Path.home() / ".config" / "auto-agents" / "worker.json"
 
 
+def automatic_worker_slots() -> int:
+    cpu_slots = max(1, (os.cpu_count() or 1) // 4)
+    memory = _memory_total_bytes()
+    reserve = 2 * 1024**3
+    memory_slots = (
+        max(1, int((memory - reserve) // (2 * 1024**3)))
+        if memory > reserve
+        else 1
+    )
+    return max(1, min(4, cpu_slots, memory_slots))
+
+
 @dataclass(frozen=True)
 class WorkerEndpoint:
     worker_id: str
     transport: str = "local"
     max_slots: int = 1
-    ssh_host: str = ""
-    command: str = "auto-agents"
+    host: str = ""
+    port: int = 0
+    tls_fingerprint: str = ""
     enabled: bool = True
     capabilities: tuple[str, ...] = ()
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, object]) -> "WorkerEndpoint":
-        worker_id = _safe_identifier(data.get("id", ""), "worker id")
-        raw_capabilities = data.get("capabilities", [])
-        if not isinstance(raw_capabilities, list) or any(
-            not isinstance(item, str) or not item.strip()
-            for item in raw_capabilities
-        ):
-            raise ValueError(
-                f"worker capabilities must be a list of non-empty strings: {worker_id}"
-            )
-        return cls(
-            worker_id=worker_id,
-            transport=str(data.get("transport", "local")).strip().lower(),
-            max_slots=max(1, int(data.get("max_slots", 1))),
-            ssh_host=str(data.get("ssh_host", "")).strip(),
-            command=str(data.get("command", "auto-agents")).strip() or "auto-agents",
-            enabled=bool(data.get("enabled", True)),
-            capabilities=tuple(
-                sorted(
-                    {
-                        str(item).strip().lower()
-                        for item in raw_capabilities
-                        if str(item).strip()
-                    }
-                )
-            ),
-        )
-
-
-@dataclass(frozen=True)
-class WorkerPool:
-    name: str
-    workers: tuple[WorkerEndpoint, ...]
-
 
 @dataclass(frozen=True)
 class WorkerEnvironment:
@@ -162,46 +135,19 @@ class LocalWorkerConfig:
     environments: Mapping[str, WorkerEnvironment]
 
 
-def load_worker_pool(name: str, path: Optional[Path] = None) -> WorkerPool:
-    config_path = path or controller_workers_config_path()
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
-    pools = payload.get("pools", {})
-    if not isinstance(pools, dict) or name not in pools:
-        raise ValueError(f"worker pool not found: {name}")
-    pool_payload = pools[name]
-    if not isinstance(pool_payload, dict):
-        raise ValueError(f"worker pool must be an object: {name}")
-    raw_workers = pool_payload.get("workers", [])
-    if not isinstance(raw_workers, list):
-        raise ValueError(f"worker pool workers must be a list: {name}")
-    workers = tuple(
-        worker
-        for item in raw_workers
-        if isinstance(item, dict)
-        for worker in [WorkerEndpoint.from_dict(item)]
-        if worker.enabled and worker.worker_id
-    )
-    if not workers:
-        raise ValueError(f"worker pool has no enabled workers: {name}")
-    if len({worker.worker_id for worker in workers}) != len(workers):
-        raise ValueError(f"worker pool contains duplicate worker ids: {name}")
-    for worker in workers:
-        if worker.transport not in {"local", "ssh"}:
-            raise ValueError(
-                f"unsupported worker transport {worker.transport}: {worker.worker_id}"
-            )
-        if worker.transport == "ssh" and not worker.ssh_host:
-            raise ValueError(f"ssh worker is missing ssh_host: {worker.worker_id}")
-    return WorkerPool(name=name, workers=workers)
-
-
 def load_local_worker_config(path: Optional[Path] = None) -> LocalWorkerConfig:
     config_path = path or local_worker_config_path()
-    if config_path.exists():
+    explicit_config = path is not None or bool(
+        os.environ.get("AUTO_AGENTS_WORKER_CONFIG", "").strip()
+    )
+    if explicit_config and config_path.exists():
         payload = json.loads(config_path.read_text(encoding="utf-8"))
     else:
         payload = {}
-    root_text = str(payload.get("managed_root", "")).strip()
+    root_text = (
+        os.environ.get("AUTO_AGENTS_WORKER_ROOT", "").strip()
+        or str(payload.get("managed_root", "")).strip()
+    )
     if root_text:
         managed_root = Path(root_text).expanduser().resolve()
     else:
@@ -241,13 +187,31 @@ def load_local_worker_config(path: Optional[Path] = None) -> LocalWorkerConfig:
                 if isinstance(raw_lock_hashes, dict)
                 else {},
             )
+    worker_id = str(payload.get("worker_id", "")).strip()
+    if not worker_id:
+        try:
+            from .worker_cluster import load_cluster_state
+
+            cluster = load_cluster_state()
+            worker_id = cluster.node_id if cluster is not None else ""
+        except RuntimeError:
+            worker_id = ""
+    if not worker_id:
+        worker_id = hashlib.sha256(
+            socket.gethostname().encode("utf-8")
+        ).hexdigest()[:24]
+    slots_text = os.environ.get("AUTO_AGENTS_WORKER_SLOTS", "").strip()
+    max_slots = (
+        automatic_worker_slots()
+        if not slots_text or slots_text.lower() == "auto"
+        else max(1, int(slots_text))
+    )
+    if explicit_config and "max_slots" in payload and not slots_text:
+        max_slots = max(1, int(payload.get("max_slots", 1)))
     return LocalWorkerConfig(
-        worker_id=_safe_identifier(
-            payload.get("worker_id", "local") or "local",
-            "worker id",
-        ),
+        worker_id=_safe_identifier(worker_id, "worker id"),
         managed_root=managed_root,
-        max_slots=max(1, int(payload.get("max_slots", 1))),
+        max_slots=max_slots,
         environments=environments,
     )
 
@@ -414,6 +378,16 @@ def _memory_available_bytes() -> int:
     return 0
 
 
+def _memory_total_bytes() -> int:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 def _mirror_path(config: LocalWorkerConfig, key: str) -> Path:
     return config.managed_root / "mirrors" / f"{_safe_id(key, 'project key')}.git"
 
@@ -530,6 +504,44 @@ def worker_probe(environment_id: str = "") -> dict[str, object]:
     }.items():
         if any(shutil.which(program) for program in programs):
             capabilities.add(capability)
+    runtimes: dict[str, str] = {}
+    python_versions: list[str] = []
+    for minor in range(9, 15):
+        executable = shutil.which(f"python3.{minor}")
+        if executable:
+            python_versions.append(f"3.{minor}")
+    current_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if current_version not in python_versions:
+        python_versions.append(current_version)
+    runtime_commands = {
+        "python": [sys.executable, "--version"],
+        "node": [shutil.which("node") or "", "--version"],
+        "ffmpeg": [shutil.which("ffmpeg") or "", "-version"],
+        "chrome": [
+            shutil.which("google-chrome")
+            or shutil.which("chromium")
+            or shutil.which("chromium-browser")
+            or "",
+            "--version",
+        ],
+    }
+    for name, command in runtime_commands.items():
+        if not command[0]:
+            continue
+        try:
+            result = subprocess.run(
+                command,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0:
+            runtimes[name] = (
+                result.stdout.strip() or result.stderr.strip()
+            ).splitlines()[0][:300]
     return {
         "ok": ok,
         "protocol_version": WORKER_PROTOCOL_VERSION,
@@ -539,9 +551,12 @@ def worker_probe(environment_id: str = "") -> dict[str, object]:
         "managed_root": str(config.managed_root),
         "max_slots": config.max_slots,
         "cpu_count": os.cpu_count() or 1,
+        "platform": f"{platform.system().lower()}-{platform.machine().lower()}",
         "memory_available_bytes": memory_kib * 1024,
         "disk_free_bytes": disk.free,
         "capabilities": sorted(capabilities),
+        "runtimes": runtimes,
+        "python_versions": sorted(python_versions),
         "checks": checks,
     }
 
@@ -555,7 +570,12 @@ def _auto_agents_version() -> str:
 
 def _worker_implementation_fingerprint() -> str:
     try:
-        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        source_root = Path(__file__).resolve().parent
+        for name in ("workers.py", "worker_cluster.py", "worker_service.py"):
+            digest.update(name.encode("utf-8"))
+            digest.update((source_root / name).read_bytes())
+        return digest.hexdigest()
     except OSError:
         return ""
 
@@ -582,26 +602,29 @@ def worker_stage(
             raise RuntimeError(process.stderr.strip() or "git init --bare failed")
     incoming = config.managed_root / "incoming"
     incoming.mkdir(parents=True, exist_ok=True)
-    bundle_path = incoming / f"{_safe_id(snapshot_sha, 'snapshot sha')}.bundle"
-    temporary = bundle_path.with_suffix(".bundle.part")
+    safe_snapshot = _safe_id(snapshot_sha, "snapshot sha")
+    temporary = incoming / (
+        f".{safe_snapshot}.{os.getpid()}.{threading.get_ident()}.bundle"
+    )
     with temporary.open("wb") as handle:
         shutil.copyfileobj(stream, handle)
     os.chmod(temporary, 0o600)
-    os.replace(temporary, bundle_path)
     target_ref = _snapshot_ref(snapshot_sha)
-    fetch = subprocess.run(
-        [
-            "git",
-            f"--git-dir={mirror}",
-            "fetch",
-            str(bundle_path),
-            f"{source_ref}:{target_ref}",
-        ],
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-    )
-    bundle_path.unlink(missing_ok=True)
+    try:
+        fetch = subprocess.run(
+            [
+                "git",
+                f"--git-dir={mirror}",
+                "fetch",
+                str(temporary),
+                f"{source_ref}:{target_ref}",
+            ],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+    finally:
+        temporary.unlink(missing_ok=True)
     if fetch.returncode != 0:
         raise RuntimeError(fetch.stderr.strip() or "git fetch bundle failed")
     resolved = subprocess.run(
@@ -678,6 +701,260 @@ def _environment_links(
         if not source.is_dir():
             raise RuntimeError(f"worker environment link is missing: {source}")
         links[normalized.as_posix()] = source
+    return links
+
+
+def build_environment_manifest(project_root: Path) -> dict[str, object]:
+    """Describe a reproducible gate environment without machine-specific paths."""
+
+    project_root = project_root.resolve()
+    python_executable = project_root / ".conda" / "bin" / "python"
+    python_payload: dict[str, object] = {}
+    if python_executable.is_file():
+        version = subprocess.run(
+            [
+                str(python_executable),
+                "-c",
+                "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
+            ],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=30,
+        )
+        freeze = subprocess.run(
+            [str(python_executable), "-m", "pip", "freeze", "--all"],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=120,
+        )
+        if version.returncode == 0 and freeze.returncode == 0:
+            requirements = [
+                line.strip()
+                for line in freeze.stdout.splitlines()
+                if line.strip()
+                and " @ file:" not in line
+                and not line.startswith("-e ")
+            ]
+            python_payload = {
+                "version": version.stdout.strip(),
+                "requirements": requirements,
+            }
+    node_packages: list[dict[str, object]] = []
+    ignored_directories = {
+        ".auto-agents",
+        ".conda",
+        ".git",
+        ".tmp",
+        ".tmp-tests",
+        "node_modules",
+    }
+    for directory, names, files in os.walk(project_root):
+        names[:] = [name for name in names if name not in ignored_directories]
+        if "package-lock.json" not in files or "package.json" not in files:
+            continue
+        package_root = Path(directory)
+        lock_path = package_root / "package-lock.json"
+        package_json = package_root / "package.json"
+        node_packages.append(
+            {
+                "root": package_root.relative_to(project_root).as_posix() or ".",
+                "lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+                "package_sha256": hashlib.sha256(package_json.read_bytes()).hexdigest(),
+            }
+        )
+    node_packages.sort(key=lambda item: str(item["root"]))
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "platform": f"{platform.system().lower()}-{platform.machine().lower()}",
+        "python": python_payload,
+        "node": node_packages,
+    }
+    payload["environment_id"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def _python_for_version(version: str) -> str:
+    candidates = [f"python{version}", "python3", "python"]
+    for candidate in candidates:
+        executable = shutil.which(candidate)
+        if not executable:
+            continue
+        process = subprocess.run(
+            [
+                executable,
+                "-c",
+                "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
+            ],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=15,
+        )
+        if process.returncode == 0 and process.stdout.strip() == version:
+            return executable
+    raise RuntimeError(f"worker does not provide Python {version}")
+
+
+def _auto_environment_links(
+    config: LocalWorkerConfig,
+    manifest: Mapping[str, object],
+    sandbox: Path,
+) -> dict[str, Path]:
+    environment = manifest.get("environment_manifest", {})
+    if not isinstance(environment, dict):
+        return {}
+    expected_platform = str(environment.get("platform", "")).strip()
+    local_platform = f"{platform.system().lower()}-{platform.machine().lower()}"
+    if expected_platform and expected_platform != local_platform:
+        raise RuntimeError(
+            "worker platform does not match the controller environment: "
+            f"{local_platform} != {expected_platform}"
+        )
+    environment_id = _safe_id(
+        str(environment.get("environment_id", "")),
+        "environment id",
+    )
+    environment_root = config.managed_root / "environments" / environment_id
+    lock_path = config.managed_root / "environment-locks" / f"{environment_id}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        complete = environment_root / "complete.json"
+        if not complete.is_file():
+            if environment_root.exists():
+                shutil.rmtree(environment_root)
+            temporary = environment_root.with_name(
+                f".{environment_root.name}.{os.getpid()}.build"
+            )
+            shutil.rmtree(temporary, ignore_errors=True)
+            temporary.mkdir(parents=True, exist_ok=True)
+            try:
+                python_payload = environment.get("python", {})
+                if isinstance(python_payload, dict) and python_payload.get("version"):
+                    version = str(python_payload["version"])
+                    executable = _python_for_version(version)
+                    process = subprocess.run(
+                        [executable, "-m", "venv", str(temporary / ".conda")],
+                        text=True,
+                        encoding="utf-8",
+                        capture_output=True,
+                        timeout=300,
+                    )
+                    if process.returncode != 0:
+                        raise RuntimeError(
+                            process.stderr.strip()
+                            or f"failed to create Python {version} environment"
+                        )
+                    requirements = python_payload.get("requirements", [])
+                    if isinstance(requirements, list) and requirements:
+                        requirements_path = temporary / "requirements.freeze.txt"
+                        requirements_path.write_text(
+                            "\n".join(str(item) for item in requirements) + "\n",
+                            encoding="utf-8",
+                        )
+                        install = subprocess.run(
+                            [
+                                str(temporary / ".conda" / "bin" / "python"),
+                                "-m",
+                                "pip",
+                                "install",
+                                "-r",
+                                str(requirements_path),
+                            ],
+                            text=True,
+                            encoding="utf-8",
+                            capture_output=True,
+                            timeout=1800,
+                        )
+                        if install.returncode != 0:
+                            raise RuntimeError(
+                                install.stderr.strip()
+                                or "failed to install frozen Python dependencies"
+                            )
+                raw_node = environment.get("node", [])
+                if isinstance(raw_node, list):
+                    for item in raw_node:
+                        if not isinstance(item, dict):
+                            continue
+                        root_text = str(item.get("root", "."))
+                        root = PurePosixPath(root_text)
+                        if root.is_absolute() or ".." in root.parts:
+                            raise RuntimeError(
+                                f"unsafe Node package root: {root_text}"
+                            )
+                        source_root = sandbox if root_text == "." else sandbox / root_text
+                        node_root = temporary / "node" / hashlib.sha256(
+                            root_text.encode("utf-8")
+                        ).hexdigest()[:16]
+                        node_root.mkdir(parents=True, exist_ok=True)
+                        for name in ("package.json", "package-lock.json"):
+                            source = source_root / name
+                            if not source.is_file():
+                                raise RuntimeError(
+                                    f"worker snapshot is missing {root_text}/{name}"
+                                )
+                            shutil.copy2(source, node_root / name)
+                        npm = shutil.which("npm")
+                        if not npm:
+                            raise RuntimeError("worker does not provide npm")
+                        install = subprocess.run(
+                            [npm, "ci"],
+                            cwd=str(node_root),
+                            text=True,
+                            encoding="utf-8",
+                            capture_output=True,
+                            timeout=1800,
+                            env={
+                                **os.environ,
+                                "npm_config_cache": str(
+                                    config.managed_root / "package-cache" / "npm"
+                                ),
+                            },
+                        )
+                        if install.returncode != 0:
+                            raise RuntimeError(
+                                install.stderr.strip()
+                                or f"npm ci failed for {root_text}"
+                            )
+                (temporary / "complete.json").write_text(
+                    json.dumps(environment, sort_keys=True, indent=2),
+                    encoding="utf-8",
+                )
+                environment_root.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.replace(temporary, environment_root)
+                except OSError:
+                    if not complete.is_file():
+                        raise
+                    shutil.rmtree(temporary, ignore_errors=True)
+            except Exception:
+                shutil.rmtree(temporary, ignore_errors=True)
+                raise
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    links: dict[str, Path] = {}
+    python_environment = environment_root / ".conda"
+    if python_environment.is_dir():
+        links[".conda"] = python_environment
+    raw_node = environment.get("node", [])
+    if isinstance(raw_node, list):
+        for item in raw_node:
+            if not isinstance(item, dict):
+                continue
+            root_text = str(item.get("root", "."))
+            node_root = environment_root / "node" / hashlib.sha256(
+                root_text.encode("utf-8")
+            ).hexdigest()[:16] / "node_modules"
+            relative = (
+                "node_modules"
+                if root_text == "."
+                else f"{root_text.rstrip('/')}/node_modules"
+            )
+            if node_root.is_dir():
+                links[relative] = node_root
     return links
 
 
@@ -765,6 +1042,7 @@ def worker_execute(
     manifest: Mapping[str, object],
     *,
     event_stream=sys.stdout,
+    cancel_event: Optional[threading.Event] = None,
 ) -> CommandResult:
     config = load_local_worker_config()
     config.managed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -786,7 +1064,7 @@ def worker_execute(
             termination_reason="infrastructure_error",
             job_id=job_id,
             worker_id=config.worker_id,
-            backend="ssh-isolated",
+            backend="lan-worker",
             infrastructure_error=True,
         )
     environment_id = str(manifest.get("environment_id", "")).strip()
@@ -818,7 +1096,10 @@ def worker_execute(
             required_slots,
         ):
             mirror, sandbox, _created = _worker_sandbox(config, manifest)
-            links = _environment_links(config, environment_id)
+            if isinstance(manifest.get("environment_manifest"), dict):
+                links = _auto_environment_links(config, manifest, sandbox)
+            else:
+                links = _environment_links(config, environment_id)
             install_dependency_links(sandbox, links)
             runtime_root = config.managed_root / "runtime" / job_id
             env = gate_environment(
@@ -909,6 +1190,7 @@ def worker_execute(
                     progress=progress,
                     on_start=on_start,
                     kind="gate-worker",
+                    cancel_event=cancel_event,
                 )
             mutations = _worker_mutations(sandbox, list(links))
             stderr = redact_values(process.stderr, list(forwarded.values()))
@@ -947,7 +1229,7 @@ def worker_execute(
                 process_snapshot=process.process_snapshot,
                 job_id=job_id,
                 worker_id=config.worker_id,
-                backend="ssh-isolated",
+                backend="lan-worker",
                 mutation_paths=mutations,
                 artifacts=artifact_hashes,
             )
@@ -978,7 +1260,7 @@ def worker_execute(
             termination_reason="infrastructure_error",
             job_id=job_id,
             worker_id=config.worker_id,
-            backend="ssh-isolated",
+            backend="lan-worker",
             infrastructure_error=True,
         )
         base_record.update(
@@ -1028,7 +1310,20 @@ def worker_cancel(job_id: str, grace_seconds: float = 5.0) -> dict[str, object]:
     path = config.managed_root / "jobs" / f"{_safe_id(job_id, 'job id')}.json"
     record = _read_json(path)
     pgid = int(record.get("pgid", 0) or 0)
-    if pgid <= 0 or not process_group_exists(pgid):
+    if record.get("state") == "terminal":
+        return {"ok": True, "job_id": job_id, "stopped": True}
+    if pgid <= 0:
+        record.update(
+            {
+                "job_id": job_id,
+                "state": "cancellation_requested",
+                "cancel_requested": True,
+                "updated_at": time.time(),
+            }
+        )
+        _write_json_atomic(path, record)
+        return {"ok": True, "job_id": job_id, "stopped": False}
+    if not process_group_exists(pgid):
         return {"ok": True, "job_id": job_id, "stopped": True}
     try:
         os.killpg(pgid, signal.SIGTERM)
@@ -1119,221 +1414,3 @@ def command_result_from_dict(payload: Mapping[str, object]) -> CommandResult:
             if name in payload
         }
     )
-
-
-def ssh_command(
-    endpoint: WorkerEndpoint,
-    args: Sequence[str],
-    *,
-    connect_timeout_seconds: int,
-) -> list[str]:
-    return [
-        "ssh",
-        "-T",
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        f"ConnectTimeout={max(1, connect_timeout_seconds)}",
-        endpoint.ssh_host,
-        endpoint.command,
-        "worker",
-        *args,
-    ]
-
-
-def controller_worker_call(
-    endpoint: WorkerEndpoint,
-    args: Sequence[str],
-    *,
-    connect_timeout_seconds: int = 10,
-    input_bytes: Optional[bytes] = None,
-) -> subprocess.CompletedProcess[bytes]:
-    if endpoint.transport == "local":
-        raise ValueError("controller_worker_call requires an ssh endpoint")
-    return subprocess.run(
-        ssh_command(
-            endpoint,
-            args,
-            connect_timeout_seconds=connect_timeout_seconds,
-        ),
-        input=input_bytes,
-        capture_output=True,
-    )
-
-
-def controller_workers_doctor(
-    pool_name: str,
-    *,
-    environment_id: str = "",
-    project_root: Optional[Path] = None,
-) -> dict[str, object]:
-    pool = load_worker_pool(pool_name)
-    expected_lock_hashes: dict[str, str] = {}
-    if project_root is not None:
-        for name in (
-            "pyproject.toml",
-            "poetry.lock",
-            "uv.lock",
-            "requirements.txt",
-            "package-lock.json",
-            "pnpm-lock.yaml",
-            "yarn.lock",
-            "workbench/package-lock.json",
-        ):
-            path = project_root / name
-            if path.is_file():
-                expected_lock_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    results: list[dict[str, object]] = []
-    for endpoint in pool.workers:
-        if endpoint.transport == "local":
-            payload = worker_probe(environment_id)
-        else:
-            probe_args = ["probe"]
-            if environment_id:
-                probe_args.extend(["--environment-id", environment_id])
-            try:
-                process = controller_worker_call(
-                    endpoint,
-                    probe_args,
-                )
-                payload = json.loads(process.stdout.decode("utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-                payload = {
-                    "ok": False,
-                    "error": str(error),
-                }
-        if not isinstance(payload, dict):
-            payload = {
-                "ok": False,
-                "error": "worker probe returned a non-object payload",
-            }
-        payload["configured_id"] = endpoint.worker_id
-        payload["transport"] = endpoint.transport
-        if payload.get("worker_id") != endpoint.worker_id:
-            payload["ok"] = False
-            payload["worker_id_error"] = {
-                "configured": endpoint.worker_id,
-                "reported": payload.get("worker_id"),
-            }
-        if payload.get("protocol_version") != WORKER_PROTOCOL_VERSION:
-            payload["ok"] = False
-            payload["protocol_error"] = {
-                "expected": WORKER_PROTOCOL_VERSION,
-                "reported": payload.get("protocol_version"),
-            }
-        payload["reported_max_slots"] = payload.get("max_slots")
-        payload["configured_max_slots"] = endpoint.max_slots
-        reported_capabilities = {
-            str(item).strip().lower()
-            for item in payload.get("capabilities", [])
-            if str(item).strip()
-        }
-        missing_capabilities = sorted(
-            set(endpoint.capabilities) - reported_capabilities
-        )
-        if missing_capabilities:
-            payload["ok"] = False
-            payload["capability_error"] = {
-                "configured": list(endpoint.capabilities),
-                "reported": sorted(reported_capabilities),
-                "missing": missing_capabilities,
-            }
-        if (
-            payload.get("reported_max_slots") is not None
-            and int(payload["reported_max_slots"]) < endpoint.max_slots
-        ):
-            payload["ok"] = False
-            payload["slot_error"] = (
-                f"worker exposes {payload['reported_max_slots']} slots but "
-                f"pool config requests {endpoint.max_slots}"
-            )
-        checks = payload.get("checks", {})
-        actual_lock_hashes = (
-            checks.get("lock_hashes", {})
-            if isinstance(checks, dict)
-            else {}
-        )
-        if expected_lock_hashes and actual_lock_hashes != expected_lock_hashes:
-            payload["ok"] = False
-            payload["lock_hash_error"] = {
-                "expected": expected_lock_hashes,
-                "actual": actual_lock_hashes,
-            }
-        results.append(payload)
-    environment_fingerprints: dict[str, str] = {}
-    for item in results:
-        checks = item.get("checks", {})
-        executables = checks.get("executables", {}) if isinstance(checks, dict) else {}
-        normalized: dict[str, object] = {}
-        if isinstance(executables, dict):
-            for name, entry in executables.items():
-                if not isinstance(entry, dict):
-                    continue
-                normalized[str(name)] = {
-                    "version": entry.get("version", ""),
-                    "package_fingerprint": entry.get("package_fingerprint", ""),
-                }
-        environment_fingerprints[str(item.get("configured_id", ""))] = hashlib.sha256(
-            json.dumps(normalized, sort_keys=True).encode("utf-8")
-        ).hexdigest()
-    if len(set(environment_fingerprints.values())) > 1:
-        for item in results:
-            item["ok"] = False
-            item["environment_mismatch"] = environment_fingerprints
-    versions = {
-        str(item.get("configured_id", "")): str(
-            item.get("auto_agents_version", "")
-        )
-        for item in results
-    }
-    if len(set(versions.values())) > 1:
-        for item in results:
-            item["ok"] = False
-            item["auto_agents_version_mismatch"] = versions
-    implementation_fingerprints = {
-        str(item.get("configured_id", "")): str(
-            item.get("worker_implementation_fingerprint", "")
-        )
-        for item in results
-    }
-    if len(set(implementation_fingerprints.values())) > 1:
-        for item in results:
-            item["ok"] = False
-            item["worker_implementation_mismatch"] = implementation_fingerprints
-    return {
-        "ok": all(bool(item.get("ok")) for item in results),
-        "pool": pool_name,
-        "workers": results,
-    }
-
-
-def controller_workers_status(pool_name: str) -> dict[str, object]:
-    return controller_workers_doctor(pool_name)
-
-
-def controller_workers_cleanup(
-    pool_name: str,
-    *,
-    max_age_seconds: float = 86400.0,
-) -> dict[str, object]:
-    pool = load_worker_pool(pool_name)
-    results: list[dict[str, object]] = []
-    for endpoint in pool.workers:
-        if endpoint.transport == "local":
-            payload = worker_gc(max_age_seconds)
-        else:
-            try:
-                process = controller_worker_call(
-                    endpoint,
-                    ["gc", "--max-age-seconds", str(max_age_seconds)],
-                )
-                payload = json.loads(process.stdout.decode("utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-                payload = {"ok": False, "error": str(error)}
-        payload["worker_id"] = endpoint.worker_id
-        results.append(payload)
-    return {
-        "ok": all(bool(item.get("ok")) for item in results),
-        "pool": pool_name,
-        "workers": results,
-    }

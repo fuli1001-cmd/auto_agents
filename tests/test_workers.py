@@ -70,30 +70,6 @@ def _worker_config(tmp_path: Path) -> Path:
     return path
 
 
-def _controller_config(tmp_path: Path) -> Path:
-    path = tmp_path / "workers.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "pools": {
-                    "test-pool": {
-                        "workers": [
-                            {
-                                "id": "test-worker",
-                                "transport": "local",
-                                "max_slots": 2,
-                            }
-                        ]
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    return path
-
-
 def test_forwarded_environment_uses_fixed_denylist() -> None:
     result = forwarded_environment(
         {
@@ -173,7 +149,7 @@ def test_worker_stage_execute_and_query(tmp_path: Path, monkeypatch) -> None:
     manager.close()
 
 
-def test_distributed_executor_uses_configured_local_pool(
+def test_distributed_executor_uses_controller_as_local_worker(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -181,10 +157,6 @@ def test_distributed_executor_uses_configured_local_pool(
     monkeypatch.setenv(
         "AUTO_AGENTS_WORKER_CONFIG",
         str(_worker_config(tmp_path)),
-    )
-    monkeypatch.setenv(
-        "AUTO_AGENTS_WORKERS_CONFIG",
-        str(_controller_config(tmp_path)),
     )
     commands = [
         f"{sys.executable} -c \"from pathlib import Path; assert Path('value.txt').exists()\"",
@@ -196,11 +168,7 @@ def test_distributed_executor_uses_configured_local_pool(
             enabled=True,
             worktree_root=str(tmp_path / "worktrees"),
         ),
-        distributed=DistributedGatesConfig(
-            enabled=True,
-            worker_pool="test-pool",
-            environment_id="test",
-        ),
+        distributed=DistributedGatesConfig(mode="auto"),
     )
     metadata = {
         command: GateCommandMetadata(resource_class="normal")
@@ -229,10 +197,13 @@ def test_distributed_auto_parallelism_uses_gate_capacity() -> None:
     orchestrator.config.gates.max_auto_workers = 5
     orchestrator.config.gates.parallel_workers = "auto"
 
-    assert orchestrator._gate_parallel_workers() == 2
-
-    orchestrator.config.gates.distributed.enabled = True
     assert orchestrator._gate_parallel_workers() == 5
+
+    orchestrator.config.gates.max_auto_workers = "auto"
+    assert orchestrator._gate_parallel_workers() == 32
+
+    orchestrator.config.gates.distributed.mode = "off"
+    assert orchestrator._gate_parallel_workers() == 2
 
     orchestrator.config.gates.parallel_workers = 3
     assert orchestrator._gate_parallel_workers() == 3
