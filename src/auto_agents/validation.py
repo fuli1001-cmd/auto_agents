@@ -20,6 +20,9 @@ from .models import (
     DOCUMENT_LANGUAGE_OPTIONS,
     SMART_TIMEOUT_PROGRESS_PROTOCOL,
     TASK_ORIGINS,
+    VERIFICATION_CACHE_SCOPES,
+    VERIFICATION_CADENCES,
+    VERIFICATION_RESOURCE_CLASSES,
 )
 from .requirements import (
     normalize_requirements_trace_payload,
@@ -208,6 +211,47 @@ def validate_verification_steps(steps: object, field_name: str = "verification_s
             errors.append(f"{prefix}.command is not allowed for structured test steps")
         if "parallel_safe" in raw_step and not isinstance(raw_step.get("parallel_safe"), bool):
             errors.append(f"{prefix}.parallel_safe must be a boolean when provided")
+        cadence = str(raw_step.get("cadence", "implement_and_final")).strip().lower()
+        if cadence not in VERIFICATION_CADENCES:
+            allowed = ", ".join(VERIFICATION_CADENCES)
+            errors.append(f"{prefix}.cadence must be one of: {allowed}")
+        cache_scope = str(raw_step.get("cache_scope", "run_context")).strip().lower()
+        if cache_scope not in VERIFICATION_CACHE_SCOPES:
+            allowed = ", ".join(VERIFICATION_CACHE_SCOPES)
+            errors.append(f"{prefix}.cache_scope must be one of: {allowed}")
+        resource_class = str(raw_step.get("resource_class", "normal")).strip().lower()
+        if resource_class not in VERIFICATION_RESOURCE_CLASSES:
+            allowed = ", ".join(VERIFICATION_RESOURCE_CLASSES)
+            errors.append(f"{prefix}.resource_class must be one of: {allowed}")
+        for field in ("requires", "exclusive_resources", "artifact_globs"):
+            value = raw_step.get(field, [])
+            if value is not None and (
+                not isinstance(value, list)
+                or any(not isinstance(item, str) or not item.strip() for item in value)
+            ):
+                errors.append(
+                    f"{prefix}.{field} must be a list of non-empty strings when provided"
+                )
+        exclusive = raw_step.get("exclusive_resources", [])
+        if isinstance(exclusive, list):
+            for item in exclusive:
+                if isinstance(item, str) and (
+                    not item.startswith(("host:", "pool:"))
+                    or not item.split(":", 1)[1].strip()
+                ):
+                    errors.append(
+                        f"{prefix}.exclusive_resources entries must be host:<name> or pool:<name>"
+                    )
+        artifacts = raw_step.get("artifact_globs", [])
+        if isinstance(artifacts, list):
+            for item in artifacts:
+                if not isinstance(item, str):
+                    continue
+                normalized = item.replace("\\", "/")
+                if normalized.startswith("/") or ".." in normalized.split("/"):
+                    errors.append(
+                        f"{prefix}.artifact_globs entries must be safe project-relative globs"
+                    )
     return errors
 
 
@@ -847,6 +891,84 @@ def validate_project_config_payload(payload: object) -> List[str]:
             errors.append(
                 "gates.command_idle_timeout_seconds must be <= gates.command_timeout_seconds"
             )
+        isolation = gates.get("isolation", {})
+        if not isinstance(isolation, dict):
+            errors.append("gates.isolation must be an object")
+        else:
+            if not isinstance(isolation.get("enabled", False), bool):
+                errors.append("gates.isolation.enabled must be a boolean")
+            if isolation.get("mode", "git_worktree") != "git_worktree":
+                errors.append("gates.isolation.mode must be 'git_worktree'")
+            if not isinstance(isolation.get("worktree_root", ""), str):
+                errors.append("gates.isolation.worktree_root must be a string")
+            for key, default in (
+                ("artifact_max_bytes", 256 * 1024 * 1024),
+                ("artifact_max_files", 2000),
+            ):
+                value = isolation.get(key, default)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    errors.append(f"gates.isolation.{key} must be an integer >= 1")
+        distributed = gates.get("distributed", {})
+        if not isinstance(distributed, dict):
+            errors.append("gates.distributed must be an object")
+        else:
+            enabled = distributed.get("enabled", False)
+            if not isinstance(enabled, bool):
+                errors.append("gates.distributed.enabled must be a boolean")
+            worker_pool = distributed.get("worker_pool", "")
+            environment_id = distributed.get("environment_id", "")
+            if not isinstance(worker_pool, str):
+                errors.append("gates.distributed.worker_pool must be a string")
+            elif enabled and not worker_pool.strip():
+                errors.append(
+                    "gates.distributed.worker_pool must be non-empty when enabled"
+                )
+            if not isinstance(environment_id, str):
+                errors.append("gates.distributed.environment_id must be a string")
+            elif enabled and not environment_id.strip():
+                errors.append(
+                    "gates.distributed.environment_id must be non-empty when enabled"
+                )
+            if (
+                enabled
+                and isinstance(isolation, dict)
+                and not isolation.get("enabled", False)
+            ):
+                errors.append(
+                    "gates.isolation.enabled must be true when distributed gates are enabled"
+                )
+            if distributed.get("fallback", "local") != "local":
+                errors.append("gates.distributed.fallback must be 'local'")
+            if (
+                distributed.get("forward_environment", "all_except_denylist")
+                != "all_except_denylist"
+            ):
+                errors.append(
+                    "gates.distributed.forward_environment must be 'all_except_denylist'"
+                )
+            for key, default in (
+                ("connect_timeout_seconds", 10),
+                ("heartbeat_timeout_seconds", 90),
+            ):
+                value = distributed.get(key, default)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    errors.append(f"gates.distributed.{key} must be an integer >= 1")
+            retry_limit = distributed.get("infrastructure_retry_limit", 2)
+            if (
+                not isinstance(retry_limit, int)
+                or isinstance(retry_limit, bool)
+                or retry_limit < 0
+            ):
+                errors.append(
+                    "gates.distributed.infrastructure_retry_limit must be an integer >= 0"
+                )
+            denylist = distributed.get("extra_environment_denylist", [])
+            if not isinstance(denylist, list) or any(
+                not isinstance(item, str) or not item.strip() for item in denylist
+            ):
+                errors.append(
+                    "gates.distributed.extra_environment_denylist must be a list of non-empty strings"
+                )
 
     git = payload.get("git")
     if not isinstance(git, dict):

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import re
 import shlex
 import threading
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence
+from typing import Callable, Iterable, List, Optional, Protocol, Sequence
 
 from .models import (
     DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS,
@@ -29,11 +29,54 @@ _UNITTEST_FAILED = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
 GateProgressCallback = Callable[[str, str, float], None]
 
 
+class GateCommandExecutor(Protocol):
+    def priority(self, command: str) -> tuple[int, str]: ...
+
+    def run(
+        self,
+        command: str,
+        *,
+        lane: str = "",
+        timeout_seconds: float,
+        adaptive_timeout_enabled: bool,
+        idle_timeout_seconds: float,
+        cancel_event: Optional[threading.Event] = None,
+        progress: Optional[GateProgressCallback] = None,
+    ) -> CommandResult: ...
+
+
 @dataclass
 class FailureExtraction:
     failure_ids: List[str]
     comparable: bool
     non_comparable_ids: List[str]
+
+
+@dataclass
+class GateCommandMetadata:
+    resource_class: str = "normal"
+    requires: List[str] = field(default_factory=list)
+    exclusive_resources: List[str] = field(default_factory=list)
+    artifact_globs: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ResolvedGatePlan:
+    commands: List[str]
+    parallel_groups: List[GateParallelGroup]
+    cache_scopes: dict[str, str]
+    raw_command_count: int
+    metadata: dict[str, GateCommandMetadata] = field(default_factory=dict)
+
+    @property
+    def unique_command_count(self) -> int:
+        return len(self.commands) + sum(
+            len(group.commands) for group in self.parallel_groups
+        )
+
+    @property
+    def duplicates_removed(self) -> int:
+        return max(0, self.raw_command_count - self.unique_command_count)
 
 
 class GateCommandTimeoutError(RuntimeError):
@@ -149,6 +192,12 @@ def expand_pytest_directory_steps(
                             targets=[target],
                             args=list(step.args),
                             parallel_safe=step.parallel_safe,
+                            cadence=step.cadence,
+                            cache_scope=step.cache_scope,
+                            resource_class=step.resource_class,
+                            requires=list(step.requires),
+                            exclusive_resources=list(step.exclusive_resources),
+                            artifact_globs=list(step.artifact_globs),
                         )
                     )
                     seen_targets.add(target)
@@ -163,6 +212,12 @@ def expand_pytest_directory_steps(
                         targets=[test_file],
                         args=list(step.args),
                         parallel_safe=step.parallel_safe,
+                        cadence=step.cadence,
+                        cache_scope=step.cache_scope,
+                        resource_class=step.resource_class,
+                        requires=list(step.requires),
+                        exclusive_resources=list(step.exclusive_resources),
+                        artifact_globs=list(step.artifact_globs),
                     )
                 )
                 seen_targets.add(test_file)
@@ -196,7 +251,117 @@ def commands_from_verification_steps(
     steps: Sequence[VerificationStep],
     project_root: Optional[Path] = None,
 ) -> List[str]:
-    return [command_from_verification_step(step, project_root=project_root) for step in steps]
+    commands: List[str] = []
+    seen: set[str] = set()
+    for step in steps:
+        command = command_from_verification_step(step, project_root=project_root)
+        if command in seen:
+            continue
+        seen.add(command)
+        commands.append(command)
+    return commands
+
+
+def resolve_gate_plan_from_verification_steps(
+    steps: Sequence[VerificationStep],
+    project_root: Optional[Path] = None,
+    *,
+    phase: str = "final",
+) -> ResolvedGatePlan:
+    if phase not in {"implement", "final"}:
+        raise ValueError(f"unsupported gate plan phase: {phase}")
+
+    occurrences: dict[str, List[VerificationStep]] = {}
+    order: List[str] = []
+    raw_count = 0
+    for step in steps:
+        cadence = step.cadence.strip().lower() or "implement_and_final"
+        if phase == "implement" and cadence == "final_only":
+            continue
+        command = command_from_verification_step(step, project_root=project_root)
+        raw_count += 1
+        if command not in occurrences:
+            occurrences[command] = []
+            order.append(command)
+        occurrences[command].append(step)
+
+    sequential: List[str] = []
+    grouped: dict[str, List[str]] = {}
+    runner_order: List[str] = []
+    cache_scopes: dict[str, str] = {}
+    metadata: dict[str, GateCommandMetadata] = {}
+    for command in order:
+        command_steps = occurrences[command]
+        parallel_safe = all(step.parallel_safe for step in command_steps)
+        cache_scope = (
+            "run_context"
+            if any(
+                (step.cache_scope.strip().lower() or "run_context") != "source"
+                for step in command_steps
+            )
+            else "source"
+        )
+        cache_scopes[command] = cache_scope
+        resource_class = (
+            "heavy"
+            if any(
+                step.resource_class.strip().lower() == "heavy"
+                or any(
+                    requirement.strip().lower() in {"chrome", "browser", "ffmpeg"}
+                    for requirement in step.requires
+                )
+                for step in command_steps
+            )
+            else "normal"
+        )
+        metadata[command] = GateCommandMetadata(
+            resource_class=resource_class,
+            requires=list(
+                dict.fromkeys(
+                    requirement.strip()
+                    for step in command_steps
+                    for requirement in step.requires
+                    if requirement.strip()
+                )
+            ),
+            exclusive_resources=list(
+                dict.fromkeys(
+                    resource.strip()
+                    for step in command_steps
+                    for resource in step.exclusive_resources
+                    if resource.strip()
+                )
+            ),
+            artifact_globs=list(
+                dict.fromkeys(
+                    pattern.strip()
+                    for step in command_steps
+                    for pattern in step.artifact_globs
+                    if pattern.strip()
+                )
+            ),
+        )
+        if not parallel_safe:
+            sequential.append(command)
+            continue
+        runner = command_steps[0].runner.strip().lower() or "test"
+        if runner not in grouped:
+            grouped[runner] = []
+            runner_order.append(runner)
+        grouped[runner].append(command)
+
+    groups = [
+        GateParallelGroup(name=f"steps-{runner}", commands=grouped[runner])
+        for runner in runner_order
+        if grouped[runner]
+    ]
+    return ResolvedGatePlan(
+        commands=sequential,
+        parallel_groups=groups,
+        cache_scopes=cache_scopes,
+        raw_command_count=raw_count,
+        metadata=metadata,
+    )
 
 
 def gate_plan_from_verification_steps(
@@ -208,25 +373,12 @@ def gate_plan_from_verification_steps(
     Only steps explicitly marked ``parallel_safe`` enter a parallel group.
     Unmarked and legacy steps remain sequential.
     """
-    sequential: List[str] = []
-    grouped: dict[str, List[str]] = {}
-    runner_order: List[str] = []
-    for step in steps:
-        command = command_from_verification_step(step, project_root=project_root)
-        if not step.parallel_safe:
-            sequential.append(command)
-            continue
-        runner = step.runner.strip().lower() or "test"
-        if runner not in grouped:
-            grouped[runner] = []
-            runner_order.append(runner)
-        grouped[runner].append(command)
-    groups = [
-        GateParallelGroup(name=f"steps-{runner}", commands=grouped[runner])
-        for runner in runner_order
-        if grouped[runner]
-    ]
-    return sequential, groups
+    plan = resolve_gate_plan_from_verification_steps(
+        steps,
+        project_root,
+        phase="final",
+    )
+    return plan.commands, plan.parallel_groups
 
 
 def build_failure_identity_diagnostic_command(command: str) -> str:
@@ -336,37 +488,71 @@ def _run_parallel_commands(
     adaptive_timeout_enabled: bool = False,
     idle_timeout_seconds: float = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
     progress: Optional[GateProgressCallback] = None,
+    gate_executor: Optional[GateCommandExecutor] = None,
+    cancel_on_failure: bool = False,
 ) -> List[CommandResult]:
     if not commands:
         return []
     if len(commands) == 1:
         return [
-            _run_command(
-                commands[0], cwd, timeout_seconds=timeout_seconds,
-                adaptive_timeout_enabled=adaptive_timeout_enabled,
-                idle_timeout_seconds=idle_timeout_seconds, progress=progress
+            (
+                gate_executor.run(
+                    commands[0],
+                    timeout_seconds=timeout_seconds,
+                    adaptive_timeout_enabled=adaptive_timeout_enabled,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                    progress=progress,
+                )
+                if gate_executor is not None
+                else _run_command(
+                    commands[0], cwd, timeout_seconds=timeout_seconds,
+                    adaptive_timeout_enabled=adaptive_timeout_enabled,
+                    idle_timeout_seconds=idle_timeout_seconds, progress=progress
+                )
             )
         ]
 
     results: List[CommandResult] = [None] * len(commands)  # type: ignore[list-item]
     cancel_event = threading.Event()
-    with ThreadPoolExecutor(max_workers=max(1, min(len(commands), max_workers))) as executor:
+    ordered_commands = list(enumerate(commands))
+    if gate_executor is not None:
+        ordered_commands.sort(key=lambda item: gate_executor.priority(item[1]))
+    with ThreadPoolExecutor(max_workers=max(1, min(len(commands), max_workers))) as pool:
         future_to_index = {
-            executor.submit(
-                _run_command,
+            pool.submit(
+                (
+                    gate_executor.run
+                    if gate_executor is not None
+                    else _run_command
+                ),
                 command,
-                cwd,
-                timeout_seconds=timeout_seconds,
-                adaptive_timeout_enabled=adaptive_timeout_enabled,
-                idle_timeout_seconds=idle_timeout_seconds,
-                cancel_event=cancel_event,
-                progress=progress,
+                **(
+                    {
+                        "timeout_seconds": timeout_seconds,
+                        "adaptive_timeout_enabled": adaptive_timeout_enabled,
+                        "idle_timeout_seconds": idle_timeout_seconds,
+                        "cancel_event": cancel_event,
+                        "progress": progress,
+                    }
+                    if gate_executor is not None
+                    else {
+                        "cwd": cwd,
+                        "timeout_seconds": timeout_seconds,
+                        "adaptive_timeout_enabled": adaptive_timeout_enabled,
+                        "idle_timeout_seconds": idle_timeout_seconds,
+                        "cancel_event": cancel_event,
+                        "progress": progress,
+                    }
+                ),
             ): index
-            for index, command in enumerate(commands)
+            for index, command in ordered_commands
         }
         for future in as_completed(future_to_index):
             try:
-                results[future_to_index[future]] = future.result()
+                result = future.result()
+                results[future_to_index[future]] = result
+                if cancel_on_failure and not result.ok:
+                    cancel_event.set()
             except BaseException:
                 cancel_event.set()
                 raise
@@ -444,16 +630,28 @@ def run_gate_plan(
     adaptive_timeout_enabled: bool = False,
     command_idle_timeout_seconds: float = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
     progress: Optional[GateProgressCallback] = None,
+    gate_executor: Optional[GateCommandExecutor] = None,
 ) -> GateResult:
     results: List[CommandResult] = []
     summaries: List[str] = []
     ok = True
 
     for command in commands:
-        result = _run_command(
-            command, cwd, timeout_seconds=command_timeout_seconds,
-            adaptive_timeout_enabled=adaptive_timeout_enabled,
-            idle_timeout_seconds=command_idle_timeout_seconds, progress=progress
+        result = (
+            gate_executor.run(
+                command,
+                lane="serial",
+                timeout_seconds=command_timeout_seconds,
+                adaptive_timeout_enabled=adaptive_timeout_enabled,
+                idle_timeout_seconds=command_idle_timeout_seconds,
+                progress=progress,
+            )
+            if gate_executor is not None
+            else _run_command(
+                command, cwd, timeout_seconds=command_timeout_seconds,
+                adaptive_timeout_enabled=adaptive_timeout_enabled,
+                idle_timeout_seconds=command_idle_timeout_seconds, progress=progress
+            )
         )
         results.append(result)
         if result.ok:
@@ -472,13 +670,20 @@ def run_gate_plan(
             adaptive_timeout_enabled=adaptive_timeout_enabled,
             idle_timeout_seconds=command_idle_timeout_seconds,
             progress=progress,
+            gate_executor=gate_executor,
+            cancel_on_failure=not collect_all,
         )
         results.extend(group_results)
         failed = [result for result in group_results if not result.ok]
         if not failed:
             continue
         ok = False
-        summaries.extend(_failure_summary(result) for result in failed)
+        reportable = [
+            result
+            for result in failed
+            if result.termination_reason != "cancelled"
+        ] or failed[:1]
+        summaries.extend(_failure_summary(result) for result in reportable)
         if any(result.termination_reason for result in failed) or not collect_all:
             break
 

@@ -12,8 +12,8 @@ from .gates import extract_failure_info
 from .models import CommandResult, GateResult
 
 
-CACHE_VERSION = 2
-EXECUTION_MODE_VERSION = 2
+CACHE_VERSION = 3
+EXECUTION_MODE_VERSION = 3
 MAX_SUMMARY_BYTES = 8 * 1024
 MAX_ROWS = 5_000
 MAX_AGE_SECONDS = 30 * 24 * 60 * 60
@@ -42,25 +42,34 @@ def make_cache_key(
     *,
     collect_all: bool,
     parallel_groups: Sequence[object] = (),
+    environment_fingerprint: str = "",
 ) -> str:
     payload = {
         "baseline_ref": str(baseline_ref).strip(),
         "commands": _command_modes(commands, parallel_groups),
         "collect_all": bool(collect_all),
         "execution_mode_version": EXECUTION_MODE_VERSION,
+        "environment_fingerprint": str(environment_fingerprint),
     }
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
 
 
-def _entry_key(baseline_ref: str, command: str, mode: str, collect_all: bool) -> str:
+def _entry_key(
+    baseline_ref: str,
+    command: str,
+    mode: str,
+    collect_all: bool,
+    environment_fingerprint: str = "",
+) -> str:
     payload = {
         "baseline_ref": str(baseline_ref).strip(),
         "command": str(command).strip(),
         "mode": str(mode),
         "collect_all": bool(collect_all),
         "execution_mode_version": EXECUTION_MODE_VERSION,
+        "environment_fingerprint": str(environment_fingerprint),
     }
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -70,9 +79,16 @@ def _entry_key(baseline_ref: str, command: str, mode: str, collect_all: bool) ->
 class GateBaselineCache:
     """Best-effort command-level clean-head baseline cache backed by SQLite."""
 
-    def __init__(self, project_root: Path, cache_path: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        cache_path: Optional[Path] = None,
+        *,
+        environment_fingerprint: str = "",
+    ) -> None:
         self.project_root = Path(project_root)
         self.cache_path = cache_path or gate_baseline_cache_path(self.project_root)
+        self.environment_fingerprint = str(environment_fingerprint)
         self.disabled = False
 
     def get(
@@ -92,7 +108,15 @@ class GateBaselineCache:
                 for command, mode in entries:
                     row = connection.execute(
                         "SELECT failure_ids, mutation_detected FROM command_entries WHERE cache_key = ?",
-                        (_entry_key(baseline_ref, command, mode, collect_all),),
+                        (
+                            _entry_key(
+                                baseline_ref,
+                                command,
+                                mode,
+                                collect_all,
+                                self.environment_fingerprint,
+                            ),
+                        ),
                     ).fetchone()
                     if row is None or bool(row[1]):
                         return None
@@ -121,7 +145,15 @@ class GateBaselineCache:
                 for command, mode in _command_modes(commands, parallel_groups):
                     row = connection.execute(
                         "SELECT mutation_detected FROM command_entries WHERE cache_key = ?",
-                        (_entry_key(baseline_ref, command, mode, collect_all),),
+                        (
+                            _entry_key(
+                                baseline_ref,
+                                command,
+                                mode,
+                                collect_all,
+                                self.environment_fingerprint,
+                            ),
+                        ),
                     ).fetchone()
                     if row is None or bool(row[0]):
                         missing.append(command)
@@ -158,7 +190,15 @@ class GateBaselineCache:
                         SELECT failure_ids, mutation_detected, summary
                         FROM command_entries WHERE cache_key = ?
                         """,
-                        (_entry_key(source_ref, command, mode, collect_all),),
+                        (
+                            _entry_key(
+                                source_ref,
+                                command,
+                                mode,
+                                collect_all,
+                                self.environment_fingerprint,
+                            ),
+                        ),
                     ).fetchone()
                     if row is None or bool(row[1]):
                         continue
@@ -171,7 +211,13 @@ class GateBaselineCache:
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            _entry_key(target_ref, command, mode, collect_all),
+                            _entry_key(
+                                target_ref,
+                                command,
+                                mode,
+                                collect_all,
+                                self.environment_fingerprint,
+                            ),
                             str(target_ref).strip(),
                             command,
                             mode,
@@ -225,7 +271,15 @@ class GateBaselineCache:
                         if result.termination_reason or result.cleanup_incomplete:
                             connection.execute(
                                 "DELETE FROM command_entries WHERE cache_key = ?",
-                                (_entry_key(baseline_ref, command, mode, collect_all),),
+                                (
+                                    _entry_key(
+                                        baseline_ref,
+                                        command,
+                                        mode,
+                                        collect_all,
+                                        self.environment_fingerprint,
+                                    ),
+                                ),
                             )
                             continue
                         extraction = extract_failure_info(
@@ -249,7 +303,13 @@ class GateBaselineCache:
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            _entry_key(baseline_ref, command, mode, collect_all),
+                            _entry_key(
+                                baseline_ref,
+                                command,
+                                mode,
+                                collect_all,
+                                self.environment_fingerprint,
+                            ),
                             str(baseline_ref).strip(),
                             command,
                             mode,

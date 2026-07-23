@@ -16,6 +16,9 @@ dependencies = [
   "regex>=2024.7.24,<2026.0; python_version < '3.10'",
 ]
 
+[project.scripts]
+auto-agents = "auto_agents.cli:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

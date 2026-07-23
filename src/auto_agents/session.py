@@ -29,8 +29,6 @@ from .gates import (
     extract_failure_ids,
     extract_failure_info,
     run_gate_plan,
-    run_commands,
-    run_commands_collect_all,
 )
 from .git_ops import changed_paths, commit_all, head_ref, worktree_fingerprint
 from .io_utils import read_text, write_text
@@ -1365,17 +1363,20 @@ class Session:
         """
         self._print("Capturing baseline gate snapshot...")
         gate_commands = self._gate_commands()
-        gate = run_gate_plan(
-            gate_commands,
-            self.config.gates.parallel_groups,
-            self.project_root,
-            collect_all=True,
-            parallel_workers=self.orch._gate_parallel_workers(),
-            command_timeout_seconds=self.config.gates.command_timeout_seconds,
-            adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-            command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-            progress=self.orch._gate_progress_callback("session baseline snapshot"),
-        )
+        metadata = self.orch._resolved_gate_plan("final").metadata
+        with self.orch._gate_executor_context(metadata) as gate_executor:
+            gate = run_gate_plan(
+                gate_commands,
+                self.config.gates.parallel_groups,
+                self.project_root,
+                collect_all=True,
+                parallel_workers=self.orch._gate_parallel_workers(),
+                command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                progress=self.orch._gate_progress_callback("session baseline snapshot"),
+                gate_executor=gate_executor,
+            )
         self.orch._raise_for_baseline_termination(
             gate,
             context="session baseline snapshot",
@@ -1419,14 +1420,20 @@ class Session:
         if state.fix_verify_command:
             verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
             try:
-                targeted_gate = run_commands(
-                    [verify_command],
-                    self.project_root,
-                    command_timeout_seconds=self.config.gates.command_timeout_seconds,
-                    adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-                    command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-                    progress=self.orch._gate_progress_callback("session fix verification"),
-                )
+                with self.orch._gate_executor_context(
+                    {verify_command: {}}
+                ) as gate_executor:
+                    targeted_gate = run_gate_plan(
+                        [verify_command],
+                        [],
+                        self.project_root,
+                        collect_all=False,
+                        command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                        adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                        command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                        progress=self.orch._gate_progress_callback("session fix verification"),
+                        gate_executor=gate_executor,
+                    )
             except Exception as exc:
                 return {"ok": False, "reason": f"fix_verify_command error: {exc}"}
             if not targeted_gate.ok:
@@ -1446,17 +1453,20 @@ class Session:
         gate_commands = self._gate_commands()
         if not gate_commands and not self.config.gates.parallel_groups:
             return {"ok": True, "reason": "no verification steps or commands configured"}
-        gate = run_gate_plan(
-            gate_commands,
-            self.config.gates.parallel_groups,
-            self.project_root,
-            collect_all=True,
-            parallel_workers=self.orch._gate_parallel_workers(),
-            command_timeout_seconds=self.config.gates.command_timeout_seconds,
-            adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-            command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-            progress=self.orch._gate_progress_callback("session verification"),
-        )
+        metadata = self.orch._resolved_gate_plan("final").metadata
+        with self.orch._gate_executor_context(metadata) as gate_executor:
+            gate = run_gate_plan(
+                gate_commands,
+                self.config.gates.parallel_groups,
+                self.project_root,
+                collect_all=True,
+                parallel_workers=self.orch._gate_parallel_workers(),
+                command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                progress=self.orch._gate_progress_callback("session verification"),
+                gate_executor=gate_executor,
+            )
         extraction = extract_failure_info(gate)
         current_failures = extraction.failure_ids
         if not extraction.comparable and not gate.ok:

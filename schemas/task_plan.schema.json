@@ -45,6 +45,33 @@
           },
           "parallel_safe": {
             "type": "boolean"
+          },
+          "cadence": {
+            "type": "string",
+            "enum": ["implement_and_final", "final_only"]
+          },
+          "cache_scope": {
+            "type": "string",
+            "enum": ["source", "run_context"]
+          },
+          "resource_class": {
+            "type": "string",
+            "enum": ["normal", "heavy"]
+          },
+          "requires": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "exclusive_resources": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^(host|pool):.+"
+            }
+          },
+          "artifact_globs": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
           }
         },
         "additionalProperties": false

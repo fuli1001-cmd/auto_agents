@@ -15,6 +15,7 @@ from auto_agents.models import (
     AgentResult,
     CommandResult,
     GateParallelGroup,
+    GateResult,
     RunState,
     TaskSpec,
     VerificationStep,
@@ -713,6 +714,108 @@ class GateOptimizationTests(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(state.implement_verify_baseline_failures, [])
             orchestrator._run_missing_baseline_commands.assert_not_called()
+
+    def test_source_cache_survives_run_context_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            orchestrator.config.gates.steps = [
+                VerificationStep(
+                    runner="pytest",
+                    targets=["tests/source.py"],
+                    cache_scope="source",
+                ),
+                VerificationStep(
+                    runner="pytest",
+                    targets=["tests/context.py"],
+                    cache_scope="run_context",
+                ),
+            ]
+            task = TaskSpec(
+                task_id="task-001",
+                title="Cache scopes",
+                description="Verify split cache behavior.",
+                acceptance=["done"],
+            )
+            state = RunState(run_id="test", tasks=[task])
+            audit_hashes = iter(("sha256:first", "sha256:second"))
+            orchestrator._run_requirements_audit = lambda *_args, **_kwargs: {
+                "input_context_sha256": next(audit_hashes)
+            }
+            executed = []
+
+            def successful_gate(_ref, commands, parallel_groups, *, context):
+                pending = list(commands) + [
+                    command for group in parallel_groups for command in group.commands
+                ]
+                executed.extend(pending)
+                return (
+                    GateResult(
+                        ok=True,
+                        commands=[
+                            CommandResult(command=command, ok=True, returncode=0)
+                            for command in pending
+                        ],
+                        summary="ok",
+                    ),
+                    "",
+                )
+
+            orchestrator._run_missing_baseline_commands = successful_gate
+
+            orchestrator._ensure_implement_verify_baseline(state, [task])
+            orchestrator._ensure_implement_verify_baseline(state, [task])
+
+            source_runs = [command for command in executed if "source.py" in command]
+            context_runs = [command for command in executed if "context.py" in command]
+            self.assertEqual(len(source_runs), 1)
+            self.assertEqual(len(context_runs), 2)
+
+    def test_proof_evidence_reuses_identical_successful_task_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Proof reuse",
+                description="Reuse exact verification evidence.",
+                acceptance=["done"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-001",
+                        "oracle_index": 0,
+                        "status": "verified",
+                        "evidence_refs": ["tests/test_demo.py::test_contract"],
+                    }
+                ],
+            )
+            command = orchestrator._build_task_proof_evidence_command_for_ref(
+                "tests/test_demo.py::test_contract"
+            )
+            self.assertTrue(command)
+            orchestrator._proof_execution_fingerprint = Mock(return_value="same")
+            orchestrator._task_verify_proof_reuse[task.task_id] = (
+                "same",
+                {
+                    command: CommandResult(
+                        command=command,
+                        ok=True,
+                        returncode=0,
+                        stdout="passed",
+                    )
+                },
+                None,
+            )
+
+            with patch(
+                "auto_agents.orchestrator.run_gate_plan",
+                side_effect=AssertionError("identical proof command should be reused"),
+            ):
+                result = orchestrator._run_task_proof_evidence(task)
+
+            self.assertTrue(result["ok"])
 
 
 class EvidencePreflightTests(unittest.TestCase):

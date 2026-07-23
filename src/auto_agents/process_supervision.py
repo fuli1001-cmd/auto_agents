@@ -309,6 +309,7 @@ def run_supervised_shell_command(
     cancel_event: Optional[threading.Event] = None,
     heartbeat_seconds: float = 60.0,
     progress: Optional[Callable[[str, float], None]] = None,
+    on_start: Optional[Callable[[int, int], None]] = None,
 ) -> SupervisedCommandResult:
     """Run one shell command with an absolute ceiling and optional activity lease."""
     started = time.monotonic()
@@ -335,6 +336,8 @@ def run_supervised_shell_command(
             )
 
         record = ACTIVE_PROCESSES.register(process, kind=kind)
+        if on_start is not None:
+            on_start(process.pid, record.pgid)
         deadline = started + max(0.001, float(timeout_seconds))
         idle_budget = max(0.001, float(idle_timeout_seconds or timeout_seconds))
         last_activity = started

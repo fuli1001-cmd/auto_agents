@@ -2478,7 +2478,7 @@ class BaselineDiffVerifyTests(unittest.TestCase):
             state.fix_verify_command = 'pytest -q tests/test_issue_regressions_api.py -k "bug_case"'
             session._current_state = state
 
-            with patch("auto_agents.session.run_commands") as run_mock:
+            with patch("auto_agents.session.run_gate_plan") as run_mock:
                 run_mock.return_value = GateResult(
                     ok=True,
                     commands=[

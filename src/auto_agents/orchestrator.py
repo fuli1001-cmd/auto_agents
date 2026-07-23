@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import hashlib
 import os
@@ -68,11 +69,13 @@ from .config import (
 )
 from .gates import (
     GateCommandTimeoutError,
+    ResolvedGatePlan,
     build_failure_identity_diagnostic_command,
     commands_from_verification_steps,
     extract_failure_ids,
     extract_failure_info,
     gate_plan_from_verification_steps,
+    resolve_gate_plan_from_verification_steps,
     expand_pytest_directory_steps,
     first_terminated_command,
     run_gate_plan,
@@ -80,6 +83,9 @@ from .gates import (
     run_commands_collect_all,
 )
 from .gate_baseline_cache import GateBaselineCache
+from .gate_execution import LocalGatePlanExecutor
+from .distributed_gates import DistributedGatePlanExecutor
+from .workers import gate_environment_fingerprint
 from .execution_recovery import (
     ExecutionIncident,
     ExecutionIncidentStore,
@@ -120,10 +126,12 @@ from .models import (
     AgentResult,
     AgentRequest,
     AgentUsage,
+    CommandResult,
     DOCUMENT_LANGUAGE_OPTIONS,
     ProviderConfig,
     ProjectConfig,
     GateParallelGroup,
+    GateResult,
     RunState,
     STAGE_ORDER,
     TaskSpec,
@@ -255,13 +263,27 @@ class Orchestrator:
         self._repo_map_builder: Optional[RepoMapBuilder] = None
         self._last_repo_map_result: Optional[RepoMapResult] = None
         self._task_proof_evidence_cache: Dict[Tuple[str, str], Dict[str, object]] = {}
+        self._task_verify_proof_reuse: Dict[
+            str, Tuple[str, Dict[str, CommandResult], Optional[RunState]]
+        ] = {}
         self._parallel_tuning = ParallelTuningStore(self.project_root)
         self._max_tasks_remaining: Optional[int] = None
         self._task_budget_exhausted = False
         self._active_run_log_path: Optional[Path] = None
+        gate_environment = gate_environment_fingerprint(
+            isolation_mode=(
+                self.config.gates.isolation.mode
+                if self.config.gates.isolation.enabled
+                else "shared_worktree"
+            ),
+            environment_id=self.config.gates.distributed.environment_id,
+            distributed=self.config.gates.distributed.enabled,
+            extra_denylist=self.config.gates.distributed.extra_environment_denylist,
+        )
         self._gate_baseline_cache = GateBaselineCache(
             self.project_root,
             cache_path=gate_baseline_cache_path(self.project_root),
+            environment_fingerprint=gate_environment,
         )
         # Snapshot of active/deferred REQ IDs captured BEFORE a clarify
         # iteration generation; used by _clarify_validation_feedback to
@@ -3064,33 +3086,83 @@ class Orchestrator:
             if not self._is_orchestrator_diagnostic_path(path)
         ]
 
-    def _run_gate_commands(self, *, collect_all: bool, context: str):
+    def _gate_result_mutation_paths(self, gate: object) -> List[str]:
+        """Collect sandbox mutations using the same ownership filter as local runs."""
+
+        paths = {
+            str(path)
+            for result in getattr(gate, "commands", [])
+            for path in getattr(result, "mutation_paths", [])
+            if str(path) and not self._is_orchestrator_diagnostic_path(str(path))
+        }
+        return sorted(paths)
+
+    def _run_gate_commands(
+        self,
+        *,
+        collect_all: bool,
+        context: str,
+        phase: Optional[str] = None,
+    ):
         self._apply_generated_verification_config()
+        if phase is None:
+            phase = (
+                "implement"
+                if context.startswith("task verification commands")
+                or context.startswith("implement verify baseline commands")
+                else "final"
+            )
         before_snapshot = self._worktree_change_snapshot()
-        commands = self._default_gate_commands()
+        plan = self._resolved_gate_plan(phase)
+        commands = plan.commands
+        parallel_groups = plan.parallel_groups
+        scope_counts = {
+            scope: sum(1 for value in plan.cache_scopes.values() if value == scope)
+            for scope in ("source", "run_context")
+        }
+        self.logger.info(
+            "[gate-plan] phase=%s raw=%s unique=%s duplicates_removed=%s "
+            "sequential=%s parallel=%s source_scope=%s run_context_scope=%s",
+            phase,
+            plan.raw_command_count,
+            plan.unique_command_count,
+            plan.duplicates_removed,
+            len(commands),
+            sum(len(group.commands) for group in parallel_groups),
+            scope_counts["source"],
+            scope_counts["run_context"],
+        )
         self.logger.info(
             "[gate] start context=%s commands=%s groups=%s collect_all=%s",
             context,
             len(commands),
-            len(self.config.gates.parallel_groups),
+            len(parallel_groups),
             str(collect_all).lower(),
         )
-        with log_timing(self.logger, f"gate:{context} commands={len(commands)} groups={len(self.config.gates.parallel_groups)}"):
-            gate = run_gate_plan(
-                commands,
-                self.config.gates.parallel_groups,
-                self.project_root,
-                collect_all=collect_all,
-                parallel_workers=self._gate_parallel_workers(),
-                command_timeout_seconds=self.config.gates.command_timeout_seconds,
-                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-                progress=self._gate_progress_callback(context),
-            )
+        with log_timing(
+            self.logger,
+            f"gate:{context} commands={len(commands)} groups={len(parallel_groups)}",
+        ):
+            with self._gate_executor_context(plan.metadata) as gate_executor:
+                gate = run_gate_plan(
+                    commands,
+                    parallel_groups,
+                    self.project_root,
+                    collect_all=collect_all,
+                    parallel_workers=self._gate_parallel_workers(),
+                    command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                    adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                    command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                    progress=self._gate_progress_callback(context),
+                    gate_executor=gate_executor,
+                )
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
-        changed = self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot)
+        changed = sorted(
+            set(self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot))
+            | set(self._gate_result_mutation_paths(gate))
+        )
         reason = ""
         if changed:
             reason = (
@@ -3115,21 +3187,28 @@ class Orchestrator:
             str(collect_all).lower(),
         )
         with log_timing(self.logger, f"gate:{context} commands={len(commands)}"):
-            gate = run_gate_plan(
-                commands,
-                [],
-                self.project_root,
-                collect_all=collect_all,
-                parallel_workers=self._gate_parallel_workers(),
-                command_timeout_seconds=self.config.gates.command_timeout_seconds,
-                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-                progress=self._gate_progress_callback(context),
-            )
+            known = self._resolved_gate_plan("final").metadata
+            metadata = {command: known.get(command, {}) for command in commands}
+            with self._gate_executor_context(metadata) as gate_executor:
+                gate = run_gate_plan(
+                    commands,
+                    [],
+                    self.project_root,
+                    collect_all=collect_all,
+                    parallel_workers=self._gate_parallel_workers(),
+                    command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                    adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                    command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                    progress=self._gate_progress_callback(context),
+                    gate_executor=gate_executor,
+                )
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
-        changed = self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot)
+        changed = sorted(
+            set(self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot))
+            | set(self._gate_result_mutation_paths(gate))
+        )
         reason = ""
         if changed:
             reason = (
@@ -3163,11 +3242,12 @@ class Orchestrator:
             for group in parallel_groups
         ]
         pending_groups = [group for group in pending_groups if group.commands]
+        implement_plan = self._resolved_gate_plan("implement")
         if (
             pending_commands == commands
             and pending_groups == parallel_groups
-            and commands == self._default_gate_commands()
-            and parallel_groups == self.config.gates.parallel_groups
+            and commands == implement_plan.commands
+            and parallel_groups == implement_plan.parallel_groups
         ):
             return self._run_gate_commands(collect_all=True, context=context)
         if not pending_groups:
@@ -3182,21 +3262,30 @@ class Orchestrator:
             f"gate:{context} cache_missing={len(missing)} commands={len(pending_commands)} "
             f"groups={len(pending_groups)}",
         ):
-            gate = run_gate_plan(
-                pending_commands,
-                pending_groups,
-                self.project_root,
-                collect_all=True,
-                parallel_workers=self._gate_parallel_workers(),
-                command_timeout_seconds=self.config.gates.command_timeout_seconds,
-                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-                progress=self._gate_progress_callback(context),
-            )
+            metadata = {
+                command: implement_plan.metadata.get(command, {})
+                for command in missing
+            }
+            with self._gate_executor_context(metadata) as gate_executor:
+                gate = run_gate_plan(
+                    pending_commands,
+                    pending_groups,
+                    self.project_root,
+                    collect_all=True,
+                    parallel_workers=self._gate_parallel_workers(),
+                    command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                    adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                    command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                    progress=self._gate_progress_callback(context),
+                    gate_executor=gate_executor,
+                )
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
-        changed = self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot)
+        changed = sorted(
+            set(self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot))
+            | set(self._gate_result_mutation_paths(gate))
+        )
         reason = ""
         if changed:
             reason = (
@@ -3208,7 +3297,7 @@ class Orchestrator:
     def _log_gate_command_results(self, context: str, results: Iterable[object]) -> None:
         for index, result in enumerate(results, start=1):
             self.logger.info(
-                "[gate-command] context=%s index=%s ok=%s returncode=%s duration_seconds=%.3f termination=%s cleanup_incomplete=%s command=%s",
+                "[gate-command] context=%s index=%s ok=%s returncode=%s duration_seconds=%.3f termination=%s cleanup_incomplete=%s worker=%s backend=%s job_id=%s command=%s",
                 context,
                 index,
                 str(bool(getattr(result, "ok", False))).lower(),
@@ -3216,6 +3305,9 @@ class Orchestrator:
                 float(getattr(result, "duration_seconds", 0.0) or 0.0),
                 str(getattr(result, "termination_reason", "") or "none"),
                 str(bool(getattr(result, "cleanup_incomplete", False))).lower(),
+                str(getattr(result, "worker_id", "") or "local"),
+                str(getattr(result, "backend", "") or "local"),
+                str(getattr(result, "job_id", "") or "none"),
                 str(getattr(result, "command", ""))[:300],
             )
 
@@ -4034,10 +4126,140 @@ class Orchestrator:
     def _default_gate_commands(self) -> List[str]:
         return list(self.config.gates.commands)
 
+    def _resolved_gate_plan(self, phase: str) -> ResolvedGatePlan:
+        """Resolve one deduplicated plan for the requested execution phase."""
+        if phase not in {"implement", "final"}:
+            raise ValueError(f"unsupported gate plan phase: {phase}")
+
+        steps = list(self.config.gates.steps)
+        manual_groups = [
+            group
+            for group in self.config.gates.parallel_groups
+            if not group.name.startswith("steps-")
+        ]
+        if steps:
+            resolved = resolve_gate_plan_from_verification_steps(
+                steps,
+                self.project_root,
+                phase=phase,
+            )
+            commands = list(resolved.commands)
+            groups = [
+                GateParallelGroup(name=group.name, commands=list(group.commands))
+                for group in resolved.parallel_groups
+            ]
+            cache_scopes = dict(resolved.cache_scopes)
+            metadata = dict(resolved.metadata)
+            raw_count = resolved.raw_command_count + sum(
+                len(group.commands) for group in manual_groups
+            )
+        else:
+            commands = []
+            groups = []
+            cache_scopes: Dict[str, str] = {}
+            metadata = {}
+            raw_count = len(self.config.gates.commands) + sum(
+                len(group.commands) for group in manual_groups
+            )
+            for command in self.config.gates.commands:
+                normalized = str(command).strip()
+                if not normalized or normalized in cache_scopes:
+                    continue
+                commands.append(normalized)
+                cache_scopes[normalized] = "run_context"
+                metadata[normalized] = {}
+
+        seen = set(cache_scopes)
+        for group in manual_groups:
+            unique_group_commands: List[str] = []
+            for command in group.commands:
+                normalized = str(command).strip()
+                if not normalized:
+                    continue
+                if normalized in seen:
+                    cache_scopes[normalized] = "run_context"
+                    continue
+                seen.add(normalized)
+                cache_scopes[normalized] = "run_context"
+                metadata[normalized] = {}
+                unique_group_commands.append(normalized)
+            if unique_group_commands:
+                groups.append(
+                    GateParallelGroup(name=group.name, commands=unique_group_commands)
+                )
+        return ResolvedGatePlan(
+            commands=commands,
+            parallel_groups=groups,
+            cache_scopes=cache_scopes,
+            raw_command_count=raw_count,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _gate_plan_for_cache_scope(
+        plan: ResolvedGatePlan,
+        cache_scope: str,
+    ) -> ResolvedGatePlan:
+        commands = [
+            command
+            for command in plan.commands
+            if plan.cache_scopes.get(command, "run_context") == cache_scope
+        ]
+        groups = [
+            GateParallelGroup(
+                name=group.name,
+                commands=[
+                    command
+                    for command in group.commands
+                    if plan.cache_scopes.get(command, "run_context") == cache_scope
+                ],
+            )
+            for group in plan.parallel_groups
+        ]
+        groups = [group for group in groups if group.commands]
+        scoped_commands = commands + [
+            command for group in groups for command in group.commands
+        ]
+        return ResolvedGatePlan(
+            commands=commands,
+            parallel_groups=groups,
+            cache_scopes={command: cache_scope for command in scoped_commands},
+            raw_command_count=len(scoped_commands),
+            metadata={
+                command: plan.metadata.get(command, {})
+                for command in scoped_commands
+            },
+        )
+
+    @staticmethod
+    def _source_verify_baseline_ref(baseline_ref: str) -> str:
+        parts = str(baseline_ref or "").split(":", 2)
+        return ":".join(parts[:2]) if len(parts) >= 2 else str(baseline_ref or "")
+
+    def _gate_executor_context(
+        self,
+        metadata: Optional[Dict[str, object]] = None,
+    ):
+        if not self.config.gates.isolation.enabled:
+            return contextlib.nullcontext(None)
+        if self.config.gates.distributed.enabled:
+            return DistributedGatePlanExecutor(
+                self.project_root,
+                self.config.gates,
+                metadata or {},
+            )
+        return LocalGatePlanExecutor(
+            self.project_root,
+            self.config.gates,
+            metadata or {},
+        )
+
     def _gate_parallel_workers(self) -> int:
         configured = self.config.gates.parallel_workers
         if isinstance(configured, int):
             return max(1, configured)
+        if self.config.gates.distributed.enabled:
+            return max(1, self.config.gates.max_auto_workers)
         return max(1, min(2, self.config.gates.max_auto_workers))
 
     def _implement_touched_code(self, task: Optional[TaskSpec] = None) -> bool:
@@ -6898,6 +7120,8 @@ class Orchestrator:
         *,
         state: Optional[RunState] = None,
     ) -> Dict[str, object]:
+        if task is not None:
+            self._task_verify_proof_reuse.pop(task.task_id, None)
         task_commands = self._build_task_verify_commands(task)
         quick_failure = self._quick_verify_failure(task_commands if task_commands else None)
         if quick_failure:
@@ -6984,6 +7208,19 @@ class Orchestrator:
                 "raw_output": mutation_error,
                 "comparable_failures": False,
             }
+        if task is not None:
+            reusable_results = {
+                result.command: result
+                for result in verify_gate.commands
+                if result.ok
+                and not result.termination_reason
+                and not result.cleanup_incomplete
+            }
+            self._task_verify_proof_reuse[task.task_id] = (
+                self._proof_execution_fingerprint(task, state),
+                reusable_results,
+                state,
+            )
         extraction = extract_failure_info(verify_gate)
         diagnostic_identity_only = False
         raw_output = self._gate_raw_output(verify_gate)
@@ -7463,14 +7700,44 @@ class Orchestrator:
             )
         )
 
-    def _proof_evidence_cache_key(self, task: TaskSpec) -> Tuple[str, str]:
+    def _proof_execution_fingerprint(
+        self,
+        task: TaskSpec,
+        state: Optional[RunState] = None,
+    ) -> str:
+        try:
+            tasks = (
+                state.tasks
+                if state is not None and state.tasks
+                else self._load_tasks_from_plan()
+            )
+        except (OSError, ValueError, KeyError):
+            tasks = [task]
+        try:
+            audit_context = requirements_audit_context_sha256(
+                self.project_root,
+                tasks,
+                current_spec=self._current_audit_spec(state),
+            )
+        except (OSError, ValueError, TypeError):
+            audit_context = ""
         refs_payload = json.dumps(
             self._task_requirement_evidence_refs(task),
             ensure_ascii=True,
             sort_keys=True,
         )
-        digest = hashlib.sha256(refs_payload.encode("utf-8")).hexdigest()
-        return (task.task_id, f"{worktree_fingerprint(self.project_root)}:{digest}")
+        payload = {
+            "head": head_ref(self.project_root),
+            "worktree": worktree_fingerprint(self.project_root),
+            "requirements_audit_context": audit_context,
+            "evidence_refs": refs_payload,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _proof_evidence_cache_key(self, task: TaskSpec) -> Tuple[str, str]:
+        return (task.task_id, self._proof_execution_fingerprint(task))
 
     def _proof_verification_command_templates(self) -> List[str]:
         commands: List[str] = []
@@ -7774,7 +8041,10 @@ class Orchestrator:
         if not evidence_refs:
             return None
 
-        cache_key = self._proof_evidence_cache_key(task)
+        reuse_bundle = self._task_verify_proof_reuse.pop(task.task_id, None)
+        reuse_state = reuse_bundle[2] if reuse_bundle is not None else None
+        execution_fingerprint = self._proof_execution_fingerprint(task, reuse_state)
+        cache_key = (task.task_id, execution_fingerprint)
         cached = self._task_proof_evidence_cache.get(cache_key)
         if cached is not None:
             return dict(cached)
@@ -7814,23 +8084,65 @@ class Orchestrator:
             self._task_proof_evidence_cache[cache_key] = dict(result)
             return result
 
-        commands = [command for _, command in command_pairs]
-        with log_timing(self.logger, f"proof-evidence commands={len(commands)}"):
-            gate_result = run_gate_plan(
-                commands,
-                [],
-                self.project_root,
-                collect_all=True,
-                command_timeout_seconds=self.config.gates.command_timeout_seconds,
-                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-                progress=self._gate_progress_callback("owned proof evidence"),
-            )
+        commands = list(dict.fromkeys(command for _, command in command_pairs))
+        reusable_results: Dict[str, CommandResult] = {}
+        if reuse_bundle is not None and reuse_bundle[0] == execution_fingerprint:
+            reusable_results = {
+                command: result
+                for command, result in reuse_bundle[1].items()
+                if command in commands
+                and result.ok
+                and not result.termination_reason
+                and not result.cleanup_incomplete
+            }
+        missing_commands = [
+            command for command in commands if command not in reusable_results
+        ]
+        if missing_commands:
+            with log_timing(
+                self.logger,
+                f"proof-evidence commands={len(missing_commands)}",
+            ):
+                with self._gate_executor_context(
+                    {command: {} for command in missing_commands}
+                ) as gate_executor:
+                    executed_gate = run_gate_plan(
+                        missing_commands,
+                        [],
+                        self.project_root,
+                        collect_all=True,
+                        command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                        adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                        command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                        progress=self._gate_progress_callback("owned proof evidence"),
+                        gate_executor=gate_executor,
+                    )
+            self._log_gate_command_results("owned proof evidence", executed_gate.commands)
+        else:
+            executed_gate = GateResult(ok=True, commands=[], summary="all commands reused")
+        executed_results = {result.command: result for result in executed_gate.commands}
+        results_by_command = {**reusable_results, **executed_results}
+        ordered_results = [
+            results_by_command[command]
+            for command in commands
+            if command in results_by_command
+        ]
+        gate_result = GateResult(
+            ok=len(ordered_results) == len(commands)
+            and all(result.ok for result in ordered_results),
+            commands=ordered_results,
+            summary=executed_gate.summary,
+        )
+        self.logger.info(
+            "[proof-evidence] requested=%s reused=%s executed=%s",
+            len(commands),
+            len(reusable_results),
+            len(missing_commands),
+        )
         raw_output = self._gate_raw_output(gate_result)
         failed_refs = [
-            ref
-            for (ref, _command), command_result in zip(command_pairs, gate_result.commands)
-            if not command_result.ok
+            ref for ref, command in command_pairs
+            if command not in results_by_command or not results_by_command[command].ok
         ]
         passed_refs = [ref for ref in evidence_refs if ref not in failed_refs]
         command = commands[0] if len(commands) == 1 else "\n".join(commands)
@@ -7963,82 +8275,110 @@ class Orchestrator:
         tasks: Iterable[TaskSpec],
     ) -> bool:
         task_list = list(tasks)
+        self._apply_generated_verification_config()
+        plan = self._resolved_gate_plan("implement")
         audit_result = self._run_requirements_audit(
             task_list,
             current_spec=self._current_audit_spec(state),
         )
-        baseline_ref = self._task_verify_baseline_ref(
+        source_ref = self._task_verify_baseline_ref()
+        run_context_ref = self._task_verify_baseline_ref(
             str(audit_result.get("input_context_sha256", ""))
         )
         changed = False
-        if state.implement_verify_baseline_ref != baseline_ref:
-            previous_ref = state.implement_verify_baseline_ref
-            state.implement_verify_baseline_ref = baseline_ref
-            gate_commands = self._default_gate_commands()
-            if previous_ref and any(
-                task.status not in {"pending", "done"} for task in task_list
+        previous_ref = state.implement_verify_baseline_ref
+        if previous_ref and any(
+            task.status not in {"pending", "done"} for task in task_list
+        ):
+            promoted = 0
+            for cache_scope, old_ref, new_ref in (
+                (
+                    "source",
+                    self._source_verify_baseline_ref(previous_ref),
+                    source_ref,
+                ),
+                ("run_context", previous_ref, run_context_ref),
             ):
-                promoted = self._gate_baseline_cache.promote(
-                    previous_ref,
-                    baseline_ref,
-                    gate_commands,
+                scoped = self._gate_plan_for_cache_scope(plan, cache_scope)
+                promoted += self._gate_baseline_cache.promote(
+                    old_ref,
+                    new_ref,
+                    scoped.commands,
                     collect_all=True,
-                    parallel_groups=self.config.gates.parallel_groups,
+                    parallel_groups=scoped.parallel_groups,
                 )
-                self.logger.info(
-                    "[gate-baseline-cache] resume promotion source=%s target=%s "
-                    "commands=%s",
-                    self._git_ref_from_verify_baseline_ref(previous_ref),
-                    self._git_ref_from_verify_baseline_ref(baseline_ref),
-                    promoted,
+            self.logger.info(
+                "[gate-baseline-cache] resume promotion source=%s target=%s commands=%s",
+                self._git_ref_from_verify_baseline_ref(previous_ref),
+                self._git_ref_from_verify_baseline_ref(run_context_ref),
+                promoted,
+            )
+
+        baseline_failures: List[str] = []
+        for cache_scope, baseline_ref in (
+            ("source", source_ref),
+            ("run_context", run_context_ref),
+        ):
+            scoped = self._gate_plan_for_cache_scope(plan, cache_scope)
+            cached_failures = self._gate_baseline_cache.get(
+                baseline_ref,
+                scoped.commands,
+                collect_all=True,
+                parallel_groups=scoped.parallel_groups,
+            )
+            cache_state = "hit" if cached_failures is not None else "miss"
+            self.logger.info(
+                "[gate-baseline-cache] scope=%s state=%s commands=%s ref=%s",
+                cache_scope,
+                cache_state,
+                scoped.unique_command_count,
+                self._git_ref_from_verify_baseline_ref(baseline_ref),
+            )
+            if cached_failures is None:
+                gate, mutation_error = self._run_missing_baseline_commands(
+                    baseline_ref,
+                    scoped.commands,
+                    scoped.parallel_groups,
+                    context="implement verify baseline commands",
                 )
-            if not gate_commands and not self.config.gates.parallel_groups:
-                state.implement_verify_baseline_failures = []
-            else:
+                self._raise_for_baseline_termination(
+                    gate,
+                    context="implement verify baseline commands",
+                )
+                if mutation_error:
+                    raise RuntimeError(mutation_error)
+                failures = (
+                    self._normalize_verify_failure_ids(
+                        extract_failure_ids(gate), gate.summary
+                    )
+                    if not gate.ok
+                    else []
+                )
+                self._gate_baseline_cache.put(
+                    baseline_ref,
+                    scoped.commands,
+                    collect_all=True,
+                    failure_ids=failures,
+                    summary=gate.summary,
+                    parallel_groups=scoped.parallel_groups,
+                    command_results=gate.commands,
+                )
                 cached_failures = self._gate_baseline_cache.get(
                     baseline_ref,
-                    gate_commands,
+                    scoped.commands,
                     collect_all=True,
-                    parallel_groups=self.config.gates.parallel_groups,
+                    parallel_groups=scoped.parallel_groups,
                 )
-                if cached_failures is not None:
-                    state.implement_verify_baseline_failures = list(cached_failures)
-                else:
-                    gate, mutation_error = self._run_missing_baseline_commands(
-                        baseline_ref,
-                        gate_commands,
-                        list(self.config.gates.parallel_groups),
-                        context="implement verify baseline commands",
-                    )
-                    self._raise_for_baseline_termination(
-                        gate,
-                        context="implement verify baseline commands",
-                    )
-                    if mutation_error:
-                        raise RuntimeError(mutation_error)
-                    failures = (
-                        self._normalize_verify_failure_ids(extract_failure_ids(gate), gate.summary)
-                        if not gate.ok
-                        else []
-                    )
-                    state.implement_verify_baseline_failures = list(failures)
-                    self._gate_baseline_cache.put(
-                        baseline_ref,
-                        gate_commands,
-                        collect_all=True,
-                        failure_ids=failures,
-                        summary=gate.summary,
-                        parallel_groups=self.config.gates.parallel_groups,
-                        command_results=gate.commands,
-                    )
-                    cached_failures = self._gate_baseline_cache.get(
-                        baseline_ref,
-                        gate_commands,
-                        collect_all=True,
-                        parallel_groups=self.config.gates.parallel_groups,
-                    )
-                    if cached_failures is not None:
-                        state.implement_verify_baseline_failures = list(cached_failures)
+                if cached_failures is None:
+                    cached_failures = failures
+            baseline_failures.extend(cached_failures)
+
+        baseline_failures = list(dict.fromkeys(baseline_failures))
+        if state.implement_verify_baseline_ref != run_context_ref:
+            state.implement_verify_baseline_ref = run_context_ref
+            changed = True
+        if state.implement_verify_baseline_failures != baseline_failures:
+            state.implement_verify_baseline_failures = list(baseline_failures)
             changed = True
         baseline_failures = list(state.implement_verify_baseline_failures)
         for task in task_list:
@@ -8060,26 +8400,38 @@ class Orchestrator:
         # absorbed as a new baseline, and aggregate data must not populate the
         # command-level SQLite cache.
         previous_ref = state.implement_verify_baseline_ref
+        self._apply_generated_verification_config()
+        plan = self._resolved_gate_plan("implement")
         verification_context = requirements_audit_context_sha256(
             self.project_root,
             state.tasks,
             current_spec=self._current_audit_spec(state),
         )
-        next_ref = self._task_verify_baseline_ref(verification_context)
-        gate_commands = self._default_gate_commands()
-        promoted = self._gate_baseline_cache.promote(
-            previous_ref,
-            next_ref,
-            gate_commands,
-            collect_all=True,
-            parallel_groups=self.config.gates.parallel_groups,
-        )
-        state.implement_verify_baseline_ref = next_ref
+        next_source_ref = self._task_verify_baseline_ref()
+        next_run_context_ref = self._task_verify_baseline_ref(verification_context)
+        promoted = 0
+        for cache_scope, old_ref, new_ref in (
+            (
+                "source",
+                self._source_verify_baseline_ref(previous_ref),
+                next_source_ref,
+            ),
+            ("run_context", previous_ref, next_run_context_ref),
+        ):
+            scoped = self._gate_plan_for_cache_scope(plan, cache_scope)
+            promoted += self._gate_baseline_cache.promote(
+                old_ref,
+                new_ref,
+                scoped.commands,
+                collect_all=True,
+                parallel_groups=scoped.parallel_groups,
+            )
+        state.implement_verify_baseline_ref = next_run_context_ref
         save_run_state(self.project_root, state)
         self.logger.info(
             "[gate-baseline-cache] warm promotion source=%s target=%s commands=%s",
             self._git_ref_from_verify_baseline_ref(previous_ref),
-            self._git_ref_from_verify_baseline_ref(next_ref),
+            self._git_ref_from_verify_baseline_ref(next_run_context_ref),
             promoted,
         )
 
@@ -9395,6 +9747,7 @@ class Orchestrator:
         verify_gate, mutation_error = self._run_gate_commands(
             collect_all=False,
             context="verify stage commands",
+            phase="final",
         )
         if mutation_error:
             raise RuntimeError(mutation_error)
@@ -9415,22 +9768,22 @@ class Orchestrator:
         state.current_stage = "verify"
         state.stage_summaries["verify"] = summary.strip()
         state.last_error = ""
+        final_plan = self._resolved_gate_plan("final")
         if not verify_gate.ok:
             state.status = "failed"
             raw_output = self._gate_raw_output(verify_gate)
             raw_log_path = self._persist_failed_verification_log(raw_output, label="verify-stage")
-            gate_commands = self._default_gate_commands()
-            if gate_commands or self.config.gates.parallel_groups:
+            if final_plan.commands or final_plan.parallel_groups:
                 self._gate_baseline_cache.put(
                     self._task_verify_baseline_ref(),
-                    gate_commands,
+                    final_plan.commands,
                     collect_all=False,
                     failure_ids=self._normalize_verify_failure_ids(
                         extract_failure_ids(verify_gate),
                         verify_gate.summary,
                     ),
                     summary=verify_gate.summary,
-                    parallel_groups=self.config.gates.parallel_groups,
+                    parallel_groups=final_plan.parallel_groups,
                     command_results=verify_gate.commands,
                 )
             if self._verify_failure_looks_like_oracle_proof_state(f"{verify_gate.summary}\n{raw_output}"):
@@ -9470,14 +9823,14 @@ class Orchestrator:
                 return state
             self._emit_stage_verify_result("fail", state.last_error or summary.strip())
             raise RuntimeError(state.last_error or "verify stage failed")
-        if self.config.gates.commands or self.config.gates.parallel_groups:
+        if final_plan.commands or final_plan.parallel_groups:
             self._gate_baseline_cache.put(
                 self._task_verify_baseline_ref(),
-                self.config.gates.commands,
+                final_plan.commands,
                 collect_all=False,
                 failure_ids=[],
                 summary=verify_gate.summary,
-                parallel_groups=self.config.gates.parallel_groups,
+                parallel_groups=final_plan.parallel_groups,
                 command_results=verify_gate.commands,
             )
         tasks = state.tasks or self._load_tasks_from_plan()
@@ -10389,6 +10742,9 @@ class Orchestrator:
                 "Avoid oversized tasks that bundle multiple loosely related features together.",
                 "Prefer tasks that each deliver one coherent, testable capability or technical slice.",
                 "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist; auto_agents may expand directory targets such as ['tests'] into per-file pytest steps before running gates. Set parallel_safe=true only when a step is isolated from shared databases, ports, mutable fixtures, snapshots, build outputs, and other process-global state; otherwise omit it or set false.",
+                "Classify verification cadence explicitly: use cadence='implement_and_final' for focused checks needed during implementation and cadence='final_only' for broad release suites. Classify cache_scope='source' only when results depend solely on HEAD and tracked/untracked source content; use cache_scope='run_context' for requirements/task-state/config-sensitive checks. Defaults are implement_and_final and run_context.",
+                "Gate commands run in snapshot-backed worktrees. Use per-test relative temp paths and dynamically allocated port 0 whenever possible. Commands that intentionally share generated artifacts must remain parallel_safe=false and appear in producer-before-consumer order; commands that use fixed host ports, Docker daemons, or shared external accounts must declare host:/pool: exclusive_resources.",
+                "Declare requires for non-default tools such as ffmpeg or chrome, resource_class='heavy' for browser/FFmpeg workloads, and artifact_globs only for ignored project-relative evidence that must survive sandbox cleanup. Never use absolute artifact paths or '..'.",
                 "For JavaScript/TypeScript verification, use verification_steps entries with kind='test', runner='vitest'.",
                 "Do not generate free-form shell verification commands for test steps; auto_agents derives the runnable command from verification_steps.",
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",

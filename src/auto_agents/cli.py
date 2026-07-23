@@ -63,6 +63,19 @@ from .self_repair import (
     classify_auto_agents_error,
 )
 from .validation import validation_report
+from .workers import (
+    controller_workers_cleanup,
+    controller_workers_doctor,
+    controller_workers_status,
+    worker_artifacts,
+    worker_cancel,
+    worker_cleanup_plan,
+    worker_execute,
+    worker_gc,
+    worker_probe,
+    worker_query,
+    worker_stage,
+)
 
 
 def _default_project_name(project: Path) -> str:
@@ -732,6 +745,61 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sessions_clear_parser.add_argument("--project", required=True, help="Target project directory.")
 
+    workers_parser = subparsers.add_parser(
+        "workers",
+        help="Inspect and maintain configured gate worker pools.",
+    )
+    workers_subparsers = workers_parser.add_subparsers(
+        dest="workers_command",
+        required=True,
+    )
+    workers_doctor = workers_subparsers.add_parser(
+        "doctor",
+        help="Validate worker connectivity, environment, and capacity.",
+    )
+    workers_doctor.add_argument("--pool", required=True)
+    workers_doctor.add_argument("--project")
+    workers_doctor.add_argument("--environment-id", default="")
+    workers_status = workers_subparsers.add_parser(
+        "status",
+        help="Show worker pool health and capacity.",
+    )
+    workers_status.add_argument("--pool", required=True)
+    workers_cleanup = workers_subparsers.add_parser(
+        "cleanup",
+        help="Remove stale terminal worker job records and artifacts.",
+    )
+    workers_cleanup.add_argument("--pool", required=True)
+    workers_cleanup.add_argument("--max-age-seconds", type=float, default=86400.0)
+
+    worker_parser = subparsers.add_parser(
+        "worker",
+        help=argparse.SUPPRESS,
+    )
+    worker_subparsers = worker_parser.add_subparsers(
+        dest="worker_command",
+        required=True,
+    )
+    worker_probe_parser = worker_subparsers.add_parser("probe")
+    worker_probe_parser.add_argument("--environment-id", default="")
+    worker_stage_parser = worker_subparsers.add_parser("stage")
+    worker_stage_parser.add_argument("--project-key", required=True)
+    worker_stage_parser.add_argument("--snapshot", required=True)
+    worker_stage_parser.add_argument("--source-ref", required=True)
+    worker_subparsers.add_parser("execute")
+    worker_query_parser = worker_subparsers.add_parser("query")
+    worker_query_parser.add_argument("--job-id", required=True)
+    worker_cancel_parser = worker_subparsers.add_parser("cancel")
+    worker_cancel_parser.add_argument("--job-id", required=True)
+    worker_cancel_parser.add_argument("--grace-seconds", type=float, default=5.0)
+    worker_artifacts_parser = worker_subparsers.add_parser("artifacts")
+    worker_artifacts_parser.add_argument("--job-id", required=True)
+    worker_cleanup_plan_parser = worker_subparsers.add_parser("cleanup-plan")
+    worker_cleanup_plan_parser.add_argument("--project-key", required=True)
+    worker_cleanup_plan_parser.add_argument("--plan-id", required=True)
+    worker_gc_parser = worker_subparsers.add_parser("gc")
+    worker_gc_parser.add_argument("--max-age-seconds", type=float, default=86400.0)
+
     return parser
 
 
@@ -739,6 +807,71 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _load_cli_dotenv()
+
+    if args.command == "workers":
+        if args.workers_command == "doctor":
+            payload = controller_workers_doctor(
+                args.pool,
+                environment_id=args.environment_id,
+                project_root=(
+                    Path(args.project).expanduser().resolve()
+                    if args.project
+                    else None
+                ),
+            )
+        elif args.workers_command == "status":
+            payload = controller_workers_status(args.pool)
+        else:
+            payload = controller_workers_cleanup(
+                args.pool,
+                max_age_seconds=args.max_age_seconds,
+            )
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if bool(payload.get("ok")) else 1
+
+    if args.command == "worker":
+        if args.worker_command == "probe":
+            payload = worker_probe(args.environment_id)
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0 if bool(payload.get("ok")) else 1
+        if args.worker_command == "stage":
+            payload = worker_stage(
+                key=args.project_key,
+                snapshot_sha=args.snapshot,
+                source_ref=args.source_ref,
+                stream=sys.stdin.buffer,
+            )
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
+        if args.worker_command == "execute":
+            try:
+                manifest = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                print(json.dumps({"type": "error", "error": str(error)}))
+                return 2
+            if not isinstance(manifest, dict):
+                print(json.dumps({"type": "error", "error": "manifest must be an object"}))
+                return 2
+            result = worker_execute(manifest)
+            return 0 if result.ok else max(1, min(125, int(result.returncode or 1)))
+        if args.worker_command == "query":
+            payload = worker_query(args.job_id)
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0 if payload else 1
+        if args.worker_command == "cancel":
+            payload = worker_cancel(args.job_id, args.grace_seconds)
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0 if bool(payload.get("ok")) else 1
+        if args.worker_command == "artifacts":
+            worker_artifacts(args.job_id, sys.stdout.buffer)
+            return 0
+        if args.worker_command == "cleanup-plan":
+            payload = worker_cleanup_plan(args.project_key, args.plan_id)
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
+        payload = worker_gc(args.max_age_seconds)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
 
     if args.command == "init":
         project_root = Path(args.project)

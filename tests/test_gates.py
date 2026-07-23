@@ -12,6 +12,7 @@ from auto_agents.gates import (
     extract_failure_ids,
     extract_failure_info,
     expand_pytest_directory_steps,
+    resolve_gate_plan_from_verification_steps,
     run_commands,
     run_gate_plan,
 )
@@ -367,6 +368,57 @@ class GateTests(unittest.TestCase):
         ).to_dict()
 
         self.assertNotIn("command", payload)
+
+    def test_verification_step_serializes_cadence_and_cache_scope(self) -> None:
+        payload = VerificationStep(
+            runner="pytest",
+            targets=["tests/test_demo.py"],
+            cadence="final_only",
+            cache_scope="source",
+        ).to_dict()
+
+        self.assertEqual(payload["cadence"], "final_only")
+        self.assertEqual(payload["cache_scope"], "source")
+
+    def test_gate_plan_filters_final_only_and_deduplicates_conservatively(self) -> None:
+        duplicate_target = ["tests/test_demo.py"]
+        steps = [
+            VerificationStep(
+                runner="pytest",
+                targets=duplicate_target,
+                parallel_safe=True,
+                cache_scope="source",
+            ),
+            VerificationStep(
+                runner="pytest",
+                targets=duplicate_target,
+                parallel_safe=False,
+                cache_scope="run_context",
+            ),
+            VerificationStep(
+                runner="pytest",
+                targets=["tests/test_full.py"],
+                cadence="final_only",
+                cache_scope="source",
+            ),
+        ]
+
+        implement = resolve_gate_plan_from_verification_steps(
+            steps, Path("/tmp/demo"), phase="implement"
+        )
+        final = resolve_gate_plan_from_verification_steps(
+            steps, Path("/tmp/demo"), phase="final"
+        )
+
+        self.assertEqual(implement.raw_command_count, 2)
+        self.assertEqual(implement.unique_command_count, 1)
+        self.assertEqual(implement.duplicates_removed, 1)
+        self.assertEqual(len(implement.commands), 1)
+        self.assertEqual(implement.parallel_groups, [])
+        self.assertEqual(
+            implement.cache_scopes[implement.commands[0]], "run_context"
+        )
+        self.assertEqual(final.unique_command_count, 2)
 
     def test_identity_diagnostic_command_upgrades_pytest_verbosity(self) -> None:
         command = build_failure_identity_diagnostic_command(

@@ -1,0 +1,23 @@
+{
+  "worker_id": "lan-worker-1",
+  "managed_root": "/home/aa-worker/.local/share/auto-agents-worker",
+  "max_slots": 2,
+  "environments": {
+    "sdgp-v1": {
+      "links": {
+        ".conda": "/home/aa-worker/environments/sdgp/.conda",
+        "workbench/node_modules": "/home/aa-worker/environments/sdgp/workbench/node_modules"
+      },
+      "executables": {
+        "python": "/home/aa-worker/environments/sdgp/.conda/bin/python",
+        "node": "/usr/bin/node",
+        "ffmpeg": "/usr/bin/ffmpeg",
+        "chrome": "/usr/bin/google-chrome"
+      },
+      "lock_hashes": {
+        "pyproject.toml": "cb67defb76ae89a0db13bf999744d168e828934c9b65c6bc78901fc3a665f628",
+        "workbench/package-lock.json": "9784791b1507a94ee0f45c6595c2ebfce90f59499cbb4f7b1d17bae29a15d680"
+      }
+    }
+  }
+}

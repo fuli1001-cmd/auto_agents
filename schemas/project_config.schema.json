@@ -220,6 +220,33 @@
               },
               "parallel_safe": {
                 "type": "boolean"
+              },
+              "cadence": {
+                "type": "string",
+                "enum": ["implement_and_final", "final_only"]
+              },
+              "cache_scope": {
+                "type": "string",
+                "enum": ["source", "run_context"]
+              },
+              "resource_class": {
+                "type": "string",
+                "enum": ["normal", "heavy"]
+              },
+              "requires": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "exclusive_resources": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^(host|pool):.+"
+                }
+              },
+              "artifact_globs": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
               }
             },
             "additionalProperties": false
@@ -276,6 +303,53 @@
           "type": "integer",
           "minimum": 1,
           "default": 900
+        },
+        "isolation": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "mode": {"type": "string", "const": "git_worktree"},
+            "worktree_root": {"type": "string"},
+            "artifact_max_bytes": {"type": "integer", "minimum": 1},
+            "artifact_max_files": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        },
+        "distributed": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "worker_pool": {"type": "string"},
+            "environment_id": {"type": "string"},
+            "fallback": {"type": "string", "const": "local"},
+            "connect_timeout_seconds": {"type": "integer", "minimum": 1},
+            "heartbeat_timeout_seconds": {"type": "integer", "minimum": 1},
+            "infrastructure_retry_limit": {"type": "integer", "minimum": 0},
+            "forward_environment": {
+              "type": "string",
+              "const": "all_except_denylist"
+            },
+            "extra_environment_denylist": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {"enabled": {"const": true}},
+                "required": ["enabled"]
+              },
+              "then": {
+                "required": ["worker_pool", "environment_id"],
+                "properties": {
+                  "worker_pool": {"minLength": 1},
+                  "environment_id": {"minLength": 1}
+                }
+              }
+            }
+          ],
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

@@ -17,6 +17,9 @@ SESSION_AGENT_ERROR_THRESHOLD = 5
 SESSION_HARD_CEILING = {"fix": 15, "collab": 25, "provider_resolve": 15}
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 TASK_ORIGINS = ("planned", "scope_split", "evidence_repair", "stage_recovery")
+VERIFICATION_CADENCES = ("implement_and_final", "final_only")
+VERIFICATION_CACHE_SCOPES = ("source", "run_context")
+VERIFICATION_RESOURCE_CLASSES = ("normal", "heavy")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity-claude", "antigravity-gemini")
 DEFAULT_EFFORTS = {
     "clarify": "deep",
@@ -254,6 +257,12 @@ class VerificationStep:
     args: List[str] = field(default_factory=list)
     command: str = ""
     parallel_safe: bool = False
+    cadence: str = "implement_and_final"
+    cache_scope: str = "run_context"
+    resource_class: str = "normal"
+    requires: List[str] = field(default_factory=list)
+    exclusive_resources: List[str] = field(default_factory=list)
+    artifact_globs: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "VerificationStep":
@@ -264,6 +273,14 @@ class VerificationStep:
             args=[str(item) for item in data.get("args", [])],
             command=str(data.get("command", "")),
             parallel_safe=bool(data.get("parallel_safe", False)),
+            cadence=str(data.get("cadence", "implement_and_final")),
+            cache_scope=str(data.get("cache_scope", "run_context")),
+            resource_class=str(data.get("resource_class", "normal")),
+            requires=[str(item) for item in data.get("requires", [])],
+            exclusive_resources=[
+                str(item) for item in data.get("exclusive_resources", [])
+            ],
+            artifact_globs=[str(item) for item in data.get("artifact_globs", [])],
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -273,6 +290,12 @@ class VerificationStep:
             "targets": list(self.targets),
             "args": list(self.args),
             "parallel_safe": self.parallel_safe,
+            "cadence": self.cadence,
+            "cache_scope": self.cache_scope,
+            "resource_class": self.resource_class,
+            "requires": list(self.requires),
+            "exclusive_resources": list(self.exclusive_resources),
+            "artifact_globs": list(self.artifact_globs),
         }
 
 
@@ -293,6 +316,62 @@ class GateParallelGroup:
 
 
 @dataclass
+class GateIsolationConfig:
+    enabled: bool = False
+    mode: str = "git_worktree"
+    worktree_root: str = ""
+    artifact_max_bytes: int = 256 * 1024 * 1024
+    artifact_max_files: int = 2000
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "GateIsolationConfig":
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            mode=str(data.get("mode", "git_worktree")),
+            worktree_root=str(data.get("worktree_root", "")),
+            artifact_max_bytes=int(data.get("artifact_max_bytes", 256 * 1024 * 1024)),
+            artifact_max_files=int(data.get("artifact_max_files", 2000)),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class DistributedGatesConfig:
+    enabled: bool = False
+    worker_pool: str = ""
+    environment_id: str = ""
+    fallback: str = "local"
+    connect_timeout_seconds: int = 10
+    heartbeat_timeout_seconds: int = 90
+    infrastructure_retry_limit: int = 2
+    forward_environment: str = "all_except_denylist"
+    extra_environment_denylist: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "DistributedGatesConfig":
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            worker_pool=str(data.get("worker_pool", "")),
+            environment_id=str(data.get("environment_id", "")),
+            fallback=str(data.get("fallback", "local")),
+            connect_timeout_seconds=int(data.get("connect_timeout_seconds", 10)),
+            heartbeat_timeout_seconds=int(data.get("heartbeat_timeout_seconds", 90)),
+            infrastructure_retry_limit=int(data.get("infrastructure_retry_limit", 2)),
+            forward_environment=str(
+                data.get("forward_environment", "all_except_denylist")
+            ),
+            extra_environment_denylist=[
+                str(item) for item in data.get("extra_environment_denylist", [])
+            ],
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class GateConfig:
     commands: List[str] = field(default_factory=list)
     steps: List[VerificationStep] = field(default_factory=list)
@@ -304,6 +383,8 @@ class GateConfig:
     command_timeout_seconds: int = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS
     adaptive_timeout_enabled: bool = True
     command_idle_timeout_seconds: int = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS
+    isolation: GateIsolationConfig = field(default_factory=GateIsolationConfig)
+    distributed: DistributedGatesConfig = field(default_factory=DistributedGatesConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "GateConfig":
@@ -340,6 +421,16 @@ class GateConfig:
                     min(DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS, command_timeout_seconds),
                 )
             ),
+            isolation=GateIsolationConfig.from_dict(
+                dict(data.get("isolation", {}))
+                if isinstance(data.get("isolation", {}), dict)
+                else {}
+            ),
+            distributed=DistributedGatesConfig.from_dict(
+                dict(data.get("distributed", {}))
+                if isinstance(data.get("distributed", {}), dict)
+                else {}
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -354,6 +445,8 @@ class GateConfig:
             "command_timeout_seconds": self.command_timeout_seconds,
             "adaptive_timeout_enabled": self.adaptive_timeout_enabled,
             "command_idle_timeout_seconds": self.command_idle_timeout_seconds,
+            "isolation": self.isolation.to_dict(),
+            "distributed": self.distributed.to_dict(),
         }
 
 
@@ -1053,6 +1146,12 @@ class CommandResult:
     last_activity_seconds: float = 0.0
     activity_kind: str = ""
     process_snapshot: Dict[str, object] = field(default_factory=dict)
+    job_id: str = ""
+    worker_id: str = ""
+    backend: str = "local"
+    infrastructure_error: bool = False
+    mutation_paths: List[str] = field(default_factory=list)
+    artifacts: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

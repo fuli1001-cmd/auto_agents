@@ -283,6 +283,13 @@ JavaScript and TypeScript verification steps must use `runner: "vitest"`. Legacy
 `verification_commands` are still accepted for compatibility, but new plans should not generate
 free-form shell verification commands.
 
+Each step may also declare `cadence` and `cache_scope`. `cadence: "implement_and_final"`
+(the default) runs during implementation baselines and final verification;
+`cadence: "final_only"` reserves broad release suites for the final verify stage. Use
+`cache_scope: "source"` only for checks whose result depends solely on the source/worktree;
+the conservative default, `cache_scope: "run_context"`, also invalidates when requirement or task
+context changes.
+
 Inspect persisted progress:
 
 ```bash
@@ -515,14 +522,106 @@ Setting review to `deep` or `max` overrides auto-escalation and uses that effort
 Implementation-stage verification baselines are cached per command in
 `.auto-agents/state/gate_baseline_cache.sqlite3`, keyed by the effective baseline ref, normalized
 command, execution mode, and collect-all behavior. Adding one command therefore runs only the new
-command. The legacy JSON cache is ignored; the first run after upgrading captures one cold baseline.
-Cache corruption disables reuse and falls back to running the real commands.
+command. Source-scoped entries survive a plan rewind when the source fingerprint is unchanged;
+run-context entries are recaptured when requirement/task context changes. Exact successful task
+verification commands are also reused as owned proof evidence while the source and semantic
+fingerprint remain identical. The legacy JSON cache is ignored; the first run after upgrading
+captures one cold baseline. Cache corruption disables reuse and falls back to running the real
+commands.
 
 Gate commands remain sequential by default. A structured `verification_steps` entry is concurrent
 only when it explicitly sets `parallel_safe=true`; safe entries are grouped by runner and capped by
 `gates.max_auto_workers` (default 2). The marker is appropriate only for checks isolated from shared
 databases, ports, mutable fixtures, snapshots, and build output. Existing `gates.parallel_groups`
-remain supported as an explicit opt-in.
+remain supported as an explicit opt-in. Identical derived commands are executed once in first-seen
+order; duplicate declarations merge conservatively, so any unsafe occurrence keeps the command
+sequential and any run-context occurrence keeps the narrower cache scope.
+
+New projects run gates in isolated Git worktrees. Each parallel command receives the exact same
+snapshot, including tracked edits and non-ignored untracked files, plus private temporary and cache
+directories. Project-local `.conda`, `.venv`, and `node_modules` directories are linked into each
+worktree and treated as immutable shared dependencies; Vitest disk caching is disabled to prevent
+writes through a shared dependency tree.
+Sequential commands share one worktree so deliberate producer/consumer chains still work. A gate
+that changes tracked or unignored source is rejected by the existing mutation guard, while declared
+`artifact_globs` are copied back atomically under both their project path and
+`.auto-agents/runs/<plan-id>/gate-artifacts/`.
+
+```json
+{
+  "gates": {
+    "max_auto_workers": 5,
+    "isolation": {
+      "enabled": true,
+      "mode": "git_worktree",
+      "worktree_root": "",
+      "artifact_max_bytes": 268435456,
+      "artifact_max_files": 2000
+    }
+  }
+}
+```
+
+Gate steps may also declare scheduling and artifact metadata:
+
+```json
+{
+  "kind": "test",
+  "runner": "vitest",
+  "targets": ["workbench/src/e2e/example.test.ts"],
+  "parallel_safe": true,
+  "resource_class": "heavy",
+  "requires": ["node", "chrome"],
+  "exclusive_resources": ["host:display-99"],
+  "artifact_globs": [".tmp-tests/evidence/**/*.png"]
+}
+```
+
+`resource_class=heavy` consumes two worker slots; normal commands consume one. `requires` limits
+dispatch to workers that advertise every capability. `host:<name>` locks one resource on a worker,
+while `pool:<name>` locks it across the controller's entire pool.
+
+Linux/WSL machines can form an SSH gate pool. Install the same auto_agents version on every worker,
+prepare the environment and dependency directories, and configure key-based, non-interactive SSH.
+The controller reads `~/.config/auto-agents/workers.json`; every machine reads its own
+`~/.config/auto-agents/worker.json`. Starting templates are available in
+`examples/workers.lan.json` and `examples/worker.sdgp.json`. Change worker IDs, SSH aliases, paths,
+slot counts, and lock hashes for each machine; the local endpoint's worker ID must match the local
+`worker.json`. Worker IDs are logical names, not CPU model names; start with conservative slot
+counts and increase them only after observing memory and load during a full gate run.
+
+```json
+{
+  "gates": {
+    "distributed": {
+      "enabled": true,
+      "worker_pool": "lan-fast",
+      "environment_id": "sdgp-v1",
+      "fallback": "local",
+      "connect_timeout_seconds": 10,
+      "heartbeat_timeout_seconds": 90,
+      "infrastructure_retry_limit": 2,
+      "forward_environment": "all_except_denylist",
+      "extra_environment_denylist": ["OPENAI_API_KEY"]
+    }
+  }
+}
+```
+
+Before enabling a pool, run:
+
+```bash
+auto-agents workers doctor --pool lan-fast --environment-id sdgp-v1 --project /path/to/project
+auto-agents workers status --pool lan-fast
+```
+
+The doctor checks SSH reachability, protocol version, slots, capabilities, registered dependency
+paths, executable/package fingerprints, and project lock-file hashes. A run transfers one immutable
+Git snapshot per remote worker, then schedules parallel-safe commands by available capacity while
+pinning the sequential lane to one worker. Infrastructure failures are retried on a different
+worker; an accepted job with uncertain remote state is never duplicated. If pool loading or staging
+fails before execution, `fallback=local` uses the same isolated snapshot. Stale terminal records and
+artifacts can be removed with `auto-agents workers cleanup --pool lan-fast`.
 
 Gate commands use an activity lease plus an absolute wall-clock ceiling. The defaults for new
 projects are 900 seconds without observable output/CPU activity and a 7200-second ceiling:

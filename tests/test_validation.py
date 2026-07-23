@@ -145,6 +145,34 @@ class TaskPlanValidationTests(unittest.TestCase):
 
         self.assertEqual(validate_task_plan_payload(payload, require_verification=True), [])
 
+    def test_rejects_unknown_verification_cadence_and_cache_scope(self) -> None:
+        payload = {
+            "test_strategy": "python-pytest",
+            "verification_steps": [
+                {
+                    "kind": "test",
+                    "runner": "pytest",
+                    "targets": ["tests"],
+                    "cadence": "sometimes",
+                    "cache_scope": "global",
+                }
+            ],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Add CLI entrypoint",
+                    "description": "Add a runnable command line entrypoint.",
+                    "acceptance": ["done"],
+                    "status": "pending",
+                    "commit_message": "feat(task-001): add CLI entrypoint",
+                }
+            ],
+        }
+
+        errors = validate_task_plan_payload(payload, require_verification=True)
+        self.assertTrue(any(".cadence must be one of" in item for item in errors))
+        self.assertTrue(any(".cache_scope must be one of" in item for item in errors))
+
     def test_allows_large_task_count_without_hard_failure(self) -> None:
         payload = {
             "tasks": [
