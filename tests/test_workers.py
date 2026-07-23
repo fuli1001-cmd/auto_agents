@@ -149,6 +149,43 @@ def test_worker_stage_execute_and_query(tmp_path: Path, monkeypatch) -> None:
     manager.close()
 
 
+def test_worker_probe_reports_ffmpeg_and_ffprobe_capabilities(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "AUTO_AGENTS_WORKER_CONFIG",
+        str(_worker_config(tmp_path)),
+    )
+    executables = {
+        "ffmpeg": "/opt/media/bin/ffmpeg",
+        "ffprobe": "/opt/media/bin/ffprobe",
+    }
+    monkeypatch.setattr(
+        "auto_agents.workers.shutil.which",
+        lambda program: executables.get(program),
+    )
+
+    def fake_run(command, **_kwargs):
+        executable = Path(command[0]).name
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=f"{executable} version test\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("auto_agents.workers.subprocess.run", fake_run)
+
+    probe = worker_probe()
+
+    assert probe["ok"]
+    assert probe["max_slots"] == 2
+    assert {"ffmpeg", "ffprobe"}.issubset(probe["capabilities"])
+    assert probe["runtimes"]["ffmpeg"] == "ffmpeg version test"
+    assert probe["runtimes"]["ffprobe"] == "ffprobe version test"
+
+
 def test_distributed_executor_uses_controller_as_local_worker(
     tmp_path: Path,
     monkeypatch,

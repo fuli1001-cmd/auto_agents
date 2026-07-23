@@ -500,6 +500,7 @@ def worker_probe(environment_id: str = "") -> dict[str, object]:
         "python": ("python3", "python"),
         "node": ("node",),
         "ffmpeg": ("ffmpeg",),
+        "ffprobe": ("ffprobe",),
         "chrome": ("google-chrome", "chromium", "chromium-browser"),
     }.items():
         if any(shutil.which(program) for program in programs):
@@ -517,6 +518,7 @@ def worker_probe(environment_id: str = "") -> dict[str, object]:
         "python": [sys.executable, "--version"],
         "node": [shutil.which("node") or "", "--version"],
         "ffmpeg": [shutil.which("ffmpeg") or "", "-version"],
+        "ffprobe": [shutil.which("ffprobe") or "", "-version"],
         "chrome": [
             shutil.which("google-chrome")
             or shutil.which("chromium")
