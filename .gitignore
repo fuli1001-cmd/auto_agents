@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 dist/
 build/
+*.egg-info/
 .DS_Store
 .auto-agents/state/repomap_cache.json
 .antigravitycli
