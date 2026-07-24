@@ -243,8 +243,10 @@ class DistributedGatePlanExecutor:
         exclude: set[str],
         lane: str,
         cancel_event: Optional[threading.Event] = None,
+        wait_timeout_seconds: float = 7200.0,
     ) -> tuple[WorkerEndpoint, int]:
         required = self._required_slots(command)
+        deadline = time.monotonic() + max(0.1, float(wait_timeout_seconds))
         if lane and lane in self._lane_endpoint:
             endpoint = self._lane_endpoint[lane]
             if (
@@ -258,12 +260,24 @@ class DistributedGatePlanExecutor:
             while not self._try_acquire(endpoint, required):
                 if cancel_event is not None and cancel_event.is_set():
                     raise _EndpointAcquireCancelled
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "worker slot scheduling timed out while waiting for "
+                        f"{required} slot(s) on {endpoint.worker_id}"
+                    )
                 with self._slot_condition:
-                    self._slot_condition.wait(timeout=0.1)
+                    self._slot_condition.wait(
+                        timeout=min(0.1, max(0.0, deadline - time.monotonic()))
+                    )
             return endpoint, required
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 raise _EndpointAcquireCancelled
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "worker slot scheduling timed out while waiting for "
+                    f"{required} slot(s)"
+                )
             candidates = [
                 endpoint
                 for endpoint in self.endpoints
@@ -300,7 +314,9 @@ class DistributedGatePlanExecutor:
                         self._lane_endpoint[lane] = endpoint
                     return endpoint, required
             with self._slot_condition:
-                self._slot_condition.wait(timeout=0.1)
+                self._slot_condition.wait(
+                    timeout=min(0.1, max(0.0, deadline - time.monotonic()))
+                )
 
     def _bundle(self) -> Path:
         with self._bundle_lock:
@@ -603,6 +619,7 @@ class DistributedGatePlanExecutor:
                     exclude=attempted,
                     lane=lane,
                     cancel_event=cancel_event,
+                    wait_timeout_seconds=timeout_seconds,
                 )
             except _EndpointAcquireCancelled:
                 return CommandResult(

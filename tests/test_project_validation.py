@@ -243,6 +243,62 @@ class ProjectRunLockTests(unittest.TestCase):
 
 
 class ProjectValidationTests(unittest.TestCase):
+    def test_cli_recover_command_is_removed(self) -> None:
+        with (
+            self.assertRaises(SystemExit) as raised,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            main(["recover", "--project", "/tmp/demo"])
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_cli_run_uses_saved_context_for_blocked_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            saved_spec = project_root / "specs" / "iteration.md"
+            saved_spec.parent.mkdir()
+            write_text(saved_spec, "# Spec\n")
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "external_provider",
+                "category": "provider_unavailable",
+                "status": "blocked",
+            }
+            state.resume_context = {
+                "spec_file": str(saved_spec),
+                "auto_approve": True,
+                "print_agent_output": True,
+                "provider_kind": "mock",
+            }
+            save_run_state(project_root, state)
+            calls = {}
+
+            class FakeState:
+                def to_dict(self):
+                    return {"status": "completed", "current_stage": "readme"}
+
+            class FakeOrchestrator:
+                def __init__(self, project_root, agent_output_stream=None):
+                    pass
+
+                def run(self, **kwargs):
+                    calls.update(kwargs)
+                    return FakeState()
+
+            with (
+                patch("auto_agents.cli.Orchestrator", FakeOrchestrator),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = main(["run", "--project", str(project_root)])
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(calls["spec_file"], saved_spec)
+            self.assertTrue(calls["auto_approve"])
+            self.assertTrue(calls["print_agent_output"])
+            self.assertEqual(calls["provider_kind"], "mock")
+
     @staticmethod
     def _configure_git_identity(project_root: Path) -> None:
         subprocess.run(
@@ -942,7 +998,7 @@ class ProjectValidationTests(unittest.TestCase):
                 exit_code = main(["run", "--project", str(project_root), "--spec-file", str(spec_file)])
 
             payload = json.loads(buffer.getvalue())
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 3)
             self.assertFalse(payload["ok"])
             self.assertIn("Expecting property name enclosed in double quotes", payload["error"])
 
@@ -1658,7 +1714,7 @@ class ProjectValidationTests(unittest.TestCase):
                 int(resume_env[RUN_LOCK_FD_ENV]),
             )
 
-    def test_cli_gate_timeout_fails_without_entering_self_repair(self) -> None:
+    def test_cli_gate_timeout_enters_unified_triage_and_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -1668,21 +1724,32 @@ class ProjectValidationTests(unittest.TestCase):
                 "baseline gate command timeout: pytest -q (timeout=1800s)"
             )
             stdout = io.StringIO()
+            triage = SelfRepairTriageResult(
+                decision=SelfRepairDecision(
+                    False,
+                    category="gate_timeout",
+                    reason="target-project gate timed out",
+                ),
+                source="provider",
+                reason="target project owns the timeout",
+            )
 
             with (
                 patch.object(Orchestrator, "run", side_effect=error),
                 patch(
                     "auto_agents.cli._triage_terminal_run_error",
-                    side_effect=AssertionError("timeout must not enter self-repair triage"),
-                ),
+                    return_value=triage,
+                ) as triage_run,
                 contextlib.redirect_stdout(stdout),
             ):
                 exit_code = main(
                     ["run", "--project", str(project_root), "--spec-file", str(spec_file)]
                 )
 
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 3)
+            triage_run.assert_called_once()
             self.assertIn("baseline gate command timeout", stdout.getvalue())
+            self.assertEqual(load_run_state(project_root).status, "blocked")
 
     def test_cli_run_sends_unexpected_exception_to_provider_triage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1712,7 +1779,7 @@ class ProjectValidationTests(unittest.TestCase):
                     ["run", "--project", str(project_root), "--spec-file", str(spec_file)]
                 )
 
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 3)
             adjudicate.assert_called_once()
             payload = json.loads(stdout.getvalue())
             self.assertEqual(payload["error"], "unexpected state shape")
@@ -1869,7 +1936,7 @@ class ProjectValidationTests(unittest.TestCase):
                 exit_code = main(["run", "--project", str(project_root)])
 
             payload = json.loads(buffer.getvalue())
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 3)
             self.assertFalse(payload["ok"])
             self.assertIn(str(project_root / "spec.md"), payload["error"])
 
@@ -1907,7 +1974,7 @@ class ProjectValidationTests(unittest.TestCase):
                     ]
                 )
 
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 3)
             config = load_project_config(project_root)
             self.assertEqual(config.active_provider, "copilot-cli")
 
@@ -2172,10 +2239,10 @@ class ProjectValidationTests(unittest.TestCase):
             ):
                 exit_code = main(["run", "--project", str(project_root), "--spec-file", str(spec_file)])
 
-            self.assertEqual(exit_code, 1)
+            self.assertEqual(exit_code, 3)
             notify.assert_called_once()
             self.assertEqual(notify.call_args.args[0], project_root)
-            self.assertEqual(notify.call_args.kwargs["status"], "failed")
+            self.assertEqual(notify.call_args.kwargs["status"], "blocked")
             self.assertEqual(notify.call_args.kwargs["error"], "boom")
 
     def test_cli_run_passes_document_language_override(self) -> None:

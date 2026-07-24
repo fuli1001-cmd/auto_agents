@@ -357,6 +357,33 @@ def test_distributed_executor_slot_wait_honors_cancellation(
     assert results[0].termination_reason == "cancelled"
 
 
+def test_distributed_executor_slot_wait_has_absolute_deadline(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    command = "heavy command"
+    executor = DistributedGatePlanExecutor(
+        project,
+        GateConfig(),
+        {command: GateCommandMetadata(resource_class="heavy")},
+    )
+    endpoint = WorkerEndpoint(
+        worker_id="local-worker",
+        transport="local",
+        max_slots=2,
+    )
+    executor.endpoints = [endpoint]
+    executor._active_slots[endpoint.worker_id] = 2
+
+    with pytest.raises(RuntimeError, match="slot scheduling timed out"):
+        executor._acquire_endpoint(
+            command,
+            exclude=set(),
+            lane="",
+            wait_timeout_seconds=0.01,
+        )
+
+
 def test_distributed_auto_parallelism_uses_gate_capacity() -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator.config = ProjectConfig(project_name="test")

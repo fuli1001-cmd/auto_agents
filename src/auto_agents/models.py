@@ -901,6 +901,7 @@ class RunState:
     last_recovery_route: Dict[str, object] = field(default_factory=dict)
     active_execution_incident_id: str = ""
     execution_incidents: List[Dict[str, object]] = field(default_factory=list)
+    active_blocker: Dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -951,6 +952,11 @@ class RunState:
                 entry for entry in (data.get("execution_incidents", []) or [])
                 if isinstance(entry, dict)
             ],
+            active_blocker=(
+                dict(data.get("active_blocker", {}))
+                if isinstance(data.get("active_blocker", {}), dict)
+                else {}
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:

@@ -1158,9 +1158,10 @@ class Orchestrator:
                 state.workflow_version = 2
                 save_run_state(self.project_root, state)
             self._attach_run_logger(state.run_id)
-            active_incident = self._incident_store(state).active(state)
-            if active_incident is not None and active_incident.status == "self_repair":
-                state.status = "paused"
+            if self._resume_blocked_run(state):
+                save_run_state(self.project_root, state)
+            if state.status == "blocked":
+                save_run_state(self.project_root, state)
                 return state
             if self._normalize_legacy_requirements_audit_resume(state):
                 save_run_state(self.project_root, state)
@@ -1250,7 +1251,7 @@ class Orchestrator:
                         active_incident.source == "provider"
                         or active_incident.status == "needs_human"
                     ):
-                        self._pause_for_execution_incident(
+                        self._block_for_execution_incident(
                             state,
                             active_incident,
                             f"automatic execution recovery routes were exhausted: {error}",
@@ -1265,7 +1266,9 @@ class Orchestrator:
                 self._merge_persisted_execution_incidents(state)
                 self._resolve_rewound_execution_incident(state, stage)
                 save_run_state(self.project_root, state)
-                if state.status == "paused" and stage not in state.stage_summaries:
+                if state.status == "blocked" or (
+                    state.status == "paused" and stage not in state.stage_summaries
+                ):
                     return state
                 if stage == "implement" and self._task_budget_exhausted:
                     state.status = "pending"
@@ -1296,6 +1299,7 @@ class Orchestrator:
                 save_run_state(self.project_root, state)
                 raise RuntimeError(state.last_error)
             state.status = "completed"
+            self._clear_run_blocker(state)
             save_run_state(self.project_root, state)
             self._commit_if_dirty("chore: finalize run state")
             return state
@@ -1658,8 +1662,12 @@ class Orchestrator:
                     timeout_seconds=self.config.frontend_design.network_timeout_seconds,
                 ).load()
             except FrontendDesignUnavailable as error:
-                state.status = "paused"
-                state.last_error = str(error)
+                self._block_run(
+                    state,
+                    owner="external_provider",
+                    category="frontend_catalog_unavailable",
+                    reason=str(error),
+                )
                 return state
 
             selection_path = frontend_design_docs_dir(self.project_root) / "selection.json"
@@ -3394,22 +3402,181 @@ class Orchestrator:
         store.save(incident, state)
         return incident
 
-    def _pause_for_execution_incident(
+    def _block_for_execution_incident(
         self,
         state: RunState,
         incident: ExecutionIncident,
         reason: str,
     ) -> bool:
         incident.status = "needs_human"
-        incident.history.append({"event": "paused", "reason": reason})
-        state.status = "paused"
-        state.last_error = (
-            f"execution incident {incident.incident_id} requires intervention: {reason}; "
-            f"run `python auto_agents.py recover --project {self.project_root}` to continue"
+        incident.history.append({"event": "blocked", "reason": reason})
+        self._block_run(
+            state,
+            owner=str(incident.diagnosis.get("owner", "unknown") or "unknown"),
+            category=incident.kind,
+            reason=reason,
+            incident_id=incident.incident_id,
+            fingerprint=incident.evidence_fingerprint or incident.incident_fingerprint,
         )
         self._incident_store(state).save(incident, state)
         self.logger.error(state.last_error)
         return False
+
+    def _block_run(
+        self,
+        state: RunState,
+        *,
+        owner: str,
+        category: str,
+        reason: str,
+        incident_id: str = "",
+        fingerprint: str = "",
+    ) -> None:
+        previous = state.active_blocker if isinstance(state.active_blocker, dict) else {}
+        same = bool(
+            previous
+            and str(previous.get("fingerprint", "")) == str(fingerprint)
+            and str(previous.get("category", "")) == str(category)
+        )
+        try:
+            checkpoint_head = head_ref(self.project_root)
+        except Exception:
+            checkpoint_head = ""
+        try:
+            checkpoint_worktree = worktree_fingerprint(self.project_root)
+        except Exception:
+            checkpoint_worktree = ""
+        state.active_blocker = {
+            "owner": owner or "unknown",
+            "category": category or "run_error",
+            "reason": reason,
+            "incident_id": incident_id,
+            "fingerprint": fingerprint,
+            "checkpoint": {
+                "stage": state.current_stage,
+                "head": checkpoint_head,
+                "worktree": checkpoint_worktree,
+            },
+            "occurrence_count": (
+                int(previous.get("occurrence_count", 0) or 0) + 1 if same else 1
+            ),
+            "resume_attempts": int(previous.get("resume_attempts", 0) or 0),
+            "status": "blocked",
+            "updated_at": utc_now_iso(),
+        }
+        state.status = "blocked"
+        state.last_error = reason
+
+    def record_run_blocker(
+        self,
+        *,
+        owner: str,
+        category: str,
+        reason: str,
+        fingerprint: str = "",
+    ) -> RunState:
+        state = load_run_state(self.project_root)
+        self._block_run(
+            state,
+            owner=owner,
+            category=category,
+            reason=reason,
+            fingerprint=fingerprint,
+        )
+        save_run_state(self.project_root, state)
+        return state
+
+    def mark_self_repair_applied(self, commit_sha: str) -> RunState:
+        state = load_run_state(self.project_root)
+        blocker = dict(state.active_blocker)
+        blocker.update(
+            {
+                "status": "retrying",
+                "self_repair_commit": commit_sha,
+                "updated_at": utc_now_iso(),
+            }
+        )
+        state.active_blocker = blocker
+        state.status = "pending"
+        state.last_error = ""
+        incident = self._incident_store(state).active(state)
+        if incident is not None:
+            incident.status = "recovering"
+            incident.recovery_round = 0
+            incident.history.append(
+                {"event": "self_repair_applied", "commit_sha": commit_sha}
+            )
+            self._incident_store(state).save(incident, state)
+        save_run_state(self.project_root, state)
+        return state
+
+    def _resume_blocked_run(self, state: RunState) -> bool:
+        active_incident = self._incident_store(state).active(state)
+        legacy_incident_pause = bool(
+            state.status == "paused"
+            and not state.pending_approval
+            and active_incident is not None
+            and active_incident.status in {"needs_human", "self_repair"}
+        )
+        if state.status != "blocked" and not legacy_incident_pause:
+            return False
+        blocker = dict(state.active_blocker)
+        had_persisted_blocker = bool(blocker)
+        if not blocker:
+            blocker = {
+                "owner": str(
+                    (active_incident.diagnosis if active_incident else {}).get(
+                        "owner", "unknown"
+                    )
+                ),
+                "category": active_incident.kind if active_incident else "legacy_run_block",
+                "reason": state.last_error,
+                "incident_id": active_incident.incident_id if active_incident else "",
+                "fingerprint": (
+                    active_incident.evidence_fingerprint if active_incident else ""
+                ),
+                "occurrence_count": 1,
+                "resume_attempts": 0,
+            }
+        legacy_self_repair_incident = bool(
+            not had_persisted_blocker
+            and active_incident is not None
+            and active_incident.status == "self_repair"
+        )
+        if (
+            str(blocker.get("owner", "")) == "auto_agents"
+            and str(blocker.get("status", "blocked")) != "retrying"
+            and (had_persisted_blocker or legacy_self_repair_incident)
+        ):
+            blocker["status"] = "blocked"
+            blocker["updated_at"] = utc_now_iso()
+            state.active_blocker = blocker
+            state.status = "blocked"
+            return False
+        blocker["status"] = "retrying"
+        blocker["resume_attempts"] = int(blocker.get("resume_attempts", 0) or 0) + 1
+        blocker["updated_at"] = utc_now_iso()
+        state.active_blocker = blocker
+        state.status = "pending"
+        state.last_error = ""
+        if active_incident is not None:
+            active_incident.status = "recovering"
+            active_incident.recovery_round = 0
+            active_incident.history.append(
+                {
+                    "event": "explicit_run_resume",
+                    "attempt": blocker["resume_attempts"],
+                }
+            )
+            self._incident_store(state).save(active_incident, state)
+        return True
+
+    @staticmethod
+    def _clear_run_blocker(state: RunState) -> None:
+        state.active_blocker = {}
+        if state.status == "blocked":
+            state.status = "pending"
+        state.last_error = ""
 
     def _handle_gate_execution_incident(
         self,
@@ -3419,8 +3586,12 @@ class Orchestrator:
     ) -> bool:
         result = error.result
         if result is None:
-            state.status = "paused"
-            state.last_error = str(error)
+            self._block_run(
+                state,
+                owner="unknown",
+                category="gate_timeout_missing_result",
+                reason=str(error),
+            )
             return False
         incident = command_incident(
             run_id=state.run_id,
@@ -3438,7 +3609,7 @@ class Orchestrator:
         if diagnosis is None:
             diagnosis = self._agent_diagnose_execution_incident(incident)
         if diagnosis is None:
-            return self._pause_for_execution_incident(state, incident, "automatic diagnosis was inconclusive")
+            return self._block_for_execution_incident(state, incident, "automatic diagnosis was inconclusive")
         return self._apply_execution_incident_diagnosis(state, incident, diagnosis)
 
     def _record_inline_gate_incident(
@@ -3528,7 +3699,7 @@ class Orchestrator:
             {"event": "diagnosed", "diagnosis": diagnosis.to_dict()}
         )
         if not self.config.execution.recovery.enabled:
-            return self._pause_for_execution_incident(
+            return self._block_for_execution_incident(
                 state, incident, "automatic execution recovery is disabled"
             )
         distinct_incidents = {
@@ -3537,11 +3708,11 @@ class Orchestrator:
             if str(entry.get("incident_fingerprint", ""))
         }
         if len(distinct_incidents) > self.config.execution.recovery.max_incidents_per_run:
-            return self._pause_for_execution_incident(
+            return self._block_for_execution_incident(
                 state, incident, "run-level incident budget was exhausted"
             )
         if incident.recovery_round >= self.config.execution.recovery.max_rounds:
-            return self._pause_for_execution_incident(
+            return self._block_for_execution_incident(
                 state, incident, "the same incident exhausted its recovery rounds"
             )
         previous_route = next(
@@ -3557,22 +3728,25 @@ class Orchestrator:
             and str(previous_route.get("evidence_fingerprint", ""))
             == incident.evidence_fingerprint
         ):
-            return self._pause_for_execution_incident(
+            return self._block_for_execution_incident(
                 state,
                 incident,
                 "the previous recovery route produced no new execution evidence",
             )
         if diagnosis.confidence < 0.8 or diagnosis.action in {"ASK_USER", "STOP"}:
-            return self._pause_for_execution_incident(state, incident, diagnosis.reason)
+            return self._block_for_execution_incident(state, incident, diagnosis.reason)
         if diagnosis.action == "SELF_REPAIR":
             incident.status = "self_repair"
             incident.history.append(
                 {"event": "route", "action": "SELF_REPAIR", "owner": diagnosis.owner}
             )
-            state.status = "paused"
-            state.last_error = (
-                f"execution incident {incident.incident_id} was routed to auto_agents self-repair: "
-                f"{diagnosis.reason}"
+            self._block_run(
+                state,
+                owner="auto_agents",
+                category=incident.kind,
+                reason=diagnosis.reason,
+                incident_id=incident.incident_id,
+                fingerprint=incident.evidence_fingerprint,
             )
             self._incident_store(state).save(incident, state)
             return False
@@ -3593,7 +3767,7 @@ class Orchestrator:
             self._rewind_state_from_stage(state, "plan")
         elif diagnosis.action == "RECOVER_TARGET":
             if not self._safe_execution_recovery_command(incident.command):
-                return self._pause_for_execution_incident(
+                return self._block_for_execution_incident(
                     state,
                     incident,
                     "the original verification command contains redacted or missing data and "
@@ -3642,38 +3816,6 @@ class Orchestrator:
         except (RuntimeError, ValueError, json.JSONDecodeError) as error:
             self.logger.warning("[execution-recovery] judge failed: %s", error)
             return None
-
-    def recover_execution_incident(self, *, interactive: bool = True) -> RunState:
-        state = load_run_state(self.project_root)
-        store = self._incident_store(state)
-        incident = store.active(state)
-        if incident is None:
-            raise RuntimeError("no active execution incident to recover")
-        if incident.cleanup_incomplete:
-            self._pause_for_execution_incident(
-                state,
-                incident,
-                "process-group cleanup is still incomplete; run the stop command and verify cleanup first",
-            )
-            save_run_state(self.project_root, state)
-            return state
-        context = ""
-        if interactive:
-            context = self._prompt_user(
-                f"Execution incident {incident.incident_id}: {incident.kind} during "
-                f"{incident.context}. Describe relevant context, or type 'stop': "
-            ).strip()
-            if context.lower() in {"stop", "quit", "abort"}:
-                self._pause_for_execution_incident(state, incident, "user stopped recovery")
-                save_run_state(self.project_root, state)
-                return state
-        diagnosis = self._agent_diagnose_execution_incident(incident, user_context=context)
-        if diagnosis is None:
-            self._pause_for_execution_incident(state, incident, "recovery agent could not establish a safe route")
-        else:
-            self._apply_execution_incident_diagnosis(state, incident, diagnosis)
-        save_run_state(self.project_root, state)
-        return state
 
     def reconcile_runtime_interruption(
         self,
@@ -3739,11 +3881,17 @@ class Orchestrator:
 
         max_rounds = max(1, int(self.config.execution.recovery.max_rounds))
         if occurrence > max_rounds:
-            event["action"] = "pause_repeated_interruption"
-            state.status = "paused"
-            state.last_error = (
+            event["action"] = "block_repeated_interruption"
+            reason = (
                 "the same runtime checkpoint was interrupted repeatedly without progress; "
                 f"fingerprint={fingerprint} occurrences={occurrence} limit={max_rounds}"
+            )
+            self._block_run(
+                state,
+                owner="unknown",
+                category="runtime_interruption",
+                reason=reason,
+                fingerprint=fingerprint,
             )
         elif occurrence > 1:
             incident = ExecutionIncident(
@@ -3768,11 +3916,17 @@ class Orchestrator:
             diagnosis = self._agent_diagnose_execution_incident(incident)
             event["diagnosis"] = diagnosis.to_dict() if diagnosis is not None else {}
             if diagnosis is None or diagnosis.confidence < 0.8 or diagnosis.action in {"ASK_USER", "STOP"}:
-                event["action"] = "pause_inconclusive_diagnosis"
-                state.status = "paused"
-                state.last_error = (
+                event["action"] = "block_inconclusive_diagnosis"
+                reason = (
                     "repeated runtime interruption could not be diagnosed safely; "
                     f"fingerprint={fingerprint}"
+                )
+                self._block_run(
+                    state,
+                    owner="unknown",
+                    category="runtime_interruption",
+                    reason=reason,
+                    fingerprint=fingerprint,
                 )
             elif (
                 diagnosis.action == "SELF_REPAIR"
@@ -3805,11 +3959,17 @@ class Orchestrator:
                     state.status = "pending"
                 state.last_error = ""
             else:
-                event["action"] = "pause_unsupported_diagnosis"
-                state.status = "paused"
-                state.last_error = (
+                event["action"] = "block_unsupported_diagnosis"
+                reason = (
                     "repeated runtime interruption diagnosis did not produce a safe route; "
                     f"action={diagnosis.action} owner={diagnosis.owner}"
+                )
+                self._block_run(
+                    state,
+                    owner=diagnosis.owner,
+                    category="runtime_interruption",
+                    reason=reason,
+                    fingerprint=fingerprint,
                 )
         elif (
             state.status == "failed"
@@ -3920,10 +4080,15 @@ class Orchestrator:
                 continue
             command = str(marker.get("verification_command", "")).strip()
             if not self._safe_execution_recovery_command(command):
-                state.status = "paused"
-                state.last_error = (
+                reason = (
                     f"execution recovery task {root.task_id} cannot reproduce its original "
-                    "verification command safely; run recover with the missing context"
+                    "verification command safely; fix the persisted command context and rerun"
+                )
+                self._block_run(
+                    state,
+                    owner="user_input",
+                    category="missing_recovery_context",
+                    reason=reason,
                 )
                 return changed
 
@@ -3943,11 +4108,16 @@ class Orchestrator:
                 item for item in legacy_children if item.status in {"in_progress", "blocked"}
             ]
             if ambiguous:
-                state.status = "paused"
-                state.last_error = (
+                reason = (
                     "legacy execution recovery has partially executed unscoped repair tasks: "
                     + ", ".join(item.task_id for item in ambiguous)
                     + "; automatic migration stopped to preserve possible worktree changes"
+                )
+                self._block_run(
+                    state,
+                    owner="unknown",
+                    category="legacy_recovery_migration",
+                    reason=reason,
                 )
                 return changed
 
@@ -4090,6 +4260,7 @@ class Orchestrator:
             {"event": "resolved", "task_id": task.task_id, "commit_sha": task.commit_sha}
         )
         store.save(incident, state)
+        self._clear_run_blocker(state)
 
     def _resolve_inline_task_incident(self, state: RunState, task: TaskSpec) -> None:
         store = self._incident_store(state)
@@ -4106,6 +4277,7 @@ class Orchestrator:
             {"event": "resolved", "task_id": task.task_id, "reason": "task retry succeeded"}
         )
         store.save(incident, state)
+        self._clear_run_blocker(state)
 
     def _resolve_rewound_execution_incident(self, state: RunState, stage: str) -> None:
         store = self._incident_store(state)
@@ -4116,12 +4288,14 @@ class Orchestrator:
         expected_stage = {
             "REWIND_PLAN": "plan",
             "REWIND_CLARIFY": "clarify",
+            "RETRY": incident.stage,
         }.get(action, "")
         if expected_stage != stage or stage not in state.stage_summaries:
             return
         incident.status = "resolved"
         incident.history.append({"event": "resolved", "stage": stage})
         store.save(incident, state)
+        self._clear_run_blocker(state)
 
     def _default_gate_commands(self) -> List[str]:
         return list(self.config.gates.commands)
@@ -4624,7 +4798,7 @@ class Orchestrator:
         state.tasks = tasks
         self._commit_planning_baseline_if_needed(tasks)
         self._normalize_legacy_execution_recovery_tasks(state, tasks)
-        if state.status == "paused":
+        if state.status in {"paused", "blocked"}:
             return state
         prebaseline_recovery, recovery_pending = self._ready_prebaseline_recovery_task(
             state, tasks

@@ -63,7 +63,7 @@ def notify_run_finished(
     error: str = "",
 ) -> bool:
     final_status = (status or str(state_payload.get("status", ""))).strip()
-    if final_status not in {"completed", "failed"}:
+    if final_status not in {"completed", "failed", "blocked"}:
         return False
     run_id = str(state_payload.get("run_id", "")).strip()
     stage = str(state_payload.get("current_stage", "")).strip()
@@ -196,7 +196,7 @@ def notify_flow_finished(
     detail: str = "",
     paths: Iterable[Path] = (),
 ) -> bool:
-    if status not in {"completed", "failed"}:
+    if status not in {"completed", "failed", "blocked"}:
         return False
     content = _format_flow_message(
         project_root,
@@ -224,7 +224,7 @@ def _format_flow_message(
 ) -> str:
     project_root = project_root.expanduser()
     project_name = _project_name(project_root)
-    color = "warning" if status == "failed" else "info"
+    color = "warning" if status in {"failed", "blocked"} else "info"
     time_label = "Started" if status == "started" else "Finished"
     lines = [
         f"<font color=\"{color}\">**auto-agents {workflow} {status}**</font>",

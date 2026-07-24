@@ -683,10 +683,12 @@ bounded by `execution.recovery.max_rounds`; inconclusive or exhausted recovery p
 looping. A host-level `SIGKILL` still requires a later CLI invocation because no in-process code can
 continue after the host has removed the process.
 
-In an interactive terminal, a paused incident enters a recovery-agent dialogue. Background runs
-persist the incident under `.auto-agents/runs/<run-id>/recovery_incidents/` and exit paused; resume it
-later with `python3 -m auto_agents recover --project /tmp/demo`. Recovery does not automatically
-weaken checks, change credentials/global environment, or raise the absolute safety ceiling.
+Incidents are persisted under `.auto-agents/runs/<run-id>/recovery_incidents/`. Target-project
+failures use bounded task recovery, auto_agents-owned failures enter verified self-repair, and
+environment or external failures exit with run status `blocked`. After resolving a blocker, rerun
+`python3 -m auto_agents run --project /tmp/demo`; the saved checkpoint and run options resume
+without a separate recovery dialogue. Recovery never weakens checks, changes credentials/global
+environment, or raises the absolute safety ceiling.
 
 Forbidden-pattern requirements use timeout-capable regex matching with per-pattern/file and total
 audit limits. Broad DOTALL wildcards and nested unbounded quantifiers fail closed with a diagnostic;

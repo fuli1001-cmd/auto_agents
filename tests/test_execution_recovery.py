@@ -111,7 +111,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
             )
 
             self.assertFalse(recovered)
-            self.assertEqual(state.status, "paused")
+            self.assertEqual(state.status, "blocked")
             self.assertIn("cannot be reproduced safely", state.last_error)
 
     def test_store_persists_incident_and_run_summary(self) -> None:
@@ -354,7 +354,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertEqual(parent.recovery_round, 1)
             self.assertTrue(parent.recovery_history[1]["superseded"])
 
-    def test_legacy_recovery_with_partial_repair_pauses_without_discarding_it(self) -> None:
+    def test_legacy_recovery_with_partial_repair_blocks_without_discarding_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
             Orchestrator.init_project(root, "project", "mock")
@@ -386,9 +386,31 @@ class ExecutionRecoveryTests(unittest.TestCase):
 
             orchestrator._normalize_legacy_execution_recovery_tasks(state, tasks)
 
-            self.assertEqual(state.status, "paused")
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(
+                state.active_blocker["category"], "legacy_recovery_migration"
+            )
             self.assertEqual([task.task_id for task in tasks], [repair.task_id, parent.task_id])
             self.assertIn("partially executed unscoped repair", state.last_error)
+
+    def test_gate_timeout_without_result_blocks_for_safe_rerun(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = RunState(run_id="run-no-result", current_stage="implement")
+
+            recovered = orchestrator._handle_gate_execution_incident(
+                state,
+                "implement",
+                GateCommandTimeoutError("worker ended without a command result"),
+            )
+
+            self.assertFalse(recovered)
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(
+                state.active_blocker["category"], "gate_timeout_missing_result"
+            )
 
     def test_provider_termination_is_persisted_as_an_execution_incident(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -417,7 +439,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
             state = orchestrator.status()
             self.assertEqual(state["active_execution_incident_id"], incident.incident_id)
 
-    def test_interactive_recovery_agent_can_rewind_to_plan(self) -> None:
+    def test_run_reopens_legacy_blocked_incident_without_dialogue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
             Orchestrator.init_project(root, "project", "mock")
@@ -433,25 +455,83 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 context="baseline",
                 termination_reason="stalled",
                 status="needs_human",
+                diagnosis={
+                    "owner": "auto_agents",
+                    "action": "RETRY",
+                    "confidence": 0.99,
+                },
             )
             ExecutionIncidentStore(root, state.run_id).save(incident, state)
             save_run_state(root, state)
-            orchestrator = Orchestrator(root, user_input_fn=lambda _prompt: "watch mode")
+            incident.recovery_round = 2
+            ExecutionIncidentStore(root, state.run_id).save(incident, state)
+            save_run_state(root, state)
+            orchestrator = Orchestrator(root)
 
-            with patch.object(
-                orchestrator,
-                "_agent_diagnose_execution_incident",
-                return_value=IncidentDiagnosis(
-                    owner="verification_contract",
-                    action="REWIND_PLAN",
-                    confidence=0.95,
-                    reason="configured command is non-terminating",
-                ),
-            ):
-                recovered = orchestrator.recover_execution_incident(interactive=True)
+            changed = orchestrator._resume_blocked_run(state)
 
-            self.assertEqual(recovered.status, "pending")
-            self.assertEqual(recovered.current_stage, "plan")
+            self.assertTrue(changed)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.current_stage, "implement")
+            reopened = ExecutionIncidentStore(root, state.run_id).load(
+                incident.incident_id
+            )
+            self.assertEqual(reopened.status, "recovering")
+            self.assertEqual(reopened.recovery_round, 0)
+            self.assertEqual(state.active_blocker["status"], "retrying")
+
+    def test_auto_agents_block_waits_for_self_repair_before_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "scheduler_invariant",
+                "reason": "scheduler state is inconsistent",
+                "status": "blocked",
+            }
+
+            changed = orchestrator._resume_blocked_run(state)
+
+            self.assertFalse(changed)
+            self.assertEqual(state.status, "blocked")
+
+    def test_self_repair_commit_reopens_incident_for_new_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            incident = ExecutionIncident(
+                incident_id="repair-1",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_infrastructure_error",
+                stage="implement",
+                context="baseline",
+                status="self_repair",
+                recovery_round=2,
+            )
+            ExecutionIncidentStore(root, state.run_id).save(incident, state)
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": incident.kind,
+                "status": "blocked",
+            }
+            save_run_state(root, state)
+
+            reopened = orchestrator.mark_self_repair_applied("abc123")
+
+            self.assertEqual(reopened.status, "pending")
+            self.assertEqual(reopened.active_blocker["status"], "retrying")
+            self.assertEqual(reopened.active_blocker["self_repair_commit"], "abc123")
+            saved = ExecutionIncidentStore(root, state.run_id).load(incident.incident_id)
+            self.assertEqual(saved.status, "recovering")
+            self.assertEqual(saved.recovery_round, 0)
 
     def test_runtime_interruption_resumes_once_then_uses_read_only_diagnosis(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -539,11 +619,10 @@ class ExecutionRecoveryTests(unittest.TestCase):
 
             third = orchestrator.reconcile_runtime_interruption(snapshot)
 
-            self.assertEqual(third.status, "paused")
+            self.assertEqual(third.status, "blocked")
             self.assertIn("interrupted repeatedly", third.last_error)
             self.assertEqual(
-                third.recovery_loop_events[-1]["action"],
-                "pause_repeated_interruption",
+                third.recovery_loop_events[-1]["action"], "block_repeated_interruption"
             )
 
 
