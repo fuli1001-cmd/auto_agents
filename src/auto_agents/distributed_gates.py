@@ -29,6 +29,10 @@ from .workers import (
 )
 
 
+class _EndpointAcquireCancelled(RuntimeError):
+    """Raised when a queued gate command no longer needs a worker slot."""
+
+
 class DistributedGatePlanExecutor:
     """Dispatch isolated gates to the local executor and paired LAN workers."""
 
@@ -58,9 +62,9 @@ class DistributedGatePlanExecutor:
         self._stage_locks: dict[str, threading.Lock] = {}
         self._lane_endpoint: dict[str, WorkerEndpoint] = {}
         self._lane_successes: dict[str, int] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._slot_condition = threading.Condition(self._lock)
         self._active_slots: dict[str, int] = {}
-        self._semaphores: dict[str, threading.BoundedSemaphore] = {}
         self.endpoints: list[WorkerEndpoint] = []
         self.clients: dict[str, WorkerClient] = {}
 
@@ -182,9 +186,6 @@ class DistributedGatePlanExecutor:
             )
         for endpoint in self.endpoints:
             self._active_slots[endpoint.worker_id] = 0
-            self._semaphores[endpoint.worker_id] = threading.BoundedSemaphore(
-                endpoint.max_slots
-            )
             self._stage_locks[endpoint.worker_id] = threading.Lock()
         return self
 
@@ -221,25 +222,19 @@ class DistributedGatePlanExecutor:
         return not required or required.issubset(set(endpoint.capabilities))
 
     def _try_acquire(self, endpoint: WorkerEndpoint, required: int) -> bool:
-        semaphore = self._semaphores[endpoint.worker_id]
-        acquired = 0
-        for _ in range(required):
-            if not semaphore.acquire(blocking=False):
-                for _ in range(acquired):
-                    semaphore.release()
+        with self._slot_condition:
+            active = self._active_slots.get(endpoint.worker_id, 0)
+            if active + required > endpoint.max_slots:
                 return False
-            acquired += 1
-        with self._lock:
-            self._active_slots[endpoint.worker_id] += required
-        return True
+            self._active_slots[endpoint.worker_id] = active + required
+            return True
 
     def _release(self, endpoint: WorkerEndpoint, required: int) -> None:
-        with self._lock:
+        with self._slot_condition:
             self._active_slots[endpoint.worker_id] = max(
                 0, self._active_slots[endpoint.worker_id] - required
             )
-        for _ in range(required):
-            self._semaphores[endpoint.worker_id].release()
+            self._slot_condition.notify_all()
 
     def _acquire_endpoint(
         self,
@@ -247,6 +242,7 @@ class DistributedGatePlanExecutor:
         *,
         exclude: set[str],
         lane: str,
+        cancel_event: Optional[threading.Event] = None,
     ) -> tuple[WorkerEndpoint, int]:
         required = self._required_slots(command)
         if lane and lane in self._lane_endpoint:
@@ -260,9 +256,14 @@ class DistributedGatePlanExecutor:
                     "satisfies this command's capacity or capabilities"
                 )
             while not self._try_acquire(endpoint, required):
-                time.sleep(0.1)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise _EndpointAcquireCancelled
+                with self._slot_condition:
+                    self._slot_condition.wait(timeout=0.1)
             return endpoint, required
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _EndpointAcquireCancelled
             candidates = [
                 endpoint
                 for endpoint in self.endpoints
@@ -298,7 +299,8 @@ class DistributedGatePlanExecutor:
                     if lane:
                         self._lane_endpoint[lane] = endpoint
                     return endpoint, required
-            time.sleep(0.1)
+            with self._slot_condition:
+                self._slot_condition.wait(timeout=0.1)
 
     def _bundle(self) -> Path:
         with self._bundle_lock:
@@ -526,6 +528,7 @@ class DistributedGatePlanExecutor:
                 endpoint.worker_id,
                 endpoint.max_slots,
                 required,
+                cancel_event=cancel_event,
             ):
                 result = self.local.run(
                     command,
@@ -599,6 +602,15 @@ class DistributedGatePlanExecutor:
                     command,
                     exclude=attempted,
                     lane=lane,
+                    cancel_event=cancel_event,
+                )
+            except _EndpointAcquireCancelled:
+                return CommandResult(
+                    command=command,
+                    ok=False,
+                    returncode=130,
+                    stderr="command cancelled while waiting for a worker slot",
+                    termination_reason="cancelled",
                 )
             except RuntimeError as error:
                 result.stderr = str(error)

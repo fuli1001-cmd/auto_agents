@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -21,6 +24,8 @@ from auto_agents.models import (
 )
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.workers import (
+    WorkerEndpoint,
+    WorkerSlotLease,
     forwarded_environment,
     worker_execute,
     worker_probe,
@@ -186,6 +191,48 @@ def test_worker_probe_reports_ffmpeg_and_ffprobe_capabilities(
     assert probe["runtimes"]["ffprobe"] == "ffprobe version test"
 
 
+def test_worker_slot_lease_reports_persistent_memory_pressure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "auto_agents.workers._memory_available_bytes",
+        lambda: 3 * 1024**3,
+    )
+
+    with pytest.raises(RuntimeError, match="memory capacity.*3072 MiB available"):
+        with WorkerSlotLease(
+            tmp_path,
+            "test-worker",
+            slots=2,
+            required=2,
+            timeout_seconds=0,
+        ):
+            pass
+
+
+def test_worker_slot_lease_honors_cancellation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "auto_agents.workers._memory_available_bytes",
+        lambda: 3 * 1024**3,
+    )
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(RuntimeError, match="slot acquisition was cancelled"):
+        with WorkerSlotLease(
+            tmp_path,
+            "test-worker",
+            slots=2,
+            required=2,
+            cancel_event=cancel_event,
+        ):
+            pass
+
+
 def test_distributed_executor_uses_controller_as_local_worker(
     tmp_path: Path,
     monkeypatch,
@@ -226,6 +273,88 @@ def test_distributed_executor_uses_controller_as_local_worker(
         )
     assert result.ok
     assert {item.worker_id for item in result.commands} == {"test-worker"}
+
+
+def test_distributed_executor_reserves_heavy_slots_atomically(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    executor = DistributedGatePlanExecutor(project, GateConfig(), {})
+    endpoint = WorkerEndpoint(
+        worker_id="local-worker",
+        transport="local",
+        max_slots=2,
+    )
+    executor.endpoints = [endpoint]
+    executor._active_slots[endpoint.worker_id] = 0
+    start = threading.Barrier(3)
+    results: list[bool] = []
+
+    def acquire() -> None:
+        start.wait()
+        results.append(executor._try_acquire(endpoint, 2))
+
+    threads = [threading.Thread(target=acquire) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    start.wait()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert sorted(results) == [False, True]
+    assert executor._active_slots[endpoint.worker_id] == 2
+
+
+def test_distributed_executor_slot_wait_honors_cancellation(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    command = "heavy command"
+    executor = DistributedGatePlanExecutor(
+        project,
+        GateConfig(),
+        {command: GateCommandMetadata(resource_class="heavy")},
+    )
+    endpoint = WorkerEndpoint(
+        worker_id="local-worker",
+        transport="local",
+        max_slots=2,
+    )
+    executor.endpoints = [endpoint]
+    executor._active_slots[endpoint.worker_id] = 2
+    cancel_event = threading.Event()
+    waiting = threading.Event()
+    results = []
+    original_try_acquire = executor._try_acquire
+
+    def try_acquire(endpoint: WorkerEndpoint, required: int) -> bool:
+        waiting.set()
+        return original_try_acquire(endpoint, required)
+
+    executor._try_acquire = try_acquire  # type: ignore[method-assign]
+
+    def run() -> None:
+        results.append(
+            executor.run(
+                command,
+                timeout_seconds=30,
+                adaptive_timeout_enabled=False,
+                idle_timeout_seconds=10,
+                cancel_event=cancel_event,
+            )
+        )
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert waiting.wait(timeout=1)
+    cancel_event.set()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert len(results) == 1
+    assert results[0].returncode == 130
+    assert results[0].termination_reason == "cancelled"
 
 
 def test_distributed_auto_parallelism_uses_gate_capacity() -> None:

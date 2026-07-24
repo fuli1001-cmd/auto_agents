@@ -319,42 +319,101 @@ def _read_json(path: Path) -> dict[str, object]:
 
 
 class WorkerSlotLease:
-    def __init__(self, root: Path, worker_id: str, slots: int, required: int) -> None:
+    def __init__(
+        self,
+        root: Path,
+        worker_id: str,
+        slots: int,
+        required: int,
+        *,
+        timeout_seconds: float = 30.0,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
         self.root = root
         self.worker_id = worker_id
         self.slots = max(1, slots)
         self.required = max(1, min(required, self.slots))
+        self.timeout_seconds = max(0.0, timeout_seconds)
+        self.cancel_event = cancel_event
         self.handles: list[object] = []
 
     def __enter__(self) -> "WorkerSlotLease":
         slot_root = self.root / "slots" / self.worker_id
         slot_root.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.timeout_seconds
+        required_memory = (
+            4 * 1024**3 if self.required >= 2 else 2 * 1024**3
+        )
+        memory_threshold = required_memory + 2 * 1024**3
+        memory_available = 0
         while len(self.handles) < self.required:
+            if self.cancel_event is not None and self.cancel_event.is_set():
+                raise RuntimeError("worker slot acquisition was cancelled")
             memory_available = _memory_available_bytes()
-            required_memory = (
-                4 * 1024**3 if self.required >= 2 else 2 * 1024**3
-            )
             if (
                 memory_available > 0
-                and memory_available < required_memory + 2 * 1024**3
+                and memory_available < memory_threshold
             ):
-                time.sleep(0.5)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        "worker memory capacity remained unavailable for "
+                        f"{self.timeout_seconds:.1f}s: "
+                        f"{memory_available // 1024**2} MiB available, "
+                        f"{memory_threshold // 1024**2} MiB required "
+                        "including the safety reserve"
+                    )
+                self._wait(0.5)
                 continue
-            for index in range(self.slots):
-                if len(self.handles) >= self.required:
-                    break
-                path = slot_root / f"{index}.lock"
-                handle = path.open("a+")
+            allocation_handle = (slot_root / ".allocation.lock").open("a+")
+            try:
                 try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(
+                        allocation_handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
                 except BlockingIOError:
-                    handle.close()
-                    continue
-                self.handles.append(handle)
-            if len(self.handles) < self.required:
-                self._release()
-                time.sleep(0.2)
+                    pass
+                else:
+                    for index in range(self.slots):
+                        if len(self.handles) >= self.required:
+                            break
+                        path = slot_root / f"{index}.lock"
+                        handle = path.open("a+")
+                        try:
+                            fcntl.flock(
+                                handle.fileno(),
+                                fcntl.LOCK_EX | fcntl.LOCK_NB,
+                            )
+                        except BlockingIOError:
+                            handle.close()
+                            continue
+                        self.handles.append(handle)
+                    if len(self.handles) >= self.required:
+                        return self
+                    self._release()
+            finally:
+                try:
+                    fcntl.flock(allocation_handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    allocation_handle.close()
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "worker slots remained unavailable for "
+                    f"{self.timeout_seconds:.1f}s: "
+                    f"{self.required} of {self.slots} slots required"
+                )
+            self._wait(0.2)
         return self
+
+    def _wait(self, seconds: float) -> None:
+        remaining = max(
+            0.0,
+            min(seconds, self.timeout_seconds),
+        )
+        if self.cancel_event is not None:
+            self.cancel_event.wait(timeout=remaining)
+        else:
+            time.sleep(remaining)
 
     def _release(self) -> None:
         for handle in self.handles:
@@ -1096,6 +1155,7 @@ def worker_execute(
             config.worker_id,
             config.max_slots,
             required_slots,
+            cancel_event=cancel_event,
         ):
             mirror, sandbox, _created = _worker_sandbox(config, manifest)
             if isinstance(manifest.get("environment_manifest"), dict):
