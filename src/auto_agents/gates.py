@@ -57,6 +57,7 @@ class GateCommandMetadata:
     resource_class: str = "normal"
     requires: List[str] = field(default_factory=list)
     exclusive_resources: List[str] = field(default_factory=list)
+    dynamic_ports: List[str] = field(default_factory=list)
     artifact_globs: List[str] = field(default_factory=list)
 
 
@@ -197,6 +198,7 @@ def expand_pytest_directory_steps(
                             resource_class=step.resource_class,
                             requires=list(step.requires),
                             exclusive_resources=list(step.exclusive_resources),
+                            dynamic_ports=list(step.dynamic_ports),
                             artifact_globs=list(step.artifact_globs),
                         )
                     )
@@ -217,6 +219,7 @@ def expand_pytest_directory_steps(
                         resource_class=step.resource_class,
                         requires=list(step.requires),
                         exclusive_resources=list(step.exclusive_resources),
+                        dynamic_ports=list(step.dynamic_ports),
                         artifact_globs=list(step.artifact_globs),
                     )
                 )
@@ -330,6 +333,14 @@ def resolve_gate_plan_from_verification_steps(
                     for step in command_steps
                     for resource in step.exclusive_resources
                     if resource.strip()
+                )
+            ),
+            dynamic_ports=list(
+                dict.fromkeys(
+                    name.strip()
+                    for step in command_steps
+                    for name in step.dynamic_ports
+                    if name.strip()
                 )
             ),
             artifact_globs=list(

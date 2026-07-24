@@ -145,6 +145,35 @@ class TaskPlanValidationTests(unittest.TestCase):
 
         self.assertEqual(validate_task_plan_payload(payload, require_verification=True), [])
 
+    def test_validates_dynamic_port_names(self) -> None:
+        payload = {
+            "test_strategy": "python-pytest",
+            "verification_steps": [
+                {
+                    "kind": "test",
+                    "runner": "pytest",
+                    "targets": ["tests"],
+                    "dynamic_ports": ["api", "api", "Bad-Port"],
+                }
+            ],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Add server",
+                    "description": "Add a server.",
+                    "acceptance": ["done"],
+                    "status": "pending",
+                    "commit_message": "feat: add server",
+                }
+            ],
+        }
+
+        errors = validate_task_plan_payload(payload, require_verification=True)
+        self.assertTrue(any("must be unique" in item for item in errors))
+        self.assertTrue(
+            any("lowercase snake_case" in item for item in errors)
+        )
+
     def test_rejects_unknown_verification_cadence_and_cache_scope(self) -> None:
         payload = {
             "test_strategy": "python-pytest",

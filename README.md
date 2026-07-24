@@ -574,19 +574,27 @@ Gate steps may also declare scheduling and artifact metadata:
   "resource_class": "heavy",
   "requires": ["node", "chrome"],
   "exclusive_resources": ["host:display-99"],
+  "dynamic_ports": ["api", "frontend"],
   "artifact_globs": [".tmp-tests/evidence/**/*.png"]
 }
 ```
 
 `resource_class=heavy` consumes two worker slots; normal commands consume one. `requires` limits
 dispatch to workers that advertise every capability. `host:<name>` locks one resource on a worker,
-while `pool:<name>` locks it across the controller's entire pool.
+while `pool:<name>` locks it across the controller's entire pool. `dynamic_ports` asks the actual
+execution worker to reserve distinct loopback ports and exports them as
+`AUTO_AGENTS_GATE_PORT_<UPPER_NAME>`, plus `AUTO_AGENTS_GATE_HOST=127.0.0.1` and a JSON map in
+`AUTO_AGENTS_GATE_PORTS_JSON`. Prefer binding port `0` directly when the test process owns the
+listener; use named ports for child processes that require a number before launch. Port metadata
+does not imply `parallel_safe=true`.
 
 Linux/WSL computers can form a trusted LAN worker cluster without SSH, host lists, or per-project
 worker configuration. The computer running `auto-agents run` always executes work locally too.
 Paired computers running `auto-agents worker serve` are discovered automatically, and the
 controller schedules isolated gate commands across their combined capacity. Any paired computer
-can later act as the controller.
+can later act as the controller. After upgrading auto_agents, restart each worker so its gate
+protocol matches the controller; pairing state is preserved, and incompatible workers are not
+scheduled.
 
 Install the same auto_agents version on each computer. On the first computer, initialize a cluster
 and create a one-time pairing code:

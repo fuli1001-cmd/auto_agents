@@ -24,6 +24,7 @@ from auto_agents.models import (
 )
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.workers import (
+    WORKER_PROTOCOL_VERSION,
     WorkerEndpoint,
     WorkerSlotLease,
     forwarded_environment,
@@ -119,13 +120,15 @@ def test_worker_stage_execute_and_query(tmp_path: Path, monkeypatch) -> None:
     assert staged["ok"]
 
     command = (
-        f"{sys.executable} -c \"from pathlib import Path; "
-        "assert Path('value.txt').read_text() == 'snapshot\\\\n'\""
+        f"{sys.executable} -c \"import os, socket; from pathlib import Path; "
+        "assert Path('value.txt').read_text() == 'snapshot\\\\n'; "
+        "port=int(os.environ['AUTO_AGENTS_GATE_PORT_API']); "
+        "sock=socket.socket(); sock.bind(('127.0.0.1', port)); sock.close()\""
     )
     events = io.StringIO()
     result = worker_execute(
         {
-            "protocol_version": 1,
+            "protocol_version": WORKER_PROTOCOL_VERSION,
             "project_key": "project-key",
             "snapshot": snapshot.commit_sha,
             "plan_id": "plan-one",
@@ -139,19 +142,44 @@ def test_worker_stage_execute_and_query(tmp_path: Path, monkeypatch) -> None:
             "adaptive_timeout_enabled": True,
             "idle_timeout_seconds": 10,
             "artifact_globs": [],
+            "dynamic_ports": ["api"],
             "artifact_max_files": 10,
             "artifact_max_bytes": 1024,
         },
         event_stream=events,
     )
-    assert result.ok
+    assert result.ok, result.stderr
     assert result.worker_id == "test-worker"
     assert "do-not-log" not in events.getvalue()
     record = worker_query("job-one")
     assert record["state"] == "terminal"
     assert record["result"]["ok"] is True
+    assert 49152 <= record["dynamic_ports"]["api"] <= 65535
     assert worker_probe("test")["ok"]
     manager.close()
+
+
+def test_worker_rejects_legacy_gate_protocol(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "AUTO_AGENTS_WORKER_CONFIG",
+        str(_worker_config(tmp_path)),
+    )
+
+    result = worker_execute(
+        {
+            "protocol_version": WORKER_PROTOCOL_VERSION - 1,
+            "job_id": "legacy-job",
+            "command": "true",
+        },
+        event_stream=io.StringIO(),
+    )
+
+    assert not result.ok
+    assert result.infrastructure_error
+    assert "unsupported worker protocol version" in result.stderr
 
 
 def test_worker_probe_reports_ffmpeg_and_ffprobe_capabilities(

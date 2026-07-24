@@ -25,6 +25,7 @@ from typing import BinaryIO, Mapping, Optional, Sequence
 from .gate_execution import (
     _run_git,
     auto_agents_state_root,
+    dynamic_port_lease,
     exclusive_resource_lease,
     gate_environment,
     install_dependency_links,
@@ -34,7 +35,7 @@ from .models import CommandResult
 from .process_supervision import process_group_exists, run_supervised_shell_command
 
 
-WORKER_PROTOCOL_VERSION = 1
+WORKER_PROTOCOL_VERSION = 2
 
 SYSTEM_ENVIRONMENT_DENYLIST = frozenset(
     {
@@ -1164,12 +1165,6 @@ def worker_execute(
                 links = _environment_links(config, environment_id)
             install_dependency_links(sandbox, links)
             runtime_root = config.managed_root / "runtime" / job_id
-            env = gate_environment(
-                sandbox,
-                job_id=job_id,
-                base={**os.environ, **forwarded},
-                runtime_root=runtime_root,
-            )
             record = {
                 **base_record,
                 "state": "accepted",
@@ -1237,23 +1232,40 @@ def worker_execute(
                 ],
                 worker_id=config.worker_id,
             ):
-                process = run_supervised_shell_command(
-                    isolated_command(command),
-                    cwd=sandbox,
-                    env=env,
-                    timeout_seconds=float(manifest.get("timeout_seconds", 7200)),
-                    adaptive_timeout_enabled=bool(
-                        manifest.get("adaptive_timeout_enabled", True)
-                    ),
-                    idle_timeout_seconds=float(
-                        manifest.get("idle_timeout_seconds", 900)
-                    ),
-                    heartbeat_seconds=15.0,
-                    progress=progress,
-                    on_start=on_start,
-                    kind="gate-worker",
-                    cancel_event=cancel_event,
-                )
+                raw_dynamic_ports = manifest.get("dynamic_ports", [])
+                if not isinstance(raw_dynamic_ports, list):
+                    raise ValueError("dynamic_ports must be a list")
+                with dynamic_port_lease(
+                    [str(item) for item in raw_dynamic_ports]
+                ) as dynamic_ports:
+                    record["dynamic_ports"] = dict(dynamic_ports)
+                    _write_json_atomic(registry_path, record)
+                    env = gate_environment(
+                        sandbox,
+                        job_id=job_id,
+                        base={**os.environ, **forwarded},
+                        runtime_root=runtime_root,
+                        dynamic_ports=dynamic_ports,
+                    )
+                    process = run_supervised_shell_command(
+                        isolated_command(command),
+                        cwd=sandbox,
+                        env=env,
+                        timeout_seconds=float(
+                            manifest.get("timeout_seconds", 7200)
+                        ),
+                        adaptive_timeout_enabled=bool(
+                            manifest.get("adaptive_timeout_enabled", True)
+                        ),
+                        idle_timeout_seconds=float(
+                            manifest.get("idle_timeout_seconds", 900)
+                        ),
+                        heartbeat_seconds=15.0,
+                        progress=progress,
+                        on_start=on_start,
+                        kind="gate-worker",
+                        cancel_event=cancel_event,
+                    )
             mutations = _worker_mutations(sandbox, list(links))
             stderr = redact_values(process.stderr, list(forwarded.values()))
             stdout = redact_values(process.stdout, list(forwarded.values()))

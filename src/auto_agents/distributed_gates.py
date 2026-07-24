@@ -19,6 +19,7 @@ from .models import CommandResult, GateConfig
 from .worker_cluster import discover_workers, load_cluster_state
 from .worker_service import WorkerClient, result_from_job_record
 from .workers import (
+    WORKER_PROTOCOL_VERSION,
     WorkerEndpoint,
     WorkerSlotLease,
     build_environment_manifest,
@@ -435,7 +436,7 @@ class DistributedGatePlanExecutor:
         distributed = self.gate_config.distributed
         artifact_globs = self._metadata_list(command, "artifact_globs")
         manifest = {
-            "protocol_version": 1,
+            "protocol_version": WORKER_PROTOCOL_VERSION,
             "project_key": self.key,
             "snapshot": self.local.snapshot.commit_sha,
             "plan_id": self.local.plan_id,
@@ -460,6 +461,7 @@ class DistributedGatePlanExecutor:
                 )
                 if resource.startswith("host:")
             ],
+            "dynamic_ports": self._metadata_list(command, "dynamic_ports"),
             "artifact_max_files": self.gate_config.isolation.artifact_max_files,
             "artifact_max_bytes": self.gate_config.isolation.artifact_max_bytes,
         }

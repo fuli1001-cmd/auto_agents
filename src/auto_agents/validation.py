@@ -223,7 +223,12 @@ def validate_verification_steps(steps: object, field_name: str = "verification_s
         if resource_class not in VERIFICATION_RESOURCE_CLASSES:
             allowed = ", ".join(VERIFICATION_RESOURCE_CLASSES)
             errors.append(f"{prefix}.resource_class must be one of: {allowed}")
-        for field in ("requires", "exclusive_resources", "artifact_globs"):
+        for field in (
+            "requires",
+            "exclusive_resources",
+            "dynamic_ports",
+            "artifact_globs",
+        ):
             value = raw_step.get(field, [])
             if value is not None and (
                 not isinstance(value, list)
@@ -242,6 +247,30 @@ def validate_verification_steps(steps: object, field_name: str = "verification_s
                     errors.append(
                         f"{prefix}.exclusive_resources entries must be host:<name> or pool:<name>"
                     )
+        dynamic_ports = raw_step.get("dynamic_ports", [])
+        if isinstance(dynamic_ports, list):
+            seen_ports: set[str] = set()
+            for item in dynamic_ports:
+                if not isinstance(item, str):
+                    continue
+                name = item.strip()
+                if (
+                    not name
+                    or not name[0].islower()
+                    or any(
+                        character not in "abcdefghijklmnopqrstuvwxyz0123456789_"
+                        for character in name
+                    )
+                ):
+                    errors.append(
+                        f"{prefix}.dynamic_ports entries must use lowercase snake_case names"
+                    )
+                    continue
+                if name in seen_ports:
+                    errors.append(
+                        f"{prefix}.dynamic_ports entries must be unique"
+                    )
+                seen_ports.add(name)
         artifacts = raw_step.get("artifact_globs", [])
         if isinstance(artifacts, list):
             for item in artifacts:

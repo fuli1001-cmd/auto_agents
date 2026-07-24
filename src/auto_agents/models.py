@@ -262,6 +262,7 @@ class VerificationStep:
     resource_class: str = "normal"
     requires: List[str] = field(default_factory=list)
     exclusive_resources: List[str] = field(default_factory=list)
+    dynamic_ports: List[str] = field(default_factory=list)
     artifact_globs: List[str] = field(default_factory=list)
 
     @classmethod
@@ -280,6 +281,9 @@ class VerificationStep:
             exclusive_resources=[
                 str(item) for item in data.get("exclusive_resources", [])
             ],
+            dynamic_ports=[
+                str(item) for item in data.get("dynamic_ports", [])
+            ],
             artifact_globs=[str(item) for item in data.get("artifact_globs", [])],
         )
 
@@ -295,6 +299,7 @@ class VerificationStep:
             "resource_class": self.resource_class,
             "requires": list(self.requires),
             "exclusive_resources": list(self.exclusive_resources),
+            "dynamic_ports": list(self.dynamic_ports),
             "artifact_globs": list(self.artifact_globs),
         }
 

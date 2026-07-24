@@ -24,6 +24,7 @@ from auto_agents.worker_cluster import (
 from auto_agents.cli import build_parser
 from auto_agents.models import DistributedGatesConfig
 from auto_agents.worker_service import WorkerClient, WorkerService
+from auto_agents.workers import WORKER_PROTOCOL_VERSION
 
 
 def _free_tcp_port() -> int:
@@ -143,13 +144,16 @@ def test_worker_service_uses_pinned_authenticated_https(
         bundle=bundle,
     )["ok"]
     manifest = {
-        "protocol_version": 1,
+        "protocol_version": WORKER_PROTOCOL_VERSION,
         "project_key": "test-project",
         "snapshot": snapshot,
         "plan_id": "test-plan",
         "job_id": "test-job",
         "lane": "",
-        "command": "test -f value.txt",
+        "command": (
+            "test -f value.txt && "
+            "test -n \"$AUTO_AGENTS_GATE_PORT_API\""
+        ),
         "resource_class": "normal",
         "environment_manifest": {
             "environment_id": "a" * 64,
@@ -162,6 +166,7 @@ def test_worker_service_uses_pinned_authenticated_https(
         "idle_timeout_seconds": 10,
         "artifact_globs": [],
         "exclusive_resources": [],
+        "dynamic_ports": ["api"],
         "artifact_max_files": 10,
         "artifact_max_bytes": 1024,
     }
@@ -176,6 +181,7 @@ def test_worker_service_uses_pinned_authenticated_https(
             raise AssertionError(f"worker job did not finish: {record}")
         time.sleep(0.05)
     assert record["result"]["ok"] is True
+    assert 49152 <= record["dynamic_ports"]["api"] <= 65535
 
     wrong_worker = DiscoveredWorker(
         **{

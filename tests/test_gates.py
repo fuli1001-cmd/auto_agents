@@ -347,6 +347,27 @@ class GateTests(unittest.TestCase):
 
             self.assertEqual([step.targets for step in steps], [["tests"]])
 
+    def test_expand_pytest_directory_steps_preserves_dynamic_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests = root / "tests"
+            tests.mkdir()
+            (tests / "test_alpha.py").write_text("", encoding="utf-8")
+
+            steps = expand_pytest_directory_steps(
+                [
+                    VerificationStep(
+                        kind="test",
+                        runner="pytest",
+                        targets=["tests"],
+                        dynamic_ports=["api"],
+                    )
+                ],
+                root,
+            )
+
+            self.assertEqual(steps[0].dynamic_ports, ["api"])
+
     def test_verification_step_ignores_freeform_command_field(self) -> None:
         command = command_from_verification_step(
             VerificationStep(
@@ -375,10 +396,12 @@ class GateTests(unittest.TestCase):
             targets=["tests/test_demo.py"],
             cadence="final_only",
             cache_scope="source",
+            dynamic_ports=["api"],
         ).to_dict()
 
         self.assertEqual(payload["cadence"], "final_only")
         self.assertEqual(payload["cache_scope"], "source")
+        self.assertEqual(payload["dynamic_ports"], ["api"])
 
     def test_gate_plan_filters_final_only_and_deduplicates_conservatively(self) -> None:
         duplicate_target = ["tests/test_demo.py"]
@@ -388,12 +411,14 @@ class GateTests(unittest.TestCase):
                 targets=duplicate_target,
                 parallel_safe=True,
                 cache_scope="source",
+                dynamic_ports=["api"],
             ),
             VerificationStep(
                 runner="pytest",
                 targets=duplicate_target,
                 parallel_safe=False,
                 cache_scope="run_context",
+                dynamic_ports=["frontend", "api"],
             ),
             VerificationStep(
                 runner="pytest",
@@ -417,6 +442,10 @@ class GateTests(unittest.TestCase):
         self.assertEqual(implement.parallel_groups, [])
         self.assertEqual(
             implement.cache_scopes[implement.commands[0]], "run_context"
+        )
+        self.assertEqual(
+            implement.metadata[implement.commands[0]].dynamic_ports,
+            ["api", "frontend"],
         )
         self.assertEqual(final.unique_command_count, 2)
 

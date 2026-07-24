@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import json
+import socket
 import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.gate_execution import LocalGatePlanExecutor, isolated_command
+from auto_agents.gate_execution import (
+    LocalGatePlanExecutor,
+    dynamic_port_lease,
+    gate_environment,
+    isolated_command,
+)
 from auto_agents.gates import GateCommandMetadata, run_gate_plan
-from auto_agents.models import GateConfig, GateIsolationConfig
+from auto_agents.models import GateConfig, GateIsolationConfig, GateParallelGroup
 
 
 def _git(project: Path, *args: str) -> None:
@@ -139,3 +146,90 @@ def test_vitest_cache_is_disabled_for_shared_dependencies() -> None:
         " --no-cache"
     )
     assert isolated_command("vitest run --no-cache") == "vitest run --no-cache"
+
+
+def test_gate_environment_injects_ports_and_clears_stale_values(
+    tmp_path: Path,
+) -> None:
+    env = gate_environment(
+        tmp_path,
+        job_id="job-one",
+        base={
+            "AUTO_AGENTS_GATE_HOST": "stale",
+            "AUTO_AGENTS_GATE_PORT_OLD": "1234",
+            "AUTO_AGENTS_GATE_PORTS_JSON": "{\"old\":1234}",
+        },
+        dynamic_ports={"api": 51234, "next_app": 51235},
+    )
+
+    assert env["AUTO_AGENTS_GATE_HOST"] == "127.0.0.1"
+    assert env["AUTO_AGENTS_GATE_PORT_API"] == "51234"
+    assert env["AUTO_AGENTS_GATE_PORT_NEXT_APP"] == "51235"
+    assert json.loads(env["AUTO_AGENTS_GATE_PORTS_JSON"]) == {
+        "api": 51234,
+        "next_app": 51235,
+    }
+    assert "AUTO_AGENTS_GATE_PORT_OLD" not in env
+
+
+def test_dynamic_port_lease_exposes_bindable_tcp_and_udp_ports(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("AUTO_AGENTS_STATE_HOME", str(tmp_path / "state"))
+
+    with dynamic_port_lease(["api", "frontend"]) as ports:
+        assert set(ports) == {"api", "frontend"}
+        assert len(set(ports.values())) == 2
+        for port in ports.values():
+            tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                tcp_socket.bind(("127.0.0.1", port))
+                udp_socket.bind(("127.0.0.1", port))
+            finally:
+                tcp_socket.close()
+                udp_socket.close()
+
+
+def test_parallel_isolated_gates_receive_distinct_dynamic_ports(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("AUTO_AGENTS_STATE_HOME", str(tmp_path / "state"))
+    project = _project(tmp_path)
+
+    def command(label: str) -> str:
+        return (
+            f"{sys.executable} -c \"import json, os, socket, time; "
+            "port=int(os.environ['AUTO_AGENTS_GATE_PORT_API']); "
+            "assert json.loads(os.environ['AUTO_AGENTS_GATE_PORTS_JSON'])['api'] == port; "
+            "sock=socket.socket(); sock.bind(('127.0.0.1', port)); sock.listen(1); "
+            f"print('{label}:' + str(port), flush=True); time.sleep(0.25); sock.close()\""
+        )
+
+    commands = [command("one"), command("two")]
+    metadata = {
+        item: GateCommandMetadata(dynamic_ports=["api"])
+        for item in commands
+    }
+    with LocalGatePlanExecutor(
+        project,
+        _config(tmp_path),
+        metadata,
+    ) as executor:
+        result = run_gate_plan(
+            [],
+            [GateParallelGroup(name="ports", commands=commands)],
+            project,
+            collect_all=True,
+            parallel_workers=2,
+            gate_executor=executor,
+        )
+
+    assert result.ok
+    ports = {
+        int(item.stdout.rsplit(":", 1)[1])
+        for item in result.commands
+    }
+    assert len(ports) == 2

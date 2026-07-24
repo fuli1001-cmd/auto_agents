@@ -4,9 +4,12 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
+import secrets
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -182,6 +185,102 @@ def exclusive_resource_lease(
                 handle.close()
 
 
+@contextmanager
+def dynamic_port_lease(
+    names: Sequence[str],
+    *,
+    max_attempts: int = 128,
+) -> object:
+    """Reserve unique loopback ports for one gate job."""
+
+    normalized = list(dict.fromkeys(str(item).strip() for item in names))
+    for name in normalized:
+        if (
+            not name
+            or not name[0].islower()
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789_"
+                for character in name
+            )
+        ):
+            raise ValueError(
+                "dynamic port names must use lowercase snake_case"
+            )
+    if not normalized:
+        yield {}
+        return
+
+    root = auto_agents_state_root() / "port-locks"
+    root.mkdir(parents=True, exist_ok=True)
+    handles: list[object] = []
+    reservations: list[socket.socket] = []
+    allocated: dict[str, int] = {}
+    used_ports: set[int] = set()
+    try:
+        for name in normalized:
+            for _attempt in range(max(1, max_attempts)):
+                port = 49152 + secrets.randbelow(65535 - 49152 + 1)
+                if port in used_ports:
+                    continue
+                handle = (root / f"{port}.lock").open("a+")
+                try:
+                    fcntl.flock(
+                        handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError:
+                    handle.close()
+                    continue
+
+                tcp_socket: Optional[socket.socket] = None
+                udp_socket: Optional[socket.socket] = None
+                try:
+                    tcp_socket = socket.socket(
+                        socket.AF_INET,
+                        socket.SOCK_STREAM,
+                    )
+                    udp_socket = socket.socket(
+                        socket.AF_INET,
+                        socket.SOCK_DGRAM,
+                    )
+                    tcp_socket.bind(("127.0.0.1", port))
+                    udp_socket.bind(("127.0.0.1", port))
+                except OSError:
+                    if tcp_socket is not None:
+                        tcp_socket.close()
+                    if udp_socket is not None:
+                        udp_socket.close()
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    handle.close()
+                    continue
+
+                assert tcp_socket is not None
+                assert udp_socket is not None
+                handles.append(handle)
+                reservations.extend((tcp_socket, udp_socket))
+                allocated[name] = port
+                used_ports.add(port)
+                break
+            else:
+                raise RuntimeError(
+                    f"unable to allocate dynamic gate port for {name!r} "
+                    f"after {max(1, max_attempts)} attempts"
+                )
+
+        for reservation in reservations:
+            reservation.close()
+        reservations.clear()
+        yield dict(allocated)
+    finally:
+        for reservation in reservations:
+            reservation.close()
+        for handle in reversed(handles):
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
 def _safe_artifact_pattern(pattern: str) -> str:
     normalized = pattern.replace("\\", "/").strip()
     path = PurePosixPath(normalized)
@@ -217,8 +316,18 @@ def gate_environment(
     job_id: str,
     base: Optional[Mapping[str, str]] = None,
     runtime_root: Optional[Path] = None,
+    dynamic_ports: Optional[Mapping[str, int]] = None,
 ) -> dict[str, str]:
     env = dict(base or os.environ)
+    for key in list(env):
+        if (
+            key in {
+                "AUTO_AGENTS_GATE_HOST",
+                "AUTO_AGENTS_GATE_PORTS_JSON",
+            }
+            or key.startswith("AUTO_AGENTS_GATE_PORT_")
+        ):
+            env.pop(key, None)
     runtime_root = runtime_root or (sandbox / ".auto-agents-gate-runtime")
     temp_root = runtime_root / "tmp"
     cache_root = runtime_root / "cache"
@@ -241,6 +350,20 @@ def gate_environment(
             "npm_config_cache": str(cache_root / "npm"),
         }
     )
+    ports = {
+        str(name): int(port)
+        for name, port in dict(dynamic_ports or {}).items()
+    }
+    if ports:
+        env["AUTO_AGENTS_GATE_HOST"] = "127.0.0.1"
+        env["AUTO_AGENTS_GATE_PORTS_JSON"] = json.dumps(
+            ports,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for name, port in ports.items():
+            env[f"AUTO_AGENTS_GATE_PORT_{name.upper()}"] = str(port)
     return env
 
 
@@ -472,11 +595,6 @@ class LocalGatePlanExecutor:
         try:
             sandbox, _created = self._sandbox(lane, job_id)
             runtime_root = self.worktree_root / self.plan_id / ".runtime" / job_id
-            env = gate_environment(
-                sandbox,
-                job_id=job_id,
-                runtime_root=runtime_root,
-            )
             if progress is not None:
                 progress("start", command, 0.0)
             metadata = self.metadata.get(command)
@@ -484,21 +602,34 @@ class LocalGatePlanExecutor:
                 _metadata_list(metadata, "exclusive_resources"),
                 worker_id=self.worker_id,
             ):
-                process = run_supervised_shell_command(
-                    isolated_command(command),
-                    cwd=sandbox,
-                    env=env,
-                    timeout_seconds=timeout_seconds,
-                    adaptive_timeout_enabled=adaptive_timeout_enabled,
-                    idle_timeout_seconds=idle_timeout_seconds,
-                    kind="gate",
-                    cancel_event=cancel_event,
-                    progress=(
-                        (lambda event, elapsed: progress(event, command, elapsed))
-                        if progress is not None
-                        else None
-                    ),
-                )
+                with dynamic_port_lease(
+                    _metadata_list(metadata, "dynamic_ports")
+                ) as dynamic_ports:
+                    env = gate_environment(
+                        sandbox,
+                        job_id=job_id,
+                        runtime_root=runtime_root,
+                        dynamic_ports=dynamic_ports,
+                    )
+                    process = run_supervised_shell_command(
+                        isolated_command(command),
+                        cwd=sandbox,
+                        env=env,
+                        timeout_seconds=timeout_seconds,
+                        adaptive_timeout_enabled=adaptive_timeout_enabled,
+                        idle_timeout_seconds=idle_timeout_seconds,
+                        kind="gate",
+                        cancel_event=cancel_event,
+                        progress=(
+                            (
+                                lambda event, elapsed: progress(
+                                    event, command, elapsed
+                                )
+                            )
+                            if progress is not None
+                            else None
+                        ),
+                    )
             mutations = self._mutation_paths(sandbox)
             self._publish_diagnostics(sandbox, job_id)
             stderr = process.stderr
