@@ -360,6 +360,10 @@ class GateTests(unittest.TestCase):
                         kind="test",
                         runner="pytest",
                         targets=["tests"],
+                        cpu_slots=2,
+                        memory_mb=1024,
+                        memory_reserve_mb=256,
+                        memory_guard="advisory",
                         dynamic_ports=["api"],
                     )
                 ],
@@ -367,6 +371,10 @@ class GateTests(unittest.TestCase):
             )
 
             self.assertEqual(steps[0].dynamic_ports, ["api"])
+            self.assertEqual(steps[0].cpu_slots, 2)
+            self.assertEqual(steps[0].memory_mb, 1024)
+            self.assertEqual(steps[0].memory_reserve_mb, 256)
+            self.assertEqual(steps[0].memory_guard, "advisory")
 
     def test_verification_step_ignores_freeform_command_field(self) -> None:
         command = command_from_verification_step(
@@ -396,12 +404,25 @@ class GateTests(unittest.TestCase):
             targets=["tests/test_demo.py"],
             cadence="final_only",
             cache_scope="source",
+            cpu_slots=3,
+            memory_mb=4096,
+            memory_reserve_mb=1024,
+            memory_guard="required",
             dynamic_ports=["api"],
         ).to_dict()
 
         self.assertEqual(payload["cadence"], "final_only")
         self.assertEqual(payload["cache_scope"], "source")
+        self.assertEqual(payload["cpu_slots"], 3)
+        self.assertEqual(payload["memory_mb"], 4096)
+        self.assertEqual(payload["memory_reserve_mb"], 1024)
+        self.assertEqual(payload["memory_guard"], "required")
         self.assertEqual(payload["dynamic_ports"], ["api"])
+        restored = VerificationStep.from_dict(payload)
+        self.assertEqual(restored.cpu_slots, 3)
+        self.assertEqual(restored.memory_mb, 4096)
+        self.assertEqual(restored.memory_reserve_mb, 1024)
+        self.assertEqual(restored.memory_guard, "required")
 
     def test_gate_plan_filters_final_only_and_deduplicates_conservatively(self) -> None:
         duplicate_target = ["tests/test_demo.py"]
@@ -411,6 +432,10 @@ class GateTests(unittest.TestCase):
                 targets=duplicate_target,
                 parallel_safe=True,
                 cache_scope="source",
+                cpu_slots=2,
+                memory_mb=4096,
+                memory_reserve_mb=512,
+                memory_guard="advisory",
                 dynamic_ports=["api"],
             ),
             VerificationStep(
@@ -418,6 +443,10 @@ class GateTests(unittest.TestCase):
                 targets=duplicate_target,
                 parallel_safe=False,
                 cache_scope="run_context",
+                cpu_slots=3,
+                memory_mb=2048,
+                memory_reserve_mb=1024,
+                memory_guard="required",
                 dynamic_ports=["frontend", "api"],
             ),
             VerificationStep(
@@ -446,6 +475,18 @@ class GateTests(unittest.TestCase):
         self.assertEqual(
             implement.metadata[implement.commands[0]].dynamic_ports,
             ["api", "frontend"],
+        )
+        self.assertEqual(
+            implement.metadata[implement.commands[0]].cpu_slots, 3
+        )
+        self.assertEqual(
+            implement.metadata[implement.commands[0]].memory_mb, 4096
+        )
+        self.assertEqual(
+            implement.metadata[implement.commands[0]].memory_reserve_mb, 1024
+        )
+        self.assertEqual(
+            implement.metadata[implement.commands[0]].memory_guard, "required"
         )
         self.assertEqual(final.unique_command_count, 2)
 

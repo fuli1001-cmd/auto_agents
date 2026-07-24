@@ -1221,6 +1221,7 @@ class Orchestrator:
                 if stage != "clarify" and self._route_forbidden_pattern_definition_recovery(state):
                     save_run_state(self.project_root, state)
                     continue
+                stage_had_summary = stage in state.stage_summaries
                 self._emit_stage_start(stage)
                 try:
                     with log_timing(self.logger, f"stage:{stage}"):
@@ -1265,6 +1266,19 @@ class Orchestrator:
 
                 self._merge_persisted_execution_incidents(state)
                 self._resolve_rewound_execution_incident(state, stage)
+                stage_completed_now = (
+                    not stage_had_summary
+                    and stage in state.stage_summaries
+                    and not state.active_execution_incident_id
+                    and not (
+                        stage == "implement" and self._task_budget_exhausted
+                    )
+                )
+                if stage_completed_now:
+                    self._advance_execution_incident_budget_epoch(
+                        state,
+                        reason=f"stage {stage} completed",
+                    )
                 save_run_state(self.project_root, state)
                 if state.status == "blocked" or (
                     state.status == "paused" and stage not in state.stage_summaries
@@ -1354,6 +1368,13 @@ class Orchestrator:
         state.implement_verify_baseline_failures = []
         state.implement_verify_baseline_ref = ""
         state.plan_task_replacements = {}
+        state.recovery_loop_events = []
+        state.last_recovery_route = {}
+        state.active_execution_incident_id = ""
+        state.execution_incidents = []
+        state.execution_incident_budget_epoch = 0
+        state.execution_incident_budget_checkpoint = {}
+        state.active_blocker = {}
         state.last_error = ""
         state.rejection_reason = ""
         state.rejected_stage = ""
@@ -3369,6 +3390,16 @@ class Orchestrator:
             return
         state.execution_incidents = list(persisted.execution_incidents)
         state.active_execution_incident_id = persisted.active_execution_incident_id
+        if (
+            persisted.execution_incident_budget_epoch
+            > state.execution_incident_budget_epoch
+        ):
+            state.execution_incident_budget_epoch = (
+                persisted.execution_incident_budget_epoch
+            )
+            state.execution_incident_budget_checkpoint = dict(
+                persisted.execution_incident_budget_checkpoint
+            )
 
     def _merge_or_save_execution_incident(
         self,
@@ -3376,11 +3407,14 @@ class Orchestrator:
         incident: ExecutionIncident,
     ) -> ExecutionIncident:
         store = self._incident_store(state)
+        incident.budget_epoch = state.execution_incident_budget_epoch
         existing = None
         for summary in reversed(state.execution_incidents):
             if (
                 str(summary.get("incident_fingerprint", ""))
                 == incident.incident_fingerprint
+                and int(summary.get("budget_epoch", 0) or 0)
+                == state.execution_incident_budget_epoch
                 and str(summary.get("status", "")) != "resolved"
             ):
                 existing = store.load(str(summary.get("incident_id", "")))
@@ -3401,6 +3435,55 @@ class Orchestrator:
             incident = existing
         store.save(incident, state)
         return incident
+
+    @staticmethod
+    def _execution_incident_budget_fingerprints(state: RunState) -> Set[str]:
+        epoch = state.execution_incident_budget_epoch
+        return {
+            str(entry.get("incident_fingerprint", ""))
+            for entry in state.execution_incidents
+            if str(entry.get("incident_fingerprint", ""))
+            and int(entry.get("budget_epoch", 0) or 0) == epoch
+        }
+
+    def _advance_execution_incident_budget_epoch(
+        self,
+        state: RunState,
+        *,
+        reason: str,
+        incident: Optional[ExecutionIncident] = None,
+    ) -> bool:
+        previous_epoch = state.execution_incident_budget_epoch
+        epoch_entries = [
+            entry
+            for entry in state.execution_incidents
+            if int(entry.get("budget_epoch", 0) or 0) == previous_epoch
+        ]
+        if not epoch_entries:
+            return False
+        latest = epoch_entries[-1]
+        state.execution_incident_budget_epoch = previous_epoch + 1
+        state.execution_incident_budget_checkpoint = {
+            "previous_epoch": previous_epoch,
+            "epoch": state.execution_incident_budget_epoch,
+            "reason": reason,
+            "incident_id": (
+                incident.incident_id
+                if incident is not None
+                else str(latest.get("incident_id", ""))
+            ),
+            "stage": (
+                incident.stage
+                if incident is not None
+                else str(latest.get("stage", state.current_stage))
+            ),
+            "head": incident.head_ref if incident is not None else "",
+            "worktree": (
+                incident.worktree_fingerprint if incident is not None else ""
+            ),
+            "updated_at": utc_now_iso(),
+        }
+        return True
 
     def _block_for_execution_incident(
         self,
@@ -3639,11 +3722,7 @@ class Orchestrator:
         diagnosis = deterministic_diagnosis(incident)
         if diagnosis is not None:
             incident.diagnosis = diagnosis.to_dict()
-        distinct_incidents = {
-            str(entry.get("incident_fingerprint", ""))
-            for entry in state.execution_incidents
-            if str(entry.get("incident_fingerprint", ""))
-        }
+        distinct_incidents = self._execution_incident_budget_fingerprints(state)
         previous = next(
             (entry for entry in reversed(incident.history) if entry.get("event") == "route"),
             None,
@@ -3702,11 +3781,7 @@ class Orchestrator:
             return self._block_for_execution_incident(
                 state, incident, "automatic execution recovery is disabled"
             )
-        distinct_incidents = {
-            str(entry.get("incident_fingerprint", ""))
-            for entry in state.execution_incidents
-            if str(entry.get("incident_fingerprint", ""))
-        }
+        distinct_incidents = self._execution_incident_budget_fingerprints(state)
         if len(distinct_incidents) > self.config.execution.recovery.max_incidents_per_run:
             return self._block_for_execution_incident(
                 state, incident, "run-level incident budget was exhausted"
@@ -4260,6 +4335,11 @@ class Orchestrator:
             {"event": "resolved", "task_id": task.task_id, "commit_sha": task.commit_sha}
         )
         store.save(incident, state)
+        self._advance_execution_incident_budget_epoch(
+            state,
+            reason="execution recovery task passed its original command",
+            incident=incident,
+        )
         self._clear_run_blocker(state)
 
     def _resolve_inline_task_incident(self, state: RunState, task: TaskSpec) -> None:
@@ -4277,6 +4357,11 @@ class Orchestrator:
             {"event": "resolved", "task_id": task.task_id, "reason": "task retry succeeded"}
         )
         store.save(incident, state)
+        self._advance_execution_incident_budget_epoch(
+            state,
+            reason="task retry passed",
+            incident=incident,
+        )
         self._clear_run_blocker(state)
 
     def _resolve_rewound_execution_incident(self, state: RunState, stage: str) -> None:
@@ -4295,6 +4380,42 @@ class Orchestrator:
         incident.status = "resolved"
         incident.history.append({"event": "resolved", "stage": stage})
         store.save(incident, state)
+        self._advance_execution_incident_budget_epoch(
+            state,
+            reason=f"stage {stage} completed after execution recovery",
+            incident=incident,
+        )
+        self._clear_run_blocker(state)
+
+    def _resolve_successful_baseline_execution_incident(
+        self,
+        state: RunState,
+        *,
+        context: str,
+    ) -> None:
+        store = self._incident_store(state)
+        incident = store.active(state)
+        if (
+            incident is None
+            or incident.source != "gate"
+            or not incident.baseline
+            or incident.context != context
+            or incident.status != "recovering"
+        ):
+            return
+        incident.status = "resolved"
+        incident.history.append(
+            {
+                "event": "resolved",
+                "reason": "baseline commands produced a finite result",
+            }
+        )
+        store.save(incident, state)
+        self._advance_execution_incident_budget_epoch(
+            state,
+            reason="baseline commands produced a finite result",
+            incident=incident,
+        )
         self._clear_run_blocker(state)
 
     def _default_gate_commands(self) -> List[str]:
@@ -8564,6 +8685,10 @@ class Orchestrator:
             if task.verify_baseline_failures != baseline_failures:
                 task.verify_baseline_failures = list(baseline_failures)
                 changed = True
+        self._resolve_successful_baseline_execution_incident(
+            state,
+            context="implement verify baseline commands",
+        )
         return changed
 
     def _warm_clean_head_verify_baseline(
@@ -10921,7 +11046,7 @@ class Orchestrator:
                 "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist; auto_agents may expand directory targets such as ['tests'] into per-file pytest steps before running gates. Set parallel_safe=true only when a step is isolated from shared databases, ports, mutable fixtures, snapshots, build outputs, and other process-global state; otherwise omit it or set false.",
                 "Classify verification cadence explicitly: use cadence='implement_and_final' for focused checks needed during implementation and cadence='final_only' for broad release suites. Classify cache_scope='source' only when results depend solely on HEAD and tracked/untracked source content; use cache_scope='run_context' for requirements/task-state/config-sensitive checks. Defaults are implement_and_final and run_context.",
                 "Gate commands run in snapshot-backed worktrees. Use per-test relative temp paths and dynamically allocated port 0 whenever the same process can discover the bound port. When a child process requires a numeric port before launch, declare lowercase snake_case dynamic_ports names and make the test read AUTO_AGENTS_GATE_PORT_<UPPER_NAME>; keep a port-0 fallback for manual runs. Declaring dynamic_ports does not by itself make a step parallel-safe. Commands that intentionally share generated artifacts must remain parallel_safe=false and appear in producer-before-consumer order; commands that use unadapted fixed host ports, Docker daemons, or shared external accounts must declare host:/pool: exclusive_resources.",
-                "Declare requires for non-default tools such as ffmpeg or chrome, resource_class='heavy' for browser/FFmpeg workloads, and artifact_globs only for ignored project-relative evidence that must survive sandbox cleanup. Never use absolute artifact paths or '..'.",
+                "Declare requires for non-default tools such as ffmpeg or chrome and resource_class='heavy' for browser/FFmpeg workloads. Use cpu_slots only when a command needs an explicit scheduling capacity instead of the resource_class default. Memory checks are opt-in: memory_mb is the measured command working-set budget, memory_reserve_mb is the desired host reserve, and memory_guard must be 'off', 'advisory', or 'required'. Prefer advisory unless a dependable hard minimum is known; never invent a memory estimate. Declare artifact_globs only for ignored project-relative evidence that must survive sandbox cleanup. Never use absolute artifact paths or '..'.",
                 "For JavaScript/TypeScript verification, use verification_steps entries with kind='test', runner='vitest'.",
                 "Do not generate free-form shell verification commands for test steps; auto_agents derives the runnable command from verification_steps.",
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
@@ -13036,11 +13161,7 @@ class Orchestrator:
             )
         self._incident_store(state).save(incident, state)
         save_run_state(self.project_root, state)
-        distinct = {
-            str(entry.get("incident_fingerprint", ""))
-            for entry in state.execution_incidents
-            if str(entry.get("incident_fingerprint", ""))
-        }
+        distinct = self._execution_incident_budget_fingerprints(state)
         if len(distinct) > self.config.execution.recovery.max_incidents_per_run:
             incident.status = "needs_human"
             incident.history.append(
@@ -13061,6 +13182,12 @@ class Orchestrator:
         incident.status = "resolved"
         incident.history.append({"event": "resolved", "reason": "provider attempt succeeded"})
         self._incident_store(state).save(incident, state)
+        self._advance_execution_incident_budget_epoch(
+            state,
+            reason="provider attempt succeeded",
+            incident=incident,
+        )
+        self._clear_run_blocker(state)
         save_run_state(self.project_root, state)
 
     def _provider_request_for_attempt(

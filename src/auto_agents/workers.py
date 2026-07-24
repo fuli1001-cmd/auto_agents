@@ -8,6 +8,7 @@ import hashlib
 import hmac
 from importlib import metadata as importlib_metadata
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import platform
@@ -35,7 +36,8 @@ from .models import CommandResult
 from .process_supervision import process_group_exists, run_supervised_shell_command
 
 
-WORKER_PROTOCOL_VERSION = 2
+WORKER_PROTOCOL_VERSION = 3
+LOGGER = logging.getLogger(__name__)
 
 SYSTEM_ENVIRONMENT_DENYLIST = frozenset(
     {
@@ -327,6 +329,9 @@ class WorkerSlotLease:
         slots: int,
         required: int,
         *,
+        memory_mb: int = 0,
+        memory_reserve_mb: int = 0,
+        memory_guard: str = "off",
         timeout_seconds: float = 30.0,
         cancel_event: Optional[threading.Event] = None,
     ) -> None:
@@ -334,6 +339,15 @@ class WorkerSlotLease:
         self.worker_id = worker_id
         self.slots = max(1, slots)
         self.required = max(1, min(required, self.slots))
+        self.memory_mb = max(0, int(memory_mb))
+        self.memory_reserve_mb = max(0, int(memory_reserve_mb))
+        self.memory_guard = str(memory_guard).strip().lower() or "off"
+        if self.memory_guard not in {"off", "advisory", "required"}:
+            raise ValueError(f"unsupported worker memory guard: {memory_guard}")
+        if self.memory_guard != "off" and self.memory_mb <= 0:
+            raise ValueError(
+                "worker memory_mb must be positive when memory_guard is enabled"
+            )
         self.timeout_seconds = max(0.0, timeout_seconds)
         self.cancel_event = cancel_event
         self.handles: list[object] = []
@@ -342,29 +356,44 @@ class WorkerSlotLease:
         slot_root = self.root / "slots" / self.worker_id
         slot_root.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self.timeout_seconds
-        required_memory = (
-            4 * 1024**3 if self.required >= 2 else 2 * 1024**3
+        memory_threshold = (
+            (self.memory_mb + self.memory_reserve_mb) * 1024**2
+            if self.memory_guard != "off"
+            else 0
         )
-        memory_threshold = required_memory + 2 * 1024**3
         memory_available = 0
+        memory_warning_emitted = False
         while len(self.handles) < self.required:
             if self.cancel_event is not None and self.cancel_event.is_set():
                 raise RuntimeError("worker slot acquisition was cancelled")
             memory_available = _memory_available_bytes()
             if (
                 memory_available > 0
+                and memory_threshold > 0
                 and memory_available < memory_threshold
             ):
-                if time.monotonic() >= deadline:
+                if self.memory_guard == "advisory":
+                    if not memory_warning_emitted:
+                        LOGGER.warning(
+                            "worker memory is below the command declaration: "
+                            "%d MiB available, %d MiB requested plus %d MiB reserve; "
+                            "continuing because memory_guard=advisory",
+                            memory_available // 1024**2,
+                            self.memory_mb,
+                            self.memory_reserve_mb,
+                        )
+                        memory_warning_emitted = True
+                elif time.monotonic() >= deadline:
                     raise RuntimeError(
                         "worker memory capacity remained unavailable for "
                         f"{self.timeout_seconds:.1f}s: "
                         f"{memory_available // 1024**2} MiB available, "
-                        f"{memory_threshold // 1024**2} MiB required "
-                        "including the safety reserve"
+                        f"{self.memory_mb} MiB requested plus "
+                        f"{self.memory_reserve_mb} MiB safety reserve"
                     )
-                self._wait(0.5)
-                continue
+                else:
+                    self._wait(0.5)
+                    continue
             allocation_handle = (slot_root / ".allocation.lock").open("a+")
             try:
                 try:
@@ -1139,7 +1168,22 @@ def worker_execute(
     sandbox: Optional[Path] = None
     lane = str(manifest.get("lane", "")).strip()
     keep_sandbox = bool(lane)
-    required_slots = 2 if str(manifest.get("resource_class", "")) == "heavy" else 1
+    try:
+        declared_slots = max(0, int(manifest.get("cpu_slots", 0) or 0))
+        memory_mb = max(0, int(manifest.get("memory_mb", 0) or 0))
+        memory_reserve_mb = max(
+            0, int(manifest.get("memory_reserve_mb", 0) or 0)
+        )
+    except (TypeError, ValueError):
+        declared_slots = 0
+        memory_mb = 0
+        memory_reserve_mb = 0
+    required_slots = declared_slots or (
+        2 if str(manifest.get("resource_class", "")) == "heavy" else 1
+    )
+    memory_guard = str(manifest.get("memory_guard", "off")).strip().lower()
+    if memory_guard not in {"off", "advisory", "required"}:
+        memory_guard = "off"
     base_record: dict[str, object] = {
         "protocol_version": WORKER_PROTOCOL_VERSION,
         "job_id": job_id,
@@ -1156,6 +1200,9 @@ def worker_execute(
             config.worker_id,
             config.max_slots,
             required_slots,
+            memory_mb=memory_mb,
+            memory_reserve_mb=memory_reserve_mb,
+            memory_guard=memory_guard,
             cancel_event=cancel_event,
         ):
             mirror, sandbox, _created = _worker_sandbox(config, manifest)

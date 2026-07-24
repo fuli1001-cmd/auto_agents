@@ -572,6 +572,10 @@ Gate steps may also declare scheduling and artifact metadata:
   "targets": ["workbench/src/e2e/example.test.ts"],
   "parallel_safe": true,
   "resource_class": "heavy",
+  "cpu_slots": 2,
+  "memory_mb": 4096,
+  "memory_reserve_mb": 1024,
+  "memory_guard": "advisory",
   "requires": ["node", "chrome"],
   "exclusive_resources": ["host:display-99"],
   "dynamic_ports": ["api", "frontend"],
@@ -579,10 +583,21 @@ Gate steps may also declare scheduling and artifact metadata:
 }
 ```
 
-`resource_class=heavy` consumes two worker slots; normal commands consume one. `requires` limits
-dispatch to workers that advertise every capability. `host:<name>` locks one resource on a worker,
-while `pool:<name>` locks it across the controller's entire pool. `dynamic_ports` asks the actual
-execution worker to reserve distinct loopback ports and exports them as
+`cpu_slots` declares how many worker scheduling slots the command consumes. Zero or omission keeps
+the compatibility default: `resource_class=heavy` consumes two slots and normal commands consume
+one. It is a capacity declaration, not CPU affinity or an exact core reservation.
+
+Memory checks are opt-in and use MiB. `memory_mb` is the command's expected working-set budget and
+`memory_reserve_mb` is memory that should remain available for the OS and other processes.
+`memory_guard=required` waits for the declared total and fails if it remains unavailable;
+`advisory` logs a warning but still runs; `off` (the default) performs no memory check. In
+particular, `resource_class=heavy` no longer implies a guessed 6 GiB threshold. Declare a required
+guard only when the command has a measured, dependable minimum; otherwise prefer `advisory` or
+leave the guard off.
+
+`requires` limits dispatch to workers that advertise every capability. `host:<name>` locks one
+resource on a worker, while `pool:<name>` locks it across the controller's entire pool.
+`dynamic_ports` asks the actual execution worker to reserve distinct loopback ports and exports them as
 `AUTO_AGENTS_GATE_PORT_<UPPER_NAME>`, plus `AUTO_AGENTS_GATE_HOST=127.0.0.1` and a JSON map in
 `AUTO_AGENTS_GATE_PORTS_JSON`. Prefer binding port `0` directly when the test process owns the
 listener; use named ports for child processes that require a number before launch. Port metadata
@@ -673,7 +688,10 @@ On a stall or ceiling timeout, auto_agents terminates the entire command process
 `SIGTERM`/`SIGKILL` cleanup and persists a structured execution incident. Deterministic rules route
 high-confidence incidents to bounded retry, stage rewind, or a pre-baseline target-project repair
 task. The same incident gets at most `execution.recovery.max_rounds` recovery rounds (two by
-default), and a run gets at most `max_incidents_per_run` distinct incidents. Cleanup uncertainty,
+default), and the current recovery epoch gets at most `max_incidents_per_run` distinct incidents.
+An epoch closes only after a concrete stable checkpoint, such as the original recovery command,
+baseline, provider attempt, task retry, or stage completing successfully. Earlier incidents remain
+in the run history for audit but no longer consume the next epoch's budget. Cleanup uncertainty,
 low-confidence diagnosis, or exhausted budgets pause safely instead of mutating blindly.
 
 A pre-baseline repair task owns the exact command that created the incident; it does not fall back
@@ -873,8 +891,8 @@ during implementation.
 Across iterations, `state/task_plan.json` is the active plan for the current run, not a permanent
 history table. When a completed project starts a new iteration, auto_agents archives the previous
 plan to `.auto-agents/history/task_plans/<run_id>.json`, archives the final run state beside it,
-and resets the active plan to an empty `{ "tasks": [] }` placeholder until the new plan stage
-generates current-iteration tasks.
+resets incident, blocker, and recovery-budget state, and resets the active plan to an empty
+`{ "tasks": [] }` placeholder until the new plan stage generates current-iteration tasks.
 
 Archived done tasks from `.auto-agents/history/task_plans/*.json` are still used as historical
 requirement coverage. If an archived task has verified requirement proofs that still satisfy the

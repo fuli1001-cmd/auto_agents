@@ -205,7 +205,29 @@ class DistributedGatePlanExecutor:
         )
 
     def _required_slots(self, command: str) -> int:
+        declared = self._metadata_int(command, "cpu_slots")
+        if declared > 0:
+            return declared
         return 2 if self._resource_class(command) == "heavy" else 1
+
+    def _metadata_int(self, command: str, field: str) -> int:
+        raw = getattr(self.metadata.get(command), field, 0)
+        try:
+            return max(0, int(raw or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _memory_policy(self, command: str) -> tuple[int, int, str]:
+        guard = str(
+            getattr(self.metadata.get(command), "memory_guard", "off")
+        ).strip().lower()
+        if guard not in {"off", "advisory", "required"}:
+            guard = "off"
+        return (
+            self._metadata_int(command, "memory_mb"),
+            self._metadata_int(command, "memory_reserve_mb"),
+            guard,
+        )
 
     def _metadata_list(self, command: str, field: str) -> list[str]:
         raw = getattr(self.metadata.get(command), field, [])
@@ -435,6 +457,7 @@ class DistributedGatePlanExecutor:
             raise RuntimeError("gate snapshot is unavailable")
         distributed = self.gate_config.distributed
         artifact_globs = self._metadata_list(command, "artifact_globs")
+        memory_mb, memory_reserve_mb, memory_guard = self._memory_policy(command)
         manifest = {
             "protocol_version": WORKER_PROTOCOL_VERSION,
             "project_key": self.key,
@@ -444,6 +467,10 @@ class DistributedGatePlanExecutor:
             "lane": lane,
             "command": command,
             "resource_class": self._resource_class(command),
+            "cpu_slots": self._metadata_int(command, "cpu_slots"),
+            "memory_mb": memory_mb,
+            "memory_reserve_mb": memory_reserve_mb,
+            "memory_guard": memory_guard,
             "environment_manifest": self.environment_manifest,
             "environment": forwarded_environment(
                 os.environ,
@@ -539,6 +566,7 @@ class DistributedGatePlanExecutor:
         progress,
     ) -> CommandResult:
         required = self._required_slots(command)
+        memory_mb, memory_reserve_mb, memory_guard = self._memory_policy(command)
         if endpoint.transport == "local":
             local_config = load_local_worker_config()
             with WorkerSlotLease(
@@ -546,6 +574,9 @@ class DistributedGatePlanExecutor:
                 endpoint.worker_id,
                 endpoint.max_slots,
                 required,
+                memory_mb=memory_mb,
+                memory_reserve_mb=memory_reserve_mb,
+                memory_guard=memory_guard,
                 cancel_event=cancel_event,
             ):
                 result = self.local.run(

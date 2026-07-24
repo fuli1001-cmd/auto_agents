@@ -20,6 +20,7 @@ TASK_ORIGINS = ("planned", "scope_split", "evidence_repair", "stage_recovery")
 VERIFICATION_CADENCES = ("implement_and_final", "final_only")
 VERIFICATION_CACHE_SCOPES = ("source", "run_context")
 VERIFICATION_RESOURCE_CLASSES = ("normal", "heavy")
+VERIFICATION_MEMORY_GUARDS = ("off", "advisory", "required")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity-claude", "antigravity-gemini")
 DEFAULT_EFFORTS = {
     "clarify": "deep",
@@ -260,6 +261,10 @@ class VerificationStep:
     cadence: str = "implement_and_final"
     cache_scope: str = "run_context"
     resource_class: str = "normal"
+    cpu_slots: int = 0
+    memory_mb: int = 0
+    memory_reserve_mb: int = 0
+    memory_guard: str = "off"
     requires: List[str] = field(default_factory=list)
     exclusive_resources: List[str] = field(default_factory=list)
     dynamic_ports: List[str] = field(default_factory=list)
@@ -277,6 +282,10 @@ class VerificationStep:
             cadence=str(data.get("cadence", "implement_and_final")),
             cache_scope=str(data.get("cache_scope", "run_context")),
             resource_class=str(data.get("resource_class", "normal")),
+            cpu_slots=int(data.get("cpu_slots", 0) or 0),
+            memory_mb=int(data.get("memory_mb", 0) or 0),
+            memory_reserve_mb=int(data.get("memory_reserve_mb", 0) or 0),
+            memory_guard=str(data.get("memory_guard", "off")),
             requires=[str(item) for item in data.get("requires", [])],
             exclusive_resources=[
                 str(item) for item in data.get("exclusive_resources", [])
@@ -297,6 +306,10 @@ class VerificationStep:
             "cadence": self.cadence,
             "cache_scope": self.cache_scope,
             "resource_class": self.resource_class,
+            "cpu_slots": self.cpu_slots,
+            "memory_mb": self.memory_mb,
+            "memory_reserve_mb": self.memory_reserve_mb,
+            "memory_guard": self.memory_guard,
             "requires": list(self.requires),
             "exclusive_resources": list(self.exclusive_resources),
             "dynamic_ports": list(self.dynamic_ports),
@@ -906,6 +919,10 @@ class RunState:
     last_recovery_route: Dict[str, object] = field(default_factory=dict)
     active_execution_incident_id: str = ""
     execution_incidents: List[Dict[str, object]] = field(default_factory=list)
+    execution_incident_budget_epoch: int = 0
+    execution_incident_budget_checkpoint: Dict[str, object] = field(
+        default_factory=dict
+    )
     active_blocker: Dict[str, object] = field(default_factory=dict)
 
     @classmethod
@@ -957,6 +974,16 @@ class RunState:
                 entry for entry in (data.get("execution_incidents", []) or [])
                 if isinstance(entry, dict)
             ],
+            execution_incident_budget_epoch=max(
+                0, int(data.get("execution_incident_budget_epoch", 0) or 0)
+            ),
+            execution_incident_budget_checkpoint=(
+                dict(data.get("execution_incident_budget_checkpoint", {}))
+                if isinstance(
+                    data.get("execution_incident_budget_checkpoint", {}), dict
+                )
+                else {}
+            ),
             active_blocker=(
                 dict(data.get("active_blocker", {}))
                 if isinstance(data.get("active_blocker", {}), dict)
@@ -992,6 +1019,11 @@ class RunState:
             "last_recovery_route": dict(self.last_recovery_route),
             "active_execution_incident_id": self.active_execution_incident_id,
             "execution_incidents": list(self.execution_incidents),
+            "execution_incident_budget_epoch": self.execution_incident_budget_epoch,
+            "execution_incident_budget_checkpoint": dict(
+                self.execution_incident_budget_checkpoint
+            ),
+            "active_blocker": dict(self.active_blocker),
         }
 
 

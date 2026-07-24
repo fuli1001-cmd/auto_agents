@@ -13,6 +13,7 @@ from auto_agents.execution_recovery import (
     command_incident,
     deterministic_diagnosis,
     parse_incident_diagnosis,
+    provider_incident,
 )
 from auto_agents.models import AgentResult, AgentTermination, CommandResult, RunState, TaskSpec
 from auto_agents.gates import GateCommandTimeoutError
@@ -44,6 +45,87 @@ class ExecutionRecoveryTests(unittest.TestCase):
         self.assertEqual(incident.kind, "gate_stall")
         self.assertNotIn("secret-value", incident.stderr_tail)
         self.assertEqual(incident.process_snapshot["pgid"], 12)
+
+    def test_command_incident_dynamic_output_changes_evidence_not_identity(self) -> None:
+        first = command_incident(
+            run_id="run-1",
+            stage="implement",
+            context="baseline",
+            result=CommandResult(
+                command="npm exec -- vitest run browser.test.ts",
+                ok=False,
+                returncode=125,
+                stderr=(
+                    "worker memory capacity remained unavailable for 30.0s: "
+                    "4597 MiB available, 6144 MiB required"
+                ),
+                termination_reason="remote_lane_state_lost",
+            ),
+            baseline=True,
+            head_ref="head-1",
+        )
+        second = command_incident(
+            run_id="run-1",
+            stage="implement",
+            context="baseline",
+            result=CommandResult(
+                command="npm exec -- vitest run browser.test.ts",
+                ok=False,
+                returncode=125,
+                stderr=(
+                    "worker memory capacity remained unavailable for 30.0s: "
+                    "4590 MiB available, 6144 MiB required"
+                ),
+                termination_reason="remote_lane_state_lost",
+            ),
+            baseline=True,
+            head_ref="head-1",
+        )
+
+        self.assertEqual(first.incident_fingerprint, second.incident_fingerprint)
+        self.assertNotEqual(first.evidence_fingerprint, second.evidence_fingerprint)
+
+    def test_provider_incident_dynamic_output_changes_evidence_not_identity(self) -> None:
+        first = provider_incident(
+            run_id="run-1",
+            stage="implement",
+            provider="codex",
+            result=AgentResult(
+                ok=False,
+                command=["codex"],
+                output_path=Path("first.md"),
+                stderr="provider request req-123 failed after 5.1s",
+                returncode=1,
+                termination=AgentTermination(
+                    reason="provider_error",
+                    elapsed_seconds=5.1,
+                ),
+            ),
+            head_ref="head-1",
+        )
+        second = provider_incident(
+            run_id="run-1",
+            stage="implement",
+            provider="codex",
+            result=AgentResult(
+                ok=False,
+                command=["codex"],
+                output_path=Path("second.md"),
+                stderr="provider request req-456 failed after 6.2s",
+                returncode=1,
+                termination=AgentTermination(
+                    reason="provider_error",
+                    elapsed_seconds=6.2,
+                ),
+            ),
+            head_ref="head-1",
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertEqual(first.incident_fingerprint, second.incident_fingerprint)
+        self.assertNotEqual(first.evidence_fingerprint, second.evidence_fingerprint)
 
     def test_deterministic_routes_watch_mode_to_plan(self) -> None:
         incident = ExecutionIncident(
@@ -135,6 +217,273 @@ class ExecutionRecoveryTests(unittest.TestCase):
             incident.status = "resolved"
             store.save(incident, state)
             self.assertEqual(state.active_execution_incident_id, "")
+
+    def test_run_state_round_trips_incident_budget_and_blocker(self) -> None:
+        state = RunState(
+            run_id="run-1",
+            execution_incident_budget_epoch=3,
+            execution_incident_budget_checkpoint={
+                "epoch": 3,
+                "reason": "baseline passed",
+            },
+            active_blocker={
+                "owner": "auto_agents",
+                "category": "gate_timeout",
+            },
+        )
+
+        restored = RunState.from_dict(state.to_dict())
+
+        self.assertEqual(restored.execution_incident_budget_epoch, 3)
+        self.assertEqual(
+            restored.execution_incident_budget_checkpoint["reason"],
+            "baseline passed",
+        )
+        self.assertEqual(restored.active_blocker["owner"], "auto_agents")
+
+    def test_new_iteration_resets_incident_and_blocker_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            previous_run_id = state.run_id
+            state.status = "completed"
+            state.active_execution_incident_id = "incident-1"
+            state.execution_incidents = [
+                {
+                    "incident_id": "incident-1",
+                    "incident_fingerprint": "fingerprint-1",
+                    "budget_epoch": 4,
+                }
+            ]
+            state.execution_incident_budget_epoch = 4
+            state.execution_incident_budget_checkpoint = {
+                "epoch": 4,
+                "reason": "old checkpoint",
+            }
+            state.active_blocker = {"owner": "auto_agents", "status": "blocked"}
+            state.recovery_loop_events = [{"event": "old recovery"}]
+            state.last_recovery_route = {"action": "RETRY"}
+            save_run_state(root, state)
+
+            next_state = orchestrator._start_new_iteration(state)
+
+            self.assertNotEqual(next_state.run_id, previous_run_id)
+            self.assertEqual(next_state.execution_incidents, [])
+            self.assertEqual(next_state.active_execution_incident_id, "")
+            self.assertEqual(next_state.execution_incident_budget_epoch, 0)
+            self.assertEqual(next_state.execution_incident_budget_checkpoint, {})
+            self.assertEqual(next_state.active_blocker, {})
+            self.assertEqual(next_state.recovery_loop_events, [])
+            self.assertEqual(next_state.last_recovery_route, {})
+
+    def test_run_incident_budget_counts_only_the_current_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            state.execution_incident_budget_epoch = 1
+            state.execution_incidents = [
+                {
+                    "incident_id": f"old-{index}",
+                    "incident_fingerprint": f"old-fingerprint-{index}",
+                    "budget_epoch": 0,
+                    "status": "resolved",
+                }
+                for index in range(10)
+            ]
+            incident = ExecutionIncident(
+                incident_id="current-1",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_remote_lane_state_lost",
+                stage="implement",
+                context="baseline",
+                command="npm exec -- vitest run browser.test.ts",
+                termination_reason="remote_lane_state_lost",
+                incident_fingerprint="current-fingerprint",
+                evidence_fingerprint="current-evidence",
+            )
+            incident = orchestrator._merge_or_save_execution_incident(
+                state, incident
+            )
+
+            recovered = orchestrator._apply_execution_incident_diagnosis(
+                state,
+                incident,
+                IncidentDiagnosis(
+                    owner="external_provider",
+                    action="RETRY",
+                    confidence=0.95,
+                    reason="retry the current execution lane",
+                ),
+            )
+
+            self.assertTrue(recovered)
+            self.assertEqual(incident.budget_epoch, 1)
+            self.assertEqual(incident.recovery_round, 1)
+            self.assertEqual(state.status, "pending")
+
+    def test_run_incident_budget_blocks_seventh_identity_in_current_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            state.execution_incident_budget_epoch = 2
+            state.execution_incidents = [
+                {
+                    "incident_id": f"current-{index}",
+                    "incident_fingerprint": f"current-fingerprint-{index}",
+                    "budget_epoch": 2,
+                    "status": "recovering",
+                }
+                for index in range(6)
+            ]
+            incident = ExecutionIncident(
+                incident_id="current-7",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_remote_lane_state_lost",
+                stage="implement",
+                context="baseline",
+                command="npm exec -- vitest run browser.test.ts",
+                termination_reason="remote_lane_state_lost",
+                incident_fingerprint="current-fingerprint-7",
+                evidence_fingerprint="current-evidence-7",
+            )
+            incident = orchestrator._merge_or_save_execution_incident(
+                state, incident
+            )
+
+            recovered = orchestrator._apply_execution_incident_diagnosis(
+                state,
+                incident,
+                IncidentDiagnosis(
+                    owner="external_provider",
+                    action="RETRY",
+                    confidence=0.95,
+                    reason="retry the current execution lane",
+                ),
+            )
+
+            self.assertFalse(recovered)
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(
+                state.last_error,
+                "run-level incident budget was exhausted",
+            )
+
+    def test_resolved_incident_advances_budget_epoch_at_stable_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            task = TaskSpec(
+                task_id="task-1",
+                title="Task",
+                description="Task",
+                acceptance=["passes"],
+            )
+            incident = ExecutionIncident(
+                incident_id="incident-1",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_stalled",
+                stage="implement",
+                context="task verification",
+                task_id=task.task_id,
+                status="recovering",
+                incident_fingerprint="fingerprint-1",
+                evidence_fingerprint="evidence-1",
+            )
+            orchestrator._merge_or_save_execution_incident(state, incident)
+
+            orchestrator._resolve_inline_task_incident(state, task)
+
+            self.assertEqual(state.execution_incident_budget_epoch, 1)
+            self.assertEqual(
+                state.execution_incident_budget_checkpoint["incident_id"],
+                incident.incident_id,
+            )
+            self.assertEqual(
+                state.execution_incident_budget_checkpoint["reason"],
+                "task retry passed",
+            )
+            self.assertEqual(state.active_execution_incident_id, "")
+
+    def test_completed_stage_checkpoint_closes_legacy_incident_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            state.current_stage = "design"
+            state.execution_incidents = [
+                {
+                    "incident_id": "legacy-resolved",
+                    "incident_fingerprint": "legacy-fingerprint",
+                    "stage": "clarify",
+                    "status": "resolved",
+                }
+            ]
+
+            advanced = orchestrator._advance_execution_incident_budget_epoch(
+                state,
+                reason="stage design completed",
+            )
+
+            self.assertTrue(advanced)
+            self.assertEqual(state.execution_incident_budget_epoch, 1)
+            self.assertEqual(
+                state.execution_incident_budget_checkpoint["reason"],
+                "stage design completed",
+            )
+
+    def test_same_incident_identity_is_not_merged_across_budget_epochs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            previous = ExecutionIncident(
+                incident_id="previous",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_timeout",
+                stage="implement",
+                context="baseline",
+                incident_fingerprint="same-fingerprint",
+                evidence_fingerprint="old-evidence",
+                status="resolved",
+            )
+            orchestrator._merge_or_save_execution_incident(state, previous)
+            orchestrator._advance_execution_incident_budget_epoch(
+                state,
+                reason="baseline passed",
+                incident=previous,
+            )
+            current = ExecutionIncident(
+                incident_id="current",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_timeout",
+                stage="implement",
+                context="baseline",
+                incident_fingerprint="same-fingerprint",
+                evidence_fingerprint="new-evidence",
+            )
+
+            merged = orchestrator._merge_or_save_execution_incident(state, current)
+
+            self.assertEqual(merged.incident_id, "current")
+            self.assertEqual(merged.budget_epoch, 1)
+            self.assertEqual(len(state.execution_incidents), 2)
 
     def test_agent_diagnosis_requires_strict_bounded_json(self) -> None:
         diagnosis = parse_incident_diagnosis(

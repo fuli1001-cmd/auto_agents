@@ -130,7 +130,17 @@ class TaskPlanValidationTests(unittest.TestCase):
     def test_accepts_python_pytest_verification_step(self) -> None:
         payload = {
             "test_strategy": "python-pytest",
-            "verification_steps": [{"kind": "test", "runner": "pytest", "targets": ["tests"]}],
+            "verification_steps": [
+                {
+                    "kind": "test",
+                    "runner": "pytest",
+                    "targets": ["tests"],
+                    "cpu_slots": 2,
+                    "memory_mb": 4096,
+                    "memory_reserve_mb": 1024,
+                    "memory_guard": "required",
+                }
+            ],
             "tasks": [
                 {
                     "task_id": "task-001",
@@ -144,6 +154,53 @@ class TaskPlanValidationTests(unittest.TestCase):
         }
 
         self.assertEqual(validate_task_plan_payload(payload, require_verification=True), [])
+
+    def test_rejects_invalid_verification_resource_declarations(self) -> None:
+        payload = {
+            "test_strategy": "python-pytest",
+            "verification_steps": [
+                {
+                    "kind": "test",
+                    "runner": "pytest",
+                    "targets": ["tests"],
+                    "cpu_slots": -1,
+                    "memory_mb": 0,
+                    "memory_reserve_mb": True,
+                    "memory_guard": "required",
+                }
+            ],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Add CLI entrypoint",
+                    "description": "Add a runnable command line entrypoint.",
+                    "acceptance": ["done"],
+                    "status": "pending",
+                    "commit_message": "feat(task-001): add CLI entrypoint",
+                }
+            ],
+        }
+
+        errors = validate_task_plan_payload(payload, require_verification=True)
+        self.assertTrue(
+            any(
+                ".cpu_slots must be a non-negative integer" in item
+                for item in errors
+            )
+        )
+        self.assertTrue(
+            any(
+                ".memory_reserve_mb must be a non-negative integer" in item
+                for item in errors
+            )
+        )
+        self.assertTrue(
+            any(
+                ".memory_mb must be positive when memory_guard is 'required'"
+                in item
+                for item in errors
+            )
+        )
 
     def test_validates_dynamic_port_names(self) -> None:
         payload = {

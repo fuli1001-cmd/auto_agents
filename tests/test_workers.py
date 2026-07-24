@@ -234,9 +234,56 @@ def test_worker_slot_lease_reports_persistent_memory_pressure(
             "test-worker",
             slots=2,
             required=2,
+            memory_mb=4096,
+            memory_reserve_mb=2048,
+            memory_guard="required",
             timeout_seconds=0,
         ):
             pass
+
+
+def test_worker_slot_lease_has_no_implicit_memory_threshold(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "auto_agents.workers._memory_available_bytes",
+        lambda: 1,
+    )
+
+    with WorkerSlotLease(
+        tmp_path,
+        "test-worker",
+        slots=2,
+        required=2,
+        timeout_seconds=0,
+    ):
+        pass
+
+
+def test_worker_slot_lease_advisory_memory_guard_warns_and_continues(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    monkeypatch.setattr(
+        "auto_agents.workers._memory_available_bytes",
+        lambda: 512 * 1024**2,
+    )
+
+    with WorkerSlotLease(
+        tmp_path,
+        "test-worker",
+        slots=1,
+        required=1,
+        memory_mb=1024,
+        memory_reserve_mb=256,
+        memory_guard="advisory",
+        timeout_seconds=0,
+    ):
+        pass
+
+    assert "memory_guard=advisory" in caplog.text
 
 
 def test_worker_slot_lease_honors_cancellation(
@@ -332,6 +379,29 @@ def test_distributed_executor_reserves_heavy_slots_atomically(
     assert not any(thread.is_alive() for thread in threads)
     assert sorted(results) == [False, True]
     assert executor._active_slots[endpoint.worker_id] == 2
+
+
+def test_distributed_executor_prefers_declared_cpu_slots(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    command = "declared command"
+    executor = DistributedGatePlanExecutor(
+        project,
+        GateConfig(),
+        {
+            command: GateCommandMetadata(
+                resource_class="normal",
+                cpu_slots=3,
+                memory_mb=4096,
+                memory_reserve_mb=1024,
+                memory_guard="required",
+            )
+        },
+    )
+
+    assert executor._required_slots(command) == 3
+    assert executor._memory_policy(command) == (4096, 1024, "required")
 
 
 def test_distributed_executor_slot_wait_honors_cancellation(

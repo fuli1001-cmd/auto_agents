@@ -55,6 +55,10 @@ class FailureExtraction:
 @dataclass
 class GateCommandMetadata:
     resource_class: str = "normal"
+    cpu_slots: int = 0
+    memory_mb: int = 0
+    memory_reserve_mb: int = 0
+    memory_guard: str = "off"
     requires: List[str] = field(default_factory=list)
     exclusive_resources: List[str] = field(default_factory=list)
     dynamic_ports: List[str] = field(default_factory=list)
@@ -196,6 +200,10 @@ def expand_pytest_directory_steps(
                             cadence=step.cadence,
                             cache_scope=step.cache_scope,
                             resource_class=step.resource_class,
+                            cpu_slots=step.cpu_slots,
+                            memory_mb=step.memory_mb,
+                            memory_reserve_mb=step.memory_reserve_mb,
+                            memory_guard=step.memory_guard,
                             requires=list(step.requires),
                             exclusive_resources=list(step.exclusive_resources),
                             dynamic_ports=list(step.dynamic_ports),
@@ -217,6 +225,10 @@ def expand_pytest_directory_steps(
                         cadence=step.cadence,
                         cache_scope=step.cache_scope,
                         resource_class=step.resource_class,
+                        cpu_slots=step.cpu_slots,
+                        memory_mb=step.memory_mb,
+                        memory_reserve_mb=step.memory_reserve_mb,
+                        memory_guard=step.memory_guard,
                         requires=list(step.requires),
                         exclusive_resources=list(step.exclusive_resources),
                         dynamic_ports=list(step.dynamic_ports),
@@ -317,8 +329,23 @@ def resolve_gate_plan_from_verification_steps(
             )
             else "normal"
         )
+        memory_guard_order = {"off": 0, "advisory": 1, "required": 2}
+        memory_guard = max(
+            (
+                (step.memory_guard.strip().lower() or "off")
+                for step in command_steps
+            ),
+            key=lambda value: memory_guard_order.get(value, 0),
+        )
         metadata[command] = GateCommandMetadata(
             resource_class=resource_class,
+            cpu_slots=max((step.cpu_slots for step in command_steps), default=0),
+            memory_mb=max((step.memory_mb for step in command_steps), default=0),
+            memory_reserve_mb=max(
+                (step.memory_reserve_mb for step in command_steps),
+                default=0,
+            ),
+            memory_guard=memory_guard,
             requires=list(
                 dict.fromkeys(
                     requirement.strip()

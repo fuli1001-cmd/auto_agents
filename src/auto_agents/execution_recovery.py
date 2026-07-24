@@ -109,6 +109,7 @@ class ExecutionIncident:
     worktree_fingerprint: str = ""
     incident_fingerprint: str = ""
     evidence_fingerprint: str = ""
+    budget_epoch: int = 0
     occurrence_count: int = 1
     recovery_round: int = 0
     status: str = "open"
@@ -135,6 +136,7 @@ class ExecutionIncident:
             "task_id": self.task_id,
             "incident_fingerprint": self.incident_fingerprint,
             "evidence_fingerprint": self.evidence_fingerprint,
+            "budget_epoch": self.budget_epoch,
             "occurrence_count": self.occurrence_count,
             "recovery_round": self.recovery_round,
             "status": self.status,
@@ -211,12 +213,14 @@ def command_incident(
             "context": context,
             "command": " ".join(command.split()),
             "termination_reason": result.termination_reason,
-            "output": _fingerprint_payload({"stdout": stdout_tail, "stderr": stderr_tail}),
         }
     )
     evidence_fp = _fingerprint_payload(
         {
             "incident": incident_fp,
+            "output": _fingerprint_payload(
+                {"stdout": stdout_tail, "stderr": stderr_tail}
+            ),
             "head": head_ref,
             "worktree": worktree_fingerprint,
             "process": result.process_snapshot,
@@ -271,11 +275,15 @@ def provider_incident(
             "stage": stage,
             "reason": reason,
             "active_tool": termination.active_tool,
-            "output": _fingerprint_payload({"stderr": stderr_tail}),
         }
     )
     evidence_fp = _fingerprint_payload(
-        {"incident": incident_fp, "head": head_ref, "worktree": worktree_fingerprint}
+        {
+            "incident": incident_fp,
+            "output": _fingerprint_payload({"stderr": stderr_tail}),
+            "head": head_ref,
+            "worktree": worktree_fingerprint,
+        }
     )
     return ExecutionIncident(
         incident_id=uuid.uuid4().hex[:12],

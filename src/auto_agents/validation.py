@@ -22,6 +22,7 @@ from .models import (
     TASK_ORIGINS,
     VERIFICATION_CACHE_SCOPES,
     VERIFICATION_CADENCES,
+    VERIFICATION_MEMORY_GUARDS,
     VERIFICATION_RESOURCE_CLASSES,
 )
 from .requirements import (
@@ -223,6 +224,27 @@ def validate_verification_steps(steps: object, field_name: str = "verification_s
         if resource_class not in VERIFICATION_RESOURCE_CLASSES:
             allowed = ", ".join(VERIFICATION_RESOURCE_CLASSES)
             errors.append(f"{prefix}.resource_class must be one of: {allowed}")
+        for field in ("cpu_slots", "memory_mb", "memory_reserve_mb"):
+            value = raw_step.get(field, 0)
+            if type(value) is not int or value < 0:
+                errors.append(
+                    f"{prefix}.{field} must be a non-negative integer when provided"
+                )
+        memory_guard = str(raw_step.get("memory_guard", "off")).strip().lower()
+        if memory_guard not in VERIFICATION_MEMORY_GUARDS:
+            allowed = ", ".join(VERIFICATION_MEMORY_GUARDS)
+            errors.append(f"{prefix}.memory_guard must be one of: {allowed}")
+        elif (
+            memory_guard != "off"
+            and (
+                type(raw_step.get("memory_mb", 0)) is not int
+                or raw_step.get("memory_mb", 0) <= 0
+            )
+        ):
+            errors.append(
+                f"{prefix}.memory_mb must be positive when memory_guard is "
+                f"'{memory_guard}'"
+            )
         for field in (
             "requires",
             "exclusive_resources",
