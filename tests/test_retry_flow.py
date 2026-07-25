@@ -141,6 +141,130 @@ class VerifyFailureClassificationTests(unittest.TestCase):
             self.assertIn("non-comparable", analysis["stats"])
             self.assertIn("stop-unresolved-identity", analysis["stats"])
 
+    def test_single_non_comparable_command_is_not_repair_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            command_ref = (
+                "cmd:python -m pytest -q "
+                "tests/test_checkout.py::test_rejects_expired_quote"
+            )
+            task = TaskSpec(
+                task_id="task-checkout",
+                title="Validate checkout",
+                description="",
+                acceptance=[],
+                verify_history=[
+                    {
+                        "attempt": 1,
+                        "decision": "fail",
+                        "summary": "command failed without a test identifier",
+                        "failure_ids": [command_ref],
+                        "comparable_failures": False,
+                    }
+                ],
+            )
+
+            refs = orchestrator._candidate_repair_refs(
+                task,
+                {
+                    "failure_ids": [command_ref],
+                    "comparable_failures": False,
+                },
+            )
+
+            self.assertEqual(refs, [])
+
+    def test_repeated_non_comparable_commands_schedule_evidence_repairs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            command_refs = [
+                (
+                    "cmd:python -m pytest -q "
+                    "tests/test_checkout.py::test_rejects_expired_quote"
+                ),
+                (
+                    "cmd:npm --prefix web test -- "
+                    "src/e2e/checkout.test.ts -t rejects_expired_quote"
+                ),
+            ]
+            unresolved_description = (
+                "src/e2e/checkout.test.ts > checkout contract > "
+                "rejects_expired_quote"
+            )
+            repeated_set = [*command_refs, unresolved_description]
+            task = TaskSpec(
+                task_id="task-checkout",
+                title="Validate checkout",
+                description="Keep checkout evidence current.",
+                acceptance=["Checkout verification passes."],
+                status="blocked",
+                review_summary="verification stopped with unresolved failure identity",
+                verify_history=[
+                    {
+                        "attempt": 1,
+                        "decision": "fail",
+                        "summary": "command failed without stable test identifiers",
+                        "failure_ids": repeated_set,
+                        "comparable_failures": False,
+                    },
+                    {
+                        "attempt": 2,
+                        "decision": "fail",
+                        "summary": "a diagnostic isolated a different failure",
+                        "failure_ids": [
+                            "tests/test_diagnostics.py::test_environment_contract"
+                        ],
+                        "comparable_failures": True,
+                    },
+                    {
+                        "attempt": 3,
+                        "decision": "fail",
+                        "summary": "command failed without stable test identifiers",
+                        "failure_ids": list(reversed(repeated_set)),
+                        "comparable_failures": False,
+                    },
+                ],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            tasks = state.tasks
+
+            payload = orchestrator._task_recovery_payload_from_history(task, state)
+            scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                state,
+                tasks,
+                task,
+                payload,
+            )
+
+            self.assertTrue(scheduled)
+            repairs = [
+                item for item in tasks if item.task_origin == "evidence_repair"
+            ]
+            self.assertEqual(len(repairs), 2)
+            self.assertEqual(
+                {ref for repair in repairs for ref in repair.verification_refs},
+                set(command_refs),
+            )
+            self.assertEqual(
+                {
+                    command
+                    for repair in repairs
+                    for command in orchestrator._build_task_verify_commands(repair)
+                },
+                {ref.removeprefix("cmd:") for ref in command_refs},
+            )
+            self.assertEqual(
+                state.last_recovery_route["outcome"],
+                "repair_tasks_scheduled",
+            )
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(set(task.depends_on), {repair.task_id for repair in repairs})
+
     def test_recovery_signature_is_stable_across_review_reason_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

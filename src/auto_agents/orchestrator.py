@@ -6487,17 +6487,49 @@ class Orchestrator:
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
+    def _has_repeated_non_comparable_failure_set(
+        self,
+        task: TaskSpec,
+        failure_ids: List[str],
+    ) -> bool:
+        signature = tuple(self._normalize_verify_failure_ids(failure_ids, ""))
+        if not signature or all(item.startswith("reason:") for item in signature):
+            return False
+        matches = 0
+        for entry in task.verify_history:
+            if (
+                not isinstance(entry, dict)
+                or str(entry.get("decision", "")) != "fail"
+                or bool(entry.get("comparable_failures", True))
+            ):
+                continue
+            if tuple(self._verify_failure_signature_from_entry(entry)) != signature:
+                continue
+            matches += 1
+            if matches >= 2:
+                return True
+        return False
+
     def _candidate_repair_refs(self, task: TaskSpec, result: Dict[str, object]) -> List[str]:
         comparable = bool(result.get("comparable_failures", True))
         raw_ids = result.get("failure_ids", [])
         failure_ids = [str(item).strip() for item in raw_ids if str(item).strip()] if isinstance(raw_ids, list) else []
-        if not comparable:
+        repeated_non_comparable = (
+            not comparable
+            and self._has_repeated_non_comparable_failure_set(task, failure_ids)
+        )
+        if not comparable and not repeated_non_comparable:
             return []
         refs: List[str] = []
         for failure_id in failure_ids:
-            if failure_id.startswith("reason:") or failure_id.startswith("cmd:"):
+            if failure_id.startswith("reason:"):
                 continue
-            if self._build_task_proof_evidence_command_for_ref(failure_id):
+            if failure_id.startswith("cmd:") and not repeated_non_comparable:
+                continue
+            if (
+                self._build_task_proof_evidence_command_for_ref(failure_id)
+                and failure_id not in refs
+            ):
                 refs.append(failure_id)
         if refs:
             return refs
@@ -6505,7 +6537,11 @@ class Orchestrator:
         if isinstance(proof_evidence, dict):
             for raw_ref in proof_evidence.get("failed_refs", []) or []:
                 ref = str(raw_ref).strip()
-                if ref and self._build_task_proof_evidence_command_for_ref(ref):
+                if (
+                    ref
+                    and ref not in refs
+                    and self._build_task_proof_evidence_command_for_ref(ref)
+                ):
                     refs.append(ref)
         return refs
 
