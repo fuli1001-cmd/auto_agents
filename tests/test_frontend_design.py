@@ -33,7 +33,7 @@ from auto_agents.frontend_design import (
     validate_prototype_manifest,
 )
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentRequest, AgentResult
+from auto_agents.models import AgentRequest, AgentResult, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 
 
@@ -114,6 +114,68 @@ def write_frontend_trace(project_root: Path) -> None:
                 ],
             },
             "requirements": [],
+        },
+    )
+
+
+def write_frontend_fidelity_trace(project_root: Path) -> None:
+    write_json(
+        requirements_trace_path(project_root),
+        {
+            "version": 1,
+            "frontend_scope": {
+                "requested": True,
+                "surfaces": [
+                    {
+                        "id": "surface-home",
+                        "name": "Home",
+                        "route": "/",
+                        "priority": "core",
+                        "purpose": "Primary landing page",
+                        "key_states": ["default"],
+                        "requirement_ids": ["REQ-001"],
+                    }
+                ],
+            },
+            "frontend_surfaces": [
+                {
+                    "name": "Home",
+                    "route": "/",
+                    "prototype_refs": ["specs/prototype/home.html", "DESIGN.md"],
+                    "viewports": ["1440x900"],
+                    "requirement_ids": ["REQ-001"],
+                }
+            ],
+            "requirements": [
+                {
+                    "id": "REQ-001",
+                    "status": "active",
+                    "priority": "mandatory",
+                    "text": "The home page must match the supplied prototype.",
+                    "acceptance_oracles": ["The rendered home page matches the prototype."],
+                    "oracle_type": "mixed",
+                    "oracle_strength": "human",
+                    "evidence_boundary": "system_boundary",
+                    "forbidden_proxy_oracles": [],
+                }
+            ],
+        },
+    )
+
+
+def frontend_task(*, status: str = "in_progress") -> TaskSpec:
+    return TaskSpec(
+        task_id="task-frontend",
+        title="Implement the home surface",
+        description="Implement the approved home surface.",
+        acceptance=["The rendered home page matches the prototype."],
+        requirement_ids=["REQ-001"],
+        status=status,
+        evidence_preflight={
+            "decision": "READY",
+            "reason": "Browser evidence is feasible.",
+            "checklist": ["Capture the rendered page."],
+            "fingerprint": "cached-ready",
         },
     )
 
@@ -249,6 +311,159 @@ class FrontendDesignTests(unittest.TestCase):
             self.assertEqual(load_frontend_design_lock(root)["source"]["kind"], "user")
             trace = json.loads(requirements_trace_path(root).read_text(encoding="utf-8"))
             self.assertEqual(trace["frontend_surfaces"][0]["prototype_refs"][0], ".auto-agents/docs/frontend_prototype/home.html")
+
+    def test_missing_contract_rewinds_before_frontend_task_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_frontend_fidelity_trace(root)
+            task = frontend_task()
+            state = load_run_state(root)
+            state.status = "pending"
+            state.current_stage = "implement"
+            state.stage_summaries = {
+                "clarify": "done",
+                "prototype": "Skipped: existing frontend surfaces were discovered.",
+                "design": "done",
+                "plan": "done",
+                "provider_research": "done",
+            }
+            state.approved_gates = ["requirements", "architecture", "release"]
+            state.tasks = [task]
+            state.resume_context["implementation_ready_tasks"] = {
+                task.task_id: False
+            }
+
+            orchestrator = Orchestrator(root)
+            with patch.object(
+                orchestrator, "_ensure_evidence_preflight"
+            ) as evidence_preflight, patch.object(
+                orchestrator, "_execute_task_with_retries"
+            ) as task_execution:
+                result = orchestrator._execute_task_in_main_worktree(
+                    state, [task], task
+                )
+
+            self.assertIs(result, state)
+            evidence_preflight.assert_not_called()
+            task_execution.assert_not_called()
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.current_stage, "prototype")
+            self.assertEqual(state.pending_approval, "")
+            self.assertNotIn("prototype", state.stage_summaries)
+            self.assertEqual(state.approved_gates, ["requirements"])
+            self.assertTrue(
+                state.resume_context[
+                    Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT
+                ]
+            )
+            self.assertNotIn(
+                task.task_id,
+                state.resume_context.get("implementation_ready_tasks", {}),
+            )
+
+    def test_parallel_scheduler_checks_contract_before_evidence_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_frontend_fidelity_trace(root)
+            task = frontend_task(status="pending")
+            backend_task = TaskSpec(
+                task_id="task-backend",
+                title="Implement an API",
+                description="Add one API endpoint.",
+                acceptance=["The endpoint returns a response."],
+            )
+            tasks = [task, backend_task]
+            state = load_run_state(root)
+            state.status = "pending"
+            state.current_stage = "implement"
+            state.tasks = tasks
+
+            orchestrator = Orchestrator(root)
+            with patch.object(
+                orchestrator, "_parallel_execution_fallback_reason", return_value=""
+            ), patch.object(
+                orchestrator, "_parallel_worker_count", return_value=2
+            ), patch.object(
+                orchestrator, "_log_parallel_worker_resolution"
+            ), patch.object(
+                orchestrator,
+                "_process_next_parallel_pending_integration",
+                return_value=None,
+            ), patch.object(
+                orchestrator, "_ensure_evidence_preflight"
+            ) as evidence_preflight, patch.object(
+                orchestrator, "_run_parallel_task_batch"
+            ) as parallel_batch:
+                result = orchestrator._run_parallel_implementation_loop(
+                    state, tasks, max_tasks=None
+                )
+
+            self.assertIs(result, state)
+            evidence_preflight.assert_not_called()
+            parallel_batch.assert_not_called()
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(state.current_stage, "prototype")
+
+    def test_contract_recovery_handles_existing_frontend_then_routes_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_text(root / "spec.md", "# Existing frontend fidelity\n")
+            write_text(root / "src/pages/Home.tsx", "export const Home = () => <main />")
+            write_text(root / "specs/prototype/home.html", HTML)
+            write_text(design_md_path(root), "# User design\n")
+            write_frontend_fidelity_trace(root)
+
+            orchestrator = Orchestrator(root)
+            adapter = PrototypeAdapter(root)
+            orchestrator.adapter = adapter
+            state = load_run_state(root)
+            state.resume_context[
+                Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT
+            ] = True
+
+            state = orchestrator._run_prototype_stage(state, root / "spec.md")
+
+            lock = load_frontend_design_lock(root)
+            self.assertEqual(lock["status"], "pending_approval")
+            self.assertTrue(lock["trigger"]["existing_frontend"])
+            self.assertTrue(
+                any(call.startswith("prototype-generate") for call in adapter.calls)
+            )
+            self.assertNotIn(
+                Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT,
+                state.resume_context,
+            )
+
+            task = frontend_task()
+            state.status = "pending"
+            state.current_stage = "implement"
+            state.stage_summaries.update(
+                {
+                    "design": "done",
+                    "plan": "done",
+                    "provider_research": "done",
+                }
+            )
+            state.approved_gates = ["requirements", "architecture"]
+            state.tasks = [task]
+            with patch.object(
+                orchestrator, "_ensure_evidence_preflight"
+            ) as evidence_preflight:
+                result = orchestrator._execute_task_in_main_worktree(
+                    state, [task], task
+                )
+
+            self.assertIs(result, state)
+            evidence_preflight.assert_not_called()
+            self.assertEqual(state.status, "paused")
+            self.assertEqual(state.current_stage, "prototype")
+            self.assertEqual(state.pending_approval, "prototype")
+            self.assertEqual(state.approved_gates, ["requirements"])
+            self.assertEqual(task.status, "pending")
 
     def test_external_catalog_design_is_copied_byte_for_byte_and_pinned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

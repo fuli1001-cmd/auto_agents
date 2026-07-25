@@ -380,6 +380,7 @@ class ParallelTuningTests(unittest.TestCase):
                     "task-b": {"fingerprint": "fp", "paths": ["app/shared.py"]}
                 },
                 "implementation_ready_tasks": {"task-d": True},
+                Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT: True,
             }
 
             orchestrator._capture_resume_context(
@@ -400,6 +401,11 @@ class ParallelTuningTests(unittest.TestCase):
             )
             self.assertEqual(
                 state.resume_context["implementation_ready_tasks"], {"task-d": True}
+            )
+            self.assertTrue(
+                state.resume_context[
+                    Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT
+                ]
             )
 
     def test_integration_conflict_batch_does_not_scale_workers_up(self) -> None:

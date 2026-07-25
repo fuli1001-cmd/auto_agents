@@ -97,7 +97,10 @@ from .execution_recovery import (
     parse_incident_diagnosis,
     recovery_task_marker,
 )
-from .frontend_fidelity import frontend_fidelity_requirement_ids, validate_frontend_fidelity_trace
+from .frontend_fidelity import (
+    frontend_fidelity_requirement_ids,
+    validate_frontend_fidelity_trace,
+)
 from .frontend_design import (
     AwesomeDesignCatalogClient,
     FrontendDesignUnavailable,
@@ -240,6 +243,7 @@ class Orchestrator:
     ARBITER_MIN_REVIEW_FAILS = 2
     MAX_RECOVERY_LOOP_EVENTS = 20
     RECOVERY_LOOP_REPEAT_THRESHOLD = 2
+    FRONTEND_CONTRACT_RECOVERY_CONTEXT = "frontend_design_contract_recovery"
 
     def __init__(
         self,
@@ -1613,18 +1617,25 @@ class Orchestrator:
     def _run_prototype_stage(self, state: RunState, spec_file: Path) -> RunState:
         trace = load_requirements_trace(self.project_root, normalize=False)
         state.current_stage = "prototype"
+        contract_recovery = bool(
+            state.resume_context.get(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, False)
+        )
         rejection_feedback = ""
         if state.rejected_stage == "prototype" and state.rejection_reason:
             rejection_feedback = state.rejection_reason
             state.rejected_stage = ""
             state.rejection_reason = ""
         if not frontend_scope_requested(trace):
+            state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
             state.stage_summaries["prototype"] = "Skipped: the clarified scope does not request frontend work."
             state.last_error = ""
             return state
 
         discovery = discover_existing_frontend(self.project_root)
-        if discovery.existing_frontend:
+        # Existing frontends normally skip greenfield prototyping. A task-level
+        # prerequisite rewind is different: it must produce the missing lock
+        # before the same task can be selected again.
+        if discovery.existing_frontend and not contract_recovery:
             state.stage_summaries["prototype"] = (
                 "Skipped: existing frontend surfaces were discovered: "
                 + ", ".join(discovery.evidence[:5])
@@ -1632,6 +1643,7 @@ class Orchestrator:
             state.last_error = ""
             return state
         if approved_frontend_design(self.project_root):
+            state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
             state.stage_summaries["prototype"] = "Reused the approved, pinned frontend design contract."
             state.last_error = ""
             return state
@@ -1768,7 +1780,7 @@ class Orchestrator:
             "created_at": utc_now_iso(),
             "trigger": {
                 "frontend_requested": True,
-                "existing_frontend": False,
+                "existing_frontend": discovery.existing_frontend,
                 "discovery_evidence": list(discovery.evidence),
             },
             "source": source,
@@ -1786,6 +1798,7 @@ class Orchestrator:
         write_json(frontend_design_lock_path(self.project_root), lock)
         trace["frontend_surfaces"] = derived_frontend_surfaces(lock)
         write_json(requirements_trace_path(self.project_root), trace)
+        state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
         state.stage_summaries["prototype"] = (
             f"Generated {len(lock['prototype']['pages'])} static prototype page(s); manual approval required."
         )
@@ -4991,6 +5004,72 @@ class Orchestrator:
         state.last_error = ""
         return state
 
+    def _task_requires_frontend_design_contract(self, task: TaskSpec) -> bool:
+        trace_payload = load_requirements_trace(self.project_root)
+        frontend_requirement_ids = set(
+            frontend_fidelity_requirement_ids(trace_payload)
+        )
+        return bool(frontend_requirement_ids.intersection(task.requirement_ids))
+
+    def _route_frontend_design_contract_prerequisite(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+    ) -> Optional[RunState]:
+        """Route contract-bound tasks before evidence preflight or implementation."""
+        if not self._task_requires_frontend_design_contract(task):
+            return None
+        if approved_frontend_design(self.project_root):
+            state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
+            return None
+
+        task.status = "pending"
+        self._clear_implementation_ready_marker(state, task)
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        self._rewind_state_from_stage(state, "prototype")
+        prototype_approval_index = APPROVAL_ORDER.index("prototype")
+        downstream_approvals = set(APPROVAL_ORDER[prototype_approval_index:])
+        state.approved_gates = [
+            gate for gate in state.approved_gates if gate not in downstream_approvals
+        ]
+        state.rejected_stage = ""
+        state.rejection_reason = ""
+        state.last_error = ""
+
+        lock = load_frontend_design_lock(self.project_root)
+        pending_contract_ready = (
+            lock.get("status") == "pending_approval"
+            and not validate_frontend_design_artifacts(
+                self.project_root,
+                lock,
+                require_approved=False,
+                max_pages=self.config.frontend_design.max_pages,
+            )
+        )
+        if pending_contract_ready:
+            state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
+            state.stage_summaries["prototype"] = (
+                "Reused the generated frontend design contract; manual approval required."
+            )
+            state.pending_approval = "prototype"
+            state.status = "paused"
+            route = "approval"
+        else:
+            state.resume_context[self.FRONTEND_CONTRACT_RECOVERY_CONTEXT] = True
+            state.pending_approval = ""
+            state.status = "pending"
+            route = "prototype"
+
+        self.logger.info(
+            "[frontend-contract] task=%s route=%s reason=approved-contract-required",
+            task.task_id,
+            route,
+        )
+        save_run_state(self.project_root, state)
+        return state
+
     def _has_task_budget(self, local_max_tasks: Optional[int], local_processed: int) -> bool:
         if self._max_tasks_remaining is not None:
             return self._max_tasks_remaining > 0
@@ -5124,6 +5203,11 @@ class Orchestrator:
             batch_size = min(current_workers, remaining)
             batch = self._select_parallel_batch(state, ready, batch_size)
             for candidate in batch:
+                route = self._route_frontend_design_contract_prerequisite(
+                    state, tasks, candidate
+                )
+                if route is not None:
+                    return route
                 route = self._ensure_evidence_preflight(state, candidate)
                 if route:
                     return self._route_evidence_preflight(state, tasks, candidate, route)
@@ -5330,6 +5414,12 @@ class Orchestrator:
         tasks: List[TaskSpec],
         task: TaskSpec,
     ) -> Optional[RunState]:
+        prerequisite_route = self._route_frontend_design_contract_prerequisite(
+            state, tasks, task
+        )
+        if prerequisite_route is not None:
+            return prerequisite_route
+
         visual_gate_recheck = self._task_is_blocked_by_visual_judge(task)
         if self._is_terminal_review_rejected_task(state, task):
             if self._schedule_repair_tasks_for_failure(
@@ -9307,6 +9397,7 @@ class Orchestrator:
                 "parallel_sequential_retry_tasks",
                 "parallel_integration_metrics",
                 "parallel_task_path_history",
+                self.FRONTEND_CONTRACT_RECOVERY_CONTEXT,
             )
             if key in state.resume_context
         }
@@ -11352,9 +11443,7 @@ class Orchestrator:
             )
         if requirement_context:
             common.extend(["", requirement_context])
-        trace_payload = load_requirements_trace(self.project_root)
-        frontend_requirement_ids = set(frontend_fidelity_requirement_ids(trace_payload))
-        if frontend_requirement_ids.intersection(task.requirement_ids):
+        if self._task_requires_frontend_design_contract(task):
             frontend_contract = self._frontend_design_prompt_lines()
             if not frontend_contract:
                 raise RuntimeError(
