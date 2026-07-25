@@ -16,6 +16,7 @@ from auto_agents.gate_execution import GateSnapshotManager
 from auto_agents.distributed_gates import DistributedGatePlanExecutor
 from auto_agents.gates import GateCommandMetadata, run_gate_plan
 from auto_agents.models import (
+    CommandResult,
     DistributedGatesConfig,
     GateConfig,
     GateIsolationConfig,
@@ -498,3 +499,79 @@ def test_distributed_auto_parallelism_uses_gate_capacity() -> None:
 
     orchestrator.config.gates.parallel_workers = 3
     assert orchestrator._gate_parallel_workers() == 3
+
+
+def test_reported_infrastructure_rotates_each_worker_once() -> None:
+    executor = object.__new__(DistributedGatePlanExecutor)
+    executor.gate_config = GateConfig(
+        distributed=DistributedGatesConfig(
+            mode="auto",
+            reported_infrastructure_max_workers=8,
+        )
+    )
+    executor._lane_successes = {}
+    executor._lane_endpoint = {}
+    endpoints = [
+        WorkerEndpoint(worker_id=f"worker-{index}", transport="local", max_slots=1)
+        for index in range(1, 4)
+    ]
+    calls: list[str] = []
+
+    def acquire(command, *, exclude, **kwargs):
+        endpoint = next(item for item in endpoints if item.worker_id not in exclude)
+        return endpoint, 1
+
+    def run_endpoint(endpoint, command, **kwargs):
+        calls.append(endpoint.worker_id)
+        if endpoint.worker_id == "worker-3":
+            return CommandResult(
+                command=command,
+                ok=True,
+                returncode=0,
+                worker_id=endpoint.worker_id,
+                backend="local-isolated",
+            )
+        return CommandResult(
+            command=command,
+            ok=False,
+            returncode=1,
+            stdout=(
+                "Error: AUTO_AGENTS_INFRA_FAILURE "
+                "id=browser_launch_failed"
+            ),
+            worker_id=endpoint.worker_id,
+            backend="local-isolated",
+        )
+
+    executor._acquire_endpoint = acquire
+    executor._run_on_endpoint = run_endpoint
+    executor._release = lambda endpoint, required: None
+    first = CommandResult(
+        command="npm test",
+        ok=False,
+        returncode=1,
+        stdout="AUTO_AGENTS_INFRA_FAILURE id=browser_launch_failed",
+        worker_id="worker-1",
+        infrastructure_error=True,
+        infrastructure_failure_id="browser_launch_failed",
+    )
+
+    result = executor._retry_reported_infrastructure(
+        command="npm test",
+        lane="",
+        first_result=first,
+        attempted={"worker-1"},
+        timeout_seconds=60,
+        adaptive_timeout_enabled=True,
+        idle_timeout_seconds=30,
+        cancel_event=None,
+        progress=None,
+    )
+
+    assert result.ok
+    assert calls == ["worker-2", "worker-3"]
+    assert [item["worker_id"] for item in result.infrastructure_attempts] == [
+        "worker-1",
+        "worker-2",
+        "worker-3",
+    ]

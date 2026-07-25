@@ -977,8 +977,27 @@ def _compact_run_state(payload: dict[str, object]) -> dict[str, object]:
         "rejection_reason",
         "resume_context",
         "last_recovery_route",
+        "active_blocker",
+        "active_execution_incident_id",
     ]
     compact = {key: payload.get(key) for key in keys if key in payload}
+    active_incident_id = str(
+        payload.get("active_execution_incident_id", "")
+    ).strip()
+    incidents = payload.get("execution_incidents")
+    if isinstance(incidents, list):
+        relevant = [
+            item
+            for item in incidents
+            if isinstance(item, dict)
+            and (
+                str(item.get("incident_id", "")).strip() == active_incident_id
+                or str(item.get("status", "")).strip()
+                in {"active", "recovering", "self_repair", "needs_human"}
+            )
+        ]
+        if relevant:
+            compact["execution_incidents"] = relevant[-3:]
     tasks = payload.get("tasks")
     if isinstance(tasks, list):
         route = payload.get("last_recovery_route", {})

@@ -11,9 +11,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, TextIO, Tuple
 
@@ -68,15 +69,19 @@ from .config import (
     write_run_prompt,
 )
 from .gates import (
+    GateCommandExecutionError,
+    GateCommandInfrastructureError,
     GateCommandTimeoutError,
     ResolvedGatePlan,
     build_failure_identity_diagnostic_command,
+    classify_reported_infrastructure_failure,
     commands_from_verification_steps,
     extract_failure_ids,
     extract_failure_info,
     gate_plan_from_verification_steps,
     resolve_gate_plan_from_verification_steps,
     expand_pytest_directory_steps,
+    first_infrastructure_command,
     first_terminated_command,
     run_gate_plan,
     run_commands,
@@ -132,6 +137,7 @@ from .models import (
     CommandResult,
     DOCUMENT_LANGUAGE_OPTIONS,
     ProviderConfig,
+    ProviderFailoverConfig,
     ProjectConfig,
     GateParallelGroup,
     GateResult,
@@ -195,7 +201,8 @@ _FAILOVER_PATTERN = re.compile(
     r"rate.limit|usage.limit|\b429\b|quota|too many requests|capacity|unavailable"
     r"|service.unavailable|not.found|No such file|ENOENT"
     r"|no.last.agent.message|wrote.empty.content|empty.response"
-    r"|connection.error|connect.error|timed?\s*out|stalled"
+    r"|connection.error|connect.error|websocket.*failed.to.connect|failed.to.conne"
+    r"|timed?\s*out|stalled"
     r"|provider.protocol.error|prompt.transport.error"
     r"|smart.timeout|semantic.stall|provider.idle|tool.stall"
     r"|loop.detected|safety.ceiling|protocol.error",
@@ -208,6 +215,34 @@ _FAILOVER_QUOTA_PATTERN = re.compile(
 )
 _FAILOVER_PROTOCOL_PATTERN = re.compile(
     r"provider.protocol.error|prompt.transport.error",
+    re.IGNORECASE,
+)
+_FAILOVER_CAPACITY_PATTERN = re.compile(r"\bcapacity\b", re.IGNORECASE)
+_FAILOVER_RATE_PATTERN = re.compile(
+    r"rate.limit|\b429\b|too many requests|throttl", re.IGNORECASE
+)
+_FAILOVER_EXPLICIT_QUOTA_PATTERN = re.compile(
+    r"individual quota|quota\s+(?:reached|exhausted)|usage.limit",
+    re.IGNORECASE,
+)
+_FAILOVER_CONNECTION_PATTERN = re.compile(
+    r"websocket.*failed to connect|connection.error|connect.error|failed to conne",
+    re.IGNORECASE,
+)
+_FAILOVER_AVAILABILITY_PATTERN = re.compile(
+    r"unavailable|service.unavailable|not.found|No such file|ENOENT",
+    re.IGNORECASE,
+)
+_RESET_IN_PATTERN = re.compile(
+    r"resets?\s+in\s*"
+    r"(?:(?P<days>\d+)\s*d)?\s*"
+    r"(?:(?P<hours>\d+)\s*h)?\s*"
+    r"(?:(?P<minutes>\d+)\s*m)?\s*"
+    r"(?:(?P<seconds>\d+)\s*s)?",
+    re.IGNORECASE,
+)
+_RETRY_AFTER_PATTERN = re.compile(
+    r"retry[- ]after\s*[:=]?\s*(?P<seconds>\d+)\s*(?:seconds?|s)?",
     re.IGNORECASE,
 )
 _PARALLEL_PROVIDER_PRESSURE_PATTERN = re.compile(
@@ -237,6 +272,14 @@ _PARALLEL_SOFT_PRESSURE_PATTERN = re.compile(
 )
 
 
+@dataclass
+class _ProviderHealth:
+    category: str
+    failure_count: int
+    next_probe_at: float
+    last_error: str = ""
+
+
 class Orchestrator:
     MAX_SPLIT_DEPTH = 2
     SPLIT_TASK_MARKER = "SPLIT_TASK:"
@@ -263,6 +306,7 @@ class Orchestrator:
         # Run-level failover memory (in-memory only, never persisted)
         self._last_successful_provider: Optional[str] = None
         self._failed_providers: Set[str] = set()
+        self._provider_health: Dict[str, _ProviderHealth] = {}
         self._current_provider: str = self.config.active_provider
         self._repo_map_builder: Optional[RepoMapBuilder] = None
         self._last_repo_map_result: Optional[RepoMapResult] = None
@@ -1243,7 +1287,7 @@ class Orchestrator:
                             state = self._run_readme(state, spec_file, auto_approve=auto_approve)
                         else:
                             state = self._run_agent_stage(stage, state, spec_file, auto_approve=auto_approve)
-                except GateCommandTimeoutError as error:
+                except GateCommandExecutionError as error:
                     recovered = self._handle_gate_execution_incident(state, stage, error)
                     save_run_state(self.project_root, state)
                     if recovered:
@@ -3198,6 +3242,7 @@ class Orchestrator:
                     progress=self._gate_progress_callback(context),
                     gate_executor=gate_executor,
                 )
+        self._classify_reported_infrastructure_failures(gate)
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
@@ -3244,6 +3289,7 @@ class Orchestrator:
                     progress=self._gate_progress_callback(context),
                     gate_executor=gate_executor,
                 )
+        self._classify_reported_infrastructure_failures(gate)
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
@@ -3321,6 +3367,7 @@ class Orchestrator:
                     progress=self._gate_progress_callback(context),
                     gate_executor=gate_executor,
                 )
+        self._classify_reported_infrastructure_failures(gate)
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
         after_snapshot = self._worktree_change_snapshot()
@@ -3336,16 +3383,39 @@ class Orchestrator:
             )
         return gate, reason
 
+    def _classify_reported_infrastructure_failures(self, gate: GateResult) -> None:
+        for result in gate.commands:
+            classify_reported_infrastructure_failure(
+                result,
+                self.config.gates.reported_infrastructure_markers,
+            )
+            if result.infrastructure_failure_id and not result.infrastructure_attempts:
+                result.infrastructure_attempts = [
+                    {
+                        "worker_id": result.worker_id or "local",
+                        "backend": result.backend or "local",
+                        "job_id": result.job_id,
+                        "ok": result.ok,
+                        "returncode": result.returncode,
+                        "failure_id": result.infrastructure_failure_id,
+                        "termination_reason": result.termination_reason,
+                        "stdout_tail": result.stdout[-1000:],
+                        "stderr_tail": result.stderr[-1000:],
+                    }
+                ]
+
     def _log_gate_command_results(self, context: str, results: Iterable[object]) -> None:
         for index, result in enumerate(results, start=1):
             self.logger.info(
-                "[gate-command] context=%s index=%s ok=%s returncode=%s duration_seconds=%.3f termination=%s cleanup_incomplete=%s worker=%s backend=%s job_id=%s command=%s",
+                "[gate-command] context=%s index=%s ok=%s returncode=%s duration_seconds=%.3f termination=%s infrastructure_failure=%s infrastructure_attempts=%s cleanup_incomplete=%s worker=%s backend=%s job_id=%s command=%s",
                 context,
                 index,
                 str(bool(getattr(result, "ok", False))).lower(),
                 getattr(result, "returncode", ""),
                 float(getattr(result, "duration_seconds", 0.0) or 0.0),
                 str(getattr(result, "termination_reason", "") or "none"),
+                str(getattr(result, "infrastructure_failure_id", "") or "none"),
+                len(getattr(result, "infrastructure_attempts", []) or []),
                 str(bool(getattr(result, "cleanup_incomplete", False))).lower(),
                 str(getattr(result, "worker_id", "") or "local"),
                 str(getattr(result, "backend", "") or "local"),
@@ -3373,7 +3443,24 @@ class Orchestrator:
         return emit
 
     def _raise_for_baseline_termination(self, gate: GateResult, *, context: str) -> None:
-        result = first_terminated_command(gate)
+        infrastructure = first_infrastructure_command(gate)
+        if infrastructure is not None:
+            raise GateCommandInfrastructureError(
+                "baseline gate reported verification infrastructure failure "
+                f"during {context}: {infrastructure.infrastructure_failure_id or 'unknown'} "
+                f"({infrastructure.command})",
+                result=infrastructure,
+                context=context,
+                baseline=True,
+            )
+        result = next(
+            (
+                item
+                for item in gate.commands
+                if item.termination_reason and not item.infrastructure_error
+            ),
+            None,
+        )
         if result is None:
             return
         if result.cleanup_incomplete:
@@ -3678,7 +3765,7 @@ class Orchestrator:
         self,
         state: RunState,
         stage: str,
-        error: GateCommandTimeoutError,
+        error: GateCommandExecutionError,
     ) -> bool:
         result = error.result
         if result is None:
@@ -3717,7 +3804,14 @@ class Orchestrator:
         context: str,
         task_id: str = "",
     ) -> Optional[ExecutionIncident]:
-        result = first_terminated_command(gate)
+        result = next(
+            (
+                item
+                for item in gate.commands
+                if item.termination_reason and not item.infrastructure_error
+            ),
+            None,
+        )
         if result is None:
             return None
         incident = command_incident(
@@ -3786,6 +3880,39 @@ class Orchestrator:
         incident: ExecutionIncident,
         diagnosis: IncidentDiagnosis,
     ) -> bool:
+        if incident.kind == "gate_reported_infrastructure_error":
+            if diagnosis.confidence < 0.8:
+                return self._block_for_execution_incident(
+                    state,
+                    incident,
+                    "reported infrastructure failure ownership was not diagnosed "
+                    "with enough confidence",
+                )
+            if diagnosis.owner in {"target_project", "verification_contract"}:
+                diagnosis = IncidentDiagnosis(
+                    owner=diagnosis.owner,
+                    action="RECOVER_TARGET",
+                    confidence=diagnosis.confidence,
+                    reason=diagnosis.reason,
+                    evidence=list(diagnosis.evidence),
+                    source=diagnosis.source,
+                )
+            elif diagnosis.owner == "auto_agents":
+                diagnosis = IncidentDiagnosis(
+                    owner=diagnosis.owner,
+                    action="SELF_REPAIR",
+                    confidence=diagnosis.confidence,
+                    reason=diagnosis.reason,
+                    evidence=list(diagnosis.evidence),
+                    source=diagnosis.source,
+                )
+            else:
+                return self._block_for_execution_incident(
+                    state,
+                    incident,
+                    "reported infrastructure failure ownership is unknown or external; "
+                    f"owner={diagnosis.owner}: {diagnosis.reason}",
+                )
         incident.diagnosis = diagnosis.to_dict()
         incident.history.append(
             {"event": "diagnosed", "diagnosis": diagnosis.to_dict()}
@@ -3883,6 +4010,10 @@ class Orchestrator:
             "evidence. owner must be one of target_project, verification_contract, requirements, "
             "external_provider, auto_agents, user_input, unknown. action must be one of RETRY, "
             "RECOVER_TARGET, REWIND_PLAN, REWIND_CLARIFY, SELF_REPAIR, ASK_USER, STOP.\n\n"
+            "For kind=gate_reported_infrastructure_error, worker retries are already exhausted: "
+            "attribute the underlying defect. Use RECOVER_TARGET for target_project or "
+            "verification_contract, SELF_REPAIR only for auto_agents, and ASK_USER when ownership "
+            "cannot be established. Do not choose RETRY.\n\n"
             f"Incident:\n{json.dumps(incident.to_dict(), ensure_ascii=False, indent=2)}\n"
             f"User context:\n{user_context or '(none)'}"
         )
@@ -4098,19 +4229,43 @@ class Orchestrator:
             and task.status != "done"
             for task in tasks
         ):
+            reported_infrastructure = (
+                incident.kind == "gate_reported_infrastructure_error"
+            )
+            attempts = incident.process_snapshot.get(
+                "infrastructure_attempts", []
+            )
+            attempt_summary = (
+                json.dumps(attempts, ensure_ascii=False, indent=2)[-6000:]
+                if isinstance(attempts, list) and attempts
+                else "(no worker attempt details recorded)"
+            )
             task = TaskSpec(
                 task_id=f"recover-execution-{incident.incident_id}-r{incident.recovery_round}",
-                title="Repair stalled verification command",
+                title=(
+                    "Repair verification infrastructure"
+                    if reported_infrastructure
+                    else "Repair stalled verification command"
+                ),
                 description=(
+                    "Diagnose and repair the target-project verification infrastructure defect. "
+                    "The test explicitly reported that its infrastructure could not run and all "
+                    "currently eligible workers were already tried. Do not merely rerun the test. "
+                    if reported_infrastructure
+                    else
                     "Diagnose and repair the target-project cause of this supervised verification "
-                    "incident. Do not weaken, skip, xfail, or remove verification. Do not increase "
+                    "incident. "
+                )
+                + (
+                    "Do not weaken, skip, xfail, or remove verification. Do not increase "
                     "the timeout as the primary fix. Reproduce the command with a bounded diagnostic "
                     f"probe of at most {self.config.execution.recovery.diagnostic_probe_timeout_seconds} "
                     "seconds, identify the root cause, and make the smallest general fix.\n\n"
                     f"Command: {incident.command}\nContext: {incident.context}\n"
                     f"Termination: {incident.termination_reason}\n"
                     f"Last activity: {incident.last_activity_seconds:.1f}s ({incident.activity_kind})\n"
-                    f"stderr tail:\n{incident.stderr_tail[-2000:]}"
+                    f"stderr tail:\n{incident.stderr_tail[-2000:]}\n"
+                    f"Worker attempts:\n{attempt_summary}"
                 ),
                 acceptance=[
                     "The original verification command completes within its configured budgets",
@@ -6136,6 +6291,8 @@ class Orchestrator:
                 "verify_current_failure_ids": list(gate_result.get("verify_current_failure_ids", [])),
             }
             return dict(self._rebase_parallel_worker_paths(result, worktree_path))
+        except GateCommandExecutionError:
+            raise
         except Exception as error:
             task = next((item for item in tasks if item.task_id == task_id), None)
             task_payload = task.to_dict() if task is not None else {"task_id": task_id}
@@ -7620,6 +7777,22 @@ class Orchestrator:
                 ),
                 task_id=task.task_id if task is not None else "",
             )
+        infrastructure = first_infrastructure_command(verify_gate)
+        if infrastructure is not None:
+            context = (
+                f"task verification commands ({task.task_id})"
+                if task is not None
+                else "verification commands"
+            )
+            raise GateCommandInfrastructureError(
+                "verification reported infrastructure failure "
+                f"{infrastructure.infrastructure_failure_id or 'unknown'} "
+                f"during {context}",
+                result=infrastructure,
+                context=context,
+                baseline=False,
+                task_id=task.task_id if task is not None else "",
+            )
         if mutation_error:
             failure_ids = self._normalize_verify_failure_ids([], mutation_error)
             return {
@@ -7671,11 +7844,32 @@ class Orchestrator:
             if task is not None and task.verify_baseline_failures
             else []
         )
+        non_comparable_prefixes = (
+            "cmd:",
+            "cmd-timeout:",
+            "cmd-stalled:",
+            "cmd-terminated:",
+            "infra:",
+            "reason:",
+        )
+        baseline_identity_transition = bool(
+            baseline_failure_ids
+            and extraction.comparable
+            and any(
+                failure_id.startswith(non_comparable_prefixes)
+                for failure_id in baseline_failure_ids
+            )
+        )
+        comparison_comparable = (
+            extraction.comparable and not baseline_identity_transition
+        )
         new_failure_ids = (
             sorted(set(current_failure_ids) - set(baseline_failure_ids))
-            if extraction.comparable
+            if comparison_comparable
             else list(current_failure_ids)
         )
+        if baseline_identity_transition:
+            new_failure_ids = []
         if task is not None and task.expected_test_migrations:
             allowed_migrations = {str(item) for item in task.expected_test_migrations}
             new_failure_ids = [fid for fid in new_failure_ids if fid not in allowed_migrations]
@@ -7692,7 +7886,7 @@ class Orchestrator:
         )
         if (
             task is not None
-            and extraction.comparable
+            and comparison_comparable
             and not diagnostic_identity_only
             and current_failure_ids
             and not new_failure_ids
@@ -7721,7 +7915,15 @@ class Orchestrator:
                     )
                 )
             )
-            if diagnostic_identity_only:
+            if baseline_identity_transition:
+                reason = (
+                    "verification failure identity changed from a command-level baseline "
+                    "to stable test-case ids; the baseline comparison is non-comparable: "
+                    + ", ".join(current_failure_ids[:10])
+                )
+                if raw_log_path:
+                    reason = f"{reason}; raw log: {raw_log_path}"
+            elif diagnostic_identity_only:
                 reason = (
                     "verification failed before a stable full failure summary was emitted; "
                     f"identity diagnostic captured: {', '.join(current_failure_ids[:10])}"
@@ -7754,10 +7956,15 @@ class Orchestrator:
                     "failure_ids": effective_failure_ids,
                     "current_failure_ids": current_failure_ids,
                     "baseline_failure_ids": baseline_failure_ids,
-                    "new_failure_ids": new_failure_ids or effective_failure_ids,
+                    "new_failure_ids": (
+                        []
+                        if baseline_identity_transition
+                        else new_failure_ids or effective_failure_ids
+                    ),
                     "raw_output": raw_output,
                     "raw_log_path": raw_log_path,
                     "comparable_failures": extraction.comparable,
+                    "baseline_comparison_comparable": comparison_comparable,
                     "retryable_missing_owned_evidence_refs": retryable_missing_owned_evidence,
                     "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
                     "contract_scope_issue": True,
@@ -7768,10 +7975,16 @@ class Orchestrator:
                 "failure_ids": effective_failure_ids,
                 "current_failure_ids": current_failure_ids,
                 "baseline_failure_ids": baseline_failure_ids,
-                "new_failure_ids": new_failure_ids or effective_failure_ids,
+                "new_failure_ids": (
+                    []
+                    if baseline_identity_transition
+                    else new_failure_ids or effective_failure_ids
+                ),
                 "raw_output": raw_output,
                 "raw_log_path": raw_log_path,
                 "comparable_failures": extraction.comparable,
+                "baseline_comparison_comparable": comparison_comparable,
+                "baseline_identity_transition": baseline_identity_transition,
                 "retryable_missing_owned_evidence_refs": retryable_missing_owned_evidence,
                 "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
             }
@@ -7835,6 +8048,7 @@ class Orchestrator:
             "raw_output": raw_output,
             "raw_log_path": raw_log_path,
             "comparable_failures": extraction.comparable,
+            "baseline_comparison_comparable": comparison_comparable,
             "proof_evidence": proof_evidence,
         }
 
@@ -8541,7 +8755,18 @@ class Orchestrator:
                         progress=self._gate_progress_callback("owned proof evidence"),
                         gate_executor=gate_executor,
                     )
+            self._classify_reported_infrastructure_failures(executed_gate)
             self._log_gate_command_results("owned proof evidence", executed_gate.commands)
+            infrastructure = first_infrastructure_command(executed_gate)
+            if infrastructure is not None:
+                raise GateCommandInfrastructureError(
+                    "owned proof evidence reported infrastructure failure "
+                    f"{infrastructure.infrastructure_failure_id or 'unknown'}",
+                    result=infrastructure,
+                    context="owned proof evidence",
+                    baseline=False,
+                    task_id=task.task_id if task is not None else "",
+                )
         else:
             executed_gate = GateResult(ok=True, commands=[], summary="all commands reused")
         executed_results = {result.command: result for result in executed_gate.commands}
@@ -10180,6 +10405,16 @@ class Orchestrator:
         )
         if mutation_error:
             raise RuntimeError(mutation_error)
+        infrastructure = first_infrastructure_command(verify_gate)
+        if infrastructure is not None:
+            raise GateCommandInfrastructureError(
+                "verify gate reported infrastructure failure "
+                f"{infrastructure.infrastructure_failure_id or 'unknown'}: "
+                f"{infrastructure.command}",
+                result=infrastructure,
+                context="verify stage commands",
+                baseline=False,
+            )
         terminated = first_terminated_command(verify_gate)
         if terminated is not None:
             raise GateCommandTimeoutError(
@@ -12396,7 +12631,12 @@ class Orchestrator:
         else:
             base_order = self._failover_provider_order()
             first = self._last_successful_provider if self._last_successful_provider else self.config.active_provider
-            candidates = [first] + [kind for kind in base_order if kind != first]
+            ordered = [first] + [kind for kind in base_order if kind != first]
+            health = self._provider_health_map()
+            candidates = (
+                [kind for kind in ordered if kind not in health]
+                + [kind for kind in ordered if kind in health]
+            )
 
         eligible: List[str] = []
         diagnostics: List[str] = []
@@ -12417,7 +12657,11 @@ class Orchestrator:
             available_fn = getattr(adapter, "available", None)
             if not callable(available_fn) or not available_fn():
                 diagnostics.append(f"provider {kind} excluded: binary is unavailable")
-                self._failed_providers.add(kind)
+                self._record_provider_failure(
+                    kind,
+                    category="unavailable",
+                    detail="provider binary is unavailable",
+                )
                 self.logger.info(f"[visual_judge] provider={kind} binary not found, skipping")
                 continue
             if not self._adapter_supports_image_attachments(adapter):
@@ -12451,12 +12695,37 @@ class Orchestrator:
         effort = self.config.efforts.get("visual_judge", self.config.efforts.get("review", "balanced"))
         output_path = self._stage_output_path(state.run_id, stage_key)
         write_run_prompt(self.project_root, state.run_id, stage_key, prompt)
+        probe_basis = AgentRequest(
+            stage="visual_judge",
+            effort=effort,
+            prompt=prompt,
+            cwd=self.project_root,
+            output_path=output_path,
+            attempt_id=stage_key,
+        )
+        if (
+            self.config.active_provider in provider_order
+            and provider_order[0] != self.config.active_provider
+            and self._probe_active_provider(probe_basis)
+        ):
+            provider_order = [
+                self.config.active_provider,
+                *[
+                    kind
+                    for kind in provider_order
+                    if kind != self.config.active_provider
+                ],
+            ]
         last_result: Optional[AgentResult] = None
         for kind in provider_order:
             adapter = self.adapter if kind == self.config.active_provider else self._build_adapter_for_provider(kind)
             available_fn = getattr(adapter, "available", None)
             if available_fn is not None and not available_fn():
-                self._failed_providers.add(kind)
+                self._record_provider_failure(
+                    kind,
+                    category="unavailable",
+                    detail="provider binary is unavailable",
+                )
                 self.logger.info(f"[visual_judge] provider={kind} binary not found, skipping")
                 continue
             if not self._adapter_supports_image_attachments(adapter):
@@ -12479,11 +12748,22 @@ class Orchestrator:
                 result = self._run_provider_with_smart_recovery(adapter, request, kind)
             self._emit_agent_output(stage_key, result)
             last_result = result
-            if result.ok or not self._is_failover_error(result):
+            if result.ok:
+                self._last_successful_provider = kind
+                self._clear_provider_failure(kind)
                 return result
-            self._failed_providers.add(kind)
+            if not self._is_failover_error(result):
+                return result
+            health = self._record_provider_failure(kind, result)
             label = self._failover_error_label(result)
-            self.logger.info(f"[visual_judge] provider={kind} {label}, trying next...")
+            self.logger.info(
+                "[visual_judge] provider=%s category=%s %s, "
+                "next_probe_seconds=%s, trying next...",
+                kind,
+                health.category,
+                label,
+                max(0, int(health.next_probe_at - self._provider_now())),
+            )
         return last_result
 
     def _visual_judge_attachments(self, pairs: Iterable[object]) -> List[Path]:
@@ -13071,21 +13351,249 @@ class Orchestrator:
             return False
         if result.termination is not None:
             return True
-        text = result.stderr or ""
+        text = result.stderr or result.summary or ""
         return _FAILOVER_PATTERN.search(text) is not None
 
     @staticmethod
     def _failover_error_label(result: AgentResult) -> str:
-        if result.termination is not None:
-            return result.termination.reason.replace("_", " ")
-        text = result.stderr or ""
+        labels = {
+            "timeout": "timeout/stall",
+            "quota": "quota exhausted",
+            "rate_limit": "rate limited",
+            "capacity": "model capacity unavailable",
+            "protocol": "provider protocol error",
+            "connection": "provider connection error",
+            "unavailable": "provider unavailable",
+            "provider_error": "provider error",
+        }
+        category = Orchestrator._failover_error_category(result)
+        return labels.get(category, "provider availability error")
+
+    @staticmethod
+    def _failover_error_category(result: AgentResult) -> str:
+        termination = result.termination
+        if termination is not None:
+            reason = termination.reason.lower()
+            if any(token in reason for token in ("timeout", "stall", "idle", "ceiling", "loop")):
+                return "timeout"
+            if reason == "provider_error":
+                text = result.stderr or result.summary or ""
+                if _FAILOVER_CONNECTION_PATTERN.search(text):
+                    return "connection"
+                if _FAILOVER_PROTOCOL_PATTERN.search(text):
+                    return "protocol"
+                return "provider_error"
+        text = result.stderr or result.summary or ""
+        if _FAILOVER_EXPLICIT_QUOTA_PATTERN.search(text):
+            return "quota"
+        if _FAILOVER_RATE_PATTERN.search(text):
+            return "rate_limit"
+        if _FAILOVER_CAPACITY_PATTERN.search(text):
+            return "capacity"
         if _FAILOVER_TIMEOUT_PATTERN.search(text):
-            return "timeout/stall"
-        if _FAILOVER_QUOTA_PATTERN.search(text):
-            return "quota/rate error"
+            return "timeout"
         if _FAILOVER_PROTOCOL_PATTERN.search(text):
-            return "provider protocol error"
-        return "provider availability error"
+            return "protocol"
+        if _FAILOVER_CONNECTION_PATTERN.search(text):
+            return "connection"
+        if _FAILOVER_AVAILABILITY_PATTERN.search(text):
+            return "unavailable"
+        return "provider_error"
+
+    def _provider_failover_config(self) -> ProviderFailoverConfig:
+        execution = getattr(self.config, "execution", None)
+        config = getattr(execution, "provider_failover", None)
+        return config if isinstance(config, ProviderFailoverConfig) else ProviderFailoverConfig()
+
+    @staticmethod
+    def _provider_reset_hint_seconds(text: str) -> Optional[int]:
+        match = _RESET_IN_PATTERN.search(text)
+        if match and any(match.groupdict().values()):
+            values = {
+                key: int(value or 0)
+                for key, value in match.groupdict().items()
+            }
+            return (
+                values["days"] * 86400
+                + values["hours"] * 3600
+                + values["minutes"] * 60
+                + values["seconds"]
+            )
+        match = _RETRY_AFTER_PATTERN.search(text)
+        return int(match.group("seconds")) if match else None
+
+    def _provider_now(self) -> float:
+        return time.monotonic()
+
+    def _provider_health_map(self) -> Dict[str, _ProviderHealth]:
+        health = getattr(self, "_provider_health", None)
+        if health is None:
+            health = {}
+            self._provider_health = health
+        return health
+
+    def _record_provider_failure(
+        self,
+        provider: str,
+        result: Optional[AgentResult] = None,
+        *,
+        category: str = "",
+        detail: str = "",
+    ) -> _ProviderHealth:
+        category = category or (
+            self._failover_error_category(result)
+            if result is not None
+            else "unavailable"
+        )
+        text = detail or (
+            (result.stderr or result.summary or "") if result is not None else ""
+        )
+        config = self._provider_failover_config()
+        base = {
+            "connection": config.connection_cooldown_seconds,
+            "protocol": config.connection_cooldown_seconds,
+            "provider_error": config.connection_cooldown_seconds,
+            "capacity": config.pressure_cooldown_seconds,
+            "rate_limit": config.pressure_cooldown_seconds,
+            "unavailable": config.pressure_cooldown_seconds,
+            "timeout": config.timeout_cooldown_seconds,
+            "quota": config.quota_cooldown_seconds,
+        }.get(category, config.connection_cooldown_seconds)
+        previous = self._provider_health_map().get(provider)
+        failure_count = (previous.failure_count + 1) if previous else 1
+        reset_hint = (
+            self._provider_reset_hint_seconds(text) if category == "quota" else None
+        )
+        cooldown = (
+            reset_hint
+            if reset_hint is not None
+            else min(
+                config.max_cooldown_seconds,
+                int(base) * (2 ** max(0, failure_count - 1)),
+            )
+        )
+        health = _ProviderHealth(
+            category=category,
+            failure_count=failure_count,
+            next_probe_at=self._provider_now() + max(1, int(cooldown)),
+            last_error=" ".join(text.split())[:500],
+        )
+        self._provider_health_map()[provider] = health
+        self._failed_providers.add(provider)
+        return health
+
+    def _clear_provider_failure(self, provider: str) -> None:
+        self._failed_providers.discard(provider)
+        self._provider_health_map().pop(provider, None)
+
+    def _build_probe_adapter_for_provider(self, provider_kind: str):
+        provider = self.config.providers[provider_kind]
+        if not isinstance(provider, ProviderConfig):
+            return self._build_adapter_for_provider(provider_kind)
+        timeout = self._provider_failover_config().probe_timeout_seconds
+        probe_provider = replace(
+            provider,
+            timeout_seconds=min(provider.timeout_seconds, timeout),
+            idle_timeout_seconds=min(provider.idle_timeout_seconds, timeout),
+        )
+        smart = replace(
+            self.config.execution.smart_timeout,
+            provider_idle_seconds=min(
+                self.config.execution.smart_timeout.provider_idle_seconds,
+                timeout,
+            ),
+            tool_idle_seconds=min(
+                self.config.execution.smart_timeout.tool_idle_seconds,
+                timeout,
+            ),
+            semantic_stall_seconds=min(
+                self.config.execution.smart_timeout.semantic_stall_seconds,
+                timeout,
+            ),
+            safety_ceiling_seconds=timeout,
+            same_provider_resume_limit=0,
+        )
+        if probe_provider.kind == "codex":
+            return CodexAdapter(probe_provider, smart)
+        if probe_provider.kind == "copilot-cli":
+            return CopilotCliAdapter(probe_provider, smart)
+        if probe_provider.kind == "antigravity":
+            return AntigravityAdapter(probe_provider, smart)
+        if probe_provider.kind == "mock":
+            return MockAdapter()
+        return ShellAdapter(probe_provider, smart)
+
+    def _probe_active_provider(self, request: AgentRequest) -> bool:
+        provider = self.config.active_provider
+        config = self._provider_failover_config()
+        health = self._provider_health_map().get(provider)
+        if (
+            not config.probe_enabled
+            or health is None
+            or self._provider_now() < health.next_probe_at
+        ):
+            return False
+        self.logger.info(
+            "[failover-probe] provider=%s state=start category=%s failures=%s timeout_seconds=%s",
+            provider,
+            health.category,
+            health.failure_count,
+            config.probe_timeout_seconds,
+        )
+        try:
+            with tempfile.TemporaryDirectory(prefix="auto-agents-provider-probe-") as temp:
+                root = Path(temp)
+                probe_request = AgentRequest(
+                    stage="provider_probe",
+                    effort=request.effort,
+                    prompt=(
+                        "Provider health canary. Do not use tools or inspect files. "
+                        "Reply with exactly PROVIDER_READY."
+                    ),
+                    cwd=root,
+                    output_path=root / "provider-probe.md",
+                    attempt_id=f"provider-probe-{provider}",
+                )
+                result = self._build_probe_adapter_for_provider(provider).run(
+                    probe_request
+                )
+                response = (
+                    result.summary
+                    or result.stdout
+                    or read_text(probe_request.output_path)
+                ).strip()
+        except Exception as error:
+            health = self._record_provider_failure(
+                provider,
+                category="connection",
+                detail=str(error),
+            )
+            self.logger.info(
+                "[failover-probe] provider=%s state=fail category=%s next_probe_seconds=%s",
+                provider,
+                health.category,
+                max(0, int(health.next_probe_at - self._provider_now())),
+            )
+            return False
+        if result.ok and response == "PROVIDER_READY":
+            self._clear_provider_failure(provider)
+            self.logger.info(
+                "[failover-probe] provider=%s state=recovered",
+                provider,
+            )
+            return True
+        health = self._record_provider_failure(
+            provider,
+            result,
+            detail=result.stderr or response or result.summary,
+        )
+        self.logger.info(
+            "[failover-probe] provider=%s state=fail category=%s next_probe_seconds=%s",
+            provider,
+            health.category,
+            max(0, int(health.next_probe_at - self._provider_now())),
+        )
+        return False
 
     def _failover_provider_order(self) -> List[str]:
         active = self.config.active_provider
@@ -13107,14 +13615,26 @@ class Orchestrator:
         # Build provider order: [last_successful or active] + untried + previously_failed
         base_order = self._failover_provider_order()
         interrupted_provider = self._interrupted_provider_for_request(request, base_order)
-        first = (
-            interrupted_provider
-            or self._last_successful_provider
-            or self.config.active_provider
-        )
+        health = self._provider_health_map()
+        if interrupted_provider:
+            first = interrupted_provider
+        elif (
+            self.config.active_provider in health
+            and self._probe_active_provider(request)
+        ):
+            first = self.config.active_provider
+            health = self._provider_health_map()
+        else:
+            preferred = self._last_successful_provider or self.config.active_provider
+            first = preferred
+            if preferred in health:
+                first = next(
+                    (kind for kind in base_order if kind not in health),
+                    preferred,
+                )
         rest = [k for k in base_order if k != first]
-        untried = [k for k in rest if k not in self._failed_providers]
-        retryable = [k for k in rest if k in self._failed_providers]
+        untried = [k for k in rest if k not in health]
+        retryable = [k for k in rest if k in health]
         order = [first] + untried + retryable
 
         tried: List[str] = []
@@ -13123,7 +13643,11 @@ class Orchestrator:
             adapter = self.adapter if kind == self.config.active_provider else self._build_adapter_for_provider(kind)
             available_fn = getattr(adapter, "available", None)
             if available_fn is not None and not available_fn():
-                self._failed_providers.add(kind)
+                self._record_provider_failure(
+                    kind,
+                    category="unavailable",
+                    detail="provider binary is unavailable",
+                )
                 self.logger.info(f"[failover] provider={kind} binary not found, skipping")
                 tried.append(kind)
                 continue
@@ -13134,7 +13658,7 @@ class Orchestrator:
 
             if result.ok:
                 self._last_successful_provider = kind
-                self._failed_providers.discard(kind)
+                self._clear_provider_failure(kind)
                 if kind != self.config.active_provider:
                     self.logger.info(f"[failover] using provider={kind}")
                 return result
@@ -13142,10 +13666,17 @@ class Orchestrator:
             if not self._is_failover_error(result):
                 return result
 
-            self._failed_providers.add(kind)
+            health_state = self._record_provider_failure(kind, result)
             snippet = (result.stderr or "")[:120]
             label = self._failover_error_label(result)
-            self.logger.info(f"[failover] provider={kind} {label} ({snippet}), trying next...")
+            self.logger.info(
+                "[failover] provider=%s category=%s %s (%s), next_probe_seconds=%s, trying next...",
+                kind,
+                health_state.category,
+                label,
+                snippet,
+                max(0, int(health_state.next_probe_at - self._provider_now())),
+            )
             last_error = result.stderr or result.summary or "unknown error"
 
         raise RuntimeError(

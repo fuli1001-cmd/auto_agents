@@ -2674,6 +2674,45 @@ class RetryFlowTests(unittest.TestCase):
                 ],
             )
 
+    def test_task_verify_does_not_call_stable_id_new_against_command_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            verify_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command="npm test",
+                        ok=False,
+                        returncode=1,
+                        stdout=(
+                            "FAIL src/e2e/create-modal.test.ts > "
+                            "create_modal_close_and_submit_contract\n"
+                        ),
+                    )
+                ],
+                summary="command failed",
+            )
+            orchestrator._run_gate_commands = lambda **_kwargs: (verify_gate, "")
+            task = TaskSpec(
+                task_id="task-001",
+                title="verify identity transition",
+                description="",
+                acceptance=[],
+                verify_baseline_failures=["cmd:npm test"],
+            )
+
+            result = orchestrator._run_task_verify(task)
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["comparable_failures"])
+            self.assertFalse(result["baseline_comparison_comparable"])
+            self.assertTrue(result["baseline_identity_transition"])
+            self.assertEqual(result["new_failure_ids"], [])
+            self.assertNotIn("new verification failure", result["reason"])
+            self.assertIn("baseline comparison is non-comparable", result["reason"])
+
     def test_task_proof_evidence_supports_mixed_pytest_and_vitest_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

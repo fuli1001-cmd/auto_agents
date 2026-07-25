@@ -222,6 +222,7 @@ DEFAULT_CONFIG = {
         "command_timeout_seconds": 7200,
         "adaptive_timeout_enabled": True,
         "command_idle_timeout_seconds": 900,
+        "reported_infrastructure_markers": [],
         "isolation": {
             "enabled": True,
             "mode": "git_worktree",
@@ -234,6 +235,7 @@ DEFAULT_CONFIG = {
             "discovery_timeout_seconds": 1.5,
             "request_timeout_seconds": 15,
             "infrastructure_retry_limit": 2,
+            "reported_infrastructure_max_workers": 8,
             "forward_environment": "all_except_denylist",
             "extra_environment_denylist": [],
         },
@@ -269,6 +271,15 @@ DEFAULT_CONFIG = {
             "safety_ceiling_seconds": 43200,
             "loop_repeat_limit": 3,
             "same_provider_resume_limit": 1,
+        },
+        "provider_failover": {
+            "probe_enabled": True,
+            "probe_timeout_seconds": 60,
+            "connection_cooldown_seconds": 60,
+            "pressure_cooldown_seconds": 300,
+            "timeout_cooldown_seconds": 1800,
+            "quota_cooldown_seconds": 3600,
+            "max_cooldown_seconds": 14400,
         },
         "recovery": {
             "enabled": True,

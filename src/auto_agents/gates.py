@@ -15,6 +15,7 @@ from .models import (
     CommandResult,
     GateParallelGroup,
     GateResult,
+    InfrastructureFailureMarker,
     VerificationStep,
 )
 from .process_supervision import run_supervised_shell_command
@@ -26,6 +27,19 @@ _VITEST_FAILED = re.compile(
     re.MULTILINE,
 )
 _UNITTEST_FAILED = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
+_STANDARD_INFRA_FAILURE = re.compile(
+    r"\bAUTO_AGENTS_INFRA_FAILURE\s+id=(?P<id>[a-z][a-z0-9_-]{1,63})\b",
+    re.IGNORECASE,
+)
+_BUILTIN_INFRA_MARKERS = (
+    (
+        "browser_verification_infrastructure_failed",
+        re.compile(
+            r"\bbrowser_verification_infrastructure_failed\b|"
+            r"\bBrowserVerificationInfrastructureError\b"
+        ),
+    ),
+)
 GateProgressCallback = Callable[[str, str, float], None]
 
 
@@ -84,8 +98,8 @@ class ResolvedGatePlan:
         return max(0, self.raw_command_count - self.unique_command_count)
 
 
-class GateCommandTimeoutError(RuntimeError):
-    """A baseline gate could not produce a finite, cacheable result."""
+class GateCommandExecutionError(RuntimeError):
+    """A gate command failed for reasons that require incident recovery."""
 
     def __init__(
         self,
@@ -103,11 +117,79 @@ class GateCommandTimeoutError(RuntimeError):
         self.task_id = task_id
 
 
+class GateCommandTimeoutError(GateCommandExecutionError):
+    """A baseline gate could not produce a finite, cacheable result."""
+
+
+class GateCommandInfrastructureError(GateCommandExecutionError):
+    """A test reported that verification infrastructure could not run."""
+
+
 def first_terminated_command(gate_result: GateResult) -> Optional[CommandResult]:
     return next(
         (item for item in gate_result.commands if item.termination_reason),
         None,
     )
+
+
+def first_infrastructure_command(
+    gate_result: GateResult,
+) -> Optional[CommandResult]:
+    return next(
+        (item for item in gate_result.commands if item.infrastructure_error),
+        None,
+    )
+
+
+def _diagnostic_output_lines(result: CommandResult) -> List[str]:
+    lines: List[str] = []
+    for raw in f"{result.stdout}\n{result.stderr}".splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if (
+            "AUTO_AGENTS_INFRA_FAILURE" in line
+            or "infrastructure_failed" in line.lower()
+            or "InfrastructureError" in line
+        ):
+            lines.append(line)
+    return lines
+
+
+def classify_reported_infrastructure_failure(
+    result: CommandResult,
+    markers: Sequence[InfrastructureFailureMarker] = (),
+) -> CommandResult:
+    """Promote an explicit test-reported infrastructure failure.
+
+    Tests may use the stable ``AUTO_AGENTS_INFRA_FAILURE id=<id>`` protocol.
+    A small built-in compatibility set recognizes existing browser verification
+    failures, while project configuration can add literal diagnostic markers.
+    """
+    if result.ok or result.infrastructure_error or result.termination_reason:
+        return result
+    full_output = f"{result.stdout}\n{result.stderr}"
+    lines = _diagnostic_output_lines(result)
+    if not lines and not markers:
+        return result
+    diagnostic = "\n".join(lines)
+    standard = _STANDARD_INFRA_FAILURE.search(diagnostic)
+    failure_id = standard.group("id").lower() if standard else ""
+    if not failure_id:
+        for marker_id, pattern in _BUILTIN_INFRA_MARKERS:
+            if pattern.search(diagnostic):
+                failure_id = marker_id
+                break
+    if not failure_id:
+        lowered = full_output.lower()
+        for marker in markers:
+            if marker.contains.lower() in lowered:
+                failure_id = marker.marker_id
+                break
+    if failure_id:
+        result.infrastructure_error = True
+        result.infrastructure_failure_id = failure_id
+    return result
 
 
 def _pytest_failure_ids(output: str) -> List[str]:
@@ -696,7 +778,7 @@ def run_gate_plan(
             continue
         ok = False
         summaries.append(_failure_summary(result))
-        if result.termination_reason or not collect_all:
+        if result.termination_reason or result.infrastructure_error or not collect_all:
             return GateResult(ok=False, commands=results, summary="; ".join(summaries))
 
     for group in parallel_groups:
@@ -722,7 +804,13 @@ def run_gate_plan(
             if result.termination_reason != "cancelled"
         ] or failed[:1]
         summaries.extend(_failure_summary(result) for result in reportable)
-        if any(result.termination_reason for result in failed) or not collect_all:
+        if (
+            any(
+                result.termination_reason or result.infrastructure_error
+                for result in failed
+            )
+            or not collect_all
+        ):
             break
 
     summary = "all commands passed" if ok else "; ".join(summaries)
@@ -741,6 +829,16 @@ def extract_failure_info(gate_result: GateResult) -> FailureExtraction:
     non_comparable: List[str] = []
     for cmd_result in gate_result.commands:
         if cmd_result.ok:
+            continue
+        if cmd_result.infrastructure_error:
+            failure_id = (
+                cmd_result.infrastructure_failure_id
+                or cmd_result.termination_reason
+                or "unknown"
+            )
+            non_comparable.append(
+                f"infra:{failure_id}:{cmd_result.command}"
+            )
             continue
         if cmd_result.termination_reason:
             prefix = (

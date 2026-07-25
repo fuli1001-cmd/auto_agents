@@ -657,6 +657,7 @@ The default project setting is:
       "discovery_timeout_seconds": 1.5,
       "request_timeout_seconds": 15,
       "infrastructure_retry_limit": 2,
+      "reported_infrastructure_max_workers": 8,
       "forward_environment": "all_except_denylist",
       "extra_environment_denylist": ["OPENAI_API_KEY"]
     }
@@ -670,6 +671,15 @@ parallel-safe commands by free capacity while pinning sequential producer/consum
 worker. Infrastructure failures before acceptance may be retried elsewhere; a job whose remote
 state becomes uncertain after acceptance is never duplicated. Stale terminal records and artifacts
 can be removed with `auto-agents workers cleanup`.
+
+Tests can explicitly report that they could not exercise the target behavior by emitting
+`AUTO_AGENTS_INFRA_FAILURE id=<stable_id>` on a diagnostic line. auto_agents also recognizes its
+built-in browser-verification marker, plus literal project markers configured under
+`gates.reported_infrastructure_markers`. A reported infrastructure failure is retried once on each
+currently eligible worker, up to `reported_infrastructure_max_workers`; if every worker fails,
+ownership diagnosis routes target-project/verification defects to a scoped repair task,
+auto_agents defects to self-repair, and unknown ownership to a blocked run. These failures are
+non-comparable and are never counted as new test failures against a command-level baseline.
 
 Gate commands use an activity lease plus an absolute wall-clock ceiling. The defaults for new
 projects are 900 seconds without observable output/CPU activity and a 7200-second ceiling:
@@ -754,6 +764,15 @@ worktrees. Example:
       "loop_repeat_limit": 3,
       "same_provider_resume_limit": 1
     },
+    "provider_failover": {
+      "probe_enabled": true,
+      "probe_timeout_seconds": 60,
+      "connection_cooldown_seconds": 60,
+      "pressure_cooldown_seconds": 300,
+      "timeout_cooldown_seconds": 1800,
+      "quota_cooldown_seconds": 3600,
+      "max_cooldown_seconds": 14400
+    },
     "recovery": {
       "enabled": true,
       "max_rounds": 2,
@@ -765,6 +784,13 @@ worktrees. Example:
   }
 }
 ```
+
+Provider failover state is category-aware and run-local. Connection/protocol failures cool down for
+60 seconds, capacity/rate pressure for 5 minutes, supervised timeouts for 30 minutes, and quota
+failures without a reset hint for 1 hour. Repeated failures back off exponentially up to 4 hours;
+an explicit provider reset hint is honored. At a later agent-call boundary, a due active provider
+gets one bounded 60-second canary. Only the exact `PROVIDER_READY` response restores it ahead of
+fallback providers.
 
 When that mode is enabled, the planner should emit `depends_on` arrays in
 `.auto-agents/state/task_plan.json`, for example `[]` for an independent task or

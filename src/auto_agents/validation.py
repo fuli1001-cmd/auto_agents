@@ -951,6 +951,46 @@ def validate_project_config_payload(payload: object) -> List[str]:
             errors.append(
                 "gates.command_idle_timeout_seconds must be <= gates.command_timeout_seconds"
             )
+        infrastructure_markers = gates.get(
+            "reported_infrastructure_markers", []
+        )
+        if not isinstance(infrastructure_markers, list):
+            errors.append(
+                "gates.reported_infrastructure_markers must be a list"
+            )
+        else:
+            seen_marker_ids: set[str] = set()
+            for index, marker in enumerate(infrastructure_markers):
+                prefix = f"gates.reported_infrastructure_markers[{index}]"
+                if not isinstance(marker, dict):
+                    errors.append(f"{prefix} must be an object")
+                    continue
+                unknown = sorted(set(marker) - {"id", "contains"})
+                if unknown:
+                    errors.append(
+                        f"{prefix} contains unknown fields: {', '.join(unknown)}"
+                    )
+                marker_id = marker.get("id")
+                contains = marker.get("contains")
+                if (
+                    not isinstance(marker_id, str)
+                    or not re.fullmatch(r"[a-z][a-z0-9_-]{1,63}", marker_id)
+                ):
+                    errors.append(
+                        f"{prefix}.id must match [a-z][a-z0-9_-]{{1,63}}"
+                    )
+                elif marker_id in seen_marker_ids:
+                    errors.append(f"{prefix}.id must be unique")
+                else:
+                    seen_marker_ids.add(marker_id)
+                if (
+                    not isinstance(contains, str)
+                    or not contains.strip()
+                    or len(contains) > 512
+                ):
+                    errors.append(
+                        f"{prefix}.contains must be a non-empty string of at most 512 characters"
+                    )
         isolation = gates.get("isolation", {})
         if not isinstance(isolation, dict):
             errors.append("gates.isolation must be an object")
@@ -1041,6 +1081,18 @@ def validate_project_config_payload(payload: object) -> List[str]:
             ):
                 errors.append(
                     "gates.distributed.infrastructure_retry_limit must be an integer >= 0"
+                )
+            reported_max = distributed.get(
+                "reported_infrastructure_max_workers", 8
+            )
+            if (
+                not isinstance(reported_max, int)
+                or isinstance(reported_max, bool)
+                or reported_max < 1
+            ):
+                errors.append(
+                    "gates.distributed.reported_infrastructure_max_workers "
+                    "must be an integer >= 1"
                 )
             denylist = distributed.get("extra_environment_denylist", [])
             if not isinstance(denylist, list) or any(
@@ -1158,6 +1210,56 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 ):
                     errors.append(
                         "execution.smart_timeout.safety_ceiling_seconds must be >= all lease timeouts"
+                    )
+            provider_failover = execution.get("provider_failover", {})
+            if not isinstance(provider_failover, dict):
+                errors.append("execution.provider_failover must be an object")
+            else:
+                if not isinstance(
+                    provider_failover.get("probe_enabled", True), bool
+                ):
+                    errors.append(
+                        "execution.provider_failover.probe_enabled must be a boolean"
+                    )
+                failover_defaults = {
+                    "probe_timeout_seconds": 60,
+                    "connection_cooldown_seconds": 60,
+                    "pressure_cooldown_seconds": 300,
+                    "timeout_cooldown_seconds": 1800,
+                    "quota_cooldown_seconds": 3600,
+                    "max_cooldown_seconds": 14400,
+                }
+                for key, default in failover_defaults.items():
+                    value = provider_failover.get(key, default)
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 1
+                    ):
+                        errors.append(
+                            f"execution.provider_failover.{key} must be an integer >= 1"
+                        )
+                maximum = provider_failover.get(
+                    "max_cooldown_seconds", 14400
+                )
+                cooldowns = [
+                    provider_failover.get(key, default)
+                    for key, default in failover_defaults.items()
+                    if key.endswith("_cooldown_seconds")
+                    and key != "max_cooldown_seconds"
+                ]
+                if (
+                    isinstance(maximum, int)
+                    and not isinstance(maximum, bool)
+                    and all(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        for value in cooldowns
+                    )
+                    and maximum < max(cooldowns)
+                ):
+                    errors.append(
+                        "execution.provider_failover.max_cooldown_seconds must "
+                        "be >= all provider cooldowns"
                     )
             recovery = execution.get("recovery", {})
             if not isinstance(recovery, dict):

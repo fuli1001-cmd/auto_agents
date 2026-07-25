@@ -57,6 +57,7 @@
     "command_timeout_seconds": 7200,
     "adaptive_timeout_enabled": true,
     "command_idle_timeout_seconds": 900,
+    "reported_infrastructure_markers": [],
     "isolation": {
       "enabled": true,
       "mode": "git_worktree",
@@ -69,6 +70,7 @@
       "discovery_timeout_seconds": 1.5,
       "request_timeout_seconds": 15,
       "infrastructure_retry_limit": 2,
+      "reported_infrastructure_max_workers": 8,
       "forward_environment": "all_except_denylist",
       "extra_environment_denylist": []
     }
@@ -95,6 +97,15 @@
     },
     "evidence_preflight": {
       "mode": "high_risk"
+    },
+    "provider_failover": {
+      "probe_enabled": true,
+      "probe_timeout_seconds": 60,
+      "connection_cooldown_seconds": 60,
+      "pressure_cooldown_seconds": 300,
+      "timeout_cooldown_seconds": 1800,
+      "quota_cooldown_seconds": 3600,
+      "max_cooldown_seconds": 14400
     },
     "recovery": {
       "enabled": true,

@@ -202,8 +202,16 @@ def command_incident(
     command = redact_incident_text(result.command)
     stdout_tail = _compact(redact_incident_text(result.stdout))
     stderr_tail = _compact(redact_incident_text(result.stderr))
-    kind = "gate_stall" if result.termination_reason == "stalled" else "gate_timeout"
-    if result.termination_reason not in {"timeout", "stalled"}:
+    if result.infrastructure_failure_id:
+        kind = "gate_reported_infrastructure_error"
+    elif result.infrastructure_error:
+        kind = "gate_infrastructure_error"
+    else:
+        kind = "gate_stall" if result.termination_reason == "stalled" else "gate_timeout"
+    if (
+        not result.infrastructure_error
+        and result.termination_reason not in {"timeout", "stalled"}
+    ):
         kind = f"gate_{result.termination_reason or 'abnormal_exit'}"
     incident_fp = _fingerprint_payload(
         {
@@ -213,6 +221,7 @@ def command_incident(
             "context": context,
             "command": " ".join(command.split()),
             "termination_reason": result.termination_reason,
+            "infrastructure_failure_id": result.infrastructure_failure_id,
         }
     )
     evidence_fp = _fingerprint_payload(
@@ -224,6 +233,7 @@ def command_incident(
             "head": head_ref,
             "worktree": worktree_fingerprint,
             "process": result.process_snapshot,
+            "infrastructure_attempts": result.infrastructure_attempts,
         }
     )
     return ExecutionIncident(
@@ -246,7 +256,11 @@ def command_incident(
         cleanup_incomplete=result.cleanup_incomplete,
         stdout_tail=stdout_tail,
         stderr_tail=stderr_tail,
-        process_snapshot=dict(result.process_snapshot),
+        process_snapshot={
+            **dict(result.process_snapshot),
+            "infrastructure_failure_id": result.infrastructure_failure_id,
+            "infrastructure_attempts": list(result.infrastructure_attempts),
+        },
         head_ref=head_ref,
         worktree_fingerprint=worktree_fingerprint,
         incident_fingerprint=incident_fp,

@@ -211,6 +211,18 @@ class TestIsFailoverError(unittest.TestCase):
         )
         self.assertTrue(Orchestrator._is_failover_error(r))
 
+    def test_websocket_connect_error(self):
+        r = _make_result(
+            ok=False,
+            returncode=1,
+            stderr="responses_websocket: failed to connect",
+        )
+        self.assertTrue(Orchestrator._is_failover_error(r))
+        self.assertEqual(
+            Orchestrator._failover_error_category(r),
+            "connection",
+        )
+
 
 class TestFailoverErrorLabel(unittest.TestCase):
     def test_timeout_label(self):
@@ -219,11 +231,11 @@ class TestFailoverErrorLabel(unittest.TestCase):
 
     def test_quota_label(self):
         r = _make_result(ok=False, returncode=1, stderr="429 Too Many Requests")
-        self.assertEqual(Orchestrator._failover_error_label(r), "quota/rate error")
+        self.assertEqual(Orchestrator._failover_error_label(r), "rate limited")
 
     def test_availability_label(self):
         r = _make_result(ok=False, returncode=1, stderr="service unavailable")
-        self.assertEqual(Orchestrator._failover_error_label(r), "provider availability error")
+        self.assertEqual(Orchestrator._failover_error_label(r), "provider unavailable")
 
     def test_protocol_error_label(self):
         r = _make_result(ok=False, returncode=0, stderr="provider protocol error")
@@ -572,7 +584,7 @@ class TestCallWithFailover(unittest.TestCase):
         self.assertEqual(copilot2.calls, 0)
 
     def test_recovered_provider_rejoins(self):
-        """A previously failed provider that now succeeds is removed from _failed_providers."""
+        """A due canary restores the active provider ahead of the fallback."""
         quota = _make_result(ok=False, returncode=1, stderr="rate limit")
         ok = _make_result(ok=True)
         stub = _stub_orchestrator(
@@ -593,9 +605,13 @@ class TestCallWithFailover(unittest.TestCase):
         # But let's set _last_successful_provider to None to test codex as first (active)
         stub._last_successful_provider = None
         stub.adapter = codex_ok
+        stub._provider_health["codex"].next_probe_at = 0
+        probe = _FakeAdapter(_make_result(ok=True, summary="PROVIDER_READY"))
+        stub._build_probe_adapter_for_provider = lambda kind: probe
 
         result = stub._call_with_failover(_make_request())
         self.assertTrue(result.ok)
+        self.assertEqual(probe.calls, 1)
         self.assertEqual(codex_ok.calls, 1)
         # codex succeeded → removed from _failed_providers
         self.assertNotIn("codex", stub._failed_providers)
@@ -610,7 +626,7 @@ class TestCallWithFailover(unittest.TestCase):
         )
         stub._call_with_failover(_make_request())
         log = stub.agent_output_stream.getvalue()
-        self.assertIn("[failover] provider=codex quota/rate error", log)
+        self.assertIn("[failover] provider=codex category=rate_limit rate limited", log)
         self.assertIn("[failover] using provider=copilot-cli", log)
 
     def test_timeout_log_output(self):
@@ -622,8 +638,43 @@ class TestCallWithFailover(unittest.TestCase):
         )
         stub._call_with_failover(_make_request())
         log = stub.agent_output_stream.getvalue()
-        self.assertIn("[failover] provider=copilot-cli timeout/stall", log)
-        self.assertNotIn("quota/rate error (timed out", log)
+        self.assertIn(
+            "[failover] provider=copilot-cli category=timeout timeout/stall",
+            log,
+        )
+        self.assertNotIn("category=quota", log)
+
+    def test_explicit_quota_reset_hint_sets_probe_deadline(self):
+        stub = _stub_orchestrator({"codex": {}}, "codex", {"codex": _FakeAdapter(_make_result())})
+        stub._provider_now = lambda: 100.0
+
+        health = stub._record_provider_failure(
+            "codex",
+            _make_result(
+                ok=False,
+                returncode=1,
+                stderr="Individual quota reached. Resets in 3h48m44s.",
+            ),
+        )
+
+        self.assertEqual(health.category, "quota")
+        self.assertEqual(health.next_probe_at, 100 + 3 * 3600 + 48 * 60 + 44)
+
+    def test_active_provider_is_not_probed_before_cooldown(self):
+        quota = _make_result(ok=False, returncode=1, stderr="rate limit")
+        ok = _make_result(ok=True)
+        stub = _stub_orchestrator(
+            {"codex": {}, "copilot-cli": {}},
+            "codex",
+            {"codex": _FakeAdapter(quota), "copilot-cli": _FakeAdapter(ok)},
+        )
+        stub._call_with_failover(_make_request())
+        probe = _FakeAdapter(_make_result(ok=True, summary="PROVIDER_READY"))
+        stub._build_probe_adapter_for_provider = lambda kind: probe
+
+        stub._call_with_failover(_make_request())
+
+        self.assertEqual(probe.calls, 0)
 
 
 if __name__ == "__main__":

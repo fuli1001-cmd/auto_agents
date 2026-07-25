@@ -1377,6 +1377,7 @@ class Session:
                 progress=self.orch._gate_progress_callback("session baseline snapshot"),
                 gate_executor=gate_executor,
             )
+        self.orch._classify_reported_infrastructure_failures(gate)
         self.orch._raise_for_baseline_termination(
             gate,
             context="session baseline snapshot",
@@ -1436,8 +1437,17 @@ class Session:
                     )
             except Exception as exc:
                 return {"ok": False, "reason": f"fix_verify_command error: {exc}"}
+            self.orch._classify_reported_infrastructure_failures(targeted_gate)
             if not targeted_gate.ok:
                 command_result = targeted_gate.commands[0]
+                if command_result.infrastructure_error:
+                    return {
+                        "ok": False,
+                        "reason": (
+                            "fix_verify_command reported infrastructure failure: "
+                            f"{command_result.infrastructure_failure_id or 'unknown'}"
+                        ),
+                    }
                 detail = (
                     command_result.stderr
                     or command_result.stdout
@@ -1467,12 +1477,38 @@ class Session:
                 progress=self.orch._gate_progress_callback("session verification"),
                 gate_executor=gate_executor,
             )
+        self.orch._classify_reported_infrastructure_failures(gate)
         extraction = extract_failure_info(gate)
         current_failures = extraction.failure_ids
         if not extraction.comparable and not gate.ok:
             return {
                 "ok": False,
                 "reason": "non-comparable verification failure: failed command did not yield stable test-case failure ids",
+            }
+        if (
+            not gate.ok
+            and extraction.comparable
+            and any(
+                str(item).startswith(
+                    (
+                        "cmd:",
+                        "cmd-timeout:",
+                        "cmd-stalled:",
+                        "cmd-terminated:",
+                        "infra:",
+                        "reason:",
+                    )
+                )
+                for item in state.baseline_failures
+            )
+        ):
+            return {
+                "ok": False,
+                "reason": (
+                    "verification failure identity changed from a command-level "
+                    "baseline to stable test-case ids; baseline comparison is "
+                    "non-comparable"
+                ),
             }
         new_failures = sorted(set(current_failures) - set(state.baseline_failures))
         if new_failures:

@@ -361,6 +361,7 @@ class DistributedGatesConfig:
     discovery_timeout_seconds: float = 1.5
     request_timeout_seconds: int = 15
     infrastructure_retry_limit: int = 2
+    reported_infrastructure_max_workers: int = 8
     forward_environment: str = "all_except_denylist"
     extra_environment_denylist: List[str] = field(default_factory=list)
 
@@ -380,6 +381,9 @@ class DistributedGatesConfig:
             ),
             request_timeout_seconds=int(data.get("request_timeout_seconds", 15)),
             infrastructure_retry_limit=int(data.get("infrastructure_retry_limit", 2)),
+            reported_infrastructure_max_workers=int(
+                data.get("reported_infrastructure_max_workers", 8)
+            ),
             forward_environment=str(
                 data.get("forward_environment", "all_except_denylist")
             ),
@@ -390,6 +394,22 @@ class DistributedGatesConfig:
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class InfrastructureFailureMarker:
+    marker_id: str
+    contains: str
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "InfrastructureFailureMarker":
+        return cls(
+            marker_id=str(data.get("id", "")).strip(),
+            contains=str(data.get("contains", "")).strip(),
+        )
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"id": self.marker_id, "contains": self.contains}
 
 
 @dataclass
@@ -404,6 +424,9 @@ class GateConfig:
     command_timeout_seconds: int = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS
     adaptive_timeout_enabled: bool = True
     command_idle_timeout_seconds: int = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS
+    reported_infrastructure_markers: List[InfrastructureFailureMarker] = field(
+        default_factory=list
+    )
     isolation: GateIsolationConfig = field(default_factory=GateIsolationConfig)
     distributed: DistributedGatesConfig = field(default_factory=DistributedGatesConfig)
 
@@ -446,6 +469,11 @@ class GateConfig:
                     min(DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS, command_timeout_seconds),
                 )
             ),
+            reported_infrastructure_markers=[
+                InfrastructureFailureMarker.from_dict(dict(item))
+                for item in data.get("reported_infrastructure_markers", [])
+                if isinstance(item, dict)
+            ],
             isolation=GateIsolationConfig.from_dict(
                 dict(data.get("isolation", {}))
                 if isinstance(data.get("isolation", {}), dict)
@@ -470,6 +498,9 @@ class GateConfig:
             "command_timeout_seconds": self.command_timeout_seconds,
             "adaptive_timeout_enabled": self.adaptive_timeout_enabled,
             "command_idle_timeout_seconds": self.command_idle_timeout_seconds,
+            "reported_infrastructure_markers": [
+                marker.to_dict() for marker in self.reported_infrastructure_markers
+            ],
             "isolation": self.isolation.to_dict(),
             "distributed": self.distributed.to_dict(),
         }
@@ -701,12 +732,47 @@ class SmartTimeoutConfig:
 
 
 @dataclass
+class ProviderFailoverConfig:
+    probe_enabled: bool = True
+    probe_timeout_seconds: int = 60
+    connection_cooldown_seconds: int = 60
+    pressure_cooldown_seconds: int = 300
+    timeout_cooldown_seconds: int = 1800
+    quota_cooldown_seconds: int = 3600
+    max_cooldown_seconds: int = 14400
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "ProviderFailoverConfig":
+        return cls(
+            probe_enabled=bool(data.get("probe_enabled", True)),
+            probe_timeout_seconds=int(data.get("probe_timeout_seconds", 60)),
+            connection_cooldown_seconds=int(
+                data.get("connection_cooldown_seconds", 60)
+            ),
+            pressure_cooldown_seconds=int(
+                data.get("pressure_cooldown_seconds", 300)
+            ),
+            timeout_cooldown_seconds=int(
+                data.get("timeout_cooldown_seconds", 1800)
+            ),
+            quota_cooldown_seconds=int(data.get("quota_cooldown_seconds", 3600)),
+            max_cooldown_seconds=int(data.get("max_cooldown_seconds", 14400)),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class ExecutionConfig:
     parallel_tasks: ParallelTasksConfig = field(default_factory=ParallelTasksConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     requirements_audit: RequirementsAuditConfig = field(default_factory=RequirementsAuditConfig)
     evidence_preflight: EvidencePreflightConfig = field(default_factory=EvidencePreflightConfig)
     smart_timeout: SmartTimeoutConfig = field(default_factory=SmartTimeoutConfig)
+    provider_failover: ProviderFailoverConfig = field(
+        default_factory=ProviderFailoverConfig
+    )
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ExecutionConfig":
@@ -722,6 +788,9 @@ class ExecutionConfig:
             smart_timeout=SmartTimeoutConfig.from_dict(
                 dict(data.get("smart_timeout", {}))
             ),
+            provider_failover=ProviderFailoverConfig.from_dict(
+                dict(data.get("provider_failover", {}))
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -731,6 +800,7 @@ class ExecutionConfig:
             "requirements_audit": self.requirements_audit.to_dict(),
             "evidence_preflight": self.evidence_preflight.to_dict(),
             "smart_timeout": self.smart_timeout.to_dict(),
+            "provider_failover": self.provider_failover.to_dict(),
         }
 
 
@@ -1200,6 +1270,8 @@ class CommandResult:
     worker_id: str = ""
     backend: str = "local"
     infrastructure_error: bool = False
+    infrastructure_failure_id: str = ""
+    infrastructure_attempts: List[Dict[str, object]] = field(default_factory=list)
     mutation_paths: List[str] = field(default_factory=list)
     artifacts: Dict[str, str] = field(default_factory=dict)
 

@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Mapping, Optional
 
 from .gate_execution import LocalGatePlanExecutor, exclusive_resource_lease
+from .gates import classify_reported_infrastructure_failure
 from .models import CommandResult, GateConfig
 from .worker_cluster import discover_workers, load_cluster_state
 from .worker_service import WorkerClient, result_from_job_record
@@ -267,6 +268,7 @@ class DistributedGatePlanExecutor:
         lane: str,
         cancel_event: Optional[threading.Event] = None,
         wait_timeout_seconds: float = 7200.0,
+        allow_local_reuse: bool = True,
     ) -> tuple[WorkerEndpoint, int]:
         required = self._required_slots(command)
         deadline = time.monotonic() + max(0.1, float(wait_timeout_seconds))
@@ -308,7 +310,7 @@ class DistributedGatePlanExecutor:
                 and endpoint.max_slots >= required
                 and self._endpoint_supports(endpoint, command)
             ]
-            if not candidates:
+            if not candidates and allow_local_reuse:
                 candidates = [
                     endpoint
                     for endpoint in self.endpoints
@@ -319,7 +321,7 @@ class DistributedGatePlanExecutor:
             if not candidates:
                 requirements = ", ".join(sorted(self._requires(command))) or "none"
                 raise RuntimeError(
-                    "no worker has enough slots and required capabilities "
+                    "no untried worker has enough slots and required capabilities "
                     f"({requirements})"
                 )
             with self._lock:
@@ -695,6 +697,22 @@ class DistributedGatePlanExecutor:
                     )
             finally:
                 self._release(endpoint, required)
+            classify_reported_infrastructure_failure(
+                result,
+                self.gate_config.reported_infrastructure_markers,
+            )
+            if result.infrastructure_failure_id:
+                return self._retry_reported_infrastructure(
+                    command=command,
+                    lane=lane,
+                    first_result=result,
+                    attempted=attempted,
+                    timeout_seconds=timeout_seconds,
+                    adaptive_timeout_enabled=adaptive_timeout_enabled,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                    cancel_event=cancel_event,
+                    progress=progress,
+                )
             if not result.infrastructure_error:
                 if lane and result.ok:
                     self._lane_successes[lane] = (
@@ -709,6 +727,114 @@ class DistributedGatePlanExecutor:
             if lane:
                 self._lane_endpoint.pop(lane, None)
         return result
+
+    @staticmethod
+    def _infrastructure_attempt_evidence(
+        result: CommandResult,
+    ) -> dict[str, object]:
+        return {
+            "worker_id": result.worker_id,
+            "backend": result.backend,
+            "job_id": result.job_id,
+            "ok": result.ok,
+            "returncode": result.returncode,
+            "failure_id": result.infrastructure_failure_id,
+            "termination_reason": result.termination_reason,
+            "stdout_tail": result.stdout[-1000:],
+            "stderr_tail": result.stderr[-1000:],
+        }
+
+    def _retry_reported_infrastructure(
+        self,
+        *,
+        command: str,
+        lane: str,
+        first_result: CommandResult,
+        attempted: set[str],
+        timeout_seconds: float,
+        adaptive_timeout_enabled: bool,
+        idle_timeout_seconds: float,
+        cancel_event: Optional[threading.Event],
+        progress,
+    ) -> CommandResult:
+        attempts = [self._infrastructure_attempt_evidence(first_result)]
+        first_result.infrastructure_attempts = list(attempts)
+        # A stateful lane cannot safely move after earlier commands succeeded.
+        if lane and self._lane_successes.get(lane, 0) > 0:
+            return first_result
+        if lane:
+            self._lane_endpoint.pop(lane, None)
+        maximum = max(
+            1,
+            int(
+                self.gate_config.distributed.reported_infrastructure_max_workers
+            ),
+        )
+        last = first_result
+        while len(attempted) < maximum:
+            try:
+                endpoint, required = self._acquire_endpoint(
+                    command,
+                    exclude=attempted,
+                    lane="",
+                    cancel_event=cancel_event,
+                    wait_timeout_seconds=timeout_seconds,
+                    allow_local_reuse=False,
+                )
+            except _EndpointAcquireCancelled:
+                return CommandResult(
+                    command=command,
+                    ok=False,
+                    returncode=130,
+                    stderr="command cancelled while waiting for a worker slot",
+                    termination_reason="cancelled",
+                    infrastructure_attempts=list(attempts),
+                )
+            except RuntimeError:
+                break
+            attempted.add(endpoint.worker_id)
+            try:
+                try:
+                    current = self._run_on_endpoint(
+                        endpoint,
+                        command,
+                        lane="",
+                        timeout_seconds=timeout_seconds,
+                        adaptive_timeout_enabled=adaptive_timeout_enabled,
+                        idle_timeout_seconds=idle_timeout_seconds,
+                        cancel_event=cancel_event,
+                        progress=progress,
+                    )
+                except (OSError, RuntimeError, ValueError) as error:
+                    current = CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=125,
+                        stderr=str(error),
+                        termination_reason="infrastructure_error",
+                        worker_id=endpoint.worker_id,
+                        backend=(
+                            "local-isolated"
+                            if endpoint.transport == "local"
+                            else "lan-worker"
+                        ),
+                        infrastructure_error=True,
+                    )
+            finally:
+                self._release(endpoint, required)
+            classify_reported_infrastructure_failure(
+                current,
+                self.gate_config.reported_infrastructure_markers,
+            )
+            attempts.append(self._infrastructure_attempt_evidence(current))
+            current.infrastructure_attempts = list(attempts)
+            last = current
+            if not current.infrastructure_error:
+                return current
+            if current.termination_reason == "remote_state_uncertain":
+                return current
+        last.infrastructure_attempts = list(attempts)
+        return last
 
     def close(self) -> None:
         for endpoint in self.endpoints:

@@ -85,6 +85,33 @@ class ExecutionRecoveryTests(unittest.TestCase):
         self.assertEqual(first.incident_fingerprint, second.incident_fingerprint)
         self.assertNotEqual(first.evidence_fingerprint, second.evidence_fingerprint)
 
+    def test_reported_infrastructure_incident_preserves_worker_evidence(self) -> None:
+        incident = command_incident(
+            run_id="run-1",
+            stage="implement",
+            context="task verification",
+            result=CommandResult(
+                command="npm test",
+                ok=False,
+                returncode=1,
+                infrastructure_error=True,
+                infrastructure_failure_id="browser_launch_failed",
+                infrastructure_attempts=[
+                    {"worker_id": "worker-1", "returncode": 1},
+                    {"worker_id": "worker-2", "returncode": 1},
+                ],
+            ),
+        )
+
+        self.assertEqual(
+            incident.kind,
+            "gate_reported_infrastructure_error",
+        )
+        self.assertEqual(
+            len(incident.process_snapshot["infrastructure_attempts"]),
+            2,
+        )
+
     def test_provider_incident_dynamic_output_changes_evidence_not_identity(self) -> None:
         first = provider_incident(
             run_id="run-1",
@@ -195,6 +222,46 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertFalse(recovered)
             self.assertEqual(state.status, "blocked")
             self.assertIn("cannot be reproduced safely", state.last_error)
+
+    def test_reported_infrastructure_target_owner_forces_scoped_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            incident = ExecutionIncident(
+                incident_id="infra-1",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="npm test",
+                incident_fingerprint="infra-fingerprint",
+                evidence_fingerprint="infra-evidence",
+                process_snapshot={
+                    "infrastructure_attempts": [
+                        {"worker_id": "worker-1", "returncode": 1}
+                    ]
+                },
+            )
+
+            recovered = orchestrator._apply_execution_incident_diagnosis(
+                state,
+                incident,
+                IncidentDiagnosis(
+                    owner="target_project",
+                    action="RETRY",
+                    confidence=0.95,
+                    reason="browser launcher is broken in the target project",
+                ),
+            )
+
+            self.assertTrue(recovered)
+            self.assertEqual(incident.diagnosis["action"], "RECOVER_TARGET")
+            tasks = load_task_plan(root)["tasks"]
+            self.assertEqual(tasks[0]["title"], "Repair verification infrastructure")
+            self.assertIn("all currently eligible workers", tasks[0]["description"])
 
     def test_store_persists_incident_and_run_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

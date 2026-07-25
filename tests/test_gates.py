@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gates import (
     build_failure_identity_diagnostic_command,
+    classify_reported_infrastructure_failure,
     command_from_verification_step,
     extract_failure_ids,
     extract_failure_info,
@@ -16,7 +17,13 @@ from auto_agents.gates import (
     run_commands,
     run_gate_plan,
 )
-from auto_agents.models import CommandResult, GateParallelGroup, GateResult, VerificationStep
+from auto_agents.models import (
+    CommandResult,
+    GateParallelGroup,
+    GateResult,
+    InfrastructureFailureMarker,
+    VerificationStep,
+)
 
 
 class GateTests(unittest.TestCase):
@@ -231,6 +238,74 @@ class GateTests(unittest.TestCase):
 
         self.assertTrue(info.comparable)
         self.assertEqual(info.failure_ids, ["tests/test_demo.py::test_example"])
+
+    def test_standard_reported_infrastructure_failure_is_non_comparable(self) -> None:
+        result = CommandResult(
+            command="npm test",
+            ok=False,
+            returncode=1,
+            stdout=(
+                "FAIL src/e2e/create-modal.test.ts > contract\n"
+                "Error: AUTO_AGENTS_INFRA_FAILURE id=browser_launch_failed\n"
+            ),
+        )
+
+        classify_reported_infrastructure_failure(result)
+        info = extract_failure_info(GateResult(ok=False, commands=[result]))
+
+        self.assertTrue(result.infrastructure_error)
+        self.assertEqual(result.infrastructure_failure_id, "browser_launch_failed")
+        self.assertFalse(info.comparable)
+        self.assertEqual(
+            info.failure_ids,
+            ["infra:browser_launch_failed:npm test"],
+        )
+
+    def test_builtin_browser_infrastructure_failure_beats_vitest_id(self) -> None:
+        result = CommandResult(
+            command="npm test",
+            ok=False,
+            returncode=1,
+            stdout=(
+                "FAIL src/e2e/create-modal-prototype-fidelity.test.ts > "
+                "create_modal_close_and_submit_contract\n"
+                "→ browser_verification_infrastructure_failed: launch 3/3 failed\n"
+                "BrowserVerificationInfrastructureError: SIGTRAP\n"
+            ),
+        )
+
+        classify_reported_infrastructure_failure(result)
+        info = extract_failure_info(GateResult(ok=False, commands=[result]))
+
+        self.assertEqual(
+            result.infrastructure_failure_id,
+            "browser_verification_infrastructure_failed",
+        )
+        self.assertFalse(info.comparable)
+        self.assertNotIn("create_modal_close_and_submit_contract", info.failure_ids[0])
+
+    def test_configured_reported_infrastructure_marker(self) -> None:
+        result = CommandResult(
+            command="pytest",
+            ok=False,
+            returncode=1,
+            stderr="RuntimeError: ephemeral display server refused the session",
+        )
+
+        classify_reported_infrastructure_failure(
+            result,
+            [
+                InfrastructureFailureMarker(
+                    marker_id="display_server_failed",
+                    contains="ephemeral display server refused",
+                )
+            ],
+        )
+
+        self.assertEqual(
+            result.infrastructure_failure_id,
+            "display_server_failed",
+        )
 
     def test_verbose_pytest_failure_line_is_comparable(self) -> None:
         gate = GateResult(

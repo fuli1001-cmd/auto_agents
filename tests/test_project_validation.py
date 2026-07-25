@@ -380,6 +380,36 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(any("unknown stage" in item for item in errors))
         self.assertTrue(any("docs.language" in item for item in errors))
 
+    def test_validate_project_config_rejects_invalid_infrastructure_and_failover_settings(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        payload["gates"]["reported_infrastructure_markers"] = [
+            {"id": "Bad ID", "contains": ""},
+            {"id": "browser_failed", "contains": "one"},
+            {"id": "browser_failed", "contains": "two"},
+        ]
+        payload["gates"]["distributed"][
+            "reported_infrastructure_max_workers"
+        ] = 0
+        payload["execution"]["provider_failover"] = {
+            "probe_enabled": "yes",
+            "probe_timeout_seconds": 0,
+            "connection_cooldown_seconds": 60,
+            "pressure_cooldown_seconds": 300,
+            "timeout_cooldown_seconds": 1800,
+            "quota_cooldown_seconds": 3600,
+            "max_cooldown_seconds": 300,
+        }
+
+        errors = validate_project_config_payload(payload)
+
+        self.assertTrue(any("reported_infrastructure_markers[0].id" in item for item in errors))
+        self.assertTrue(any("reported_infrastructure_markers[0].contains" in item for item in errors))
+        self.assertTrue(any("reported_infrastructure_markers[2].id must be unique" in item for item in errors))
+        self.assertTrue(any("reported_infrastructure_max_workers" in item for item in errors))
+        self.assertTrue(any("provider_failover.probe_enabled" in item for item in errors))
+        self.assertTrue(any("provider_failover.probe_timeout_seconds" in item for item in errors))
+        self.assertTrue(any("max_cooldown_seconds must be" in item for item in errors))
+
     def test_task_plan_validation_rejects_invalid_recovery_lineage(self) -> None:
         task = {
             "task_id": "task-271b",
