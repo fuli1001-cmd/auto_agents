@@ -12,8 +12,8 @@ from .gates import extract_failure_info
 from .models import CommandResult, GateResult
 
 
-CACHE_VERSION = 3
-EXECUTION_MODE_VERSION = 3
+CACHE_VERSION = 4
+EXECUTION_MODE_VERSION = 4
 MAX_SUMMARY_BYTES = 8 * 1024
 MAX_ROWS = 5_000
 MAX_AGE_SECONDS = 30 * 24 * 60 * 60

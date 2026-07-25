@@ -28,6 +28,7 @@ from auto_agents.workers import (
     WORKER_PROTOCOL_VERSION,
     WorkerEndpoint,
     WorkerSlotLease,
+    build_environment_manifest,
     forwarded_environment,
     worker_execute,
     worker_probe,
@@ -94,6 +95,39 @@ def test_forwarded_environment_uses_fixed_denylist() -> None:
         "HTTP_PROXY": "http://proxy",
         "PROJECT_TOKEN": "token",
     }
+
+
+def test_environment_manifest_excludes_controller_package(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = tmp_path / "project"
+    python = project / ".conda" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+
+    def fake_run(command, **_kwargs):
+        if "-c" in command:
+            return subprocess.CompletedProcess(command, 0, stdout="3.11\n", stderr="")
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "auto-agents==0.7.0\n"
+                "Auto_Agents==0.7.0\n"
+                "Auto.Agents==0.7.0\n"
+                "pytest==8.4.1\n"
+                "-e /workspace/editable\n"
+                "local-package @ file:///workspace/local-package\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("auto_agents.workers.subprocess.run", fake_run)
+
+    manifest = build_environment_manifest(project)
+
+    assert manifest["python"]["requirements"] == ["pytest==8.4.1"]
 
 
 def test_worker_stage_execute_and_query(tmp_path: Path, monkeypatch) -> None:

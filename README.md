@@ -532,11 +532,19 @@ commands.
 Gate commands remain sequential by default. A structured `verification_steps` entry is concurrent
 only when it explicitly sets `parallel_safe=true`; safe entries are grouped by runner and capped by
 the capacity detected across available workers (`gates.max_auto_workers` defaults to `"auto"`).
-The marker is appropriate only for checks isolated from shared
-databases, ports, mutable fixtures, snapshots, and build output. Existing `gates.parallel_groups`
-remain supported as an explicit opt-in. Identical derived commands are executed once in first-seen
-order; duplicate declarations merge conservatively, so any unsafe occurrence keeps the command
-sequential and any run-context occurrence keeps the narrower cache scope.
+With isolated gates, the ordered sequential lane and the current parallel group run at the same
+time. Parallel groups still retain barriers between groups. The marker is appropriate only for
+checks isolated from both the sequential lane and other parallel checks: no shared databases,
+ports, mutable fixtures, snapshots, build output, or producer/consumer artifacts. Existing
+`gates.parallel_groups` remain supported as an explicit opt-in. Without gate isolation, execution
+falls back to the phased sequential-first schedule. Identical derived commands are executed once in
+first-seen order; duplicate declarations merge conservatively, so any unsafe occurrence keeps the
+command sequential and any run-context occurrence keeps the narrower cache scope.
+
+The isolated scheduler dispatches a bounded amount of work instead of queueing the whole plan. A
+failure stops new dispatch while already-running commands drain, preserving their diagnostics and
+cleanup. Successful finite command durations are retained as a rolling seven-sample median, and
+known long commands are dispatched first within each parallel group to reduce the final idle tail.
 
 New projects run gates in isolated Git worktrees. Each parallel command receives the exact same
 snapshot, including tracked edits and non-ignored untracked files, plus private temporary and cache
@@ -666,9 +674,10 @@ The default project setting is:
 ```
 
 Use `mode: "off"` for local-only execution or `mode: "required"` when a run must fail if no remote
-worker is available. A run transfers one immutable Git snapshot per remote worker, then schedules
-parallel-safe commands by free capacity while pinning sequential producer/consumer lanes to one
-worker. Infrastructure failures before acceptance may be retried elsewhere; a job whose remote
+worker is available. A run transfers one immutable Git snapshot per remote worker, then overlaps
+parallel-safe commands with the ordered sequential producer/consumer lane while pinning that lane
+to one worker. Dispatch respects declared CPU slots and the total capacity advertised by all
+workers. Infrastructure failures before acceptance may be retried elsewhere; a job whose remote
 state becomes uncertain after acceptance is never duplicated. Stale terminal records and artifacts
 can be removed with `auto-agents workers cleanup`.
 

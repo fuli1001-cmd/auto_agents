@@ -12,6 +12,7 @@ import logging
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import re
 import shutil
 import signal
 import socket
@@ -795,6 +796,11 @@ def _environment_links(
     return links
 
 
+def _frozen_requirement_name(line: str) -> str:
+    raw_name = re.split(r"[<>=!~ @]", line.strip(), maxsplit=1)[0]
+    return re.sub(r"[-_.]+", "-", raw_name).lower()
+
+
 def build_environment_manifest(project_root: Path) -> dict[str, object]:
     """Describe a reproducible gate environment without machine-specific paths."""
 
@@ -827,6 +833,11 @@ def build_environment_manifest(project_root: Path) -> dict[str, object]:
                 if line.strip()
                 and " @ file:" not in line
                 and not line.startswith("-e ")
+                # auto-agents is the controller/worker runtime, not a target
+                # project dependency. Editable installs can appear as a pinned
+                # package in newer pip freeze output, and that private version
+                # may not exist on the package index used by a remote worker.
+                and _frozen_requirement_name(line) != "auto-agents"
             ]
             python_payload = {
                 "version": version.stdout.strip(),

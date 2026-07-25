@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -24,6 +27,75 @@ from auto_agents.models import (
     InfrastructureFailureMarker,
     VerificationStep,
 )
+
+
+class _RecordingGateExecutor:
+    def __init__(
+        self,
+        durations: dict[str, float],
+        *,
+        failures: set[str] | None = None,
+        slots: dict[str, int] | None = None,
+        capacity: int = 2,
+        estimates: dict[str, float] | None = None,
+    ) -> None:
+        self.durations = durations
+        self.failures = failures or set()
+        self.slots = slots or {}
+        self._capacity = capacity
+        self.estimates = estimates or {}
+        self.events: list[tuple[str, str, str, float]] = []
+        self.running_slots = 0
+        self.max_running_slots = 0
+        self._lock = threading.Lock()
+
+    def capacity(self) -> int:
+        return self._capacity
+
+    def required_slots(self, command: str) -> int:
+        return self.slots.get(command, 1)
+
+    def estimated_duration(self, command: str) -> float | None:
+        return self.estimates.get(command)
+
+    def priority(self, command: str) -> tuple[object, ...]:
+        estimate = self.estimated_duration(command)
+        return (
+            0 if estimate is not None else 1,
+            -(estimate or 0.0),
+        )
+
+    def run(
+        self,
+        command: str,
+        *,
+        lane: str = "",
+        timeout_seconds: float,
+        adaptive_timeout_enabled: bool,
+        idle_timeout_seconds: float,
+        cancel_event=None,
+        progress=None,
+    ) -> CommandResult:
+        del timeout_seconds, adaptive_timeout_enabled, idle_timeout_seconds
+        slots = self.required_slots(command)
+        with self._lock:
+            self.running_slots += slots
+            self.max_running_slots = max(
+                self.max_running_slots, self.running_slots
+            )
+            self.events.append(("start", command, lane, time.monotonic()))
+        time.sleep(self.durations[command])
+        with self._lock:
+            self.events.append(("finish", command, lane, time.monotonic()))
+            self.running_slots -= slots
+        failed = command in self.failures
+        return CommandResult(
+            command=command,
+            ok=not failed,
+            returncode=1 if failed else 0,
+            stdout=command,
+            duration_seconds=self.durations[command],
+        )
 
 
 class GateTests(unittest.TestCase):
@@ -603,6 +675,156 @@ class GateTests(unittest.TestCase):
             )
             self.assertTrue(result.ok)
             self.assertEqual([item.stdout for item in result.commands], ["first", "second", "third"])
+
+    def test_isolated_gate_plan_overlaps_serial_lane_and_parallel_group(self) -> None:
+        executor = _RecordingGateExecutor(
+            {
+                "serial-one": 0.12,
+                "serial-two": 0.12,
+                "parallel-one": 0.18,
+            },
+            capacity=2,
+        )
+
+        result = run_gate_plan(
+            ["serial-one", "serial-two"],
+            [GateParallelGroup(name="checks", commands=["parallel-one"])],
+            Path("/tmp"),
+            collect_all=True,
+            parallel_workers=2,
+            gate_executor=executor,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            [item.command for item in result.commands],
+            ["serial-one", "serial-two", "parallel-one"],
+        )
+        event_times = {
+            (event, command): timestamp
+            for event, command, _lane, timestamp in executor.events
+        }
+        self.assertLess(
+            event_times[("start", "parallel-one")],
+            event_times[("finish", "serial-one")],
+        )
+        self.assertLess(
+            event_times[("finish", "parallel-one")],
+            event_times[("finish", "serial-two")],
+        )
+
+    def test_isolated_gate_plan_preserves_group_barriers_during_overlap(self) -> None:
+        executor = _RecordingGateExecutor(
+            {
+                "serial": 0.3,
+                "group-one": 0.08,
+                "group-two": 0.08,
+            },
+            capacity=2,
+        )
+
+        result = run_gate_plan(
+            ["serial"],
+            [
+                GateParallelGroup(name="one", commands=["group-one"]),
+                GateParallelGroup(name="two", commands=["group-two"]),
+            ],
+            Path("/tmp"),
+            collect_all=True,
+            parallel_workers=2,
+            gate_executor=executor,
+        )
+
+        self.assertTrue(result.ok)
+        event_times = {
+            (event, command): timestamp
+            for event, command, _lane, timestamp in executor.events
+        }
+        self.assertGreaterEqual(
+            event_times[("start", "group-two")],
+            event_times[("finish", "group-one")],
+        )
+        self.assertLess(
+            event_times[("start", "group-two")],
+            event_times[("finish", "serial")],
+        )
+
+    def test_isolated_gate_plan_stops_dispatch_and_drains_inflight(self) -> None:
+        executor = _RecordingGateExecutor(
+            {
+                "fails": 0.04,
+                "serial-later": 0.01,
+                "inflight": 0.16,
+                "parallel-later": 0.01,
+            },
+            failures={"fails"},
+            capacity=2,
+        )
+        started = time.monotonic()
+
+        result = run_gate_plan(
+            ["fails", "serial-later"],
+            [
+                GateParallelGroup(
+                    name="checks",
+                    commands=["inflight", "parallel-later"],
+                )
+            ],
+            Path("/tmp"),
+            collect_all=False,
+            parallel_workers=2,
+            gate_executor=executor,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertGreaterEqual(time.monotonic() - started, 0.14)
+        self.assertEqual(
+            [item.command for item in result.commands],
+            ["fails", "inflight"],
+        )
+        started_commands = {
+            command
+            for event, command, _lane, _timestamp in executor.events
+            if event == "start"
+        }
+        self.assertNotIn("serial-later", started_commands)
+        self.assertNotIn("parallel-later", started_commands)
+
+    def test_isolated_gate_plan_uses_lpt_and_weighted_capacity(self) -> None:
+        executor = _RecordingGateExecutor(
+            {
+                "short": 0.03,
+                "long": 0.08,
+                "normal": 0.03,
+            },
+            slots={"long": 2},
+            capacity=3,
+            estimates={"short": 1.0, "long": 10.0, "normal": 2.0},
+        )
+
+        result = run_gate_plan(
+            [],
+            [
+                GateParallelGroup(
+                    name="checks",
+                    commands=["short", "long", "normal"],
+                )
+            ],
+            Path("/tmp"),
+            collect_all=True,
+            parallel_workers=3,
+            gate_executor=executor,
+        )
+
+        self.assertTrue(result.ok)
+        starts = [
+            command
+            for event, command, _lane, _timestamp in executor.events
+            if event == "start"
+        ]
+        self.assertEqual(set(starts[:2]), {"long", "normal"})
+        self.assertEqual(starts[-1], "short")
+        self.assertLessEqual(executor.max_running_slots, 3)
 
     def test_run_gate_plan_stops_after_failed_parallel_group_when_not_collecting_all(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

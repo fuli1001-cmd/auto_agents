@@ -3439,6 +3439,23 @@ class Orchestrator:
                     elapsed_seconds,
                     command[:300],
                 )
+            elif event in {"dispatch_serial", "dispatch_parallel"}:
+                self.logger.info(
+                    "[gate-scheduler] context=%s state=dispatch lane=%s "
+                    "estimated_seconds=%.3f command=%s",
+                    context,
+                    "serial" if event == "dispatch_serial" else "parallel",
+                    elapsed_seconds,
+                    command[:300],
+                )
+            elif event in {"scheduler_start", "scheduler_finish"}:
+                self.logger.info(
+                    "[gate-scheduler] context=%s state=%s elapsed_seconds=%.3f %s",
+                    context,
+                    "start" if event == "scheduler_start" else "finish",
+                    elapsed_seconds,
+                    command[:500],
+                )
 
         return emit
 
@@ -4710,11 +4727,17 @@ class Orchestrator:
                 self.project_root,
                 self.config.gates,
                 metadata or {},
+                environment_fingerprint=(
+                    self._gate_baseline_cache.environment_fingerprint
+                ),
             )
         return LocalGatePlanExecutor(
             self.project_root,
             self.config.gates,
             metadata or {},
+            environment_fingerprint=(
+                self._gate_baseline_cache.environment_fingerprint
+            ),
         )
 
     def _gate_parallel_workers(self) -> int:
@@ -11405,7 +11428,7 @@ class Orchestrator:
                 "Keep each task small enough to implement, review, and verify independently, but do not split into trivial housekeeping-only tasks.",
                 "Avoid oversized tasks that bundle multiple loosely related features together.",
                 "Prefer tasks that each deliver one coherent, testable capability or technical slice.",
-                "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist; auto_agents may expand directory targets such as ['tests'] into per-file pytest steps before running gates. Set parallel_safe=true only when a step is isolated from shared databases, ports, mutable fixtures, snapshots, build outputs, and other process-global state; otherwise omit it or set false.",
+                "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist; auto_agents may expand directory targets such as ['tests'] into per-file pytest steps before running gates. Set parallel_safe=true only when a step is independent from both the ordered serial lane and peer parallel checks, including shared databases, ports, mutable fixtures, snapshots, build outputs, producer/consumer artifacts, and other process-global state; otherwise omit it or set false.",
                 "Classify verification cadence explicitly: use cadence='implement_and_final' for focused checks needed during implementation and cadence='final_only' for broad release suites. Classify cache_scope='source' only when results depend solely on HEAD and tracked/untracked source content; use cache_scope='run_context' for requirements/task-state/config-sensitive checks. Defaults are implement_and_final and run_context.",
                 "Gate commands run in snapshot-backed worktrees. Use per-test relative temp paths and dynamically allocated port 0 whenever the same process can discover the bound port. When a child process requires a numeric port before launch, declare lowercase snake_case dynamic_ports names and make the test read AUTO_AGENTS_GATE_PORT_<UPPER_NAME>; keep a port-0 fallback for manual runs. Declaring dynamic_ports does not by itself make a step parallel-safe. Commands that intentionally share generated artifacts must remain parallel_safe=false and appear in producer-before-consumer order; commands that use unadapted fixed host ports, Docker daemons, or shared external accounts must declare host:/pool: exclusive_resources.",
                 "Declare requires for non-default tools such as ffmpeg or chrome and resource_class='heavy' for browser/FFmpeg workloads. Use cpu_slots only when a command needs an explicit scheduling capacity instead of the resource_class default. Memory checks are opt-in: memory_mb is the measured command working-set budget, memory_reserve_mb is the desired host reserve, and memory_guard must be 'off', 'advisory', or 'required'. Prefer advisory unless a dependable hard minimum is known; never invent a memory estimate. Declare artifact_globs only for ignored project-relative evidence that must survive sandbox cleanup. Never use absolute artifact paths or '..'.",

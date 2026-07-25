@@ -17,6 +17,7 @@ import uuid
 from typing import Callable, Mapping, Optional, Sequence
 
 from .models import CommandResult, GateConfig
+from .gate_timing import GateTimingStore
 from .process_supervision import run_supervised_shell_command
 
 
@@ -412,6 +413,7 @@ class LocalGatePlanExecutor:
         run_id: str = "",
         dependency_links: Optional[Mapping[str, Path]] = None,
         worker_id: str = "local",
+        environment_fingerprint: str = "",
     ) -> None:
         self.project_root = project_root.resolve()
         self.gate_config = gate_config
@@ -434,6 +436,10 @@ class LocalGatePlanExecutor:
             else discover_dependency_links(self.project_root)
         )
         self.worker_id = worker_id
+        self.timing_store = GateTimingStore(
+            self.project_root,
+            environment_fingerprint=environment_fingerprint,
+        )
         self._shared_sandboxes: dict[str, Path] = {}
         self._published_hashes: dict[str, str] = {}
         self._lock = threading.Lock()
@@ -446,12 +452,30 @@ class LocalGatePlanExecutor:
     def __exit__(self, _type, _value, _traceback) -> None:
         self.close()
 
-    def priority(self, command: str) -> tuple[int, str]:
+    def priority(self, command: str) -> tuple[object, ...]:
         metadata = self.metadata.get(command)
+        estimate = self.estimated_duration(command)
         return (
+            0 if estimate is not None else 1,
+            -(estimate or 0.0),
             0 if _metadata_resource_class(metadata) == "heavy" else 1,
-            command,
         )
+
+    def estimated_duration(self, command: str) -> Optional[float]:
+        return self.timing_store.estimate(command, self.metadata.get(command))
+
+    def required_slots(self, command: str) -> int:
+        metadata = self.metadata.get(command)
+        try:
+            declared = max(0, int(getattr(metadata, "cpu_slots", 0) or 0))
+        except (TypeError, ValueError):
+            declared = 0
+        if declared > 0:
+            return declared
+        return 2 if _metadata_resource_class(metadata) == "heavy" else 1
+
+    def record_timing(self, command: str, result: CommandResult) -> None:
+        self.timing_store.record(command, result, self.metadata.get(command))
 
     def _sandbox(self, lane: str, job_id: str) -> tuple[Path, bool]:
         if lane:
@@ -666,9 +690,10 @@ class LocalGatePlanExecutor:
             )
             if progress is not None:
                 progress("finish", command, result.duration_seconds)
+            self.record_timing(command, result)
             return result
         except (OSError, RuntimeError, ValueError) as error:
-            return CommandResult(
+            result = CommandResult(
                 command=command,
                 ok=False,
                 returncode=125,
@@ -680,6 +705,8 @@ class LocalGatePlanExecutor:
                 backend="local-isolated",
                 infrastructure_error=True,
             )
+            self.record_timing(command, result)
+            return result
         finally:
             if cleanup and sandbox is not None:
                 try:

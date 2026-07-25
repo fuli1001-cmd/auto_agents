@@ -45,6 +45,7 @@ class DistributedGatePlanExecutor:
         metadata: Mapping[str, object],
         *,
         run_id: str = "",
+        environment_fingerprint: str = "",
     ) -> None:
         self.project_root = project_root.resolve()
         self.gate_config = gate_config
@@ -55,6 +56,7 @@ class DistributedGatePlanExecutor:
             metadata,
             run_id=run_id,
             worker_id="local",
+            environment_fingerprint=environment_fingerprint,
         )
         self.key = project_key(self.project_root)
         self.environment_manifest = build_environment_manifest(self.project_root)
@@ -194,8 +196,17 @@ class DistributedGatePlanExecutor:
     def __exit__(self, _type, _value, _traceback) -> None:
         self.close()
 
-    def priority(self, command: str) -> tuple[int, str]:
+    def priority(self, command: str) -> tuple[object, ...]:
         return self.local.priority(command)
+
+    def estimated_duration(self, command: str) -> Optional[float]:
+        return self.local.estimated_duration(command)
+
+    def capacity(self) -> int:
+        return max(1, sum(endpoint.max_slots for endpoint in self.endpoints))
+
+    def required_slots(self, command: str) -> int:
+        return self._required_slots(command)
 
     def _resource_class(self, command: str) -> str:
         metadata = self.metadata.get(command)
@@ -613,6 +624,7 @@ class DistributedGatePlanExecutor:
                 idle_timeout_seconds=idle_timeout_seconds,
                 cancel_event=cancel_event,
             )
+        self.local.record_timing(command, result)
         if progress is not None:
             progress("finish", command, result.duration_seconds)
         return result

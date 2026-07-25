@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from dataclasses import dataclass, field
 import os
 import re
 import shlex
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Protocol, Sequence
 
@@ -44,7 +51,11 @@ GateProgressCallback = Callable[[str, str, float], None]
 
 
 class GateCommandExecutor(Protocol):
-    def priority(self, command: str) -> tuple[int, str]: ...
+    def priority(self, command: str) -> tuple[object, ...]: ...
+
+    def estimated_duration(self, command: str) -> Optional[float]: ...
+
+    def required_slots(self, command: str) -> int: ...
 
     def run(
         self,
@@ -752,26 +763,368 @@ def run_gate_plan(
     progress: Optional[GateProgressCallback] = None,
     gate_executor: Optional[GateCommandExecutor] = None,
 ) -> GateResult:
+    if gate_executor is not None:
+        return _run_overlapped_gate_plan(
+            list(commands),
+            parallel_groups,
+            collect_all=collect_all,
+            parallel_workers=parallel_workers,
+            command_timeout_seconds=command_timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            command_idle_timeout_seconds=command_idle_timeout_seconds,
+            progress=progress,
+            gate_executor=gate_executor,
+        )
+    return _run_phased_gate_plan(
+        commands,
+        parallel_groups,
+        cwd,
+        collect_all=collect_all,
+        parallel_workers=parallel_workers,
+        command_timeout_seconds=command_timeout_seconds,
+        adaptive_timeout_enabled=adaptive_timeout_enabled,
+        command_idle_timeout_seconds=command_idle_timeout_seconds,
+        progress=progress,
+    )
+
+
+@dataclass(frozen=True)
+class _ScheduledGateCommand:
+    command: str
+    lane: str
+    command_index: int
+    group_index: int = -1
+    slots: int = 1
+
+
+def _executor_capacity(
+    gate_executor: GateCommandExecutor,
+    parallel_workers: int,
+) -> int:
+    capacity = getattr(gate_executor, "capacity", None)
+    if callable(capacity):
+        try:
+            return max(1, int(capacity()))
+        except (TypeError, ValueError):
+            pass
+    return max(1, int(parallel_workers))
+
+
+def _executor_required_slots(
+    gate_executor: GateCommandExecutor,
+    command: str,
+    capacity: int,
+) -> int:
+    required_slots = getattr(gate_executor, "required_slots", None)
+    if callable(required_slots):
+        try:
+            return min(capacity, max(1, int(required_slots(command))))
+        except (TypeError, ValueError):
+            pass
+    return 1
+
+
+def _executor_estimated_duration(
+    gate_executor: GateCommandExecutor,
+    command: str,
+) -> Optional[float]:
+    estimated_duration = getattr(gate_executor, "estimated_duration", None)
+    if not callable(estimated_duration):
+        return None
+    try:
+        estimate = estimated_duration(command)
+        return max(0.0, float(estimate)) if estimate is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _ordered_parallel_commands(
+    gate_executor: GateCommandExecutor,
+    commands: Sequence[str],
+) -> list[tuple[int, str]]:
+    ordered = list(enumerate(commands))
+    ordered.sort(
+        key=lambda item: (
+            gate_executor.priority(item[1]),
+            item[0],
+        )
+    )
+    return ordered
+
+
+def _run_overlapped_gate_plan(
+    commands: Sequence[str],
+    parallel_groups: Sequence[GateParallelGroup],
+    *,
+    collect_all: bool,
+    parallel_workers: int,
+    command_timeout_seconds: float,
+    adaptive_timeout_enabled: bool,
+    command_idle_timeout_seconds: float,
+    progress: Optional[GateProgressCallback],
+    gate_executor: GateCommandExecutor,
+) -> GateResult:
+    slot_capacity = _executor_capacity(gate_executor, parallel_workers)
+    job_capacity = max(1, min(int(parallel_workers), slot_capacity))
+    pending_groups = [
+        _ordered_parallel_commands(gate_executor, group.commands)
+        for group in parallel_groups
+    ]
+    serial_results: dict[int, CommandResult] = {}
+    parallel_results: dict[tuple[int, int], CommandResult] = {}
+    running: dict[Future[CommandResult], _ScheduledGateCommand] = {}
+    cancel_event = threading.Event()
+    serial_next = 0
+    group_index = 0
+    stop_dispatch = False
+    fatal_error: Optional[BaseException] = None
+    scheduler_started = time.monotonic()
+    last_accounted = scheduler_started
+    occupied_slot_seconds = 0.0
+    overlap_seconds = 0.0
+
+    def account_running_time() -> None:
+        nonlocal last_accounted, occupied_slot_seconds, overlap_seconds
+        now = time.monotonic()
+        elapsed = now - last_accounted
+        occupied_slot_seconds += sum(item.slots for item in running.values()) * elapsed
+        if (
+            any(item.lane == "serial" for item in running.values())
+            and any(item.lane != "serial" for item in running.values())
+        ):
+            overlap_seconds += elapsed
+        last_accounted = now
+
+    def group_is_running(index: int) -> bool:
+        return any(item.group_index == index for item in running.values())
+
+    def advance_completed_groups() -> None:
+        nonlocal group_index
+        while (
+            group_index < len(pending_groups)
+            and not pending_groups[group_index]
+            and not group_is_running(group_index)
+        ):
+            group_index += 1
+
+    def submit(
+        pool: ThreadPoolExecutor,
+        scheduled: _ScheduledGateCommand,
+    ) -> None:
+        account_running_time()
+        estimate = _executor_estimated_duration(
+            gate_executor, scheduled.command
+        )
+        if progress is not None:
+            progress(
+                (
+                    "dispatch_serial"
+                    if scheduled.lane == "serial"
+                    else "dispatch_parallel"
+                ),
+                scheduled.command,
+                estimate or 0.0,
+            )
+        future = pool.submit(
+            gate_executor.run,
+            scheduled.command,
+            lane=scheduled.lane,
+            timeout_seconds=command_timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            idle_timeout_seconds=command_idle_timeout_seconds,
+            cancel_event=cancel_event,
+            progress=progress,
+        )
+        running[future] = scheduled
+
+    if progress is not None:
+        progress(
+            "scheduler_start",
+            (
+                f"mode=overlap slots={slot_capacity} "
+                f"jobs={job_capacity} serial={len(commands)} "
+                f"groups={len(parallel_groups)}"
+            ),
+            0.0,
+        )
+
+    with ThreadPoolExecutor(max_workers=job_capacity) as pool:
+        while True:
+            advance_completed_groups()
+            made_progress = False
+            if not stop_dispatch:
+                used_slots = sum(item.slots for item in running.values())
+                serial_running = any(
+                    item.lane == "serial" for item in running.values()
+                )
+                if (
+                    serial_next < len(commands)
+                    and not serial_running
+                    and len(running) < job_capacity
+                ):
+                    command = commands[serial_next]
+                    slots = _executor_required_slots(
+                        gate_executor, command, slot_capacity
+                    )
+                    if used_slots + slots <= slot_capacity:
+                        submit(
+                            pool,
+                            _ScheduledGateCommand(
+                                command=command,
+                                lane="serial",
+                                command_index=serial_next,
+                                slots=slots,
+                            ),
+                        )
+                        serial_next += 1
+                        used_slots += slots
+                        made_progress = True
+
+                if group_index < len(pending_groups):
+                    pending = pending_groups[group_index]
+                    while pending and len(running) < job_capacity:
+                        selected_position = next(
+                            (
+                                position
+                                for position, (_index, command) in enumerate(pending)
+                                if used_slots
+                                + _executor_required_slots(
+                                    gate_executor, command, slot_capacity
+                                )
+                                <= slot_capacity
+                            ),
+                            None,
+                        )
+                        if selected_position is None:
+                            break
+                        command_index, command = pending.pop(selected_position)
+                        slots = _executor_required_slots(
+                            gate_executor, command, slot_capacity
+                        )
+                        submit(
+                            pool,
+                            _ScheduledGateCommand(
+                                command=command,
+                                lane="",
+                                command_index=command_index,
+                                group_index=group_index,
+                                slots=slots,
+                            ),
+                        )
+                        used_slots += slots
+                        made_progress = True
+
+            advance_completed_groups()
+            all_serial_done = serial_next >= len(commands)
+            all_groups_done = group_index >= len(pending_groups)
+            if not running and (
+                stop_dispatch or (all_serial_done and all_groups_done)
+            ):
+                break
+            if not running and not made_progress:
+                raise RuntimeError(
+                    "gate scheduler could not dispatch any remaining command"
+                )
+            if made_progress and len(running) < job_capacity:
+                continue
+
+            completed, _pending = wait(
+                tuple(running),
+                return_when=FIRST_COMPLETED,
+            )
+            account_running_time()
+            for future in completed:
+                scheduled = running.pop(future)
+                try:
+                    result = future.result()
+                except BaseException as error:
+                    fatal_error = error
+                    stop_dispatch = True
+                    cancel_event.set()
+                    continue
+                if scheduled.lane == "serial":
+                    serial_results[scheduled.command_index] = result
+                else:
+                    parallel_results[
+                        (scheduled.group_index, scheduled.command_index)
+                    ] = result
+                if not result.ok and (
+                    not collect_all
+                    or result.termination_reason
+                    or result.infrastructure_error
+                ):
+                    stop_dispatch = True
+
+    account_running_time()
+    scheduler_elapsed = time.monotonic() - scheduler_started
+    if progress is not None:
+        utilization = (
+            occupied_slot_seconds / (slot_capacity * scheduler_elapsed)
+            if scheduler_elapsed > 0
+            else 0.0
+        )
+        progress(
+            "scheduler_finish",
+            (
+                f"mode=overlap slots={slot_capacity} "
+                f"overlap_seconds={overlap_seconds:.3f} "
+                f"slot_utilization={utilization:.3f}"
+            ),
+            scheduler_elapsed,
+        )
+    if fatal_error is not None:
+        raise fatal_error
+
+    results = [
+        serial_results[index]
+        for index in range(len(commands))
+        if index in serial_results
+    ]
+    for current_group, group in enumerate(parallel_groups):
+        results.extend(
+            parallel_results[(current_group, command_index)]
+            for command_index in range(len(group.commands))
+            if (current_group, command_index) in parallel_results
+        )
+    failed = [result for result in results if not result.ok]
+    reportable = [
+        result for result in failed if result.termination_reason != "cancelled"
+    ] or failed[:1]
+    summaries = [_failure_summary(result) for result in reportable]
+    ok = not failed and len(results) == (
+        len(commands) + sum(len(group.commands) for group in parallel_groups)
+    )
+    return GateResult(
+        ok=ok,
+        commands=results,
+        summary="all commands passed" if ok else "; ".join(summaries),
+    )
+
+
+def _run_phased_gate_plan(
+    commands: Iterable[str],
+    parallel_groups: Sequence[GateParallelGroup],
+    cwd: Path,
+    *,
+    collect_all: bool,
+    parallel_workers: int,
+    command_timeout_seconds: float,
+    adaptive_timeout_enabled: bool,
+    command_idle_timeout_seconds: float,
+    progress: Optional[GateProgressCallback],
+) -> GateResult:
     results: List[CommandResult] = []
     summaries: List[str] = []
     ok = True
 
     for command in commands:
-        result = (
-            gate_executor.run(
-                command,
-                lane="serial",
-                timeout_seconds=command_timeout_seconds,
-                adaptive_timeout_enabled=adaptive_timeout_enabled,
-                idle_timeout_seconds=command_idle_timeout_seconds,
-                progress=progress,
-            )
-            if gate_executor is not None
-            else _run_command(
-                command, cwd, timeout_seconds=command_timeout_seconds,
-                adaptive_timeout_enabled=adaptive_timeout_enabled,
-                idle_timeout_seconds=command_idle_timeout_seconds, progress=progress
-            )
+        result = _run_command(
+            command,
+            cwd,
+            timeout_seconds=command_timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            idle_timeout_seconds=command_idle_timeout_seconds,
+            progress=progress,
         )
         results.append(result)
         if result.ok:
@@ -790,7 +1143,7 @@ def run_gate_plan(
             adaptive_timeout_enabled=adaptive_timeout_enabled,
             idle_timeout_seconds=command_idle_timeout_seconds,
             progress=progress,
-            gate_executor=gate_executor,
+            gate_executor=None,
             cancel_on_failure=not collect_all,
         )
         results.extend(group_results)
