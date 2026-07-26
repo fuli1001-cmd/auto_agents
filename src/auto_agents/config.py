@@ -290,6 +290,8 @@ DEFAULT_CONFIG = {
             "diagnostic_probe_timeout_seconds": 300,
             "managed_runtime_downloads_enabled": True,
             "max_managed_runtime_candidates": 3,
+            "managed_runtime_layout_repairs_enabled": True,
+            "max_managed_repair_attempts_per_incident": 6,
         },
     },
     "approvals": {

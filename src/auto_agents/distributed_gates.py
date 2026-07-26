@@ -14,7 +14,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Mapping, Optional
 
-from .gate_execution import LocalGatePlanExecutor, exclusive_resource_lease
+from .gate_execution import (
+    SHORT_RUNTIME_PROFILE,
+    LocalGatePlanExecutor,
+    exclusive_resource_lease,
+)
 from .gates import classify_reported_infrastructure_failure
 from .execution_recovery import ExecutionIncident
 from .infrastructure_repair import repair_execution_infrastructure
@@ -25,6 +29,7 @@ from .workers import (
     WORKER_PROTOCOL_VERSION,
     WorkerEndpoint,
     WorkerSlotLease,
+    MANAGED_RUNTIME_LAYOUT_FEATURE,
     build_environment_manifest,
     enrich_worker_probe,
     forwarded_environment,
@@ -499,6 +504,9 @@ class DistributedGatePlanExecutor:
             distributed.extra_environment_denylist,
         )
         overrides = dict(environment_overrides or {})
+        requested_runtime_profile = str(
+            overrides.pop("AUTO_AGENTS_GATE_RUNTIME_PROFILE", "")
+        ).strip()
         path_prepend = overrides.pop("AUTO_AGENTS_PATH_PREPEND", "")
         if path_prepend:
             environment["PATH"] = (
@@ -543,6 +551,10 @@ class DistributedGatePlanExecutor:
             "artifact_max_files": self.gate_config.isolation.artifact_max_files,
             "artifact_max_bytes": self.gate_config.isolation.artifact_max_bytes,
         }
+        if MANAGED_RUNTIME_LAYOUT_FEATURE in endpoint.features:
+            manifest["runtime_profile"] = (
+                requested_runtime_profile or SHORT_RUNTIME_PROFILE
+            )
         client = self.clients[endpoint.worker_id]
         client.submit(manifest)
         accepted = True
@@ -932,7 +944,7 @@ class DistributedGatePlanExecutor:
         )
         return repaired or last
 
-    def _managed_recovery_config(self) -> tuple[bool, int]:
+    def _managed_recovery_config(self) -> tuple[bool, int, bool, int]:
         try:
             payload = json.loads(
                 (self.project_root / ".auto-agents" / "config.json").read_text(
@@ -943,9 +955,22 @@ class DistributedGatePlanExecutor:
             return (
                 bool(recovery.get("managed_runtime_downloads_enabled", True)),
                 max(1, int(recovery.get("max_managed_runtime_candidates", 3))),
+                bool(
+                    recovery.get(
+                        "managed_runtime_layout_repairs_enabled", True
+                    )
+                ),
+                max(
+                    1,
+                    int(
+                        recovery.get(
+                            "max_managed_repair_attempts_per_incident", 6
+                        )
+                    ),
+                ),
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return True, 3
+            return True, 3, True, 6
 
     def _repair_reported_infrastructure(
         self,
@@ -960,15 +985,98 @@ class DistributedGatePlanExecutor:
         progress,
     ) -> Optional[CommandResult]:
         failure_id = first_result.infrastructure_failure_id
-        lowered = f"{failure_id} {first_result.stderr}".lower()
+        lowered = (
+            f"{failure_id} {first_result.stdout} {first_result.stderr}"
+        ).lower()
         if not any(token in lowered for token in ("browser", "chrome", "chromium", "devtools")):
             return None
-        allow_downloads, max_candidates = self._managed_recovery_config()
+        (
+            allow_downloads,
+            max_candidates,
+            allow_runtime_layout_repair,
+            max_repair_attempts,
+        ) = self._managed_recovery_config()
         incident_id = f"managed-{uuid.uuid4().hex[:12]}"
         last = first_result
+        socket_path_failure = any(
+            token in lowered
+            for token in (
+                "socket path too long",
+                "singletonsocket",
+                "enametoolong",
+            )
+        )
+        if socket_path_failure and allow_runtime_layout_repair:
+            runtime_attempts = 0
+            for endpoint in self.endpoints:
+                if MANAGED_RUNTIME_LAYOUT_FEATURE not in endpoint.features:
+                    attempts.append(
+                        {
+                            "worker_id": endpoint.worker_id,
+                            "event": "managed_infrastructure_repair",
+                            "repaired": False,
+                            "repair_driver_id": "short_runtime_path_repair",
+                            "runtime_profile": SHORT_RUNTIME_PROFILE,
+                            "reason": (
+                                "worker does not advertise "
+                                f"{MANAGED_RUNTIME_LAYOUT_FEATURE}"
+                            ),
+                        }
+                    )
+                    continue
+                if runtime_attempts >= max_repair_attempts:
+                    break
+                runtime_attempts += 1
+                candidate_key = (
+                    f"{endpoint.worker_id}:"
+                    f"{endpoint.failure_domain.get('id', 'unknown')}:"
+                    f"{SHORT_RUNTIME_PROFILE}"
+                )
+                attempts.append(
+                    {
+                        "worker_id": endpoint.worker_id,
+                        "event": "managed_infrastructure_repair",
+                        "repaired": True,
+                        "repair_driver_id": "short_runtime_path_repair",
+                        "runtime_profile": SHORT_RUNTIME_PROFILE,
+                        "candidate_key": candidate_key,
+                        "reason": "retrying with a short per-job socket runtime",
+                    }
+                )
+                current = self._run_on_endpoint(
+                    endpoint,
+                    command,
+                    lane="",
+                    timeout_seconds=timeout_seconds,
+                    adaptive_timeout_enabled=adaptive_timeout_enabled,
+                    idle_timeout_seconds=idle_timeout_seconds,
+                    cancel_event=cancel_event,
+                    progress=progress,
+                    environment_overrides={
+                        "AUTO_AGENTS_GATE_RUNTIME_PROFILE": SHORT_RUNTIME_PROFILE,
+                    },
+                )
+                classify_reported_infrastructure_failure(
+                    current,
+                    self.gate_config.reported_infrastructure_markers,
+                )
+                attempts.append(self._infrastructure_attempt_evidence(current))
+                current.infrastructure_attempts = list(attempts)
+                last = current
+                if not current.infrastructure_error:
+                    return current
+        elif socket_path_failure:
+            attempts.append(
+                {
+                    "worker_id": "controller",
+                    "event": "managed_infrastructure_repair",
+                    "repaired": False,
+                    "repair_driver_id": "short_runtime_path_repair",
+                    "runtime_profile": SHORT_RUNTIME_PROFILE,
+                    "reason": "managed runtime layout repair is disabled",
+                }
+            )
         for endpoint in self.endpoints:
-            if not any(str(item.get("worker_id", "")) == endpoint.worker_id for item in attempts):
-                continue
             if "managed_capability_repair_v2" not in endpoint.features:
                 attempts.append(
                     {

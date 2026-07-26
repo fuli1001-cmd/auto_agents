@@ -14,7 +14,7 @@ from .io_utils import read_json, write_json
 from .models import AgentResult, CommandResult, RunState
 
 
-INCIDENT_SCHEMA_VERSION = 3
+INCIDENT_SCHEMA_VERSION = 4
 INCIDENT_ACTIONS = {
     "RETRY",
     "RECOVER_TARGET",
@@ -109,6 +109,9 @@ class ExecutionIncident:
     cleanup_incomplete: bool = False
     stdout_tail: str = ""
     stderr_tail: str = ""
+    infrastructure_cause_id: str = ""
+    cause_status: str = "unknown"
+    runtime_profile: str = ""
     process_snapshot: Dict[str, object] = field(default_factory=dict)
     head_ref: str = ""
     worktree_fingerprint: str = ""
@@ -123,7 +126,7 @@ class ExecutionIncident:
     status: str = "open"
     diagnosis: Dict[str, object] = field(default_factory=dict)
     repair_history: List[Dict[str, object]] = field(default_factory=list)
-    recovery_policy_version: int = 3
+    recovery_policy_version: int = 4
     history: List[Dict[str, object]] = field(default_factory=list)
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
@@ -236,6 +239,28 @@ def command_incident(
     command = redact_incident_text(result.command)
     stdout_tail = _compact(redact_incident_text(result.stdout))
     stderr_tail = _compact(redact_incident_text(result.stderr))
+    combined_output = f"{stdout_tail}\n{stderr_tail}".lower()
+    infrastructure_cause_id = ""
+    cause_status = "unknown"
+    if any(
+        token in combined_output
+        for token in ("socket path too long", "singletonsocket", "enametoolong")
+    ):
+        infrastructure_cause_id = "unix_socket_path_too_long"
+        cause_status = "confirmed"
+    repair_history = [
+        dict(item)
+        for item in result.infrastructure_attempts
+        if str(item.get("event", "")) == "managed_infrastructure_repair"
+    ]
+    runtime_profile = next(
+        (
+            str(item.get("runtime_profile", ""))
+            for item in reversed(repair_history)
+            if str(item.get("runtime_profile", ""))
+        ),
+        "",
+    )
     if result.infrastructure_failure_id:
         kind = "gate_reported_infrastructure_error"
     elif result.infrastructure_error:
@@ -254,6 +279,7 @@ def command_incident(
         "command": " ".join(command.split()),
         "termination_reason": result.termination_reason,
         "infrastructure_failure_id": result.infrastructure_failure_id,
+        "infrastructure_cause_id": infrastructure_cause_id,
     }
     if kind != "gate_reported_infrastructure_error":
         identity["context"] = context
@@ -290,6 +316,9 @@ def command_incident(
         cleanup_incomplete=result.cleanup_incomplete,
         stdout_tail=stdout_tail,
         stderr_tail=stderr_tail,
+        infrastructure_cause_id=infrastructure_cause_id,
+        cause_status=cause_status,
+        runtime_profile=runtime_profile,
         process_snapshot={
             **dict(result.process_snapshot),
             "infrastructure_failure_id": result.infrastructure_failure_id,
@@ -301,6 +330,7 @@ def command_incident(
         root_cause_fingerprint=incident_fp,
         origin_command=command,
         evidence_fingerprint=evidence_fp,
+        repair_history=repair_history,
     )
 
 

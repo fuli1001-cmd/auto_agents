@@ -134,6 +134,7 @@ def test_worker_stage_execute_and_query(tmp_path: Path, monkeypatch) -> None:
     project = _project(tmp_path)
     worker_config = _worker_config(tmp_path)
     monkeypatch.setenv("AUTO_AGENTS_WORKER_CONFIG", str(worker_config))
+    monkeypatch.setenv("AUTO_AGENTS_STATE_HOME", str(tmp_path / "state"))
     manager = GateSnapshotManager(project, "worker-test")
     snapshot = manager.create()
     bundle = tmp_path / "snapshot.bundle"
@@ -348,6 +349,8 @@ def test_distributed_executor_uses_controller_as_local_worker(
     monkeypatch,
 ) -> None:
     project = _project(tmp_path)
+    monkeypatch.setenv("AUTO_AGENTS_CLUSTER_HOME", str(tmp_path / "cluster"))
+    monkeypatch.setenv("AUTO_AGENTS_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setenv(
         "AUTO_AGENTS_WORKER_CONFIG",
         str(_worker_config(tmp_path)),

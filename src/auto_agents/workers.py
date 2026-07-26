@@ -25,6 +25,8 @@ import time
 from typing import BinaryIO, Mapping, Optional, Sequence
 
 from .gate_execution import (
+    LEGACY_RUNTIME_PROFILE,
+    SHORT_RUNTIME_PROFILE,
     _run_git,
     auto_agents_state_root,
     dynamic_port_lease,
@@ -32,12 +34,14 @@ from .gate_execution import (
     gate_environment,
     install_dependency_links,
     isolated_command,
+    short_job_runtime_root,
 )
 from .models import CommandResult
 from .process_supervision import process_group_exists, run_supervised_shell_command
 
 
 WORKER_PROTOCOL_VERSION = 4
+MANAGED_RUNTIME_LAYOUT_FEATURE = "managed_runtime_layout_repair_v1"
 LOGGER = logging.getLogger(__name__)
 
 SYSTEM_ENVIRONMENT_DENYLIST = frozenset(
@@ -238,6 +242,7 @@ def enrich_worker_probe(probe: Mapping[str, object]) -> dict[str, object]:
             "capability_details_v1",
             "failure_domain_v1",
             "managed_capability_repair_v2",
+            MANAGED_RUNTIME_LAYOUT_FEATURE,
         }
     )
     return enriched
@@ -1341,7 +1346,21 @@ def worker_execute(
             else:
                 links = _environment_links(config, environment_id)
             install_dependency_links(sandbox, links)
-            runtime_root = config.managed_root / "runtime" / job_id
+            runtime_profile = str(
+                manifest.get("runtime_profile", SHORT_RUNTIME_PROFILE)
+            ).strip()
+            if runtime_profile not in {
+                SHORT_RUNTIME_PROFILE,
+                LEGACY_RUNTIME_PROFILE,
+            }:
+                raise ValueError(
+                    f"unsupported gate runtime profile: {runtime_profile}"
+                )
+            runtime_root = (
+                short_job_runtime_root(job_id)
+                if runtime_profile == SHORT_RUNTIME_PROFILE
+                else config.managed_root / "runtime" / job_id
+            )
             record = {
                 **base_record,
                 "state": "accepted",
@@ -1422,6 +1441,7 @@ def worker_execute(
                         job_id=job_id,
                         base={**os.environ, **forwarded},
                         runtime_root=runtime_root,
+                        runtime_profile=runtime_profile,
                         dynamic_ports=dynamic_ports,
                     )
                     process = run_supervised_shell_command(
@@ -1546,6 +1566,9 @@ def worker_execute(
                 encoding="utf-8",
                 capture_output=True,
             )
+        runtime_path = locals().get("runtime_root")
+        if isinstance(runtime_path, Path):
+            shutil.rmtree(runtime_path, ignore_errors=True)
         shutil.rmtree(config.managed_root / "runtime" / job_id, ignore_errors=True)
 
 

@@ -68,8 +68,10 @@ def test_worker_service_uses_pinned_authenticated_https(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.delenv("AUTO_AGENTS_WORKER_CONFIG", raising=False)
     monkeypatch.setenv("AUTO_AGENTS_CLUSTER_HOME", str(tmp_path / "cluster"))
     monkeypatch.setenv("AUTO_AGENTS_WORKER_ROOT", str(tmp_path / "worker"))
+    monkeypatch.setenv("AUTO_AGENTS_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setenv("AUTO_AGENTS_WORKER_SLOTS", "1")
     state = init_cluster(name="test")
     port = _free_tcp_port()

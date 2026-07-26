@@ -13,6 +13,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -22,6 +23,58 @@ from .process_supervision import run_supervised_shell_command
 
 
 GateProgressCallback = Callable[[str, str, float], None]
+SHORT_RUNTIME_PROFILE = "short_socket_path_v1"
+LEGACY_RUNTIME_PROFILE = "legacy_v1"
+_SHORT_RUNTIME_SOCKET_BUDGET = 100
+_SHORT_RUNTIME_STALE_SECONDS = 24 * 60 * 60
+
+
+def short_job_runtime_root(job_id: str, *, create: bool = True) -> Path:
+    """Return a short, user-owned per-job root suitable for Unix sockets."""
+    normalized = str(job_id).strip()
+    if not normalized:
+        raise ValueError("gate job id is required for a short runtime")
+    if os.name != "posix":
+        root = Path(tempfile.gettempdir()) / (
+            "auto-agents-gate-" + hashlib.sha256(normalized.encode()).hexdigest()[:12]
+        )
+    else:
+        base = Path("/tmp")
+        if not base.is_dir() or not os.access(base, os.W_OK | os.X_OK):
+            base = Path(tempfile.gettempdir())
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        prefix = f"aag-{uid}-"
+        root = base / (prefix + hashlib.sha256(normalized.encode()).hexdigest()[:12])
+        worst_socket = root / "t" / ("s" * 64)
+        if len(os.fsencode(str(worst_socket))) > _SHORT_RUNTIME_SOCKET_BUDGET:
+            raise RuntimeError(
+                "short_runtime_root_unavailable: no writable temporary root "
+                "satisfies the Unix socket path budget"
+            )
+        if create:
+            now = time.time()
+            for candidate in base.glob(f"{prefix}*"):
+                marker = candidate / ".auto-agents-runtime.json"
+                try:
+                    if (
+                        marker.is_file()
+                        and now - candidate.stat().st_mtime
+                        > _SHORT_RUNTIME_STALE_SECONDS
+                    ):
+                        shutil.rmtree(candidate, ignore_errors=True)
+                except OSError:
+                    continue
+    if create:
+        if root.is_symlink():
+            raise RuntimeError("short runtime root must not be a symbolic link")
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            root.chmod(0o700)
+        (root / ".auto-agents-runtime.json").write_text(
+            json.dumps({"job_id": normalized}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return root
 
 
 def _run_git(
@@ -148,10 +201,20 @@ def auto_agents_state_root() -> Path:
         / f"auto-agents-state-{getattr(os, 'getuid', lambda: 0)()}"
     )
     for candidate in candidates:
+        probe: Optional[Path] = None
         try:
             candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / f".write-probe-{uuid.uuid4().hex}"
+            with probe.open("xb") as handle:
+                handle.write(b"ok")
+            probe.unlink()
             return candidate.resolve()
         except OSError:
+            if probe is not None:
+                try:
+                    probe.unlink()
+                except OSError:
+                    pass
             continue
     raise RuntimeError("no writable state directory is available for gate execution")
 
@@ -317,6 +380,7 @@ def gate_environment(
     job_id: str,
     base: Optional[Mapping[str, str]] = None,
     runtime_root: Optional[Path] = None,
+    runtime_profile: str = SHORT_RUNTIME_PROFILE,
     dynamic_ports: Optional[Mapping[str, int]] = None,
 ) -> dict[str, str]:
     env = dict(base or os.environ)
@@ -329,26 +393,39 @@ def gate_environment(
             or key.startswith("AUTO_AGENTS_GATE_PORT_")
         ):
             env.pop(key, None)
-    runtime_root = runtime_root or (sandbox / ".auto-agents-gate-runtime")
-    temp_root = runtime_root / "tmp"
-    cache_root = runtime_root / "cache"
+    runtime_profile = str(runtime_profile or SHORT_RUNTIME_PROFILE).strip()
+    if runtime_profile not in {SHORT_RUNTIME_PROFILE, LEGACY_RUNTIME_PROFILE}:
+        raise ValueError(f"unsupported gate runtime profile: {runtime_profile}")
+    if runtime_profile == SHORT_RUNTIME_PROFILE:
+        runtime_root = short_job_runtime_root(job_id)
+    else:
+        runtime_root = runtime_root or (sandbox / ".auto-agents-gate-runtime")
+    temp_root = runtime_root / "t"
+    cache_root = runtime_root / "c"
+    xdg_runtime_root = runtime_root / "r"
     temp_root.mkdir(parents=True, exist_ok=True)
     cache_root.mkdir(parents=True, exist_ok=True)
+    xdg_runtime_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name == "posix":
+        xdg_runtime_root.chmod(0o700)
     env.update(
         {
             "AUTO_AGENTS_GATE_JOB_ID": job_id,
             "AUTO_AGENTS_GATE_SANDBOX_ROOT": str(sandbox),
+            "AUTO_AGENTS_GATE_RUNTIME_PROFILE": runtime_profile,
+            "AUTO_AGENTS_GATE_RUNTIME_ROOT": str(runtime_root),
             "AUTO_AGENTS_TEST": "True",
             "PYTEST_CURRENT_TEST": "auto_agents_gate_run",
             "TESTING": "True",
             "TMPDIR": str(temp_root),
             "TMP": str(temp_root),
             "TEMP": str(temp_root),
-            "XDG_CACHE_HOME": str(cache_root / "xdg"),
-            "XDG_STATE_HOME": str(runtime_root / "state"),
-            "PYTHONPYCACHEPREFIX": str(cache_root / "pycache"),
+            "XDG_RUNTIME_DIR": str(xdg_runtime_root),
+            "XDG_CACHE_HOME": str(cache_root / "x"),
+            "XDG_STATE_HOME": str(runtime_root / "s"),
+            "PYTHONPYCACHEPREFIX": str(cache_root / "p"),
             "PYTHONDONTWRITEBYTECODE": "1",
-            "npm_config_cache": str(cache_root / "npm"),
+            "npm_config_cache": str(cache_root / "n"),
         }
     )
     ports = {
@@ -616,10 +693,20 @@ class LocalGatePlanExecutor:
     ) -> CommandResult:
         job_id = uuid.uuid4().hex
         sandbox: Optional[Path] = None
+        runtime_root: Optional[Path] = None
         cleanup = not bool(lane)
         try:
             sandbox, _created = self._sandbox(lane, job_id)
-            runtime_root = self.worktree_root / self.plan_id / ".runtime" / job_id
+            requested_profile = str(
+                dict(environment_overrides or {}).get(
+                    "AUTO_AGENTS_GATE_RUNTIME_PROFILE", SHORT_RUNTIME_PROFILE
+                )
+            )
+            runtime_root = (
+                short_job_runtime_root(job_id)
+                if requested_profile == SHORT_RUNTIME_PROFILE
+                else self.worktree_root / self.plan_id / ".runtime" / job_id
+            )
             if progress is not None:
                 progress("start", command, 0.0)
             metadata = self.metadata.get(command)
@@ -635,6 +722,7 @@ class LocalGatePlanExecutor:
                         job_id=job_id,
                         base={**os.environ, **dict(environment_overrides or {})},
                         runtime_root=runtime_root,
+                        runtime_profile=requested_profile,
                         dynamic_ports=dynamic_ports,
                     )
                     process = run_supervised_shell_command(
@@ -710,6 +798,8 @@ class LocalGatePlanExecutor:
             self.record_timing(command, result)
             return result
         finally:
+            if runtime_root is not None:
+                shutil.rmtree(runtime_root, ignore_errors=True)
             if cleanup and sandbox is not None:
                 try:
                     _run_git(

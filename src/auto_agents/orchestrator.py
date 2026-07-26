@@ -3956,6 +3956,11 @@ class Orchestrator:
         incident: ExecutionIncident,
         diagnosis: IncidentDiagnosis,
     ) -> bool:
+        if (
+            incident.cause_status == "confirmed"
+            and diagnosis.cause_status != "confirmed"
+        ):
+            diagnosis.cause_status = "confirmed"
         if incident.kind == "gate_reported_infrastructure_error":
             if diagnosis.confidence < 0.8:
                 return self._block_for_execution_incident(
@@ -3971,6 +3976,7 @@ class Orchestrator:
                     confidence=diagnosis.confidence,
                     reason=diagnosis.reason,
                     evidence=list(diagnosis.evidence),
+                    cause_status=diagnosis.cause_status,
                     source=diagnosis.source,
                 )
             elif diagnosis.owner == "auto_agents":
@@ -3980,6 +3986,7 @@ class Orchestrator:
                     confidence=diagnosis.confidence,
                     reason=diagnosis.reason,
                     evidence=list(diagnosis.evidence),
+                    cause_status=diagnosis.cause_status,
                     source=diagnosis.source,
                 )
             elif diagnosis.owner in {
@@ -3994,6 +4001,7 @@ class Orchestrator:
                     confidence=diagnosis.confidence,
                     reason=diagnosis.reason,
                     evidence=list(diagnosis.evidence),
+                    cause_status=diagnosis.cause_status,
                     source=diagnosis.source,
                 )
             else:
