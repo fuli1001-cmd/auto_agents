@@ -712,6 +712,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable Aider-style repo map injection for this run.",
     )
+    run_parser.add_argument(
+        "--restart-blocked",
+        action="store_true",
+        help="Archive a blocked run and start a fresh run; refuses dirty project code.",
+    )
 
     stop_parser = subparsers.add_parser(
         "stop",
@@ -1101,6 +1106,7 @@ def main(argv: list[str] | None = None) -> int:
                 print_agent_output=bool(args.print_agent_output),
                 doc_language=args.doc_language,
                 provider_kind=args.provider,
+                restart_blocked=bool(getattr(args, "restart_blocked", False)),
             )
             state_payload = state.to_dict()
             state_status = str(state_payload.get("status", ""))

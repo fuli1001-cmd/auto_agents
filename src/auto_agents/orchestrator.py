@@ -1179,6 +1179,7 @@ class Orchestrator:
         print_agent_output: bool = False,
         doc_language: Optional[str] = None,
         provider_kind: Optional[str] = None,
+        restart_blocked: bool = False,
     ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
         self._ensure_agent_instructions_synced()
@@ -1193,6 +1194,7 @@ class Orchestrator:
             self._max_tasks_remaining = max_tasks
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
+            restarted_before_preconditions = False
             if state.workflow_version < 2:
                 legacy_progress = any(
                     stage in state.stage_summaries
@@ -1206,11 +1208,20 @@ class Orchestrator:
                 state.workflow_version = 2
                 save_run_state(self.project_root, state)
             self._attach_run_logger(state.run_id)
-            if self._resume_blocked_run(state):
-                save_run_state(self.project_root, state)
-            if state.status == "blocked":
-                save_run_state(self.project_root, state)
-                return state
+            if (
+                restart_blocked
+                and state.status == "blocked"
+                and not load_task_plan(self.project_root).get("tasks", [])
+            ):
+                state = self.restart_blocked_run()
+                restarted_before_preconditions = True
+                self._attach_run_logger(state.run_id)
+            if not restart_blocked:
+                if self._resume_blocked_run(state):
+                    save_run_state(self.project_root, state)
+                if state.status == "blocked":
+                    save_run_state(self.project_root, state)
+                    return state
             if self._normalize_legacy_requirements_audit_resume(state):
                 save_run_state(self.project_root, state)
             resolved_spec_file = spec_file.expanduser().resolve()
@@ -1233,12 +1244,18 @@ class Orchestrator:
             pattern_recovery = self._route_forbidden_pattern_definition_recovery(state)
             if pattern_recovery:
                 save_run_state(self.project_root, state)
-            self._ensure_preconditions(
-                state,
-                spec_file=spec_file,
-                skip_validate=skip_validate,
-                allow_unsafe_forbidden_pattern_definitions=pattern_recovery,
-            )
+            if not restarted_before_preconditions:
+                self._ensure_preconditions(
+                    state,
+                    spec_file=spec_file,
+                    skip_validate=skip_validate,
+                    allow_unsafe_forbidden_pattern_definitions=pattern_recovery,
+                )
+
+            if restart_blocked and not restarted_before_preconditions:
+                state = self.restart_blocked_run()
+                self._attach_run_logger(state.run_id)
+                save_run_state(self.project_root, state)
 
             if state.status == "completed":
                 self.logger.info("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]")
@@ -1396,6 +1413,28 @@ class Orchestrator:
         self._write_archive_json(task_archive, load_task_plan(self.project_root))
         self._write_archive_json(state_archive, run_state_payload)
         return task_archive, state_archive
+
+    def restart_blocked_run(self) -> RunState:
+        state = load_run_state(self.project_root)
+        if state.status != "blocked":
+            raise RuntimeError("--restart-blocked requires the active run to be blocked")
+        dirty_code = [
+            path
+            for path in changed_paths(self.project_root)
+            if not str(path).startswith(".auto-agents/")
+        ]
+        if dirty_code:
+            raise RuntimeError(
+                "--restart-blocked refuses to archive a dirty project code tree: "
+                + ", ".join(sorted(str(path) for path in dirty_code)[:20])
+            )
+        previous_run_id = state.run_id
+        restarted = self._start_new_iteration(state)
+        restarted.resume_context.pop("previous_run_id", None)
+        restarted.resume_context.pop("previous_task_plan_archive", None)
+        restarted.resume_context["restarted_blocked_run_id"] = previous_run_id
+        save_run_state(self.project_root, restarted)
+        return restarted
 
     def _start_new_iteration(self, state: RunState) -> RunState:
         previous_run_id = state.run_id
@@ -3525,6 +3564,12 @@ class Orchestrator:
     ) -> ExecutionIncident:
         store = self._incident_store(state)
         incident.budget_epoch = state.execution_incident_budget_epoch
+        if not incident.root_cause_fingerprint:
+            incident.root_cause_fingerprint = incident.incident_fingerprint
+        if not incident.root_incident_id:
+            incident.root_incident_id = incident.incident_id
+        if not incident.origin_command:
+            incident.origin_command = incident.command
         existing = None
         for summary in reversed(state.execution_incidents):
             if (
@@ -3549,6 +3594,14 @@ class Orchestrator:
             existing.head_ref = incident.head_ref
             existing.worktree_fingerprint = incident.worktree_fingerprint
             existing.evidence_fingerprint = incident.evidence_fingerprint
+            existing.root_incident_id = (
+                existing.root_incident_id or incident.root_incident_id
+            )
+            existing.root_cause_fingerprint = (
+                existing.root_cause_fingerprint
+                or incident.root_cause_fingerprint
+            )
+            existing.origin_command = existing.origin_command or incident.origin_command
             incident = existing
         store.save(incident, state)
         return incident
@@ -3557,9 +3610,15 @@ class Orchestrator:
     def _execution_incident_budget_fingerprints(state: RunState) -> Set[str]:
         epoch = state.execution_incident_budget_epoch
         return {
-            str(entry.get("incident_fingerprint", ""))
+            str(
+                entry.get("root_cause_fingerprint")
+                or entry.get("incident_fingerprint", "")
+            )
             for entry in state.execution_incidents
-            if str(entry.get("incident_fingerprint", ""))
+            if str(
+                entry.get("root_cause_fingerprint")
+                or entry.get("incident_fingerprint", "")
+            )
             and int(entry.get("budget_epoch", 0) or 0) == epoch
         }
 
@@ -4024,25 +4083,11 @@ class Orchestrator:
                     "cannot be reproduced safely",
                 )
             if diagnosis.action == "REPAIR_INFRASTRUCTURE":
-                from .infrastructure_repair import (
-                    managed_diagnostic_refs,
-                    repair_execution_infrastructure,
-                    scoped_verification_repair_instructions,
-                )
-
-                repair = repair_execution_infrastructure(incident)
-                repair_entry = {
-                    "event": "managed_infrastructure_repair",
-                    "round": incident.recovery_round,
-                    **repair.to_dict(),
-                }
-                incident.repair_history.append(repair_entry)
-                incident.history.append(repair_entry)
-                incident.process_snapshot["managed_diagnostic_refs"] = (
-                    managed_diagnostic_refs(incident)
-                )
-                incident.process_snapshot["scoped_repair_instructions"] = (
-                    scoped_verification_repair_instructions()
+                return self._block_for_execution_incident(
+                    state,
+                    incident,
+                    "managed worker/runtime repair exhausted all eligible candidates: "
+                    + diagnosis.reason,
                 )
             self._schedule_prebaseline_recovery_task(state, incident)
         else:
@@ -4059,6 +4104,8 @@ class Orchestrator:
         user_context: str = "",
     ) -> Optional[IncidentDiagnosis]:
         prompt = (
+            "Separate observed evidence from inferred causation. Include cause_status as one of "
+            "confirmed, suspected, or unknown; adjacent crash diagnostics are not causal proof. "
             "You are a read-only execution incident judge. Do not edit files or run unbounded "
             "commands. Diagnose ownership and choose one safe recovery route. Never recommend "
             "weakening tests, disabling checks, changing credentials/global environment, or merely "

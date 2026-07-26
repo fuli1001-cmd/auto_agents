@@ -612,6 +612,7 @@ class LocalGatePlanExecutor:
         idle_timeout_seconds: float,
         cancel_event: Optional[threading.Event] = None,
         progress: Optional[GateProgressCallback] = None,
+        environment_overrides: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
         job_id = uuid.uuid4().hex
         sandbox: Optional[Path] = None
@@ -632,6 +633,7 @@ class LocalGatePlanExecutor:
                     env = gate_environment(
                         sandbox,
                         job_id=job_id,
+                        base={**os.environ, **dict(environment_overrides or {})},
                         runtime_root=runtime_root,
                         dynamic_ports=dynamic_ports,
                     )

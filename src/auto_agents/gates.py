@@ -35,7 +35,9 @@ _VITEST_FAILED = re.compile(
 )
 _UNITTEST_FAILED = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
 _STANDARD_INFRA_FAILURE = re.compile(
-    r"\bAUTO_AGENTS_INFRA_FAILURE\s+id=(?P<id>[a-z][a-z0-9_-]{1,63})\b",
+    r"\bAUTO_AGENTS_INFRA_FAILURE\s+id=(?P<id>[a-z][a-z0-9_-]{1,63})\b"
+    r"(?:\s+capability=(?P<capability>[a-z][a-z0-9_-]{1,31}))?"
+    r"(?:\s+contract=(?P<contract>[a-z][a-z0-9_-]{1,31}))?",
     re.IGNORECASE,
 )
 _BUILTIN_INFRA_MARKERS = (
@@ -186,6 +188,13 @@ def classify_reported_infrastructure_failure(
     diagnostic = "\n".join(lines)
     standard = _STANDARD_INFRA_FAILURE.search(diagnostic)
     failure_id = standard.group("id").lower() if standard else ""
+    if standard:
+        result.infrastructure_capability = (
+            standard.group("capability") or ""
+        ).lower()
+        result.infrastructure_contract = (
+            standard.group("contract") or ""
+        ).lower()
     if not failure_id:
         for marker_id, pattern in _BUILTIN_INFRA_MARKERS:
             if pattern.search(diagnostic):

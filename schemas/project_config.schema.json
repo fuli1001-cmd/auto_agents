@@ -444,6 +444,15 @@
               "type": "integer",
               "minimum": 1,
               "default": 300
+            },
+            "managed_runtime_downloads_enabled": {
+              "type": "boolean",
+              "default": true
+            },
+            "max_managed_runtime_candidates": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 3
             }
           },
           "additionalProperties": false

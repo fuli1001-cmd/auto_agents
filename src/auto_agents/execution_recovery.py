@@ -14,7 +14,7 @@ from .io_utils import read_json, write_json
 from .models import AgentResult, CommandResult, RunState
 
 
-INCIDENT_SCHEMA_VERSION = 2
+INCIDENT_SCHEMA_VERSION = 3
 INCIDENT_ACTIONS = {
     "RETRY",
     "RECOVER_TARGET",
@@ -72,6 +72,7 @@ class IncidentDiagnosis:
     confidence: float
     reason: str
     evidence: List[str] = field(default_factory=list)
+    cause_status: str = "unknown"
     source: str = "deterministic"
 
     def valid(self) -> bool:
@@ -80,6 +81,7 @@ class IncidentDiagnosis:
             and self.action in INCIDENT_ACTIONS
             and 0.0 <= float(self.confidence) <= 1.0
             and bool(self.reason.strip())
+            and self.cause_status in {"confirmed", "suspected", "unknown"}
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -111,6 +113,9 @@ class ExecutionIncident:
     head_ref: str = ""
     worktree_fingerprint: str = ""
     incident_fingerprint: str = ""
+    root_incident_id: str = ""
+    root_cause_fingerprint: str = ""
+    origin_command: str = ""
     evidence_fingerprint: str = ""
     budget_epoch: int = 0
     occurrence_count: int = 1
@@ -118,7 +123,7 @@ class ExecutionIncident:
     status: str = "open"
     diagnosis: Dict[str, object] = field(default_factory=dict)
     repair_history: List[Dict[str, object]] = field(default_factory=list)
-    recovery_policy_version: int = 2
+    recovery_policy_version: int = 3
     history: List[Dict[str, object]] = field(default_factory=list)
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
@@ -143,6 +148,9 @@ class ExecutionIncident:
             "context": self.context,
             "task_id": self.task_id,
             "incident_fingerprint": self.incident_fingerprint,
+            "root_incident_id": self.root_incident_id,
+            "root_cause_fingerprint": self.root_cause_fingerprint,
+            "origin_command": self.origin_command,
             "evidence_fingerprint": self.evidence_fingerprint,
             "budget_epoch": self.budget_epoch,
             "occurrence_count": self.occurrence_count,
@@ -239,17 +247,17 @@ def command_incident(
         and result.termination_reason not in {"timeout", "stalled"}
     ):
         kind = f"gate_{result.termination_reason or 'abnormal_exit'}"
-    incident_fp = _fingerprint_payload(
-        {
-            "source": "gate",
-            "kind": kind,
-            "stage": stage,
-            "context": context,
-            "command": " ".join(command.split()),
-            "termination_reason": result.termination_reason,
-            "infrastructure_failure_id": result.infrastructure_failure_id,
-        }
-    )
+    identity = {
+        "source": "gate",
+        "kind": kind,
+        "stage": stage,
+        "command": " ".join(command.split()),
+        "termination_reason": result.termination_reason,
+        "infrastructure_failure_id": result.infrastructure_failure_id,
+    }
+    if kind != "gate_reported_infrastructure_error":
+        identity["context"] = context
+    incident_fp = _fingerprint_payload(identity)
     evidence_fp = _fingerprint_payload(
         {
             "incident": incident_fp,
@@ -290,6 +298,8 @@ def command_incident(
         head_ref=head_ref,
         worktree_fingerprint=worktree_fingerprint,
         incident_fingerprint=incident_fp,
+        root_cause_fingerprint=incident_fp,
+        origin_command=command,
         evidence_fingerprint=evidence_fp,
     )
 
@@ -417,6 +427,7 @@ def parse_incident_diagnosis(raw: str) -> IncidentDiagnosis:
             str(item).strip() for item in payload.get("evidence", [])
             if str(item).strip()
         ],
+        cause_status=str(payload.get("cause_status", "unknown")).strip().lower(),
         source="provider",
     )
     if not diagnosis.valid():

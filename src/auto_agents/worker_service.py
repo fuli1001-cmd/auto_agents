@@ -301,6 +301,9 @@ class WorkerClient:
         run_id: str,
         incident_id: str,
         failure_id: str = "",
+        failed_artifacts=(),
+        allow_downloads: bool = True,
+        max_candidates: int = 3,
     ) -> dict[str, object]:
         body = canonical_json(
             {
@@ -308,6 +311,9 @@ class WorkerClient:
                 "run_id": run_id,
                 "incident_id": incident_id,
                 "failure_id": failure_id,
+                "failed_artifacts": list(failed_artifacts),
+                "allow_downloads": bool(allow_downloads),
+                "max_candidates": int(max_candidates),
             }
         )
         _status, payload, _headers = self._request(
@@ -625,7 +631,14 @@ class WorkerHTTPServer(ThreadingHTTPServer):
             stderr_tail=failure_id or "browser runtime repair",
             process_snapshot={"infrastructure_failure_id": failure_id},
         )
-        result = repair_execution_infrastructure(incident)
+        result = repair_execution_infrastructure(
+            incident,
+            failed_artifacts=[
+                str(item) for item in payload.get("failed_artifacts", [])
+            ],
+            allow_downloads=bool(payload.get("allow_downloads", True)),
+            max_candidates=max(1, int(payload.get("max_candidates", 3))),
+        )
         self._json(200 if result.repaired else 409, {"ok": result.repaired, **result.to_dict()})
 
 

@@ -37,7 +37,7 @@ from .models import CommandResult
 from .process_supervision import process_group_exists, run_supervised_shell_command
 
 
-WORKER_PROTOCOL_VERSION = 3
+WORKER_PROTOCOL_VERSION = 4
 LOGGER = logging.getLogger(__name__)
 
 SYSTEM_ENVIRONMENT_DENYLIST = frozenset(
@@ -122,6 +122,7 @@ class WorkerEndpoint:
     tls_fingerprint: str = ""
     enabled: bool = True
     capabilities: tuple[str, ...] = ()
+    features: tuple[str, ...] = ()
     capability_details: Mapping[str, object] = field(default_factory=dict)
     failure_domain: Mapping[str, object] = field(default_factory=dict)
 
@@ -236,6 +237,7 @@ def enrich_worker_probe(probe: Mapping[str, object]) -> dict[str, object]:
             ),
             "capability_details_v1",
             "failure_domain_v1",
+            "managed_capability_repair_v2",
         }
     )
     return enriched

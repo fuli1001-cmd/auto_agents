@@ -16,6 +16,8 @@ from typing import Mapping, Optional
 
 from .gate_execution import LocalGatePlanExecutor, exclusive_resource_lease
 from .gates import classify_reported_infrastructure_failure
+from .execution_recovery import ExecutionIncident
+from .infrastructure_repair import repair_execution_infrastructure
 from .models import CommandResult, GateConfig
 from .worker_cluster import discover_workers, load_cluster_state
 from .worker_service import WorkerClient, result_from_job_record
@@ -49,6 +51,7 @@ class DistributedGatePlanExecutor:
         environment_fingerprint: str = "",
     ) -> None:
         self.project_root = project_root.resolve()
+        self.run_id = str(run_id)
         self.gate_config = gate_config
         self.metadata = dict(metadata)
         self.local = LocalGatePlanExecutor(
@@ -94,6 +97,9 @@ class DistributedGatePlanExecutor:
                 capabilities=tuple(
                     str(item)
                     for item in local_probe.get("capabilities", [])
+                ),
+                features=tuple(
+                    str(item) for item in local_probe.get("features", [])
                 ),
                 capability_details=dict(
                     local_probe.get("capability_details", {})
@@ -182,6 +188,13 @@ class DistributedGatePlanExecutor:
                         sorted(
                             str(item).strip().lower()
                             for item in probe.get("capabilities", [])
+                            if str(item).strip()
+                        )
+                    ),
+                    features=tuple(
+                        sorted(
+                            str(item).strip()
+                            for item in probe.get("features", [])
                             if str(item).strip()
                         )
                     ),
@@ -472,6 +485,7 @@ class DistributedGatePlanExecutor:
         adaptive_timeout_enabled: bool,
         idle_timeout_seconds: float,
         cancel_event: Optional[threading.Event],
+        environment_overrides: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
         job_id = uuid.uuid4().hex
         self._stage_remote(endpoint)
@@ -480,6 +494,24 @@ class DistributedGatePlanExecutor:
         distributed = self.gate_config.distributed
         artifact_globs = self._metadata_list(command, "artifact_globs")
         memory_mb, memory_reserve_mb, memory_guard = self._memory_policy(command)
+        environment = forwarded_environment(
+            os.environ,
+            distributed.extra_environment_denylist,
+        )
+        overrides = dict(environment_overrides or {})
+        path_prepend = overrides.pop("AUTO_AGENTS_PATH_PREPEND", "")
+        if path_prepend:
+            environment["PATH"] = (
+                f"{path_prepend}{os.pathsep}{environment.get('PATH', '')}"
+            )
+        environment.update(
+            {
+                key: value
+                for key, value in overrides.items()
+                if key.startswith("AUTO_AGENTS_CAPABILITY_")
+                or key in {"AUTO_AGENTS_CRASH_DIR", "AUTO_AGENTS_INFRA_REPORT_PATH"}
+            }
+        )
         manifest = {
             "protocol_version": WORKER_PROTOCOL_VERSION,
             "project_key": self.key,
@@ -494,10 +526,7 @@ class DistributedGatePlanExecutor:
             "memory_reserve_mb": memory_reserve_mb,
             "memory_guard": memory_guard,
             "environment_manifest": self.environment_manifest,
-            "environment": forwarded_environment(
-                os.environ,
-                distributed.extra_environment_denylist,
-            ),
+            "environment": environment,
             "timeout_seconds": timeout_seconds,
             "adaptive_timeout_enabled": adaptive_timeout_enabled,
             "idle_timeout_seconds": idle_timeout_seconds,
@@ -586,6 +615,7 @@ class DistributedGatePlanExecutor:
         idle_timeout_seconds: float,
         cancel_event: Optional[threading.Event],
         progress,
+        environment_overrides: Optional[Mapping[str, str]] = None,
     ) -> CommandResult:
         required = self._required_slots(command)
         memory_mb, memory_reserve_mb, memory_guard = self._memory_policy(command)
@@ -601,6 +631,12 @@ class DistributedGatePlanExecutor:
                 memory_guard=memory_guard,
                 cancel_event=cancel_event,
             ):
+                local_overrides = dict(environment_overrides or {})
+                path_prepend = local_overrides.pop("AUTO_AGENTS_PATH_PREPEND", "")
+                if path_prepend:
+                    local_overrides["PATH"] = (
+                        f"{path_prepend}{os.pathsep}{os.environ.get('PATH', '')}"
+                    )
                 result = self.local.run(
                     command,
                     lane=lane,
@@ -609,6 +645,7 @@ class DistributedGatePlanExecutor:
                     idle_timeout_seconds=idle_timeout_seconds,
                     cancel_event=cancel_event,
                     progress=progress,
+                    environment_overrides=local_overrides,
                 )
                 result.worker_id = endpoint.worker_id
                 return result
@@ -632,6 +669,7 @@ class DistributedGatePlanExecutor:
                 adaptive_timeout_enabled=adaptive_timeout_enabled,
                 idle_timeout_seconds=idle_timeout_seconds,
                 cancel_event=cancel_event,
+                environment_overrides=environment_overrides,
             )
         self.local.record_timing(command, result)
         if progress is not None:
@@ -880,6 +918,150 @@ class DistributedGatePlanExecutor:
             if not current.infrastructure_error:
                 return current
             if current.termination_reason == "remote_state_uncertain":
+                return current
+        last.infrastructure_attempts = list(attempts)
+        repaired = self._repair_reported_infrastructure(
+            command=command,
+            first_result=last,
+            attempts=attempts,
+            timeout_seconds=timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            idle_timeout_seconds=idle_timeout_seconds,
+            cancel_event=cancel_event,
+            progress=progress,
+        )
+        return repaired or last
+
+    def _managed_recovery_config(self) -> tuple[bool, int]:
+        try:
+            payload = json.loads(
+                (self.project_root / ".auto-agents" / "config.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            recovery = payload.get("execution", {}).get("recovery", {})
+            return (
+                bool(recovery.get("managed_runtime_downloads_enabled", True)),
+                max(1, int(recovery.get("max_managed_runtime_candidates", 3))),
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return True, 3
+
+    def _repair_reported_infrastructure(
+        self,
+        *,
+        command: str,
+        first_result: CommandResult,
+        attempts: list[dict[str, object]],
+        timeout_seconds: float,
+        adaptive_timeout_enabled: bool,
+        idle_timeout_seconds: float,
+        cancel_event: Optional[threading.Event],
+        progress,
+    ) -> Optional[CommandResult]:
+        failure_id = first_result.infrastructure_failure_id
+        lowered = f"{failure_id} {first_result.stderr}".lower()
+        if not any(token in lowered for token in ("browser", "chrome", "chromium", "devtools")):
+            return None
+        allow_downloads, max_candidates = self._managed_recovery_config()
+        incident_id = f"managed-{uuid.uuid4().hex[:12]}"
+        last = first_result
+        for endpoint in self.endpoints:
+            if not any(str(item.get("worker_id", "")) == endpoint.worker_id for item in attempts):
+                continue
+            if "managed_capability_repair_v2" not in endpoint.features:
+                attempts.append(
+                    {
+                        "worker_id": endpoint.worker_id,
+                        "event": "managed_infrastructure_repair",
+                        "repaired": False,
+                        "reason": (
+                            "worker does not advertise "
+                            "managed_capability_repair_v2"
+                        ),
+                    }
+                )
+                continue
+            failed_artifacts = {
+                str(
+                    item.get("capability_details", {})
+                    .get("chrome", {})
+                    .get("artifact_sha256", "")
+                )
+                for item in attempts
+                if str(item.get("worker_id", "")) == endpoint.worker_id
+                and isinstance(item.get("capability_details"), dict)
+            }
+            try:
+                if endpoint.transport == "local":
+                    repair = repair_execution_infrastructure(
+                        ExecutionIncident(
+                            incident_id=incident_id,
+                            run_id=self.run_id,
+                            source="gate",
+                            kind="gate_reported_infrastructure_error",
+                            stage="worker",
+                            context="managed capability repair",
+                            command=command,
+                            stderr_tail=failure_id,
+                        ),
+                        failed_artifacts=sorted(failed_artifacts),
+                        allow_downloads=allow_downloads,
+                        max_candidates=max_candidates,
+                    ).to_dict()
+                else:
+                    repair = self.clients[endpoint.worker_id].repair_capability(
+                        capability="chrome",
+                        run_id=self.run_id,
+                        incident_id=incident_id,
+                        failure_id=failure_id,
+                        failed_artifacts=sorted(failed_artifacts),
+                        allow_downloads=allow_downloads,
+                        max_candidates=max_candidates,
+                    )
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+                attempts.append(
+                    {
+                        "worker_id": endpoint.worker_id,
+                        "event": "managed_infrastructure_repair",
+                        "repaired": False,
+                        "reason": str(error),
+                    }
+                )
+                continue
+            attempts.append(
+                {
+                    "worker_id": endpoint.worker_id,
+                    "event": "managed_infrastructure_repair",
+                    **repair,
+                }
+            )
+            if not bool(repair.get("repaired", repair.get("ok", False))):
+                continue
+            environment = repair.get("environment", {})
+            if not isinstance(environment, Mapping):
+                continue
+            current = self._run_on_endpoint(
+                endpoint,
+                command,
+                lane="",
+                timeout_seconds=timeout_seconds,
+                adaptive_timeout_enabled=adaptive_timeout_enabled,
+                idle_timeout_seconds=idle_timeout_seconds,
+                cancel_event=cancel_event,
+                progress=progress,
+                environment_overrides={
+                    str(key): str(value) for key, value in environment.items()
+                },
+            )
+            classify_reported_infrastructure_failure(
+                current,
+                self.gate_config.reported_infrastructure_markers,
+            )
+            attempts.append(self._infrastructure_attempt_evidence(current))
+            current.infrastructure_attempts = list(attempts)
+            last = current
+            if not current.infrastructure_error:
                 return current
         last.infrastructure_attempts = list(attempts)
         return last

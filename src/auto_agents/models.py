@@ -658,6 +658,8 @@ class RecoveryConfig:
     max_refs_per_repair_task: int = 8
     max_incidents_per_run: int = 6
     diagnostic_probe_timeout_seconds: int = 300
+    managed_runtime_downloads_enabled: bool = True
+    max_managed_runtime_candidates: int = 3
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RecoveryConfig":
@@ -669,6 +671,12 @@ class RecoveryConfig:
             max_incidents_per_run=int(data.get("max_incidents_per_run", 6)),
             diagnostic_probe_timeout_seconds=int(
                 data.get("diagnostic_probe_timeout_seconds", 300)
+            ),
+            managed_runtime_downloads_enabled=bool(
+                data.get("managed_runtime_downloads_enabled", True)
+            ),
+            max_managed_runtime_candidates=max(
+                1, int(data.get("max_managed_runtime_candidates", 3))
             ),
         )
 
@@ -1272,6 +1280,8 @@ class CommandResult:
     backend: str = "local"
     infrastructure_error: bool = False
     infrastructure_failure_id: str = ""
+    infrastructure_capability: str = ""
+    infrastructure_contract: str = ""
     infrastructure_attempts: List[Dict[str, object]] = field(default_factory=list)
     mutation_paths: List[str] = field(default_factory=list)
     artifacts: Dict[str, str] = field(default_factory=dict)

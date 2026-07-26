@@ -682,13 +682,24 @@ state becomes uncertain after acceptance is never duplicated. Stale terminal rec
 can be removed with `auto-agents workers cleanup`.
 
 Tests can explicitly report that they could not exercise the target behavior by emitting
-`AUTO_AGENTS_INFRA_FAILURE id=<stable_id>` on a diagnostic line. auto_agents also recognizes its
+`AUTO_AGENTS_INFRA_FAILURE id=<stable_id>` on a diagnostic line. Capability-aware checks may append
+`capability=<name> contract=<name>`; the original ID-only form remains compatible. auto_agents also recognizes its
 built-in browser-verification marker, plus literal project markers configured under
 `gates.reported_infrastructure_markers`. A reported infrastructure failure is retried once on each
 currently eligible worker, up to `reported_infrastructure_max_workers`; if every worker fails,
 ownership diagnosis routes target-project/verification defects to a scoped repair task,
 auto_agents defects to self-repair, and unknown ownership to a blocked run. These failures are
 non-comparable and are never counted as new test failures against a command-level baseline.
+
+Browser infrastructure failures additionally use a managed `chrome/cdp-v1` recovery driver. It
+quarantines browser artifacts that already failed the original command, performs a real DevTools
+handshake, and may install a pinned SHA-256-verified Chrome package under the worker's user-owned
+managed root. Runtime selection is scoped to one worker job and never mutates the controller's
+global environment. If all candidates fail, one stable root incident blocks without generating
+target-project edits. Use `run --restart-blocked` to archive a blocked run and create a fresh run;
+the command refuses to proceed while project code outside `.auto-agents` is dirty.
+Managed repair requires worker protocol v4 and the
+`managed_capability_repair_v2` feature; restart every LAN worker after upgrading auto_agents.
 
 Gate commands use an activity lease plus an absolute wall-clock ceiling. The defaults for new
 projects are 900 seconds without observable output/CPU activity and a 7200-second ceiling:

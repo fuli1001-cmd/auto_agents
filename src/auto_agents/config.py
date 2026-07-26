@@ -288,6 +288,8 @@ DEFAULT_CONFIG = {
             "max_refs_per_repair_task": 8,
             "max_incidents_per_run": 6,
             "diagnostic_probe_timeout_seconds": 300,
+            "managed_runtime_downloads_enabled": True,
+            "max_managed_runtime_candidates": 3,
         },
     },
     "approvals": {
