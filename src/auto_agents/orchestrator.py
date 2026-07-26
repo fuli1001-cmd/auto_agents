@@ -6923,6 +6923,7 @@ class Orchestrator:
         for entry in task.verify_history:
             if (
                 not isinstance(entry, dict)
+                or not self._verify_history_entry_is_in_active_recovery_round(task, entry)
                 or str(entry.get("decision", "")) != "fail"
                 or bool(entry.get("comparable_failures", True))
             ):
@@ -13345,6 +13346,24 @@ class Orchestrator:
             return self._normalize_verify_failure_ids(raw_ids, str(entry.get("summary", "")))
         return self._normalize_verify_failure_ids([], str(entry.get("summary", "")))
 
+    @staticmethod
+    def _verify_history_entry_is_in_active_recovery_round(
+        task: TaskSpec,
+        entry: Dict[str, object],
+    ) -> bool:
+        # Entries persisted before recovery-round metadata was introduced belong
+        # to the original execution round. This keeps legacy non-recovery retry
+        # behavior intact without letting those entries stop a later requeue.
+        try:
+            entry_epoch = int(entry.get("recovery_epoch", 0) or 0)
+            entry_round = int(entry.get("recovery_round", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        return (
+            entry_epoch == int(task.recovery_epoch)
+            and entry_round == int(task.recovery_round)
+        )
+
     def _analyze_verify_failure(
         self,
         task: TaskSpec,
@@ -13352,21 +13371,27 @@ class Orchestrator:
         *,
         comparable: bool = True,
     ) -> Dict[str, object]:
-        prior_failures = [
-            entry for entry in task.verify_history
+        active_history = [
+            entry
+            for entry in task.verify_history
             if (
                 isinstance(entry, dict)
-                and str(entry.get("decision", "")) == "fail"
+                and self._verify_history_entry_is_in_active_recovery_round(task, entry)
+            )
+        ]
+        prior_failures = [
+            entry for entry in active_history
+            if (
+                str(entry.get("decision", "")) == "fail"
                 and bool(entry.get("comparable_failures", True))
             )
         ]
         failure_count = len(failure_ids)
         if not comparable:
             prior_non_comparable = [
-                entry for entry in task.verify_history
+                entry for entry in active_history
                 if (
-                    isinstance(entry, dict)
-                    and str(entry.get("decision", "")) == "fail"
+                    str(entry.get("decision", "")) == "fail"
                     and not bool(entry.get("comparable_failures", True))
                 )
             ]
@@ -13530,6 +13555,8 @@ class Orchestrator:
             "attempt": attempt,
             "decision": decision,
             "summary": summary.strip(),
+            "recovery_epoch": int(task.recovery_epoch),
+            "recovery_round": int(task.recovery_round),
         }
         normalized_failure_ids = [str(item).strip() for item in (failure_ids or []) if str(item).strip()]
         if normalized_failure_ids:

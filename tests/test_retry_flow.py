@@ -141,6 +141,50 @@ class VerifyFailureClassificationTests(unittest.TestCase):
             self.assertIn("non-comparable", analysis["stats"])
             self.assertIn("stop-unresolved-identity", analysis["stats"])
 
+    def test_repeat_detection_is_scoped_to_the_active_recovery_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            failure_id = "tests/test_checkout.py::test_rejects_expired_quote"
+            task = TaskSpec(
+                task_id="task-checkout",
+                title="Validate checkout",
+                description="",
+                acceptance=[],
+                recovery_round=1,
+                verify_history=[
+                    {
+                        "attempt": 2,
+                        "decision": "fail",
+                        "summary": "failed in the original implementation round",
+                        "failure_ids": [failure_id],
+                        "comparable_failures": True,
+                        "recovery_epoch": 0,
+                        "recovery_round": 0,
+                    }
+                ],
+            )
+
+            first_in_round = orchestrator._analyze_verify_failure(task, [failure_id])
+            self.assertFalse(first_in_round["stop_retry"])
+
+            task.verify_history.append(
+                {
+                    "attempt": 1,
+                    "decision": "fail",
+                    "summary": "failed in the active recovery round",
+                    "failure_ids": [failure_id],
+                    "comparable_failures": True,
+                    "recovery_epoch": 0,
+                    "recovery_round": 1,
+                }
+            )
+            repeated_in_round = orchestrator._analyze_verify_failure(task, [failure_id])
+
+            self.assertTrue(repeated_in_round["stop_retry"])
+            self.assertEqual(repeated_in_round["first_attempt"], 1)
+
     def test_single_non_comparable_command_is_not_repair_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -5140,6 +5184,102 @@ class RetryFlowTests(unittest.TestCase):
                 "[recovery] requeued repair=repair-task-001-r1-1 parent=task-001 round=2",
                 stream.getvalue(),
             )
+
+    def test_requeued_task_does_not_reuse_prior_round_verify_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.retries.per_stage["implement"] = 2
+            config.execution.recovery.max_rounds = 2
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = SequencedVerifyFailureAdapter(
+                project_root,
+                ["first recovery attempt", "second recovery attempt"],
+            )
+
+            failure_id = "tests/test_contract.py::test_observable_contract"
+            task = TaskSpec(
+                task_id="contract-slice",
+                title="Repair the observable contract",
+                description="Address the latest review feedback.",
+                acceptance=["The observable contract passes."],
+                status="in_progress",
+                task_origin="scope_split",
+                review_summary="The observable contract still needs one focused fix.",
+                verify_history=[
+                    {
+                        "attempt": 2,
+                        "decision": "fail",
+                        "summary": "verification failed before the review recovery",
+                        "failure_ids": [failure_id],
+                        "comparable_failures": True,
+                    }
+                ],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+
+            with patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                return_value={
+                    "decision": "CONTINUE",
+                    "reason": "The review identifies one remaining implementation fix.",
+                    "actionable_items": ["Apply the focused contract fix."],
+                    "split_axis": [],
+                    "source": "provider",
+                },
+            ):
+                requeued = orchestrator._recover_review_rejected_task(
+                    state,
+                    state.tasks,
+                    task,
+                    {
+                        "reason": "review rejected the task",
+                        "review": task.review_summary,
+                        "failure_ids": [failure_id],
+                    },
+                )
+
+            self.assertTrue(requeued)
+            self.assertEqual(task.recovery_round, 1)
+
+            with patch.object(
+                orchestrator,
+                "_run_task_verify",
+                side_effect=[
+                    {
+                        "ok": False,
+                        "reason": "the observable contract still fails",
+                        "failure_ids": [failure_id],
+                        "current_failure_ids": [failure_id],
+                        "comparable_failures": True,
+                    },
+                    {
+                        "ok": True,
+                        "reason": "all commands passed",
+                        "current_failure_ids": [],
+                    },
+                ],
+            ):
+                result = orchestrator._execute_task_with_retries(state, task)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            self.assertEqual(
+                [entry["decision"] for entry in task.verify_history],
+                ["fail", "fail", "pass"],
+            )
+            self.assertNotIn("recovery_round", task.verify_history[0])
+            self.assertEqual(task.verify_history[1]["recovery_round"], 1)
+            self.assertEqual(task.verify_history[2]["recovery_round"], 1)
+            self.assertNotIn("stopping retries early", stream.getvalue())
 
     def test_review_rejected_scope_split_task_is_requeued_without_id_heuristics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
