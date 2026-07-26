@@ -3586,8 +3586,7 @@ class RetryFlowTests(unittest.TestCase):
             state = load_run_state(project_root)
             state.tasks = orchestrator._load_tasks_from_plan()
 
-            with self.assertRaises(RuntimeError):
-                orchestrator._run_implementation_loop(state, max_tasks=1)
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
 
             self.assertEqual(orchestrator.adapter.implement_calls, 2)
             self.assertEqual(orchestrator.adapter.review_calls, 0)
@@ -3757,8 +3756,7 @@ class RetryFlowTests(unittest.TestCase):
             state = load_run_state(project_root)
             state.tasks = orchestrator._load_tasks_from_plan()
 
-            with self.assertRaises(RuntimeError):
-                orchestrator._run_implementation_loop(state, max_tasks=1)
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
 
             self.assertEqual(len(orchestrator.adapter.implement_prompts), 2)
             self.assertIn("Failure type: local_verification", orchestrator.adapter.implement_prompts[1])

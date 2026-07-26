@@ -36,6 +36,7 @@ DEFAULT_EFFORTS = {
     "verify": "balanced",
     "readme": "balanced",
     "arbiter": "balanced",
+    "incident_judge": "max",
     "evidence_preflight": "balanced",
 }
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 1800

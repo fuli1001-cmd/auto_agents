@@ -36,11 +36,16 @@ from .workers import (
     worker_cancel,
     worker_cleanup_plan,
     worker_execute,
+    enrich_worker_probe,
     worker_gc,
-    worker_probe,
+    worker_probe as _worker_probe,
     worker_query,
     worker_stage,
 )
+
+
+def worker_probe(environment_id: str = "") -> dict[str, object]:
+    return enrich_worker_probe(_worker_probe(environment_id))
 
 
 MAX_REQUEST_BYTES = 512 * 1024 * 1024
@@ -286,6 +291,28 @@ class WorkerClient:
     def gc(self, max_age_seconds: float) -> dict[str, object]:
         body = canonical_json({"max_age_seconds": max_age_seconds})
         _status, payload, _headers = self._request("POST", "/v1/gc", body=body)
+        value = json.loads(payload.decode("utf-8"))
+        return value if isinstance(value, dict) else {}
+
+    def repair_capability(
+        self,
+        *,
+        capability: str,
+        run_id: str,
+        incident_id: str,
+        failure_id: str = "",
+    ) -> dict[str, object]:
+        body = canonical_json(
+            {
+                "capability": capability,
+                "run_id": run_id,
+                "incident_id": incident_id,
+                "failure_id": failure_id,
+            }
+        )
+        _status, payload, _headers = self._request(
+            "POST", "/v1/repair-capability", body=body
+        )
         value = json.loads(payload.decode("utf-8"))
         return value if isinstance(value, dict) else {}
 
@@ -566,6 +593,40 @@ class WorkerHTTPServer(ThreadingHTTPServer):
                 return False
             self._nonces[nonce] = now
             return True
+
+    def _repair_capability(self, body: bytes) -> None:
+        if not self._authenticated(body):
+            self._json(401, {"ok": False, "error": "authentication failed"})
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._json(400, {"ok": False, "error": "invalid JSON"})
+            return
+        capability = str(payload.get("capability", "")).strip().lower()
+        if capability != "chrome":
+            self._json(
+                400,
+                {"ok": False, "error": "unsupported managed capability"},
+            )
+            return
+        from .execution_recovery import ExecutionIncident
+        from .infrastructure_repair import repair_execution_infrastructure
+
+        failure_id = str(payload.get("failure_id", "")).strip()
+        incident = ExecutionIncident(
+            incident_id=str(payload.get("incident_id", "")).strip() or "worker-repair",
+            run_id=str(payload.get("run_id", "")).strip() or "worker",
+            source="gate",
+            kind="gate_reported_infrastructure_error",
+            stage="worker",
+            context="managed capability repair",
+            command="chrome",
+            stderr_tail=failure_id or "browser runtime repair",
+            process_snapshot={"infrastructure_failure_id": failure_id},
+        )
+        result = repair_execution_infrastructure(incident)
+        self._json(200 if result.repaired else 409, {"ok": result.repaired, **result.to_dict()})
 
 
 class WorkerService:

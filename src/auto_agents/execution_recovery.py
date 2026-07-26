@@ -14,10 +14,11 @@ from .io_utils import read_json, write_json
 from .models import AgentResult, CommandResult, RunState
 
 
-INCIDENT_SCHEMA_VERSION = 1
+INCIDENT_SCHEMA_VERSION = 2
 INCIDENT_ACTIONS = {
     "RETRY",
     "RECOVER_TARGET",
+    "REPAIR_INFRASTRUCTURE",
     "REWIND_PLAN",
     "REWIND_CLARIFY",
     "SELF_REPAIR",
@@ -27,6 +28,8 @@ INCIDENT_ACTIONS = {
 INCIDENT_OWNERS = {
     "target_project",
     "verification_contract",
+    "verification_infrastructure",
+    "execution_environment",
     "requirements",
     "external_provider",
     "auto_agents",
@@ -114,6 +117,8 @@ class ExecutionIncident:
     recovery_round: int = 0
     status: str = "open"
     diagnosis: Dict[str, object] = field(default_factory=dict)
+    repair_history: List[Dict[str, object]] = field(default_factory=list)
+    recovery_policy_version: int = 2
     history: List[Dict[str, object]] = field(default_factory=list)
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
@@ -121,7 +126,10 @@ class ExecutionIncident:
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ExecutionIncident":
         fields = cls.__dataclass_fields__
-        return cls(**{key: value for key, value in data.items() if key in fields})
+        values = {key: value for key, value in data.items() if key in fields}
+        if "recovery_policy_version" not in values:
+            values["recovery_policy_version"] = 1
+        return cls(**values)
 
     def to_dict(self) -> Dict[str, object]:
         return {"schema_version": INCIDENT_SCHEMA_VERSION, **asdict(self)}
@@ -141,6 +149,8 @@ class ExecutionIncident:
             "recovery_round": self.recovery_round,
             "status": self.status,
             "diagnosis": dict(self.diagnosis),
+            "repair_history": list(self.repair_history),
+            "recovery_policy_version": self.recovery_policy_version,
             "updated_at": self.updated_at,
         }
 
@@ -178,7 +188,23 @@ class ExecutionIncidentStore:
 
     def active(self, state: RunState) -> Optional[ExecutionIncident]:
         incident_id = state.active_execution_incident_id.strip()
-        return self.load(incident_id) if incident_id else None
+        incident = self.load(incident_id) if incident_id else None
+        if (
+            incident is not None
+            and incident.kind == "gate_reported_infrastructure_error"
+            and incident.status == "needs_human"
+            and incident.recovery_policy_version < INCIDENT_SCHEMA_VERSION
+        ):
+            incident.status = "open"
+            incident.recovery_policy_version = INCIDENT_SCHEMA_VERSION
+            incident.history.append(
+                {
+                    "event": "legacy_reopen",
+                    "reason": "new managed infrastructure recovery policy is available",
+                }
+            )
+            self.save(incident, state)
+        return incident
 
 
 def _fingerprint_payload(payload: Dict[str, object]) -> str:

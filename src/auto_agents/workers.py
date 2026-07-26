@@ -122,6 +122,123 @@ class WorkerEndpoint:
     tls_fingerprint: str = ""
     enabled: bool = True
     capabilities: tuple[str, ...] = ()
+    capability_details: Mapping[str, object] = field(default_factory=dict)
+    failure_domain: Mapping[str, object] = field(default_factory=dict)
+
+
+def enrich_worker_probe(probe: Mapping[str, object]) -> dict[str, object]:
+    """Add bounded runtime health and failure-domain evidence to a probe."""
+    enriched = dict(probe)
+    capabilities = {
+        str(item).strip().lower()
+        for item in probe.get("capabilities", [])
+        if str(item).strip()
+    }
+    details: dict[str, object] = {
+        capability: {"state": "available"}
+        for capability in sorted(capabilities)
+    }
+    if "chrome" in capabilities:
+        browser = (
+            shutil.which("google-chrome")
+            or shutil.which("google-chrome-stable")
+            or shutil.which("chromium")
+            or shutil.which("chromium-browser")
+            or ""
+        )
+        chrome: dict[str, object] = {
+            "state": "unknown",
+            "path": browser,
+            "version": "",
+            "artifact_sha256": "",
+            "probe_kind": "headless_dump_dom",
+        }
+        if browser:
+            try:
+                version = subprocess.run(
+                    [browser, "--version"],
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                chrome["version"] = (version.stdout or version.stderr).strip()
+                digest = hashlib.sha256()
+                with open(browser, "rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                chrome["artifact_sha256"] = digest.hexdigest()
+                with tempfile.TemporaryDirectory(
+                    prefix="auto-agents-chrome-probe-"
+                ) as data_dir:
+                    launch = subprocess.run(
+                        [
+                            browser,
+                            "--headless=new",
+                            "--disable-gpu",
+                            "--disable-dev-shm-usage",
+                            "--no-sandbox",
+                            f"--user-data-dir={data_dir}",
+                            "--dump-dom",
+                            "about:blank",
+                        ],
+                        text=True,
+                        encoding="utf-8",
+                        capture_output=True,
+                        timeout=20,
+                        check=False,
+                    )
+                chrome["state"] = (
+                    "healthy" if launch.returncode == 0 else "unhealthy"
+                )
+                if launch.returncode != 0:
+                    chrome["error"] = (launch.stderr or launch.stdout)[-2000:]
+            except (OSError, subprocess.SubprocessError) as error:
+                chrome["state"] = "unhealthy"
+                chrome["error"] = str(error)
+        else:
+            chrome["state"] = "unhealthy"
+            chrome["error"] = "no Chrome or Chromium executable resolved on PATH"
+        details["chrome"] = chrome
+
+    release = platform.release()
+    lowered = release.lower()
+    virtualization = (
+        "wsl2"
+        if "microsoft" in lowered
+        else "container"
+        if Path("/.dockerenv").exists()
+        else "native"
+    )
+    domain_payload = {
+        "platform": str(probe.get("platform", platform.system().lower())),
+        "architecture": platform.machine(),
+        "kernel_family": release.split("-", 1)[0],
+        "virtualization": virtualization,
+        "capability_artifacts": {
+            name: str(value.get("artifact_sha256", ""))
+            for name, value in details.items()
+            if isinstance(value, dict) and value.get("artifact_sha256")
+        },
+    }
+    domain_id = hashlib.sha256(
+        json.dumps(domain_payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:24]
+    enriched["capability_details"] = details
+    enriched["failure_domain"] = {"id": domain_id, **domain_payload}
+    enriched["features"] = sorted(
+        {
+            *(
+                str(item)
+                for item in probe.get("features", [])
+                if str(item).strip()
+            ),
+            "capability_details_v1",
+            "failure_domain_v1",
+        }
+    )
+    return enriched
 
 @dataclass(frozen=True)
 class WorkerEnvironment:

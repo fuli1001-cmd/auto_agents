@@ -24,6 +24,7 @@ from .workers import (
     WorkerEndpoint,
     WorkerSlotLease,
     build_environment_manifest,
+    enrich_worker_probe,
     forwarded_environment,
     load_local_worker_config,
     project_key,
@@ -76,7 +77,7 @@ class DistributedGatePlanExecutor:
         self.local.__enter__()
         distributed = self.gate_config.distributed
         local_config = load_local_worker_config()
-        local_probe = worker_probe("")
+        local_probe = enrich_worker_probe(worker_probe(""))
         local_slots = local_config.max_slots
         maximum = self.gate_config.max_auto_workers
         if isinstance(maximum, int):
@@ -94,6 +95,10 @@ class DistributedGatePlanExecutor:
                     str(item)
                     for item in local_probe.get("capabilities", [])
                 ),
+                capability_details=dict(
+                    local_probe.get("capability_details", {})
+                ),
+                failure_domain=dict(local_probe.get("failure_domain", {})),
             )
         ]
         self.local.worker_id = local_id
@@ -180,6 +185,10 @@ class DistributedGatePlanExecutor:
                             if str(item).strip()
                         )
                     ),
+                    capability_details=dict(
+                        probe.get("capability_details", {})
+                    ),
+                    failure_domain=dict(probe.get("failure_domain", {})),
                 )
                 self.endpoints.append(endpoint)
                 self.clients[endpoint.worker_id] = client
@@ -740,10 +749,18 @@ class DistributedGatePlanExecutor:
                 self._lane_endpoint.pop(lane, None)
         return result
 
-    @staticmethod
     def _infrastructure_attempt_evidence(
+        self,
         result: CommandResult,
     ) -> dict[str, object]:
+        endpoint = next(
+            (
+                item
+                for item in getattr(self, "endpoints", [])
+                if item.worker_id == result.worker_id
+            ),
+            None,
+        )
         return {
             "worker_id": result.worker_id,
             "backend": result.backend,
@@ -754,6 +771,12 @@ class DistributedGatePlanExecutor:
             "termination_reason": result.termination_reason,
             "stdout_tail": result.stdout[-1000:],
             "stderr_tail": result.stderr[-1000:],
+            "capability_details": (
+                dict(endpoint.capability_details) if endpoint else {}
+            ),
+            "failure_domain": (
+                dict(endpoint.failure_domain) if endpoint else {}
+            ),
         }
 
     def _retry_reported_infrastructure(
@@ -770,6 +793,12 @@ class DistributedGatePlanExecutor:
         progress,
     ) -> CommandResult:
         attempts = [self._infrastructure_attempt_evidence(first_result)]
+        attempted_domains = {
+            str(item.get("failure_domain", {}).get("id", ""))
+            for item in attempts
+            if isinstance(item.get("failure_domain"), dict)
+            and str(item.get("failure_domain", {}).get("id", ""))
+        }
         first_result.infrastructure_attempts = list(attempts)
         # A stateful lane cannot safely move after earlier commands succeeded.
         if lane and self._lane_successes.get(lane, 0) > 0:
@@ -804,6 +833,13 @@ class DistributedGatePlanExecutor:
                 )
             except RuntimeError:
                 break
+            domain_id = str(endpoint.failure_domain.get("id", ""))
+            if domain_id and domain_id in attempted_domains:
+                attempted.add(endpoint.worker_id)
+                self._release(endpoint, required)
+                continue
+            if domain_id:
+                attempted_domains.add(domain_id)
             attempted.add(endpoint.worker_id)
             try:
                 try:

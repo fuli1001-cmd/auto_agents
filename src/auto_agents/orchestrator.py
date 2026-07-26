@@ -3923,7 +3923,25 @@ class Orchestrator:
                     evidence=list(diagnosis.evidence),
                     source=diagnosis.source,
                 )
+            elif diagnosis.owner in {
+                "verification_infrastructure",
+                "execution_environment",
+                "external_provider",
+                "unknown",
+            }:
+                diagnosis = IncidentDiagnosis(
+                    owner=diagnosis.owner,
+                    action="REPAIR_INFRASTRUCTURE",
+                    confidence=diagnosis.confidence,
+                    reason=diagnosis.reason,
+                    evidence=list(diagnosis.evidence),
+                    source=diagnosis.source,
+                )
             else:
+                incident.diagnosis = diagnosis.to_dict()
+                incident.history.append(
+                    {"event": "diagnosed", "diagnosis": diagnosis.to_dict()}
+                )
                 return self._block_for_execution_incident(
                     state,
                     incident,
@@ -3997,13 +4015,34 @@ class Orchestrator:
             self._rewind_state_from_stage(state, "clarify")
         elif diagnosis.action == "REWIND_PLAN":
             self._rewind_state_from_stage(state, "plan")
-        elif diagnosis.action == "RECOVER_TARGET":
+        elif diagnosis.action in {"RECOVER_TARGET", "REPAIR_INFRASTRUCTURE"}:
             if not self._safe_execution_recovery_command(incident.command):
                 return self._block_for_execution_incident(
                     state,
                     incident,
                     "the original verification command contains redacted or missing data and "
                     "cannot be reproduced safely",
+                )
+            if diagnosis.action == "REPAIR_INFRASTRUCTURE":
+                from .infrastructure_repair import (
+                    managed_diagnostic_refs,
+                    repair_execution_infrastructure,
+                    scoped_verification_repair_instructions,
+                )
+
+                repair = repair_execution_infrastructure(incident)
+                repair_entry = {
+                    "event": "managed_infrastructure_repair",
+                    "round": incident.recovery_round,
+                    **repair.to_dict(),
+                }
+                incident.repair_history.append(repair_entry)
+                incident.history.append(repair_entry)
+                incident.process_snapshot["managed_diagnostic_refs"] = (
+                    managed_diagnostic_refs(incident)
+                )
+                incident.process_snapshot["scoped_repair_instructions"] = (
+                    scoped_verification_repair_instructions()
                 )
             self._schedule_prebaseline_recovery_task(state, incident)
         else:
@@ -4025,12 +4064,14 @@ class Orchestrator:
             "weakening tests, disabling checks, changing credentials/global environment, or merely "
             "raising a safety timeout. Return only JSON with keys owner, action, confidence, reason, "
             "evidence. owner must be one of target_project, verification_contract, requirements, "
-            "external_provider, auto_agents, user_input, unknown. action must be one of RETRY, "
-            "RECOVER_TARGET, REWIND_PLAN, REWIND_CLARIFY, SELF_REPAIR, ASK_USER, STOP.\n\n"
+            "verification_infrastructure, execution_environment, external_provider, auto_agents, "
+            "user_input, unknown. action must be one of RETRY, RECOVER_TARGET, "
+            "REPAIR_INFRASTRUCTURE, REWIND_PLAN, REWIND_CLARIFY, SELF_REPAIR, ASK_USER, STOP.\n\n"
             "For kind=gate_reported_infrastructure_error, worker retries are already exhausted: "
             "attribute the underlying defect. Use RECOVER_TARGET for target_project or "
-            "verification_contract, SELF_REPAIR only for auto_agents, and ASK_USER when ownership "
-            "cannot be established. Do not choose RETRY.\n\n"
+            "verification_contract, REPAIR_INFRASTRUCTURE for verification_infrastructure or "
+            "execution_environment, SELF_REPAIR only for auto_agents, and ASK_USER only after "
+            "no bounded diagnostic or repair route remains. Do not choose RETRY.\n\n"
             f"Incident:\n{json.dumps(incident.to_dict(), ensure_ascii=False, indent=2)}\n"
             f"User context:\n{user_context or '(none)'}"
         )
@@ -4039,7 +4080,7 @@ class Orchestrator:
             with tempfile.TemporaryDirectory(prefix="auto-agents-incident-judge-") as temp_root:
                 request = AgentRequest(
                     stage="execution_recovery",
-                    effort=self.config.efforts.get("arbiter", "balanced"),
+                    effort=self.config.efforts.get("incident_judge", "max"),
                     prompt=prompt,
                     cwd=Path(temp_root),
                     output_path=output_path,

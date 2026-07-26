@@ -41,6 +41,7 @@ DEFAULTED_EFFORT_STAGES = {
     "sync-agent-instructions",
     "provider_research",
     "arbiter",
+    "incident_judge",
     "visual_judge",
     "self_repair",
     "evidence_preflight",
