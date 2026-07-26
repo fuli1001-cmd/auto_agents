@@ -4298,6 +4298,18 @@ class Orchestrator:
                 if isinstance(attempts, list) and attempts
                 else "(no worker attempt details recorded)"
             )
+            task_marker = recovery_task_marker(
+                incident.incident_id,
+                incident.command,
+                recovery_round=incident.recovery_round,
+            )
+            worktree_handoff = self._capture_execution_recovery_worktree_handoff(
+                state,
+                tasks,
+                source_task_id=incident.task_id,
+            )
+            if worktree_handoff:
+                task_marker["worktree_handoff"] = worktree_handoff
             task = TaskSpec(
                 task_id=f"recover-execution-{incident.incident_id}-r{incident.recovery_round}",
                 title=(
@@ -4333,13 +4345,7 @@ class Orchestrator:
                 status="pending",
                 task_origin="stage_recovery",
                 recovery_round=incident.recovery_round,
-                recovery_history=[
-                    recovery_task_marker(
-                        incident.incident_id,
-                        incident.command,
-                        recovery_round=incident.recovery_round,
-                    )
-                ],
+                recovery_history=[task_marker],
                 verification_refs=[f"cmd:{incident.command}"],
             )
             tasks.insert(0, task)
@@ -4361,6 +4367,143 @@ class Orchestrator:
             ):
                 return entry
         return {}
+
+    def _capture_execution_recovery_worktree_handoff(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        *,
+        source_task_id: str,
+    ) -> Dict[str, object]:
+        source_id = str(source_task_id or "").strip()
+        source_task = next(
+            (item for item in tasks if item.task_id == source_id),
+            None,
+        )
+        if (
+            source_task is None
+            or source_task.status != "in_progress"
+            or not self._in_progress_implementation_is_ready(state, source_task)
+        ):
+            return {}
+
+        changed = sorted(set(self._changed_paths_excluding_agent_instructions()))
+        if not changed:
+            return {}
+        return {
+            "version": 1,
+            "source_task_id": source_task.task_id,
+            "head_ref": head_ref(self.project_root),
+            "worktree_fingerprint": (
+                self._worktree_fingerprint_excluding_agent_instructions()
+            ),
+            "changed_paths": changed,
+        }
+
+    def _migrate_execution_recovery_worktree_handoff(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        marker: Dict[str, object],
+    ) -> Dict[str, object]:
+        incident_id = str(marker.get("execution_incident_id", "")).strip()
+        incident = self._incident_store(state).load(incident_id) if incident_id else None
+        if (
+            incident is None
+            or not str(incident.task_id).strip()
+            or incident.head_ref != head_ref(self.project_root)
+            or not incident.worktree_fingerprint
+            or incident.worktree_fingerprint != worktree_fingerprint(self.project_root)
+        ):
+            return {}
+
+        handoff = self._capture_execution_recovery_worktree_handoff(
+            state,
+            tasks,
+            source_task_id=incident.task_id,
+        )
+        if not handoff:
+            return {}
+        handoff["migrated_from_incident_checkpoint"] = True
+        marker["worktree_handoff"] = handoff
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        self.logger.info(
+            "[execution-recovery] restored worktree handoff task=%s source=%s paths=%s",
+            task.task_id,
+            handoff["source_task_id"],
+            len(handoff["changed_paths"]),
+        )
+        return handoff
+
+    def _execution_recovery_worktree_handoff_matches(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+    ) -> bool:
+        if (
+            task.status != "pending"
+            or task.task_origin != "stage_recovery"
+            or not is_execution_incident_recovery_task(task)
+        ):
+            return False
+
+        marker = self._execution_recovery_marker(task)
+        raw_handoff = marker.get("worktree_handoff")
+        handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+        if not handoff:
+            handoff = self._migrate_execution_recovery_worktree_handoff(
+                state,
+                tasks,
+                task,
+                marker,
+            )
+        if str(handoff.get("version", "")).strip() != "1":
+            return False
+
+        source_id = str(handoff.get("source_task_id", "")).strip()
+        source_task = next(
+            (item for item in tasks if item.task_id == source_id),
+            None,
+        )
+        if (
+            source_task is None
+            or source_task.status != "in_progress"
+            or not self._in_progress_implementation_is_ready(state, source_task)
+        ):
+            return False
+
+        raw_paths = handoff.get("changed_paths", [])
+        if not isinstance(raw_paths, list):
+            return False
+        expected_paths = sorted(
+            {
+                str(path).strip()
+                for path in raw_paths
+                if str(path).strip()
+            }
+        )
+        current_paths = sorted(
+            set(self._changed_paths_excluding_agent_instructions())
+        )
+        matches = bool(
+            expected_paths
+            and current_paths == expected_paths
+            and str(handoff.get("head_ref", "")) == head_ref(self.project_root)
+            and str(handoff.get("worktree_fingerprint", ""))
+            == self._worktree_fingerprint_excluding_agent_instructions()
+        )
+        if matches:
+            self.logger.info(
+                "[execution-recovery] carrying worktree handoff task=%s source=%s paths=%s",
+                task.task_id,
+                source_id,
+                len(current_paths),
+            )
+        return matches
 
     @staticmethod
     def _safe_execution_recovery_command(command: object) -> bool:
@@ -5697,13 +5840,18 @@ class Orchestrator:
             self._persist_tasks(tasks)
 
         if (
-            not (
+            self.config.gates.require_clean_git_before_task
+            and not (
                 resume_existing
                 or allow_dirty_retry
                 or allow_dirty_repair
                 or self._allow_dirty_tree
+                or self._execution_recovery_worktree_handoff_matches(
+                    state,
+                    tasks,
+                    task,
+                )
             )
-            and self.config.gates.require_clean_git_before_task
         ):
             self._require_clean_tree_for_task(task)
 
@@ -7754,10 +7902,22 @@ class Orchestrator:
             raise RuntimeError("working tree is not clean")
 
     def _changed_paths_excluding_agent_instructions(self) -> List[str]:
+        return changed_paths(
+            self.project_root,
+            ignored_prefixes=self._task_worktree_ignored_prefixes(),
+        )
+
+    def _worktree_fingerprint_excluding_agent_instructions(self) -> str:
+        return worktree_fingerprint(
+            self.project_root,
+            ignored_prefixes=self._task_worktree_ignored_prefixes(),
+        )
+
+    def _task_worktree_ignored_prefixes(self) -> Tuple[str, ...]:
         ignored = list(GENERATED_AGENT_INSTRUCTION_PATHS) + list(LEGACY_GENERATED_AGENT_INSTRUCTION_PATHS)
         if not head_ref(self.project_root):
             ignored.extend(["README.md", ".gitignore"])
-        return changed_paths(self.project_root, ignored_prefixes=(".auto-agents/", *ignored))
+        return (".auto-agents/", *ignored)
 
     def _run_task_verify(
         self,

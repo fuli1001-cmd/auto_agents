@@ -14,9 +14,11 @@ from auto_agents.execution_recovery import (
     deterministic_diagnosis,
     parse_incident_diagnosis,
     provider_incident,
+    recovery_task_marker,
 )
 from auto_agents.models import AgentResult, AgentTermination, CommandResult, RunState, TaskSpec
 from auto_agents.gates import GateCommandTimeoutError
+from auto_agents.git_ops import head_ref, worktree_fingerprint
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.config import load_run_state, load_task_plan, save_run_state
 
@@ -604,6 +606,217 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertEqual(
                 orchestrator._build_task_verify_commands(recovery_task),
                 ["python -m pytest -q"],
+            )
+
+    def test_task_recovery_carries_its_exact_dirty_worktree_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            source = TaskSpec(
+                task_id="source-task",
+                title="Source task",
+                description="Produces a partial implementation before verification.",
+                acceptance=["The verification command passes."],
+                status="in_progress",
+                task_origin="stage_recovery",
+            )
+            orchestrator._persist_tasks([source])
+            state.tasks = [source]
+            orchestrator._set_implementation_ready_marker(state, source, True)
+            (root / "partial.txt").write_text("owned recovery changes\n", encoding="utf-8")
+            incident = ExecutionIncident(
+                incident_id="next-incident",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q tests/test_owned.py",
+                task_id=source.task_id,
+                recovery_round=1,
+            )
+
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+
+            tasks = orchestrator._load_tasks_from_plan()
+            recovery = tasks[0]
+            marker = orchestrator._execution_recovery_marker(recovery)
+            handoff = marker["worktree_handoff"]
+            self.assertEqual(handoff["source_task_id"], source.task_id)
+            self.assertEqual(handoff["changed_paths"], ["partial.txt"])
+
+            gate_result = {
+                "ok": True,
+                "review": "recovery verified",
+                "verify_current_failure_ids": [],
+            }
+            with (
+                patch.object(
+                    orchestrator,
+                    "_route_frontend_design_contract_prerequisite",
+                    return_value=None,
+                ),
+                patch.object(orchestrator, "_ensure_evidence_preflight", return_value={}),
+                patch.object(
+                    orchestrator,
+                    "_execute_task_with_retries",
+                    return_value=gate_result,
+                ) as execute,
+                patch.object(orchestrator, "_warm_clean_head_verify_baseline"),
+                patch("auto_agents.orchestrator.commit_all", return_value="commit-sha"),
+            ):
+                result = orchestrator._execute_task_in_main_worktree(
+                    state,
+                    tasks,
+                    recovery,
+                )
+
+            self.assertIsNone(result)
+            execute.assert_called_once()
+            self.assertEqual(recovery.status, "done")
+
+    def test_task_recovery_rejects_a_worktree_changed_after_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            source = TaskSpec(
+                task_id="source-task",
+                title="Source task",
+                description="Produces a partial implementation before verification.",
+                acceptance=["The verification command passes."],
+                status="in_progress",
+            )
+            orchestrator._persist_tasks([source])
+            state.tasks = [source]
+            orchestrator._set_implementation_ready_marker(state, source, True)
+            partial = root / "partial.txt"
+            partial.write_text("checkpoint contents\n", encoding="utf-8")
+            incident = ExecutionIncident(
+                incident_id="next-incident",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q tests/test_owned.py",
+                task_id=source.task_id,
+                recovery_round=1,
+            )
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+            tasks = orchestrator._load_tasks_from_plan()
+            recovery = tasks[0]
+            partial.write_text("changed after scheduling\n", encoding="utf-8")
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_route_frontend_design_contract_prerequisite",
+                    return_value=None,
+                ),
+                patch.object(
+                    orchestrator,
+                    "_execute_task_with_retries",
+                ) as execute,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "working tree is not clean before task",
+                ),
+            ):
+                orchestrator._execute_task_in_main_worktree(
+                    state,
+                    tasks,
+                    recovery,
+                )
+
+            execute.assert_not_called()
+
+    def test_legacy_recovery_restores_handoff_from_incident_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            source = TaskSpec(
+                task_id="source-task",
+                title="Source task",
+                description="Produces a partial implementation before verification.",
+                acceptance=["The verification command passes."],
+                status="in_progress",
+            )
+            state.tasks = [source]
+            orchestrator._set_implementation_ready_marker(state, source, True)
+            (root / "partial.txt").write_text("legacy checkpoint\n", encoding="utf-8")
+            incident = ExecutionIncident(
+                incident_id="persisted-incident",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q tests/test_owned.py",
+                task_id=source.task_id,
+                head_ref=head_ref(root),
+                worktree_fingerprint=worktree_fingerprint(root),
+                recovery_round=1,
+                status="recovering",
+            )
+            ExecutionIncidentStore(root, state.run_id).save(incident, state)
+            recovery = TaskSpec(
+                task_id="persisted-recovery",
+                title="Persisted recovery",
+                description="Recovers a previously interrupted verification.",
+                acceptance=["The original verification command passes."],
+                status="pending",
+                task_origin="stage_recovery",
+                recovery_history=[
+                    recovery_task_marker(
+                        incident.incident_id,
+                        incident.command,
+                        recovery_round=incident.recovery_round,
+                    )
+                ],
+                verification_refs=[f"cmd:{incident.command}"],
+            )
+            tasks = [recovery, source]
+            state.tasks = tasks
+            orchestrator._persist_tasks(tasks)
+            save_run_state(root, state)
+
+            gate_result = {
+                "ok": True,
+                "review": "recovery verified",
+                "verify_current_failure_ids": [],
+            }
+            with (
+                patch.object(
+                    orchestrator,
+                    "_route_frontend_design_contract_prerequisite",
+                    return_value=None,
+                ),
+                patch.object(orchestrator, "_ensure_evidence_preflight", return_value={}),
+                patch.object(
+                    orchestrator,
+                    "_execute_task_with_retries",
+                    return_value=gate_result,
+                ) as execute,
+                patch.object(orchestrator, "_warm_clean_head_verify_baseline"),
+                patch("auto_agents.orchestrator.commit_all", return_value="commit-sha"),
+            ):
+                result = orchestrator._execute_task_in_main_worktree(
+                    state,
+                    tasks,
+                    recovery,
+                )
+
+            self.assertIsNone(result)
+            execute.assert_called_once()
+            marker = orchestrator._execution_recovery_marker(recovery)
+            self.assertTrue(
+                marker["worktree_handoff"]["migrated_from_incident_checkpoint"]
             )
 
     def test_prebaseline_lane_does_not_run_the_same_baseline_first(self) -> None:
