@@ -288,6 +288,11 @@
             "type": "integer",
             "minimum": 0
           },
+          "verify_retry_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Orchestrator-owned verification retry lifecycle counter."
+          },
           "recovery_history": {
             "type": "array",
             "items": {

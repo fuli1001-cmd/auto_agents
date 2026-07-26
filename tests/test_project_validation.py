@@ -421,6 +421,7 @@ class ProjectValidationTests(unittest.TestCase):
             "task_origin": "generated-by-id-guess",
             "recovery_epoch": -1,
             "recovery_round": True,
+            "verify_retry_epoch": -1,
         }
 
         errors = validate_task_plan_payload({"tasks": [task]})
@@ -428,6 +429,7 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(any("task_origin must be one of" in item for item in errors))
         self.assertTrue(any("recovery_epoch must be an integer >= 0" in item for item in errors))
         self.assertTrue(any("recovery_round must be an integer >= 0" in item for item in errors))
+        self.assertTrue(any("verify_retry_epoch must be an integer >= 0" in item for item in errors))
 
     def test_validate_project_config_payload_rejects_non_isolated_python_commands(self) -> None:
         payload = {

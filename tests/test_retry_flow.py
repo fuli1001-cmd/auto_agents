@@ -5249,6 +5249,7 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertTrue(requeued)
             self.assertEqual(task.recovery_round, 1)
+            self.assertEqual(task.verify_retry_epoch, 1)
 
             with patch.object(
                 orchestrator,
@@ -5279,6 +5280,8 @@ class RetryFlowTests(unittest.TestCase):
             self.assertNotIn("recovery_round", task.verify_history[0])
             self.assertEqual(task.verify_history[1]["recovery_round"], 1)
             self.assertEqual(task.verify_history[2]["recovery_round"], 1)
+            self.assertEqual(task.verify_history[1]["verify_retry_epoch"], 1)
+            self.assertEqual(task.verify_history[2]["verify_retry_epoch"], 1)
             self.assertNotIn("stopping retries early", stream.getvalue())
 
     def test_review_rejected_scope_split_task_is_requeued_without_id_heuristics(self) -> None:

@@ -631,7 +631,11 @@ def validate_task_plan_payload(
             errors.append(
                 f"{prefix} task_origin must be one of: {', '.join(TASK_ORIGINS)}"
             )
-        for field_name in ("recovery_epoch", "recovery_round"):
+        for field_name in (
+            "recovery_epoch",
+            "recovery_round",
+            "verify_retry_epoch",
+        ):
             value = task.get(field_name, 0)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 errors.append(f"{prefix} {field_name} must be an integer >= 0")

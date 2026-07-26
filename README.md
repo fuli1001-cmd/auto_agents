@@ -124,7 +124,9 @@ it gives up. A repair task is inserted ahead of the blocked parent, owns only pr
 Review rejection recovery is not limited to evidence-repair tasks: planned tasks, scope-split/replan
 children, and stage-recovery tasks all enter the same bounded recovery state machine. Persisted
 `task_origin`, `parent_task_id`, `recovery_epoch`, and `recovery_round` fields define lineage without
-depending on task ID spelling.
+depending on task ID spelling. The orchestrator-owned `verify_retry_epoch` keeps unchanged-failure
+detection within one execution lifecycle, so a deliberate requeue starts with a fresh retry budget
+without discarding earlier verification diagnostics.
 
 Before starting another implementation cycle, an adaptive read-only judge returns `CONTINUE`,
 `REPLAN`, or `STOP`. Deterministic no-progress checks and `execution.recovery.max_rounds` remain hard

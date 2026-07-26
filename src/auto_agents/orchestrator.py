@@ -3769,6 +3769,64 @@ class Orchestrator:
         save_run_state(self.project_root, state)
         return state
 
+    def _prepare_self_repair_task_retries(
+        self,
+        state: RunState,
+        blocker: Dict[str, object],
+    ) -> List[str]:
+        commit_sha = str(blocker.get("self_repair_commit", "")).strip()
+        if (
+            not commit_sha
+            or str(blocker.get("prepared_self_repair_commit", "")).strip()
+            == commit_sha
+        ):
+            return []
+
+        tasks = list(state.tasks)
+        if not tasks:
+            raw_tasks = load_task_plan(self.project_root).get("tasks", [])
+            if isinstance(raw_tasks, list):
+                tasks = [
+                    TaskSpec.from_dict(item)
+                    for item in raw_tasks
+                    if isinstance(item, dict)
+                ]
+
+        requeued_task_ids: List[str] = []
+        if state.current_stage == "implement":
+            for task in tasks:
+                if task.status != "blocked":
+                    continue
+                task.status = "pending"
+                task.commit_sha = ""
+                self._begin_fresh_verify_retry_lifecycle(task)
+                self._clear_implementation_ready_marker(state, task)
+                self._clear_stale_implementation_resume_markers(
+                    state,
+                    task_ids=[task.task_id],
+                )
+                state.task_review_cache.pop(task.task_id, None)
+                requeued_task_ids.append(task.task_id)
+
+        if requeued_task_ids:
+            state.tasks = tasks
+            self._persist_tasks(tasks)
+            route = dict(state.last_recovery_route)
+            if (
+                str(route.get("task_id", "")) in requeued_task_ids
+                or str(route.get("lineage_id", "")) in requeued_task_ids
+            ):
+                route["outcome"] = "self_repair_requeued"
+                route["reason"] = (
+                    "auto_agents self-repair opened a fresh verification retry lifecycle"
+                )
+                route["engine_invariant"] = ""
+                state.last_recovery_route = route
+
+        blocker["prepared_self_repair_commit"] = commit_sha
+        blocker["requeued_task_ids"] = requeued_task_ids
+        return requeued_task_ids
+
     def _resume_blocked_run(self, state: RunState) -> bool:
         active_incident = self._incident_store(state).active(state)
         legacy_incident_pause = bool(
@@ -3777,9 +3835,26 @@ class Orchestrator:
             and active_incident is not None
             and active_incident.status in {"needs_human", "self_repair"}
         )
-        if state.status != "blocked" and not legacy_incident_pause:
+        persisted_blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        self_repair_resume = bool(
+            state.status == "pending"
+            and str(persisted_blocker.get("owner", "")) == "auto_agents"
+            and str(persisted_blocker.get("status", "")) == "retrying"
+            and str(persisted_blocker.get("self_repair_commit", "")).strip()
+            and str(persisted_blocker.get("prepared_self_repair_commit", "")).strip()
+            != str(persisted_blocker.get("self_repair_commit", "")).strip()
+        )
+        if (
+            state.status != "blocked"
+            and not legacy_incident_pause
+            and not self_repair_resume
+        ):
             return False
-        blocker = dict(state.active_blocker)
+        blocker = persisted_blocker
         had_persisted_blocker = bool(blocker)
         if not blocker:
             blocker = {
@@ -3812,6 +3887,16 @@ class Orchestrator:
             state.active_blocker = blocker
             state.status = "blocked"
             return False
+        if self_repair_resume:
+            requeued_task_ids = self._prepare_self_repair_task_retries(
+                state,
+                blocker,
+            )
+            if requeued_task_ids:
+                self.logger.info(
+                    "[self-repair] requeued tasks=%s with fresh verification retry lifecycle",
+                    ",".join(requeued_task_ids),
+                )
         blocker["status"] = "retrying"
         blocker["resume_attempts"] = int(blocker.get("resume_attempts", 0) or 0) + 1
         blocker["updated_at"] = utc_now_iso()
@@ -6796,8 +6881,14 @@ class Orchestrator:
                 retries.append(task_id)
             self._set_parallel_sequential_retry_ids(state, retries)
             task_payload = entry.get("task", {})
+            current_retry_epoch = int(task.verify_retry_epoch)
             if isinstance(task_payload, dict):
                 self._copy_parallel_task_snapshot_fields(task, task_payload)
+            task.verify_retry_epoch = max(
+                current_retry_epoch,
+                int(task.verify_retry_epoch),
+            )
+            self._begin_fresh_verify_retry_lifecycle(task)
             task.status = "pending"
             task.commit_sha = ""
             task.review_summary = ""
@@ -6835,6 +6926,7 @@ class Orchestrator:
         task.task_origin = updated.task_origin
         task.recovery_epoch = updated.recovery_epoch
         task.recovery_round = updated.recovery_round
+        task.verify_retry_epoch = updated.verify_retry_epoch
 
     def _apply_parallel_task_snapshot(self, task: TaskSpec, payload: Dict[str, object]) -> None:
         self._copy_parallel_task_snapshot_fields(task, payload)
@@ -6923,7 +7015,7 @@ class Orchestrator:
         for entry in task.verify_history:
             if (
                 not isinstance(entry, dict)
-                or not self._verify_history_entry_is_in_active_recovery_round(task, entry)
+                or not self._verify_history_entry_is_in_active_retry_lifecycle(task, entry)
                 or str(entry.get("decision", "")) != "fail"
                 or bool(entry.get("comparable_failures", True))
             ):
@@ -7152,6 +7244,7 @@ class Orchestrator:
         task.status = "pending"
         task.commit_sha = ""
         task.recovery_round = round_number
+        self._begin_fresh_verify_retry_lifecycle(task)
         for repair in repair_tasks:
             if repair.task_id not in task.depends_on:
                 task.depends_on.append(repair.task_id)
@@ -7656,6 +7749,7 @@ class Orchestrator:
         task.review_summary = review
         task.recovery_epoch = owner.recovery_epoch
         task.recovery_round = next_round
+        self._begin_fresh_verify_retry_lifecycle(task)
         owner.recovery_round = max(owner.recovery_round, next_round)
         requeued_entry = dict(
             history_entry,
@@ -13347,22 +13441,28 @@ class Orchestrator:
         return self._normalize_verify_failure_ids([], str(entry.get("summary", "")))
 
     @staticmethod
-    def _verify_history_entry_is_in_active_recovery_round(
+    def _verify_history_entry_is_in_active_retry_lifecycle(
         task: TaskSpec,
         entry: Dict[str, object],
     ) -> bool:
-        # Entries persisted before recovery-round metadata was introduced belong
-        # to the original execution round. This keeps legacy non-recovery retry
-        # behavior intact without letting those entries stop a later requeue.
+        # Missing lifecycle metadata belongs to the original execution
+        # lifecycle. This keeps legacy retry behavior intact without letting
+        # those entries stop a later recovery or same-round requeue.
         try:
             entry_epoch = int(entry.get("recovery_epoch", 0) or 0)
             entry_round = int(entry.get("recovery_round", 0) or 0)
+            entry_retry_epoch = int(entry.get("verify_retry_epoch", 0) or 0)
         except (TypeError, ValueError):
             return False
         return (
             entry_epoch == int(task.recovery_epoch)
             and entry_round == int(task.recovery_round)
+            and entry_retry_epoch == int(task.verify_retry_epoch)
         )
+
+    @staticmethod
+    def _begin_fresh_verify_retry_lifecycle(task: TaskSpec) -> None:
+        task.verify_retry_epoch = int(task.verify_retry_epoch) + 1
 
     def _analyze_verify_failure(
         self,
@@ -13376,7 +13476,7 @@ class Orchestrator:
             for entry in task.verify_history
             if (
                 isinstance(entry, dict)
-                and self._verify_history_entry_is_in_active_recovery_round(task, entry)
+                and self._verify_history_entry_is_in_active_retry_lifecycle(task, entry)
             )
         ]
         prior_failures = [
@@ -13557,6 +13657,7 @@ class Orchestrator:
             "summary": summary.strip(),
             "recovery_epoch": int(task.recovery_epoch),
             "recovery_round": int(task.recovery_round),
+            "verify_retry_epoch": int(task.verify_retry_epoch),
         }
         normalized_failure_ids = [str(item).strip() for item in (failure_ids or []) if str(item).strip()]
         if normalized_failure_ids:

@@ -250,6 +250,7 @@ class RunStateModelTests(unittest.TestCase):
             task_origin="scope_split",
             recovery_epoch=2,
             recovery_round=1,
+            verify_retry_epoch=3,
         )
 
         restored = TaskSpec.from_dict(task.to_dict())
@@ -257,6 +258,7 @@ class RunStateModelTests(unittest.TestCase):
         self.assertEqual(restored.task_origin, "scope_split")
         self.assertEqual(restored.recovery_epoch, 2)
         self.assertEqual(restored.recovery_round, 1)
+        self.assertEqual(restored.verify_retry_epoch, 3)
 
 
 class SessionConfigTests(unittest.TestCase):

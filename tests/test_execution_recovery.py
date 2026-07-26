@@ -1162,6 +1162,106 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertEqual(saved.status, "recovering")
             self.assertEqual(saved.recovery_round, 0)
 
+    def test_self_repair_resume_requeues_blocked_task_with_fresh_verify_lifecycle(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            failure_id = "tests/test_contract.py::test_public_contract"
+            task = TaskSpec(
+                task_id="contract-task",
+                title="Repair public contract",
+                description="Repair the observable contract.",
+                acceptance=["The public contract passes."],
+                status="blocked",
+                recovery_round=2,
+                verify_history=[
+                    {
+                        "attempt": 2,
+                        "decision": "fail",
+                        "summary": "verification failed before engine self-repair",
+                        "failure_ids": [failure_id],
+                        "comparable_failures": True,
+                        "recovery_epoch": 0,
+                        "recovery_round": 2,
+                        "verify_retry_epoch": 0,
+                    }
+                ],
+            )
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [task]
+            state.resume_context["implementation_ready_tasks"] = {
+                task.task_id: True,
+            }
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "lineage_id": task.task_id,
+                "outcome": "exhausted",
+                "round": 3,
+            }
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "orchestrator_transition",
+                "status": "blocked",
+            }
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(root, state)
+
+            marked = orchestrator.mark_self_repair_applied("abc123")
+            resumed = Orchestrator(root)
+            changed = resumed._resume_blocked_run(marked)
+            resumed_task = marked.tasks[0]
+
+            self.assertTrue(changed)
+            self.assertEqual(marked.status, "pending")
+            self.assertEqual(resumed_task.status, "pending")
+            self.assertEqual(resumed_task.recovery_round, 2)
+            self.assertEqual(resumed_task.verify_retry_epoch, 1)
+            self.assertEqual(len(resumed_task.verify_history), 1)
+            self.assertNotIn(
+                task.task_id,
+                marked.resume_context.get("implementation_ready_tasks", {}),
+            )
+            self.assertEqual(
+                marked.active_blocker["prepared_self_repair_commit"],
+                "abc123",
+            )
+            self.assertEqual(
+                marked.last_recovery_route["outcome"],
+                "self_repair_requeued",
+            )
+            persisted_task = load_task_plan(root)["tasks"][0]
+            self.assertEqual(persisted_task["status"], "pending")
+            self.assertEqual(persisted_task["verify_retry_epoch"], 1)
+            self.assertFalse(resumed._resume_blocked_run(marked))
+            self.assertEqual(resumed_task.verify_retry_epoch, 1)
+
+            first_after_requeue = resumed._analyze_verify_failure(
+                resumed_task,
+                [failure_id],
+            )
+            self.assertFalse(first_after_requeue["stop_retry"])
+            resumed._record_verify_result(
+                resumed_task,
+                1,
+                "fail",
+                "verification still fails after self-repair",
+                [failure_id],
+            )
+            repeated_in_fresh_lifecycle = resumed._analyze_verify_failure(
+                resumed_task,
+                [failure_id],
+            )
+            self.assertTrue(repeated_in_fresh_lifecycle["stop_retry"])
+            self.assertEqual(
+                resumed_task.verify_history[-1]["verify_retry_epoch"],
+                1,
+            )
+
     def test_runtime_interruption_resumes_once_then_uses_read_only_diagnosis(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

@@ -96,6 +96,7 @@ class TaskSpec:
     arbitration_history: List[Dict[str, object]] = field(default_factory=list)
     recovery_history: List[Dict[str, object]] = field(default_factory=list)
     evidence_preflight: Dict[str, object] = field(default_factory=dict)
+    verify_retry_epoch: int = 0
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -155,6 +156,7 @@ class TaskSpec:
                 if isinstance(data.get("evidence_preflight", {}), dict)
                 else {}
             ),
+            verify_retry_epoch=max(0, int(data.get("verify_retry_epoch", 0) or 0)),
         )
 
     def to_dict(self) -> Dict[str, object]:

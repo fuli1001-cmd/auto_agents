@@ -334,6 +334,20 @@ class ParallelTuningTests(unittest.TestCase):
                 title="B",
                 description="Update shared code.",
                 acceptance=["done"],
+                recovery_round=2,
+                verify_retry_epoch=4,
+                verify_history=[
+                    {
+                        "attempt": 2,
+                        "decision": "fail",
+                        "summary": "worker verification failed",
+                        "failure_ids": ["tests/test_shared.py::test_contract"],
+                        "comparable_failures": True,
+                        "recovery_epoch": 0,
+                        "recovery_round": 2,
+                        "verify_retry_epoch": 4,
+                    }
+                ],
             )
             tasks = [task]
             state = RunState(run_id="test", current_stage="implement", tasks=tasks)
@@ -356,6 +370,14 @@ class ParallelTuningTests(unittest.TestCase):
 
             self.assertEqual(outcome, "retry")
             self.assertEqual(task.status, "pending")
+            self.assertEqual(task.recovery_round, 2)
+            self.assertEqual(task.verify_retry_epoch, 5)
+            self.assertEqual(len(task.verify_history), 1)
+            analysis = orchestrator._analyze_verify_failure(
+                task,
+                ["tests/test_shared.py::test_contract"],
+            )
+            self.assertFalse(analysis["stop_retry"])
             self.assertEqual(
                 state.resume_context["parallel_sequential_retry_tasks"], ["task-b"]
             )
