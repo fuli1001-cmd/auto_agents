@@ -445,7 +445,7 @@ def gate_environment(
     return env
 
 
-def discover_dependency_links(project_root: Path) -> dict[str, Path]:
+def dependency_link_paths(project_root: Path) -> tuple[str, ...]:
     candidates: set[Path] = {
         Path(".conda"),
         Path(".venv"),
@@ -461,11 +461,51 @@ def discover_dependency_links(project_root: Path) -> dict[str, Path]:
             candidates.add(lock_path.parent.relative_to(project_root) / "node_modules")
         if (project_root / lock_name).exists():
             candidates.add(Path("node_modules"))
+    return tuple(
+        relative.as_posix()
+        for relative in sorted(candidates, key=lambda item: item.as_posix())
+    )
+
+
+def self_referential_dependency_links(project_root: Path) -> list[str]:
+    """Return dependency links that lexically point back to themselves.
+
+    Dependency links installed into a worktree use absolute source paths. If
+    one of those links is accidentally committed and checked out at its source
+    path, its payload becomes a self-reference. Detect that signature without
+    resolving the link, because resolving it is the operation that raises.
+    """
+
+    leaked: list[str] = []
+    for relative in dependency_link_paths(project_root):
+        candidate = project_root / relative
+        if not candidate.is_symlink():
+            continue
+        try:
+            raw_target = candidate.readlink()
+        except OSError:
+            continue
+        target = raw_target if raw_target.is_absolute() else candidate.parent / raw_target
+        candidate_text = os.path.normcase(os.path.abspath(os.fspath(candidate)))
+        target_text = os.path.normcase(os.path.abspath(os.fspath(target)))
+        if candidate_text == target_text:
+            leaked.append(relative)
+    return leaked
+
+
+def discover_dependency_links(project_root: Path) -> dict[str, Path]:
     links: dict[str, Path] = {}
-    for relative in sorted(candidates, key=lambda item: item.as_posix()):
-        source = (project_root / relative).resolve()
-        if source.exists() and source.is_dir():
-            links[relative.as_posix()] = source
+    for relative in dependency_link_paths(project_root):
+        try:
+            source = (project_root / relative).resolve(strict=True)
+            is_directory = source.is_dir()
+        except (OSError, RuntimeError):
+            # Broken and cyclic dependency links are unusable, but discovery
+            # must remain total so the orchestrator can enter its recovery
+            # path instead of crashing while inspecting them.
+            continue
+        if is_directory:
+            links[relative] = source
     return links
 
 

@@ -92,6 +92,7 @@ from .gate_execution import (
     LocalGatePlanExecutor,
     discover_dependency_links,
     install_dependency_links,
+    self_referential_dependency_links,
 )
 from .distributed_gates import DistributedGatePlanExecutor
 from .workers import gate_environment_fingerprint
@@ -129,7 +130,7 @@ from .frontend_design import (
     validate_frontend_scope,
     validate_prototype_manifest,
 )
-from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, list_worktrees, ref_exists, remove_worktree, update_ref, worktree_fingerprint
+from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, commit_only_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, list_worktrees, ref_exists, remove_worktree, tracked_files, update_ref, worktree_fingerprint
 from .io_utils import read_json, read_text, write_json, write_text
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
 from .models import (
@@ -3944,6 +3945,12 @@ class Orchestrator:
         ):
             return []
 
+        repaired_dependency_links = (
+            self._repair_self_referential_dependency_links()
+        )
+        if repaired_dependency_links:
+            blocker["repaired_dependency_links"] = repaired_dependency_links
+
         tasks = list(state.tasks)
         if not tasks:
             raw_tasks = load_task_plan(self.project_root).get("tasks", [])
@@ -3988,6 +3995,37 @@ class Orchestrator:
         blocker["prepared_self_repair_commit"] = commit_sha
         blocker["requeued_task_ids"] = requeued_task_ids
         return requeued_task_ids
+
+    def _repair_self_referential_dependency_links(self) -> List[str]:
+        """Remove dependency links leaked by an earlier worktree commit."""
+
+        leaked = self_referential_dependency_links(self.project_root)
+        if not leaked:
+            return []
+
+        tracked = set(tracked_files(self.project_root))
+        tracked_leaks: List[str] = []
+        for relative in leaked:
+            candidate = self.project_root / relative
+            if not candidate.is_symlink():
+                continue
+            candidate.unlink()
+            if relative in tracked:
+                tracked_leaks.append(relative)
+
+        cleanup_commit = ""
+        if tracked_leaks:
+            cleanup_commit = commit_only_paths(
+                self.project_root,
+                "chore: remove leaked dependency links",
+                tracked_leaks,
+            )
+        self.logger.warning(
+            "[self-repair] removed leaked dependency links paths=%s commit=%s",
+            ",".join(leaked),
+            cleanup_commit or "untracked",
+        )
+        return leaked
 
     def _resume_blocked_run(self, state: RunState) -> bool:
         active_incident = self._incident_store(state).active(state)
@@ -6684,17 +6722,64 @@ class Orchestrator:
         archived.append(self._relative_repo_path(metadata_path))
         return archived
 
+    @staticmethod
+    def _parallel_commit_exclude_prefixes(
+        dependency_links: Iterable[str] = (),
+    ) -> Tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                (
+                    ".auto-agents",
+                    ".antigravitycli",
+                    *(
+                        str(path).replace("\\", "/").strip().rstrip("/")
+                        for path in dependency_links
+                        if str(path).replace("\\", "/").strip().rstrip("/")
+                    ),
+                )
+            )
+        )
+
+    @staticmethod
+    def _path_is_dependency_link(
+        path: str,
+        dependency_links: Iterable[str],
+    ) -> bool:
+        normalized_path = str(path).replace("\\", "/").strip().rstrip("/")
+        for dependency_link in dependency_links:
+            prefix = (
+                str(dependency_link)
+                .replace("\\", "/")
+                .strip()
+                .rstrip("/")
+            )
+            if normalized_path == prefix or normalized_path.startswith(
+                prefix + "/"
+            ):
+                return True
+        return False
+
     def _preserve_failed_task_checkpoint(
         self,
         state: RunState,
         task: TaskSpec,
         worktree_path: Path,
         gate_result: Dict[str, object],
+        *,
+        dependency_links: Iterable[str] = (),
     ) -> Dict[str, object]:
-        candidate_paths = changed_paths(
-            worktree_path,
-            ignored_prefixes=(".auto-agents/", ".antigravitycli/"),
-        )
+        dependency_link_paths = tuple(dependency_links)
+        candidate_paths = [
+            path
+            for path in changed_paths(
+                worktree_path,
+                ignored_prefixes=(".auto-agents/", ".antigravitycli/"),
+            )
+            if not self._path_is_dependency_link(
+                path,
+                dependency_link_paths,
+            )
+        ]
         checkpoint_ref = self._parallel_failure_ref(
             state.run_id,
             task.task_id,
@@ -6705,7 +6790,9 @@ class Orchestrator:
             checkpoint_sha = commit_all_except(
                 worktree_path,
                 f"checkpoint({task.task_id}): preserve failed candidate",
-                exclude_prefixes=(".auto-agents", ".antigravitycli"),
+                exclude_prefixes=self._parallel_commit_exclude_prefixes(
+                    dependency_link_paths
+                ),
             )
             update_ref(self.project_root, checkpoint_ref, checkpoint_sha)
         else:
@@ -6980,6 +7067,7 @@ class Orchestrator:
                     worker_task,
                     worktree_path,
                     gate_result,
+                    dependency_links=dependency_links,
                 )
                 result = self._parallel_task_failure_result(worker_task, gate_result)
                 result["failure_checkpoint"] = checkpoint
@@ -7010,7 +7098,9 @@ class Orchestrator:
             worker_commit_sha = commit_all_except(
                 worktree_path,
                 commit_message,
-                exclude_prefixes=(".auto-agents", ".antigravitycli"),
+                exclude_prefixes=self._parallel_commit_exclude_prefixes(
+                    dependency_links
+                ),
             )
             worker_changed_paths = commit_changed_paths(worktree_path, worker_commit_sha)
             result_ref = self._parallel_result_ref(state.run_id, task_id)
@@ -7116,9 +7206,11 @@ class Orchestrator:
         worktree_created = False
         try:
             latest_ref = head_ref(self.project_root) or "HEAD"
+            dependency_links = discover_dependency_links(self.project_root)
             self._reconcile_managed_parallel_worktree(worktree_path)
             add_worktree(self.project_root, worktree_path, ref=latest_ref)
             worktree_created = True
+            install_dependency_links(worktree_path, dependency_links)
             try:
                 cherry_pick_no_commit(worktree_path, replay_ref)
             except RuntimeError as error:
@@ -7179,7 +7271,9 @@ class Orchestrator:
             replay_commit_sha = commit_all_except(
                 worktree_path,
                 commit_message,
-                exclude_prefixes=(".auto-agents", ".antigravitycli"),
+                exclude_prefixes=self._parallel_commit_exclude_prefixes(
+                    dependency_links
+                ),
             )
             if result_ref:
                 update_ref(self.project_root, result_ref, replay_commit_sha)

@@ -13,6 +13,7 @@ from auto_agents.git_ops import (
     commit_all,
     commit_all_except,
     commit_changed_paths,
+    commit_only_paths,
     delete_ref,
     head_ref,
     list_worktrees,
@@ -155,6 +156,7 @@ class GitOpsWorktreeTests(unittest.TestCase):
                 "WORKER_VALUE = 0\n" + ("# spacer\n" * 20) + "MAIN_VALUE = 0\n",
             )
             commit_all(project_root, "test: init")
+            (project_root / ".conda" / "conda-meta").mkdir(parents=True)
 
             worker_path = Path(tmp) / "worker"
             add_worktree(project_root, worker_path)
@@ -194,10 +196,26 @@ class GitOpsWorktreeTests(unittest.TestCase):
                 "changed_paths": ["shared.py"],
             }
 
+            def verify(
+                worker: Orchestrator,
+                worker_task: TaskSpec,
+                *,
+                state: RunState,
+            ) -> dict:
+                del worker_task, state
+                self.assertTrue(
+                    (worker.project_root / ".conda").is_symlink()
+                )
+                return {
+                    "ok": True,
+                    "reason": "passed",
+                    "current_failure_ids": [],
+                }
+
             with patch.object(
                 Orchestrator,
                 "_run_task_verify",
-                return_value={"ok": True, "reason": "passed", "current_failure_ids": []},
+                new=verify,
             ):
                 replay = orchestrator._replay_parallel_pending_result(
                     state, [task], task, entry
@@ -213,6 +231,21 @@ class GitOpsWorktreeTests(unittest.TestCase):
             ).stdout
             self.assertIn("WORKER_VALUE = 1", rendered)
             self.assertIn("MAIN_VALUE = 1", rendered)
+            dependency_entry = subprocess.run(
+                [
+                    "git",
+                    "ls-tree",
+                    "--name-only",
+                    result_ref,
+                    "--",
+                    ".conda",
+                ],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(dependency_entry.stdout.strip(), "")
 
     def test_commit_all_except_and_cherry_pick_no_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -250,6 +283,83 @@ class GitOpsWorktreeTests(unittest.TestCase):
                 (project_root / ".auto-agents" / "state" / "task_plan.json").read_text(encoding="utf-8"),
                 original_plan,
             )
+
+    def test_commit_all_except_unstages_previously_staged_exclusions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            commit_all(project_root, "test: init")
+
+            dependency = project_root / ".conda"
+            dependency.symlink_to(dependency)
+            write_text(project_root / "artifact.txt", "retained\n")
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+            commit_sha = commit_all_except(
+                project_root,
+                "test: exclude dependency link",
+                exclude_prefixes=(".conda",),
+            )
+
+            self.assertEqual(
+                commit_changed_paths(project_root, commit_sha),
+                ["artifact.txt"],
+            )
+            tree = subprocess.run(
+                ["git", "ls-tree", "--name-only", commit_sha, "--", ".conda"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(tree.stdout.strip(), "")
+
+    def test_commit_only_paths_preserves_unrelated_staged_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "remove.txt", "remove\n")
+            write_text(project_root / "keep.txt", "before\n")
+            commit_all(project_root, "test: init")
+
+            (project_root / "remove.txt").unlink()
+            write_text(project_root / "keep.txt", "after\n")
+            subprocess.run(
+                ["git", "add", "keep.txt"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+            commit_sha = commit_only_paths(
+                project_root,
+                "test: remove one path",
+                ["remove.txt"],
+            )
+
+            self.assertEqual(
+                commit_changed_paths(project_root, commit_sha),
+                ["remove.txt"],
+            )
+            staged = subprocess.run(
+                ["git", "diff", "--cached", "--name-only"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(staged.stdout.strip(), "keep.txt")
 
     def test_antigravitycli_ignored(self) -> None:
         from auto_agents.git_ops import changed_entries, changed_paths, hard_reset_clean

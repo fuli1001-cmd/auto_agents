@@ -11,9 +11,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gate_execution import (
     LocalGatePlanExecutor,
+    discover_dependency_links,
     dynamic_port_lease,
     gate_environment,
     isolated_command,
+    self_referential_dependency_links,
 )
 from auto_agents.gates import GateCommandMetadata, run_gate_plan
 from auto_agents.models import GateConfig, GateIsolationConfig, GateParallelGroup
@@ -146,6 +148,24 @@ def test_vitest_cache_is_disabled_for_shared_dependencies() -> None:
         " --no-cache"
     )
     assert isolated_command("vitest run --no-cache") == "vitest run --no-cache"
+
+
+def test_dependency_discovery_skips_self_referential_links(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    workspace = project / "workbench"
+    workspace.mkdir()
+    (workspace / "package-lock.json").write_text("{}\n", encoding="utf-8")
+    (project / ".conda").symlink_to(project / ".conda")
+    (workspace / "node_modules").symlink_to(workspace / "node_modules")
+
+    assert discover_dependency_links(project) == {}
+    assert self_referential_dependency_links(project) == [
+        ".conda",
+        "workbench/node_modules",
+    ]
 
 
 def test_gate_environment_injects_ports_and_clears_stale_values(

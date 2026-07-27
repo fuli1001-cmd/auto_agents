@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,7 +19,12 @@ from auto_agents.execution_recovery import (
 )
 from auto_agents.models import AgentResult, AgentTermination, CommandResult, RunState, TaskSpec
 from auto_agents.gates import GateCommandTimeoutError
-from auto_agents.git_ops import head_ref, worktree_fingerprint
+from auto_agents.git_ops import (
+    commit_all,
+    commit_changed_paths,
+    head_ref,
+    worktree_fingerprint,
+)
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.config import load_run_state, load_task_plan, save_run_state
 
@@ -1161,6 +1167,58 @@ class ExecutionRecoveryTests(unittest.TestCase):
             saved = ExecutionIncidentStore(root, state.run_id).load(incident.incident_id)
             self.assertEqual(saved.status, "recovering")
             self.assertEqual(saved.recovery_round, 0)
+
+    def test_self_repair_resume_removes_tracked_dependency_self_link(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            commit_all(root, "test: initialize project")
+            dependency = root / ".conda"
+            dependency.symlink_to(dependency)
+            leak_commit = commit_all(root, "test: leak dependency link")
+
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "worktree_lifecycle",
+                "status": "blocked",
+            }
+            save_run_state(root, state)
+            orchestrator = Orchestrator(root)
+            marked = orchestrator.mark_self_repair_applied("repair123")
+
+            self.assertTrue(orchestrator._resume_blocked_run(marked))
+
+            cleanup_commit = head_ref(root)
+            self.assertNotEqual(cleanup_commit, leak_commit)
+            self.assertEqual(
+                commit_changed_paths(root, cleanup_commit),
+                [".conda"],
+            )
+            self.assertFalse(dependency.is_symlink())
+            dependency_entry = subprocess.run(
+                [
+                    "git",
+                    "ls-tree",
+                    "--name-only",
+                    "HEAD",
+                    "--",
+                    ".conda",
+                ],
+                cwd=str(root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(dependency_entry.stdout.strip(), "")
+            self.assertEqual(
+                marked.active_blocker["repaired_dependency_links"],
+                [".conda"],
+            )
 
     def test_self_repair_resume_requeues_blocked_task_with_fresh_verify_lifecycle(
         self,

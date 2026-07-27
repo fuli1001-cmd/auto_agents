@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import sys
+import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -310,6 +311,139 @@ class RecoveryResilienceTests(unittest.TestCase):
                 task.task_id,
             )
             self.assertIn(".conda", links)
+
+    def test_parallel_result_commit_excludes_installed_dependency_links(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            (root / ".conda" / "conda-meta").mkdir(parents=True)
+            if changed_files(root):
+                commit_all(root, "chore: initialize test project")
+            task = TaskSpec(
+                task_id="task-001",
+                title="parallel",
+                description="",
+                acceptance=[],
+            )
+            state = RunState(run_id="run-001", tasks=[task])
+
+            def complete(
+                worker: Orchestrator,
+                worker_state: RunState,
+                worker_task: TaskSpec,
+                resume_existing: bool = False,
+                gate_recheck_first: bool = False,
+            ) -> dict:
+                del worker_state, worker_task, resume_existing, gate_recheck_first
+                write_text(worker.project_root / "candidate.py", "ready = True\n")
+                return {
+                    "ok": True,
+                    "reason": "",
+                    "review": "accepted",
+                    "verify_current_failure_ids": [],
+                }
+
+            with patch.object(
+                Orchestrator,
+                "_ensure_task_verify_baseline",
+                return_value=False,
+            ), patch.object(
+                Orchestrator,
+                "_execute_task_with_retries",
+                new=complete,
+            ):
+                result = orchestrator._run_task_in_worktree(
+                    state,
+                    [task],
+                    task.task_id,
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["changed_paths"], ["candidate.py"])
+            dependency_entry = subprocess.run(
+                [
+                    "git",
+                    "ls-tree",
+                    "--name-only",
+                    str(result["commit_sha"]),
+                    "--",
+                    ".conda",
+                ],
+                cwd=str(root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(dependency_entry.stdout.strip(), "")
+
+    def test_failed_checkpoint_excludes_installed_dependency_links(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            (root / ".conda" / "conda-meta").mkdir(parents=True)
+            if changed_files(root):
+                commit_all(root, "chore: initialize test project")
+            task = TaskSpec(
+                task_id="task-001",
+                title="parallel failure",
+                description="",
+                acceptance=[],
+            )
+            state = RunState(run_id="run-001", tasks=[task])
+
+            def fail(
+                worker: Orchestrator,
+                worker_state: RunState,
+                worker_task: TaskSpec,
+                resume_existing: bool = False,
+                gate_recheck_first: bool = False,
+            ) -> dict:
+                del worker_state, worker_task, resume_existing, gate_recheck_first
+                write_text(worker.project_root / "candidate.py", "ready = False\n")
+                return {
+                    "ok": False,
+                    "reason": "verification failed",
+                    "review": "candidate is incomplete",
+                    "failure_ids": ["tests/test_demo.py::test_contract"],
+                }
+
+            with patch.object(
+                Orchestrator,
+                "_ensure_task_verify_baseline",
+                return_value=False,
+            ), patch.object(
+                Orchestrator,
+                "_execute_task_with_retries",
+                new=fail,
+            ):
+                result = orchestrator._run_task_in_worktree(
+                    state,
+                    [task],
+                    task.task_id,
+                )
+
+            self.assertFalse(result["ok"])
+            checkpoint = result["failure_checkpoint"]
+            self.assertEqual(checkpoint["changed_paths"], ["candidate.py"])
+            dependency_entry = subprocess.run(
+                [
+                    "git",
+                    "ls-tree",
+                    "--name-only",
+                    str(checkpoint["commit_sha"]),
+                    "--",
+                    ".conda",
+                ],
+                cwd=str(root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(dependency_entry.stdout.strip(), "")
 
     def test_failed_candidate_checkpoint_and_log_survive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

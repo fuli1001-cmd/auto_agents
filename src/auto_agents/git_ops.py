@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import subprocess
 from pathlib import Path
+from typing import Iterable
 
 
 def _git(project_root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -58,15 +59,113 @@ def commit_all(project_root: Path, message: str) -> str:
 
 
 def commit_all_except(project_root: Path, message: str, exclude_prefixes: tuple[str, ...]) -> str:
+    normalized_excludes = tuple(
+        dict.fromkeys(
+            prefix.replace("\\", "/").strip().rstrip("/")
+            for prefix in exclude_prefixes
+            if prefix.replace("\\", "/").strip().rstrip("/")
+        )
+    )
     add_args = ["add", "-A", "--", "."]
-    add_args.extend(f":(exclude){prefix.rstrip('/')}" for prefix in exclude_prefixes)
+    add_args.extend(
+        f":(top,exclude,literal){prefix}" for prefix in normalized_excludes
+    )
     add_process = _git(project_root, *add_args)
     if add_process.returncode != 0:
         raise RuntimeError(add_process.stderr.strip() or "git add failed")
 
+    if normalized_excludes:
+        head_process = _git(project_root, "rev-parse", "--verify", "HEAD")
+        if head_process.returncode == 0:
+            reset_process = _git(
+                project_root,
+                "reset",
+                "-q",
+                "HEAD",
+                "--",
+                *(
+                    f":(top,literal){prefix}"
+                    for prefix in normalized_excludes
+                ),
+            )
+        else:
+            reset_process = _git(
+                project_root,
+                "rm",
+                "-r",
+                "--cached",
+                "--ignore-unmatch",
+                "--",
+                *(
+                    f":(top,literal){prefix}"
+                    for prefix in normalized_excludes
+                ),
+            )
+        if reset_process.returncode != 0:
+            raise RuntimeError(
+                reset_process.stderr.strip()
+                or "git reset excluded paths failed"
+            )
+
     commit_process = _git(project_root, "commit", "-m", message)
     if commit_process.returncode != 0:
         raise RuntimeError(commit_process.stderr.strip() or "git commit failed")
+
+    rev_process = _git(project_root, "rev-parse", "HEAD")
+    if rev_process.returncode != 0:
+        raise RuntimeError(rev_process.stderr.strip() or "git rev-parse failed")
+    return rev_process.stdout.strip()
+
+
+def commit_only_paths(
+    project_root: Path,
+    message: str,
+    paths: Iterable[str],
+) -> str:
+    normalized_paths = tuple(
+        dict.fromkeys(
+            path.replace("\\", "/").strip().rstrip("/")
+            for path in paths
+            if path.replace("\\", "/").strip().rstrip("/")
+        )
+    )
+    if not normalized_paths:
+        return ""
+    pathspecs = tuple(
+        f":(top,literal){path}" for path in normalized_paths
+    )
+    add_process = _git(project_root, "add", "-A", "--", *pathspecs)
+    if add_process.returncode != 0:
+        raise RuntimeError(add_process.stderr.strip() or "git add paths failed")
+
+    diff_process = _git(
+        project_root,
+        "diff",
+        "--cached",
+        "--quiet",
+        "--",
+        *pathspecs,
+    )
+    if diff_process.returncode == 0:
+        return ""
+    if diff_process.returncode != 1:
+        raise RuntimeError(
+            diff_process.stderr.strip() or "git diff paths failed"
+        )
+
+    commit_process = _git(
+        project_root,
+        "commit",
+        "--only",
+        "-m",
+        message,
+        "--",
+        *pathspecs,
+    )
+    if commit_process.returncode != 0:
+        raise RuntimeError(
+            commit_process.stderr.strip() or "git commit paths failed"
+        )
 
     rev_process = _git(project_root, "rev-parse", "HEAD")
     if rev_process.returncode != 0:
