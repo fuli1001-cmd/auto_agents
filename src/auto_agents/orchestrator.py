@@ -90,6 +90,7 @@ from .gates import (
 from .gate_baseline_cache import GateBaselineCache
 from .gate_execution import (
     LocalGatePlanExecutor,
+    dependency_link_paths,
     discover_dependency_links,
     install_dependency_links,
     self_referential_dependency_links,
@@ -130,7 +131,8 @@ from .frontend_design import (
     validate_frontend_scope,
     validate_prototype_manifest,
 )
-from .git_ops import abort_cherry_pick, add_worktree, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, commit_only_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, list_worktrees, ref_exists, remove_worktree, tracked_files, update_ref, worktree_fingerprint
+from .git_ops import abort_cherry_pick, add_worktree, apply_commit_no_commit_excluding, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, commit_only_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, list_worktrees, ref_exists, remove_worktree, tracked_files, update_ref, worktree_fingerprint
+from .infrastructure_repair import repair_workspace_local_conda
 from .io_utils import read_json, read_text, write_json, write_text
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
 from .models import (
@@ -1356,6 +1358,8 @@ class Orchestrator:
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
             if self._normalize_legacy_verify_baselines(state):
+                save_run_state(self.project_root, state)
+            if self._normalize_missing_workspace_dependency_recovery(state):
                 save_run_state(self.project_root, state)
             restarted_before_preconditions = False
             if state.workflow_version < 2:
@@ -4027,6 +4031,119 @@ class Orchestrator:
         )
         return leaked
 
+    def _normalize_missing_workspace_dependency_recovery(
+        self,
+        state: RunState,
+    ) -> bool:
+        """Retire target-repair tasks that cannot run without the local runtime."""
+
+        conda_prefix = self.project_root / ".conda"
+        if (
+            (conda_prefix / "conda-meta").is_dir()
+            and (conda_prefix / "bin" / "python").is_file()
+        ):
+            return False
+        tasks = list(state.tasks)
+        if not tasks:
+            raw_tasks = load_task_plan(self.project_root).get("tasks", [])
+            if isinstance(raw_tasks, list):
+                tasks = [
+                    TaskSpec.from_dict(item)
+                    for item in raw_tasks
+                    if isinstance(item, dict)
+                ]
+        changed = False
+        retained_tasks: List[TaskSpec] = []
+        retired: List[Dict[str, object]] = []
+        for task in tasks:
+            if (
+                task.task_origin != "stage_recovery"
+                or task.status
+                not in {"pending", "in_progress", "blocked", "superseded"}
+            ):
+                retained_tasks.append(task)
+                continue
+            incident_id = next(
+                (
+                    str(entry.get("execution_incident_id", "")).strip()
+                    for entry in reversed(task.recovery_history)
+                    if isinstance(entry, dict)
+                    and str(entry.get("execution_incident_id", "")).strip()
+                ),
+                "",
+            )
+            if not incident_id:
+                retained_tasks.append(task)
+                continue
+            incident = self._incident_store(state).load(incident_id)
+            if incident is None:
+                retained_tasks.append(task)
+                continue
+            command = incident.command.strip()
+            if not (
+                re.search(
+                    r"\bconda\s+run\s+-p\s+(?:\./)?\.conda(?:\s|$)",
+                    command,
+                )
+                or re.search(
+                    r"(?:^|\s)(?:\./)?\.conda/bin/python(?:\s|$)",
+                    command,
+                )
+            ):
+                retained_tasks.append(task)
+                continue
+            retired.append(
+                {
+                    "task_id": task.task_id,
+                    "execution_incident_id": incident_id,
+                    "reason": (
+                        "workspace-local Conda prerequisite is missing; managed "
+                        "dependency repair owns recovery"
+                    ),
+                    "retired_at": utc_now_iso(),
+                }
+            )
+            self._clear_implementation_ready_marker(state, task)
+            self._clear_stale_implementation_resume_markers(
+                state,
+                task_ids=[task.task_id],
+            )
+            changed = True
+        if changed:
+            state.tasks = retained_tasks
+            self._persist_tasks(retained_tasks)
+            history = state.resume_context.setdefault(
+                "retired_workspace_recovery_tasks",
+                [],
+            )
+            if isinstance(history, list):
+                known = {
+                    str(entry.get("task_id", ""))
+                    for entry in history
+                    if isinstance(entry, dict)
+                }
+                history.extend(
+                    entry
+                    for entry in retired
+                    if str(entry.get("task_id", "")) not in known
+                )
+            blocker = (
+                dict(state.active_blocker)
+                if isinstance(state.active_blocker, dict)
+                else {}
+            )
+            if str(blocker.get("category", "")) == (
+                "recovery_task_invalid_lifecycle_status"
+            ):
+                state.active_blocker = {}
+                state.status = "pending"
+                state.last_error = ""
+            self.logger.warning(
+                "[execution-recovery] retired target repair tasks until "
+                "workspace-local Conda is reprovisioned"
+            )
+        return changed
+
     def _resume_blocked_run(self, state: RunState) -> bool:
         active_incident = self._incident_store(state).active(state)
         legacy_incident_pause = bool(
@@ -4304,6 +4421,43 @@ class Orchestrator:
         incident.history.append(
             {"event": "diagnosed", "diagnosis": diagnosis.to_dict()}
         )
+        if diagnosis.action == "REPAIR_INFRASTRUCTURE":
+            repair = repair_workspace_local_conda(
+                self.project_root,
+                incident,
+                allow_downloads=(
+                    self.config.execution.recovery.managed_runtime_downloads_enabled
+                ),
+            )
+            if repair.capability == "workspace_conda":
+                repair_payload = repair.to_dict()
+                incident.repair_history.append(repair_payload)
+                incident.history.append(
+                    {
+                        "event": "managed_workspace_repair",
+                        "repaired": repair.repaired,
+                        "action": repair.action,
+                        "reason": repair.reason,
+                    }
+                )
+                if repair.repaired:
+                    incident.status = "recovering"
+                    state.status = "pending"
+                    state.last_error = ""
+                    self._incident_store(state).save(incident, state)
+                    save_run_state(self.project_root, state)
+                    self.logger.warning(
+                        "[execution-recovery] repaired capability=%s action=%s",
+                        repair.capability,
+                        repair.action,
+                    )
+                    return True
+                return self._block_for_execution_incident(
+                    state,
+                    incident,
+                    "managed workspace dependency repair failed: "
+                    + repair.reason,
+                )
         if not self.config.execution.recovery.enabled:
             return self._block_for_execution_incident(
                 state, incident, "automatic execution recovery is disabled"
@@ -6856,14 +7010,29 @@ class Orchestrator:
             or not ref_exists(self.project_root, checkpoint_ref)
         ):
             return ""
+        protected_paths = dependency_link_paths(project_root)
         try:
-            cherry_pick_no_commit(project_root, checkpoint_ref)
+            apply_commit_no_commit_excluding(
+                project_root,
+                checkpoint_ref,
+                tuple(protected_paths),
+            )
         except RuntimeError as error:
             abort_cherry_pick(project_root)
             checkpoint["status"] = "replay_conflict"
             checkpoint["replay_error"] = str(error)
             checkpoint["updated_at"] = utc_now_iso()
             return ""
+        checkpoint["excluded_dependency_paths"] = [
+            path
+            for path in checkpoint.get("changed_paths", [])
+            if self._path_is_dependency_link(path, protected_paths)
+        ]
+        checkpoint["changed_paths"] = [
+            path
+            for path in checkpoint.get("changed_paths", [])
+            if not self._path_is_dependency_link(path, protected_paths)
+        ]
         checkpoint["status"] = "applied"
         checkpoint["updated_at"] = utc_now_iso()
         return checkpoint_ref

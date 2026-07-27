@@ -11,12 +11,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gates import GateCommandInfrastructureError
 from auto_agents.git_ops import (
+    add_worktree,
     changed_files,
     changed_paths,
     commit_all,
     hard_reset_clean,
     head_ref,
     ref_exists,
+    update_ref,
 )
 from auto_agents.io_utils import write_text
 from auto_agents.models import CommandResult, GateResult, RunState, TaskSpec
@@ -444,6 +446,78 @@ class RecoveryResilienceTests(unittest.TestCase):
                 capture_output=True,
             )
             self.assertEqual(dependency_entry.stdout.strip(), "")
+
+    def test_legacy_checkpoint_restore_protects_local_dependency_environment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            commit_all(root, "chore: initialize test project")
+            (root / ".conda" / "conda-meta").mkdir(parents=True)
+            write_text(root / ".conda" / "marker.txt", "keep\n")
+
+            checkpoint_worktree = Path(tmp) / "checkpoint"
+            add_worktree(root, checkpoint_worktree, ref=head_ref(root))
+            write_text(checkpoint_worktree / "candidate.py", "ready = True\n")
+            (checkpoint_worktree / ".conda").symlink_to(
+                root / ".conda",
+                target_is_directory=True,
+            )
+            subprocess.run(
+                ["git", "add", "candidate.py"],
+                cwd=str(checkpoint_worktree),
+                check=True,
+            )
+            subprocess.run(
+                ["git", "add", "-f", ".conda"],
+                cwd=str(checkpoint_worktree),
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "checkpoint: legacy candidate"],
+                cwd=str(checkpoint_worktree),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            checkpoint_sha = head_ref(checkpoint_worktree)
+            checkpoint_ref = (
+                "refs/auto-agents/runs/run-001/failed-tasks/task-001/epoch-0"
+            )
+            update_ref(root, checkpoint_ref, checkpoint_sha)
+
+            task = TaskSpec(
+                task_id="task-001",
+                title="restore",
+                description="",
+                acceptance=[],
+            )
+            state = RunState(run_id="run-001", tasks=[task])
+            state.task_failure_checkpoints[task.task_id] = {
+                "ref": checkpoint_ref,
+                "has_candidate_changes": True,
+                "changed_paths": [".conda", "candidate.py"],
+            }
+
+            restored = orchestrator._restore_task_failure_checkpoint(
+                state,
+                task,
+                root,
+            )
+
+            self.assertEqual(restored, checkpoint_ref)
+            self.assertEqual(
+                (root / ".conda" / "marker.txt").read_text(encoding="utf-8"),
+                "keep\n",
+            )
+            self.assertEqual(
+                (root / "candidate.py").read_text(encoding="utf-8"),
+                "ready = True\n",
+            )
+            checkpoint = state.task_failure_checkpoints[task.task_id]
+            self.assertEqual(checkpoint["changed_paths"], ["candidate.py"])
+            self.assertEqual(checkpoint["excluded_dependency_paths"], [".conda"])
 
     def test_failed_candidate_checkpoint_and_log_survive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

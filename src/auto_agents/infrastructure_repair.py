@@ -10,9 +10,10 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.request import urlopen
 
 from .execution_recovery import ExecutionIncident
@@ -48,6 +49,26 @@ def _incident_capability(incident: ExecutionIncident) -> str:
             str(incident.process_snapshot.get("infrastructure_failure_id", "")),
         ]
     ).lower()
+    workspace_conda_command = bool(
+        re.search(r"\bconda\s+run\s+-p\s+(?:\./)?\.conda(?:\s|$)", text)
+        or re.search(r"(?:^|\s)(?:\./)?\.conda/bin/python(?:\s|$)", text)
+    )
+    if (
+        workspace_conda_command
+        and any(
+            token in text
+            for token in (
+                "environmentlocationnotfound",
+                "not a conda environment",
+                "conda-meta",
+                "workspace-local conda",
+                "baseline_failure_identity_unresolved",
+                "no such file",
+                "not found",
+            )
+        )
+    ):
+        return "workspace_conda"
     if any(token in text for token in ("browser", "chrome", "chromium", "devtools")):
         return "chrome"
     return ""
@@ -69,6 +90,382 @@ _CHROME_LINUX_AMD64 = {
     "size": 133561688,
     "sha256": "4193e00b6d5d5969ee63f7a69596868f546aa0e8cb077b3e0bf9cc1e2c719d00",
 }
+
+
+def _run_repair_command(
+    command: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+) -> Dict[str, object]:
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {
+            "command": command,
+            "ok": False,
+            "error": str(error),
+            "elapsed_seconds": time.monotonic() - started,
+        }
+    return {
+        "command": command,
+        "ok": result.returncode == 0,
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout[-2000:],
+        "stderr_tail": result.stderr[-2000:],
+        "elapsed_seconds": time.monotonic() - started,
+    }
+
+
+def _workspace_conda_spec(
+    project_root: Path,
+) -> Optional[Tuple[str, Path]]:
+    for name in (
+        "environment.yml",
+        "environment.yaml",
+        "conda-environment.yml",
+        "conda-environment.yaml",
+    ):
+        candidate = project_root / name
+        if candidate.is_file():
+            return "conda_environment", candidate
+    pyproject = project_root / "pyproject.toml"
+    if pyproject.is_file():
+        return "pyproject", pyproject
+    return None
+
+
+def _version_tuple(value: str) -> Tuple[int, int]:
+    match = re.match(r"\s*(\d+)\.(\d+)", value)
+    if not match:
+        raise ValueError(f"invalid Python version: {value}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def _python_version_satisfies(version: str, specifier: str) -> bool:
+    candidate = _version_tuple(version)
+    for raw_clause in specifier.split(","):
+        clause = raw_clause.strip()
+        if not clause:
+            continue
+        match = re.match(r"(>=|<=|==|!=|>|<|~=)\s*(\d+\.\d+)", clause)
+        if not match:
+            continue
+        operator, raw_expected = match.groups()
+        expected = _version_tuple(raw_expected)
+        if operator == ">=" and candidate < expected:
+            return False
+        if operator == "<=" and candidate > expected:
+            return False
+        if operator == ">" and candidate <= expected:
+            return False
+        if operator == "<" and candidate >= expected:
+            return False
+        if operator == "==" and candidate != expected:
+            return False
+        if operator == "!=" and candidate == expected:
+            return False
+        if operator == "~=" and not (
+            candidate >= expected and candidate[0] == expected[0]
+        ):
+            return False
+    return True
+
+
+def _declared_python_version(project_root: Path, pyproject: Path) -> str:
+    python_version = project_root / ".python-version"
+    if python_version.is_file():
+        explicit = python_version.read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", explicit):
+            major, minor = _version_tuple(explicit)
+            return f"{major}.{minor}"
+
+    text = pyproject.read_text(encoding="utf-8")
+    match = re.search(
+        r"(?m)^\s*requires-python\s*=\s*[\"']([^\"']+)[\"']",
+        text,
+    )
+    specifier = match.group(1) if match else ""
+    # Python 3.11 is the conservative compatibility baseline for modern
+    # Pydantic/FastAPI projects. Prefer it over the controller interpreter,
+    # which may only satisfy auto_agents' own older runtime floor.
+    for candidate in ("3.11", "3.12", "3.10", "3.13", "3.9"):
+        if not specifier or _python_version_satisfies(candidate, specifier):
+            return candidate
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def _declared_node_roots(project_root: Path) -> List[Path]:
+    roots: List[Path] = []
+    ignored = {
+        ".auto-agents",
+        ".conda",
+        ".git",
+        ".tmp",
+        ".tmp-tests",
+        "node_modules",
+    }
+    for directory, names, files in os.walk(project_root):
+        names[:] = [name for name in names if name not in ignored]
+        if "package.json" not in files or "package-lock.json" not in files:
+            continue
+        roots.append(Path(directory))
+    return sorted(roots)
+
+
+def repair_workspace_local_conda(
+    project_root: Path,
+    incident: ExecutionIncident,
+    *,
+    allow_downloads: bool = True,
+) -> InfrastructureRepairResult:
+    """Recreate a missing project-local Conda prefix from a declared spec."""
+
+    if _incident_capability(incident) != "workspace_conda":
+        return InfrastructureRepairResult(
+            repaired=False,
+            capability="",
+            action="not_workspace_conda",
+            reason="incident does not require the workspace-local Conda prefix",
+        )
+    project_root = project_root.resolve()
+    prefix = project_root / ".conda"
+    if (
+        (prefix / "conda-meta").is_dir()
+        and (prefix / "bin" / "python").is_file()
+    ):
+        return InfrastructureRepairResult(
+            repaired=True,
+            capability="workspace_conda",
+            action="existing_conda_prefix_healthy",
+            reason="workspace-local Conda prefix is already provisioned",
+            environment={"AUTO_AGENTS_WORKSPACE_CONDA": str(prefix)},
+        )
+    if prefix.exists() or prefix.is_symlink():
+        return InfrastructureRepairResult(
+            repaired=False,
+            capability="workspace_conda",
+            action="unsafe_existing_prefix",
+            reason=(
+                "refusing to replace an existing non-Conda .conda path; "
+                "remove or repair that path explicitly"
+            ),
+        )
+    spec = _workspace_conda_spec(project_root)
+    if spec is None:
+        return InfrastructureRepairResult(
+            repaired=False,
+            capability="workspace_conda",
+            action="missing_declared_spec",
+            reason=(
+                "workspace-local Conda prefix is missing and the project has no "
+                "environment.yml, environment.yaml, or pyproject.toml"
+            ),
+        )
+    if not allow_downloads:
+        return InfrastructureRepairResult(
+            repaired=False,
+            capability="workspace_conda",
+            action="managed_downloads_disabled",
+            reason=(
+                "workspace-local Conda reconstruction requires dependency downloads, "
+                "but managed runtime downloads are disabled"
+            ),
+        )
+    conda = shutil.which("conda")
+    if not conda:
+        return InfrastructureRepairResult(
+            repaired=False,
+            capability="workspace_conda",
+            action="conda_unavailable",
+            reason="the controller does not provide a conda executable",
+        )
+
+    spec_kind, spec_path = spec
+    attempts: List[Dict[str, object]] = []
+    if spec_kind == "conda_environment":
+        create_command = [
+            conda,
+            "env",
+            "create",
+            "--yes",
+            "--prefix",
+            str(prefix),
+            "--file",
+            str(spec_path),
+        ]
+    else:
+        python_version = _declared_python_version(project_root, spec_path)
+        create_command = [
+            conda,
+            "create",
+            "--yes",
+            "--prefix",
+            str(prefix),
+            f"python={python_version}",
+            "pip",
+        ]
+    create = _run_repair_command(
+        create_command,
+        cwd=project_root,
+        timeout=1800,
+    )
+    attempts.append(create)
+    if not bool(create.get("ok")):
+        return InfrastructureRepairResult(
+            repaired=False,
+            capability="workspace_conda",
+            action="conda_prefix_create_failed",
+            reason=(
+                str(create.get("stderr_tail", "")).strip()
+                or str(create.get("error", "")).strip()
+                or "conda failed to create the workspace-local prefix"
+            ),
+            candidate_attempts=attempts,
+        )
+
+    if spec_kind == "pyproject":
+        install = _run_repair_command(
+            [
+                conda,
+                "run",
+                "--prefix",
+                str(prefix),
+                "python",
+                "-m",
+                "pip",
+                "install",
+                "-e",
+                ".[dev]",
+            ],
+            cwd=project_root,
+            timeout=1800,
+        )
+        attempts.append(install)
+        if not bool(install.get("ok")):
+            return InfrastructureRepairResult(
+                repaired=False,
+                capability="workspace_conda",
+                action="declared_dependencies_install_failed",
+                reason=(
+                    str(install.get("stderr_tail", "")).strip()
+                    or str(install.get("error", "")).strip()
+                    or "pip failed to install declared project dependencies"
+                ),
+                candidate_attempts=attempts,
+            )
+
+    node_roots = _declared_node_roots(project_root)
+    missing_node_roots = [
+        root for root in node_roots if not (root / "node_modules").is_dir()
+    ]
+    if missing_node_roots:
+        npm = shutil.which("npm")
+        if not npm:
+            return InfrastructureRepairResult(
+                repaired=False,
+                capability="workspace_conda",
+                action="npm_unavailable",
+                reason=(
+                    "declared package-lock.json files require npm ci, but npm "
+                    "is unavailable on the controller"
+                ),
+                candidate_attempts=attempts,
+            )
+        for node_root in missing_node_roots:
+            npm_install = _run_repair_command(
+                [npm, "ci"],
+                cwd=node_root,
+                timeout=1800,
+            )
+            attempts.append(npm_install)
+            if not bool(npm_install.get("ok")):
+                relative = node_root.relative_to(project_root).as_posix() or "."
+                return InfrastructureRepairResult(
+                    repaired=False,
+                    capability="workspace_conda",
+                    action="declared_node_dependencies_install_failed",
+                    reason=(
+                        str(npm_install.get("stderr_tail", "")).strip()
+                        or str(npm_install.get("error", "")).strip()
+                        or f"npm ci failed for {relative}"
+                    ),
+                    candidate_attempts=attempts,
+                )
+
+    probe = _run_repair_command(
+        [
+            conda,
+            "run",
+            "--prefix",
+            str(prefix),
+            "python",
+            "-c",
+            "import pytest; print('workspace-conda-ready')",
+        ],
+        cwd=project_root,
+        timeout=120,
+    )
+    attempts.append(probe)
+    if not bool(probe.get("ok")):
+        return InfrastructureRepairResult(
+            repaired=False,
+            capability="workspace_conda",
+            action="workspace_conda_probe_failed",
+            reason=(
+                str(probe.get("stderr_tail", "")).strip()
+                or str(probe.get("error", "")).strip()
+                or "workspace-local Conda probe failed"
+            ),
+            probe=probe,
+            candidate_attempts=attempts,
+        )
+    managed_manifest = prefix / ".auto-agents-managed.json"
+    managed_manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "capability": "workspace_conda",
+                "source_kind": spec_kind,
+                "source_path": spec_path.name,
+                "python_version": (
+                    _declared_python_version(project_root, spec_path)
+                    if spec_kind == "pyproject"
+                    else ""
+                ),
+                "created_at": _utc_now(),
+                "node_roots": [
+                    root.relative_to(project_root).as_posix() or "."
+                    for root in node_roots
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return InfrastructureRepairResult(
+        repaired=True,
+        capability="workspace_conda",
+        action=f"recreated_from_{spec_kind}",
+        reason=(
+            "workspace-local Conda prefix was recreated from "
+            f"{spec_path.name} and passed the pytest import probe"
+        ),
+        environment={"AUTO_AGENTS_WORKSPACE_CONDA": str(prefix)},
+        probe=probe,
+        candidate_attempts=attempts,
+    )
 
 
 def _sha256(path: Path) -> str:

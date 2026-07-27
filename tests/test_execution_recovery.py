@@ -19,6 +19,7 @@ from auto_agents.execution_recovery import (
 )
 from auto_agents.models import AgentResult, AgentTermination, CommandResult, RunState, TaskSpec
 from auto_agents.gates import GateCommandTimeoutError
+from auto_agents.infrastructure_repair import InfrastructureRepairResult
 from auto_agents.git_ops import (
     commit_all,
     commit_changed_paths,
@@ -270,6 +271,116 @@ class ExecutionRecoveryTests(unittest.TestCase):
             tasks = load_task_plan(root)["tasks"]
             self.assertEqual(tasks[0]["title"], "Repair verification infrastructure")
             self.assertIn("all currently eligible workers", tasks[0]["description"])
+
+    def test_workspace_conda_repair_resumes_before_repeat_route_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            state.status = "blocked"
+            incident = ExecutionIncident(
+                incident_id="conda-1",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="baseline",
+                command="conda run -p ./.conda python -m pytest -q",
+                stderr_tail=(
+                    "EnvironmentLocationNotFound: Not a conda environment: "
+                    f"{root / '.conda'}"
+                ),
+                evidence_fingerprint="same-evidence",
+                history=[
+                    {
+                        "event": "route",
+                        "action": "REPAIR_INFRASTRUCTURE",
+                        "evidence_fingerprint": "same-evidence",
+                    }
+                ],
+            )
+            repair = InfrastructureRepairResult(
+                repaired=True,
+                capability="workspace_conda",
+                action="recreated_from_pyproject",
+                reason="ready",
+            )
+
+            with patch(
+                "auto_agents.orchestrator.repair_workspace_local_conda",
+                return_value=repair,
+            ):
+                recovered = orchestrator._apply_execution_incident_diagnosis(
+                    state,
+                    incident,
+                    IncidentDiagnosis(
+                        owner="execution_environment",
+                        action="REPAIR_INFRASTRUCTURE",
+                        confidence=0.95,
+                        reason="workspace prefix is missing",
+                    ),
+                )
+
+            self.assertTrue(recovered)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.last_error, "")
+            self.assertEqual(
+                incident.repair_history[-1]["action"],
+                "recreated_from_pyproject",
+            )
+
+    def test_missing_conda_supersedes_misrouted_target_recovery_task(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            incident = ExecutionIncident(
+                incident_id="runtime-1",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="baseline",
+                command="./.conda/bin/python -m pytest -q tests/test_api.py",
+                diagnosis={
+                    "owner": "target_project",
+                    "action": "RECOVER_TARGET",
+                    "cause_status": "unknown",
+                },
+            )
+            orchestrator._incident_store(state).save(incident, state)
+            task = TaskSpec(
+                task_id="recover-execution-runtime-1-r1",
+                title="Repair verification infrastructure",
+                description="repair",
+                acceptance=["verification runs"],
+                status="in_progress",
+                task_origin="stage_recovery",
+                recovery_history=[
+                    {
+                        "kind": "execution_incident",
+                        "execution_incident_id": incident.incident_id,
+                    }
+                ],
+            )
+            state.tasks = [task]
+            orchestrator._persist_tasks(state.tasks)
+
+            changed = orchestrator._normalize_missing_workspace_dependency_recovery(
+                state
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(state.tasks, [])
+            retired = state.resume_context["retired_workspace_recovery_tasks"]
+            self.assertEqual(
+                retired[0]["task_id"],
+                task.task_id,
+            )
 
     def test_store_persists_incident_and_run_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from auto_agents.execution_recovery import (
     ExecutionIncident,
@@ -11,6 +12,7 @@ from auto_agents.execution_recovery import (
 from auto_agents.infrastructure_repair import (
     InfrastructureRepairResult,
     managed_diagnostic_refs,
+    repair_workspace_local_conda,
     scoped_verification_repair_instructions,
     verification_repair_guard,
 )
@@ -131,3 +133,69 @@ def test_managed_diagnostic_refs_are_bounded(
             "kind": "minidump",
         }
     ]
+
+
+def test_workspace_conda_is_recreated_from_pyproject(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\n"
+        "name = \"demo\"\n"
+        "version = \"0.1.0\"\n"
+        "dependencies = []\n"
+        "[project.optional-dependencies]\n"
+        "dev = [\"pytest>=8\"]\n",
+        encoding="utf-8",
+    )
+    workbench = tmp_path / "workbench"
+    workbench.mkdir()
+    (workbench / "package.json").write_text(
+        '{"name":"demo","version":"1.0.0"}\n',
+        encoding="utf-8",
+    )
+    (workbench / "package-lock.json").write_text(
+        '{"name":"demo","version":"1.0.0","lockfileVersion":3,"packages":{}}\n',
+        encoding="utf-8",
+    )
+    incident = ExecutionIncident(
+        incident_id="conda-1",
+        run_id="run-1",
+        source="gate",
+        kind="gate_reported_infrastructure_error",
+        stage="implement",
+        context="baseline",
+        command="conda run -p ./.conda python -m pytest -q",
+        stderr_tail=(
+            "EnvironmentLocationNotFound: Not a conda environment: "
+            f"{tmp_path / '.conda'}"
+        ),
+    )
+    successes = [
+        {"ok": True, "returncode": 0},
+        {"ok": True, "returncode": 0},
+        {"ok": True, "returncode": 0},
+        {"ok": True, "returncode": 0, "stdout_tail": "workspace-conda-ready"},
+    ]
+    responses = iter(successes)
+
+    def run_command(command, **_kwargs):
+        if "create" in command:
+            (tmp_path / ".conda").mkdir()
+        return next(responses)
+
+    with patch(
+        "auto_agents.infrastructure_repair.shutil.which",
+        return_value="/opt/conda/bin/conda",
+    ), patch(
+        "auto_agents.infrastructure_repair._run_repair_command",
+        side_effect=run_command,
+    ) as run:
+        result = repair_workspace_local_conda(tmp_path, incident)
+
+    assert result.repaired is True
+    assert result.capability == "workspace_conda"
+    assert result.action == "recreated_from_pyproject"
+    commands = [call.args[0] for call in run.call_args_list]
+    assert commands[0][1:3] == ["create", "--yes"]
+    assert "python=3.11" in commands[0]
+    assert commands[1][-3:] == ["install", "-e", ".[dev]"]
+    assert commands[2][-1] == "ci"
+    assert "import pytest" in commands[3][-1]

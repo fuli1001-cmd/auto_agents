@@ -292,6 +292,56 @@ def cherry_pick_no_commit(project_root: Path, commit_sha: str) -> None:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git cherry-pick failed")
 
 
+def apply_commit_no_commit_excluding(
+    project_root: Path,
+    commit_sha: str,
+    exclude_prefixes: tuple[str, ...],
+) -> None:
+    """Apply a commit delta while protecting workspace-local dependency roots."""
+
+    normalized_excludes = tuple(
+        dict.fromkeys(
+            prefix.replace("\\", "/").strip().rstrip("/")
+            for prefix in exclude_prefixes
+            if prefix.replace("\\", "/").strip().rstrip("/")
+        )
+    )
+    if not normalized_excludes:
+        cherry_pick_no_commit(project_root, commit_sha)
+        return
+
+    show_args = ["show", "--format=", "--binary", commit_sha, "--", "."]
+    show_args.extend(
+        f":(top,exclude,literal){prefix}" for prefix in normalized_excludes
+    )
+    patch = _git(project_root, *show_args)
+    if patch.returncode != 0:
+        raise RuntimeError(
+            patch.stderr.strip()
+            or patch.stdout.strip()
+            or "git show for filtered commit failed"
+        )
+    if not patch.stdout:
+        return
+
+    applied = subprocess.run(
+        ["git", "apply", "--3way", "--index", "-"],
+        cwd=str(project_root),
+        text=True,
+        encoding="utf-8",
+        input=patch.stdout,
+        capture_output=True,
+    )
+    if applied.returncode == 0:
+        return
+    _git(project_root, "reset", "--merge", "HEAD")
+    raise RuntimeError(
+        applied.stderr.strip()
+        or applied.stdout.strip()
+        or "filtered commit apply failed"
+    )
+
+
 def abort_cherry_pick(project_root: Path) -> str:
     result = _git(project_root, "cherry-pick", "--abort")
     if result.returncode != 0:
