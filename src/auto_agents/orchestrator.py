@@ -88,7 +88,11 @@ from .gates import (
     run_commands_collect_all,
 )
 from .gate_baseline_cache import GateBaselineCache
-from .gate_execution import LocalGatePlanExecutor
+from .gate_execution import (
+    LocalGatePlanExecutor,
+    discover_dependency_links,
+    install_dependency_links,
+)
 from .distributed_gates import DistributedGatePlanExecutor
 from .workers import gate_environment_fingerprint
 from .execution_recovery import (
@@ -207,6 +211,15 @@ _FAILOVER_PATTERN = re.compile(
     r"|smart.timeout|semantic.stall|provider.idle|tool.stall"
     r"|loop.detected|safety.ceiling|protocol.error",
     re.IGNORECASE,
+)
+
+VERIFY_BASELINE_SCHEMA_VERSION = 1
+_NON_COMPARABLE_BASELINE_PREFIXES = (
+    "cmd-timeout:",
+    "cmd-stalled:",
+    "cmd-terminated:",
+    "infra:",
+    "reason:",
 )
 _FAILOVER_TIMEOUT_PATTERN = re.compile(r"timed?\s*out|stalled", re.IGNORECASE)
 _FAILOVER_QUOTA_PATTERN = re.compile(
@@ -582,6 +595,153 @@ class Orchestrator:
         state.rejected_stage = ""
         state.rejection_reason = ""
         state.agent_attempts.pop("requirements_audit_recovery", None)
+        return True
+
+    def _normalize_legacy_verify_baselines(self, state: RunState) -> bool:
+        tasks = list(state.tasks)
+        if not tasks:
+            try:
+                tasks = self._load_tasks_from_plan()
+            except Exception:
+                return False
+        changed = False
+        invalid_task_ids: List[str] = []
+        reopened_blocked_task = False
+        for task in tasks:
+            if (
+                task.verify_baseline_schema_version
+                >= VERIFY_BASELINE_SCHEMA_VERSION
+            ):
+                continue
+            if not task.verify_baseline_ref:
+                continue
+            if self._baseline_failure_ids_are_valid(
+                task.verify_baseline_failures
+            ) or task.status == "done":
+                task.verify_baseline_schema_version = (
+                    VERIFY_BASELINE_SCHEMA_VERSION
+                )
+                changed = True
+                continue
+
+            invalid_task_ids.append(task.task_id)
+            task.verify_baseline_ref = ""
+            task.verify_baseline_failures = []
+            task.verify_baseline_schema_version = (
+                VERIFY_BASELINE_SCHEMA_VERSION
+            )
+            task.recovery_epoch = int(task.recovery_epoch) + 1
+            task.recovery_round = 0
+            self._begin_fresh_verify_retry_lifecycle(task)
+            if task.status != "done":
+                reopened_blocked_task = (
+                    reopened_blocked_task
+                    or task.status in {"blocked", "in_progress"}
+                )
+                task.status = "pending"
+                task.commit_sha = ""
+            state.task_review_cache.pop(task.task_id, None)
+            self._clear_implementation_ready_marker(state, task)
+            self._clear_stale_implementation_resume_markers(
+                state,
+                task_ids=[task.task_id],
+            )
+            changed = True
+
+        if (
+            state.implement_verify_baseline_ref
+            and not self._baseline_failure_ids_are_valid(
+                state.implement_verify_baseline_failures
+            )
+        ):
+            state.implement_verify_baseline_ref = ""
+            state.implement_verify_baseline_failures = []
+            changed = True
+
+        if not changed:
+            return False
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        if invalid_task_ids:
+            migrations = state.resume_context.get(
+                "verify_baseline_migrations", {}
+            )
+            migration_map = (
+                dict(migrations) if isinstance(migrations, dict) else {}
+            )
+            for task_id in invalid_task_ids:
+                migration_map[task_id] = {
+                    "schema_version": VERIFY_BASELINE_SCHEMA_VERSION,
+                    "migrated_at": utc_now_iso(),
+                    "reason": "legacy non-comparable test baseline",
+                }
+            state.resume_context["verify_baseline_migrations"] = migration_map
+            route_task_id = str(
+                state.last_recovery_route.get("task_id", "")
+            )
+            if route_task_id in invalid_task_ids:
+                state.last_recovery_route = {
+                    "task_id": route_task_id,
+                    "outcome": "baseline_migrated",
+                    "failure_kind": "invalid_verify_baseline",
+                    "reason": (
+                        "legacy command-level test baseline was discarded "
+                        "and will be recaptured"
+                    ),
+                    "engine_invariant": "",
+                }
+            if (
+                route_task_id in invalid_task_ids
+                or (state.status == "blocked" and reopened_blocked_task)
+            ):
+                state.active_blocker = {}
+                state.status = "pending"
+                state.last_error = ""
+            for task in tasks:
+                if task.task_id not in invalid_task_ids:
+                    continue
+                review_evidence = "\n".join(
+                    [
+                        task.review_summary,
+                        *[
+                            str(entry.get("summary", ""))
+                            for entry in task.review_history
+                            if isinstance(entry, dict)
+                        ],
+                    ]
+                )
+                if not re.search(
+                    r"provider[_ -]?reference|canonical|"
+                    r"\.auto-agents/docs/provider_references/",
+                    review_evidence,
+                    flags=re.IGNORECASE,
+                ):
+                    continue
+                references = sorted(
+                    self._provider_reference_paths_from_review(
+                        review_evidence
+                    )
+                )
+                if not references:
+                    continue
+                self._rewind_state_from_stage(
+                    state,
+                    "provider_research",
+                )
+                state.rejected_stage = "provider_research"
+                state.rejection_reason = (
+                    "A legacy invalid verification baseline masked a "
+                    "provider_research-owned canonical document failure.\n\n"
+                    f"{review_evidence.strip()}"
+                )
+                self._mark_provider_references_needs_refresh(
+                    references,
+                    reason=(
+                        f"legacy baseline migration for task "
+                        f"{task.task_id}"
+                    ),
+                )
+                break
         return True
 
     @staticmethod
@@ -1194,6 +1354,8 @@ class Orchestrator:
             self._max_tasks_remaining = max_tasks
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
+            if self._normalize_legacy_verify_baselines(state):
+                save_run_state(self.project_root, state)
             restarted_before_preconditions = False
             if state.workflow_version < 2:
                 legacy_progress = any(
@@ -5764,6 +5926,11 @@ class Orchestrator:
                         continue
                     self._apply_parallel_task_failure_snapshot(task, dict(result["task"]))
                     task.status = "blocked"
+                    self._record_task_failure_checkpoint(
+                        state,
+                        task,
+                        result,
+                    )
                     rewind_stage = str(result.get("rewind_to_stage", "")).strip()
                     if (
                         rewind_stage in STAGE_ORDER
@@ -5814,6 +5981,7 @@ class Orchestrator:
                 integrated_paths.update(result_changed_paths)
                 self._record_parallel_task_paths(state, task, result_changed_paths)
                 self._delete_parallel_result_ref(str(result.get("result_ref", "")))
+                self._clear_task_failure_checkpoint(state, task.task_id)
                 self._increment_parallel_metrics(state, integrated=1)
                 batch_integrated += 1
                 for command in self._build_task_verify_commands(task):
@@ -6009,6 +6177,14 @@ class Orchestrator:
         ):
             self._persist_tasks(tasks)
 
+        restored_checkpoint_ref = self._restore_task_failure_checkpoint(
+            state,
+            task,
+            self.project_root,
+        )
+        if restored_checkpoint_ref:
+            resume_existing = True
+
         gate_result = self._execute_task_with_retries(
             state,
             task,
@@ -6018,6 +6194,14 @@ class Orchestrator:
         if not gate_result["ok"]:
             rewind_stage = str(gate_result.get("rewind_to_stage", "")).strip()
             if rewind_stage:
+                state.task_failure_checkpoints[task.task_id] = (
+                    self._preserve_failed_task_checkpoint(
+                        state,
+                        task,
+                        self.project_root,
+                        gate_result,
+                    )
+                )
                 rewind_state = self._handle_review_stage_rewind(
                     state,
                     task,
@@ -6049,6 +6233,7 @@ class Orchestrator:
             )
 
         task.status = "done"
+        self._clear_task_failure_checkpoint(state, task.task_id)
         self._clear_implementation_ready_marker(state, task)
         task.review_summary = str(gate_result["review"])
         commit_message = task.commit_message or self.config.git.commit_message_template.format(
@@ -6440,6 +6625,172 @@ class Orchestrator:
             f"refs/auto-agents/runs/{component(run_id)}/tasks/{component(task_id)}"
         )
 
+    @staticmethod
+    def _parallel_failure_ref(
+        run_id: str,
+        task_id: str,
+        verify_retry_epoch: int,
+    ) -> str:
+        def component(value: str) -> str:
+            normalized = re.sub(
+                r"[^A-Za-z0-9._-]+", "-", value
+            ).strip(".-")
+            return normalized or "unknown"
+
+        return (
+            f"refs/auto-agents/runs/{component(run_id)}/failed-tasks/"
+            f"{component(task_id)}/epoch-{max(0, int(verify_retry_epoch))}"
+        )
+
+    def _archive_failed_task_diagnostics(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        worktree_path: Path,
+        gate_result: Dict[str, object],
+    ) -> List[str]:
+        destination = (
+            run_path(self.project_root, state.run_id)
+            / "failed-tasks"
+            / task.task_id
+            / f"epoch-{max(0, int(task.verify_retry_epoch))}"
+        )
+        destination.mkdir(parents=True, exist_ok=True)
+        archived: List[str] = []
+        source_dir = (
+            worktree_path / ".auto-agents" / "failed-verification-logs"
+        )
+        if source_dir.is_dir():
+            for source in sorted(source_dir.glob("*.log")):
+                target = destination / source.name
+                shutil.copy2(source, target)
+                archived.append(self._relative_repo_path(target))
+        metadata_path = destination / "failure.json"
+        write_json(
+            metadata_path,
+            {
+                "schema_version": 1,
+                "task_id": task.task_id,
+                "failure_ids": [
+                    str(item).strip()
+                    for item in gate_result.get("failure_ids", []) or []
+                    if str(item).strip()
+                ],
+                "reason": str(gate_result.get("reason", "")).strip(),
+                "review": str(gate_result.get("review", "")).strip(),
+                "created_at": utc_now_iso(),
+            },
+        )
+        archived.append(self._relative_repo_path(metadata_path))
+        return archived
+
+    def _preserve_failed_task_checkpoint(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        worktree_path: Path,
+        gate_result: Dict[str, object],
+    ) -> Dict[str, object]:
+        candidate_paths = changed_paths(
+            worktree_path,
+            ignored_prefixes=(".auto-agents/", ".antigravitycli/"),
+        )
+        checkpoint_ref = self._parallel_failure_ref(
+            state.run_id,
+            task.task_id,
+            task.verify_retry_epoch,
+        )
+        has_candidate_changes = bool(candidate_paths)
+        if has_candidate_changes:
+            checkpoint_sha = commit_all_except(
+                worktree_path,
+                f"checkpoint({task.task_id}): preserve failed candidate",
+                exclude_prefixes=(".auto-agents", ".antigravitycli"),
+            )
+            update_ref(self.project_root, checkpoint_ref, checkpoint_sha)
+        else:
+            checkpoint_sha = head_ref(worktree_path)
+        diagnostics = self._archive_failed_task_diagnostics(
+            state,
+            task,
+            worktree_path,
+            gate_result,
+        )
+        return {
+            "schema_version": 1,
+            "task_id": task.task_id,
+            "ref": checkpoint_ref if has_candidate_changes else "",
+            "commit_sha": checkpoint_sha,
+            "base_ref": self._git_ref_from_verify_baseline_ref(
+                task.verify_baseline_ref
+            ),
+            "changed_paths": list(candidate_paths),
+            "has_candidate_changes": has_candidate_changes,
+            "failure_ids": [
+                str(item).strip()
+                for item in gate_result.get("failure_ids", []) or []
+                if str(item).strip()
+            ],
+            "diagnostic_paths": diagnostics,
+            "verify_retry_epoch": int(task.verify_retry_epoch),
+            "recovery_epoch": int(task.recovery_epoch),
+            "recovery_round": int(task.recovery_round),
+            "owner_stage": str(
+                gate_result.get("rewind_to_stage", "")
+            ).strip(),
+            "status": "recoverable",
+            "created_at": utc_now_iso(),
+        }
+
+    def _record_task_failure_checkpoint(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        result: Dict[str, object],
+    ) -> None:
+        payload = result.get("failure_checkpoint")
+        if not isinstance(payload, dict):
+            return
+        state.task_failure_checkpoints[task.task_id] = dict(payload)
+
+    def _restore_task_failure_checkpoint(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        project_root: Path,
+    ) -> str:
+        checkpoint = state.task_failure_checkpoints.get(task.task_id)
+        if not isinstance(checkpoint, dict):
+            return ""
+        checkpoint_ref = str(checkpoint.get("ref", "")).strip()
+        if (
+            not checkpoint_ref
+            or not bool(checkpoint.get("has_candidate_changes"))
+            or not ref_exists(self.project_root, checkpoint_ref)
+        ):
+            return ""
+        try:
+            cherry_pick_no_commit(project_root, checkpoint_ref)
+        except RuntimeError as error:
+            abort_cherry_pick(project_root)
+            checkpoint["status"] = "replay_conflict"
+            checkpoint["replay_error"] = str(error)
+            checkpoint["updated_at"] = utc_now_iso()
+            return ""
+        checkpoint["status"] = "applied"
+        checkpoint["updated_at"] = utc_now_iso()
+        return checkpoint_ref
+
+    def _clear_task_failure_checkpoint(
+        self,
+        state: RunState,
+        task_id: str,
+    ) -> None:
+        checkpoint = state.task_failure_checkpoints.pop(task_id, None)
+        if not isinstance(checkpoint, dict):
+            return
+        self._delete_parallel_result_ref(str(checkpoint.get("ref", "")))
+
     def _delete_parallel_result_ref(self, ref_name: str) -> None:
         if not ref_name or not ref_exists(self.project_root, ref_name):
             return
@@ -6591,9 +6942,11 @@ class Orchestrator:
         worktree_path = self._parallel_worktree_root() / state.run_id / task_id
         worktree_created = False
         try:
+            dependency_links = discover_dependency_links(self.project_root)
             self._reconcile_managed_parallel_worktree(worktree_path)
             add_worktree(self.project_root, worktree_path, ref=base_ref)
             worktree_created = True
+            install_dependency_links(worktree_path, dependency_links)
             worker = self.__class__(
                 worktree_path,
                 agent_output_stream=self.agent_output_stream,
@@ -6609,11 +6962,42 @@ class Orchestrator:
             worker_task = next(task for task in worker_tasks if task.task_id == task_id)
             if worker._ensure_task_verify_baseline(worker_task):
                 worker._persist_tasks(worker_tasks)
-            gate_result = worker._execute_task_with_retries(worker_state, worker_task, resume_existing=False)
+            restored_checkpoint_ref = self._restore_task_failure_checkpoint(
+                state,
+                worker_task,
+                worktree_path,
+            )
+            gate_result = worker._execute_task_with_retries(
+                worker_state,
+                worker_task,
+                resume_existing=bool(restored_checkpoint_ref),
+            )
             if not gate_result["ok"]:
                 worker_task.status = "blocked"
                 worker_task.review_summary = str(gate_result["review"])
+                checkpoint = self._preserve_failed_task_checkpoint(
+                    state,
+                    worker_task,
+                    worktree_path,
+                    gate_result,
+                )
                 result = self._parallel_task_failure_result(worker_task, gate_result)
+                result["failure_checkpoint"] = checkpoint
+                result["diagnostic_paths"] = list(
+                    checkpoint.get("diagnostic_paths", [])
+                )
+                stable_logs = [
+                    str(path)
+                    for path in checkpoint.get("diagnostic_paths", [])
+                    if str(path).endswith(".log")
+                ]
+                if stable_logs:
+                    result["reason"] = re.sub(
+                        r"\.auto-agents/failed-verification-logs/"
+                        r"[A-Za-z0-9_.-]+\.log",
+                        stable_logs[0],
+                        str(result.get("reason", "")),
+                    )
                 return dict(self._rebase_parallel_worker_paths(result, worktree_path))
 
             worker_task.status = "done"
@@ -6641,6 +7025,7 @@ class Orchestrator:
                 "base_ref": base_ref,
                 "changed_paths": worker_changed_paths,
                 "verify_current_failure_ids": list(gate_result.get("verify_current_failure_ids", [])),
+                "recovered_checkpoint_ref": restored_checkpoint_ref,
             }
             return dict(self._rebase_parallel_worker_paths(result, worktree_path))
         except GateCommandExecutionError:
@@ -6860,6 +7245,7 @@ class Orchestrator:
                 pending.pop(task_id, None)
                 self._set_parallel_pending_integrations(state, pending)
                 self._delete_parallel_result_ref(result_ref)
+                self._clear_task_failure_checkpoint(state, task_id)
                 self._increment_parallel_metrics(state, integrated=1, replayed=1)
                 self._warm_clean_head_verify_baseline(
                     state,
@@ -6927,6 +7313,9 @@ class Orchestrator:
         task.recovery_epoch = updated.recovery_epoch
         task.recovery_round = updated.recovery_round
         task.verify_retry_epoch = updated.verify_retry_epoch
+        task.verify_baseline_schema_version = (
+            updated.verify_baseline_schema_version
+        )
 
     def _apply_parallel_task_snapshot(self, task: TaskSpec, payload: Dict[str, object]) -> None:
         self._copy_parallel_task_snapshot_fields(task, payload)
@@ -9214,6 +9603,125 @@ class Orchestrator:
         return f"{base}:{verification_context}" if verification_context else base
 
     @staticmethod
+    def _is_test_verification_command(command: str) -> bool:
+        if build_failure_identity_diagnostic_command(command):
+            return True
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return False
+        return "unittest" in parts or any(
+            part.endswith(("/pytest", "/vitest")) for part in parts
+        )
+
+    @classmethod
+    def _baseline_failure_ids_are_valid(
+        cls,
+        failure_ids: Iterable[str],
+    ) -> bool:
+        for raw_failure_id in failure_ids:
+            failure_id = str(raw_failure_id).strip()
+            if not failure_id:
+                continue
+            if failure_id.startswith(_NON_COMPARABLE_BASELINE_PREFIXES):
+                return False
+            if failure_id.startswith("cmd:") and cls._is_test_verification_command(
+                failure_id[len("cmd:") :]
+            ):
+                return False
+        return True
+
+    def _validated_baseline_failures(
+        self,
+        gate: GateResult,
+        *,
+        context: str,
+        task_id: str = "",
+    ) -> List[str]:
+        if gate.ok:
+            return []
+        extraction = extract_failure_info(gate)
+        failures = [str(item).strip() for item in extraction.failure_ids if str(item).strip()]
+        if self._baseline_failure_ids_are_valid(failures):
+            return self._normalize_verify_failure_ids(failures, gate.summary)
+
+        diagnostic_gate = self._run_verify_failure_identity_diagnostic(gate)
+        if diagnostic_gate is not None:
+            diagnostic_extraction = extract_failure_info(diagnostic_gate)
+            diagnostic_failures = [
+                str(item).strip()
+                for item in diagnostic_extraction.failure_ids
+                if str(item).strip()
+            ]
+            non_test_command_failures = [
+                failure_id
+                for failure_id in failures
+                if failure_id.startswith("cmd:")
+                and not self._is_test_verification_command(
+                    failure_id[len("cmd:") :]
+                )
+            ]
+            combined = list(
+                dict.fromkeys(diagnostic_failures + non_test_command_failures)
+            )
+            if (
+                diagnostic_extraction.comparable
+                and combined
+                and self._baseline_failure_ids_are_valid(combined)
+            ):
+                return self._normalize_verify_failure_ids(combined, diagnostic_gate.summary)
+
+        failed_result = next((result for result in gate.commands if not result.ok), None)
+        incident_result = (
+            replace(
+                failed_result,
+                infrastructure_error=True,
+                infrastructure_failure_id="baseline_failure_identity_unresolved",
+                infrastructure_contract="stable_test_failure_ids",
+            )
+            if failed_result is not None
+            else None
+        )
+        failure_detail = ""
+        if failed_result is not None:
+            failure_detail = self._truncate_feedback_excerpt(
+                failed_result.stderr or failed_result.stdout,
+                limit=1200,
+            )
+            if (
+                self._is_test_verification_command(
+                    failed_result.command
+                )
+                and re.search(
+                    r"(?:file or directory )?not found",
+                    failure_detail,
+                    flags=re.IGNORECASE,
+                )
+            ):
+                failure_detail = (
+                    f"missing pytest target: {failure_detail}"
+                )
+            if ".conda" in failed_result.command:
+                conda_hint = (
+                    " verify that .conda/conda-meta exists and the project "
+                    "conda prefix is available;"
+                )
+            else:
+                conda_hint = ""
+        else:
+            conda_hint = ""
+        raise GateCommandInfrastructureError(
+            f"{context} failed before producing stable test-case failure ids; "
+            "the result was not cached as a semantic baseline"
+            + conda_hint
+            + (f" {failure_detail}" if failure_detail else ""),
+            result=incident_result,
+            context=context,
+            baseline=True,
+            task_id=task_id,
+        )
+
+    @staticmethod
     def _git_ref_from_verify_baseline_ref(baseline_ref: str) -> str:
         candidate = str(baseline_ref or "").strip()
         if not candidate:
@@ -9244,10 +9752,15 @@ class Orchestrator:
             verification_context = str(audit_result.get("input_context_sha256", ""))
         baseline_ref = self._task_verify_baseline_ref(verification_context)
         task_commands = self._build_task_verify_commands(task)
-        if task.verify_baseline_ref == baseline_ref:
+        if (
+            task.verify_baseline_ref == baseline_ref
+            and task.verify_baseline_schema_version
+            == VERIFY_BASELINE_SCHEMA_VERSION
+        ):
             return False
-        task.verify_baseline_ref = baseline_ref
         if not task_commands:
+            task.verify_baseline_ref = baseline_ref
+            task.verify_baseline_schema_version = VERIFY_BASELINE_SCHEMA_VERSION
             return True
         cached_failures = self._gate_baseline_cache.get(
             baseline_ref,
@@ -9255,8 +9768,15 @@ class Orchestrator:
             collect_all=True,
             parallel_groups=[],
         )
+        if (
+            cached_failures is not None
+            and not self._baseline_failure_ids_are_valid(cached_failures)
+        ):
+            cached_failures = None
         if cached_failures is not None:
             task.verify_baseline_failures = list(cached_failures)
+            task.verify_baseline_ref = baseline_ref
+            task.verify_baseline_schema_version = VERIFY_BASELINE_SCHEMA_VERSION
             return True
         gate, mutation_error = self._run_missing_baseline_commands(
             baseline_ref,
@@ -9270,12 +9790,11 @@ class Orchestrator:
         )
         if mutation_error:
             raise RuntimeError(mutation_error)
-        failures = (
-            self._normalize_verify_failure_ids(extract_failure_ids(gate), gate.summary)
-            if not gate.ok
-            else []
+        failures = self._validated_baseline_failures(
+            gate,
+            context=f"task baseline verification commands ({task.task_id})",
+            task_id=task.task_id,
         )
-        task.verify_baseline_failures = list(failures)
         self._gate_baseline_cache.put(
             baseline_ref,
             task_commands,
@@ -9289,7 +9808,10 @@ class Orchestrator:
             baseline_ref, task_commands, collect_all=True
         )
         if cached_failures is not None:
-            task.verify_baseline_failures = list(cached_failures)
+            failures = list(cached_failures)
+        task.verify_baseline_failures = list(failures)
+        task.verify_baseline_ref = baseline_ref
+        task.verify_baseline_schema_version = VERIFY_BASELINE_SCHEMA_VERSION
         return True
 
     def _ensure_implement_verify_baseline(
@@ -9370,12 +9892,9 @@ class Orchestrator:
                 )
                 if mutation_error:
                     raise RuntimeError(mutation_error)
-                failures = (
-                    self._normalize_verify_failure_ids(
-                        extract_failure_ids(gate), gate.summary
-                    )
-                    if not gate.ok
-                    else []
+                failures = self._validated_baseline_failures(
+                    gate,
+                    context="implement verify baseline commands",
                 )
                 self._gate_baseline_cache.put(
                     baseline_ref,
@@ -10665,6 +11184,66 @@ class Orchestrator:
         if len(owners) == 1:
             return next(iter(owners))
         return ""
+
+    def _verification_failure_owner_route(
+        self,
+        task: TaskSpec,
+        verify_result: Dict[str, object],
+    ) -> Tuple[str, str]:
+        current_evidence = "\n".join(
+            value
+            for value in (
+                str(verify_result.get("reason", "")).strip(),
+                str(verify_result.get("raw_output", "")).strip(),
+                "\n".join(
+                    str(item).strip()
+                    for item in verify_result.get("failure_ids", []) or []
+                    if str(item).strip()
+                ),
+            )
+            if value
+        )
+        provider_signal = re.search(
+            r"provider[_ -]?reference|canonical[_ -]?reference|"
+            r"canonical provider|\.auto-agents/docs/provider_references/",
+            current_evidence,
+            flags=re.IGNORECASE,
+        )
+        if not provider_signal:
+            return "", ""
+
+        historical_feedback = "\n".join(
+            str(entry.get("summary", "")).strip()
+            for entry in task.review_history
+            if isinstance(entry, dict)
+            and str(entry.get("summary", "")).strip()
+        )
+        combined = "\n\n".join(
+            value
+            for value in (
+                current_evidence,
+                task.review_summary.strip(),
+                historical_feedback,
+            )
+            if value
+        )
+        references = sorted(
+            self._provider_reference_paths_from_review(combined)
+        )
+        if not references:
+            return "", ""
+        feedback = (
+            f"{current_evidence}\n\n"
+            "The failing verification targets provider_research-owned "
+            "canonical reference(s): "
+            + ", ".join(references)
+        )
+        if historical_feedback:
+            feedback = (
+                f"{feedback}\n\nPrevious review evidence:\n"
+                f"{historical_feedback}"
+            )
+        return "provider_research", feedback
 
     @staticmethod
     def _review_feedback_is_obsolete_for_task(task: TaskSpec, text: str) -> bool:
@@ -12391,6 +12970,14 @@ class Orchestrator:
                     else None
                 )
                 rewind_stage = str(verify_result.get("rewind_to_stage", "")).strip()
+                owner_feedback = ""
+                if not rewind_stage:
+                    rewind_stage, owner_feedback = (
+                        self._verification_failure_owner_route(
+                            task,
+                            verify_result,
+                        )
+                    )
                 if rewind_stage:
                     self._record_verify_result(
                         task,
@@ -12403,15 +12990,22 @@ class Orchestrator:
                     self._emit_task_verify_result(task, "fail", last_reason)
                     return {
                         "ok": False,
-                        "review": last_reason,
+                        "review": owner_feedback or last_reason,
                         "reason": last_reason,
                         "failure_ids": list(failure_ids),
+                        "comparable_failures": comparable_failures,
                         "rewind_to_stage": rewind_stage,
                         "expected_owner_stage": str(
                             verify_result.get("expected_owner_stage", rewind_stage)
                         ).strip(),
                         "rewind_reason": str(
-                            verify_result.get("rewind_reason", last_reason)
+                            verify_result.get(
+                                "rewind_reason",
+                                (
+                                    f"verification failure points to "
+                                    f"{rewind_stage}-owned source-of-truth"
+                                ),
+                            )
                         ),
                     }
                 verify_analysis = self._analyze_verify_failure(
@@ -13471,6 +14065,29 @@ class Orchestrator:
         *,
         comparable: bool = True,
     ) -> Dict[str, object]:
+        candidate_fingerprint = (
+            self._worktree_fingerprint_excluding_agent_instructions()
+        )
+
+        def same_candidate(entry: Dict[str, object]) -> bool:
+            entry_fingerprint = str(
+                entry.get("candidate_fingerprint", "")
+            )
+            entry_schema = int(
+                entry.get("verify_baseline_schema_version", 0) or 0
+            )
+            if (
+                int(task.verify_baseline_schema_version) == 0
+                and not entry_fingerprint
+                and entry_schema == 0
+            ):
+                return True
+            return (
+                entry_fingerprint == candidate_fingerprint
+                and entry_schema
+                == int(task.verify_baseline_schema_version)
+            )
+
         active_history = [
             entry
             for entry in task.verify_history
@@ -13499,7 +14116,11 @@ class Orchestrator:
             matching_entries = [
                 entry
                 for entry in prior_non_comparable
-                if tuple(self._verify_failure_signature_from_entry(entry)) == current_signature
+                if (
+                    tuple(self._verify_failure_signature_from_entry(entry))
+                    == current_signature
+                    and same_candidate(entry)
+                )
             ]
             if matching_entries:
                 first_attempt = matching_entries[0].get("attempt", "?")
@@ -13535,7 +14156,11 @@ class Orchestrator:
         latest_signature = tuple(self._verify_failure_signature_from_entry(latest_entry))
         matching_entries = [
             entry for entry in prior_failures
-            if tuple(self._verify_failure_signature_from_entry(entry)) == current_signature
+            if (
+                tuple(self._verify_failure_signature_from_entry(entry))
+                == current_signature
+                and same_candidate(entry)
+            )
         ]
         if matching_entries:
             first_attempt = matching_entries[0].get("attempt", "?")
@@ -13642,8 +14267,8 @@ class Orchestrator:
             "Treat this as a product-contract or gate-scope issue instead of retrying implementation."
         )
 
-    @staticmethod
     def _record_verify_result(
+        self,
         task: TaskSpec,
         attempt: int,
         decision: str,
@@ -13658,6 +14283,12 @@ class Orchestrator:
             "recovery_epoch": int(task.recovery_epoch),
             "recovery_round": int(task.recovery_round),
             "verify_retry_epoch": int(task.verify_retry_epoch),
+            "verify_baseline_schema_version": int(
+                task.verify_baseline_schema_version
+            ),
+            "candidate_fingerprint": (
+                self._worktree_fingerprint_excluding_agent_instructions()
+            ),
         }
         normalized_failure_ids = [str(item).strip() for item in (failure_ids or []) if str(item).strip()]
         if normalized_failure_ids:

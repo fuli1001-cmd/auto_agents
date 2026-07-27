@@ -19,7 +19,10 @@ from .gate_execution import (
     LocalGatePlanExecutor,
     exclusive_resource_lease,
 )
-from .gates import classify_reported_infrastructure_failure
+from .gates import (
+    GateCommandInfrastructureError,
+    classify_reported_infrastructure_failure,
+)
 from .execution_recovery import ExecutionIncident
 from .infrastructure_repair import repair_execution_infrastructure
 from .models import CommandResult, GateConfig
@@ -113,6 +116,11 @@ class DistributedGatePlanExecutor:
             )
         ]
         self.local.worker_id = local_id
+        rejection_reasons: list[str] = []
+        if distributed.mode != "off" and cluster is None:
+            rejection_reasons.append(
+                "controller has no paired cluster state"
+            )
         if distributed.mode != "off" and cluster is not None:
             try:
                 discovered = discover_workers(
@@ -125,6 +133,10 @@ class DistributedGatePlanExecutor:
                         "distributed gates are required but LAN discovery failed"
                     )
                 discovered = []
+            if not discovered:
+                rejection_reasons.append(
+                    "discovery returned no LAN worker before the configured timeout"
+                )
             candidates = []
             for worker in discovered:
                 client = WorkerClient(
@@ -150,11 +162,17 @@ class DistributedGatePlanExecutor:
                     worker, client = futures[future]
                     try:
                         probes[worker.worker_id] = (worker, client, future.result())
-                    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+                    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+                        rejection_reasons.append(
+                            f"{worker.worker_id}: probe failed ({error})"
+                        )
                         continue
             for worker_id in sorted(probes):
                 worker, client, probe = probes[worker_id]
                 if not bool(probe.get("ok")):
+                    rejection_reasons.append(
+                        f"{worker_id}: probe returned ok=false"
+                    )
                     continue
                 expected_platform = str(
                     self.environment_manifest.get("platform", "")
@@ -163,6 +181,11 @@ class DistributedGatePlanExecutor:
                     expected_platform
                     and str(probe.get("platform", "")) != expected_platform
                 ):
+                    rejection_reasons.append(
+                        f"{worker_id}: platform mismatch "
+                        f"(controller={expected_platform}, "
+                        f"worker={str(probe.get('platform', '')) or 'unknown'})"
+                    )
                     continue
                 python_manifest = self.environment_manifest.get("python", {})
                 required_python = (
@@ -178,6 +201,9 @@ class DistributedGatePlanExecutor:
                         or required_python not in python_versions
                     )
                 ):
+                    rejection_reasons.append(
+                        f"{worker_id}: Python {required_python} is unavailable"
+                    )
                     continue
                 endpoint = WorkerEndpoint(
                     worker_id=worker.worker_id,
@@ -212,8 +238,24 @@ class DistributedGatePlanExecutor:
                 self.clients[endpoint.worker_id] = client
         if distributed.mode == "required" and len(self.endpoints) == 1:
             self.local.close()
-            raise RuntimeError(
+            detail = "; ".join(rejection_reasons[:8])
+            reason = (
                 "distributed gates are required but no paired LAN worker is available"
+                + (f": {detail}" if detail else "")
+            )
+            raise GateCommandInfrastructureError(
+                reason,
+                result=CommandResult(
+                    command="distributed gate worker discovery",
+                    ok=False,
+                    returncode=1,
+                    stderr=reason,
+                    infrastructure_error=True,
+                    infrastructure_failure_id="paired_lan_worker_unavailable",
+                    infrastructure_capability="distributed_gate_worker",
+                    infrastructure_contract="paired_worker_required",
+                ),
+                context="distributed gate worker discovery",
             )
         for endpoint in self.endpoints:
             self._active_slots[endpoint.worker_id] = 0

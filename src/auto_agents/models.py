@@ -97,6 +97,7 @@ class TaskSpec:
     recovery_history: List[Dict[str, object]] = field(default_factory=list)
     evidence_preflight: Dict[str, object] = field(default_factory=dict)
     verify_retry_epoch: int = 0
+    verify_baseline_schema_version: int = 0
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -157,6 +158,9 @@ class TaskSpec:
                 else {}
             ),
             verify_retry_epoch=max(0, int(data.get("verify_retry_epoch", 0) or 0)),
+            verify_baseline_schema_version=max(
+                0, int(data.get("verify_baseline_schema_version", 0) or 0)
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1013,6 +1017,9 @@ class RunState:
         default_factory=dict
     )
     active_blocker: Dict[str, object] = field(default_factory=dict)
+    task_failure_checkpoints: Dict[str, Dict[str, object]] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -1078,6 +1085,13 @@ class RunState:
                 if isinstance(data.get("active_blocker", {}), dict)
                 else {}
             ),
+            task_failure_checkpoints={
+                str(key): dict(value)
+                for key, value in dict(
+                    data.get("task_failure_checkpoints", {})
+                ).items()
+                if isinstance(value, dict)
+            },
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1113,6 +1127,10 @@ class RunState:
                 self.execution_incident_budget_checkpoint
             ),
             "active_blocker": dict(self.active_blocker),
+            "task_failure_checkpoints": {
+                key: dict(value)
+                for key, value in self.task_failure_checkpoints.items()
+            },
         }
 
 

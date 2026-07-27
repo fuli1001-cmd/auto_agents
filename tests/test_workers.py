@@ -14,7 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gate_execution import GateSnapshotManager
 from auto_agents.distributed_gates import DistributedGatePlanExecutor
-from auto_agents.gates import GateCommandMetadata, run_gate_plan
+from auto_agents.gates import (
+    GateCommandInfrastructureError,
+    GateCommandMetadata,
+    run_gate_plan,
+)
 from auto_agents.models import (
     CommandResult,
     DistributedGatesConfig,
@@ -386,6 +390,41 @@ def test_distributed_executor_uses_controller_as_local_worker(
         )
     assert result.ok
     assert {item.worker_id for item in result.commands} == {"test-worker"}
+
+
+def test_required_distributed_worker_failure_is_infrastructure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = _project(tmp_path)
+    monkeypatch.setenv(
+        "AUTO_AGENTS_CLUSTER_HOME",
+        str(tmp_path / "empty-cluster"),
+    )
+    monkeypatch.setenv(
+        "AUTO_AGENTS_WORKER_CONFIG",
+        str(_worker_config(tmp_path)),
+    )
+    config = GateConfig(
+        isolation=GateIsolationConfig(
+            enabled=True,
+            worktree_root=str(tmp_path / "worktrees"),
+        ),
+        distributed=DistributedGatesConfig(mode="required"),
+    )
+
+    with pytest.raises(
+        GateCommandInfrastructureError,
+        match="no paired LAN worker.*no paired cluster state",
+    ) as raised:
+        with DistributedGatePlanExecutor(project, config, {}):
+            pass
+
+    assert raised.value.result is not None
+    assert (
+        raised.value.result.infrastructure_failure_id
+        == "paired_lan_worker_unavailable"
+    )
 
 
 def test_distributed_executor_reserves_heavy_slots_atomically(

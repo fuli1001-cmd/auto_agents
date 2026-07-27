@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import gate_baseline_cache_path
-from .gates import extract_failure_info
+from .gates import build_failure_identity_diagnostic_command, extract_failure_info
 from .models import CommandResult, GateResult
 
 
 CACHE_VERSION = 4
-EXECUTION_MODE_VERSION = 4
+EXECUTION_MODE_VERSION = 5
 MAX_SUMMARY_BYTES = 8 * 1024
 MAX_ROWS = 5_000
 MAX_AGE_SECONDS = 30 * 24 * 60 * 60
@@ -268,7 +268,23 @@ class GateBaselineCache:
                     result_list = results_by_command.get(command, [])
                     if result_list:
                         result = result_list.pop(0)
-                        if result.termination_reason or result.cleanup_incomplete:
+                        extraction = extract_failure_info(
+                            GateResult(ok=result.ok, commands=[result], summary="")
+                        )
+                        invalid_test_identity = bool(
+                            not result.ok
+                            and not extraction.comparable
+                            and (
+                                build_failure_identity_diagnostic_command(command)
+                                or "unittest" in command
+                            )
+                        )
+                        if (
+                            result.termination_reason
+                            or result.cleanup_incomplete
+                            or result.infrastructure_error
+                            or invalid_test_identity
+                        ):
                             connection.execute(
                                 "DELETE FROM command_entries WHERE cache_key = ?",
                                 (
@@ -282,9 +298,6 @@ class GateBaselineCache:
                                 ),
                             )
                             continue
-                        extraction = extract_failure_info(
-                            GateResult(ok=result.ok, commands=[result], summary="")
-                        )
                         command_failures = extraction.failure_ids if not result.ok else []
                         command_summary = result.stderr or result.stdout or summary
                     elif aggregate_fallback:

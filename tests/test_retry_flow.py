@@ -4051,12 +4051,16 @@ class RetryFlowTests(unittest.TestCase):
 
             state = load_run_state(project_root)
             state.tasks = orchestrator._load_tasks_from_plan()
-            with self.assertRaises(RuntimeError) as ctx:
+            try:
                 orchestrator._run_implementation_loop(state, max_tasks=2)
+            except RuntimeError as error:
+                failure_message = str(error)
+            else:
+                self.fail(stream.getvalue())
 
             self.assertIn(
                 "new verification failure(s) vs task baseline: tests/test_plan_state.py::test_task_001_stays_pending",
-                str(ctx.exception),
+                failure_message,
             )
             self.assertEqual(state.implement_verify_baseline_failures, [])
             self.assertEqual(state.tasks[0].status, "done")
@@ -4591,7 +4595,7 @@ class RetryFlowTests(unittest.TestCase):
             rendered = stream.getvalue()
             self.assertFalse(result["ok"])
             self.assertEqual(orchestrator.adapter.implement_calls, 3)
-            self.assertIn("action=continue-owned-evidence-repair", rendered)
+            self.assertIn("compare=changed-failure-set", rendered)
             self.assertNotIn("stopping retries early", rendered)
             self.assertIn(
                 "not found: " + missing_node_id,
@@ -4663,7 +4667,7 @@ class RetryFlowTests(unittest.TestCase):
             rendered = stream.getvalue()
             self.assertFalse(result["ok"])
             self.assertEqual(orchestrator.adapter.implement_calls, 3)
-            self.assertIn("action=continue-owned-evidence-repair", rendered)
+            self.assertIn("compare=changed-failure-set", rendered)
             self.assertNotIn("stopping retries early", rendered)
             self.assertIn(ref, str(result["reason"]))
 
@@ -4758,7 +4762,9 @@ class RetryFlowTests(unittest.TestCase):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
             self.assertIn(".conda/conda-meta", str(raised.exception))
-            self.assertEqual(orchestrator.adapter.implement_calls, 2)
+            # Baseline preflight rejects an unusable test runtime before an
+            # implementation provider call can consume the retry budget.
+            self.assertEqual(orchestrator.adapter.implement_calls, 0)
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
     def test_task_specific_vitest_verification_skips_global_missing_conda_fast_fail(self) -> None:
@@ -4828,10 +4834,15 @@ class RetryFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
+            (project_root / ".conda").symlink_to(
+                Path(sys.prefix),
+                target_is_directory=True,
+            )
             orchestrator = Orchestrator(project_root)
 
             config = orchestrator.config
             config.gates.commands = ["conda run -p ./.conda python -m pytest -q tests/test_missing.py"]
+            config.gates.require_clean_git_before_task = False
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root)
             orchestrator.adapter = MissingPytestTargetFastFailAdapter(project_root)
@@ -8289,16 +8300,16 @@ class ScopeOverflowTests(unittest.TestCase):
                 commands = []
 
             import auto_agents.orchestrator as orch_mod
-            original_collect = orch_mod.run_commands_collect_all
             original_extract = orch_mod.extract_failure_ids
             try:
-                orch_mod.run_commands_collect_all = lambda *a, **kw: _Gate()
                 orch_mod.extract_failure_ids = lambda gate: ["new:migrated_case", "old:legacy_case"]
                 config.gates.commands = ["echo run"]
                 orchestrator.config = config
+                orchestrator._run_gate_commands_for_commands = (
+                    lambda *args, **kwargs: (_Gate(), "")
+                )
                 result = orchestrator._run_task_verify(task)
             finally:
-                orch_mod.run_commands_collect_all = original_collect
                 orch_mod.extract_failure_ids = original_extract
 
             # Migration is excluded; baseline failure is also excluded → verify passes.
