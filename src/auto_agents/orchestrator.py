@@ -747,6 +747,263 @@ class Orchestrator:
                 break
         return True
 
+    def _latest_review_rewind_incident(
+        self,
+        state: RunState,
+        *,
+        target_stage: str,
+    ) -> Tuple[Optional[Path], Dict[str, object]]:
+        incident_dir = (
+            run_path(self.project_root, state.run_id)
+            / "recovery_incidents"
+        )
+        if not incident_dir.is_dir():
+            return None, {}
+        candidates: List[Path] = []
+        for path in incident_dir.glob("*.json"):
+            try:
+                payload = read_json(path, default={})
+            except Exception:
+                continue
+            if (
+                isinstance(payload, dict)
+                and str(payload.get("target_stage", "")).strip()
+                == target_stage
+            ):
+                candidates.append(path)
+        if not candidates:
+            return None, {}
+        candidates.sort(
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        )
+        latest = candidates[0]
+        payload = read_json(latest, default={})
+        return latest, payload if isinstance(payload, dict) else {}
+
+    def _restore_provider_reference_refresh_incident(
+        self,
+        incident: Dict[str, object],
+    ) -> Tuple[bool, str]:
+        references = {
+            self._normalize_relative_artifact_path(item)
+            for item in incident.get("provider_reference_paths", []) or []
+            if self._normalize_relative_artifact_path(item)
+        }
+        if not references:
+            references = self._provider_reference_paths_from_review(
+                str(incident.get("review", ""))
+            )
+        if not references:
+            return False, ""
+
+        before_payload = incident.get("provider_lock_before", {})
+        before_entries = (
+            dict(before_payload)
+            if isinstance(before_payload, dict)
+            else {}
+        )
+        missing = references - set(before_entries)
+        if missing:
+            fallback = self._provider_reference_entries_at_ref(
+                str(incident.get("rewind_ref", "")).strip(),
+                missing,
+            )
+            before_entries.update(fallback)
+        unresolved = references - set(before_entries)
+        if unresolved:
+            return False, (
+                "cannot safely restore provider reference lock entries from "
+                f"rewind_ref for: {', '.join(sorted(unresolved))}"
+            )
+
+        lock_path = provider_references_lock_path(self.project_root)
+        lock = read_json(lock_path, default={"version": 1, "references": {}})
+        if not isinstance(lock, dict):
+            return False, "provider reference lock is not a JSON object"
+        current_entries = lock.get("references", {})
+        if not isinstance(current_entries, dict):
+            return False, "provider reference lock has an invalid references object"
+
+        task_id = str(incident.get("task_id", "")).strip()
+        marker = (
+            f"Needs refresh: review rejected task {task_id} and requested "
+            "provider_research recovery"
+        )
+        changed = False
+        for reference in sorted(references):
+            before_record = before_entries.get(reference)
+            if not isinstance(before_record, dict):
+                return False, f"provider reference restore record is invalid: {reference}"
+            before_entry = before_record.get("entry")
+            if not isinstance(before_entry, dict):
+                return False, f"provider reference baseline entry is invalid: {reference}"
+
+            current_key = ""
+            current_entry: Optional[Dict[str, object]] = None
+            for key, value in current_entries.items():
+                if not isinstance(value, dict):
+                    continue
+                if (
+                    self._normalize_relative_artifact_path(value.get("path"))
+                    == reference
+                ):
+                    current_key = str(key)
+                    current_entry = value
+                    break
+            if current_entry is None:
+                return False, f"provider reference lock entry is missing: {reference}"
+            if current_entry == before_entry:
+                continue
+            if marker not in str(current_entry.get("notes", "")):
+                return False, (
+                    "provider reference lock changed outside the recorded "
+                    f"misroute and will not be overwritten: {reference}"
+                )
+            current_entries[current_key] = dict(before_entry)
+            changed = True
+
+        if changed:
+            lock["references"] = current_entries
+            write_json(lock_path, lock)
+        return changed, ""
+
+    def _normalize_misrouted_provider_research_resume(
+        self,
+        state: RunState,
+    ) -> bool:
+        if (
+            state.status == "completed"
+            or state.current_stage != "provider_research"
+            or "provider_research" in state.stage_summaries
+        ):
+            return False
+        incident_path, incident = self._latest_review_rewind_incident(
+            state,
+            target_stage="provider_research",
+        )
+        if incident_path is None or not incident:
+            return False
+        incident_id = str(
+            incident.get("incident_id", incident_path.stem)
+        ).strip()
+        route_source = str(incident.get("route_source", "")).strip()
+        legacy_owner_route = str(
+            incident.get("rewind_reason", "")
+        ).strip().startswith(
+            "verification failure points to provider_research-owned"
+        )
+        if (
+            route_source
+            and route_source != "verification_failure_owner"
+        ) or (not route_source and not legacy_owner_route):
+            return False
+        receipts_payload = state.resume_context.get(
+            "review_route_reclassifications",
+            {},
+        )
+        receipts = (
+            dict(receipts_payload)
+            if isinstance(receipts_payload, dict)
+            else {}
+        )
+        if incident_id in receipts:
+            return False
+
+        task_id = str(incident.get("task_id", "")).strip()
+        task = next(
+            (item for item in state.tasks if item.task_id == task_id),
+            None,
+        )
+        if task is None or task.status == "done":
+            return False
+        route_result: Dict[str, object] = {
+            "reason": str(incident.get("reason", "")).strip(),
+            "failure_ids": list(incident.get("failure_ids", []) or []),
+            "comparable_failures": bool(
+                incident.get("comparable_failures", True)
+            ),
+        }
+        for key in (
+            "current_failure_ids",
+            "baseline_failure_ids",
+            "new_failure_ids",
+            "baseline_comparison_comparable",
+        ):
+            if key in incident:
+                route_result[key] = incident.get(key)
+        route_stage, _feedback = self._verification_failure_owner_route(
+            task,
+            route_result,
+        )
+        if route_stage == "provider_research":
+            return False
+
+        _restored, restore_error = (
+            self._restore_provider_reference_refresh_incident(incident)
+        )
+        if restore_error:
+            state.status = "blocked"
+            state.last_error = (
+                "automatic review-route correction is blocked: "
+                f"{restore_error}"
+            )
+            state.active_blocker = {
+                "kind": "review_route_reclassification",
+                "incident_id": incident_id,
+                "reason": restore_error,
+            }
+            return True
+
+        task.status = "pending"
+        task.commit_sha = ""
+        task.review_summary = (
+            "Verification failure remains implementation-owned after route "
+            "reclassification:\n"
+            f"{str(incident.get('reason', '')).strip()}"
+        ).strip()
+        self._begin_fresh_verify_retry_lifecycle(task)
+        self._clear_implementation_ready_marker(state, task)
+        self._clear_stale_implementation_resume_markers(
+            state,
+            task_ids=[task.task_id],
+        )
+        state.task_review_cache.pop(task.task_id, None)
+        state.stage_summaries["provider_research"] = (
+            "Recovered the previously completed provider research stage after "
+            "an implementation-owned verification failure was misrouted."
+        )
+        self._rewind_state_from_stage(state, "implement")
+        state.rejected_stage = ""
+        state.rejection_reason = ""
+        state.last_error = ""
+        state.active_blocker = {}
+        receipts[incident_id] = {
+            "reclassified_at": utc_now_iso(),
+            "from_stage": "provider_research",
+            "to_stage": "implement",
+            "failure_ids": [
+                str(item).strip()
+                for item in incident.get("failure_ids", []) or []
+                if str(item).strip()
+            ],
+        }
+        state.resume_context["review_route_reclassifications"] = receipts
+        state.last_recovery_route = {
+            "task_id": task.task_id,
+            "outcome": "route_reclassified",
+            "failure_kind": "verification_failure_owner",
+            "reason": (
+                "the active failure set is implementation-owned; provider "
+                "baseline noise was excluded"
+            ),
+            "from_stage": "provider_research",
+            "to_stage": "implement",
+            "incident_id": incident_id,
+        }
+        self._persist_tasks(state.tasks)
+        return True
+
     @staticmethod
     def _is_requirements_audit_recovery_task(task: Optional[TaskSpec]) -> bool:
         if task is None:
@@ -1404,6 +1661,11 @@ class Orchestrator:
                 provider_kind=provider_kind,
                 doc_language=doc_language,
             )
+            if self._normalize_misrouted_provider_research_resume(state):
+                save_run_state(self.project_root, state)
+            if state.status == "blocked":
+                save_run_state(self.project_root, state)
+                return state
             if self._normalize_historically_covered_iteration_resume(state):
                 save_run_state(self.project_root, state)
             if self._normalize_blocked_requirements_audit_recovery_resume(state):
@@ -2713,16 +2975,28 @@ class Orchestrator:
                 entry = {"path": reference}
                 refs[key] = entry
             previous_status = str(entry.get("status", "")).strip()
-            if previous_status == "needs_refresh":
-                continue
             entry["path"] = reference
-            entry["status"] = "needs_refresh"
             entry.setdefault("retrieved_at", "")
             entry.setdefault("source_urls", [])
             previous_notes = str(entry.get("notes", "")).strip()
             marker = f"Needs refresh: {reason}".strip()
-            entry["notes"] = f"{previous_notes}\n{marker}".strip() if previous_notes else marker
-            changed.append(reference)
+            next_notes = (
+                previous_notes
+                if marker in previous_notes
+                else (
+                    f"{previous_notes}\n{marker}".strip()
+                    if previous_notes
+                    else marker
+                )
+            )
+            entry_changed = (
+                previous_status != "needs_refresh"
+                or next_notes != previous_notes
+            )
+            entry["status"] = "needs_refresh"
+            entry["notes"] = next_notes
+            if entry_changed:
+                changed.append(reference)
         if changed:
             write_json(provider_references_lock_path(self.project_root), lock)
         return changed
@@ -2760,9 +3034,30 @@ class Orchestrator:
             / "recovery_incidents"
             / f"{incident_id}.json"
         )
+        provider_references = sorted({
+            self._normalize_relative_artifact_path(item)
+            for item in gate_result.get("provider_reference_paths", []) or []
+            if self._normalize_relative_artifact_path(item)
+        })
+        if target_stage == "provider_research" and not provider_references:
+            provider_references = sorted(
+                self._provider_reference_paths_from_review(
+                    str(gate_result.get("review", ""))
+                )
+            )
+        provider_lock_before: Dict[str, object] = {}
+        if provider_references:
+            provider_lock_before = self._provider_reference_entries_at_ref(
+                rewind_ref,
+                provider_references,
+            )
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "incident_id": incident_id,
+            "created_at": utc_now_iso(),
+            "route_source": str(
+                gate_result.get("route_source", "")
+            ).strip(),
             "task_id": task.task_id,
             "requirement_ids": sorted(set(task.requirement_ids)),
             "target_stage": target_stage,
@@ -2778,12 +3073,75 @@ class Orchestrator:
                 for item in gate_result.get("failure_ids", []) or []
                 if str(item).strip()
             ],
+            "current_failure_ids": [
+                str(item).strip()
+                for item in gate_result.get("current_failure_ids", []) or []
+                if str(item).strip()
+            ],
+            "baseline_failure_ids": [
+                str(item).strip()
+                for item in gate_result.get("baseline_failure_ids", []) or []
+                if str(item).strip()
+            ],
+            "new_failure_ids": [
+                str(item).strip()
+                for item in gate_result.get("new_failure_ids", []) or []
+                if str(item).strip()
+            ],
+            "comparable_failures": bool(
+                gate_result.get("comparable_failures", True)
+            ),
+            "baseline_comparison_comparable": bool(
+                gate_result.get(
+                    "baseline_comparison_comparable",
+                    gate_result.get("comparable_failures", True),
+                )
+            ),
+            "provider_reference_paths": provider_references,
+            "provider_lock_before": provider_lock_before,
             "reason": str(gate_result.get("reason", "")).strip(),
             "review": str(gate_result.get("review", "")).strip(),
             "rewind_reason": str(gate_result.get("rewind_reason", "")).strip(),
         }
         write_json(path, payload)
         return self._relative_repo_path(path)
+
+    def _provider_reference_entries_at_ref(
+        self,
+        git_ref: str,
+        references: Iterable[str],
+    ) -> Dict[str, object]:
+        normalized_references = {
+            self._normalize_relative_artifact_path(reference)
+            for reference in references
+            if self._normalize_relative_artifact_path(reference)
+        }
+        if not git_ref or not normalized_references:
+            return {}
+        raw = self._git_text(
+            "show",
+            f"{git_ref}:.auto-agents/state/provider_references.lock.json",
+        )
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        entries = payload.get("references", {})
+        if not isinstance(entries, dict):
+            return {}
+        found: Dict[str, object] = {}
+        for key, value in entries.items():
+            if not isinstance(value, dict):
+                continue
+            path = self._normalize_relative_artifact_path(value.get("path"))
+            if path in normalized_references:
+                found[path] = {
+                    "lock_key": str(key),
+                    "entry": dict(value),
+                }
+        return found
 
     def _owner_artifact_paths_for_stage(self, stage: str, review_text: str) -> List[str]:
         if stage == "provider_research":
@@ -8566,7 +8924,15 @@ class Orchestrator:
         state.last_error = f"review rejected task {task.task_id}; rewinding to {target_stage}"
         refreshed_refs: List[str] = []
         if target_stage == "provider_research":
-            references = self._provider_reference_paths_from_review(state.rejection_reason)
+            references = {
+                self._normalize_relative_artifact_path(item)
+                for item in gate_result.get("provider_reference_paths", []) or []
+                if self._normalize_relative_artifact_path(item)
+            }
+            if not references:
+                references = self._provider_reference_paths_from_review(
+                    state.rejection_reason
+                )
             refreshed_refs = self._mark_provider_references_needs_refresh(
                 references,
                 reason=f"review rejected task {task.task_id} and requested provider_research recovery",
@@ -11453,16 +11819,45 @@ class Orchestrator:
         task: TaskSpec,
         verify_result: Dict[str, object],
     ) -> Tuple[str, str]:
+        comparison_comparable = bool(
+            verify_result.get(
+                "baseline_comparison_comparable",
+                verify_result.get("comparable_failures", True),
+            )
+        )
+        if not comparison_comparable:
+            return "", ""
+
+        failure_ids = [
+            str(item).strip()
+            for item in verify_result.get("failure_ids", []) or []
+            if str(item).strip()
+        ]
+        baseline_failure_ids = {
+            str(item).strip()
+            for item in verify_result.get("baseline_failure_ids", []) or []
+            if str(item).strip()
+        }
+        if "new_failure_ids" in verify_result:
+            active_failure_ids = [
+                str(item).strip()
+                for item in verify_result.get("new_failure_ids", []) or []
+                if str(item).strip()
+            ]
+        elif baseline_failure_ids:
+            active_failure_ids = [
+                item for item in failure_ids if item not in baseline_failure_ids
+            ]
+        else:
+            active_failure_ids = failure_ids
+        if not active_failure_ids:
+            return "", ""
+
         current_evidence = "\n".join(
             value
             for value in (
                 str(verify_result.get("reason", "")).strip(),
-                str(verify_result.get("raw_output", "")).strip(),
-                "\n".join(
-                    str(item).strip()
-                    for item in verify_result.get("failure_ids", []) or []
-                    if str(item).strip()
-                ),
+                "\n".join(active_failure_ids),
             )
             if value
         )
@@ -11475,24 +11870,22 @@ class Orchestrator:
         if not provider_signal:
             return "", ""
 
-        historical_feedback = "\n".join(
-            str(entry.get("summary", "")).strip()
-            for entry in task.review_history
-            if isinstance(entry, dict)
-            and str(entry.get("summary", "")).strip()
+        scoped_evidence = "\n".join(
+            [current_evidence, *sorted(set(task.requirement_ids))]
         )
-        combined = "\n\n".join(
-            value
-            for value in (
-                current_evidence,
-                task.review_summary.strip(),
-                historical_feedback,
-            )
-            if value
+        references = set(
+            self._provider_reference_paths_from_review(scoped_evidence)
         )
-        references = sorted(
-            self._provider_reference_paths_from_review(combined)
+        normalized_evidence = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            scoped_evidence.lower(),
         )
+        for reference in self._active_provider_reference_paths():
+            stem = re.sub(r"[^a-z0-9]+", "_", Path(reference).stem.lower())
+            if stem and stem in normalized_evidence:
+                references.add(reference)
+        references = sorted(references)
         if not references:
             return "", ""
         feedback = (
@@ -11501,11 +11894,6 @@ class Orchestrator:
             "canonical reference(s): "
             + ", ".join(references)
         )
-        if historical_feedback:
-            feedback = (
-                f"{feedback}\n\nPrevious review evidence:\n"
-                f"{historical_feedback}"
-            )
         return "provider_research", feedback
 
     @staticmethod
@@ -13234,6 +13622,7 @@ class Orchestrator:
                 )
                 rewind_stage = str(verify_result.get("rewind_to_stage", "")).strip()
                 owner_feedback = ""
+                owner_routed = False
                 if not rewind_stage:
                     rewind_stage, owner_feedback = (
                         self._verification_failure_owner_route(
@@ -13241,6 +13630,7 @@ class Orchestrator:
                             verify_result,
                         )
                     )
+                    owner_routed = bool(rewind_stage)
                 if rewind_stage:
                     self._record_verify_result(
                         task,
@@ -13251,12 +13641,60 @@ class Orchestrator:
                         comparable_failures=comparable_failures,
                     )
                     self._emit_task_verify_result(task, "fail", last_reason)
+                    provider_reference_paths = (
+                        sorted(
+                            self._provider_reference_paths_from_review(
+                                owner_feedback
+                            )
+                        )
+                        if rewind_stage == "provider_research"
+                        else []
+                    )
                     return {
                         "ok": False,
                         "review": owner_feedback or last_reason,
                         "reason": last_reason,
                         "failure_ids": list(failure_ids),
+                        "current_failure_ids": [
+                            str(item).strip()
+                            for item in verify_result.get(
+                                "current_failure_ids",
+                                failure_ids,
+                            )
+                            or []
+                            if str(item).strip()
+                        ],
+                        "baseline_failure_ids": [
+                            str(item).strip()
+                            for item in verify_result.get(
+                                "baseline_failure_ids",
+                                [],
+                            )
+                            or []
+                            if str(item).strip()
+                        ],
+                        "new_failure_ids": [
+                            str(item).strip()
+                            for item in verify_result.get(
+                                "new_failure_ids",
+                                failure_ids,
+                            )
+                            or []
+                            if str(item).strip()
+                        ],
                         "comparable_failures": comparable_failures,
+                        "baseline_comparison_comparable": bool(
+                            verify_result.get(
+                                "baseline_comparison_comparable",
+                                comparable_failures,
+                            )
+                        ),
+                        "provider_reference_paths": provider_reference_paths,
+                        "route_source": (
+                            "verification_failure_owner"
+                            if owner_routed
+                            else "explicit_verification_rewind"
+                        ),
                         "rewind_to_stage": rewind_stage,
                         "expected_owner_stage": str(
                             verify_result.get("expected_owner_stage", rewind_stage)

@@ -20,7 +20,7 @@ from auto_agents.git_ops import (
     ref_exists,
     update_ref,
 )
-from auto_agents.io_utils import write_text
+from auto_agents.io_utils import read_json, write_json, write_text
 from auto_agents.models import CommandResult, GateResult, RunState, TaskSpec
 from auto_agents.orchestrator import (
     VERIFY_BASELINE_SCHEMA_VERSION,
@@ -278,6 +278,434 @@ class RecoveryResilienceTests(unittest.TestCase):
 
             self.assertEqual(stage, "provider_research")
             self.assertIn("provider.md", feedback)
+
+    def test_provider_baseline_noise_does_not_route_new_frontend_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            task = TaskSpec(
+                task_id="task-303",
+                title="frontend browser evidence",
+                description="",
+                acceptance=[],
+                review_history=[
+                    {
+                        "attempt": 1,
+                        "summary": (
+                            "REQ-102 canonical provider reference is incomplete"
+                        ),
+                    }
+                ],
+            )
+            orchestrator._provider_reference_paths_from_review = Mock(
+                return_value={
+                    ".auto-agents/docs/provider_references/provider.md"
+                }
+            )
+            frontend_failure = (
+                "src/e2e/video-home-prototype-fidelity.test.ts > "
+                "video home prototype fidelity > "
+                "create_failure_and_validation_errors_remain_user_visible"
+            )
+
+            stage, feedback = orchestrator._verification_failure_owner_route(
+                task,
+                {
+                    "reason": (
+                        "1 new verification failure(s) vs task baseline: "
+                        f"{frontend_failure}"
+                    ),
+                    "failure_ids": [frontend_failure],
+                    "new_failure_ids": [frontend_failure],
+                    "baseline_failure_ids": [
+                        "tests/test_requirements_audit_state.py::"
+                        "test_canonical_reference_records_sizes"
+                    ],
+                    "baseline_comparison_comparable": True,
+                    "raw_output": (
+                        "FAILED tests/test_requirements_audit_state.py::"
+                        "test_canonical_reference_records_sizes\n"
+                        ".auto-agents/docs/provider_references/provider.md"
+                    ),
+                },
+            )
+
+            self.assertEqual(stage, "")
+            self.assertEqual(feedback, "")
+            orchestrator._provider_reference_paths_from_review.assert_not_called()
+
+    def test_non_comparable_failure_does_not_rewind_provider_research(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            task = TaskSpec(
+                task_id="task-001",
+                title="provider contract",
+                description="",
+                acceptance=[],
+            )
+
+            stage, feedback = orchestrator._verification_failure_owner_route(
+                task,
+                {
+                    "reason": "canonical provider reference command failed",
+                    "failure_ids": ["cmd:pytest tests/test_provider.py"],
+                    "new_failure_ids": ["cmd:pytest tests/test_provider.py"],
+                    "baseline_comparison_comparable": False,
+                    "raw_output": (
+                        ".auto-agents/docs/provider_references/provider.md"
+                    ),
+                },
+            )
+
+            self.assertEqual(stage, "")
+            self.assertEqual(feedback, "")
+
+    def test_provider_route_selects_only_reference_named_by_new_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            apiyi_reference = (
+                ".auto-agents/docs/provider_references/apiyi_gpt_image_2.md"
+            )
+            unrelated_reference = (
+                ".auto-agents/docs/provider_references/doubao_tts_direct.md"
+            )
+            orchestrator._active_provider_reference_paths = Mock(
+                return_value={apiyi_reference, unrelated_reference}
+            )
+            orchestrator._provider_reference_paths_from_review = Mock(
+                return_value=set()
+            )
+            task = TaskSpec(
+                task_id="task-provider",
+                title="provider contract",
+                description="",
+                acceptance=[],
+            )
+            failure_id = (
+                "tests/test_requirements_audit_state.py::"
+                "test_apiyi_gpt_image_2_canonical_reference_records_sizes"
+            )
+
+            stage, feedback = orchestrator._verification_failure_owner_route(
+                task,
+                {
+                    "reason": (
+                        "1 new verification failure(s) vs task baseline: "
+                        f"{failure_id}"
+                    ),
+                    "failure_ids": [failure_id],
+                    "new_failure_ids": [failure_id],
+                    "baseline_comparison_comparable": True,
+                },
+            )
+
+            self.assertEqual(stage, "provider_research")
+            self.assertIn(apiyi_reference, feedback)
+            self.assertNotIn(unrelated_reference, feedback)
+
+    def test_misrouted_provider_resume_restores_lock_and_returns_to_implement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            reference = (
+                ".auto-agents/docs/provider_references/provider.md"
+            )
+            lock_path = (
+                root
+                / ".auto-agents"
+                / "state"
+                / "provider_references.lock.json"
+            )
+            baseline_entry = {
+                "path": reference,
+                "status": "verified",
+                "retrieved_at": "2026-07-28T00:00:00Z",
+                "source_urls": ["https://example.test/provider"],
+                "notes": "verified contract",
+            }
+            write_json(
+                lock_path,
+                {
+                    "version": 1,
+                    "references": {"provider": baseline_entry},
+                },
+            )
+            rewind_ref = commit_all(root, "provider baseline")
+            task = TaskSpec(
+                task_id="task-303",
+                title="frontend browser evidence",
+                description="",
+                acceptance=[],
+                status="pending",
+            )
+            state = RunState(
+                run_id="run-001",
+                status="failed",
+                current_stage="provider_research",
+                tasks=[task],
+                stage_summaries={
+                    "clarify": "done",
+                    "prototype": "done",
+                    "design": "done",
+                    "plan": "done",
+                },
+                last_error="run interrupted by SIGINT",
+            )
+            marker = (
+                "Needs refresh: review rejected task task-303 and requested "
+                "provider_research recovery"
+            )
+            write_json(
+                lock_path,
+                {
+                    "version": 1,
+                    "references": {
+                        "provider": {
+                            **baseline_entry,
+                            "status": "needs_refresh",
+                            "notes": f"verified contract\n{marker}",
+                        }
+                    },
+                },
+            )
+            incident_dir = (
+                root
+                / ".auto-agents"
+                / "runs"
+                / state.run_id
+                / "recovery_incidents"
+            )
+            frontend_failure = (
+                "src/e2e/video-home-prototype-fidelity.test.ts > "
+                "create_failure_and_validation_errors_remain_user_visible"
+            )
+            write_json(
+                incident_dir / "incident-001.json",
+                {
+                    "schema_version": 1,
+                    "incident_id": "incident-001",
+                    "task_id": task.task_id,
+                    "target_stage": "provider_research",
+                    "rewind_ref": rewind_ref,
+                    "failure_ids": [frontend_failure],
+                    "reason": (
+                        "1 new verification failure(s) vs task baseline: "
+                        f"{frontend_failure}"
+                    ),
+                    "rewind_reason": (
+                        "verification failure points to "
+                        "provider_research-owned source-of-truth"
+                    ),
+                    "review": reference,
+                },
+            )
+            orchestrator._provider_reference_paths_from_review = Mock(
+                return_value={reference}
+            )
+
+            self.assertTrue(
+                orchestrator._normalize_misrouted_provider_research_resume(
+                    state
+                )
+            )
+
+            restored = read_json(lock_path)
+            self.assertEqual(
+                restored["references"]["provider"],
+                baseline_entry,
+            )
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.current_stage, "implement")
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(task.verify_retry_epoch, 1)
+            self.assertIn("plan", state.stage_summaries)
+            self.assertIn("provider_research", state.stage_summaries)
+            self.assertNotIn("implement", state.stage_summaries)
+            self.assertEqual(state.last_error, "")
+            self.assertIn(
+                "incident-001",
+                state.resume_context["review_route_reclassifications"],
+            )
+            self.assertEqual(
+                state.last_recovery_route["outcome"],
+                "route_reclassified",
+            )
+            self.assertFalse(
+                orchestrator._normalize_misrouted_provider_research_resume(
+                    state
+                )
+            )
+
+    def test_provider_lock_restore_refuses_missing_recorded_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            reference = (
+                ".auto-agents/docs/provider_references/provider.md"
+            )
+            lock_path = (
+                root
+                / ".auto-agents"
+                / "state"
+                / "provider_references.lock.json"
+            )
+            marked_entry = {
+                "path": reference,
+                "status": "needs_refresh",
+                "retrieved_at": "",
+                "source_urls": [],
+                "notes": (
+                    "Needs refresh: review rejected task task-303 and "
+                    "requested provider_research recovery"
+                ),
+            }
+            write_json(
+                lock_path,
+                {
+                    "version": 1,
+                    "references": {"provider": marked_entry},
+                },
+            )
+            orchestrator._provider_reference_paths_from_review = Mock(
+                return_value={reference}
+            )
+
+            restored, error = (
+                orchestrator._restore_provider_reference_refresh_incident(
+                    {
+                        "task_id": "task-303",
+                        "rewind_ref": "missing-ref",
+                        "review": reference,
+                    }
+                )
+            )
+
+            self.assertFalse(restored)
+            self.assertIn("cannot safely restore", error)
+            self.assertEqual(
+                read_json(lock_path)["references"]["provider"],
+                marked_entry,
+            )
+
+    def test_provider_refresh_marker_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            reference = (
+                ".auto-agents/docs/provider_references/provider.md"
+            )
+            lock_path = (
+                root
+                / ".auto-agents"
+                / "state"
+                / "provider_references.lock.json"
+            )
+            write_json(
+                lock_path,
+                {
+                    "version": 1,
+                    "references": {
+                        "provider": {
+                            "path": reference,
+                            "status": "verified",
+                            "retrieved_at": "",
+                            "source_urls": [],
+                            "notes": "verified",
+                        }
+                    },
+                },
+            )
+
+            first = orchestrator._mark_provider_references_needs_refresh(
+                [reference],
+                reason="review rejected task task-303",
+            )
+            second = orchestrator._mark_provider_references_needs_refresh(
+                [reference],
+                reason="review rejected task task-303",
+            )
+
+            entry = read_json(lock_path)["references"]["provider"]
+            self.assertEqual(first, [reference])
+            self.assertEqual(second, [])
+            self.assertEqual(
+                entry["notes"].count(
+                    "Needs refresh: review rejected task task-303"
+                ),
+                1,
+            )
+
+    def test_rewind_incident_records_causal_failures_and_lock_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            reference = (
+                ".auto-agents/docs/provider_references/provider.md"
+            )
+            baseline_entry = {
+                "path": reference,
+                "status": "verified",
+            }
+            orchestrator._provider_reference_entries_at_ref = Mock(
+                return_value={
+                    reference: {
+                        "lock_key": "provider",
+                        "entry": baseline_entry,
+                    }
+                }
+            )
+            state = RunState(run_id="run-001")
+            task = TaskSpec(
+                task_id="task-provider",
+                title="provider contract",
+                description="",
+                acceptance=[],
+            )
+            failure_id = (
+                "tests/test_provider.py::"
+                "test_provider_canonical_reference"
+            )
+
+            relative_path = orchestrator._persist_rewind_incident(
+                state,
+                task=task,
+                target_stage="provider_research",
+                rewind_ref="baseline-ref",
+                gate_result={
+                    "route_source": "verification_failure_owner",
+                    "reason": "one new provider failure",
+                    "review": reference,
+                    "failure_ids": [failure_id],
+                    "current_failure_ids": ["old-failure", failure_id],
+                    "baseline_failure_ids": ["old-failure"],
+                    "new_failure_ids": [failure_id],
+                    "comparable_failures": True,
+                    "baseline_comparison_comparable": True,
+                    "provider_reference_paths": [reference],
+                },
+            )
+
+            incident = read_json(root / relative_path)
+            self.assertEqual(incident["schema_version"], 2)
+            self.assertEqual(
+                incident["route_source"],
+                "verification_failure_owner",
+            )
+            self.assertEqual(incident["new_failure_ids"], [failure_id])
+            self.assertEqual(
+                incident["provider_reference_paths"],
+                [reference],
+            )
+            self.assertEqual(
+                incident["provider_lock_before"][reference]["entry"],
+                baseline_entry,
+            )
 
     def test_parallel_worktree_installs_dependency_links_before_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
