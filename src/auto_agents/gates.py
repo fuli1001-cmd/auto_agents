@@ -35,19 +35,25 @@ _VITEST_FAILED = re.compile(
 )
 _UNITTEST_FAILED = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
 _STANDARD_INFRA_FAILURE = re.compile(
-    r"\bAUTO_AGENTS_INFRA_FAILURE\s+id=(?P<id>[a-z][a-z0-9_-]{1,63})\b"
+    r"^AUTO_AGENTS_INFRA_FAILURE\s+id=(?P<id>[a-z][a-z0-9_-]{1,63})\b"
     r"(?:\s+capability=(?P<capability>[a-z][a-z0-9_-]{1,31}))?"
-    r"(?:\s+contract=(?P<contract>[a-z][a-z0-9_-]{1,31}))?",
+    r"(?:\s+contract=(?P<contract>[a-z][a-z0-9_-]{1,31}))?"
+    r"(?=$|[\s:])",
     re.IGNORECASE,
 )
 _BUILTIN_INFRA_MARKERS = (
     (
         "browser_verification_infrastructure_failed",
         re.compile(
-            r"\bbrowser_verification_infrastructure_failed\b|"
-            r"\bBrowserVerificationInfrastructureError\b"
+            r"^(?:browser_verification_infrastructure_failed|"
+            r"BrowserVerificationInfrastructureError)(?=$|[\s:])"
         ),
     ),
+)
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_DIAGNOSTIC_PREFIX = re.compile(
+    r"^(?:(?:E|ERROR|Error|FAIL|FAILED)\s*[:>]?\s+|"
+    r"(?:[>→×✖❯])\s*)"
 )
 GateProgressCallback = Callable[[str, str, float], None]
 
@@ -154,16 +160,24 @@ def first_infrastructure_command(
     )
 
 
+def _normalized_diagnostic_line(raw: str) -> str:
+    line = _ANSI_ESCAPE.sub("", raw).strip()
+    while line:
+        stripped = _DIAGNOSTIC_PREFIX.sub("", line, count=1)
+        if stripped == line:
+            break
+        line = stripped.strip()
+    return line
+
+
 def _diagnostic_output_lines(result: CommandResult) -> List[str]:
     lines: List[str] = []
     for raw in f"{result.stdout}\n{result.stderr}".splitlines():
-        line = raw.strip()
+        line = _normalized_diagnostic_line(raw)
         if not line:
             continue
-        if (
-            "AUTO_AGENTS_INFRA_FAILURE" in line
-            or "infrastructure_failed" in line.lower()
-            or "InfrastructureError" in line
+        if _STANDARD_INFRA_FAILURE.match(line) or any(
+            pattern.match(line) for _, pattern in _BUILTIN_INFRA_MARKERS
         ):
             lines.append(line)
     return lines
@@ -186,8 +200,17 @@ def classify_reported_infrastructure_failure(
     if not lines and not markers:
         return result
     diagnostic = "\n".join(lines)
-    standard = _STANDARD_INFRA_FAILURE.search(diagnostic)
+    standard = next(
+        (
+            match
+            for line in lines
+            if (match := _STANDARD_INFRA_FAILURE.match(line)) is not None
+        ),
+        None,
+    )
     failure_id = standard.group("id").lower() if standard else ""
+    provenance_source = "standard" if standard else ""
+    matched_line = standard.group(0) if standard else ""
     if standard:
         result.infrastructure_capability = (
             standard.group("capability") or ""
@@ -197,18 +220,36 @@ def classify_reported_infrastructure_failure(
         ).lower()
     if not failure_id:
         for marker_id, pattern in _BUILTIN_INFRA_MARKERS:
-            if pattern.search(diagnostic):
-                failure_id = marker_id
+            for line in lines:
+                builtin = pattern.match(line)
+                if builtin:
+                    failure_id = marker_id
+                    provenance_source = "builtin"
+                    matched_line = builtin.group(0)
+                    break
+            if failure_id:
                 break
     if not failure_id:
         lowered = full_output.lower()
         for marker in markers:
             if marker.contains.lower() in lowered:
                 failure_id = marker.marker_id
+                provenance_source = "configured"
+                matched_line = marker.contains
                 break
     if failure_id:
         result.infrastructure_error = True
         result.infrastructure_failure_id = failure_id
+        result.process_snapshot = {
+            **dict(result.process_snapshot),
+            "reported_infrastructure_marker": {
+                "source": provenance_source,
+                "id": failure_id,
+                "capability": result.infrastructure_capability,
+                "contract": result.infrastructure_contract,
+                "matched": matched_line,
+            },
+        }
     return result
 
 

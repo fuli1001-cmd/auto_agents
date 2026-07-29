@@ -14,7 +14,7 @@ from .io_utils import read_json, write_json
 from .models import AgentResult, CommandResult, RunState
 
 
-INCIDENT_SCHEMA_VERSION = 4
+INCIDENT_SCHEMA_VERSION = 5
 INCIDENT_ACTIONS = {
     "RETRY",
     "RECOVER_TARGET",
@@ -126,7 +126,7 @@ class ExecutionIncident:
     status: str = "open"
     diagnosis: Dict[str, object] = field(default_factory=dict)
     repair_history: List[Dict[str, object]] = field(default_factory=list)
-    recovery_policy_version: int = 4
+    recovery_policy_version: int = INCIDENT_SCHEMA_VERSION
     history: List[Dict[str, object]] = field(default_factory=list)
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
@@ -206,12 +206,23 @@ class ExecutionIncidentStore:
             and incident.status == "needs_human"
             and incident.recovery_policy_version < INCIDENT_SCHEMA_VERSION
         ):
+            # Policy v4 could consume a round by re-verifying an already
+            # in-progress recovery task without running implementation again.
+            # Return that ineffective final round to the incident budget once
+            # when upgrading the persisted incident.
+            previous_policy = incident.recovery_policy_version
+            if previous_policy < 5 and incident.recovery_round > 0:
+                incident.recovery_round -= 1
             incident.status = "open"
             incident.recovery_policy_version = INCIDENT_SCHEMA_VERSION
             incident.history.append(
                 {
                     "event": "legacy_reopen",
-                    "reason": "new managed infrastructure recovery policy is available",
+                    "previous_policy_version": previous_policy,
+                    "reason": (
+                        "policy v5 requires a fresh implementation attempt for every "
+                        "managed target recovery round"
+                    ),
                 }
             )
             self.save(incident, state)

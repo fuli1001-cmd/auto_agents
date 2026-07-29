@@ -60,7 +60,7 @@ def test_reported_infrastructure_identity_ignores_recovery_context() -> None:
     assert first.evidence_fingerprint != second.evidence_fingerprint
 
 
-def test_incident_v4_preserves_root_identity_and_cause_status() -> None:
+def test_incident_v5_preserves_root_identity_and_cause_status() -> None:
     incident = ExecutionIncident(
         incident_id="incident-1",
         run_id="run-1",
@@ -73,7 +73,7 @@ def test_incident_v4_preserves_root_identity_and_cause_status() -> None:
         origin_command="npm test",
     )
     restored = ExecutionIncident.from_dict(incident.to_dict())
-    assert incident.to_dict()["schema_version"] == 4
+    assert incident.to_dict()["schema_version"] == 5
     assert restored.root_cause_fingerprint == "root-1"
     diagnosis = IncidentDiagnosis(
         owner="execution_environment",
@@ -181,4 +181,4 @@ def test_socket_path_failure_is_persisted_as_a_confirmed_cause() -> None:
     )
     assert incident.infrastructure_cause_id == "unix_socket_path_too_long"
     assert incident.cause_status == "confirmed"
-    assert incident.to_dict()["schema_version"] == 4
+    assert incident.to_dict()["schema_version"] == 5

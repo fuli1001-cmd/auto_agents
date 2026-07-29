@@ -355,6 +355,47 @@ class GateTests(unittest.TestCase):
         )
         self.assertFalse(info.comparable)
         self.assertNotIn("create_modal_close_and_submit_contract", info.failure_ids[0])
+        self.assertEqual(
+            result.process_snapshot["reported_infrastructure_marker"]["source"],
+            "builtin",
+        )
+
+    def test_marker_literal_in_pytest_source_is_not_infrastructure_failure(self) -> None:
+        result = CommandResult(
+            command="python -m pytest -q tests/test_audit.py",
+            ok=False,
+            returncode=1,
+            stdout=(
+                "________________ test_audit __________________\n"
+                "    def test_audit():\n"
+                '        assert "browser_verification_infrastructure_failed" in source\n'
+                "E       AssertionError: missing current-run evidence\n"
+                "FAILED tests/test_audit.py::test_audit - AssertionError\n"
+            ),
+        )
+
+        classify_reported_infrastructure_failure(result)
+        info = extract_failure_info(GateResult(ok=False, commands=[result]))
+
+        self.assertFalse(result.infrastructure_error)
+        self.assertTrue(info.comparable)
+        self.assertEqual(info.failure_ids, ["tests/test_audit.py::test_audit"])
+
+    def test_marker_literal_in_file_not_found_traceback_is_not_infrastructure(self) -> None:
+        result = CommandResult(
+            command="python -m pytest -q tests/test_audit.py",
+            ok=False,
+            returncode=1,
+            stderr=(
+                'marker = "BrowserVerificationInfrastructureError"\n'
+                "E   FileNotFoundError: current browser evidence receipt is missing\n"
+                "FAILED tests/test_audit.py::test_current_receipt - FileNotFoundError\n"
+            ),
+        )
+
+        classify_reported_infrastructure_failure(result)
+
+        self.assertFalse(result.infrastructure_error)
 
     def test_configured_reported_infrastructure_marker(self) -> None:
         result = CommandResult(

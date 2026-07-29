@@ -26,7 +26,15 @@ from auto_agents.config import (
 from auto_agents.gates import FailureExtraction
 from auto_agents.git_ops import changed_files, changed_paths, commit_all, hard_reset_clean, head_ref, worktree_fingerprint
 from auto_agents.io_utils import write_json, write_text
-from auto_agents.models import AgentResult, CommandResult, GateParallelGroup, GateResult, RunState, TaskSpec
+from auto_agents.models import (
+    AgentResult,
+    CommandResult,
+    GateParallelGroup,
+    GateResult,
+    RunState,
+    TaskSpec,
+    VerificationStep,
+)
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.validation import validation_report
 
@@ -2983,6 +2991,165 @@ class RetryFlowTests(unittest.TestCase):
                 [screenshot_ref, prototype_ref, css_ref],
             )
             self.assertEqual(result["failed_refs"], [])
+
+    def test_vitest_selector_ref_reuses_configured_artifact_producer_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.steps.append(
+                VerificationStep(
+                    kind="test",
+                    runner="vitest",
+                    targets=["workbench/src/e2e/browser-verification.test.ts"],
+                    args=["-t", "publishes_current_run"],
+                    artifact_globs=[".tmp-tests/runs/*/*.json"],
+                )
+            )
+
+            command = orchestrator._build_task_proof_evidence_command_for_ref(
+                "workbench/src/e2e/browser-verification.test.ts::"
+                "publishes_current_run"
+            )
+
+            self.assertEqual(
+                command,
+                "npm exec -- vitest run -t publishes_current_run "
+                "workbench/src/e2e/browser-verification.test.ts",
+            )
+
+    def test_vitest_selector_ref_falls_back_to_configured_full_file_producer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.steps.append(
+                VerificationStep(
+                    kind="test",
+                    runner="vitest",
+                    targets=["workbench/src/e2e/browser-verification.test.ts"],
+                    artifact_globs=[".tmp-tests/runs/*/*.json"],
+                )
+            )
+
+            command = orchestrator._build_task_proof_evidence_command_for_ref(
+                "workbench/src/e2e/browser-verification.test.ts::"
+                "another_current_run_contract"
+            )
+
+            self.assertEqual(
+                command,
+                "npm exec -- vitest run "
+                "workbench/src/e2e/browser-verification.test.ts",
+            )
+
+    def test_ignored_exact_proof_ref_requires_current_isolated_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            (project_root / ".gitignore").write_text(".tmp-tests/\n", encoding="utf-8")
+            evidence = project_root / ".tmp-tests" / "runs" / "old" / "receipt.json"
+            evidence.parent.mkdir(parents=True)
+            evidence.write_text('{"run_id":"old"}\n', encoding="utf-8")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.isolation.enabled = True
+            task = TaskSpec(
+                task_id="task-portability",
+                title="Portable evidence",
+                description="Require current isolated evidence.",
+                acceptance=["proof is portable"],
+                requirement_proofs=[
+                    {
+                        "status": "verified",
+                        "evidence_refs": [
+                            ".tmp-tests/runs/old/receipt.json",
+                        ],
+                    }
+                ],
+            )
+
+            failure = (
+                orchestrator._ignored_supporting_evidence_portability_failure(
+                    task,
+                    GateResult(ok=True, commands=[]),
+                )
+            )
+
+            self.assertIsNotNone(failure)
+            self.assertIn("nonportable_ignored_evidence", failure["failure_ids"][0])
+
+    def test_ignored_wildcard_proof_ref_accepts_current_isolated_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            (project_root / ".gitignore").write_text(".tmp-tests/\n", encoding="utf-8")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.isolation.enabled = True
+            task = TaskSpec(
+                task_id="task-portability",
+                title="Portable evidence",
+                description="Require current isolated evidence.",
+                acceptance=["proof is portable"],
+                requirement_proofs=[
+                    {
+                        "status": "verified",
+                        "evidence_refs": [
+                            ".tmp-tests/runs/*/receipt.json",
+                        ],
+                    }
+                ],
+            )
+            gate = GateResult(
+                ok=True,
+                commands=[
+                    CommandResult(
+                        command="npm test",
+                        ok=True,
+                        returncode=0,
+                        artifacts={
+                            ".tmp-tests/runs/current/receipt.json": "abc123",
+                        },
+                    )
+                ],
+            )
+
+            failure = (
+                orchestrator._ignored_supporting_evidence_portability_failure(
+                    task,
+                    gate,
+                )
+            )
+
+            self.assertIsNone(failure)
+
+    def test_ignored_proof_portability_is_backward_compatible_without_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            (project_root / ".gitignore").write_text(".tmp-tests/\n", encoding="utf-8")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.isolation.enabled = False
+            task = TaskSpec(
+                task_id="task-portability",
+                title="Portable evidence",
+                description="Shared worktree compatibility.",
+                acceptance=["proof exists"],
+                requirement_proofs=[
+                    {
+                        "status": "verified",
+                        "evidence_refs": [".tmp-tests/runs/old/receipt.json"],
+                    }
+                ],
+            )
+
+            failure = (
+                orchestrator._ignored_supporting_evidence_portability_failure(
+                    task,
+                    GateResult(ok=True, commands=[]),
+                )
+            )
+
+            self.assertIsNone(failure)
 
     def test_task_proof_evidence_cache_key_changes_when_refs_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

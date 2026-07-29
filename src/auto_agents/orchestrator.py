@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import fnmatch
 import json
 import hashlib
 import os
@@ -75,6 +76,7 @@ from .gates import (
     ResolvedGatePlan,
     build_failure_identity_diagnostic_command,
     classify_reported_infrastructure_failure,
+    command_from_verification_step,
     commands_from_verification_steps,
     extract_failure_ids,
     extract_failure_info,
@@ -4115,6 +4117,8 @@ class Orchestrator:
             existing.stdout_tail = incident.stdout_tail
             existing.stderr_tail = incident.stderr_tail
             existing.process_snapshot = incident.process_snapshot
+            existing.context = incident.context
+            existing.task_id = incident.task_id
             existing.cleanup_incomplete = incident.cleanup_incomplete
             existing.head_ref = incident.head_ref
             existing.worktree_fingerprint = incident.worktree_fingerprint
@@ -4502,8 +4506,71 @@ class Orchestrator:
             )
         return changed
 
+    def _prepare_policy_v5_reported_infrastructure_resume(
+        self,
+        state: RunState,
+        incident: Optional[ExecutionIncident],
+    ) -> bool:
+        if (
+            incident is None
+            or incident.kind != "gate_reported_infrastructure_error"
+            or incident.recovery_policy_version < 5
+            or not any(
+                str(entry.get("event", "")) == "legacy_reopen"
+                for entry in incident.history
+                if isinstance(entry, dict)
+            )
+            or any(
+                str(entry.get("event", "")) == "policy_v5_task_migration"
+                for entry in incident.history
+                if isinstance(entry, dict)
+            )
+        ):
+            return False
+        tasks = self._load_tasks_from_plan()
+        recovery_task = next(
+            (
+                task
+                for task in tasks
+                if task.status != "done"
+                and any(
+                    str(entry.get("execution_incident_id", ""))
+                    == incident.incident_id
+                    for entry in task.recovery_history
+                    if isinstance(entry, dict)
+                )
+            ),
+            None,
+        )
+        if recovery_task is None:
+            return False
+        next_round = min(
+            int(self.config.execution.recovery.max_rounds),
+            max(
+                1,
+                int(incident.recovery_round),
+                int(recovery_task.recovery_round),
+            )
+            + 1,
+        )
+        incident.recovery_round = next_round
+        incident.history.append(
+            {
+                "event": "policy_v5_task_migration",
+                "round": next_round,
+                "task_id": recovery_task.task_id,
+                "reason": "fresh implementation is required before verification",
+            }
+        )
+        self._schedule_prebaseline_recovery_task(state, incident)
+        self._incident_store(state).save(incident, state)
+        return True
+
     def _resume_blocked_run(self, state: RunState) -> bool:
         active_incident = self._incident_store(state).active(state)
+        if active_incident is not None and active_incident.status == "resolved":
+            state.active_execution_incident_id = ""
+            active_incident = None
         legacy_incident_pause = bool(
             state.status == "paused"
             and not state.pending_approval
@@ -4529,6 +4596,10 @@ class Orchestrator:
             and not self_repair_resume
         ):
             return False
+        policy_v5_resume = self._prepare_policy_v5_reported_infrastructure_resume(
+            state,
+            active_incident,
+        )
         blocker = persisted_blocker
         had_persisted_blocker = bool(blocker)
         if not blocker:
@@ -4580,7 +4651,8 @@ class Orchestrator:
         state.last_error = ""
         if active_incident is not None:
             active_incident.status = "recovering"
-            active_incident.recovery_round = 0
+            if not policy_v5_resume:
+                active_incident.recovery_round = 0
             active_incident.history.append(
                 {
                     "event": "explicit_run_resume",
@@ -5131,14 +5203,19 @@ class Orchestrator:
         incident: ExecutionIncident,
     ) -> None:
         tasks = self._load_tasks_from_plan()
-        if not any(
-            any(
+        existing_task = next(
+            (
+                task
+                for task in tasks
+                if any(
                 str(item.get("execution_incident_id", "")) == incident.incident_id
                 for item in task.recovery_history
-            )
-            and task.status != "done"
-            for task in tasks
-        ):
+                )
+                and task.status != "done"
+            ),
+            None,
+        )
+        if existing_task is None:
             reported_infrastructure = (
                 incident.kind == "gate_reported_infrastructure_error"
             )
@@ -5155,6 +5232,9 @@ class Orchestrator:
                 incident.command,
                 recovery_round=incident.recovery_round,
             )
+            task_marker["implementation_required_round"] = incident.recovery_round
+            task_marker["implementation_completed_round"] = 0
+            task_marker["evidence_fingerprint"] = incident.evidence_fingerprint
             worktree_handoff = self._capture_execution_recovery_worktree_handoff(
                 state,
                 tasks,
@@ -5202,6 +5282,30 @@ class Orchestrator:
             )
             tasks.insert(0, task)
             self._persist_tasks(tasks)
+        else:
+            marker = self._execution_recovery_marker(existing_task)
+            marker["implementation_required_round"] = incident.recovery_round
+            marker["evidence_fingerprint"] = incident.evidence_fingerprint
+            marker["result"] = "rescheduled"
+            existing_task.recovery_round = incident.recovery_round
+            existing_task.status = "blocked"
+            existing_task.review_summary = ""
+            self._clear_implementation_ready_marker(state, existing_task)
+            self._clear_stale_implementation_resume_markers(
+                state,
+                task_ids=[existing_task.task_id],
+            )
+            self._begin_fresh_verify_retry_lifecycle(existing_task)
+            existing_task.recovery_history.append(
+                {
+                    "kind": "execution_incident_round",
+                    "execution_incident_id": incident.incident_id,
+                    "round": incident.recovery_round,
+                    "result": "implementation_required",
+                    "evidence_fingerprint": incident.evidence_fingerprint,
+                }
+            )
+            self._persist_tasks(tasks)
         self._rewind_state_from_stage(state, "implement")
         state.tasks = tasks
         state.status = "pending"
@@ -5219,6 +5323,49 @@ class Orchestrator:
             ):
                 return entry
         return {}
+
+    def _execution_recovery_implementation_required(
+        self,
+        task: TaskSpec,
+    ) -> bool:
+        marker = self._execution_recovery_marker(task)
+        required = int(marker.get("implementation_required_round", 0) or 0)
+        completed = int(marker.get("implementation_completed_round", 0) or 0)
+        return required > completed
+
+    def _mark_execution_recovery_implementation_complete(
+        self,
+        task: TaskSpec,
+    ) -> None:
+        marker = self._execution_recovery_marker(task)
+        required = int(marker.get("implementation_required_round", 0) or 0)
+        if required:
+            marker["implementation_completed_round"] = required
+
+    def _assert_execution_recovery_implementation_completed(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> None:
+        if not self._execution_recovery_implementation_required(task):
+            return
+        marker = self._execution_recovery_marker(task)
+        required = int(marker.get("implementation_required_round", 0) or 0)
+        reason = (
+            "execution recovery reached verification without a fresh implementation "
+            f"attempt for recovery round {required}"
+        )
+        self._record_recovery_route(
+            state,
+            task,
+            outcome="invariant_violation",
+            failure_kind="execution_recovery_scheduler",
+            reason=reason,
+            round_number=required,
+            engine_invariant="execution_recovery_round_without_implementation",
+        )
+        save_run_state(self.project_root, state)
+        raise RuntimeError(reason)
 
     def _capture_execution_recovery_worktree_handoff(
         self,
@@ -6681,7 +6828,11 @@ class Orchestrator:
             self._set_implementation_ready_marker(state, task, False)
             self._persist_tasks(tasks)
             save_run_state(self.project_root, state)
-        if task.status == "blocked" and not visual_gate_recheck:
+        if (
+            task.status == "blocked"
+            and not visual_gate_recheck
+            and not self._execution_recovery_implementation_required(task)
+        ):
             payload = self._task_recovery_payload_from_history(task, state)
             if self._schedule_repair_tasks_for_failure(state, tasks, task, payload):
                 return state
@@ -9381,6 +9532,23 @@ class Orchestrator:
                 "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
             }
             return failure_result
+        portability_failure = self._ignored_supporting_evidence_portability_failure(
+            task,
+            verify_gate,
+        )
+        if portability_failure is not None:
+            failure_ids = list(portability_failure["failure_ids"])
+            return {
+                "ok": False,
+                "reason": str(portability_failure["reason"]),
+                "failure_ids": failure_ids,
+                "current_failure_ids": failure_ids,
+                "baseline_failure_ids": baseline_failure_ids,
+                "new_failure_ids": failure_ids,
+                "raw_output": str(portability_failure["reason"]),
+                "comparable_failures": True,
+                "verification_contract_failure": True,
+            }
         stale_plan_audit = self._run_stale_plan_coupled_test_audit(task, state=state)
         if stale_plan_audit:
             stale_failure_ids = self._normalize_verify_failure_ids(
@@ -9936,10 +10104,37 @@ class Orchestrator:
         )
 
     def _build_vitest_evidence_command(self, ref: str) -> Optional[str]:
+        path, selector = self._split_evidence_ref(ref)
+        normalized_path = path.replace("\\", "/").strip().removeprefix("./")
+        configured_target_fallback: Optional[VerificationStep] = None
+        for step in self.config.gates.steps:
+            if step.runner.strip().lower() != "vitest":
+                continue
+            targets = {
+                target.replace("\\", "/").strip().removeprefix("./")
+                for target in step.targets
+            }
+            if normalized_path not in targets:
+                continue
+            args = [arg.strip() for arg in step.args if arg.strip()]
+            if selector and args != ["-t", selector]:
+                if not args and configured_target_fallback is None:
+                    configured_target_fallback = step
+                continue
+            if not selector and args:
+                continue
+            return command_from_verification_step(
+                step,
+                project_root=self.project_root,
+            )
+        if configured_target_fallback is not None:
+            return command_from_verification_step(
+                configured_target_fallback,
+                project_root=self.project_root,
+            )
         package_root = self._find_package_root_for_evidence_ref(ref)
         if package_root is None or not self._package_supports_vitest(package_root):
             return None
-        path, selector = self._split_evidence_ref(ref)
         candidate = Path(path)
         candidate = candidate if candidate.is_absolute() else (self.project_root / candidate)
         candidate = candidate.resolve()
@@ -10226,6 +10421,113 @@ class Orchestrator:
             }
         self._task_proof_evidence_cache[cache_key] = dict(result)
         return result
+
+    def _git_path_is_tracked(self, relative: str) -> bool:
+        process = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", relative],
+            cwd=str(self.project_root),
+            text=True,
+            capture_output=True,
+        )
+        return process.returncode == 0
+
+    def _git_path_is_ignored(self, relative: str) -> bool:
+        process = subprocess.run(
+            ["git", "check-ignore", "--no-index", "-q", "--", relative],
+            cwd=str(self.project_root),
+            text=True,
+            capture_output=True,
+        )
+        return process.returncode == 0
+
+    @staticmethod
+    def _artifact_ref_pattern(ref: str) -> str:
+        path, selector = Orchestrator._split_evidence_ref(ref)
+        if selector or not path:
+            return ""
+        normalized = path.replace("\\", "/").strip().removeprefix("./")
+        candidate = Path(normalized)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            return ""
+        return normalized
+
+    @staticmethod
+    def _glob_probe_path(pattern: str) -> str:
+        parts: List[str] = []
+        for part in Path(pattern).parts:
+            probe = re.sub(r"\[[^\]]*\]|\*+|\?+", "__auto_agents_probe__", part)
+            parts.append(probe or "__auto_agents_probe__")
+        return Path(*parts).as_posix()
+
+    def _ignored_supporting_evidence_portability_failure(
+        self,
+        task: Optional[TaskSpec],
+        gate: GateResult,
+    ) -> Optional[Dict[str, object]]:
+        if (
+            task is None
+            or not self.config.gates.isolation.enabled
+            or not self._task_requirement_evidence_refs(task)
+        ):
+            return None
+        artifacts = {
+            path.replace("\\", "/").removeprefix("./"): digest
+            for result in gate.commands
+            for path, digest in result.artifacts.items()
+        }
+        failed_refs: List[str] = []
+        for ref in self._task_requirement_evidence_refs(task):
+            if self._build_task_proof_evidence_command_for_ref(ref):
+                continue
+            pattern = self._artifact_ref_pattern(ref)
+            if not pattern or not self._looks_like_supporting_evidence_ref(ref):
+                continue
+            has_glob = any(token in pattern for token in ("*", "?", "["))
+            root_matches = [
+                path.relative_to(self.project_root).as_posix()
+                for path in self.project_root.glob(pattern)
+                if path.is_file()
+            ]
+            ignored = False
+            if has_glob:
+                candidates = list(dict.fromkeys([*root_matches, *artifacts]))
+                ignored = any(
+                    not self._git_path_is_tracked(path)
+                    and self._git_path_is_ignored(path)
+                    for path in candidates
+                    if fnmatch.fnmatchcase(path, pattern)
+                )
+                if not ignored:
+                    probe = self._glob_probe_path(pattern)
+                    ignored = self._git_path_is_ignored(probe)
+                portable = any(
+                    fnmatch.fnmatchcase(path, pattern) for path in artifacts
+                )
+            else:
+                ignored = (
+                    not self._git_path_is_tracked(pattern)
+                    and self._git_path_is_ignored(pattern)
+                )
+                portable = pattern in artifacts
+            if ignored and not portable:
+                failed_refs.append(ref)
+        if not failed_refs:
+            return None
+        reason = (
+            "verification contract requires ignored supporting evidence to be "
+            "published by this task's current isolated verification via artifact_globs: "
+            + ", ".join(failed_refs)
+        )
+        return {
+            "ok": False,
+            "reason": reason,
+            "failure_ids": [
+                f"verification_contract:nonportable_ignored_evidence:{ref}"
+                for ref in failed_refs
+            ],
+            "failed_refs": failed_refs,
+            "artifacts": artifacts,
+        }
 
     def _task_verify_baseline_ref(self, verification_context: str = "") -> str:
         base = f"{head_ref(self.project_root)}:{worktree_fingerprint(self.project_root)}"
@@ -13013,6 +13315,7 @@ class Orchestrator:
                 "Classify verification cadence explicitly: use cadence='implement_and_final' for focused checks needed during implementation and cadence='final_only' for broad release suites. Classify cache_scope='source' only when results depend solely on HEAD and tracked/untracked source content; use cache_scope='run_context' for requirements/task-state/config-sensitive checks. Defaults are implement_and_final and run_context.",
                 "Gate commands run in snapshot-backed worktrees. Use per-test relative temp paths and dynamically allocated port 0 whenever the same process can discover the bound port. When a child process requires a numeric port before launch, declare lowercase snake_case dynamic_ports names and make the test read AUTO_AGENTS_GATE_PORT_<UPPER_NAME>; keep a port-0 fallback for manual runs. Declaring dynamic_ports does not by itself make a step parallel-safe. Commands that intentionally share generated artifacts must remain parallel_safe=false and appear in producer-before-consumer order; commands that use unadapted fixed host ports, Docker daemons, or shared external accounts must declare host:/pool: exclusive_resources.",
                 "Declare requires for non-default tools such as ffmpeg or chrome and resource_class='heavy' for browser/FFmpeg workloads. Use cpu_slots only when a command needs an explicit scheduling capacity instead of the resource_class default. Memory checks are opt-in: memory_mb is the measured command working-set budget, memory_reserve_mb is the desired host reserve, and memory_guard must be 'off', 'advisory', or 'required'. Prefer advisory unless a dependable hard minimum is known; never invent a memory estimate. Declare artifact_globs only for ignored project-relative evidence that must survive sandbox cleanup. Never use absolute artifact paths or '..'.",
+                "Requirement proofs for ignored generated evidence must be portable across isolated gate worktrees. Reference stable current-run pointers or project-relative wildcard paths covered by the producing verification step's artifact_globs; never bind a proof to an implementation-session UUID. A pre-existing ignored file is not proof unless the current isolated verification publishes it.",
                 "For JavaScript/TypeScript verification, use verification_steps entries with kind='test', runner='vitest'.",
                 "Do not generate free-form shell verification commands for test steps; auto_agents derives the runnable command from verification_steps.",
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
@@ -13305,6 +13608,10 @@ class Orchestrator:
             "do not implement, review-fail, or emit ORACLE_PROOF_UPDATES for those absent pairs.",
             "If Task JSON includes verification_refs, those refs are the current repair task's "
             "owned executable proof surface and must pass before the repair can complete.",
+            "When requirement proof evidence is generated under an ignored path, use a stable "
+            "current-run pointer or a project-relative wildcard covered by the current verification "
+            "step's artifact_globs. Do not cite an implementation-session UUID. The current isolated "
+            "verification must publish every ignored supporting evidence ref before completion.",
         ]
         if task.verification_refs:
             common.extend(
@@ -13515,6 +13822,7 @@ class Orchestrator:
                     continue
 
                 self._set_implementation_ready_marker(state, task, True)
+                self._mark_execution_recovery_implementation_complete(task)
                 save_run_state(self.project_root, state)
 
                 self._sync_allowed_repair_task_plan_edits(state, task)
@@ -13560,6 +13868,7 @@ class Orchestrator:
                     continue
                 empty_diff_streak = 0
 
+            self._assert_execution_recovery_implementation_completed(state, task)
             self._emit_task_activity(task, "verify", attempt)
             task_commands = self._build_task_verify_commands(task)
             quick_failure = self._quick_verify_failure_details(task_commands if task_commands else None)

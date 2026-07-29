@@ -52,9 +52,9 @@ def test_incident_schema_preserves_repair_history() -> None:
     )
     payload = incident.to_dict()
     restored = ExecutionIncident.from_dict(payload)
-    assert payload["schema_version"] == 4
+    assert payload["schema_version"] == 5
     assert restored.repair_history == [{"action": "health_probe_failed"}]
-    assert restored.recovery_policy_version == 4
+    assert restored.recovery_policy_version == 5
 
 
 def test_managed_repair_result_is_json_serializable(tmp_path: Path) -> None:

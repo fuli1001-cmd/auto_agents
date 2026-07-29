@@ -789,10 +789,170 @@ class ExecutionRecoveryTests(unittest.TestCase):
                     tasks,
                     recovery,
                 )
-
             self.assertIsNone(result)
             execute.assert_called_once()
             self.assertEqual(recovery.status, "done")
+
+    def test_recurring_incident_requeues_same_task_for_fresh_implementation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            incident = ExecutionIncident(
+                incident_id="repeat-infra",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q tests/test_owned.py",
+                recovery_round=1,
+                evidence_fingerprint="evidence-1",
+            )
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+            task = orchestrator._load_tasks_from_plan()[0]
+            marker = orchestrator._execution_recovery_marker(task)
+            marker["implementation_completed_round"] = 1
+            task.status = "in_progress"
+            state.tasks = [task]
+            state.agent_attempts[f"implement-{task.task_id}"] = 1
+            orchestrator._set_implementation_ready_marker(state, task, True)
+            orchestrator._persist_tasks([task])
+
+            incident.recovery_round = 2
+            incident.evidence_fingerprint = "evidence-2"
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+
+            requeued = orchestrator._load_tasks_from_plan()[0]
+            requeued_marker = orchestrator._execution_recovery_marker(requeued)
+            self.assertEqual(requeued.status, "blocked")
+            self.assertEqual(requeued.recovery_round, 2)
+            self.assertEqual(requeued.verify_retry_epoch, 1)
+            self.assertEqual(
+                requeued_marker["implementation_required_round"],
+                2,
+            )
+            self.assertEqual(
+                requeued_marker["implementation_completed_round"],
+                1,
+            )
+            self.assertNotIn(
+                requeued.task_id,
+                state.resume_context.get("implementation_ready_tasks", {}),
+            )
+            self.assertNotIn(f"implement-{requeued.task_id}", state.agent_attempts)
+
+    def test_recovery_verify_without_current_round_implementation_is_invariant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            task = TaskSpec(
+                task_id="recover-execution-i1-r1",
+                title="Recovery",
+                description="Recovery",
+                acceptance=["passes"],
+                recovery_round=2,
+                task_origin="stage_recovery",
+                recovery_history=[
+                    {
+                        "kind": "execution_incident",
+                        "execution_incident_id": "i1",
+                        "verification_command": "python -m pytest -q",
+                        "implementation_required_round": 2,
+                        "implementation_completed_round": 1,
+                    }
+                ],
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "without a fresh implementation attempt",
+            ):
+                orchestrator._assert_execution_recovery_implementation_completed(
+                    state,
+                    task,
+                )
+
+            self.assertEqual(
+                state.last_recovery_route["engine_invariant"],
+                "execution_recovery_round_without_implementation",
+            )
+
+    def test_recurring_recovery_runs_implementation_before_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            task = TaskSpec(
+                task_id="recover-execution-i1-r1",
+                title="Recovery",
+                description="Recovery",
+                acceptance=["passes"],
+                recovery_round=2,
+                task_origin="stage_recovery",
+                recovery_history=[
+                    {
+                        "kind": "execution_incident",
+                        "execution_incident_id": "i1",
+                        "verification_command": "python -m pytest -q",
+                        "implementation_required_round": 2,
+                        "implementation_completed_round": 1,
+                    }
+                ],
+            )
+            events = []
+
+            def implement(**_kwargs):
+                events.append("implement")
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=root / "agent-output.txt",
+                    summary="implemented",
+                )
+
+            def verify(*_args, **_kwargs):
+                events.append("verify")
+                return {
+                    "ok": True,
+                    "reason": "passed",
+                    "current_failure_ids": [],
+                }
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_run_agent_with_retries",
+                    side_effect=implement,
+                ),
+                patch.object(orchestrator, "_implement_touched_code", return_value=True),
+                patch.object(orchestrator, "_run_task_verify", side_effect=verify),
+                patch.object(
+                    orchestrator,
+                    "_run_task_review",
+                    return_value={"ok": True, "review": "passed", "reason": ""},
+                ),
+                patch.object(
+                    orchestrator,
+                    "_run_task_visual_judge",
+                    return_value={"ok": True, "status": "skipped", "reason": "not visual"},
+                ),
+            ):
+                result = orchestrator._execute_task_with_retries(
+                    state,
+                    task,
+                    resume_existing=False,
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(events, ["implement", "verify"])
+            self.assertFalse(
+                orchestrator._execution_recovery_implementation_required(task)
+            )
 
     def test_task_recovery_rejects_a_worktree_changed_after_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1225,6 +1385,116 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertEqual(reopened.status, "recovering")
             self.assertEqual(reopened.recovery_round, 0)
             self.assertEqual(state.active_blocker["status"], "retrying")
+
+    def test_v4_reported_infrastructure_resume_requires_fresh_implementation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "target_project",
+                "category": "gate_reported_infrastructure_error",
+                "status": "blocked",
+            }
+            task = TaskSpec(
+                task_id="recover-execution-infra-r1",
+                title="Recovery",
+                description="Recovery",
+                acceptance=["passes"],
+                status="in_progress",
+                task_origin="stage_recovery",
+                recovery_round=1,
+                recovery_history=[
+                    {
+                        "kind": "execution_incident",
+                        "execution_incident_id": "infra",
+                        "initial_recovery_round": 1,
+                        "verification_command": "python -m pytest -q",
+                    }
+                ],
+            )
+            state.tasks = [task]
+            state.resume_context["implementation_ready_tasks"] = {
+                task.task_id: True,
+            }
+            orchestrator = Orchestrator(root)
+            orchestrator._persist_tasks([task])
+            incident = ExecutionIncident(
+                incident_id="infra",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q",
+                status="needs_human",
+                recovery_round=2,
+                recovery_policy_version=4,
+            )
+            ExecutionIncidentStore(root, state.run_id).save(incident, state)
+            save_run_state(root, state)
+
+            changed = orchestrator._resume_blocked_run(state)
+
+            self.assertTrue(changed)
+            migrated_task = orchestrator._load_tasks_from_plan()[0]
+            marker = orchestrator._execution_recovery_marker(migrated_task)
+            self.assertEqual(migrated_task.status, "blocked")
+            self.assertEqual(marker["implementation_required_round"], 2)
+            self.assertEqual(marker.get("implementation_completed_round", 0), 0)
+            self.assertNotIn(
+                migrated_task.task_id,
+                state.resume_context.get("implementation_ready_tasks", {}),
+            )
+            migrated_incident = ExecutionIncidentStore(
+                root,
+                state.run_id,
+            ).load("infra")
+            self.assertEqual(migrated_incident.recovery_policy_version, 5)
+            self.assertEqual(migrated_incident.recovery_round, 2)
+            self.assertTrue(
+                any(
+                    entry.get("event") == "policy_v5_task_migration"
+                    for entry in migrated_incident.history
+                )
+            )
+
+    def test_interrupted_run_does_not_reopen_resolved_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            state = load_run_state(root)
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "user_input",
+                "category": "run_interrupted",
+                "status": "blocked",
+            }
+            incident = ExecutionIncident(
+                incident_id="resolved",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                status="resolved",
+                recovery_round=2,
+            )
+            ExecutionIncidentStore(root, state.run_id).save(incident, state)
+            state.active_execution_incident_id = incident.incident_id
+            save_run_state(root, state)
+            orchestrator = Orchestrator(root)
+
+            self.assertTrue(orchestrator._resume_blocked_run(state))
+
+            saved = ExecutionIncidentStore(root, state.run_id).load(
+                incident.incident_id
+            )
+            self.assertEqual(saved.status, "resolved")
+            self.assertEqual(saved.recovery_round, 2)
+            self.assertEqual(state.active_execution_incident_id, "")
 
     def test_auto_agents_block_waits_for_self_repair_before_resume(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

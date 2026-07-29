@@ -557,6 +557,11 @@ Sequential commands share one worktree so deliberate producer/consumer chains st
 that changes tracked or unignored source is rejected by the existing mutation guard, while declared
 `artifact_globs` are copied back atomically under both their project path and
 `.auto-agents/runs/<plan-id>/gate-artifacts/`.
+Verified requirement proofs may cite ignored generated evidence only when the current isolated
+task verification publishes it through these globs. Exact refs must be present in that
+verification's artifact map; wildcard refs must match at least one current artifact. Stable
+current-run pointers and project-relative wildcards are portable, while a pre-existing ignored
+file or an implementation-session UUID is not accepted as completion evidence.
 
 ```json
 {
@@ -732,6 +737,12 @@ their `depends_on` graph and runs ready children before retrying the parent. The
 baseline is captured only after the incident parent succeeds. Older open recovery tasks created
 without this command scope are migrated conservatively: unstarted generated children are
 superseded, while partially executed children pause for review so worktree changes are not lost.
+Every incident recovery round must run a fresh implementation attempt before verification. Reusing
+the same recovery task clears its implementation-resume marker and starts a new verify lifecycle;
+reaching verification without that attempt is an engine invariant violation eligible for the
+existing bounded self-repair path. Incident policy/schema v5 reopens affected v4 reported-
+infrastructure incidents and returns the final round that the older policy could consume by
+verification-only reuse.
 
 The project run lock also distinguishes a clean release from an owner process that disappeared.
 When a later `run` finds stale process control with no live process groups, it records a runtime
