@@ -49,7 +49,8 @@ class BootstrapTests(unittest.TestCase):
             auto_gitignore = (auto_dir(project_root) / ".gitignore").read_text(encoding="utf-8")
             self.assertEqual(
                 auto_gitignore,
-                "runs/\nstate/gate_baseline_cache.json\nstate/gate_baseline_cache.sqlite3\n"
+                "failed-verification-logs/\nruns/\nstate/sessions/\n"
+                "state/gate_baseline_cache.json\nstate/gate_baseline_cache.sqlite3\n"
                 "state/gate_baseline_cache.sqlite3-*\nstate/requirements_audit_cache.sqlite3\n"
                 "state/requirements_audit_cache.sqlite3-*\nstate/repomap_cache.json\n"
                 "state/parallel_tuning.json\n",
@@ -66,9 +67,29 @@ class BootstrapTests(unittest.TestCase):
                 ["git", "check-ignore", "-q", ".auto-agents/runs/run-001/run.log"],
                 cwd=str(project_root),
             )
+            failed_log_ignore = subprocess.run(
+                [
+                    "git",
+                    "check-ignore",
+                    "-q",
+                    ".auto-agents/failed-verification-logs/verify-stage.log",
+                ],
+                cwd=str(project_root),
+            )
+            session_ignore = subprocess.run(
+                [
+                    "git",
+                    "check-ignore",
+                    "-q",
+                    ".auto-agents/state/sessions/session-001/session_state.json",
+                ],
+                cwd=str(project_root),
+            )
             self.assertEqual(task_archive_ignore.returncode, 1)
             self.assertEqual(run_state_archive_ignore.returncode, 0)
             self.assertEqual(run_log_ignore.returncode, 0)
+            self.assertEqual(failed_log_ignore.returncode, 0)
+            self.assertEqual(session_ignore.returncode, 0)
             gitignore = (project_root / ".gitignore").read_text(encoding="utf-8")
             self.assertIn(".env", gitignore)
             self.assertIn(".conda/", gitignore)
