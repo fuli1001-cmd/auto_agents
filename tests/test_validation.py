@@ -134,6 +134,7 @@ class TaskPlanValidationTests(unittest.TestCase):
                 {
                     "kind": "test",
                     "runner": "pytest",
+                    "purpose": "Run the broad final Python regression suite.",
                     "targets": ["tests"],
                     "cpu_slots": 2,
                     "memory_mb": 4096,
@@ -162,6 +163,7 @@ class TaskPlanValidationTests(unittest.TestCase):
                 {
                     "kind": "test",
                     "runner": "pytest",
+                    "purpose": "Exercise the implementation verification surface.",
                     "targets": ["tests"],
                     "cpu_slots": -1,
                     "memory_mb": 0,
@@ -258,6 +260,115 @@ class TaskPlanValidationTests(unittest.TestCase):
         errors = validate_task_plan_payload(payload, require_verification=True)
         self.assertTrue(any(".cadence must be one of" in item for item in errors))
         self.assertTrue(any(".cache_scope must be one of" in item for item in errors))
+
+    def test_accepts_v2_plan_with_exact_task_ref_and_final_directory_suite(self) -> None:
+        payload = {
+            "verification_policy_version": 2,
+            "test_strategy": "python-pytest",
+            "verification_steps": [
+                {
+                    "kind": "test",
+                    "runner": "pytest",
+                    "purpose": "Run the broad final Python regression suite.",
+                    "targets": ["tests"],
+                    "parallel_safe": True,
+                    "cadence": "final_only",
+                    "cache_scope": "source",
+                    "result_cache_scope": "observed_inputs",
+                }
+            ],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Add CLI entrypoint",
+                    "description": "Add a runnable command line entrypoint.",
+                    "acceptance": ["done"],
+                    "verification_refs": ["tests/test_cli.py::test_help"],
+                    "status": "pending",
+                    "commit_message": "feat: add CLI",
+                }
+            ],
+        }
+
+        self.assertEqual(
+            validate_task_plan_payload(payload, require_verification=True),
+            [],
+        )
+
+    def test_v2_rejects_implicit_serial_and_broad_implement_target(self) -> None:
+        payload = {
+            "verification_policy_version": 2,
+            "test_strategy": "python-pytest",
+            "verification_steps": [
+                {
+                    "kind": "test",
+                    "runner": "pytest",
+                    "purpose": "Exercise the implementation verification surface.",
+                    "targets": ["tests"],
+                    "parallel_safe": False,
+                    "cadence": "implement_and_final",
+                }
+            ],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Add CLI entrypoint",
+                    "description": "Add a runnable command line entrypoint.",
+                    "acceptance": ["done"],
+                    "verification_refs": ["tests/test_cli.py"],
+                    "status": "pending",
+                    "commit_message": "feat: add CLI",
+                }
+            ],
+        }
+
+        errors = validate_task_plan_payload(payload, require_verification=True)
+
+        self.assertTrue(any("serial_reason is required" in item for item in errors))
+        self.assertTrue(any("broad directory targets" in item for item in errors))
+        self.assertTrue(any("whole-file verification ref" in item for item in errors))
+
+    def test_v2_rejects_duplicate_artifact_ownership(self) -> None:
+        payload = {
+            "verification_policy_version": 2,
+            "test_strategy": "browser-chain",
+            "verification_steps": [
+                {
+                    "kind": "test",
+                    "runner": "vitest",
+                    "purpose": "Produce browser evidence.",
+                    "targets": ["src/producer.test.ts"],
+                    "parallel_safe": False,
+                    "serial_reason": "artifact_chain",
+                    "artifact_globs": [".tmp-tests/evidence.json"],
+                },
+                {
+                    "kind": "test",
+                    "runner": "pytest",
+                    "purpose": "Audit browser evidence.",
+                    "targets": ["tests/test_audit.py"],
+                    "parallel_safe": False,
+                    "serial_reason": "ordered_contract",
+                    "artifact_globs": [".tmp-tests/evidence.json"],
+                },
+            ],
+            "tasks": [
+                {
+                    "task_id": "task-001",
+                    "title": "Audit evidence",
+                    "description": "Audit the produced browser evidence.",
+                    "acceptance": ["Evidence is valid."],
+                    "status": "done",
+                    "commit_message": "test: audit evidence",
+                }
+            ],
+        }
+
+        errors = validate_task_plan_payload(payload, require_verification=True)
+
+        self.assertTrue(
+            any("duplicates artifact ownership" in item for item in errors)
+        )
 
     def test_allows_large_task_count_without_hard_failure(self) -> None:
         payload = {

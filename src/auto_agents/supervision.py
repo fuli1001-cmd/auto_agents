@@ -118,7 +118,12 @@ class ProgressSupervisor:
         if self.forced_reason:
             return self.forced_reason
         elapsed = now - self.started_at
-        if elapsed >= self.config.safety_ceiling_seconds:
+        safety_ceiling = self.config.safety_ceiling_seconds
+        if self.active_tool:
+            safety_ceiling += max(
+                0, int(self.config.active_tool_grace_seconds)
+            )
+        if elapsed >= safety_ceiling:
             return "safety_ceiling"
         if (
             not self.protocol_seen

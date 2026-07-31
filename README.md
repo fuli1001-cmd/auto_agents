@@ -274,7 +274,8 @@ By default, implementation refuses to start if the target repository already has
 Use `--allow-dirty-tree` only when you explicitly want task work to proceed on top of an existing
 dirty workspace.
 
-During `plan`, the agent must write `test_strategy` and structured `verification_steps` into
+During `plan`, the agent must write `verification_policy_version: 2`, `test_strategy`, and
+structured `verification_steps` into
 `.auto-agents/state/task_plan.json`. By default the orchestrator derives runnable gate commands from
 those steps and stores both the structured steps and derived commands in `.auto-agents/config.json`,
 so new projects do not need a hand-written `gates.commands` block.
@@ -290,13 +291,25 @@ Each step may also declare `cadence` and `cache_scope`. `cadence: "implement_and
 `cadence: "final_only"` reserves broad release suites for the final verify stage. Use
 `cache_scope: "source"` only for checks whose result depends solely on the source/worktree;
 the conservative default, `cache_scope: "run_context"`, also invalidates when requirement or task
-context changes.
+context changes. Version 2 also requires every active task to own one or more executable
+`verification_refs`. Prefer an exact Pytest selector such as
+`tests/test_api.py::test_contract`; a whole-file ref is accepted only when that file is an
+`implement_and_final` step.
+
+Broad Pytest and Vitest directory targets must use `cadence: "final_only"`. Before execution,
+auto_agents expands those targets into one step per discovered test file, which permits bounded
+parallel scheduling without assigning the entire release suite to every implementation task.
 
 Inspect persisted progress:
 
 ```bash
 python3 -m auto_agents status --project /tmp/demo
 ```
+
+Each run also writes `.auto-agents/runs/<run-id>/performance.json`, containing stage wall time,
+per-command gate duration, invocation and cache-hit counts, and the slowest commands. Set
+`gates.target_final_seconds` to a non-zero project target when final verification has a known
+latency budget; zero leaves the target informationally disabled.
 
 The `runtime` section reports whether a validated run owner is active, how many supervised process
 groups are running, the last process-control heartbeat, and whether cleanup is incomplete. To stop
@@ -531,8 +544,11 @@ fingerprint remain identical. The legacy JSON cache is ignored; the first run af
 captures one cold baseline. Cache corruption disables reuse and falls back to running the real
 commands.
 
-Gate commands remain sequential by default. A structured `verification_steps` entry is concurrent
-only when it explicitly sets `parallel_safe=true`; safe entries are grouped by runner and capped by
+Under verification policy version 2, concurrency must be explicit. A
+`verification_steps` entry is concurrent only when it sets `parallel_safe=true`; otherwise it must
+set `parallel_safe=false` and declare a `serial_reason` (`artifact_chain`,
+`shared_mutable_state`, `fixed_port`, `external_side_effect`, or `ordered_contract`). Safe entries
+are grouped by runner and capped by
 the capacity detected across available workers (`gates.max_auto_workers` defaults to `"auto"`).
 With isolated gates, the ordered sequential lane and the current parallel group run at the same
 time. Parallel groups still retain barriers between groups. The marker is appropriate only for
@@ -542,6 +558,11 @@ ports, mutable fixtures, snapshots, build output, or producer/consumer artifacts
 falls back to the phased sequential-first schedule. Identical derived commands are executed once in
 first-seen order; duplicate declarations merge conservatively, so any unsafe occurrence keeps the
 command sequential and any run-context occurrence keeps the narrower cache scope.
+
+If an explicitly parallel command fails, auto_agents performs one serial confirmation before
+creating a repair incident. A command that fails only under overlap is quarantined into the serial
+lane for the rest of the run. This protects target projects from repair attempts caused by an
+incorrect concurrency declaration while retaining the original failure metadata.
 
 The isolated scheduler dispatches a bounded amount of work instead of queueing the whole plan. A
 failure stops new dispatch while already-running commands drain, preserving their diagnostics and
@@ -566,6 +587,8 @@ file or an implementation-session UUID is not accepted as completion evidence.
 ```json
 {
   "gates": {
+    "verification_policy_version": 2,
+    "target_final_seconds": 0,
     "max_auto_workers": "auto",
     "isolation": {
       "enabled": true,
@@ -586,6 +609,9 @@ Gate steps may also declare scheduling and artifact metadata:
   "runner": "vitest",
   "targets": ["workbench/src/e2e/example.test.ts"],
   "parallel_safe": true,
+  "max_batches": 4,
+  "cache_scope": "source",
+  "result_cache_scope": "candidate",
   "resource_class": "heavy",
   "cpu_slots": 2,
   "memory_mb": 4096,
@@ -597,6 +623,18 @@ Gate steps may also declare scheduling and artifact metadata:
   "artifact_globs": [".tmp-tests/evidence/**/*.png"]
 }
 ```
+
+`max_batches` bounds directory expansion for one verification step. Zero or omission uses the
+worker-aware default; `1` keeps the discovered suite in one runner process when fixtures or media
+initialization cost more than test-level concurrency saves.
+
+`result_cache_scope` controls the success-only command result cache stored in the gate cache
+database. `candidate` reuses a success only for an identical source and semantic context;
+`observed_inputs` can reuse across commits when Linux syscall tracing proves that every observed
+project input is unchanged and no network access occurred; `off` always executes. Validation only
+permits `observed_inputs` on source-scoped, parallel-safe checks without artifacts, exclusive
+resources, or dynamic ports. Failures, timeouts, mutations, infrastructure errors, and artifact
+producers are never cached.
 
 `cpu_slots` declares how many worker scheduling slots the command consumes. Zero or omission keeps
 the compatibility default: `resource_class=heavy` consumes two slots and normal commands consume
@@ -795,7 +833,17 @@ worktrees. Example:
       "semantic_stall_seconds": 3600,
       "safety_ceiling_seconds": 43200,
       "loop_repeat_limit": 3,
-      "same_provider_resume_limit": 1
+      "same_provider_resume_limit": 1,
+      "stage_checkpoint_seconds": {
+        "clarify": 1200,
+        "design": 1200,
+        "plan": 1200,
+        "implement": 1800,
+        "review": 900,
+        "readme": 900
+      },
+      "active_tool_grace_seconds": 900,
+      "fresh_continuation_limit": 1
     },
     "provider_failover": {
       "probe_enabled": true,
@@ -882,6 +930,9 @@ progress leases:
 - `semantic_stall_seconds`: no new tool result, milestone, output artifact, or workspace fingerprint
 - `loop_repeat_limit`: the same completed-tool fingerprint repeats without a workspace change
 - `safety_ceiling_seconds`: final emergency ceiling even when lower-level activity continues
+- `stage_checkpoint_seconds`: stage-specific checkpoint budget applied to one provider attempt
+- `active_tool_grace_seconds`: extra safety-ceiling grace while a declared tool is still active
+- `fresh_continuation_limit`: fresh-context continuations allowed after a stage checkpoint
 
 Provider output heartbeats refresh only the provider lease; they do not count as semantic progress.
 Codex and Copilot use native JSONL events, while Antigravity combines its native log with its local
@@ -889,8 +940,10 @@ conversation SQLite state. Checkpoints are written every 30 seconds under the ru
 `provider-attempts/` directory and include the provider session ID and bounded diagnostics.
 
 `provider_idle`, explicit provider errors, and protocol errors switch provider immediately. Tool
-stalls, semantic stalls, loops, and the safety ceiling first resume the same provider once, using
-its exact session when one was captured; a second failure switches provider. Set
+stalls, semantic stalls, and loops first resume the same provider once using its exact captured
+session. Reaching a stage checkpoint starts a fresh continuation with a bounded handoff instead of
+growing the old session indefinitely; after the configured fresh continuation limit, normal
+failover applies. Set
 `execution.smart_timeout.enabled` to `false` to restore the legacy `timeout_seconds` and
 `idle_timeout_seconds` hard-deadline behavior.
 
@@ -941,6 +994,7 @@ the implementation loop starts.
 The plan root can also define:
 
 - `test_strategy`
+- `verification_policy_version`
 - `verification_steps`
 - `oracle_proof_schema_version`
 

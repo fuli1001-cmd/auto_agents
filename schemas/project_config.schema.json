@@ -184,6 +184,14 @@
         "allow_agent_updates"
       ],
       "properties": {
+        "verification_policy_version": {
+          "type": "integer",
+          "enum": [1, 2]
+        },
+        "target_final_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
         "commands": {
           "type": "array",
           "items": {
@@ -204,6 +212,10 @@
                 "type": "string",
                 "enum": ["pytest", "vitest"]
               },
+              "purpose": {
+                "type": "string",
+                "minLength": 1
+              },
               "targets": {
                 "type": "array",
                 "items": {
@@ -221,6 +233,20 @@
               "parallel_safe": {
                 "type": "boolean"
               },
+              "max_batches": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "serial_reason": {
+                "type": "string",
+                "enum": [
+                  "artifact_chain",
+                  "shared_mutable_state",
+                  "fixed_port",
+                  "external_side_effect",
+                  "ordered_contract"
+                ]
+              },
               "cadence": {
                 "type": "string",
                 "enum": ["implement_and_final", "final_only"]
@@ -228,6 +254,10 @@
               "cache_scope": {
                 "type": "string",
                 "enum": ["source", "run_context"]
+              },
+              "result_cache_scope": {
+                "type": "string",
+                "enum": ["off", "candidate", "observed_inputs"]
               },
               "resource_class": {
                 "type": "string",
@@ -482,7 +512,13 @@
             "semantic_stall_seconds": {"type": "integer", "minimum": 60},
             "safety_ceiling_seconds": {"type": "integer", "minimum": 60},
             "loop_repeat_limit": {"type": "integer", "minimum": 2},
-            "same_provider_resume_limit": {"type": "integer", "minimum": 0}
+            "same_provider_resume_limit": {"type": "integer", "minimum": 0},
+            "stage_checkpoint_seconds": {
+              "type": "object",
+              "additionalProperties": {"type": "integer", "minimum": 60}
+            },
+            "active_tool_grace_seconds": {"type": "integer", "minimum": 0},
+            "fresh_continuation_limit": {"type": "integer", "minimum": 0}
           },
           "additionalProperties": false
         }

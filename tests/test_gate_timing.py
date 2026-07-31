@@ -64,3 +64,34 @@ def test_gate_timing_excludes_failures_and_separates_resource_signatures(
     assert other_environment.estimate(
         "pytest tests/test_demo.py", normal
     ) is None
+    assert other_environment.estimate_any_environment(
+        "pytest tests/test_demo.py", normal
+    ) == 12.0
+
+
+def test_parallel_quarantine_is_environment_scoped_and_persistent(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "gate-cache.sqlite3"
+    first = GateTimingStore(
+        tmp_path,
+        cache_path=cache,
+        environment_fingerprint="worker-a",
+    )
+    first.quarantine_parallel_command("pytest tests/test_shared.py")
+
+    reloaded = GateTimingStore(
+        tmp_path,
+        cache_path=cache,
+        environment_fingerprint="worker-a",
+    )
+    other = GateTimingStore(
+        tmp_path,
+        cache_path=cache,
+        environment_fingerprint="worker-b",
+    )
+
+    assert reloaded.quarantined_commands() == {
+        "pytest tests/test_shared.py"
+    }
+    assert other.quarantined_commands() == set()

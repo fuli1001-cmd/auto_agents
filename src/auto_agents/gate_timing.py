@@ -100,6 +100,47 @@ class GateTimingStore:
             self.disabled = True
             return None
 
+    def estimate_any_environment(
+        self,
+        command: str,
+        metadata: object = None,
+    ) -> Optional[float]:
+        """Return recent timing history usable for first-pass batch balancing.
+
+        Execution timeout and cache decisions remain environment-specific.
+        Batch construction only needs a rough relative cost, so it may combine
+        successful samples from equivalent resource signatures across workers.
+        """
+        if self.disabled:
+            return None
+        signature = _resource_signature(metadata)
+        try:
+            with self._lock, self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT samples
+                    FROM command_timings
+                    WHERE command = ?
+                      AND resource_signature = ?
+                      AND updated_at >= ?
+                    """,
+                    (
+                        str(command).strip(),
+                        signature,
+                        int(time.time()) - MAX_AGE_SECONDS,
+                    ),
+                ).fetchall()
+                samples = [
+                    float(item)
+                    for row in rows
+                    for item in json.loads(row[0])
+                    if isinstance(item, (int, float)) and float(item) >= 0
+                ]
+                return float(median(samples)) if samples else None
+        except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+            self.disabled = True
+            return None
+
     def record(
         self,
         command: str,
@@ -156,6 +197,53 @@ class GateTimingStore:
         except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
             self.disabled = True
 
+    def quarantined_commands(self) -> set[str]:
+        if self.disabled:
+            return set()
+        cutoff = int(time.time()) - MAX_AGE_SECONDS
+        try:
+            with self._lock, self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM parallel_quarantine WHERE updated_at < ?",
+                    (cutoff,),
+                )
+                rows = connection.execute(
+                    """
+                    SELECT command
+                    FROM parallel_quarantine
+                    WHERE environment_fingerprint = ?
+                    """,
+                    (self.environment_fingerprint,),
+                ).fetchall()
+                return {
+                    str(row[0]).strip()
+                    for row in rows
+                    if str(row[0]).strip()
+                }
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            self.disabled = True
+            return set()
+
+    def quarantine_parallel_command(self, command: str) -> None:
+        if self.disabled or not str(command).strip():
+            return
+        try:
+            with self._lock, self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO parallel_quarantine (
+                        command, environment_fingerprint, updated_at
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (
+                        str(command).strip(),
+                        self.environment_fingerprint,
+                        int(time.time()),
+                    ),
+                )
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            self.disabled = True
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.cache_path), timeout=1.0)
         connection.execute("PRAGMA busy_timeout = 1000")
@@ -169,6 +257,16 @@ class GateTimingStore:
                 resource_signature TEXT NOT NULL,
                 samples TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS parallel_quarantine (
+                command TEXT NOT NULL,
+                environment_fingerprint TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (command, environment_fingerprint)
             )
             """
         )

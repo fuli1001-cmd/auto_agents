@@ -57,6 +57,7 @@ class DistributedGatePlanExecutor:
         *,
         run_id: str = "",
         environment_fingerprint: str = "",
+        result_context_fingerprint: str = "",
     ) -> None:
         self.project_root = project_root.resolve()
         self.run_id = str(run_id)
@@ -69,6 +70,7 @@ class DistributedGatePlanExecutor:
             run_id=run_id,
             worker_id="local",
             environment_fingerprint=environment_fingerprint,
+            result_context_fingerprint=result_context_fingerprint,
         )
         self.key = project_key(self.project_root)
         self.environment_manifest = build_environment_manifest(self.project_root)
@@ -730,7 +732,7 @@ class DistributedGatePlanExecutor:
             progress("finish", command, result.duration_seconds)
         return result
 
-    def run(
+    def _run_uncached(
         self,
         command: str,
         *,
@@ -839,6 +841,34 @@ class DistributedGatePlanExecutor:
                 return result
             if lane:
                 self._lane_endpoint.pop(lane, None)
+        return result
+
+    def run(
+        self,
+        command: str,
+        *,
+        lane: str = "",
+        timeout_seconds: float,
+        adaptive_timeout_enabled: bool,
+        idle_timeout_seconds: float,
+        cancel_event: Optional[threading.Event] = None,
+        progress=None,
+    ) -> CommandResult:
+        cached = self.local.cached_result(command)
+        if cached is not None:
+            if progress is not None:
+                progress("cache_hit", command, 0.0)
+            return cached
+        result = self._run_uncached(
+            command,
+            lane=lane,
+            timeout_seconds=timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            idle_timeout_seconds=idle_timeout_seconds,
+            cancel_event=cancel_event,
+            progress=progress,
+        )
+        self.local.record_cached_result(command, result)
         return result
 
     def _infrastructure_attempt_evidence(

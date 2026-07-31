@@ -83,6 +83,7 @@ from .gates import (
     gate_plan_from_verification_steps,
     resolve_gate_plan_from_verification_steps,
     expand_pytest_directory_steps,
+    expand_verification_directory_steps,
     first_infrastructure_command,
     first_terminated_command,
     run_gate_plan,
@@ -90,6 +91,7 @@ from .gates import (
     run_commands_collect_all,
 )
 from .gate_baseline_cache import GateBaselineCache
+from .gate_timing import GateTimingStore
 from .gate_execution import (
     LocalGatePlanExecutor,
     dependency_link_paths,
@@ -151,6 +153,7 @@ from .models import (
     GateParallelGroup,
     GateResult,
     RunState,
+    SmartTimeoutConfig,
     STAGE_ORDER,
     TaskSpec,
     VerificationStep,
@@ -336,6 +339,8 @@ class Orchestrator:
         self._max_tasks_remaining: Optional[int] = None
         self._task_budget_exhausted = False
         self._active_run_log_path: Optional[Path] = None
+        self._performance_stages: Dict[str, float] = {}
+        self._performance_commands: Dict[str, Dict[str, object]] = {}
         gate_environment = gate_environment_fingerprint(
             isolation_mode=(
                 self.config.gates.isolation.mode
@@ -350,6 +355,14 @@ class Orchestrator:
             self.project_root,
             cache_path=gate_baseline_cache_path(self.project_root),
             environment_fingerprint=gate_environment,
+        )
+        self._gate_timing_store = GateTimingStore(
+            self.project_root,
+            cache_path=gate_baseline_cache_path(self.project_root),
+            environment_fingerprint=gate_environment,
+        )
+        self._parallel_gate_quarantine: Set[str] = (
+            self._gate_timing_store.quarantined_commands()
         )
         # Snapshot of active/deferred REQ IDs captured BEFORE a clarify
         # iteration generation; used by _clarify_validation_feedback to
@@ -1720,6 +1733,7 @@ class Orchestrator:
                 stage_had_summary = stage in state.stage_summaries
                 self._emit_stage_start(stage)
                 try:
+                    stage_started_at = time.monotonic()
                     with log_timing(self.logger, f"stage:{stage}"):
                         if stage == "implement":
                             state = self._run_implementation_loop(state, max_tasks=max_tasks)
@@ -1759,6 +1773,12 @@ class Orchestrator:
                     state.last_error = str(error)
                     save_run_state(self.project_root, state)
                     raise
+
+                self._performance_stages[stage] = (
+                    self._performance_stages.get(stage, 0.0)
+                    + max(0.0, time.monotonic() - stage_started_at)
+                )
+                self._persist_performance_report(state.run_id)
 
                 self._merge_persisted_execution_incidents(state)
                 self._resolve_rewound_execution_incident(state, stage)
@@ -3808,6 +3828,14 @@ class Orchestrator:
                     progress=self._gate_progress_callback(context),
                     gate_executor=gate_executor,
                 )
+                gate = self._serial_fallback_for_parallel_failures(
+                    gate,
+                    commands,
+                    parallel_groups,
+                    gate_executor,
+                    context=context,
+                    collect_all=collect_all,
+                )
         self._classify_reported_infrastructure_failures(gate)
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
@@ -3871,6 +3899,185 @@ class Orchestrator:
             )
         return gate, reason
 
+    def _serial_fallback_for_parallel_failures(
+        self,
+        gate: GateResult,
+        serial_commands: Sequence[str],
+        parallel_groups: Sequence[GateParallelGroup],
+        gate_executor: object,
+        *,
+        context: str,
+        collect_all: bool = False,
+    ) -> GateResult:
+        """Confirm a parallel failure serially before opening a repair incident.
+
+        A declared-safe check can still expose an undeclared shared resource.
+        When that happens, retry the incomplete tail once without overlap and
+        quarantine any command that passes only in the serial fallback.
+        """
+
+        parallel_commands = [
+            command
+            for group in parallel_groups
+            for command in group.commands
+        ]
+        if not parallel_commands:
+            return gate
+        initial = {
+            result.command: result
+            for result in gate.commands
+        }
+        confirmed_parallel_failure = any(
+            command in initial
+            and not initial[command].ok
+            and initial[command].termination_reason != "cancelled"
+            for command in parallel_commands
+        )
+        if not confirmed_parallel_failure:
+            return gate
+
+        planned = list(serial_commands) + parallel_commands
+        recovered: Dict[str, CommandResult] = {
+            command: result
+            for command, result in initial.items()
+            if result.ok
+        }
+        failed_parallel_commands = [
+            command
+            for command in parallel_commands
+            if (
+                command in initial
+                and not initial[command].ok
+                and initial[command].termination_reason != "cancelled"
+            )
+        ]
+        for command in failed_parallel_commands:
+            previous = initial[command]
+            retry = gate_executor.run(
+                command,
+                lane="",
+                timeout_seconds=self.config.gates.command_timeout_seconds,
+                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                progress=self._gate_progress_callback(
+                    f"{context} serial fallback"
+                ),
+            )
+            retry.process_snapshot = {
+                **dict(retry.process_snapshot),
+                "parallel_fallback": {
+                    "initial_returncode": (
+                        previous.returncode if previous is not None else None
+                    ),
+                    "initial_termination_reason": (
+                        previous.termination_reason or "failed"
+                    ),
+                },
+            }
+            recovered[command] = retry
+            if (
+                command in parallel_commands
+                and retry.ok
+                and previous is not None
+                and previous.termination_reason != "cancelled"
+            ):
+                self._parallel_gate_quarantine.add(command)
+                self._gate_timing_store.quarantine_parallel_command(command)
+                self.logger.warning(
+                    "[gate-scheduler] context=%s state=quarantine "
+                    "reason=parallel_failed_serial_passed command=%s",
+                    context,
+                    command[:300],
+                )
+
+        retry_failures = [
+            recovered[command]
+            for command in failed_parallel_commands
+            if not recovered[command].ok
+        ]
+        if retry_failures:
+            results = [
+                recovered[command]
+                for command in planned
+                if command in recovered
+            ]
+            return GateResult(
+                ok=False,
+                commands=results,
+                summary="; ".join(
+                    f"command failed: {result.command}"
+                    for result in retry_failures
+                ),
+            )
+
+        remaining_serial = [
+            command for command in serial_commands if command not in recovered
+        ]
+        remaining_groups = [
+            GateParallelGroup(
+                name=group.name,
+                commands=[
+                    command
+                    for command in group.commands
+                    if command not in recovered
+                ],
+            )
+            for group in parallel_groups
+        ]
+        remaining_groups = [
+            group for group in remaining_groups if group.commands
+        ]
+        if remaining_serial or remaining_groups:
+            self.logger.info(
+                "[gate-scheduler] context=%s state=resume-after-fallback "
+                "sequential=%s parallel=%s",
+                context,
+                len(remaining_serial),
+                sum(len(group.commands) for group in remaining_groups),
+            )
+            resumed = run_gate_plan(
+                remaining_serial,
+                remaining_groups,
+                self.project_root,
+                collect_all=collect_all,
+                parallel_workers=self._gate_parallel_workers(),
+                command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                progress=self._gate_progress_callback(
+                    f"{context} resumed after serial fallback"
+                ),
+                gate_executor=gate_executor,
+            )
+            resumed = self._serial_fallback_for_parallel_failures(
+                resumed,
+                remaining_serial,
+                remaining_groups,
+                gate_executor,
+                context=context,
+                collect_all=collect_all,
+            )
+            recovered.update(
+                {result.command: result for result in resumed.commands}
+            )
+
+        results = [recovered[command] for command in planned if command in recovered]
+        ok = len(results) == len(planned) and all(result.ok for result in results)
+        failures = [
+            result.command
+            for result in results
+            if not result.ok
+        ]
+        return GateResult(
+            ok=ok,
+            commands=results,
+            summary=(
+                "all commands passed after serial fallback"
+                if ok
+                else "; ".join(f"command failed: {command}" for command in failures)
+            ),
+        )
+
     def _run_missing_baseline_commands(
         self,
         baseline_ref: str,
@@ -3933,6 +4140,13 @@ class Orchestrator:
                     progress=self._gate_progress_callback(context),
                     gate_executor=gate_executor,
                 )
+                gate = self._serial_fallback_for_parallel_failures(
+                    gate,
+                    pending_commands,
+                    pending_groups,
+                    gate_executor,
+                    context=context,
+                )
         self._classify_reported_infrastructure_failures(gate)
         self._log_gate_command_results(context, gate.commands)
         self._cleanup_ephemeral_tooling_artifacts()
@@ -3973,12 +4187,13 @@ class Orchestrator:
     def _log_gate_command_results(self, context: str, results: Iterable[object]) -> None:
         for index, result in enumerate(results, start=1):
             self.logger.info(
-                "[gate-command] context=%s index=%s ok=%s returncode=%s duration_seconds=%.3f termination=%s infrastructure_failure=%s infrastructure_attempts=%s cleanup_incomplete=%s worker=%s backend=%s job_id=%s command=%s",
+                "[gate-command] context=%s index=%s ok=%s returncode=%s duration_seconds=%.3f cached=%s termination=%s infrastructure_failure=%s infrastructure_attempts=%s cleanup_incomplete=%s worker=%s backend=%s job_id=%s command=%s",
                 context,
                 index,
                 str(bool(getattr(result, "ok", False))).lower(),
                 getattr(result, "returncode", ""),
                 float(getattr(result, "duration_seconds", 0.0) or 0.0),
+                str(bool(getattr(result, "cached", False))).lower(),
                 str(getattr(result, "termination_reason", "") or "none"),
                 str(getattr(result, "infrastructure_failure_id", "") or "none"),
                 len(getattr(result, "infrastructure_attempts", []) or []),
@@ -3988,6 +4203,104 @@ class Orchestrator:
                 str(getattr(result, "job_id", "") or "none"),
                 str(getattr(result, "command", ""))[:300],
             )
+            if bool(getattr(result, "infrastructure_error", False)):
+                self.logger.warning(
+                    "[gate-command] context=%s infrastructure_detail=%s",
+                    context,
+                    str(getattr(result, "stderr", "") or "")[-1000:],
+                )
+            command = str(getattr(result, "command", "")).strip()
+            if command:
+                entry = self._performance_commands.setdefault(
+                    command,
+                    {
+                        "command": command,
+                        "invocations": 0,
+                        "duration_seconds": 0.0,
+                        "cache_hits": 0,
+                        "failures": 0,
+                        "contexts": {},
+                        "workers": {},
+                    },
+                )
+                entry["invocations"] = int(entry["invocations"]) + 1
+                entry["duration_seconds"] = float(entry["duration_seconds"]) + float(
+                    getattr(result, "duration_seconds", 0.0) or 0.0
+                )
+                entry["cache_hits"] = int(entry["cache_hits"]) + int(
+                    bool(getattr(result, "cached", False))
+                )
+                entry["failures"] = int(entry["failures"]) + int(
+                    not bool(getattr(result, "ok", False))
+                )
+                contexts = dict(entry["contexts"])
+                contexts[context] = int(contexts.get(context, 0)) + 1
+                entry["contexts"] = contexts
+                worker = str(getattr(result, "worker_id", "") or "local")
+                workers = dict(entry["workers"])
+                workers[worker] = int(workers.get(worker, 0)) + 1
+                entry["workers"] = workers
+        run_payload = read_json(run_state_path(self.project_root), default={})
+        run_id = (
+            str(run_payload.get("run_id", ""))
+            if isinstance(run_payload, dict)
+            else ""
+        )
+        self._persist_performance_report(run_id)
+
+    def _persist_performance_report(self, run_id: str) -> None:
+        if not str(run_id).strip():
+            return
+        commands = sorted(
+            self._performance_commands.values(),
+            key=lambda item: float(item.get("duration_seconds", 0.0)),
+            reverse=True,
+        )
+        total_invocations = sum(
+            int(item.get("invocations", 0)) for item in commands
+        )
+        cache_hits = sum(int(item.get("cache_hits", 0)) for item in commands)
+        final_seconds = float(self._performance_stages.get("verify", 0.0))
+        target_seconds = max(0, int(self.config.gates.target_final_seconds))
+        report = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "target_final_seconds": target_seconds,
+            "final_verification": {
+                "duration_seconds": round(final_seconds, 3),
+                "target_enabled": bool(target_seconds),
+                "target_met": (
+                    final_seconds <= target_seconds if target_seconds else None
+                ),
+                "overrun_seconds": (
+                    round(max(0.0, final_seconds - target_seconds), 3)
+                    if target_seconds
+                    else 0.0
+                ),
+            },
+            "stages": {
+                key: round(value, 3)
+                for key, value in sorted(self._performance_stages.items())
+            },
+            "gates": {
+                "command_invocations": total_invocations,
+                "duration_seconds": round(
+                    sum(
+                        float(item.get("duration_seconds", 0.0))
+                        for item in commands
+                    ),
+                    3,
+                ),
+                "cache_hits": cache_hits,
+                "cache_hit_rate": (
+                    round(cache_hits / total_invocations, 4)
+                    if total_invocations
+                    else 0.0
+                ),
+                "top_commands": commands[:20],
+            },
+        }
+        write_json(run_path(self.project_root, run_id) / "performance.json", report)
 
     def _gate_progress_callback(self, context: str):
         def emit(event: str, command: str, elapsed_seconds: float) -> None:
@@ -3996,6 +4309,12 @@ class Orchestrator:
                     "[gate-command] context=%s state=start timeout_seconds=%s command=%s",
                     context,
                     self.config.gates.command_timeout_seconds,
+                    command[:300],
+                )
+            elif event == "cache_hit":
+                self.logger.info(
+                    "[gate-command] context=%s state=cache_hit command=%s",
+                    context,
                     command[:300],
                 )
             elif event == "heartbeat":
@@ -5812,6 +6131,7 @@ class Orchestrator:
                 for group in resolved.parallel_groups
             ]
             cache_scopes = dict(resolved.cache_scopes)
+            result_cache_scopes = dict(resolved.result_cache_scopes)
             metadata = dict(resolved.metadata)
             raw_count = resolved.raw_command_count + sum(
                 len(group.commands) for group in manual_groups
@@ -5820,6 +6140,7 @@ class Orchestrator:
             commands = []
             groups = []
             cache_scopes: Dict[str, str] = {}
+            result_cache_scopes: Dict[str, str] = {}
             metadata = {}
             raw_count = len(self.config.gates.commands) + sum(
                 len(group.commands) for group in manual_groups
@@ -5830,6 +6151,7 @@ class Orchestrator:
                     continue
                 commands.append(normalized)
                 cache_scopes[normalized] = "run_context"
+                result_cache_scopes[normalized] = "off"
                 metadata[normalized] = {}
 
         seen = set(cache_scopes)
@@ -5841,21 +6163,46 @@ class Orchestrator:
                     continue
                 if normalized in seen:
                     cache_scopes[normalized] = "run_context"
+                    result_cache_scopes[normalized] = "off"
                     continue
                 seen.add(normalized)
                 cache_scopes[normalized] = "run_context"
+                result_cache_scopes[normalized] = "off"
                 metadata[normalized] = {}
                 unique_group_commands.append(normalized)
             if unique_group_commands:
                 groups.append(
                     GateParallelGroup(name=group.name, commands=unique_group_commands)
                 )
+        if self._parallel_gate_quarantine:
+            quarantined = [
+                command
+                for group in groups
+                for command in group.commands
+                if command in self._parallel_gate_quarantine
+            ]
+            commands.extend(
+                command for command in quarantined if command not in commands
+            )
+            groups = [
+                GateParallelGroup(
+                    name=group.name,
+                    commands=[
+                        command
+                        for command in group.commands
+                        if command not in self._parallel_gate_quarantine
+                    ],
+                )
+                for group in groups
+            ]
+            groups = [group for group in groups if group.commands]
         return ResolvedGatePlan(
             commands=commands,
             parallel_groups=groups,
             cache_scopes=cache_scopes,
             raw_command_count=raw_count,
             metadata=metadata,
+            result_cache_scopes=result_cache_scopes,
         )
 
     @staticmethod
@@ -5892,6 +6239,10 @@ class Orchestrator:
                 command: plan.metadata.get(command, {})
                 for command in scoped_commands
             },
+            result_cache_scopes={
+                command: plan.result_cache_scopes.get(command, "off")
+                for command in scoped_commands
+            },
         )
 
     @staticmethod
@@ -5903,6 +6254,7 @@ class Orchestrator:
         self,
         metadata: Optional[Dict[str, object]] = None,
     ):
+        result_context_fingerprint = self._gate_result_context_fingerprint()
         if not self.config.gates.isolation.enabled:
             return contextlib.nullcontext(None)
         if self.config.gates.distributed.enabled:
@@ -5913,6 +6265,7 @@ class Orchestrator:
                 environment_fingerprint=(
                     self._gate_baseline_cache.environment_fingerprint
                 ),
+                result_context_fingerprint=result_context_fingerprint,
             )
         return LocalGatePlanExecutor(
             self.project_root,
@@ -5921,7 +6274,30 @@ class Orchestrator:
             environment_fingerprint=(
                 self._gate_baseline_cache.environment_fingerprint
             ),
+            result_context_fingerprint=result_context_fingerprint,
         )
+
+    def _gate_result_context_fingerprint(self) -> str:
+        run_payload = read_json(run_state_path(self.project_root), default={})
+        run_id = (
+            str(run_payload.get("run_id", ""))
+            if isinstance(run_payload, dict)
+            else ""
+        )
+        payload = {
+            "run_id": run_id,
+            "task_plan": read_json(task_plan_path(self.project_root), default={}),
+            "requirements_trace": read_json(
+                requirements_trace_path(self.project_root),
+                default={},
+            ),
+            "verification_policy_version": (
+                self.config.gates.verification_policy_version
+            ),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
     def _gate_parallel_workers(self) -> int:
         configured = self.config.gates.parallel_workers
@@ -10164,18 +10540,36 @@ class Orchestrator:
             return self._build_vitest_evidence_command(ref)
         return None
 
+    def _task_gate_evidence_refs(self, task: Optional[TaskSpec]) -> List[str]:
+        if task is None:
+            return []
+        try:
+            payload = load_task_plan(self.project_root)
+            policy_version = max(
+                1, int(payload.get("verification_policy_version", 1) or 1)
+            )
+        except (OSError, ValueError, TypeError):
+            policy_version = 1
+        if policy_version >= 2 and task.verification_refs:
+            return list(dict.fromkeys(
+                str(ref).strip()
+                for ref in task.verification_refs
+                if str(ref).strip()
+            ))
+        return self._task_planned_evidence_refs(task)
+
     def _build_task_verify_commands(self, task: Optional[TaskSpec]) -> List[str]:
         if task is None:
             return []
         commands: List[str] = []
-        for ref in self._task_planned_evidence_refs(task):
+        for ref in self._task_gate_evidence_refs(task):
             command = self._build_task_proof_evidence_command_for_ref(ref)
             if command and command not in commands:
                 commands.append(command)
         return commands
 
     def _task_verify_command_scope_label(self, task: Optional[TaskSpec]) -> str:
-        refs = self._task_planned_evidence_refs(task)
+        refs = self._task_gate_evidence_refs(task)
         executable = [
             ref for ref in refs
             if self._build_task_proof_evidence_command_for_ref(ref)
@@ -13063,6 +13457,10 @@ class Orchestrator:
         next_payload = {"tasks": payload}
         if isinstance(current_payload.get("oracle_proof_schema_version"), int):
             next_payload["oracle_proof_schema_version"] = current_payload["oracle_proof_schema_version"]
+        if isinstance(current_payload.get("verification_policy_version"), int):
+            next_payload["verification_policy_version"] = current_payload[
+                "verification_policy_version"
+            ]
         if isinstance(current_payload.get("test_strategy"), str) and current_payload["test_strategy"].strip():
             next_payload["test_strategy"] = current_payload["test_strategy"].strip()
         verification_steps = current_payload.get("verification_steps")
@@ -13291,7 +13689,7 @@ class Orchestrator:
                 ".auto-agents/docs/requirements_audit.md, .auto-agents/docs/review.md, "
                 "project_brief.md, architecture.md, requirements_trace.json, or any other "
                 "repository files to make the plan pass.",
-                "At the root of the JSON, also define test_strategy and verification_steps.",
+                "At the root of the JSON, set verification_policy_version=2 and also define test_strategy and verification_steps.",
                 "At the root of the JSON, set oracle_proof_schema_version to 2 for all new plans. auto_agents will bind each proof to the current requirement contract hash.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
                 "Every task that covers requirement_ids must include requirement_proofs. Each proof must include requirement_id, oracle_index (1-based) or exact acceptance_oracle, proof_type, oracle_strength, evidence_boundary, evidence_refs, status='planned', and forbidden_proxy_oracles copied from the bound requirement.",
@@ -13311,12 +13709,14 @@ class Orchestrator:
                 "Keep each task small enough to implement, review, and verify independently, but do not split into trivial housekeeping-only tasks.",
                 "Avoid oversized tasks that bundle multiple loosely related features together.",
                 "Prefer tasks that each deliver one coherent, testable capability or technical slice.",
-                "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist; auto_agents may expand directory targets such as ['tests'] into per-file pytest steps before running gates. Set parallel_safe=true only when a step is independent from both the ordered serial lane and peer parallel checks, including shared databases, ports, mutable fixtures, snapshots, build outputs, producer/consumer artifacts, and other process-global state; otherwise omit it or set false.",
-                "Classify verification cadence explicitly: use cadence='implement_and_final' for focused checks needed during implementation and cadence='final_only' for broad release suites. Classify cache_scope='source' only when results depend solely on HEAD and tracked/untracked source content; use cache_scope='run_context' for requirements/task-state/config-sensitive checks. Defaults are implement_and_final and run_context.",
+                "Every active task must define verification_refs for the smallest executable proof surface it owns. Prefer exact selectors such as tests/test_api.py::test_contract. A whole test-file ref is allowed only when that same file is an implement_and_final verification target. Do not assign a broad directory or the entire suite to an individual task.",
+                "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist. A broad directory target such as ['tests'] is allowed only with cadence='final_only'; auto_agents expands Pytest and Vitest directories into per-file steps before running gates.",
+                "Give every verification step a concise non-empty purpose describing its proof surface. Declare concurrency explicitly. Set parallel_safe=true only when a step is independent from both the ordered serial lane and peer parallel checks, including shared databases, ports, mutable fixtures, snapshots, build outputs, producer/consumer artifacts, and other process-global state. Otherwise set parallel_safe=false and provide serial_reason as one of artifact_chain, shared_mutable_state, fixed_port, external_side_effect, or ordered_contract.",
+                "Classify verification cadence explicitly: use cadence='implement_and_final' for focused checks needed during implementation and cadence='final_only' for broad release suites. Directory suites may set max_batches=1 when repeated runner, fixture, media, or service initialization is more expensive than file-level concurrency; omit it or use 0 for the worker-aware default. Classify cache_scope='source' only when results depend solely on HEAD and tracked/untracked source content; use cache_scope='run_context' for requirements/task-state/config-sensitive checks. Use result_cache_scope='candidate' for normal success-only reuse, 'observed_inputs' only for source-only, parallel-safe checks with no artifacts, exclusive resources, or dynamic ports, and 'off' for checks that must always execute.",
                 "Gate commands run in snapshot-backed worktrees. Use per-test relative temp paths and dynamically allocated port 0 whenever the same process can discover the bound port. When a child process requires a numeric port before launch, declare lowercase snake_case dynamic_ports names and make the test read AUTO_AGENTS_GATE_PORT_<UPPER_NAME>; keep a port-0 fallback for manual runs. Declaring dynamic_ports does not by itself make a step parallel-safe. Commands that intentionally share generated artifacts must remain parallel_safe=false and appear in producer-before-consumer order; commands that use unadapted fixed host ports, Docker daemons, or shared external accounts must declare host:/pool: exclusive_resources.",
                 "Declare requires for non-default tools such as ffmpeg or chrome and resource_class='heavy' for browser/FFmpeg workloads. Use cpu_slots only when a command needs an explicit scheduling capacity instead of the resource_class default. Memory checks are opt-in: memory_mb is the measured command working-set budget, memory_reserve_mb is the desired host reserve, and memory_guard must be 'off', 'advisory', or 'required'. Prefer advisory unless a dependable hard minimum is known; never invent a memory estimate. Declare artifact_globs only for ignored project-relative evidence that must survive sandbox cleanup. Never use absolute artifact paths or '..'.",
                 "Requirement proofs for ignored generated evidence must be portable across isolated gate worktrees. Reference stable current-run pointers or project-relative wildcard paths covered by the producing verification step's artifact_globs; never bind a proof to an implementation-session UUID. A pre-existing ignored file is not proof unless the current isolated verification publishes it.",
-                "For JavaScript/TypeScript verification, use verification_steps entries with kind='test', runner='vitest'.",
+                "For JavaScript/TypeScript verification, use verification_steps entries with kind='test', runner='vitest'; the same exact-ref, final-only directory, and concurrency rules apply.",
                 "Do not generate free-form shell verification commands for test steps; auto_agents derives the runnable command from verification_steps.",
                 "For non-Python projects, keep all dependency installation and tooling local to the repository and avoid global installs.",
                 self._plan_spec_instruction(spec_kind),
@@ -13664,6 +14064,7 @@ class Orchestrator:
                 "Example final response block:\nORACLE_PROOF_UPDATES:\n```json\n[{\"requirement_id\":\"REQ-001\",\"oracle_index\":1,\"status\":\"verified\",\"proof_type\":\"integration_test\",\"oracle_strength\":\"behavioral\",\"evidence_boundary\":\"system_boundary\",\"evidence_refs\":[\"tests/test_public_api.py::test_behavior\"],\"proxy_oracles\":[]}]\n```",
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
+                "Run the current task's focused verification_refs while implementing. Do not repeatedly run a broad final_only suite unless retry feedback shows that broader diagnosis is required; auto_agents runs release verification at the final gate.",
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
                 "When task status migration context is present, migrate only repository tests that assert stale task status. Do not edit orchestrator-owned .auto-agents state snapshots to force that transition early.",
                 "Tests should validate observable behavior (API contracts, input/output, side-effects), not internal implementation details.",
@@ -15787,7 +16188,26 @@ class Orchestrator:
         if resume_match:
             resume_count = int(resume_match.group(1))
         while True:
-            result = adapter.run(provider_request)
+            original_smart_timeout = getattr(adapter, "smart_timeout", None)
+            checkpoint_seconds = self.config.execution.smart_timeout.stage_checkpoint_seconds.get(
+                request.stage
+            )
+            if (
+                isinstance(original_smart_timeout, SmartTimeoutConfig)
+                and checkpoint_seconds
+            ):
+                adapter.smart_timeout = replace(
+                    original_smart_timeout,
+                    safety_ceiling_seconds=min(
+                        int(original_smart_timeout.safety_ceiling_seconds),
+                        max(60, int(checkpoint_seconds)),
+                    ),
+                )
+            try:
+                result = adapter.run(provider_request)
+            finally:
+                if isinstance(original_smart_timeout, SmartTimeoutConfig):
+                    adapter.smart_timeout = original_smart_timeout
             reason = result.termination.reason if result.termination is not None else ""
             incident = self._record_provider_execution_incident(
                 request.stage, provider, result
@@ -15798,14 +16218,19 @@ class Orchestrator:
                 "loop_detected",
                 "safety_ceiling",
             }
-            if (
-                resumable
-                and resume_count
-                < self.config.execution.smart_timeout.same_provider_resume_limit
-            ):
+            resume_limit = (
+                self.config.execution.smart_timeout.fresh_continuation_limit
+                if reason == "safety_ceiling"
+                else self.config.execution.smart_timeout.same_provider_resume_limit
+            )
+            if resumable and resume_count < resume_limit:
                 resume_count += 1
                 handoff = self._smart_timeout_handoff(result, reason)
-                session_id = result.provider_session_id
+                session_id = (
+                    ""
+                    if reason == "safety_ceiling"
+                    else result.provider_session_id
+                )
                 prompt = handoff if session_id else f"{request.prompt}\n\n{handoff}"
                 provider_request = self._provider_request_for_attempt(
                     replace(
@@ -15818,14 +16243,27 @@ class Orchestrator:
                     allow_interrupted_resume=False,
                 )
                 self.logger.info(
-                    "[smart-timeout] provider=%s reason=%s action=resume-same session=%s",
+                    "[smart-timeout] provider=%s reason=%s action=%s session=%s",
                     provider,
                     reason,
+                    (
+                        "continue-fresh"
+                        if reason == "safety_ceiling"
+                        else "resume-same"
+                    ),
                     session_id or "fresh",
                 )
                 if incident is not None:
                     incident.history.append(
-                        {"event": "route", "action": "RETRY", "mode": "resume-same"}
+                        {
+                            "event": "route",
+                            "action": "RETRY",
+                            "mode": (
+                                "continue-fresh"
+                                if reason == "safety_ceiling"
+                                else "resume-same"
+                            ),
+                        }
                     )
                     state = load_run_state(self.project_root)
                     self._incident_store(state).save(incident, state)
@@ -16389,7 +16827,34 @@ class Orchestrator:
                 if isinstance(item, dict)
             ]
         if steps:
-            steps = expand_pytest_directory_steps(steps, self.project_root)
+            verification_policy_version = max(
+                1, int(payload.get("verification_policy_version", 1) or 1)
+            )
+            # "auto" distributed mode may still fall back to a small local
+            # worker. Keep local/auto fan-out bounded; only a required cluster
+            # is allowed to prepare a wider set of batches up front.
+            max_batch_cap = (
+                16
+                if self.config.gates.distributed.mode == "required"
+                else 4
+            )
+            max_batches_per_step = min(
+                max_batch_cap,
+                max(1, self._gate_parallel_workers() * 2),
+            )
+            steps = (
+                expand_verification_directory_steps(
+                    steps,
+                    self.project_root,
+                    max_batches_per_step=max_batches_per_step,
+                )
+                if verification_policy_version >= 2
+                else expand_pytest_directory_steps(
+                    steps,
+                    self.project_root,
+                    max_batches_per_step=max_batches_per_step,
+                )
+            )
             if not self.config.gates.allow_agent_updates:
                 return
             try:
@@ -16420,6 +16885,9 @@ class Orchestrator:
             ):
                 return
             self.config.gates.steps = steps
+            self.config.gates.verification_policy_version = (
+                verification_policy_version
+            )
             self.config.gates.commands = commands
             self.config.gates.parallel_groups = next_groups
             save_project_config(self.project_root, self.config)

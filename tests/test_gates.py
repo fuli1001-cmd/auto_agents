@@ -16,6 +16,7 @@ from auto_agents.gates import (
     extract_failure_ids,
     extract_failure_info,
     expand_pytest_directory_steps,
+    expand_vitest_directory_steps,
     resolve_gate_plan_from_verification_steps,
     run_commands,
     run_gate_plan,
@@ -564,6 +565,139 @@ class GateTests(unittest.TestCase):
             self.assertEqual(steps[0].memory_reserve_mb, 256)
             self.assertEqual(steps[0].memory_guard, "advisory")
 
+    def test_expand_pytest_directory_steps_honors_ignore_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests = root / "tests"
+            tests.mkdir()
+            (tests / "test_fast.py").write_text("", encoding="utf-8")
+            (tests / "test_serial.py").write_text("", encoding="utf-8")
+
+            steps = expand_pytest_directory_steps(
+                [
+                    VerificationStep(
+                        kind="test",
+                        runner="pytest",
+                        targets=["tests"],
+                        args=[
+                            "--ignore=tests/test_serial.py",
+                            "--maxfail=1",
+                        ],
+                    )
+                ],
+                root,
+            )
+
+            self.assertEqual([step.targets for step in steps], [["tests/test_fast.py"]])
+            self.assertEqual(steps[0].args, ["--maxfail=1"])
+
+    def test_expand_pytest_directory_steps_bounds_and_balances_process_fanout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests = root / "tests"
+            tests.mkdir()
+            for index in range(10):
+                (tests / f"test_{index}.py").write_text(
+                    "x" * (index + 1),
+                    encoding="utf-8",
+                )
+
+            steps = expand_pytest_directory_steps(
+                [
+                    VerificationStep(
+                        kind="test",
+                        runner="pytest",
+                        targets=["tests"],
+                        max_batches=2,
+                    )
+                ],
+                root,
+                max_batches_per_step=8,
+            )
+
+            self.assertEqual(len(steps), 2)
+            self.assertEqual(
+                sorted(target for step in steps for target in step.targets),
+                [f"tests/test_{index}.py" for index in range(10)],
+            )
+            self.assertTrue(all(len(step.targets) > 1 for step in steps))
+
+    def test_max_batches_one_preserves_runner_directory_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests = root / "tests"
+            tests.mkdir()
+            (tests / "test_fast.py").write_text("", encoding="utf-8")
+
+            pytest_step = VerificationStep(
+                kind="test",
+                runner="pytest",
+                targets=["tests"],
+                args=["--ignore=tests/test_generated.py"],
+                max_batches=1,
+            )
+            vitest_step = VerificationStep(
+                kind="test",
+                runner="vitest",
+                targets=["src"],
+                args=["--exclude=src/e2e/**"],
+                max_batches=1,
+            )
+
+            self.assertEqual(
+                expand_pytest_directory_steps([pytest_step], root),
+                [pytest_step],
+            )
+            self.assertEqual(
+                expand_vitest_directory_steps([vitest_step], root),
+                [vitest_step],
+            )
+
+    def test_expand_vitest_directory_steps_splits_files_and_honors_excludes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests = root / "src"
+            tests.mkdir()
+            (tests / "alpha.test.ts").write_text("", encoding="utf-8")
+            (tests / "beta.spec.tsx").write_text("", encoding="utf-8")
+            (tests / "helper.ts").write_text("", encoding="utf-8")
+
+            steps = expand_vitest_directory_steps(
+                [
+                    VerificationStep(
+                        kind="test",
+                        runner="vitest",
+                        targets=["src"],
+                        args=["--exclude", "src/beta.spec.tsx", "--reporter=dot"],
+                        parallel_safe=True,
+                        result_cache_scope="candidate",
+                    )
+                ],
+                root,
+            )
+
+            self.assertEqual([step.targets for step in steps], [["src/alpha.test.ts"]])
+            self.assertEqual(steps[0].args, ["--reporter=dot"])
+            self.assertTrue(steps[0].parallel_safe)
+            self.assertEqual(steps[0].result_cache_scope, "candidate")
+
+    def test_resolved_plan_preserves_v2_serial_and_result_cache_metadata(self) -> None:
+        step = VerificationStep(
+            kind="test",
+            runner="pytest",
+            targets=["tests/test_demo.py"],
+            parallel_safe=False,
+            serial_reason="shared_mutable_state",
+            cache_scope="source",
+            result_cache_scope="off",
+        )
+
+        plan = resolve_gate_plan_from_verification_steps([step], phase="final")
+        command = plan.commands[0]
+
+        self.assertEqual(plan.metadata[command].serial_reason, "shared_mutable_state")
+        self.assertEqual(plan.result_cache_scopes[command], "off")
+
     def test_verification_step_ignores_freeform_command_field(self) -> None:
         command = command_from_verification_step(
             VerificationStep(
@@ -592,6 +726,7 @@ class GateTests(unittest.TestCase):
             targets=["tests/test_demo.py"],
             cadence="final_only",
             cache_scope="source",
+            max_batches=1,
             cpu_slots=3,
             memory_mb=4096,
             memory_reserve_mb=1024,
@@ -601,6 +736,7 @@ class GateTests(unittest.TestCase):
 
         self.assertEqual(payload["cadence"], "final_only")
         self.assertEqual(payload["cache_scope"], "source")
+        self.assertEqual(payload["max_batches"], 1)
         self.assertEqual(payload["cpu_slots"], 3)
         self.assertEqual(payload["memory_mb"], 4096)
         self.assertEqual(payload["memory_reserve_mb"], 1024)
@@ -611,6 +747,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(restored.memory_mb, 4096)
         self.assertEqual(restored.memory_reserve_mb, 1024)
         self.assertEqual(restored.memory_guard, "required")
+        self.assertEqual(restored.max_batches, 1)
 
     def test_gate_plan_filters_final_only_and_deduplicates_conservatively(self) -> None:
         duplicate_target = ["tests/test_demo.py"]
@@ -789,6 +926,53 @@ class GateTests(unittest.TestCase):
             event_times[("start", "group-two")],
             event_times[("finish", "serial")],
         )
+
+    def test_isolated_gate_plan_backfills_behind_slot_blocked_group_frontier(
+        self,
+    ) -> None:
+        executor = _RecordingGateExecutor(
+            {
+                "group-one-light": 0.12,
+                "group-one-heavy": 0.04,
+                "group-two-light": 0.04,
+            },
+            slots={"group-one-heavy": 2},
+            capacity=2,
+            estimates={
+                "group-one-light": 10.0,
+                "group-one-heavy": 1.0,
+                "group-two-light": 1.0,
+            },
+        )
+
+        result = run_gate_plan(
+            [],
+            [
+                GateParallelGroup(
+                    name="one",
+                    commands=["group-one-light", "group-one-heavy"],
+                ),
+                GateParallelGroup(
+                    name="two",
+                    commands=["group-two-light"],
+                ),
+            ],
+            Path("/tmp"),
+            collect_all=True,
+            parallel_workers=2,
+            gate_executor=executor,
+        )
+
+        self.assertTrue(result.ok)
+        event_times = {
+            (event, command): timestamp
+            for event, command, _lane, timestamp in executor.events
+        }
+        self.assertLess(
+            event_times[("start", "group-two-light")],
+            event_times[("finish", "group-one-light")],
+        )
+        self.assertLessEqual(executor.max_running_slots, 2)
 
     def test_isolated_gate_plan_stops_dispatch_and_drains_inflight(self) -> None:
         executor = _RecordingGateExecutor(

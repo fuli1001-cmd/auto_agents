@@ -280,11 +280,23 @@ def load_local_worker_config(path: Optional[Path] = None) -> LocalWorkerConfig:
         managed_root = Path(root_text).expanduser().resolve()
     else:
         preferred_root = Path.home() / ".local" / "share" / "auto-agents-worker"
+        probe: Optional[Path] = None
         try:
             preferred_root.mkdir(parents=True, exist_ok=True)
+            probe = preferred_root / (
+                f".write-probe-{os.getpid()}-{threading.get_ident()}"
+            )
+            with probe.open("xb"):
+                pass
             managed_root = preferred_root.resolve()
         except OSError:
             managed_root = (auto_agents_state_root() / "worker").resolve()
+        finally:
+            if probe is not None:
+                try:
+                    probe.unlink(missing_ok=True)
+                except OSError:
+                    pass
     raw_environments = payload.get("environments", {})
     environments: dict[str, WorkerEnvironment] = {}
     if isinstance(raw_environments, dict):

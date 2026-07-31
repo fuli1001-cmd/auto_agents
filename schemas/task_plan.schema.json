@@ -5,6 +5,11 @@
   "type": "object",
   "required": ["tasks"],
   "properties": {
+    "verification_policy_version": {
+      "type": "integer",
+      "enum": [1, 2],
+      "description": "Version 2 requires explicit executable task verification refs and safe concurrency declarations."
+    },
     "test_strategy": {
       "type": "string"
     },
@@ -29,6 +34,10 @@
             "type": "string",
             "enum": ["pytest", "vitest"]
           },
+          "purpose": {
+            "type": "string",
+            "minLength": 1
+          },
           "targets": {
             "type": "array",
             "items": {
@@ -46,6 +55,20 @@
           "parallel_safe": {
             "type": "boolean"
           },
+          "max_batches": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "serial_reason": {
+            "type": "string",
+            "enum": [
+              "artifact_chain",
+              "shared_mutable_state",
+              "fixed_port",
+              "external_side_effect",
+              "ordered_contract"
+            ]
+          },
           "cadence": {
             "type": "string",
             "enum": ["implement_and_final", "final_only"]
@@ -53,6 +76,10 @@
           "cache_scope": {
             "type": "string",
             "enum": ["source", "run_context"]
+          },
+          "result_cache_scope": {
+            "type": "string",
+            "enum": ["off", "candidate", "observed_inputs"]
           },
           "resource_class": {
             "type": "string",
@@ -273,7 +300,7 @@
               "type": "string",
               "minLength": 1
             },
-            "description": "Precise executable verification refs owned by a generated repair task."
+            "description": "Precise executable verification refs owned by this task. Version 2 requires them for every active task."
           },
           "task_origin": {
             "type": "string",

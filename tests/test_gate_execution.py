@@ -88,6 +88,59 @@ def test_isolated_gate_snapshots_dirty_and_untracked_files(tmp_path: Path) -> No
     assert (project / "untracked.txt").read_text() == "present\n"
 
 
+def test_candidate_result_cache_reuses_identical_snapshot_across_executors(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    auto_dir = project / ".auto-agents"
+    auto_dir.mkdir()
+    (auto_dir / ".gitignore").write_text(
+        "state/gate_baseline_cache.sqlite3\n"
+        "state/gate_baseline_cache.sqlite3-*\n",
+        encoding="utf-8",
+    )
+    _git(project, "add", "-A")
+    _git(project, "commit", "-m", "ignore gate cache")
+    command = f"{sys.executable} -c \"print('checked')\""
+    metadata = {
+        command: GateCommandMetadata(
+            cache_scope="source",
+            result_cache_scope="candidate",
+        )
+    }
+    config = _config(tmp_path)
+    config.verification_policy_version = 2
+
+    with LocalGatePlanExecutor(
+        project,
+        config,
+        metadata,
+        environment_fingerprint="env-1",
+    ) as executor:
+        first = executor.run(
+            command,
+            timeout_seconds=60,
+            adaptive_timeout_enabled=False,
+            idle_timeout_seconds=60,
+        )
+        assert executor.cached_result(command) is not None
+    with LocalGatePlanExecutor(
+        project,
+        config,
+        metadata,
+        environment_fingerprint="env-1",
+    ) as executor:
+        second = executor.run(
+            command,
+            timeout_seconds=60,
+            adaptive_timeout_enabled=False,
+            idle_timeout_seconds=60,
+        )
+
+    assert first.ok and not first.cached
+    assert second.ok and second.cached
+
+
 def test_serial_lane_preserves_ignored_producer_artifact(tmp_path: Path) -> None:
     project = _project(tmp_path)
     producer = (

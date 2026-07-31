@@ -19,6 +19,14 @@ DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 TASK_ORIGINS = ("planned", "scope_split", "evidence_repair", "stage_recovery")
 VERIFICATION_CADENCES = ("implement_and_final", "final_only")
 VERIFICATION_CACHE_SCOPES = ("source", "run_context")
+VERIFICATION_RESULT_CACHE_SCOPES = ("off", "candidate", "observed_inputs")
+VERIFICATION_SERIAL_REASONS = (
+    "artifact_chain",
+    "shared_mutable_state",
+    "fixed_port",
+    "external_side_effect",
+    "ordered_contract",
+)
 VERIFICATION_RESOURCE_CLASSES = ("normal", "heavy")
 VERIFICATION_MEMORY_GUARDS = ("off", "advisory", "required")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity-claude", "antigravity-gemini")
@@ -261,12 +269,16 @@ class ProviderConfig:
 class VerificationStep:
     kind: str = "test"
     runner: str = ""
+    purpose: str = ""
     targets: List[str] = field(default_factory=list)
     args: List[str] = field(default_factory=list)
     command: str = ""
     parallel_safe: bool = False
+    max_batches: int = 0
+    serial_reason: str = ""
     cadence: str = "implement_and_final"
     cache_scope: str = "run_context"
+    result_cache_scope: str = "candidate"
     resource_class: str = "normal"
     cpu_slots: int = 0
     memory_mb: int = 0
@@ -282,12 +294,16 @@ class VerificationStep:
         return cls(
             kind=str(data.get("kind", "test")),
             runner=str(data.get("runner", "")),
+            purpose=str(data.get("purpose", "")),
             targets=[str(item) for item in data.get("targets", [])],
             args=[str(item) for item in data.get("args", [])],
             command=str(data.get("command", "")),
             parallel_safe=bool(data.get("parallel_safe", False)),
+            max_batches=int(data.get("max_batches", 0) or 0),
+            serial_reason=str(data.get("serial_reason", "")),
             cadence=str(data.get("cadence", "implement_and_final")),
             cache_scope=str(data.get("cache_scope", "run_context")),
+            result_cache_scope=str(data.get("result_cache_scope", "candidate")),
             resource_class=str(data.get("resource_class", "normal")),
             cpu_slots=int(data.get("cpu_slots", 0) or 0),
             memory_mb=int(data.get("memory_mb", 0) or 0),
@@ -307,11 +323,15 @@ class VerificationStep:
         return {
             "kind": self.kind,
             "runner": self.runner,
+            "purpose": self.purpose,
             "targets": list(self.targets),
             "args": list(self.args),
             "parallel_safe": self.parallel_safe,
+            "max_batches": self.max_batches,
+            "serial_reason": self.serial_reason,
             "cadence": self.cadence,
             "cache_scope": self.cache_scope,
+            "result_cache_scope": self.result_cache_scope,
             "resource_class": self.resource_class,
             "cpu_slots": self.cpu_slots,
             "memory_mb": self.memory_mb,
@@ -424,10 +444,12 @@ class GateConfig:
     commands: List[str] = field(default_factory=list)
     steps: List[VerificationStep] = field(default_factory=list)
     parallel_groups: List[GateParallelGroup] = field(default_factory=list)
+    verification_policy_version: int = 1
     require_clean_git_before_task: bool = True
     allow_agent_updates: bool = True
     parallel_workers: Union[int, str] = "auto"
     max_auto_workers: Union[int, str] = "auto"
+    target_final_seconds: int = 0
     command_timeout_seconds: int = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS
     adaptive_timeout_enabled: bool = True
     command_idle_timeout_seconds: int = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS
@@ -456,6 +478,9 @@ class GateConfig:
                 for item in raw_groups
                 if isinstance(item, dict)
             ],
+            verification_policy_version=max(
+                1, int(data.get("verification_policy_version", 1) or 1)
+            ),
             require_clean_git_before_task=bool(data.get("require_clean_git_before_task", True)),
             allow_agent_updates=bool(data.get("allow_agent_updates", True)),
             parallel_workers=(
@@ -468,6 +493,7 @@ class GateConfig:
                 if isinstance(data.get("max_auto_workers"), int)
                 else str(data.get("max_auto_workers", "auto"))
             ),
+            target_final_seconds=max(0, int(data.get("target_final_seconds", 0) or 0)),
             command_timeout_seconds=command_timeout_seconds,
             adaptive_timeout_enabled=bool(data.get("adaptive_timeout_enabled", True)),
             command_idle_timeout_seconds=int(
@@ -498,10 +524,12 @@ class GateConfig:
             "commands": list(self.commands),
             "steps": [step.to_dict() for step in self.steps],
             "parallel_groups": [group.to_dict() for group in self.parallel_groups],
+            "verification_policy_version": self.verification_policy_version,
             "require_clean_git_before_task": self.require_clean_git_before_task,
             "allow_agent_updates": self.allow_agent_updates,
             "parallel_workers": self.parallel_workers,
             "max_auto_workers": self.max_auto_workers,
+            "target_final_seconds": self.target_final_seconds,
             "command_timeout_seconds": self.command_timeout_seconds,
             "adaptive_timeout_enabled": self.adaptive_timeout_enabled,
             "command_idle_timeout_seconds": self.command_idle_timeout_seconds,
@@ -737,6 +765,9 @@ class SmartTimeoutConfig:
     safety_ceiling_seconds: int = 43200
     loop_repeat_limit: int = 3
     same_provider_resume_limit: int = 1
+    stage_checkpoint_seconds: Dict[str, int] = field(default_factory=dict)
+    active_tool_grace_seconds: int = 900
+    fresh_continuation_limit: int = 1
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "SmartTimeoutConfig":
@@ -748,6 +779,18 @@ class SmartTimeoutConfig:
             safety_ceiling_seconds=int(data.get("safety_ceiling_seconds", 43200)),
             loop_repeat_limit=int(data.get("loop_repeat_limit", 3)),
             same_provider_resume_limit=int(data.get("same_provider_resume_limit", 1)),
+            stage_checkpoint_seconds={
+                str(stage): int(seconds)
+                for stage, seconds in dict(
+                    data.get("stage_checkpoint_seconds", {})
+                ).items()
+            },
+            active_tool_grace_seconds=int(
+                data.get("active_tool_grace_seconds", 900)
+            ),
+            fresh_continuation_limit=int(
+                data.get("fresh_continuation_limit", 1)
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1313,6 +1356,10 @@ class CommandResult:
     infrastructure_attempts: List[Dict[str, object]] = field(default_factory=list)
     mutation_paths: List[str] = field(default_factory=list)
     artifacts: Dict[str, str] = field(default_factory=dict)
+    cached: bool = False
+    observed_inputs: Dict[str, str] = field(default_factory=dict)
+    input_trace_complete: bool = False
+    network_observed: bool = False
 
 
 @dataclass

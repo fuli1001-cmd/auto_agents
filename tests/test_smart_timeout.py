@@ -97,6 +97,30 @@ def test_tool_stall_and_semantic_stall_are_distinct(tmp_path):
         assert supervisor.poll() == "semantic_stall"
 
 
+def test_active_tool_extends_only_the_safety_ceiling(tmp_path):
+    clock = [0.0]
+    supervisor = _supervisor(
+        tmp_path,
+        clock,
+        SmartTimeoutConfig(
+            provider_idle_seconds=600,
+            tool_idle_seconds=600,
+            semantic_stall_seconds=600,
+            safety_ceiling_seconds=60,
+            active_tool_grace_seconds=30,
+        ),
+        ProgressDecoder(),
+    )
+    with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
+        supervisor.observe_events(
+            [AgentProgressEvent(kind="tool_started", tool_id="tool-1", detail="pytest")]
+        )
+        clock[0] = 61.0
+        assert supervisor.poll() is None
+        clock[0] = 91.0
+        assert supervisor.poll() == "safety_ceiling"
+
+
 def test_repeated_completed_tool_fingerprint_detects_loop(tmp_path):
     clock = [0.0]
     supervisor = _supervisor(

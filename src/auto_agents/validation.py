@@ -23,7 +23,9 @@ from .models import (
     VERIFICATION_CACHE_SCOPES,
     VERIFICATION_CADENCES,
     VERIFICATION_MEMORY_GUARDS,
+    VERIFICATION_RESULT_CACHE_SCOPES,
     VERIFICATION_RESOURCE_CLASSES,
+    VERIFICATION_SERIAL_REASONS,
 )
 from .requirements import (
     normalize_requirements_trace_payload,
@@ -176,7 +178,12 @@ def _validate_parallel_gate_groups(parallel_groups: object) -> List[str]:
     return errors
 
 
-def validate_verification_steps(steps: object, field_name: str = "verification_steps") -> List[str]:
+def validate_verification_steps(
+    steps: object,
+    field_name: str = "verification_steps",
+    *,
+    policy_version: int = 1,
+) -> List[str]:
     errors: List[str] = []
     if steps is None:
         return errors
@@ -184,6 +191,7 @@ def validate_verification_steps(steps: object, field_name: str = "verification_s
         return [f"{field_name} must be a list of objects"]
     if not steps:
         return errors
+    artifact_owners: Dict[str, str] = {}
     for index, raw_step in enumerate(steps, start=1):
         prefix = f"{field_name}[{index}]"
         if not isinstance(raw_step, dict):
@@ -196,6 +204,9 @@ def validate_verification_steps(steps: object, field_name: str = "verification_s
         if runner not in SUPPORTED_VERIFICATION_TEST_RUNNERS:
             allowed = ", ".join(sorted(SUPPORTED_VERIFICATION_TEST_RUNNERS))
             errors.append(f"{prefix}.runner must be one of: {allowed}")
+        purpose = str(raw_step.get("purpose", "")).strip()
+        if policy_version >= 2 and not purpose:
+            errors.append(f"{prefix}.purpose is required under verification policy v2")
         targets = raw_step.get("targets", [])
         if targets is not None and (
             not isinstance(targets, list)
@@ -213,6 +224,25 @@ def validate_verification_steps(steps: object, field_name: str = "verification_s
             errors.append(f"{prefix}.command is not allowed for structured test steps")
         if "parallel_safe" in raw_step and not isinstance(raw_step.get("parallel_safe"), bool):
             errors.append(f"{prefix}.parallel_safe must be a boolean when provided")
+        max_batches = raw_step.get("max_batches", 0)
+        if type(max_batches) is not int or max_batches < 0:
+            errors.append(
+                f"{prefix}.max_batches must be a non-negative integer when provided"
+            )
+        parallel_safe = bool(raw_step.get("parallel_safe", False))
+        serial_reason = str(raw_step.get("serial_reason", "")).strip().lower()
+        if serial_reason and serial_reason not in VERIFICATION_SERIAL_REASONS:
+            allowed = ", ".join(VERIFICATION_SERIAL_REASONS)
+            errors.append(f"{prefix}.serial_reason must be one of: {allowed}")
+        if policy_version >= 2:
+            if parallel_safe and serial_reason:
+                errors.append(
+                    f"{prefix}.serial_reason must be empty when parallel_safe is true"
+                )
+            if not parallel_safe and not serial_reason:
+                errors.append(
+                    f"{prefix}.serial_reason is required when parallel_safe is false"
+                )
         cadence = str(raw_step.get("cadence", "implement_and_final")).strip().lower()
         if cadence not in VERIFICATION_CADENCES:
             allowed = ", ".join(VERIFICATION_CADENCES)
@@ -221,6 +251,15 @@ def validate_verification_steps(steps: object, field_name: str = "verification_s
         if cache_scope not in VERIFICATION_CACHE_SCOPES:
             allowed = ", ".join(VERIFICATION_CACHE_SCOPES)
             errors.append(f"{prefix}.cache_scope must be one of: {allowed}")
+        result_cache_scope = str(
+            raw_step.get(
+                "result_cache_scope",
+                "candidate" if policy_version >= 2 else "off",
+            )
+        ).strip().lower()
+        if result_cache_scope not in VERIFICATION_RESULT_CACHE_SCOPES:
+            allowed = ", ".join(VERIFICATION_RESULT_CACHE_SCOPES)
+            errors.append(f"{prefix}.result_cache_scope must be one of: {allowed}")
         resource_class = str(raw_step.get("resource_class", "normal")).strip().lower()
         if resource_class not in VERIFICATION_RESOURCE_CLASSES:
             allowed = ", ".join(VERIFICATION_RESOURCE_CLASSES)
@@ -303,6 +342,54 @@ def validate_verification_steps(steps: object, field_name: str = "verification_s
                 if normalized.startswith("/") or ".." in normalized.split("/"):
                     errors.append(
                         f"{prefix}.artifact_globs entries must be safe project-relative globs"
+                    )
+                if policy_version >= 2 and normalized:
+                    owner = artifact_owners.get(normalized)
+                    if owner is not None:
+                        errors.append(
+                            f"{prefix}.artifact_globs duplicates artifact ownership "
+                            f"from {owner}: {normalized}"
+                        )
+                    else:
+                        artifact_owners[normalized] = prefix
+        if policy_version >= 2:
+            targets_list = targets if isinstance(targets, list) else []
+            if (
+                cadence == "implement_and_final"
+                and any(
+                    "::" not in str(target)
+                    and not re.search(
+                        r"\.(?:py|[cm]?[jt]sx?)$",
+                        str(target),
+                        re.IGNORECASE,
+                    )
+                    for target in targets_list
+                )
+            ):
+                errors.append(
+                    f"{prefix} broad directory targets must use cadence='final_only'"
+                )
+            if result_cache_scope == "observed_inputs":
+                if cache_scope != "source":
+                    errors.append(
+                        f"{prefix}.result_cache_scope observed_inputs requires cache_scope='source'"
+                    )
+                if not parallel_safe:
+                    errors.append(
+                        f"{prefix}.result_cache_scope observed_inputs requires parallel_safe=true"
+                    )
+                if any(
+                    isinstance(raw_step.get(field, []), list)
+                    and raw_step.get(field, [])
+                    for field in (
+                        "artifact_globs",
+                        "exclusive_resources",
+                        "dynamic_ports",
+                    )
+                ):
+                    errors.append(
+                        f"{prefix}.result_cache_scope observed_inputs cannot use artifacts, "
+                        "exclusive resources, or dynamic ports"
                     )
     return errors
 
@@ -488,6 +575,15 @@ def validate_task_plan_payload(
     if not isinstance(payload, dict):
         return ["task plan root must be a JSON object"]
 
+    verification_policy_version = payload.get("verification_policy_version", 1)
+    if (
+        not isinstance(verification_policy_version, int)
+        or isinstance(verification_policy_version, bool)
+        or verification_policy_version not in {1, 2}
+    ):
+        errors.append("task plan verification_policy_version must be 1 or 2")
+        verification_policy_version = 1
+
     test_strategy = payload.get("test_strategy")
     has_test_strategy = "test_strategy" in payload
     if has_test_strategy and test_strategy in ("", None):
@@ -501,7 +597,13 @@ def validate_task_plan_payload(
     if has_verification_steps and verification_steps == []:
         verification_steps = None
     if verification_steps is not None:
-        errors.extend(validate_verification_steps(verification_steps, "task plan verification_steps"))
+        errors.extend(
+            validate_verification_steps(
+                verification_steps,
+                "task plan verification_steps",
+                policy_version=verification_policy_version,
+            )
+        )
     has_verification_commands = "verification_commands" in payload
     if has_verification_commands and verification_commands == []:
         verification_commands = None
@@ -541,6 +643,15 @@ def validate_task_plan_payload(
 
     seen_ids = set()
     required_fields = {"task_id", "title", "description", "acceptance", "status", "commit_message"}
+    implement_targets = {
+        str(target).strip()
+        for step in (verification_steps or [])
+        if isinstance(step, dict)
+        and str(step.get("cadence", "implement_and_final")).strip().lower()
+        == "implement_and_final"
+        for target in (step.get("targets", []) or [])
+        if isinstance(target, str) and target.strip()
+    }
 
     for index, task in enumerate(tasks, start=1):
         prefix = f"task #{index}"
@@ -620,6 +731,53 @@ def validate_task_plan_payload(
             or any(not isinstance(item, str) or not item.strip() for item in verification_refs)
         ):
             errors.append(f"{prefix} verification_refs must be a list of non-empty strings")
+        if (
+            verification_policy_version >= 2
+            and status != "done"
+            and (
+                not isinstance(verification_refs, list)
+                or not verification_refs
+            )
+        ):
+            errors.append(
+                f"{prefix} verification_refs must contain at least one executable ref "
+                "under verification policy v2"
+            )
+        elif (
+            verification_policy_version >= 2
+            and isinstance(verification_refs, list)
+        ):
+            for ref in verification_refs:
+                if not isinstance(ref, str):
+                    continue
+                normalized = ref.strip()
+                if normalized.startswith("cmd:") and normalized[4:].strip():
+                    continue
+                path, separator, selector = normalized.partition("::")
+                is_test_file = bool(
+                    re.search(
+                        r"(?:^|/)(?:test_[^/]+\.py|[^/]+_test\.py)$",
+                        path.replace("\\", "/"),
+                        re.IGNORECASE,
+                    )
+                    or re.search(
+                        r"\.(?:test|spec)\.[cm]?[jt]sx?$",
+                        path,
+                        re.IGNORECASE,
+                    )
+                )
+                if not is_test_file:
+                    errors.append(
+                        f"{prefix} verification_refs entry is not executable: {normalized}"
+                    )
+                    continue
+                if separator and selector.strip():
+                    continue
+                if path not in implement_targets:
+                    errors.append(
+                        f"{prefix} whole-file verification ref must map to an "
+                        f"implement_and_final step or use an exact selector: {normalized}"
+                    )
         recovery_history = task.get("recovery_history", [])
         if recovery_history is not None and (
             not isinstance(recovery_history, list)
@@ -888,6 +1046,14 @@ def validate_project_config_payload(payload: object) -> List[str]:
     if not isinstance(gates, dict):
         errors.append("gates must be an object")
     else:
+        verification_policy_version = gates.get("verification_policy_version", 1)
+        if (
+            not isinstance(verification_policy_version, int)
+            or isinstance(verification_policy_version, bool)
+            or verification_policy_version not in {1, 2}
+        ):
+            errors.append("gates.verification_policy_version must be 1 or 2")
+            verification_policy_version = 1
         commands = gates.get("commands")
         if not isinstance(commands, list) or any(not isinstance(item, str) for item in commands):
             errors.append("gates.commands must be a list of strings")
@@ -900,7 +1066,13 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     python_required=python_required,
                 )
             )
-        errors.extend(validate_verification_steps(gates.get("steps", []), "gates.steps"))
+        errors.extend(
+            validate_verification_steps(
+                gates.get("steps", []),
+                "gates.steps",
+                policy_version=verification_policy_version,
+            )
+        )
         errors.extend(_validate_parallel_gate_groups(gates.get("parallel_groups", [])))
         clean = gates.get("require_clean_git_before_task")
         if not isinstance(clean, bool):
@@ -926,6 +1098,13 @@ def validate_project_config_payload(payload: object) -> List[str]:
             errors.append(
                 "gates.max_auto_workers must be 'auto' or an integer >= 1"
             )
+        target_final_seconds = gates.get("target_final_seconds", 0)
+        if (
+            not isinstance(target_final_seconds, int)
+            or isinstance(target_final_seconds, bool)
+            or target_final_seconds < 0
+        ):
+            errors.append("gates.target_final_seconds must be an integer >= 0")
         command_timeout_seconds = gates.get("command_timeout_seconds", 7200)
         if (
             not isinstance(command_timeout_seconds, int)
@@ -1201,6 +1380,49 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 if not isinstance(resume_limit, int) or isinstance(resume_limit, bool) or resume_limit < 0:
                     errors.append(
                         "execution.smart_timeout.same_provider_resume_limit must be an integer >= 0"
+                    )
+                stage_checkpoints = smart_timeout.get("stage_checkpoint_seconds", {})
+                if not isinstance(stage_checkpoints, dict):
+                    errors.append(
+                        "execution.smart_timeout.stage_checkpoint_seconds must be an object"
+                    )
+                else:
+                    for stage, seconds in stage_checkpoints.items():
+                        if not isinstance(stage, str) or not stage.strip():
+                            errors.append(
+                                "execution.smart_timeout.stage_checkpoint_seconds keys "
+                                "must be non-empty strings"
+                            )
+                        if (
+                            not isinstance(seconds, int)
+                            or isinstance(seconds, bool)
+                            or seconds < 60
+                        ):
+                            errors.append(
+                                "execution.smart_timeout.stage_checkpoint_seconds values "
+                                "must be integers >= 60"
+                            )
+                active_tool_grace = smart_timeout.get(
+                    "active_tool_grace_seconds", 900
+                )
+                if (
+                    not isinstance(active_tool_grace, int)
+                    or isinstance(active_tool_grace, bool)
+                    or active_tool_grace < 0
+                ):
+                    errors.append(
+                        "execution.smart_timeout.active_tool_grace_seconds "
+                        "must be an integer >= 0"
+                    )
+                fresh_limit = smart_timeout.get("fresh_continuation_limit", 1)
+                if (
+                    not isinstance(fresh_limit, int)
+                    or isinstance(fresh_limit, bool)
+                    or fresh_limit < 0
+                ):
+                    errors.append(
+                        "execution.smart_timeout.fresh_continuation_limit "
+                        "must be an integer >= 0"
                     )
                 safety = smart_timeout.get("safety_ceiling_seconds", 43200)
                 leases = [

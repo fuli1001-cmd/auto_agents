@@ -7,15 +7,18 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import fnmatch
 import os
 import re
 import shlex
 import threading
 import time
 from pathlib import Path
+from statistics import median
 from typing import Callable, Iterable, List, Optional, Protocol, Sequence
 
+from .gate_timing import GateTimingStore
 from .models import (
     DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
@@ -96,6 +99,9 @@ class GateCommandMetadata:
     exclusive_resources: List[str] = field(default_factory=list)
     dynamic_ports: List[str] = field(default_factory=list)
     artifact_globs: List[str] = field(default_factory=list)
+    serial_reason: str = ""
+    cache_scope: str = "run_context"
+    result_cache_scope: str = "off"
 
 
 @dataclass
@@ -105,6 +111,7 @@ class ResolvedGatePlan:
     cache_scopes: dict[str, str]
     raw_command_count: int
     metadata: dict[str, GateCommandMetadata] = field(default_factory=dict)
+    result_cache_scopes: dict[str, str] = field(default_factory=dict)
 
     @property
     def unique_command_count(self) -> int:
@@ -318,6 +325,8 @@ def command_from_verification_step(step: VerificationStep, project_root: Optiona
 def expand_pytest_directory_steps(
     steps: Sequence[VerificationStep],
     project_root: Path,
+    *,
+    max_batches_per_step: int = 8,
 ) -> List[VerificationStep]:
     expanded: List[VerificationStep] = []
     for step in steps:
@@ -326,63 +335,290 @@ def expand_pytest_directory_steps(
         if kind != "test" or runner != "pytest":
             expanded.append(step)
             continue
+        if step.max_batches == 1:
+            # Preserve the directory target so the runner's own discovery,
+            # ignore configuration, and session fixtures remain authoritative.
+            expanded.append(step)
+            continue
 
+        exclude_patterns, remaining_args = _pytest_exclude_patterns(step.args)
         raw_targets = [item.strip() for item in step.targets if item.strip()] or ["tests"]
         seen_targets: set[str] = set()
+        discovered_targets: list[str] = []
+        fallback_targets: list[str] = []
         for target in raw_targets:
-            test_files = _pytest_files_for_target(project_root, target)
+            test_files = _pytest_files_for_target(
+                project_root,
+                target,
+                exclude_patterns=exclude_patterns,
+            )
             if not test_files:
                 if target not in seen_targets:
-                    expanded.append(
-                        VerificationStep(
-                            kind=step.kind,
-                            runner=step.runner,
-                            targets=[target],
-                            args=list(step.args),
-                            parallel_safe=step.parallel_safe,
-                            cadence=step.cadence,
-                            cache_scope=step.cache_scope,
-                            resource_class=step.resource_class,
-                            cpu_slots=step.cpu_slots,
-                            memory_mb=step.memory_mb,
-                            memory_reserve_mb=step.memory_reserve_mb,
-                            memory_guard=step.memory_guard,
-                            requires=list(step.requires),
-                            exclusive_resources=list(step.exclusive_resources),
-                            dynamic_ports=list(step.dynamic_ports),
-                            artifact_globs=list(step.artifact_globs),
-                        )
-                    )
+                    fallback_targets.append(target)
                     seen_targets.add(target)
                 continue
             for test_file in test_files:
                 if test_file in seen_targets:
                     continue
-                expanded.append(
-                    VerificationStep(
-                        kind=step.kind,
-                        runner=step.runner,
-                        targets=[test_file],
-                        args=list(step.args),
-                        parallel_safe=step.parallel_safe,
-                        cadence=step.cadence,
-                        cache_scope=step.cache_scope,
-                        resource_class=step.resource_class,
-                        cpu_slots=step.cpu_slots,
-                        memory_mb=step.memory_mb,
-                        memory_reserve_mb=step.memory_reserve_mb,
-                        memory_guard=step.memory_guard,
-                        requires=list(step.requires),
-                        exclusive_resources=list(step.exclusive_resources),
-                        dynamic_ports=list(step.dynamic_ports),
-                        artifact_globs=list(step.artifact_globs),
-                    )
-                )
+                discovered_targets.append(test_file)
                 seen_targets.add(test_file)
+        expanded.extend(
+            replace(step, targets=[target], args=list(step.args))
+            for target in fallback_targets
+        )
+        expanded.extend(
+            replace(step, targets=batch, args=list(remaining_args))
+            for batch in _balanced_target_batches(
+                discovered_targets,
+                project_root,
+                max_batches=step.max_batches or max_batches_per_step,
+                target_weights=_historical_target_weights(
+                    step,
+                    discovered_targets,
+                    remaining_args,
+                    project_root,
+                ),
+            )
+        )
     return expanded
 
 
-def _pytest_files_for_target(project_root: Path, target: str) -> List[str]:
+def _pytest_exclude_patterns(args: Sequence[str]) -> tuple[list[str], list[str]]:
+    patterns: list[str] = []
+    remaining: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = str(args[index]).strip()
+        if arg in {"--ignore", "--ignore-glob"} and index + 1 < len(args):
+            patterns.append(str(args[index + 1]).strip())
+            index += 2
+            continue
+        if arg.startswith(("--ignore=", "--ignore-glob=")):
+            patterns.append(arg.split("=", 1)[1].strip())
+            index += 1
+            continue
+        remaining.append(arg)
+        index += 1
+    return patterns, remaining
+
+
+def _vitest_exclude_patterns(args: Sequence[str]) -> tuple[list[str], list[str]]:
+    patterns: list[str] = []
+    remaining: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = str(args[index]).strip()
+        if arg == "--exclude" and index + 1 < len(args):
+            patterns.append(str(args[index + 1]).strip())
+            index += 2
+            continue
+        if arg.startswith("--exclude="):
+            patterns.append(arg.split("=", 1)[1].strip())
+            index += 1
+            continue
+        remaining.append(arg)
+        index += 1
+    return patterns, remaining
+
+
+def _vitest_files_for_target(
+    project_root: Path,
+    target: str,
+    *,
+    exclude_patterns: Sequence[str] = (),
+) -> List[str]:
+    root = project_root.resolve()
+    candidate = Path(target)
+    resolved = candidate if candidate.is_absolute() else root / candidate
+    if not resolved.is_dir():
+        return []
+    suffix = re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$", re.IGNORECASE)
+    out: list[str] = []
+    for path in sorted(item for item in resolved.rglob("*") if item.is_file()):
+        if not suffix.search(path.name):
+            continue
+        try:
+            relative = path.resolve().relative_to(root).as_posix()
+        except ValueError:
+            continue
+        if any(
+            fnmatch.fnmatch(relative, pattern)
+            or relative == pattern.removeprefix("./")
+            for pattern in exclude_patterns
+            if pattern
+        ):
+            continue
+        out.append(relative)
+    return out
+
+
+def _balanced_target_batches(
+    targets: Sequence[str],
+    project_root: Path,
+    *,
+    max_batches: int,
+    target_weights: Optional[dict[str, float]] = None,
+) -> list[list[str]]:
+    """Bound process fan-out while spreading likely-expensive files.
+
+    File size is only a stable first-run proxy. Once commands have timing
+    history, the gate scheduler still orders the resulting batches by measured
+    duration. Keeping the number of batches bounded avoids repeating expensive
+    runner startup and session fixture work once per test file.
+    """
+    unique_targets = list(dict.fromkeys(targets))
+    if not unique_targets:
+        return []
+    batch_count = min(len(unique_targets), max(1, int(max_batches)))
+    if batch_count == len(unique_targets):
+        return [[target] for target in unique_targets]
+
+    weighted: list[tuple[float, str]] = []
+    for target in unique_targets:
+        weight = max(1.0, float((target_weights or {}).get(target, 0.0)))
+        if weight <= 1.0 and target not in (target_weights or {}):
+            path = project_root / target
+            try:
+                weight = float(max(1, path.stat().st_size))
+            except OSError:
+                weight = 1.0
+        weighted.append((weight, target))
+    weighted.sort(key=lambda item: (-item[0], item[1]))
+
+    batches: list[list[str]] = [[] for _ in range(batch_count)]
+    weights = [0] * batch_count
+    for weight, target in weighted:
+        index = min(range(batch_count), key=lambda item: (weights[item], item))
+        batches[index].append(target)
+        weights[index] += weight
+    return [sorted(batch) for batch in batches if batch]
+
+
+def _historical_target_weights(
+    step: VerificationStep,
+    targets: Sequence[str],
+    args: Sequence[str],
+    project_root: Path,
+) -> dict[str, float]:
+    store = GateTimingStore(project_root)
+    estimates: dict[str, float] = {}
+    sizes: dict[str, int] = {}
+    for target in targets:
+        command = command_from_verification_step(
+            replace(step, targets=[target], args=list(args)),
+            project_root=project_root,
+        )
+        estimate = store.estimate_any_environment(command, step)
+        if estimate is not None and estimate > 0:
+            estimates[target] = estimate
+        try:
+            sizes[target] = max(1, (project_root / target).stat().st_size)
+        except OSError:
+            sizes[target] = 1
+    if not estimates:
+        return {target: float(size) for target, size in sizes.items()}
+
+    typical_estimate = median(estimates.values())
+    typical_size = max(1.0, float(median(sizes.values())))
+    weights = dict(estimates)
+    for target, size in sizes.items():
+        if target in weights:
+            continue
+        size_factor = max(
+            0.25,
+            min(4.0, (float(size) / typical_size) ** 0.5),
+        )
+        weights[target] = typical_estimate * size_factor
+    return weights
+
+
+def expand_vitest_directory_steps(
+    steps: Sequence[VerificationStep],
+    project_root: Path,
+    *,
+    max_batches_per_step: int = 8,
+) -> List[VerificationStep]:
+    expanded: list[VerificationStep] = []
+    for step in steps:
+        runner = step.runner.strip().lower()
+        kind = step.kind.strip().lower() or "test"
+        if kind != "test" or runner != "vitest":
+            expanded.append(step)
+            continue
+        if step.max_batches == 1:
+            # Vitest config can exclude files that are visible on disk. A
+            # single batch must retain directory discovery instead of turning
+            # excluded files into explicit CLI filters.
+            expanded.append(step)
+            continue
+        exclude_patterns, remaining_args = _vitest_exclude_patterns(step.args)
+        raw_targets = [item.strip() for item in step.targets if item.strip()]
+        if not raw_targets:
+            expanded.append(step)
+            continue
+        seen_targets: set[str] = set()
+        discovered_targets: list[str] = []
+        fallback_targets: list[str] = []
+        for target in raw_targets:
+            test_files = _vitest_files_for_target(
+                project_root,
+                target,
+                exclude_patterns=exclude_patterns,
+            )
+            if not test_files:
+                if target not in seen_targets:
+                    fallback_targets.append(target)
+                    seen_targets.add(target)
+                continue
+            for test_file in test_files:
+                if test_file in seen_targets:
+                    continue
+                discovered_targets.append(test_file)
+                seen_targets.add(test_file)
+        expanded.extend(
+            replace(step, targets=[target], args=list(step.args))
+            for target in fallback_targets
+        )
+        expanded.extend(
+            replace(step, targets=batch, args=list(remaining_args))
+            for batch in _balanced_target_batches(
+                discovered_targets,
+                project_root,
+                max_batches=step.max_batches or max_batches_per_step,
+                target_weights=_historical_target_weights(
+                    step,
+                    discovered_targets,
+                    remaining_args,
+                    project_root,
+                ),
+            )
+        )
+    return expanded
+
+
+def expand_verification_directory_steps(
+    steps: Sequence[VerificationStep],
+    project_root: Path,
+    *,
+    max_batches_per_step: int = 8,
+) -> List[VerificationStep]:
+    return expand_vitest_directory_steps(
+        expand_pytest_directory_steps(
+            steps,
+            project_root,
+            max_batches_per_step=max_batches_per_step,
+        ),
+        project_root,
+        max_batches_per_step=max_batches_per_step,
+    )
+
+
+def _pytest_files_for_target(
+    project_root: Path,
+    target: str,
+    *,
+    exclude_patterns: Sequence[str] = (),
+) -> List[str]:
     if "::" in target:
         return []
     root = project_root.resolve()
@@ -399,9 +635,17 @@ def _pytest_files_for_target(project_root: Path, target: str) -> List[str]:
     out: List[str] = []
     for path in sorted(files):
         try:
-            out.append(path.relative_to(root).as_posix())
+            relative = path.relative_to(root).as_posix()
         except ValueError:
             continue
+        if any(
+            fnmatch.fnmatch(relative, pattern)
+            or relative == pattern.removeprefix("./")
+            for pattern in exclude_patterns
+            if pattern
+        ):
+            continue
+        out.append(relative)
     return out
 
 
@@ -447,6 +691,7 @@ def resolve_gate_plan_from_verification_steps(
     grouped: dict[str, List[str]] = {}
     runner_order: List[str] = []
     cache_scopes: dict[str, str] = {}
+    result_cache_scopes: dict[str, str] = {}
     metadata: dict[str, GateCommandMetadata] = {}
     for command in order:
         command_steps = occurrences[command]
@@ -460,6 +705,15 @@ def resolve_gate_plan_from_verification_steps(
             else "source"
         )
         cache_scopes[command] = cache_scope
+        result_cache_order = {"observed_inputs": 0, "candidate": 1, "off": 2}
+        result_cache_scope = max(
+            (
+                step.result_cache_scope.strip().lower() or "candidate"
+                for step in command_steps
+            ),
+            key=lambda value: result_cache_order.get(value, 2),
+        )
+        result_cache_scopes[command] = result_cache_scope
         resource_class = (
             "heavy"
             if any(
@@ -521,6 +775,16 @@ def resolve_gate_plan_from_verification_steps(
                     if pattern.strip()
                 )
             ),
+            serial_reason=next(
+                (
+                    step.serial_reason.strip()
+                    for step in command_steps
+                    if step.serial_reason.strip()
+                ),
+                "",
+            ),
+            cache_scope=cache_scope,
+            result_cache_scope=result_cache_scope,
         )
         if not parallel_safe:
             sequential.append(command)
@@ -542,6 +806,7 @@ def resolve_gate_plan_from_verification_steps(
         cache_scopes=cache_scopes,
         raw_command_count=raw_count,
         metadata=metadata,
+        result_cache_scopes=result_cache_scopes,
     )
 
 
@@ -1046,6 +1311,53 @@ def _run_overlapped_gate_plan(
                             None,
                         )
                         if selected_position is None:
+                            # A wide command at the head group's frontier may
+                            # not fit beside a command already running from
+                            # that group. Backfill otherwise-idle slots from a
+                            # later independent group, but preserve the normal
+                            # group barrier when the head group has no pending
+                            # work and is merely draining.
+                            later_selection = next(
+                                (
+                                    (later_group, position)
+                                    for later_group in range(
+                                        group_index + 1,
+                                        len(pending_groups),
+                                    )
+                                    for position, (_index, command) in enumerate(
+                                        pending_groups[later_group]
+                                    )
+                                    if used_slots
+                                    + _executor_required_slots(
+                                        gate_executor,
+                                        command,
+                                        slot_capacity,
+                                    )
+                                    <= slot_capacity
+                                ),
+                                None,
+                            )
+                            if later_selection is not None:
+                                later_group, position = later_selection
+                                command_index, command = pending_groups[
+                                    later_group
+                                ].pop(position)
+                                slots = _executor_required_slots(
+                                    gate_executor, command, slot_capacity
+                                )
+                                submit(
+                                    pool,
+                                    _ScheduledGateCommand(
+                                        command=command,
+                                        lane="",
+                                        command_index=command_index,
+                                        group_index=later_group,
+                                        slots=slots,
+                                    ),
+                                )
+                                used_slots += slots
+                                made_progress = True
+                                continue
                             break
                         command_index, command = pending.pop(selected_position)
                         slots = _executor_required_slots(

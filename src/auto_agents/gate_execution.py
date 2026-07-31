@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -18,6 +19,7 @@ import uuid
 from typing import Callable, Mapping, Optional, Sequence
 
 from .models import CommandResult, GateConfig
+from .gate_result_cache import GateResultCache
 from .gate_timing import GateTimingStore
 from .process_supervision import run_supervised_shell_command
 
@@ -102,6 +104,7 @@ def _run_git(
 @dataclass(frozen=True)
 class GateSourceSnapshot:
     commit_sha: str
+    tree_sha: str
     ref_name: str
 
 
@@ -152,7 +155,11 @@ class GateSnapshotManager:
             ).stdout.strip()
             ref_name = f"refs/auto-agents/gate-snapshots/{self.plan_id}"
             _run_git(self.project_root, "update-ref", ref_name, commit)
-            self.snapshot = GateSourceSnapshot(commit_sha=commit, ref_name=ref_name)
+            self.snapshot = GateSourceSnapshot(
+                commit_sha=commit,
+                tree_sha=tree,
+                ref_name=ref_name,
+            )
             return self.snapshot
         finally:
             index_path.unlink(missing_ok=True)
@@ -177,6 +184,86 @@ def _metadata_list(metadata: object, name: str) -> list[str]:
 def _metadata_resource_class(metadata: object) -> str:
     value = str(getattr(metadata, "resource_class", "normal")).strip().lower()
     return "heavy" if value == "heavy" else "normal"
+
+
+def _metadata_signature(metadata: object) -> str:
+    payload = {
+        "resource_class": _metadata_resource_class(metadata),
+        "cpu_slots": int(getattr(metadata, "cpu_slots", 0) or 0),
+        "memory_mb": int(getattr(metadata, "memory_mb", 0) or 0),
+        "memory_reserve_mb": int(
+            getattr(metadata, "memory_reserve_mb", 0) or 0
+        ),
+        "memory_guard": str(getattr(metadata, "memory_guard", "off")),
+        "requires": sorted(_metadata_list(metadata, "requires")),
+        "exclusive_resources": sorted(
+            _metadata_list(metadata, "exclusive_resources")
+        ),
+        "dynamic_ports": sorted(_metadata_list(metadata, "dynamic_ports")),
+        "artifact_globs": sorted(_metadata_list(metadata, "artifact_globs")),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _path_observation_digest(path: Path) -> str:
+    if path.is_symlink():
+        return f"link:{path.readlink()}"
+    if path.is_dir():
+        encoded = json.dumps(
+            sorted(item.name for item in path.iterdir()),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return "dir:" + hashlib.sha256(encoded).hexdigest()
+    return "file:" + _sha256(path)
+
+
+def _observed_input_manifest(
+    trace_path: Path,
+    sandbox: Path,
+    dependency_links: Mapping[str, Path],
+) -> tuple[dict[str, str], bool]:
+    try:
+        text = trace_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}, False
+    network_observed = "connect(" in text or "sendto(" in text
+    ignored = {
+        ".git",
+        ".auto-agents-gate-runtime",
+        ".auto-agents-gate-tmp",
+        ".auto-agents-gate-cache",
+        *dependency_links.keys(),
+    }
+    manifest: dict[str, str] = {}
+    for match in re.finditer(r'"(?:[^"\\]|\\.)*"', text):
+        try:
+            raw = json.loads(match.group(0))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, str) or not raw or raw.startswith(
+            ("/dev/", "/proc/", "/sys/")
+        ):
+            continue
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = sandbox / candidate
+        try:
+            resolved = candidate.resolve()
+            relative = resolved.relative_to(sandbox.resolve()).as_posix()
+        except (OSError, ValueError):
+            continue
+        if any(
+            relative == prefix or relative.startswith(prefix.rstrip("/") + "/")
+            for prefix in ignored
+        ):
+            continue
+        if not resolved.exists():
+            continue
+        try:
+            manifest[relative] = _path_observation_digest(resolved)
+        except OSError:
+            return {}, network_observed
+    return manifest, network_observed
 
 
 def auto_agents_state_root() -> Path:
@@ -531,6 +618,7 @@ class LocalGatePlanExecutor:
         dependency_links: Optional[Mapping[str, Path]] = None,
         worker_id: str = "local",
         environment_fingerprint: str = "",
+        result_context_fingerprint: str = "",
     ) -> None:
         self.project_root = project_root.resolve()
         self.gate_config = gate_config
@@ -556,6 +644,11 @@ class LocalGatePlanExecutor:
         self.timing_store = GateTimingStore(
             self.project_root,
             environment_fingerprint=environment_fingerprint,
+        )
+        self.result_cache = GateResultCache(
+            self.project_root,
+            environment_fingerprint=environment_fingerprint,
+            context_fingerprint=result_context_fingerprint,
         )
         self._shared_sandboxes: dict[str, Path] = {}
         self._published_hashes: dict[str, str] = {}
@@ -593,6 +686,49 @@ class LocalGatePlanExecutor:
 
     def record_timing(self, command: str, result: CommandResult) -> None:
         self.timing_store.record(command, result, self.metadata.get(command))
+
+    def cached_result(self, command: str) -> Optional[CommandResult]:
+        if (
+            self.gate_config.verification_policy_version < 2
+            or self.snapshot is None
+        ):
+            return None
+        metadata = self.metadata.get(command)
+        return self.result_cache.lookup(
+            command,
+            source_fingerprint=self.snapshot.tree_sha,
+            cache_scope=str(
+                getattr(metadata, "cache_scope", "run_context")
+            ).strip().lower(),
+            result_cache_scope=str(
+                getattr(metadata, "result_cache_scope", "off")
+            ).strip().lower(),
+            metadata_signature=_metadata_signature(metadata),
+        )
+
+    def record_cached_result(
+        self,
+        command: str,
+        result: CommandResult,
+    ) -> None:
+        if (
+            self.gate_config.verification_policy_version < 2
+            or self.snapshot is None
+        ):
+            return
+        metadata = self.metadata.get(command)
+        self.result_cache.record(
+            command,
+            result,
+            source_fingerprint=self.snapshot.tree_sha,
+            cache_scope=str(
+                getattr(metadata, "cache_scope", "run_context")
+            ).strip().lower(),
+            result_cache_scope=str(
+                getattr(metadata, "result_cache_scope", "off")
+            ).strip().lower(),
+            metadata_signature=_metadata_signature(metadata),
+        )
 
     def _sandbox(self, lane: str, job_id: str) -> tuple[Path, bool]:
         if lane:
@@ -736,6 +872,17 @@ class LocalGatePlanExecutor:
         runtime_root: Optional[Path] = None
         cleanup = not bool(lane)
         try:
+            metadata = self.metadata.get(command)
+            result_cache_scope = (
+                str(getattr(metadata, "result_cache_scope", "off"))
+                .strip()
+                .lower()
+            )
+            cached = self.cached_result(command)
+            if cached is not None:
+                if progress is not None:
+                    progress("cache_hit", command, 0.0)
+                return cached
             sandbox, _created = self._sandbox(lane, job_id)
             requested_profile = str(
                 dict(environment_overrides or {}).get(
@@ -749,7 +896,18 @@ class LocalGatePlanExecutor:
             )
             if progress is not None:
                 progress("start", command, 0.0)
-            metadata = self.metadata.get(command)
+            trace_path: Optional[Path] = None
+            traced_command = isolated_command(command)
+            if (
+                result_cache_scope == "observed_inputs"
+                and shutil.which("strace")
+            ):
+                trace_path = runtime_root / "input-trace.log"
+                traced_command = (
+                    "strace -f -qq -e trace=%file,%network -o "
+                    f"{shlex.quote(str(trace_path))} "
+                    f"sh -lc {shlex.quote(traced_command)}"
+                )
             with exclusive_resource_lease(
                 _metadata_list(metadata, "exclusive_resources"),
                 worker_id=self.worker_id,
@@ -766,7 +924,7 @@ class LocalGatePlanExecutor:
                         dynamic_ports=dynamic_ports,
                     )
                     process = run_supervised_shell_command(
-                        isolated_command(command),
+                        traced_command,
                         cwd=sandbox,
                         env=env,
                         timeout_seconds=timeout_seconds,
@@ -818,6 +976,16 @@ class LocalGatePlanExecutor:
                 mutation_paths=mutations,
                 artifacts=artifacts,
             )
+            if trace_path is not None and result.ok:
+                observed_inputs, network_observed = _observed_input_manifest(
+                    trace_path,
+                    sandbox,
+                    self.dependency_links,
+                )
+                result.observed_inputs = observed_inputs
+                result.input_trace_complete = bool(observed_inputs)
+                result.network_observed = network_observed
+            self.record_cached_result(command, result)
             if progress is not None:
                 progress("finish", command, result.duration_seconds)
             self.record_timing(command, result)
