@@ -4689,6 +4689,67 @@ class Orchestrator:
         blocker["requeued_task_ids"] = requeued_task_ids
         return requeued_task_ids
 
+    @staticmethod
+    def _self_repair_requeued_task_id(state: RunState) -> str:
+        route = state.last_recovery_route
+        if (
+            not isinstance(route, dict)
+            or str(route.get("outcome", "")) != "self_repair_requeued"
+        ):
+            return ""
+        return str(route.get("task_id") or route.get("lineage_id") or "").strip()
+
+    def _restore_interrupted_self_repair_retry_ownership(
+        self,
+        state: RunState,
+        blocker: Dict[str, object],
+    ) -> List[str]:
+        """Recover a retry marker lost across an old-engine self-repair handoff."""
+
+        if (
+            str(blocker.get("owner", "")) != "auto_agents"
+            or str(blocker.get("status", "blocked")) != "blocked"
+            or str(blocker.get("category", ""))
+            != "dirty_worktree_requeue_lifecycle_violation"
+        ):
+            return []
+
+        task_id = self._self_repair_requeued_task_id(state)
+        if not task_id:
+            return []
+        task = next(
+            (
+                candidate
+                for candidate in state.tasks
+                if candidate.task_id == task_id
+                and candidate.status in {"pending", "in_progress"}
+            ),
+            None,
+        )
+        if task is None:
+            return []
+
+        retry_ids = self._parallel_sequential_retry_ids(state)
+        self._set_parallel_sequential_retry_ids(state, [*retry_ids, task_id])
+        blocker["status"] = "retrying"
+        blocker["bootstrap_state_recovered"] = True
+        blocker["requeued_task_ids"] = list(
+            dict.fromkeys(
+                [
+                    *(
+                        blocker.get("requeued_task_ids", [])
+                        if isinstance(blocker.get("requeued_task_ids", []), list)
+                        else []
+                    ),
+                    task_id,
+                ]
+            )
+        )
+        state.active_blocker = blocker
+        state.status = "pending"
+        state.last_error = ""
+        return [task_id]
+
     def _repair_self_referential_dependency_links(self) -> List[str]:
         """Remove dependency links leaked by an earlier worktree commit."""
 
@@ -4950,6 +5011,15 @@ class Orchestrator:
             and active_incident is not None
             and active_incident.status == "self_repair"
         )
+        restored_retry_ids = self._restore_interrupted_self_repair_retry_ownership(
+            state,
+            blocker,
+        )
+        if restored_retry_ids:
+            self.logger.info(
+                "[self-repair] restored interrupted retry ownership tasks=%s",
+                ",".join(restored_retry_ids),
+            )
         if (
             str(blocker.get("owner", "")) == "auto_agents"
             and str(blocker.get("status", "blocked")) != "retrying"
@@ -7234,10 +7304,19 @@ class Orchestrator:
             else self._should_resume_task(state, task)
         )
         sequential_retry_ids = self._parallel_sequential_retry_ids(state)
+        route_retry = self._self_repair_requeued_task_id(state) == task.task_id
+        if route_retry and task.task_id not in sequential_retry_ids:
+            sequential_retry_ids = [*sequential_retry_ids, task.task_id]
+            self._set_parallel_sequential_retry_ids(state, sequential_retry_ids)
+            save_run_state(self.project_root, state)
         # A persisted sequential retry is an orchestrator-owned continuation even
-        # though its fresh verification lifecycle represents it as pending.
+        # though its fresh verification lifecycle represents it as pending. The
+        # recovery route is a redundant durable ownership record for handoffs made
+        # by an older in-memory engine that could not persist the newer marker.
         allow_dirty_retry = (
-            task.status == "blocked" or task.task_id in sequential_retry_ids
+            task.status == "blocked"
+            or task.task_id in sequential_retry_ids
+            or route_retry
         )
         allow_dirty_repair = self._is_repair_task(task)
         if (resume_existing or allow_dirty_retry) and task.status != "in_progress":

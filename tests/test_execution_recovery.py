@@ -1515,6 +1515,94 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertFalse(changed)
             self.assertEqual(state.status, "blocked")
 
+    def test_dirty_requeue_block_restores_retry_ownership_lost_during_handoff(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            task = TaskSpec(
+                task_id="contract-task",
+                title="Resume preserved implementation",
+                description="Continue the self-repair requeued task.",
+                acceptance=["The preserved implementation is verified."],
+                status="pending",
+                verify_retry_epoch=1,
+            )
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [task]
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "lineage_id": task.task_id,
+                "outcome": "self_repair_requeued",
+                "reason": "self-repair opened a fresh verification retry lifecycle",
+            }
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "dirty_worktree_requeue_lifecycle_violation",
+                "reason": "self-repair agent completed without changing auto_agents",
+                "status": "blocked",
+            }
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(root, state)
+
+            resumed = Orchestrator(root)
+            changed = resumed._resume_blocked_run(state)
+
+            self.assertTrue(changed)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.last_error, "")
+            self.assertEqual(
+                state.resume_context["parallel_sequential_retry_tasks"],
+                [task.task_id],
+            )
+            self.assertEqual(state.active_blocker["status"], "retrying")
+            self.assertTrue(state.active_blocker["bootstrap_state_recovered"])
+            self.assertEqual(
+                state.active_blocker["requeued_task_ids"],
+                [task.task_id],
+            )
+
+    def test_unrelated_auto_agents_block_does_not_reuse_stale_requeue_route(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            task = TaskSpec(
+                task_id="contract-task",
+                title="Pending task",
+                description="A pending task with an older recovery route.",
+                acceptance=["The task passes."],
+                status="pending",
+            )
+            state = load_run_state(root)
+            state.status = "blocked"
+            state.tasks = [task]
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "outcome": "self_repair_requeued",
+            }
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "scheduler_invariant",
+                "reason": "a different engine invariant failed",
+                "status": "blocked",
+            }
+
+            changed = orchestrator._resume_blocked_run(state)
+
+            self.assertFalse(changed)
+            self.assertEqual(state.status, "blocked")
+            self.assertNotIn(
+                "parallel_sequential_retry_tasks",
+                state.resume_context,
+            )
+
     def test_self_repair_commit_reopens_incident_for_new_engine(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
