@@ -317,6 +317,105 @@ class VerifyFailureClassificationTests(unittest.TestCase):
             self.assertEqual(task.status, "pending")
             self.assertEqual(set(task.depends_on), {repair.task_id for repair in repairs})
 
+    def test_artifact_contract_failure_schedules_its_owned_producer_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            producer_ref = "tests/test_storage_smoke.py::test_publishes_receipt"
+            unrelated_ref = "tests/test_public_api.py::test_lists_assets"
+            artifact_ref = ".tmp-tests/storage/runs/*/receipt.json"
+            failure_id = (
+                "verification_contract:nonportable_ignored_evidence:"
+                f"{artifact_ref}"
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-storage",
+                            "title": "Verify durable storage",
+                            "description": "Publish current-run storage evidence.",
+                            "acceptance": ["The storage receipt is portable."],
+                            "status": "blocked",
+                            "review_summary": (
+                                "current isolated verification did not publish "
+                                "supporting evidence"
+                            ),
+                            "verification_refs": [unrelated_ref, producer_ref],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-STORAGE",
+                                    "oracle_index": 1,
+                                    "status": "verified",
+                                    "evidence_refs": [producer_ref, artifact_ref],
+                                }
+                            ],
+                            "verify_history": [
+                                {
+                                    "attempt": 2,
+                                    "decision": "fail",
+                                    "summary": "supporting evidence was not published",
+                                    "failure_ids": [failure_id],
+                                    "comparable_failures": True,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            repair, task = result.tasks
+            self.assertEqual(repair.task_origin, "evidence_repair")
+            self.assertEqual(repair.parent_task_id, task.task_id)
+            self.assertEqual(repair.verification_refs, [producer_ref])
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(
+                result.last_recovery_route["outcome"],
+                "repair_tasks_scheduled",
+            )
+
+    def test_artifact_contract_without_sibling_uses_task_owned_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            producer_ref = "tests/test_storage_smoke.py::test_publishes_receipt"
+            artifact_ref = ".tmp-tests/storage/runs/*/receipt.json"
+            task = TaskSpec(
+                task_id="task-storage",
+                title="Verify durable storage",
+                description="Publish current-run storage evidence.",
+                acceptance=["The storage receipt is portable."],
+                verification_refs=[producer_ref],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-STORAGE",
+                        "oracle_index": 1,
+                        "status": "verified",
+                        "evidence_refs": [artifact_ref],
+                    }
+                ],
+            )
+
+            refs = orchestrator._candidate_repair_refs(
+                task,
+                {
+                    "failure_ids": [
+                        "verification_contract:nonportable_ignored_evidence:"
+                        f"{artifact_ref}"
+                    ],
+                    "comparable_failures": True,
+                },
+            )
+
+            self.assertEqual(refs, [producer_ref])
+
     def test_recovery_signature_is_stable_across_review_reason_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

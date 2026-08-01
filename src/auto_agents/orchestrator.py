@@ -222,6 +222,8 @@ _FAILOVER_PATTERN = re.compile(
 )
 
 VERIFY_BASELINE_SCHEMA_VERSION = 1
+_VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
+_IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
 _NON_COMPARABLE_BASELINE_PREFIXES = (
     "cmd-timeout:",
     "cmd-stalled:",
@@ -8691,6 +8693,11 @@ class Orchestrator:
                 refs.append(failure_id)
         if refs:
             return refs
+        refs.extend(
+            self._artifact_publication_repair_refs(task, failure_ids)
+        )
+        if refs:
+            return refs
         proof_evidence = result.get("proof_evidence")
         if isinstance(proof_evidence, dict):
             for raw_ref in proof_evidence.get("failed_refs", []) or []:
@@ -8702,6 +8709,69 @@ class Orchestrator:
                 ):
                     refs.append(ref)
         return refs
+
+    @staticmethod
+    def _structured_verification_contract_failure(
+        failure_id: str,
+    ) -> Tuple[str, str]:
+        parts = str(failure_id).strip().split(":", 2)
+        if (
+            len(parts) != 3
+            or parts[0] != _VERIFICATION_CONTRACT_FAILURE_OWNER
+            or not parts[1]
+            or not parts[2]
+        ):
+            return "", ""
+        return parts[1], parts[2]
+
+    def _artifact_publication_repair_refs(
+        self,
+        task: TaskSpec,
+        failure_ids: Iterable[str],
+    ) -> List[str]:
+        failed_artifact_refs = {
+            artifact_ref
+            for failure_id in failure_ids
+            for failure_kind, artifact_ref in [
+                self._structured_verification_contract_failure(failure_id)
+            ]
+            if failure_kind == _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND
+        }
+        if not failed_artifact_refs:
+            return []
+
+        producer_refs: List[str] = []
+        for proof in task.requirement_proofs:
+            if not isinstance(proof, dict):
+                continue
+            proof_refs = [
+                str(raw_ref).strip()
+                for raw_ref in proof.get("evidence_refs", []) or []
+                if str(raw_ref).strip()
+            ]
+            if not failed_artifact_refs.intersection(proof_refs):
+                continue
+            for ref in proof_refs:
+                if (
+                    ref not in failed_artifact_refs
+                    and ref not in producer_refs
+                    and self._build_task_proof_evidence_command_for_ref(ref)
+                ):
+                    producer_refs.append(ref)
+        if producer_refs:
+            return producer_refs
+
+        # A proof may cite only its generated artifact while the executable producer is
+        # owned at task level. In that case all executable task refs are safe recovery
+        # candidates; the repair remains bounded by the parent's verification contract.
+        for ref in self._task_planned_evidence_refs(task):
+            if (
+                ref not in failed_artifact_refs
+                and ref not in producer_refs
+                and self._build_task_proof_evidence_command_for_ref(ref)
+            ):
+                producer_refs.append(ref)
+        return producer_refs
 
     @staticmethod
     def _group_repair_refs(refs: List[str], max_refs_per_group: int, max_groups: int) -> List[List[str]]:
@@ -11020,7 +11090,8 @@ class Orchestrator:
             "ok": False,
             "reason": reason,
             "failure_ids": [
-                f"verification_contract:nonportable_ignored_evidence:{ref}"
+                f"{_VERIFICATION_CONTRACT_FAILURE_OWNER}:"
+                f"{_IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND}:{ref}"
                 for ref in failed_refs
             ],
             "failed_refs": failed_refs,
