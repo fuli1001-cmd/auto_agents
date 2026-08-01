@@ -1353,6 +1353,7 @@ class CommandResult:
     infrastructure_failure_id: str = ""
     infrastructure_capability: str = ""
     infrastructure_contract: str = ""
+    infrastructure_repair_scope: str = ""
     infrastructure_attempts: List[Dict[str, object]] = field(default_factory=list)
     mutation_paths: List[str] = field(default_factory=list)
     artifacts: Dict[str, str] = field(default_factory=dict)

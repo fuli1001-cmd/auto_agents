@@ -890,6 +890,7 @@ class DistributedGatePlanExecutor:
             "ok": result.ok,
             "returncode": result.returncode,
             "failure_id": result.infrastructure_failure_id,
+            "repair_scope": result.infrastructure_repair_scope,
             "termination_reason": result.termination_reason,
             "stdout_tail": result.stdout[-1000:],
             "stderr_tail": result.stderr[-1000:],

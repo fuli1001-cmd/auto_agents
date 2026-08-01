@@ -115,13 +115,32 @@ def test_structured_infrastructure_marker_preserves_capability_contract() -> Non
         returncode=1,
         stderr=(
             "AUTO_AGENTS_INFRA_FAILURE id=browser_launch_failed "
-            "capability=chrome contract=cdp-v1"
+            "capability=chrome contract=cdp-v1 repair_scope=target_project"
         ),
     )
     classify_reported_infrastructure_failure(result)
     assert result.infrastructure_failure_id == "browser_launch_failed"
     assert result.infrastructure_capability == "chrome"
     assert result.infrastructure_contract == "cdp-v1"
+    assert result.infrastructure_repair_scope == "target_project"
+    assert result.process_snapshot["reported_infrastructure_marker"][
+        "repair_scope"
+    ] == "target_project"
+
+
+def test_structured_infrastructure_marker_rejects_auto_agents_repair_scope() -> None:
+    result = CommandResult(
+        command="npm test",
+        ok=False,
+        returncode=1,
+        stderr=(
+            "AUTO_AGENTS_INFRA_FAILURE id=browser_launch_failed "
+            "capability=chrome contract=cdp-v1 repair_scope=auto_agents"
+        ),
+    )
+    classify_reported_infrastructure_failure(result)
+    assert result.infrastructure_failure_id == "browser_launch_failed"
+    assert result.infrastructure_repair_scope == ""
 
 
 def test_run_parser_accepts_explicit_blocked_restart() -> None:

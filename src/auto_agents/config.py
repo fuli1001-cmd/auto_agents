@@ -40,7 +40,6 @@ node_modules/
 AUTO_GITIGNORE_ENTRIES = (
     "failed-verification-logs/",
     "runs/",
-    "state/sessions/",
     "state/gate_baseline_cache.json",
     "state/gate_baseline_cache.sqlite3",
     "state/gate_baseline_cache.sqlite3-*",

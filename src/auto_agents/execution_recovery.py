@@ -413,6 +413,42 @@ def deterministic_diagnosis(incident: ExecutionIncident) -> Optional[IncidentDia
             reason="provider supervision termination uses the existing resume/failover route",
             evidence=[f"termination_reason={incident.termination_reason}"],
         )
+    marker = incident.process_snapshot.get("reported_infrastructure_marker", {})
+    repair_scope = (
+        str(marker.get("repair_scope", "")).strip().lower()
+        if isinstance(marker, dict)
+        else ""
+    )
+    if (
+        incident.kind == "gate_reported_infrastructure_error"
+        and repair_scope in {"target_project", "verification_contract"}
+    ):
+        return IncidentDiagnosis(
+            owner=repair_scope,
+            action="RECOVER_TARGET",
+            confidence=1.0,
+            reason=(
+                "the standard infrastructure marker explicitly assigns the repair "
+                f"surface to {repair_scope}"
+            ),
+            evidence=[f"repair_scope={repair_scope}"],
+            cause_status="confirmed",
+        )
+    if (
+        incident.kind == "gate_reported_infrastructure_error"
+        and repair_scope == "execution_environment"
+    ):
+        return IncidentDiagnosis(
+            owner="execution_environment",
+            action="REPAIR_INFRASTRUCTURE",
+            confidence=1.0,
+            reason=(
+                "the standard infrastructure marker explicitly assigns the repair "
+                "surface to the execution environment"
+            ),
+            evidence=["repair_scope=execution_environment"],
+            cause_status="confirmed",
+        )
     if incident.termination_reason == "launch_error":
         return IncidentDiagnosis(
             owner="verification_contract",

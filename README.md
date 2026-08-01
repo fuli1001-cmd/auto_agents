@@ -728,7 +728,12 @@ can be removed with `auto-agents workers cleanup`.
 
 Tests can explicitly report that they could not exercise the target behavior by emitting
 `AUTO_AGENTS_INFRA_FAILURE id=<stable_id>` on a diagnostic line. Capability-aware checks may append
-`capability=<name> contract=<name>`; the original ID-only form remains compatible. auto_agents also recognizes its
+`capability=<name> contract=<name>`. When the failing verification implementation itself is the
+repair surface, checks may additionally append `repair_scope=target_project` (or
+`verification_contract`); environment-owned failures may use `repair_scope=execution_environment`.
+The scope is persisted as evidence and deterministically selects the bounded recovery route, so
+auto_agents does not have to infer ownership from prose. A target project cannot use this marker to
+request auto_agents self-repair. The original ID-only form remains compatible. auto_agents also recognizes its
 built-in browser-verification marker, plus literal project markers configured under
 `gates.reported_infrastructure_markers`. A reported infrastructure failure is retried once on each
 currently eligible worker, up to `reported_infrastructure_max_workers`; if every worker fails,

@@ -18,7 +18,11 @@ from auto_agents.execution_recovery import (
     recovery_task_marker,
 )
 from auto_agents.models import AgentResult, AgentTermination, CommandResult, RunState, TaskSpec
-from auto_agents.gates import GateCommandTimeoutError
+from auto_agents.gates import (
+    GateCommandInfrastructureError,
+    GateCommandTimeoutError,
+    classify_reported_infrastructure_failure,
+)
 from auto_agents.infrastructure_repair import InfrastructureRepairResult
 from auto_agents.git_ops import (
     commit_all,
@@ -271,6 +275,48 @@ class ExecutionRecoveryTests(unittest.TestCase):
             tasks = load_task_plan(root)["tasks"]
             self.assertEqual(tasks[0]["title"], "Repair verification infrastructure")
             self.assertIn("all currently eligible workers", tasks[0]["description"])
+
+    def test_reported_infrastructure_explicit_target_scope_skips_provider_judge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            result = CommandResult(
+                command="npm exec -- vitest run src/e2e/browser.test.ts",
+                ok=False,
+                returncode=1,
+                stderr=(
+                    "AUTO_AGENTS_INFRA_FAILURE "
+                    "id=browser_verification_infrastructure_failed "
+                    "capability=chrome contract=cdp-v1 "
+                    "repair_scope=target_project: load event timed out"
+                ),
+            )
+            classify_reported_infrastructure_failure(result)
+            error = GateCommandInfrastructureError(
+                "browser verification infrastructure failed",
+                result=result,
+                context="implement verify baseline commands",
+                baseline=True,
+            )
+
+            with patch.object(
+                orchestrator,
+                "_agent_diagnose_execution_incident",
+                side_effect=AssertionError("explicit scope must be deterministic"),
+            ):
+                recovered = orchestrator._handle_gate_execution_incident(
+                    state, "implement", error
+                )
+
+            self.assertTrue(recovered)
+            tasks = load_task_plan(root)["tasks"]
+            self.assertEqual(tasks[0]["title"], "Repair verification infrastructure")
+            self.assertEqual(
+                state.execution_incidents[-1]["diagnosis"]["owner"],
+                "target_project",
+            )
 
     def test_workspace_conda_repair_resumes_before_repeat_route_guard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

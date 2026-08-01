@@ -41,6 +41,8 @@ _STANDARD_INFRA_FAILURE = re.compile(
     r"^AUTO_AGENTS_INFRA_FAILURE\s+id=(?P<id>[a-z][a-z0-9_-]{1,63})\b"
     r"(?:\s+capability=(?P<capability>[a-z][a-z0-9_-]{1,31}))?"
     r"(?:\s+contract=(?P<contract>[a-z][a-z0-9_-]{1,31}))?"
+    r"(?:\s+repair_scope=(?P<repair_scope>"
+    r"target_project|verification_contract|execution_environment|unknown))?"
     r"(?=$|[\s:])",
     re.IGNORECASE,
 )
@@ -225,6 +227,9 @@ def classify_reported_infrastructure_failure(
         result.infrastructure_contract = (
             standard.group("contract") or ""
         ).lower()
+        result.infrastructure_repair_scope = (
+            standard.group("repair_scope") or ""
+        ).lower()
     if not failure_id:
         for marker_id, pattern in _BUILTIN_INFRA_MARKERS:
             for line in lines:
@@ -254,6 +259,7 @@ def classify_reported_infrastructure_failure(
                 "id": failure_id,
                 "capability": result.infrastructure_capability,
                 "contract": result.infrastructure_contract,
+                "repair_scope": result.infrastructure_repair_scope,
                 "matched": matched_line,
             },
         }
