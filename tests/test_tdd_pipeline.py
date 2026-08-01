@@ -506,6 +506,28 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("does not match an existing proof", error)
             self.assertEqual(task.requirement_proofs[0]["status"], "planned")
 
+    def test_oracle_proof_updates_ignores_marker_mentioned_in_prose(self) -> None:
+        examples = (
+            "Cannot truthfully emit valid `ORACLE_PROOF_UPDATES` until evidence exists.",
+            "The ORACLE_PROOF_UPDATES marker is required only after verification.",
+            "- ORACLE_PROOF_UPDATES: must contain a JSON proof payload.",
+        )
+
+        for text in examples:
+            with self.subTest(text=text):
+                updates, error = Orchestrator._extract_oracle_proof_updates(text)
+
+                self.assertEqual(updates, [])
+                self.assertEqual(error, "")
+
+    def test_oracle_proof_updates_standalone_header_requires_json(self) -> None:
+        updates, error = Orchestrator._extract_oracle_proof_updates(
+            "Summary complete.\nORACLE_PROOF_UPDATES:\nNo proof is available."
+        )
+
+        self.assertEqual(updates, [])
+        self.assertIn("marker found but no JSON", error)
+
     def test_oracle_proof_updates_normalize_composite_proof_type(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

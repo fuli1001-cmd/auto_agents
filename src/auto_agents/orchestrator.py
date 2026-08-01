@@ -6345,20 +6345,27 @@ class Orchestrator:
     @staticmethod
     def _extract_oracle_proof_updates(text: str) -> Tuple[List[Dict[str, object]], str]:
         marker = "ORACLE_PROOF_UPDATES"
-        if marker not in text:
+        header = re.search(
+            rf"^[ \t]*{marker}[ \t]*:[ \t]*(?=\r?$)",
+            text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        if header is None:
             return [], ""
 
-        fenced = re.search(
-            rf"{marker}\s*:\s*```(?:json)?\s*(.*?)\s*```",
-            text,
+        protocol_body = text[header.end() :]
+
+        fenced = re.match(
+            r"\s*```(?:json)?\s*(.*?)\s*```",
+            protocol_body,
             flags=re.IGNORECASE | re.DOTALL,
         )
         if fenced:
             raw_json = fenced.group(1).strip()
         else:
-            inline = re.search(
-                rf"{marker}\s*:\s*(\[[\s\S]*?\]|\{{[\s\S]*?\}})(?=\s*(?:\n[A-Z][A-Z0-9_ -]*:|\Z))",
-                text,
+            inline = re.match(
+                r"\s*(\[[\s\S]*?\]|\{[\s\S]*?\})(?=\s*(?:\n[A-Z][A-Z0-9_ -]*:|\Z))",
+                protocol_body,
                 flags=re.IGNORECASE,
             )
             if not inline:
