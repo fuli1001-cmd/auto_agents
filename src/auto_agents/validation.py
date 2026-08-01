@@ -1664,9 +1664,11 @@ def validate_project_root(
                 if str(step.get("runner", "")).strip().lower() != "pytest":
                     continue
                 for target in step.get("targets", []) or []:
-                    if not str(target).endswith(".py") and ".py::" not in str(target):
+                    target_text = str(target)
+                    target_path = target_text.split("::", 1)[0]
+                    if not target_path.endswith(".py"):
                         continue
-                    candidate = Path(str(target))
+                    candidate = Path(target_path)
                     resolved = candidate if candidate.is_absolute() else (root / candidate).resolve()
                     if not resolved.exists():
                         errors.append(

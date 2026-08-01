@@ -885,6 +885,91 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertFalse(report["ok"])
             self.assertTrue(any("missing pytest target" in item for item in report["errors"]))
 
+    def test_validation_report_accepts_pytest_nodeid_in_verification_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(
+                project_root / "tests" / "test_contract.py",
+                (
+                    "import unittest\n\n"
+                    "class ContractTests(unittest.TestCase):\n"
+                    "    def test_public_contract(self):\n"
+                    "        pass\n"
+                ),
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [
+                        {
+                            "kind": "test",
+                            "runner": "pytest",
+                            "targets": [
+                                "tests/test_contract.py::ContractTests::test_public_contract"
+                            ],
+                        }
+                    ],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Preserve the public contract",
+                            "description": "Keep the existing contract covered.",
+                            "acceptance": ["The focused contract check passes."],
+                            "status": "pending",
+                            "commit_message": "test: preserve public contract",
+                        }
+                    ],
+                },
+            )
+
+            report = validation_report(project_root)
+
+            self.assertTrue(report["ok"], msg=str(report["errors"]))
+            self.assertFalse(
+                any("missing pytest target" in item for item in report["errors"])
+            )
+
+    def test_validation_report_rejects_missing_file_behind_pytest_nodeid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            target = "tests/test_missing.py::ContractTests::test_public_contract"
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [
+                        {
+                            "kind": "test",
+                            "runner": "pytest",
+                            "targets": [target],
+                        }
+                    ],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Preserve the public contract",
+                            "description": "Keep the existing contract covered.",
+                            "acceptance": ["The focused contract check passes."],
+                            "status": "pending",
+                            "commit_message": "test: preserve public contract",
+                        }
+                    ],
+                },
+            )
+
+            report = validation_report(project_root)
+
+            self.assertFalse(report["ok"])
+            self.assertTrue(
+                any(
+                    "missing pytest target" in item and target in item
+                    for item in report["errors"]
+                )
+            )
+
     def test_validation_report_warns_when_task_plan_looks_oversliced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
