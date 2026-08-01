@@ -1666,6 +1666,10 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 marked.resume_context.get("implementation_ready_tasks", {}),
             )
             self.assertEqual(
+                marked.resume_context["parallel_sequential_retry_tasks"],
+                [task.task_id],
+            )
+            self.assertEqual(
                 marked.active_blocker["prepared_self_repair_commit"],
                 "abc123",
             )

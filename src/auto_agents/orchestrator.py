@@ -4663,6 +4663,14 @@ class Orchestrator:
                 requeued_task_ids.append(task.task_id)
 
         if requeued_task_ids:
+            # Requeueing resets blocked tasks to pending for a fresh verification
+            # lifecycle, but their uncommitted main-worktree edits still belong to
+            # the retry. Preserve that ownership across the resume boundary.
+            sequential_retry_ids = self._parallel_sequential_retry_ids(state)
+            self._set_parallel_sequential_retry_ids(
+                state,
+                [*sequential_retry_ids, *requeued_task_ids],
+            )
             state.tasks = tasks
             self._persist_tasks(tasks)
             route = dict(state.last_recovery_route)
@@ -7225,7 +7233,12 @@ class Orchestrator:
             if task.status == "in_progress"
             else self._should_resume_task(state, task)
         )
-        allow_dirty_retry = task.status == "blocked"
+        sequential_retry_ids = self._parallel_sequential_retry_ids(state)
+        # A persisted sequential retry is an orchestrator-owned continuation even
+        # though its fresh verification lifecycle represents it as pending.
+        allow_dirty_retry = (
+            task.status == "blocked" or task.task_id in sequential_retry_ids
+        )
         allow_dirty_repair = self._is_repair_task(task)
         if (resume_existing or allow_dirty_retry) and task.status != "in_progress":
             task.status = "in_progress"
@@ -7335,6 +7348,11 @@ class Orchestrator:
             self._resolve_execution_incident_for_task(state, task)
         else:
             self._resolve_inline_task_incident(state, task)
+        if task.task_id in sequential_retry_ids:
+            self._set_parallel_sequential_retry_ids(
+                state,
+                [task_id for task_id in sequential_retry_ids if task_id != task.task_id],
+            )
         return None
 
     @staticmethod

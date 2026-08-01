@@ -3540,6 +3540,61 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.tasks[0].status, "done")
             self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "fixed")
 
+    def test_orchestrator_requeued_task_uses_dirty_sequential_retry_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.workers = 2
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.adapter = BlockedRetryAdapter(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Continue artifact",
+                            "description": (
+                                "Continue the orchestrator-owned implementation."
+                            ),
+                            "acceptance": ["artifact.txt contains fixed"],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+            (project_root / "artifact.txt").write_text(
+                "partial implementation\n",
+                encoding="utf-8",
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.resume_context["parallel_sequential_retry_tasks"] = ["task-001"]
+
+            state = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(
+                (project_root / "artifact.txt").read_text(encoding="utf-8").strip(),
+                "fixed",
+            )
+            self.assertNotIn(
+                "parallel_sequential_retry_tasks",
+                state.resume_context,
+            )
+
     def test_pending_task_reports_changed_paths_when_clean_tree_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
