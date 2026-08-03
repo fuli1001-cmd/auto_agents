@@ -159,6 +159,17 @@ class TestIsFailoverError(unittest.TestCase):
         r = _make_result(ok=False, returncode=1, stderr="syntax error on line 42")
         self.assertFalse(Orchestrator._is_failover_error(r))
 
+    def test_copilot_policy_access_denied(self):
+        r = _make_result(
+            ok=False,
+            returncode=1,
+            stderr=(
+                "Error: Access denied by policy settings\n"
+                "Your Copilot CLI policy setting may be preventing access."
+            ),
+        )
+        self.assertTrue(Orchestrator._is_failover_error(r))
+
     def test_rate_limit(self):
         r = _make_result(ok=False, returncode=1, stderr="Error: rate limit exceeded")
         self.assertTrue(Orchestrator._is_failover_error(r))

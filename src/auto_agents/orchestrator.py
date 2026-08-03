@@ -15971,6 +15971,17 @@ class Orchestrator:
 
     @staticmethod
     def _is_failover_error(result: AgentResult) -> bool:
+        if not result.ok:
+            provider_error = (result.stderr or "").lower()
+            if any(
+                marker in provider_error
+                for marker in (
+                    "access denied by policy settings",
+                    "copilot cli policy setting may be preventing access",
+                )
+            ):
+                return True
+
         if result.ok:
             return False
         if result.termination is not None:
