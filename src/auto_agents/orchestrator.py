@@ -1635,6 +1635,8 @@ class Orchestrator:
                 save_run_state(self.project_root, state)
             if self._normalize_missing_workspace_dependency_recovery(state):
                 save_run_state(self.project_root, state)
+            if self._normalize_stage_recovery_verification_refs(state):
+                save_run_state(self.project_root, state)
             restarted_before_preconditions = False
             if state.workflow_version < 2:
                 legacy_progress = any(
@@ -5908,6 +5910,101 @@ class Orchestrator:
         normalized = str(command or "").strip()
         return bool(normalized and "<redacted>" not in normalized.lower())
 
+    def _stage_recovery_verification_refs(self) -> List[str]:
+        """Return the configured proof surface for an orchestrator recovery task."""
+        try:
+            payload = load_task_plan(self.project_root)
+            policy_version = max(
+                1, int(payload.get("verification_policy_version", 1) or 1)
+            )
+        except (OSError, TypeError, ValueError):
+            return []
+        if policy_version < 2:
+            return []
+
+        commands: List[str] = []
+        try:
+            raw_steps = payload.get("verification_steps", [])
+            if isinstance(raw_steps, list):
+                steps = [
+                    VerificationStep.from_dict(dict(item))
+                    for item in raw_steps
+                    if isinstance(item, dict)
+                ]
+                commands.extend(
+                    commands_from_verification_steps(steps, self.project_root)
+                )
+            raw_commands = payload.get("verification_commands", [])
+            if isinstance(raw_commands, list):
+                commands.extend(
+                    str(command).strip()
+                    for command in raw_commands
+                    if str(command).strip()
+                )
+        except (OSError, TypeError, ValueError):
+            return []
+        return list(
+            dict.fromkeys(
+                f"cmd:{command}"
+                for command in commands
+                if self._safe_execution_recovery_command(command)
+            )
+        )
+
+    def _backfill_stage_recovery_verification_refs(
+        self,
+        tasks: Iterable[TaskSpec],
+    ) -> List[str]:
+        verification_refs = self._stage_recovery_verification_refs()
+        if not verification_refs:
+            return []
+        repaired_ids: List[str] = []
+        for task in tasks:
+            if (
+                task.status == "done"
+                or task.task_origin != "stage_recovery"
+                or any(str(ref).strip() for ref in task.verification_refs)
+            ):
+                continue
+            task.verification_refs = list(verification_refs)
+            repaired_ids.append(task.task_id)
+        return repaired_ids
+
+    def _normalize_stage_recovery_verification_refs(self, state: RunState) -> bool:
+        """Backfill proof refs that older orchestrators omitted from recovery tasks."""
+        try:
+            payload = load_task_plan(self.project_root)
+            raw_tasks = payload.get("tasks", [])
+            if not isinstance(raw_tasks, list):
+                return False
+            tasks = [
+                TaskSpec.from_dict(item)
+                for item in raw_tasks
+                if isinstance(item, dict)
+            ]
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+
+        repaired_ids = self._backfill_stage_recovery_verification_refs(tasks)
+        if not repaired_ids:
+            return False
+
+        state_tasks = {task.task_id: task for task in state.tasks}
+        for task in tasks:
+            state_task = state_tasks.get(task.task_id)
+            if (
+                task.task_id in repaired_ids
+                and state_task is not None
+                and not any(str(ref).strip() for ref in state_task.verification_refs)
+            ):
+                state_task.verification_refs = list(task.verification_refs)
+        self._persist_tasks(tasks)
+        self.logger.info(
+            "[stage-recovery] restored verification refs tasks=%s",
+            ",".join(repaired_ids),
+        )
+        return True
+
     def _normalize_legacy_execution_recovery_tasks(
         self,
         state: RunState,
@@ -6726,7 +6823,6 @@ class Orchestrator:
         save_run_state(self.project_root, state)
 
         if state.rejected_stage == "implement" and state.rejection_reason:
-            import time
             is_full_verify_recovery = "Failure type: full_verification" in state.rejection_reason
             tasks.append(
                 TaskSpec(
@@ -6748,6 +6844,7 @@ class Orchestrator:
                         "Tests pass",
                     ],
                     task_origin="stage_recovery",
+                    verification_refs=self._stage_recovery_verification_refs(),
                 )
             )
             state.rejected_stage = ""
@@ -13624,8 +13721,10 @@ class Orchestrator:
 
     def _persist_tasks(self, tasks: Iterable[TaskSpec]) -> None:
         current_payload = load_task_plan(self.project_root)
+        task_list = list(tasks)
+        self._backfill_stage_recovery_verification_refs(task_list)
         payload = []
-        for task in tasks:
+        for task in task_list:
             item = task.to_dict()
             item.pop("commit_sha", None)
             payload.append(item)

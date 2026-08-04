@@ -31,7 +31,12 @@ from auto_agents.git_ops import (
     worktree_fingerprint,
 )
 from auto_agents.orchestrator import Orchestrator
-from auto_agents.config import load_run_state, load_task_plan, save_run_state
+from auto_agents.config import (
+    load_run_state,
+    load_task_plan,
+    save_run_state,
+    save_task_plan,
+)
 
 
 class ExecutionRecoveryTests(unittest.TestCase):
@@ -770,6 +775,84 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 orchestrator._build_task_verify_commands(recovery_task),
                 ["python -m pytest -q"],
             )
+
+    def test_rejection_recovery_task_inherits_v2_command_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            save_task_plan(
+                root,
+                {
+                    "verification_policy_version": 2,
+                    "test_strategy": "vitest",
+                    "verification_steps": [
+                        {
+                            "kind": "test",
+                            "runner": "vitest",
+                            "purpose": "Run the synthetic recovery proof.",
+                            "targets": ["tests/recovery.test.ts"],
+                            "parallel_safe": True,
+                            "cadence": "final_only",
+                            "cache_scope": "source",
+                            "result_cache_scope": "observed_inputs",
+                        }
+                    ],
+                    "tasks": [
+                        {
+                            "task_id": "completed-task",
+                            "title": "Completed task",
+                            "description": "The planned work is already complete.",
+                            "acceptance": ["The planned behavior is present."],
+                            "status": "done",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            orchestrator = Orchestrator(root)
+            orchestrator.config.execution.parallel_tasks.enabled = False
+            state = load_run_state(root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.rejected_stage = "implement"
+            state.rejection_reason = (
+                "- Failure type: full_verification\n"
+                "- Reason: a synthetic final verification failed"
+            )
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_commit_planning_baseline_if_needed",
+                ),
+                patch.object(
+                    orchestrator,
+                    "_ensure_implement_verify_baseline",
+                    return_value=False,
+                ),
+                patch.object(
+                    orchestrator,
+                    "_run_sequential_implementation_loop",
+                    side_effect=lambda current, _tasks, _limit: current,
+                ),
+            ):
+                result = orchestrator._run_implementation_loop(
+                    state,
+                    max_tasks=0,
+                )
+
+            recovery_task = result.tasks[-1]
+            self.assertEqual(recovery_task.task_origin, "stage_recovery")
+            self.assertEqual(
+                recovery_task.verification_refs,
+                ["cmd:npm exec -- vitest run tests/recovery.test.ts"],
+            )
+            recovery_task.verification_refs = []
+            orchestrator._persist_tasks(result.tasks)
+            self.assertEqual(
+                load_task_plan(root)["tasks"][-1]["verification_refs"],
+                ["cmd:npm exec -- vitest run tests/recovery.test.ts"],
+            )
+            self.assertTrue(orchestrator.validate()["ok"])
 
     def test_task_recovery_carries_its_exact_dirty_worktree_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1682,6 +1765,62 @@ class ExecutionRecoveryTests(unittest.TestCase):
             saved = ExecutionIncidentStore(root, state.run_id).load(incident.incident_id)
             self.assertEqual(saved.status, "recovering")
             self.assertEqual(saved.recovery_round, 0)
+
+    def test_self_repair_resume_backfills_v2_stage_recovery_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            spec_file = root / "spec.md"
+            spec_file.write_text("Synthetic recovery specification.\n", encoding="utf-8")
+            save_task_plan(
+                root,
+                {
+                    "verification_policy_version": 2,
+                    "test_strategy": "shell",
+                    "verification_commands": ["echo recovery-proof"],
+                    "tasks": [
+                        {
+                            "task_id": "persisted-recovery",
+                            "title": "Recover final verification",
+                            "description": "Repair a synthetic verification failure.",
+                            "acceptance": ["The configured proof command passes."],
+                            "status": "in_progress",
+                            "commit_message": "",
+                            "task_origin": "stage_recovery",
+                            "verification_refs": [],
+                        }
+                    ],
+                },
+            )
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.pending_approval = "release"
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "synthetic_recovery_invariant",
+                "reason": "the persisted recovery task is missing proof refs",
+                "status": "blocked",
+            }
+            save_run_state(root, state)
+
+            orchestrator.mark_self_repair_applied("repair123")
+            resumed = Orchestrator(root)
+            result = resumed.run(spec_file=spec_file, auto_approve=False)
+
+            self.assertEqual(result.status, "paused")
+            self.assertEqual(result.pending_approval, "release")
+            self.assertEqual(
+                load_task_plan(root)["tasks"][0]["verification_refs"],
+                ["cmd:echo recovery-proof"],
+            )
+            self.assertEqual(
+                result.tasks[0].verification_refs,
+                ["cmd:echo recovery-proof"],
+            )
+            self.assertTrue(resumed.validate()["ok"])
 
     def test_self_repair_resume_removes_tracked_dependency_self_link(
         self,
