@@ -3639,6 +3639,77 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.tasks[0].status, "done")
             self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "fixed")
 
+    def test_interrupted_in_progress_task_preserves_dirty_tree_and_reruns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Continue artifact",
+                            "description": "Resume an interrupted implementation.",
+                            "acceptance": ["artifact.txt contains fixed"],
+                            "status": "in_progress",
+                            "commit_message": "",
+                            "test_generated": True,
+                        }
+                    ]
+                },
+            )
+            (project_root / "artifact.txt").write_text(
+                "partial implementation\n",
+                encoding="utf-8",
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "synthetic_task_lifecycle",
+                "status": "blocked",
+            }
+            orchestrator._set_implementation_ready_marker(
+                state,
+                state.tasks[0],
+                False,
+            )
+            save_run_state(project_root, state)
+
+            state = orchestrator.mark_self_repair_applied("repair-commit")
+            resumed = Orchestrator(project_root)
+            resumed.adapter = BlockedRetryAdapter(project_root)
+            self.assertTrue(resumed._resume_blocked_run(state))
+            self.assertNotIn(
+                "parallel_sequential_retry_tasks",
+                state.resume_context,
+            )
+
+            state = resumed._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(resumed.adapter.implement_calls, 1)
+            self.assertEqual(resumed.adapter.review_calls, 1)
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(
+                (project_root / "artifact.txt").read_text(encoding="utf-8").strip(),
+                "fixed",
+            )
+            self.assertNotIn(
+                "task-001",
+                state.resume_context.get("implementation_ready_tasks", {}),
+            )
+
     def test_orchestrator_requeued_task_uses_dirty_sequential_retry_lane(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

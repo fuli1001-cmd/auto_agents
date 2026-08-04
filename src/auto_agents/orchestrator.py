@@ -7397,9 +7397,10 @@ class Orchestrator:
             if self._schedule_repair_tasks_for_failure(state, tasks, task, payload):
                 return state
 
+        continuing_task = task.status == "in_progress"
         resume_existing = (
             self._in_progress_implementation_is_ready(state, task)
-            if task.status == "in_progress"
+            if continuing_task
             else self._should_resume_task(state, task)
         )
         sequential_retry_ids = self._parallel_sequential_retry_ids(state)
@@ -7408,10 +7409,12 @@ class Orchestrator:
             sequential_retry_ids = [*sequential_retry_ids, task.task_id]
             self._set_parallel_sequential_retry_ids(state, sequential_retry_ids)
             save_run_state(self.project_root, state)
-        # A persisted sequential retry is an orchestrator-owned continuation even
-        # though its fresh verification lifecycle represents it as pending. The
-        # recovery route is a redundant durable ownership record for handoffs made
-        # by an older in-memory engine that could not persist the newer marker.
+        # An in-progress task owns worktree changes from its interrupted attempt
+        # even when its readiness marker is false and implementation must rerun.
+        # Persisted sequential retries are also orchestrator-owned continuations
+        # even though a fresh verification lifecycle represents them as pending.
+        # The recovery route is a redundant durable ownership record for handoffs
+        # made by an older in-memory engine that could not persist the newer marker.
         allow_dirty_retry = (
             task.status == "blocked"
             or task.task_id in sequential_retry_ids
@@ -7425,7 +7428,8 @@ class Orchestrator:
         if (
             self.config.gates.require_clean_git_before_task
             and not (
-                resume_existing
+                continuing_task
+                or resume_existing
                 or allow_dirty_retry
                 or allow_dirty_repair
                 or self._allow_dirty_tree
