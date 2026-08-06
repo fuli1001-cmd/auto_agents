@@ -55,6 +55,10 @@ _BUILTIN_INFRA_MARKERS = (
         ),
     ),
 )
+_BROWSER_ARTIFACT_PUBLICATION_CONFLICT = re.compile(
+    r"(?:BrowserArtifactPublicationConflictError|"
+    r"browser_artifact_publication_conflict:)"
+)
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _DIAGNOSTIC_PREFIX = re.compile(
     r"^(?:(?:E|ERROR|Error|FAIL|FAILED)\s*[:>]?\s+|"
@@ -872,7 +876,46 @@ def build_failure_identity_diagnostic_command(command: str) -> str:
     return ""
 
 
-def _run_command(
+def _is_browser_artifact_publication_conflict(result: CommandResult) -> bool:
+    if result.ok or result.termination_reason or result.infrastructure_error:
+        return False
+    return bool(
+        _BROWSER_ARTIFACT_PUBLICATION_CONFLICT.search(
+            f"{result.stdout}\n{result.stderr}"
+        )
+    )
+
+
+def _run_with_browser_artifact_publication_confirmation(
+    command: str,
+    runner: Callable[[], CommandResult],
+    *,
+    progress: Optional[GateProgressCallback],
+) -> CommandResult:
+    first = runner()
+    if not _is_browser_artifact_publication_conflict(first):
+        return first
+    if progress is not None:
+        progress(
+            "confirmation_retry",
+            f"browser_artifact_publication_conflict command={command}",
+            first.duration_seconds,
+        )
+    confirmed = runner()
+    confirmed.duration_seconds += first.duration_seconds
+    confirmed.process_snapshot = {
+        **dict(confirmed.process_snapshot),
+        "browser_artifact_publication_confirmation": {
+            "attempts": 2,
+            "first_returncode": first.returncode,
+            "confirmed_ok": confirmed.ok,
+            "confirmed_returncode": confirmed.returncode,
+        },
+    }
+    return confirmed
+
+
+def _run_command_once(
     command: str,
     cwd: Path,
     *,
@@ -931,6 +974,57 @@ def _run_command(
     return result
 
 
+def _run_command(
+    command: str,
+    cwd: Path,
+    *,
+    timeout_seconds: float = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS,
+    adaptive_timeout_enabled: bool = False,
+    idle_timeout_seconds: float = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS,
+    cancel_event: Optional[threading.Event] = None,
+    progress: Optional[GateProgressCallback] = None,
+) -> CommandResult:
+    return _run_with_browser_artifact_publication_confirmation(
+        command,
+        lambda: _run_command_once(
+            command,
+            cwd,
+            timeout_seconds=timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            idle_timeout_seconds=idle_timeout_seconds,
+            cancel_event=cancel_event,
+            progress=progress,
+        ),
+        progress=progress,
+    )
+
+
+def _run_executor_command(
+    gate_executor: GateCommandExecutor,
+    command: str,
+    *,
+    lane: str = "",
+    timeout_seconds: float,
+    adaptive_timeout_enabled: bool,
+    idle_timeout_seconds: float,
+    cancel_event: Optional[threading.Event] = None,
+    progress: Optional[GateProgressCallback] = None,
+) -> CommandResult:
+    return _run_with_browser_artifact_publication_confirmation(
+        command,
+        lambda: gate_executor.run(
+            command,
+            lane=lane,
+            timeout_seconds=timeout_seconds,
+            adaptive_timeout_enabled=adaptive_timeout_enabled,
+            idle_timeout_seconds=idle_timeout_seconds,
+            cancel_event=cancel_event,
+            progress=progress,
+        ),
+        progress=progress,
+    )
+
+
 def _run_parallel_commands(
     commands: Sequence[str],
     cwd: Path,
@@ -948,7 +1042,8 @@ def _run_parallel_commands(
     if len(commands) == 1:
         return [
             (
-                gate_executor.run(
+                _run_executor_command(
+                    gate_executor,
                     commands[0],
                     timeout_seconds=timeout_seconds,
                     adaptive_timeout_enabled=adaptive_timeout_enabled,
@@ -973,11 +1068,15 @@ def _run_parallel_commands(
         future_to_index = {
             pool.submit(
                 (
-                    gate_executor.run
+                    _run_executor_command
                     if gate_executor is not None
                     else _run_command
                 ),
-                command,
+                *(
+                    (gate_executor, command)
+                    if gate_executor is not None
+                    else (command,)
+                ),
                 **(
                     {
                         "timeout_seconds": timeout_seconds,
@@ -1247,7 +1346,8 @@ def _run_overlapped_gate_plan(
                 estimate or 0.0,
             )
         future = pool.submit(
-            gate_executor.run,
+            _run_executor_command,
+            gate_executor,
             scheduled.command,
             lane=scheduled.lane,
             timeout_seconds=command_timeout_seconds,

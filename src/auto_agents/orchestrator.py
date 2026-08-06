@@ -192,6 +192,7 @@ from .run_lock import runtime_status
 from .validation import (
     PYTEST_VALUE_OPTIONS,
     _unwrap_conda_run,
+    project_config_warnings,
     validate_required_document,
     validate_task_dependencies,
     validate_task_plan_with_requirements,
@@ -322,6 +323,12 @@ class Orchestrator:
         self.adapter = self._build_adapter(self.config)
         self.agent_output_stream = agent_output_stream or sys.stderr
         self.logger = build_run_logger(self.agent_output_stream)
+        raw_config = read_json(
+            self.project_root / ".auto-agents" / "config.json",
+            default={},
+        )
+        for warning in project_config_warnings(raw_config):
+            self.logger.warning("[config] %s", warning)
         self._print_agent_output = False
         self._active_spec_file: Optional[Path] = None
         self._user_input_fn = user_input_fn
@@ -16477,26 +16484,7 @@ class Orchestrator:
         if resume_match:
             resume_count = int(resume_match.group(1))
         while True:
-            original_smart_timeout = getattr(adapter, "smart_timeout", None)
-            checkpoint_seconds = self.config.execution.smart_timeout.stage_checkpoint_seconds.get(
-                request.stage
-            )
-            if (
-                isinstance(original_smart_timeout, SmartTimeoutConfig)
-                and checkpoint_seconds
-            ):
-                adapter.smart_timeout = replace(
-                    original_smart_timeout,
-                    safety_ceiling_seconds=min(
-                        int(original_smart_timeout.safety_ceiling_seconds),
-                        max(60, int(checkpoint_seconds)),
-                    ),
-                )
-            try:
-                result = adapter.run(provider_request)
-            finally:
-                if isinstance(original_smart_timeout, SmartTimeoutConfig):
-                    adapter.smart_timeout = original_smart_timeout
+            result = adapter.run(provider_request)
             reason = result.termination.reason if result.termination is not None else ""
             incident = self._record_provider_execution_incident(
                 request.stage, provider, result

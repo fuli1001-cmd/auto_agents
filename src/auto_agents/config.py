@@ -271,18 +271,18 @@ DEFAULT_CONFIG = {
             "provider_idle_seconds": 1800,
             "tool_idle_seconds": 900,
             "semantic_stall_seconds": 3600,
-            "safety_ceiling_seconds": 43200,
+            "safety_ceiling_seconds": 14400,
             "loop_repeat_limit": 3,
             "same_provider_resume_limit": 1,
-            "stage_checkpoint_seconds": {
+            "stage_progress_lease_seconds": {
                 "plan": 1200,
-                "implement": 1800,
+                "implement": 3600,
                 "review": 900,
                 "clarify": 1200,
                 "design": 1200,
                 "readme": 900,
             },
-            "active_tool_grace_seconds": 900,
+            "post_ceiling_finalize_seconds": 600,
             "fresh_continuation_limit": 1,
         },
         "provider_failover": {

@@ -88,6 +88,19 @@ class _SequenceAdapter:
         return result
 
 
+class _TimeoutInspectingAdapter(_FakeAdapter):
+    def __init__(self, result, smart_timeout):
+        super().__init__(result)
+        self.smart_timeout = smart_timeout
+        self.observed_safety_ceilings = []
+
+    def run(self, request):
+        self.observed_safety_ceilings.append(
+            self.smart_timeout.safety_ceiling_seconds
+        )
+        return super().run(request)
+
+
 class _StreamLogger:
     def __init__(self, stream):
         self._stream = stream
@@ -268,6 +281,20 @@ class TestFailoverProviderOrder(unittest.TestCase):
 
 
 class TestCallWithFailover(unittest.TestCase):
+    def test_stage_progress_lease_does_not_clamp_provider_safety_ceiling(self):
+        smart_timeout = SmartTimeoutConfig(
+            safety_ceiling_seconds=14400,
+            stage_progress_lease_seconds={"plan": 60},
+        )
+        adapter = _TimeoutInspectingAdapter(_make_result(ok=True), smart_timeout)
+        stub = _stub_orchestrator({"codex": {}}, "codex", {"codex": adapter})
+        stub.config.execution.smart_timeout = smart_timeout
+
+        result = stub._call_with_failover(_make_request())
+
+        self.assertTrue(result.ok)
+        self.assertEqual(adapter.observed_safety_ceilings, [14400])
+
     def test_semantic_stall_resumes_same_session_once(self):
         stalled = _make_result(
             ok=False,

@@ -71,13 +71,14 @@ class ProgressSupervisor:
         self.workspace_fingerprint = self._workspace_fingerprint()
         self.output_fingerprint = self._file_fingerprint(request.output_path)
         self.session_id = request.resume_session_id
-        self.active_tool = ""
-        self.active_tool_id = ""
+        self.active_tools: Dict[str, str] = {}
         self.protocol_seen = decoder is None or not decoder.requires_protocol
         self.repeat_count = 0
         self.last_loop_fingerprint = ""
         self.seen_semantic_fingerprints: set[str] = set()
         self.forced_reason = ""
+        self.safety_ceiling_reached_at: Optional[float] = None
+        self.post_ceiling_finalize_deadline: Optional[float] = None
         self.events: Deque[Dict[str, object]] = deque(maxlen=50)
         self._events_lock = Lock()
         self._checkpoint_lock = Lock()
@@ -117,14 +118,10 @@ class ProgressSupervisor:
 
         if self.forced_reason:
             return self.forced_reason
+        self._observe_safety_ceiling(now)
+        if self.forced_reason:
+            return self.forced_reason
         elapsed = now - self.started_at
-        safety_ceiling = self.config.safety_ceiling_seconds
-        if self.active_tool:
-            safety_ceiling += max(
-                0, int(self.config.active_tool_grace_seconds)
-            )
-        if elapsed >= safety_ceiling:
-            return "safety_ceiling"
         if (
             not self.protocol_seen
             and elapsed >= min(PROTOCOL_STARTUP_SECONDS, self.config.provider_idle_seconds)
@@ -132,15 +129,27 @@ class ProgressSupervisor:
             return "protocol_error"
         if now - self.last_provider_activity >= self.config.provider_idle_seconds:
             return "provider_idle"
-        if self.active_tool and now - self.last_tool_activity >= self.config.tool_idle_seconds:
+        if self.active_tools and now - self.last_tool_activity >= self.config.tool_idle_seconds:
             return "tool_stalled"
-        if not self.active_tool and now - self.last_semantic_progress >= self.config.semantic_stall_seconds:
+        if self.safety_ceiling_reached_at is not None:
+            if self.active_tools:
+                return None
+            if self.post_ceiling_finalize_deadline is not None:
+                if now >= self.post_ceiling_finalize_deadline:
+                    return "safety_ceiling"
+                return None
+        if (
+            not self.active_tools
+            and now - self.last_semantic_progress
+            >= self._effective_progress_lease_seconds()
+        ):
             return "semantic_stall"
         return None
 
     def observe_events(self, events: Iterable[AgentProgressEvent]) -> None:
         for event in events:
             now = time.monotonic()
+            self._observe_safety_ceiling(now)
             self.protocol_seen = True
             self.last_provider_activity = now
             session_changed = False
@@ -148,18 +157,38 @@ class ProgressSupervisor:
                 session_changed = event.session_id != self.session_id
                 self.session_id = event.session_id
             if event.kind == "tool_started":
-                self.active_tool_id = event.tool_id
-                self.active_tool = event.detail or event.fingerprint or event.tool_id
+                tool_id = self._tool_key(event)
+                if self.safety_ceiling_reached_at is not None:
+                    self.forced_reason = "safety_ceiling"
+                    self._record(
+                        "post_ceiling_tool_rejected",
+                        detail=event.detail,
+                        fingerprint=event.fingerprint,
+                    )
+                else:
+                    self.active_tools[tool_id] = (
+                        event.detail or event.fingerprint or event.tool_id
+                    )
                 self.last_tool_activity = now
             elif event.kind == "tool_progress":
-                if not self.active_tool_id or event.tool_id == self.active_tool_id:
+                if self._tool_key(event) in self.active_tools:
                     self.last_tool_activity = now
             elif event.kind == "tool_completed":
                 self.last_tool_activity = now
                 self._observe_loop(event)
-                if not self.active_tool_id or event.tool_id == self.active_tool_id:
-                    self.active_tool_id = ""
-                    self.active_tool = ""
+                self.active_tools.pop(self._tool_key(event), None)
+                if (
+                    self.safety_ceiling_reached_at is not None
+                    and not self.active_tools
+                    and self.post_ceiling_finalize_deadline is None
+                ):
+                    self.post_ceiling_finalize_deadline = now + max(
+                        0, int(self.config.post_ceiling_finalize_seconds)
+                    )
+                    self._record(
+                        "post_ceiling_finalize_started",
+                        detail=str(self.config.post_ceiling_finalize_seconds),
+                    )
             elif event.kind == "error":
                 self.forced_reason = "provider_error"
             if event.semantic:
@@ -184,7 +213,7 @@ class ProgressSupervisor:
             elapsed_seconds=round(now - self.started_at, 3),
             last_provider_activity_seconds=round(now - self.last_provider_activity, 3),
             last_semantic_progress_seconds=round(now - self.last_semantic_progress, 3),
-            active_tool=self.active_tool[:300],
+            active_tool=self._active_tool_summary(),
             repeat_count=self.repeat_count,
             report_path=report_path,
         )
@@ -219,7 +248,15 @@ class ProgressSupervisor:
             "elapsed_seconds": round(now - self.started_at, 3),
             "last_provider_activity_seconds": round(now - self.last_provider_activity, 3),
             "last_semantic_progress_seconds": round(now - self.last_semantic_progress, 3),
-            "active_tool": self.active_tool[:300],
+            "active_tool": self._active_tool_summary(),
+            "active_tool_count": len(self.active_tools),
+            "active_tools": [
+                {"tool_id": tool_id, "detail": detail[:300]}
+                for tool_id, detail in sorted(self.active_tools.items())
+            ],
+            "effective_progress_lease_seconds": self._effective_progress_lease_seconds(),
+            "safety_ceiling_reached": self.safety_ceiling_reached_at is not None,
+            "post_ceiling_finalize_seconds_remaining": self._finalize_seconds_remaining(now),
             "repeat_count": self.repeat_count,
             "workspace_fingerprint": self.workspace_fingerprint,
             "output_fingerprint": self.output_fingerprint,
@@ -274,9 +311,51 @@ class ProgressSupervisor:
         changed = snapshot != self._process_snapshot
         if changed:
             self.last_provider_activity = now
-            if self.active_tool:
+            if self.active_tools:
                 self.last_tool_activity = now
         self._process_snapshot = snapshot
+
+    def _observe_safety_ceiling(self, now: float) -> None:
+        if self.safety_ceiling_reached_at is not None:
+            return
+        if now - self.started_at < self.config.safety_ceiling_seconds:
+            return
+        self.safety_ceiling_reached_at = self.started_at + self.config.safety_ceiling_seconds
+        if self.active_tools:
+            self._record(
+                "safety_ceiling_deferred",
+                detail=f"active_tools={len(self.active_tools)}",
+            )
+            return
+        self.forced_reason = "safety_ceiling"
+        self._record("safety_ceiling_reached")
+
+    def _effective_progress_lease_seconds(self) -> int:
+        return max(
+            60,
+            int(
+                self.config.stage_progress_lease_seconds.get(
+                    self.request.stage,
+                    self.config.semantic_stall_seconds,
+                )
+            ),
+        )
+
+    def _active_tool_summary(self) -> str:
+        return "; ".join(self.active_tools.values())[:300]
+
+    def _finalize_seconds_remaining(self, now: float) -> Optional[float]:
+        if self.post_ceiling_finalize_deadline is None:
+            return None
+        return round(max(0.0, self.post_ceiling_finalize_deadline - now), 3)
+
+    def _tool_key(self, event: AgentProgressEvent) -> str:
+        return str(
+            event.tool_id
+            or event.fingerprint
+            or self._normalize_detail(event.detail)
+            or "unknown-tool"
+        )
 
     def _workspace_fingerprint(self) -> str:
         try:

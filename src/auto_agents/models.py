@@ -762,11 +762,11 @@ class SmartTimeoutConfig:
     provider_idle_seconds: int = 1800
     tool_idle_seconds: int = 900
     semantic_stall_seconds: int = 3600
-    safety_ceiling_seconds: int = 43200
+    safety_ceiling_seconds: int = 14400
     loop_repeat_limit: int = 3
     same_provider_resume_limit: int = 1
-    stage_checkpoint_seconds: Dict[str, int] = field(default_factory=dict)
-    active_tool_grace_seconds: int = 900
+    stage_progress_lease_seconds: Dict[str, int] = field(default_factory=dict)
+    post_ceiling_finalize_seconds: int = 600
     fresh_continuation_limit: int = 1
 
     @classmethod
@@ -776,17 +776,23 @@ class SmartTimeoutConfig:
             provider_idle_seconds=int(data.get("provider_idle_seconds", 1800)),
             tool_idle_seconds=int(data.get("tool_idle_seconds", 900)),
             semantic_stall_seconds=int(data.get("semantic_stall_seconds", 3600)),
-            safety_ceiling_seconds=int(data.get("safety_ceiling_seconds", 43200)),
+            safety_ceiling_seconds=int(data.get("safety_ceiling_seconds", 14400)),
             loop_repeat_limit=int(data.get("loop_repeat_limit", 3)),
             same_provider_resume_limit=int(data.get("same_provider_resume_limit", 1)),
-            stage_checkpoint_seconds={
+            stage_progress_lease_seconds={
                 str(stage): int(seconds)
                 for stage, seconds in dict(
-                    data.get("stage_checkpoint_seconds", {})
+                    data.get(
+                        "stage_progress_lease_seconds",
+                        data.get("stage_checkpoint_seconds", {}),
+                    )
                 ).items()
             },
-            active_tool_grace_seconds=int(
-                data.get("active_tool_grace_seconds", 900)
+            post_ceiling_finalize_seconds=int(
+                data.get(
+                    "post_ceiling_finalize_seconds",
+                    data.get("active_tool_grace_seconds", 600),
+                )
             ),
             fresh_continuation_limit=int(
                 data.get("fresh_continuation_limit", 1)

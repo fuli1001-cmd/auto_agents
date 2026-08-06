@@ -1367,7 +1367,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     "provider_idle_seconds": 1800,
                     "tool_idle_seconds": 900,
                     "semantic_stall_seconds": 3600,
-                    "safety_ceiling_seconds": 43200,
+                    "safety_ceiling_seconds": 14400,
                 }
                 for key, default in timeout_defaults.items():
                     value = smart_timeout.get(key, default)
@@ -1381,16 +1381,29 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     errors.append(
                         "execution.smart_timeout.same_provider_resume_limit must be an integer >= 0"
                     )
-                stage_checkpoints = smart_timeout.get("stage_checkpoint_seconds", {})
-                if not isinstance(stage_checkpoints, dict):
+                if (
+                    "stage_progress_lease_seconds" in smart_timeout
+                    and "stage_checkpoint_seconds" in smart_timeout
+                ):
                     errors.append(
-                        "execution.smart_timeout.stage_checkpoint_seconds must be an object"
+                        "execution.smart_timeout cannot define both "
+                        "stage_progress_lease_seconds and deprecated stage_checkpoint_seconds"
+                    )
+                stage_lease_key = (
+                    "stage_progress_lease_seconds"
+                    if "stage_progress_lease_seconds" in smart_timeout
+                    else "stage_checkpoint_seconds"
+                )
+                stage_leases = smart_timeout.get(stage_lease_key, {})
+                if not isinstance(stage_leases, dict):
+                    errors.append(
+                        f"execution.smart_timeout.{stage_lease_key} must be an object"
                     )
                 else:
-                    for stage, seconds in stage_checkpoints.items():
+                    for stage, seconds in stage_leases.items():
                         if not isinstance(stage, str) or not stage.strip():
                             errors.append(
-                                "execution.smart_timeout.stage_checkpoint_seconds keys "
+                                f"execution.smart_timeout.{stage_lease_key} keys "
                                 "must be non-empty strings"
                             )
                         if (
@@ -1399,19 +1412,30 @@ def validate_project_config_payload(payload: object) -> List[str]:
                             or seconds < 60
                         ):
                             errors.append(
-                                "execution.smart_timeout.stage_checkpoint_seconds values "
+                                f"execution.smart_timeout.{stage_lease_key} values "
                                 "must be integers >= 60"
                             )
-                active_tool_grace = smart_timeout.get(
-                    "active_tool_grace_seconds", 900
-                )
                 if (
-                    not isinstance(active_tool_grace, int)
-                    or isinstance(active_tool_grace, bool)
-                    or active_tool_grace < 0
+                    "post_ceiling_finalize_seconds" in smart_timeout
+                    and "active_tool_grace_seconds" in smart_timeout
                 ):
                     errors.append(
-                        "execution.smart_timeout.active_tool_grace_seconds "
+                        "execution.smart_timeout cannot define both "
+                        "post_ceiling_finalize_seconds and deprecated active_tool_grace_seconds"
+                    )
+                finalize_key = (
+                    "post_ceiling_finalize_seconds"
+                    if "post_ceiling_finalize_seconds" in smart_timeout
+                    else "active_tool_grace_seconds"
+                )
+                finalize_seconds = smart_timeout.get(finalize_key, 600)
+                if (
+                    not isinstance(finalize_seconds, int)
+                    or isinstance(finalize_seconds, bool)
+                    or finalize_seconds < 0
+                ):
+                    errors.append(
+                        f"execution.smart_timeout.{finalize_key} "
                         "must be an integer >= 0"
                     )
                 fresh_limit = smart_timeout.get("fresh_continuation_limit", 1)
@@ -1424,15 +1448,22 @@ def validate_project_config_payload(payload: object) -> List[str]:
                         "execution.smart_timeout.fresh_continuation_limit "
                         "must be an integer >= 0"
                     )
-                safety = smart_timeout.get("safety_ceiling_seconds", 43200)
+                safety = smart_timeout.get("safety_ceiling_seconds", 14400)
                 leases = [
                     smart_timeout.get(key, default)
                     for key, default in timeout_defaults.items()
                     if key != "safety_ceiling_seconds"
                 ]
+                if isinstance(stage_leases, dict):
+                    leases.extend(stage_leases.values())
                 if (
                     isinstance(safety, int)
-                    and all(isinstance(value, int) for value in leases)
+                    and not isinstance(safety, bool)
+                    and all(
+                        isinstance(value, int) and not isinstance(value, bool)
+                        for value in leases
+                    )
+                    and leases
                     and safety < max(leases)
                 ):
                     errors.append(
@@ -1615,6 +1646,29 @@ def validate_project_config_payload(payload: object) -> List[str]:
     return errors
 
 
+def project_config_warnings(payload: object) -> List[str]:
+    if not isinstance(payload, dict):
+        return []
+    execution = payload.get("execution", {})
+    if not isinstance(execution, dict):
+        return []
+    smart_timeout = execution.get("smart_timeout", {})
+    if not isinstance(smart_timeout, dict):
+        return []
+    warnings: List[str] = []
+    if "stage_checkpoint_seconds" in smart_timeout:
+        warnings.append(
+            "execution.smart_timeout.stage_checkpoint_seconds is deprecated; "
+            "use stage_progress_lease_seconds"
+        )
+    if "active_tool_grace_seconds" in smart_timeout:
+        warnings.append(
+            "execution.smart_timeout.active_tool_grace_seconds is deprecated; "
+            "use post_ceiling_finalize_seconds"
+        )
+    return warnings
+
+
 def validate_project_root(
     project_root: Path,
     *,
@@ -1633,6 +1687,7 @@ def validate_project_root(
         errors.append(f"missing config file: {config_path(root)}")
     elif config_payload is not None:
         errors.extend(validate_project_config_payload(config_payload))
+        warnings.extend(project_config_warnings(config_payload))
         errors.extend(
             validate_verification_command_paths(
                 config_payload.get("gates", {}).get("commands", []),

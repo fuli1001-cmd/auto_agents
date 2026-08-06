@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import sys
 import tempfile
 import threading
@@ -99,6 +100,26 @@ class _RecordingGateExecutor:
         )
 
 
+class _ConflictOnceGateExecutor(_RecordingGateExecutor):
+    def __init__(self) -> None:
+        super().__init__({"flaky-browser": 0.0}, capacity=1)
+        self.calls = 0
+
+    def run(self, command: str, **kwargs) -> CommandResult:
+        self.calls += 1
+        if self.calls == 1:
+            return CommandResult(
+                command=command,
+                ok=False,
+                returncode=1,
+                stderr=(
+                    "BrowserArtifactPublicationConflictError: "
+                    "browser_artifact_publication_conflict: screenshot.png"
+                ),
+            )
+        return CommandResult(command=command, ok=True, returncode=0, stdout="confirmed")
+
+
 class GateTests(unittest.TestCase):
     def test_run_commands_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,6 +127,69 @@ class GateTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertEqual(len(result.commands), 1)
             self.assertEqual(result.commands[0].stdout, "ok")
+
+    def test_browser_artifact_publication_conflict_gets_one_confirmation_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "attempt.txt"
+            script = (
+                "from pathlib import Path; import sys; "
+                f"p=Path({str(marker)!r}); first=not p.exists(); "
+                "p.write_text('seen', encoding='utf-8'); "
+                "print('browser_artifact_publication_conflict: screenshot.png' "
+                "if first else 'confirmed'); sys.exit(1 if first else 0)"
+            )
+            result = run_commands(
+                [f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"],
+                Path(tmp),
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            result.commands[0].process_snapshot[
+                "browser_artifact_publication_confirmation"
+            ],
+            {
+                "attempts": 2,
+                "first_returncode": 1,
+                "confirmed_ok": True,
+                "confirmed_returncode": 0,
+            },
+        )
+
+    def test_persistent_browser_artifact_conflict_is_retried_only_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "attempts.txt"
+            script = (
+                "from pathlib import Path; import sys; "
+                f"p=Path({str(marker)!r}); "
+                "count=int(p.read_text() or '0') if p.exists() else 0; "
+                "p.write_text(str(count + 1), encoding='utf-8'); "
+                "print('BrowserArtifactPublicationConflictError'); sys.exit(1)"
+            )
+            result = run_commands(
+                [f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"],
+                Path(tmp),
+            )
+            attempts = marker.read_text(encoding="utf-8")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(attempts, "2")
+
+    def test_gate_executor_conflict_gets_confirmation_retry(self) -> None:
+        executor = _ConflictOnceGateExecutor()
+
+        result = run_gate_plan(
+            ["flaky-browser"],
+            [],
+            Path("/tmp"),
+            collect_all=False,
+            parallel_workers=1,
+            gate_executor=executor,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(executor.calls, 2)
+        self.assertEqual(result.commands[0].stdout, "confirmed")
 
     def test_run_commands_stops_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

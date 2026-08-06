@@ -28,7 +28,10 @@ from auto_agents.models import (
     SmartTimeoutConfig,
 )
 from auto_agents.supervision import ProgressDecoder, ProgressSupervisor
-from auto_agents.validation import validate_project_config_payload
+from auto_agents.validation import (
+    project_config_warnings,
+    validate_project_config_payload,
+)
 
 
 def _request(tmp_path: Path) -> AgentRequest:
@@ -97,7 +100,72 @@ def test_tool_stall_and_semantic_stall_are_distinct(tmp_path):
         assert supervisor.poll() == "semantic_stall"
 
 
-def test_active_tool_extends_only_the_safety_ceiling(tmp_path):
+def test_stage_progress_lease_renews_only_on_semantic_progress(tmp_path):
+    clock = [0.0]
+    supervisor = _supervisor(
+        tmp_path,
+        clock,
+        SmartTimeoutConfig(
+            provider_idle_seconds=600,
+            tool_idle_seconds=600,
+            semantic_stall_seconds=600,
+            safety_ceiling_seconds=600,
+            stage_progress_lease_seconds={"implement": 60},
+        ),
+        ProgressDecoder(),
+    )
+    with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
+        clock[0] = 50.0
+        supervisor.observe_events(
+            [
+                AgentProgressEvent(
+                    kind="milestone",
+                    fingerprint="implementation-1",
+                    detail="implemented first slice",
+                    semantic=True,
+                )
+            ]
+        )
+        clock[0] = 61.0
+        assert supervisor.poll() is None
+        clock[0] = 111.0
+        assert supervisor.poll() == "semantic_stall"
+
+
+def test_parallel_active_tools_defer_semantic_stall_until_all_complete(tmp_path):
+    clock = [0.0]
+    supervisor = _supervisor(
+        tmp_path,
+        clock,
+        SmartTimeoutConfig(
+            provider_idle_seconds=600,
+            tool_idle_seconds=600,
+            semantic_stall_seconds=600,
+            safety_ceiling_seconds=600,
+            stage_progress_lease_seconds={"implement": 60},
+        ),
+        ProgressDecoder(),
+    )
+    with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
+        supervisor.observe_events(
+            [
+                AgentProgressEvent(kind="tool_started", tool_id="tool-1", detail="pytest"),
+                AgentProgressEvent(kind="tool_started", tool_id="tool-2", detail="lint"),
+            ]
+        )
+        clock[0] = 61.0
+        supervisor.observe_events(
+            [AgentProgressEvent(kind="tool_completed", tool_id="tool-2", detail="lint")]
+        )
+        assert supervisor.poll() is None
+        assert set(supervisor.active_tools) == {"tool-1"}
+        supervisor.observe_events(
+            [AgentProgressEvent(kind="tool_completed", tool_id="tool-1", detail="pytest")]
+        )
+        assert not supervisor.active_tools
+
+
+def test_safety_ceiling_terminates_immediately_without_active_tool(tmp_path):
     clock = [0.0]
     supervisor = _supervisor(
         tmp_path,
@@ -107,7 +175,26 @@ def test_active_tool_extends_only_the_safety_ceiling(tmp_path):
             tool_idle_seconds=600,
             semantic_stall_seconds=600,
             safety_ceiling_seconds=60,
-            active_tool_grace_seconds=30,
+        ),
+        ProgressDecoder(),
+    )
+    clock[0] = 61.0
+    with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
+        assert supervisor.poll() == "safety_ceiling"
+
+
+def test_active_tool_may_finish_after_ceiling_then_gets_finalize_window(tmp_path):
+    clock = [0.0]
+    supervisor = _supervisor(
+        tmp_path,
+        clock,
+        SmartTimeoutConfig(
+            provider_idle_seconds=600,
+            tool_idle_seconds=600,
+            semantic_stall_seconds=600,
+            safety_ceiling_seconds=60,
+            post_ceiling_finalize_seconds=10,
+            stage_progress_lease_seconds={"implement": 60},
         ),
         ProgressDecoder(),
     )
@@ -117,8 +204,44 @@ def test_active_tool_extends_only_the_safety_ceiling(tmp_path):
         )
         clock[0] = 61.0
         assert supervisor.poll() is None
-        clock[0] = 91.0
+        clock[0] = 90.0
+        supervisor.observe_events(
+            [AgentProgressEvent(kind="tool_progress", tool_id="tool-1", detail="running")]
+        )
+        clock[0] = 100.0
+        supervisor.observe_events(
+            [AgentProgressEvent(kind="tool_completed", tool_id="tool-1", detail="passed")]
+        )
+        clock[0] = 109.0
+        assert supervisor.poll() is None
+        clock[0] = 111.0
         assert supervisor.poll() == "safety_ceiling"
+
+
+def test_new_tool_is_rejected_after_safety_ceiling(tmp_path):
+    clock = [0.0]
+    supervisor = _supervisor(
+        tmp_path,
+        clock,
+        SmartTimeoutConfig(
+            provider_idle_seconds=600,
+            tool_idle_seconds=600,
+            semantic_stall_seconds=600,
+            safety_ceiling_seconds=60,
+        ),
+        ProgressDecoder(),
+    )
+    with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
+        supervisor.observe_events(
+            [AgentProgressEvent(kind="tool_started", tool_id="tool-1", detail="pytest")]
+        )
+        clock[0] = 61.0
+        assert supervisor.poll() is None
+        supervisor.observe_events(
+            [AgentProgressEvent(kind="tool_started", tool_id="tool-2", detail="lint")]
+        )
+        assert supervisor.poll() == "safety_ceiling"
+        assert set(supervisor.active_tools) == {"tool-1"}
 
 
 def test_repeated_completed_tool_fingerprint_detects_loop(tmp_path):
@@ -171,6 +294,47 @@ def test_checkpoint_persists_session_and_diagnostics(tmp_path):
     assert payload["session_id"] == "session-123"
     assert payload["workspace_fingerprint"] == supervisor.workspace_fingerprint
     assert payload["events"][-1]["kind"] == "activity"
+    assert payload["active_tool_count"] == 0
+    assert payload["active_tools"] == []
+    assert payload["effective_progress_lease_seconds"] == 3600
+    assert payload["safety_ceiling_reached"] is False
+
+
+def test_legacy_smart_timeout_keys_are_loaded_and_serialized_as_new_keys():
+    config = SmartTimeoutConfig.from_dict(
+        {
+            "stage_checkpoint_seconds": {"implement": 1800},
+            "active_tool_grace_seconds": 900,
+        }
+    )
+
+    assert config.stage_progress_lease_seconds == {"implement": 1800}
+    assert config.post_ceiling_finalize_seconds == 900
+    serialized = config.to_dict()
+    assert serialized["stage_progress_lease_seconds"] == {"implement": 1800}
+    assert serialized["post_ceiling_finalize_seconds"] == 900
+    assert "stage_checkpoint_seconds" not in serialized
+    assert "active_tool_grace_seconds" not in serialized
+
+
+def test_legacy_smart_timeout_keys_warn_and_conflicting_aliases_fail_validation():
+    payload = copy.deepcopy(DEFAULT_CONFIG)
+    smart_timeout = payload["execution"]["smart_timeout"]
+    stage_leases = smart_timeout.pop("stage_progress_lease_seconds")
+    finalize_seconds = smart_timeout.pop("post_ceiling_finalize_seconds")
+    smart_timeout["stage_checkpoint_seconds"] = stage_leases
+    smart_timeout["active_tool_grace_seconds"] = finalize_seconds
+
+    assert validate_project_config_payload(payload) == []
+    warnings = project_config_warnings(payload)
+    assert any("stage_checkpoint_seconds is deprecated" in warning for warning in warnings)
+    assert any("active_tool_grace_seconds is deprecated" in warning for warning in warnings)
+
+    smart_timeout["stage_progress_lease_seconds"] = stage_leases
+    smart_timeout["post_ceiling_finalize_seconds"] = finalize_seconds
+    errors = validate_project_config_payload(payload)
+    assert any("stage_progress_lease_seconds and deprecated" in error for error in errors)
+    assert any("post_ceiling_finalize_seconds and deprecated" in error for error in errors)
 
 
 def test_smart_runner_terminates_process_group_and_writes_report(tmp_path):

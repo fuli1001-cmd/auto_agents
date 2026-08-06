@@ -564,6 +564,12 @@ creating a repair incident. A command that fails only under overlap is quarantin
 lane for the rest of the run. This protects target projects from repair attempts caused by an
 incorrect concurrency declaration while retaining the original failure metadata.
 
+When a command reports `BrowserArtifactPublicationConflictError` or the stable
+`browser_artifact_publication_conflict:` diagnostic, auto_agents performs one same-command
+confirmation retry in both local and distributed execution. A passing confirmation clears the
+transient gate failure; a second failure is reported normally and is never retried again by this
+mechanism.
+
 The isolated scheduler dispatches a bounded amount of work instead of queueing the whole plan. A
 failure stops new dispatch while already-running commands drain, preserving their diagnostics and
 cleanup. Successful finite command durations are retained as a rolling seven-sample median, and
@@ -836,18 +842,18 @@ worktrees. Example:
       "provider_idle_seconds": 1800,
       "tool_idle_seconds": 900,
       "semantic_stall_seconds": 3600,
-      "safety_ceiling_seconds": 43200,
+      "safety_ceiling_seconds": 14400,
       "loop_repeat_limit": 3,
       "same_provider_resume_limit": 1,
-      "stage_checkpoint_seconds": {
+      "stage_progress_lease_seconds": {
         "clarify": 1200,
         "design": 1200,
         "plan": 1200,
-        "implement": 1800,
+        "implement": 3600,
         "review": 900,
         "readme": 900
       },
-      "active_tool_grace_seconds": 900,
+      "post_ceiling_finalize_seconds": 600,
       "fresh_continuation_limit": 1
     },
     "provider_failover": {
@@ -934,10 +940,15 @@ progress leases:
 - `tool_idle_seconds`: a declared tool remains active without tool/process progress
 - `semantic_stall_seconds`: no new tool result, milestone, output artifact, or workspace fingerprint
 - `loop_repeat_limit`: the same completed-tool fingerprint repeats without a workspace change
-- `safety_ceiling_seconds`: final emergency ceiling even when lower-level activity continues
-- `stage_checkpoint_seconds`: stage-specific checkpoint budget applied to one provider attempt
-- `active_tool_grace_seconds`: extra safety-ceiling grace while a declared tool is still active
-- `fresh_continuation_limit`: fresh-context continuations allowed after a stage checkpoint
+- `stage_progress_lease_seconds`: stage-specific time allowed without semantic progress while no tool is active
+- `safety_ceiling_seconds`: emergency ceiling for one provider attempt; an already-running healthy tool may drain past it
+- `post_ceiling_finalize_seconds`: time allowed to summarize results after that tool finishes
+- `fresh_continuation_limit`: fresh-context continuations allowed after the emergency ceiling
+
+`stage_checkpoint_seconds` and `active_tool_grace_seconds` are deprecated compatibility aliases for
+`stage_progress_lease_seconds` and `post_ceiling_finalize_seconds`. New and legacy names cannot be
+mixed for the same setting. Loading an old project preserves its values; the next config save emits
+only the new names.
 
 Provider output heartbeats refresh only the provider lease; they do not count as semantic progress.
 Codex and Copilot use native JSONL events, while Antigravity combines its native log with its local
@@ -946,9 +957,10 @@ conversation SQLite state. Checkpoints are written every 30 seconds under the ru
 
 `provider_idle`, explicit provider errors, and protocol errors switch provider immediately. Tool
 stalls, semantic stalls, and loops first resume the same provider once using its exact captured
-session. Reaching a stage checkpoint starts a fresh continuation with a bounded handoff instead of
-growing the old session indefinitely; after the configured fresh continuation limit, normal
-failover applies. Set
+session. Reaching the emergency ceiling without an active tool starts a fresh continuation. If a
+healthy tool is already active, it may finish and the provider receives a bounded finalization
+window; starting another tool after the ceiling ends the attempt. After the configured fresh
+continuation limit, normal failover applies. Set
 `execution.smart_timeout.enabled` to `false` to restore the legacy `timeout_seconds` and
 `idle_timeout_seconds` hard-deadline behavior.
 

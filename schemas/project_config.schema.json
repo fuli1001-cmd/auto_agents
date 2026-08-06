@@ -513,10 +513,15 @@
             "safety_ceiling_seconds": {"type": "integer", "minimum": 60},
             "loop_repeat_limit": {"type": "integer", "minimum": 2},
             "same_provider_resume_limit": {"type": "integer", "minimum": 0},
+            "stage_progress_lease_seconds": {
+              "type": "object",
+              "additionalProperties": {"type": "integer", "minimum": 60}
+            },
             "stage_checkpoint_seconds": {
               "type": "object",
               "additionalProperties": {"type": "integer", "minimum": 60}
             },
+            "post_ceiling_finalize_seconds": {"type": "integer", "minimum": 0},
             "active_tool_grace_seconds": {"type": "integer", "minimum": 0},
             "fresh_continuation_limit": {"type": "integer", "minimum": 0}
           },
