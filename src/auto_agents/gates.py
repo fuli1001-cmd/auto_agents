@@ -323,12 +323,12 @@ def command_from_verification_step(step: VerificationStep, project_root: Optiona
             parts = ["conda", "run", "-p", "./.conda", "python", "-m", "pytest", "-q"]
         parts.extend(args)
         parts.extend(targets or ["tests"])
-        return " ".join(parts)
+        return shlex.join(parts)
     if kind == "test" and runner == "vitest":
         parts = ["npm", "exec", "--", "vitest", "run"]
         parts.extend(args)
         parts.extend(targets)
-        return " ".join(parts)
+        return shlex.join(parts)
     raise ValueError(f"unsupported verification step runner: {step.runner or '<empty>'}")
 
 

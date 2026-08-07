@@ -141,8 +141,46 @@ def _validate_isolated_commands(commands: object, field_name: str, python_requir
             errors.append(
                 f"{field_name}[{index}] uses unittest; Python verification must use pytest"
             )
+        marker_error = _malformed_pytest_marker_expression(command)
+        if marker_error:
+            errors.append(f"{field_name}[{index}] {marker_error}")
 
     return errors
+
+
+def _malformed_pytest_marker_expression(command: str) -> str:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return "must use valid shell quoting"
+
+    parts = _unwrap_conda_run(parts)
+    if not parts:
+        return ""
+    executable = Path(parts[0]).name
+    if executable in {"pytest", "py.test"}:
+        args = parts[1:]
+    elif (
+        len(parts) >= 3
+        and Path(parts[0]).name in {"python", "python3"}
+        and parts[1] == "-m"
+        and parts[2] == "pytest"
+    ):
+        args = parts[3:]
+    else:
+        return ""
+
+    for arg_index, arg in enumerate(args):
+        if arg != "-m":
+            continue
+        if arg_index + 1 >= len(args):
+            return "pytest -m requires a marker expression"
+        if args[arg_index + 1].strip().lower() in {"and", "or", "not"}:
+            return (
+                "pytest -m expression must be one shell argument; "
+                "quote multi-word marker expressions"
+            )
+    return ""
 
 
 def _validate_parallel_gate_groups(parallel_groups: object) -> List[str]:

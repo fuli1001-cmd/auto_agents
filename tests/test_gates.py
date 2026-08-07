@@ -590,6 +590,33 @@ class GateTests(unittest.TestCase):
 
             self.assertEqual(command, "./.conda/bin/python -m pytest -q -x tests/test_demo.py")
 
+    def test_verification_step_preserves_multiword_argument_boundary(self) -> None:
+        command = command_from_verification_step(
+            VerificationStep(
+                kind="test",
+                runner="pytest",
+                targets=["tests"],
+                args=["-m", "not storage_real_smoke and not real_provider_smoke"],
+            )
+        )
+
+        self.assertEqual(
+            shlex.split(command),
+            [
+                "conda",
+                "run",
+                "-p",
+                "./.conda",
+                "python",
+                "-m",
+                "pytest",
+                "-q",
+                "-m",
+                "not storage_real_smoke and not real_provider_smoke",
+                "tests",
+            ],
+        )
+
     def test_expand_pytest_directory_steps_splits_existing_test_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

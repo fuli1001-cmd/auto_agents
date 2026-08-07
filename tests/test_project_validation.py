@@ -708,6 +708,22 @@ class ProjectValidationTests(unittest.TestCase):
 
         self.assertEqual(validate_project_config_payload(payload), [])
 
+    def test_validate_project_config_payload_rejects_unquoted_pytest_marker_expression(self) -> None:
+        payload = copy.deepcopy(DEFAULT_CONFIG)
+        payload["gates"]["commands"] = [
+            "conda run -p ./.conda python -m pytest -q "
+            "-m not storage_real_smoke and not real_provider_smoke tests"
+        ]
+
+        errors = validate_project_config_payload(payload)
+
+        self.assertTrue(
+            any(
+                "pytest -m expression must be one shell argument" in error
+                for error in errors
+            )
+        )
+
     def test_validate_project_config_payload_rejects_invalid_parallel_workers(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
         payload["execution"] = {
