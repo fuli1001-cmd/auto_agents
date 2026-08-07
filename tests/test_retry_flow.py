@@ -5588,6 +5588,149 @@ class RetryFlowTests(unittest.TestCase):
                 stream.getvalue(),
             )
 
+    def test_verification_failed_evidence_repair_reenters_judged_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.execution.recovery.max_rounds = 2
+
+            failure_id = "tests/test_contract.py::test_observable_contract"
+            prior_feedback = "The observable contract needs one focused correction."
+            task = TaskSpec(
+                task_id="evidence-contract",
+                title="Repair observable evidence",
+                description="Keep the executable evidence aligned with the contract.",
+                acceptance=["The observable evidence passes."],
+                status="in_progress",
+                task_origin="evidence_repair",
+                recovery_round=1,
+                verification_refs=[failure_id],
+                recovery_history=[
+                    {
+                        "signature": "prior-review-signature",
+                        "failure_signature": "prior-review-signature",
+                        "round": 1,
+                        "epoch": 0,
+                        "result": "requeued",
+                        "reason": "review rejected the task",
+                        "review": prior_feedback,
+                        "failure_ids": [failure_id],
+                        "repair_task_ids": ["evidence-contract"],
+                        "judge_decision": "CONTINUE",
+                        "judge_source": "provider",
+                    }
+                ],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            state.agent_attempts["implement-evidence-contract"] = 1
+            state.resume_context["implementation_ready_tasks"] = {
+                "evidence-contract": True,
+            }
+            verification_feedback = (
+                "- Failure type: local_verification\n"
+                f"- Failing checks: {failure_id}"
+            )
+
+            with patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                return_value={
+                    "decision": "CONTINUE",
+                    "reason": "The failing evidence has a bounded corrective action.",
+                    "actionable_items": ["Correct the owned evidence contract."],
+                    "split_axis": [],
+                    "source": "provider",
+                },
+            ) as judge:
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    {
+                        "reason": "1 new verification failure vs task baseline",
+                        "review": verification_feedback,
+                        "failure_ids": [failure_id],
+                        "comparable_failures": True,
+                    },
+                )
+
+            self.assertTrue(scheduled)
+            judge.assert_called_once_with(
+                state,
+                task,
+                task,
+                verification_feedback,
+                2,
+            )
+            self.assertEqual(state.tasks, [task])
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(task.recovery_round, 2)
+            self.assertEqual(task.verify_retry_epoch, 1)
+            self.assertEqual(task.review_summary, verification_feedback)
+            self.assertNotIn("implement-evidence-contract", state.agent_attempts)
+            self.assertNotIn(
+                "evidence-contract",
+                state.resume_context.get("implementation_ready_tasks", {}),
+            )
+            self.assertEqual(task.recovery_history[-1]["result"], "requeued")
+            self.assertEqual(task.recovery_history[-1]["failure_ids"], [failure_id])
+            self.assertEqual(state.last_recovery_route["outcome"], "requeued")
+            self.assertEqual(
+                state.last_recovery_route["failure_kind"],
+                "verification_failed",
+            )
+            self.assertEqual(state.last_recovery_route["judge_decision"], "CONTINUE")
+            self.assertEqual(state.last_recovery_route["round"], 2)
+
+    def test_verification_failed_evidence_repair_obeys_recovery_round_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.execution.recovery.max_rounds = 2
+            failure_id = "tests/test_contract.py::test_observable_contract"
+            task = TaskSpec(
+                task_id="evidence-contract",
+                title="Repair observable evidence",
+                description="Keep the executable evidence aligned with the contract.",
+                acceptance=["The observable evidence passes."],
+                status="in_progress",
+                task_origin="evidence_repair",
+                recovery_round=2,
+                verification_refs=[failure_id],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+
+            with patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                side_effect=AssertionError("the hard cap must precede the judge"),
+            ):
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    {
+                        "reason": "verification still fails",
+                        "review": "The owned evidence still violates its contract.",
+                        "failure_ids": [failure_id],
+                    },
+                )
+
+            self.assertFalse(scheduled)
+            self.assertEqual(task.status, "in_progress")
+            self.assertEqual(task.recovery_history[-1]["result"], "exhausted")
+            self.assertEqual(task.recovery_history[-1]["round"], 3)
+            self.assertEqual(state.last_recovery_route["outcome"], "exhausted")
+            self.assertEqual(
+                state.last_recovery_route["failure_kind"],
+                "verification_failed",
+            )
+            self.assertEqual(state.last_recovery_route["round"], 3)
+
     def test_requeued_task_does_not_reuse_prior_round_verify_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

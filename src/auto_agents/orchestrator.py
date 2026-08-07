@@ -8934,14 +8934,12 @@ class Orchestrator:
                 result,
             )
         if self._is_repair_task(task):
-            self._record_recovery_route(
+            return self._recover_evidence_repair_failure(
                 state,
+                tasks,
                 task,
-                outcome="not_recoverable",
-                failure_kind=self._recovery_failure_kind(reason),
-                reason="evidence repair failure has no review recovery route",
+                result,
             )
-            return False
         existing_open_repairs = [
             item for item in tasks
             if item.parent_task_id == task.task_id
@@ -9381,6 +9379,65 @@ class Orchestrator:
             )
             return False
 
+        return self._recover_task_failure_with_judge(
+            state,
+            tasks,
+            task,
+            result,
+            feedback=review,
+            failure_kind="review_rejected",
+            prefer_task_verification_refs=True,
+        )
+
+    def _recover_evidence_repair_failure(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        result: Dict[str, object],
+    ) -> bool:
+        if not self._is_repair_task(task):
+            return False
+
+        reason = str(result.get("reason", "")).strip()
+        feedback = (
+            str(result.get("review", "")).strip()
+            or reason
+            or task.review_summary.strip()
+        )
+        failure_kind = self._recovery_failure_kind(reason)
+        if not feedback:
+            self._record_recovery_route(
+                state,
+                task,
+                outcome="not_recoverable",
+                failure_kind=failure_kind,
+                reason="evidence repair failure did not include actionable feedback",
+            )
+            return False
+
+        return self._recover_task_failure_with_judge(
+            state,
+            tasks,
+            task,
+            result,
+            feedback=feedback,
+            failure_kind=failure_kind,
+            prefer_task_verification_refs=False,
+        )
+
+    def _recover_task_failure_with_judge(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        result: Dict[str, object],
+        *,
+        feedback: str,
+        failure_kind: str,
+        prefer_task_verification_refs: bool,
+    ) -> bool:
+        reason = str(result.get("reason", "")).strip()
         owner = self._recovery_lineage_owner(tasks, task)
         reopened = self._reopen_recovery_epoch_if_evidence_changed(state, tasks, owner)
         terminal_route = self._terminal_recovery_route_for_owner(state, tasks, owner)
@@ -9393,7 +9450,7 @@ class Orchestrator:
                 state,
                 task,
                 outcome=outcome,
-                failure_kind="review_rejected",
+                failure_kind=failure_kind,
                 reason="terminal recovery evidence is unchanged",
                 round_number=task.recovery_round,
                 lineage_owner=owner,
@@ -9404,16 +9461,22 @@ class Orchestrator:
         next_round = int(task.recovery_round) + 1
         max_rounds = max(1, int(self.config.execution.recovery.max_rounds))
         raw_failure_ids = result.get("failure_ids", [])
-        failure_ids = list(task.verification_refs)
+        failure_ids = (
+            list(task.verification_refs)
+            if prefer_task_verification_refs
+            else []
+        )
         if not failure_ids and isinstance(raw_failure_ids, list):
             failure_ids = [
                 str(item).strip()
                 for item in raw_failure_ids
                 if str(item).strip()
             ]
+        if not failure_ids:
+            failure_ids = list(task.verification_refs)
         signature_payload = {
-            "kind": "review_rejected",
-            "review": self._review_fingerprint(review),
+            "kind": failure_kind,
+            "review": self._review_fingerprint(feedback),
             "failure_ids": sorted(failure_ids),
         }
         signature = hashlib.sha256(
@@ -9426,7 +9489,7 @@ class Orchestrator:
             "round": next_round,
             "epoch": int(owner.recovery_epoch),
             "reason": reason,
-            "review": review,
+            "review": feedback,
             "failure_ids": failure_ids,
             "repair_task_ids": [task.task_id],
             "failure_signature": signature,
@@ -9441,8 +9504,8 @@ class Orchestrator:
                 state,
                 task,
                 outcome="exhausted",
-                failure_kind="review_rejected",
-                reason=review,
+                failure_kind=failure_kind,
+                reason=feedback,
                 signature=signature,
                 round_number=next_round,
                 lineage_owner=owner,
@@ -9475,7 +9538,7 @@ class Orchestrator:
                 state,
                 task,
                 outcome="judge_stopped",
-                failure_kind="review_rejected",
+                failure_kind=failure_kind,
                 reason="deterministic no-progress: failure and owner artifacts are unchanged",
                 signature=signature,
                 round_number=next_round,
@@ -9487,9 +9550,9 @@ class Orchestrator:
             save_run_state(self.project_root, state)
             return False
 
-        judgment = self._run_recovery_judge(state, task, owner, review, next_round)
+        judgment = self._run_recovery_judge(state, task, owner, feedback, next_round)
         decision = str(judgment.get("decision", "CONTINUE"))
-        judge_reason = str(judgment.get("reason", "")).strip() or review
+        judge_reason = str(judgment.get("reason", "")).strip() or feedback
         judge_source = str(judgment.get("source", "provider"))
         if decision == "STOP":
             stopped_entry = dict(history_entry, result="judge_stopped", judge_decision=decision, judge_reason=judge_reason)
@@ -9500,7 +9563,7 @@ class Orchestrator:
                 state,
                 task,
                 outcome="judge_stopped",
-                failure_kind="review_rejected",
+                failure_kind=failure_kind,
                 reason=judge_reason,
                 signature=signature,
                 round_number=next_round,
@@ -9521,7 +9584,7 @@ class Orchestrator:
                     state,
                     task,
                     outcome="judge_stopped",
-                    failure_kind="review_rejected",
+                    failure_kind=failure_kind,
                     reason=judge_reason,
                     signature=signature,
                     round_number=next_round,
@@ -9537,7 +9600,7 @@ class Orchestrator:
                 owner,
                 tasks,
                 {
-                    "review": review,
+                    "review": feedback,
                     "split_trigger": "adaptive recovery judge requested replan",
                     "split_fingerprint": signature,
                     "arbiter": {
@@ -9552,7 +9615,7 @@ class Orchestrator:
                     state,
                     task,
                     outcome="replanned",
-                    failure_kind="review_rejected",
+                    failure_kind=failure_kind,
                     reason=judge_reason,
                     signature=signature,
                     round_number=next_round,
@@ -9565,7 +9628,7 @@ class Orchestrator:
 
         task.status = "pending"
         task.commit_sha = ""
-        task.review_summary = review
+        task.review_summary = feedback
         task.recovery_epoch = owner.recovery_epoch
         task.recovery_round = next_round
         self._begin_fresh_verify_retry_lifecycle(task)
@@ -9583,7 +9646,7 @@ class Orchestrator:
 
         # This is an intentional new implementation round, not a process resume
         # after an interrupted provider call. Force the next pass to consume the
-        # review feedback before verification and review run again.
+        # failure feedback before verification and review run again.
         self._clear_implementation_ready_marker(state, task)
         self._clear_stale_implementation_resume_markers(
             state,
@@ -9600,7 +9663,7 @@ class Orchestrator:
             state,
             task,
             outcome="requeued",
-            failure_kind="review_rejected",
+            failure_kind=failure_kind,
             reason=judge_reason,
             signature=signature,
             round_number=next_round,
