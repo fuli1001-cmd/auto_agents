@@ -796,6 +796,94 @@ class SessionCollabFlowTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
 
+    def test_collab_verification_failure_honors_hard_ceiling_for_markers(self) -> None:
+        for marker in (
+            "GOAL_ACHIEVED: implementation complete",
+            "BUG_FOUND: implementation bug fixed",
+        ):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as tmp:
+                project_root = _make_project(tmp)
+                orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "")
+                state = SessionState(
+                    session_id="bounded-collab",
+                    mode="collab",
+                    status="executing",
+                    max_attempts=10,
+                    hard_ceiling=2,
+                )
+                session = Session(orchestrator, mode="collab")
+
+                with (
+                    patch.object(session, "_call_agent", return_value=marker) as call_agent,
+                    patch.object(
+                        session,
+                        "_run_verify",
+                        return_value={"ok": False, "reason": "unrelated gate failure"},
+                    ),
+                    patch.object(session, "_compute_diff_hash", return_value="same-diff"),
+                ):
+                    result = session._phase_collab_loop(state)
+
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(result.current_attempt, 2)
+                self.assertEqual(call_agent.call_count, 2)
+
+    def test_collab_verification_uses_preexisting_failure_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "")
+            session = Session(orchestrator, mode="collab")
+            session._current_state = SessionState(session_id="collab-baseline", mode="collab")
+
+            with (
+                patch.object(
+                    session,
+                    "_run_baseline_diff_verify",
+                    return_value={"ok": True, "reason": "baseline-only failures"},
+                ) as baseline_verify,
+                patch.object(
+                    orchestrator,
+                    "_run_task_verify",
+                    side_effect=AssertionError("collab must not use absolute full-gate failures"),
+                ),
+            ):
+                result = session._run_verify()
+
+            self.assertTrue(result["ok"])
+            baseline_verify.assert_called_once_with()
+
+    def test_collab_captures_gate_baseline_before_first_iteration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "y")
+            state = SessionState(
+                session_id="collab-baseline-capture",
+                mode="collab",
+                status="executing",
+            )
+            session = Session(orchestrator, mode="collab")
+
+            with (
+                patch.object(session, "_gate_commands", return_value=["test gate"]),
+                patch.object(session, "_ensure_baseline") as ensure_baseline,
+                patch.object(
+                    session,
+                    "_call_agent",
+                    return_value="GOAL_ACHIEVED: implementation complete",
+                ),
+                patch.object(
+                    session,
+                    "_run_verify",
+                    return_value={"ok": True, "reason": "all commands passed"},
+                ),
+                patch.object(session, "_git_commit", return_value=True),
+                patch.object(session, "_release_baseline"),
+            ):
+                result = session._phase_collab_loop(state)
+
+            self.assertEqual(result.status, "completed")
+            ensure_baseline.assert_called_once_with(state)
+
     def test_collab_need_user_assist(self) -> None:
         """Agent requests user assistance, then achieves goal."""
         with tempfile.TemporaryDirectory() as tmp:

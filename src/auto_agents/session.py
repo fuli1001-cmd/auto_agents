@@ -10,7 +10,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .config import (
     create_session,
@@ -379,8 +379,14 @@ class Session:
 
     def _phase_collab_loop(self, state: SessionState) -> SessionState:
         self._current_state = state
+        if self._gate_commands():
+            self._ensure_baseline(state)
         feedback = ""
         while True:
+            stop = self._should_stop(state, "attempt limit reached")
+            if stop:
+                self._print(stop)
+                break
             state.current_attempt += 1
             self._print(f"\n--- Collab iteration {state.current_attempt} ---")
 
@@ -437,7 +443,6 @@ class Session:
             # Check for GOAL_ACHIEVED — counts as progress
             achieved_match = _GOAL_ACHIEVED.search(reply)
             if achieved_match:
-                state.stall_count = 0
                 display = _GOAL_ACHIEVED.sub("", reply).strip()
                 if display:
                     self._print(f"\nAgent:\n{display}")
@@ -458,14 +463,19 @@ class Session:
                     verify_reason = str(verify["reason"])
                     self._print(f"Verification failed: {verify_reason}")
                     self._print("Continuing the loop to fix verification issues.")
-                    feedback = self.orch._format_retry_feedback("local_verification", reason=verify_reason)
+                    feedback, stop = self._collab_verify_failure(state, verify_reason)
+                    if stop:
+                        self._print(stop)
+                        break
                     continue
 
+                state.stall_count = 0
                 self._print("Verification passed!")
                 answer = self._prompt_user("Do you confirm the goal is achieved? (y/n) [y]: ", default="y")
                 if answer.strip().lower() not in ("n", "no"):
                     state.status = "completed"
                     self._git_commit(state, "collab", reply=reply)
+                    self._release_baseline(state)
                     self._print(f"Collaborative session {state.session_id} completed successfully.")
                     return state
 
@@ -482,7 +492,6 @@ class Session:
             # Check for BUG_FOUND – agent found & fixed a bug inline — counts as progress
             bug_match = _BUG_FOUND.search(reply)
             if bug_match:
-                state.stall_count = 0
                 self._print(f"\nAgent found a bug: {bug_match.group(1)}")
                 self._print(f"\nAgent:\n{reply.strip()}")
 
@@ -497,14 +506,19 @@ class Session:
                 self._save(state)
 
                 if verify["ok"]:
+                    state.stall_count = 0
                     committed = self._commit_verified_progress(state, "collab", reply=reply)
                     if committed:
                         self._print("Bug fix verified and committed.")
                     else:
                         self._print("Bug fix verified.")
                 else:
-                    self._print(f"Bug fix verification failed: {verify['reason']}")
-                    feedback = self.orch._format_retry_feedback("local_verification", reason=str(verify["reason"]))
+                    verify_reason = str(verify["reason"])
+                    self._print(f"Bug fix verification failed: {verify_reason}")
+                    feedback, stop = self._collab_verify_failure(state, verify_reason)
+                    if stop:
+                        self._print(stop)
+                        break
                 continue
 
             # General agent output (no special marker)
@@ -518,6 +532,7 @@ class Session:
                 if answer.strip().lower() not in ("n", "no"):
                     state.status = "completed"
                     self._git_commit(state, "collab", reply=reply)
+                    self._release_baseline(state)
                     self._print(f"Collaborative session {state.session_id} completed successfully.")
                     return state
                 committed = self._commit_verified_progress(state, "collab", reply=reply)
@@ -530,15 +545,10 @@ class Session:
                 feedback = ""
             else:
                 verify_reason = str(verify["reason"])
-                diff_hash = self._compute_diff_hash()
-                verify_sig = self._compute_verify_sig(verify_reason)
-                self._update_stall_state(state, diff_hash, verify_sig)
-                self._save(state)
-                stop = self._should_stop(state, verify_reason)
+                feedback, stop = self._collab_verify_failure(state, verify_reason)
                 if stop:
                     self._print(stop)
                     break
-                feedback = self.orch._format_retry_feedback("local_verification", reason=verify_reason)
 
         state.status = "failed"
         self._save(state)
@@ -1335,18 +1345,18 @@ class Session:
     def _run_verify(self) -> Dict[str, object]:
         """Run verification appropriate for the session mode.
 
-        For fix-mode sessions that have a baseline, this performs
+        For fix and collab sessions that have a baseline, this performs
         two-layer verification:
         1.  ``fix_verify_command`` — confirms the specific bug is fixed.
         2.  Baseline-diff gates — runs all gate commands and checks for
             *new* failures compared to the pre-fix baseline.
 
-        For other sessions (collab, no baseline, no gates) falls back to
-        the original short-circuit gate runner.
+        Other session modes fall back to the original short-circuit gate
+        runner.
         """
-        # Fix mode always goes through the baseline-diff path so that
-        # fix_verify_command is checked even when no gate commands exist.
-        if self.mode == "fix":
+        # Fix and collab modes use the baseline-diff path so pre-existing,
+        # unrelated project failures do not become work for the session.
+        if self.mode in {"fix", "collab"}:
             return self._run_baseline_diff_verify()
 
         if not self._gate_commands():
@@ -1402,6 +1412,17 @@ class Session:
                 "Git HEAD changed since last baseline — re-capturing baseline snapshot."
             )
         self._snapshot_baseline(state)
+
+    def _release_baseline(self, state: SessionState) -> None:
+        ref_name = state.baseline_git_ref
+        if not ref_name.startswith("refs/auto-agents/gate-snapshots/"):
+            return
+        subprocess.run(
+            ["git", "update-ref", "-d", ref_name],
+            cwd=self.project_root,
+            capture_output=True,
+            text=True,
+        )
 
     def _run_baseline_diff_verify(self) -> Dict[str, object]:
         """Two-layer verification for fix sessions.
@@ -1581,6 +1602,22 @@ class Session:
             state.stall_count = 0
         state.last_diff_hash = diff_hash
         state.last_verify_sig = verify_sig
+
+    def _collab_verify_failure(
+        self,
+        state: SessionState,
+        verify_reason: str,
+    ) -> Tuple[str, Optional[str]]:
+        """Record a collab verification failure and enforce convergence limits."""
+        diff_hash = self._compute_diff_hash()
+        verify_sig = self._compute_verify_sig(verify_reason)
+        self._update_stall_state(state, diff_hash, verify_sig)
+        self._save(state)
+        feedback = self.orch._format_retry_feedback(
+            "local_verification",
+            reason=verify_reason,
+        )
+        return feedback, self._should_stop(state, verify_reason)
 
     def _should_stop(self, state: SessionState, reason: str) -> Optional[str]:
         """Return a stop-reason string if the session should stop, else None."""
