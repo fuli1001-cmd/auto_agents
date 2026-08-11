@@ -6,8 +6,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import nullcontext, redirect_stderr
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List
 from unittest.mock import patch
 
@@ -32,6 +33,7 @@ from auto_agents.models import (
     AgentResult,
     CommandResult,
     DEFAULT_SESSION_MAX_ATTEMPTS,
+    GateParallelGroup,
     GateResult,
     RunState,
     SessionState,
@@ -850,7 +852,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 result = session._run_verify()
 
             self.assertTrue(result["ok"])
-            baseline_verify.assert_called_once_with()
+            baseline_verify.assert_called_once_with(scope="final")
 
     def test_collab_captures_gate_baseline_before_first_iteration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -862,9 +864,9 @@ class SessionCollabFlowTests(unittest.TestCase):
                 status="executing",
             )
             session = Session(orchestrator, mode="collab")
+            orchestrator.config.gates.commands = ["test gate"]
 
             with (
-                patch.object(session, "_gate_commands", return_value=["test gate"]),
                 patch.object(session, "_ensure_baseline") as ensure_baseline,
                 patch.object(
                     session,
@@ -883,6 +885,148 @@ class SessionCollabFlowTests(unittest.TestCase):
 
             self.assertEqual(result.status, "completed")
             ensure_baseline.assert_called_once_with(state)
+
+    def test_collab_applies_generated_config_before_resolving_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "y")
+            state = SessionState(session_id="collab-config-sync", mode="collab")
+            session = Session(orchestrator, mode="collab")
+            events = []
+            plan = SimpleNamespace(commands=["test gate"], parallel_groups=[])
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_apply_generated_verification_config",
+                    side_effect=lambda: events.append("apply"),
+                ),
+                patch.object(
+                    session,
+                    "_session_gate_plan",
+                    side_effect=lambda _scope: events.append("plan") or plan,
+                ),
+                patch.object(
+                    session,
+                    "_ensure_baseline",
+                    side_effect=lambda _state: events.append("baseline"),
+                ),
+                patch.object(
+                    session,
+                    "_call_agent",
+                    return_value="GOAL_ACHIEVED: implementation complete",
+                ),
+                patch.object(
+                    session,
+                    "_run_verify",
+                    return_value={"ok": True, "reason": "passed"},
+                ),
+                patch.object(session, "_git_commit", return_value=True),
+                patch.object(session, "_release_baseline"),
+            ):
+                result = session._phase_collab_loop(state)
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(events[:3], ["apply", "plan", "baseline"])
+
+    def test_collab_general_progress_runs_final_only_after_user_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "y")
+            state = SessionState(session_id="collab-two-tier", mode="collab")
+            session = Session(orchestrator, mode="collab")
+
+            with (
+                patch.object(orchestrator, "_apply_generated_verification_config"),
+                patch.object(session, "_call_agent", return_value="Implemented the change."),
+                patch.object(
+                    session,
+                    "_run_verify",
+                    side_effect=[
+                        {"ok": True, "reason": "progress passed", "scope": "progress"},
+                        {"ok": True, "reason": "final passed", "scope": "final"},
+                    ],
+                ) as verify,
+                patch.object(session, "_git_commit", return_value=True),
+                patch.object(session, "_release_baseline"),
+            ):
+                result = session._phase_collab_loop(state)
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(
+                [call.kwargs["scope"] for call in verify.call_args_list],
+                ["progress", "final"],
+            )
+            self.assertEqual(
+                [entry["verification_scope"] for entry in state.execution_log if entry["action"].endswith("verify")],
+                ["progress", "final"],
+            )
+
+    def test_collab_final_failure_after_confirmation_does_not_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "y")
+            state = SessionState(
+                session_id="collab-final-failure",
+                mode="collab",
+                hard_ceiling=1,
+            )
+            session = Session(orchestrator, mode="collab")
+
+            with (
+                patch.object(orchestrator, "_apply_generated_verification_config"),
+                patch.object(session, "_call_agent", return_value="Implemented the change."),
+                patch.object(
+                    session,
+                    "_run_verify",
+                    side_effect=[
+                        {"ok": True, "reason": "progress passed", "scope": "progress"},
+                        {"ok": False, "reason": "final failed", "scope": "final"},
+                    ],
+                ),
+                patch.object(session, "_git_commit") as git_commit,
+            ):
+                result = session._phase_collab_loop(state)
+
+            self.assertEqual(result.status, "failed")
+            git_commit.assert_not_called()
+
+    def test_collab_marker_scopes_bug_as_progress_and_goal_as_final(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "y")
+            state = SessionState(session_id="collab-marker-scopes", mode="collab")
+            session = Session(orchestrator, mode="collab")
+
+            with (
+                patch.object(orchestrator, "_apply_generated_verification_config"),
+                patch.object(
+                    session,
+                    "_call_agent",
+                    side_effect=[
+                        "BUG_FOUND: fixed an intermediate defect",
+                        "GOAL_ACHIEVED: all work complete",
+                    ],
+                ),
+                patch.object(
+                    session,
+                    "_run_verify",
+                    side_effect=[
+                        {"ok": True, "reason": "progress passed"},
+                        {"ok": True, "reason": "final passed"},
+                    ],
+                ) as verify,
+                patch.object(session, "_commit_verified_progress", return_value=False),
+                patch.object(session, "_git_commit", return_value=True),
+                patch.object(session, "_release_baseline"),
+            ):
+                result = session._phase_collab_loop(state)
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(
+                [call.kwargs["scope"] for call in verify.call_args_list],
+                ["progress", "final"],
+            )
 
     def test_collab_need_user_assist(self) -> None:
         """Agent requests user assistance, then achieves goal."""
@@ -1526,6 +1670,12 @@ class SessionCLITests(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["collab", "--project", "/tmp/test", "--print-agent-output"])
         self.assertTrue(args.print_agent_output)
+
+    def test_collab_parser_full_verify(self) -> None:
+        from auto_agents.cli import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["collab", "--project", "/tmp/test", "--full-verify"])
+        self.assertTrue(args.full_verify)
 
     def test_provider_resolve_parser(self) -> None:
         from auto_agents.cli import build_parser
@@ -2419,6 +2569,173 @@ class SessionsListSlimTests(unittest.TestCase):
 
 class BaselineDiffVerifyTests(unittest.TestCase):
     """Test baseline-diff verification for fix mode."""
+
+    def test_policy_v3_structured_baseline_captures_source_without_running_gates(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.verification_policy_version = 3
+            orchestrator.config.gates.steps = [
+                VerificationStep(
+                    kind="test",
+                    runner="pytest",
+                    targets=["tests/test_contract.py"],
+                    parallel_safe=False,
+                    serial_reason="ordered_contract",
+                    cache_scope="source",
+                    result_cache_scope="auto",
+                )
+            ]
+            state = SessionState(session_id="lazybaseline", mode="fix")
+            session = Session(orchestrator, mode="fix")
+
+            with patch(
+                "auto_agents.session.run_gate_plan",
+                side_effect=AssertionError("baseline gates must be lazy"),
+            ):
+                session._snapshot_baseline(state)
+
+            self.assertEqual(state.baseline_failures, [])
+            self.assertTrue(
+                state.baseline_git_ref.startswith(
+                    "refs/auto-agents/gate-snapshots/"
+                )
+            )
+            self.assertEqual(len(state.baseline_commands), 1)
+            session._release_baseline(state)
+
+    def test_collab_progress_plan_excludes_final_only_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.steps = [
+                VerificationStep(
+                    kind="test",
+                    runner="pytest",
+                    targets=["tests/test_progress.py"],
+                    cadence="implement_and_final",
+                    parallel_safe=False,
+                    serial_reason="ordered",
+                ),
+                VerificationStep(
+                    kind="test",
+                    runner="pytest",
+                    targets=["tests/test_final.py"],
+                    cadence="final_only",
+                    parallel_safe=False,
+                    serial_reason="ordered",
+                ),
+            ]
+            session = Session(orchestrator, mode="collab")
+
+            progress = session._logical_gate_commands(
+                session._session_gate_plan("progress")
+            )
+            final = session._logical_gate_commands(session._session_gate_plan("final"))
+
+            self.assertEqual(len(progress), 1)
+            self.assertIn("tests/test_progress.py", progress[0])
+            self.assertEqual(len(final), 2)
+            self.assertTrue(any("tests/test_final.py" in command for command in final))
+
+    def test_baseline_command_set_includes_parallel_group_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.commands = ["echo serial"]
+            orchestrator.config.gates.parallel_groups = [
+                GateParallelGroup(name="parallel", commands=["echo parallel"])
+            ]
+            state = SessionState(session_id="parallel-baseline", mode="collab")
+            session = Session(orchestrator, mode="collab")
+
+            with patch(
+                "auto_agents.session.run_gate_plan",
+                return_value=GateResult(ok=True, commands=[], summary="passed"),
+            ):
+                session._snapshot_baseline(state)
+
+            self.assertEqual(
+                state.baseline_commands,
+                ["echo serial", "echo parallel"],
+            )
+
+    def test_collab_full_verify_bypasses_cache_only_for_final_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.commands = ["echo gate"]
+            state = SessionState(session_id="collab-full-verify", mode="collab")
+            session = Session(orchestrator, mode="collab", full_verify=True)
+            session._current_state = state
+            cache_settings = []
+
+            def executor_context(_metadata, **kwargs):
+                cache_settings.append(kwargs.get("use_result_cache", True))
+                return nullcontext(None)
+
+            def successful_gate(commands, parallel_groups, *_args, **_kwargs):
+                logical = list(commands) + [
+                    command
+                    for group in parallel_groups
+                    for command in group.commands
+                ]
+                return GateResult(
+                    ok=True,
+                    commands=[
+                        CommandResult(command=command, ok=True, returncode=0)
+                        for command in logical
+                    ],
+                    summary="passed",
+                )
+
+            with (
+                patch.object(orchestrator, "_gate_executor_context", side_effect=executor_context),
+                patch("auto_agents.session.changed_paths", return_value=[]),
+                patch("auto_agents.session.run_gate_plan", side_effect=successful_gate),
+            ):
+                progress = session._run_verify(scope="progress")
+                final = session._run_verify(scope="final")
+
+            self.assertTrue(progress["ok"])
+            self.assertTrue(final["ok"])
+            self.assertEqual(cache_settings, [True, False])
+            self.assertFalse(orchestrator._force_full_verify)
+
+    def test_verification_metrics_report_certificate_hits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.commands = ["echo gate"]
+            state = SessionState(session_id="collab-metrics", mode="collab")
+            session = Session(orchestrator, mode="collab")
+            session._current_state = state
+            cached_gate = GateResult(
+                ok=True,
+                commands=[
+                    CommandResult(
+                        command="echo gate",
+                        ok=True,
+                        returncode=0,
+                        cached=True,
+                    )
+                ],
+                summary="certificate hit",
+            )
+
+            with (
+                patch("auto_agents.session.changed_paths", return_value=[]),
+                patch("auto_agents.session.run_gate_plan", return_value=cached_gate),
+            ):
+                result = session._run_verify(scope="progress")
+
+            self.assertEqual(result["scope"], "progress")
+            self.assertEqual(result["logical_commands"], 1)
+            self.assertEqual(result["executed_commands"], 0)
+            self.assertEqual(result["certificate_hits"], 1)
+            self.assertGreaterEqual(result["duration_seconds"], 0.0)
 
     def test_preexisting_failure_tolerated(self) -> None:
         """A gate failure that exists in the baseline should not block completion."""

@@ -764,6 +764,38 @@ class GateTests(unittest.TestCase):
                 [vitest_step],
             )
 
+    def test_policy_v3_stable_shards_override_legacy_single_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests = root / "tests"
+            tests.mkdir()
+            for index in range(8):
+                (tests / f"test_{index}.py").write_text("", encoding="utf-8")
+            step = VerificationStep(
+                kind="test",
+                runner="pytest",
+                targets=["tests"],
+                max_batches=1,
+                result_cache_scope="auto",
+            )
+
+            first = expand_pytest_directory_steps(
+                [step], root, max_batches_per_step=4, stable_shards=True
+            )
+            second = expand_pytest_directory_steps(
+                [step], root, max_batches_per_step=4, stable_shards=True
+            )
+
+            self.assertGreater(len(first), 1)
+            self.assertEqual(
+                [item.targets for item in first],
+                [item.targets for item in second],
+            )
+            self.assertEqual(
+                sorted(target for item in first for target in item.targets),
+                [f"tests/test_{index}.py" for index in range(8)],
+            )
+
     def test_expand_vitest_directory_steps_splits_files_and_honors_excludes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

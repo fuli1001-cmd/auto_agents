@@ -8893,6 +8893,7 @@ class ScopeOverflowTests(unittest.TestCase):
             self.assertEqual(updated.current_stage, "implement")
             self.assertEqual(updated.rejected_stage, "implement")
             self.assertEqual(updated.agent_attempts["verify_recovery"], 1)
+            self.assertEqual(updated.verify_recovery_refs, ["cmd:fake test"])
             self.assertNotIn("verify", updated.stage_summaries)
             self.assertIn("Failure type: full_verification", updated.rejection_reason)
             self.assertIn("update repository tests only when they are stale", updated.rejection_reason)

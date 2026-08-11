@@ -186,7 +186,17 @@
       "properties": {
         "verification_policy_version": {
           "type": "integer",
-          "enum": [1, 2]
+          "enum": [1, 2, 3]
+        },
+        "incremental": {
+          "type": "object",
+          "properties": {
+            "mode": {"type": "string", "enum": ["auto", "off"]},
+            "warm_target_seconds": {"type": "integer", "minimum": 1},
+            "shard_target_seconds": {"type": "integer", "minimum": 1},
+            "cache_max_age_seconds": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
         },
         "target_final_seconds": {
           "type": "integer",
@@ -257,7 +267,7 @@
               },
               "result_cache_scope": {
                 "type": "string",
-                "enum": ["off", "candidate", "observed_inputs"]
+                "enum": ["off", "candidate", "observed_inputs", "auto"]
               },
               "resource_class": {
                 "type": "string",

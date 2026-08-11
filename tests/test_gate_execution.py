@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import json
+import shutil
 import socket
 import subprocess
 import sys
@@ -139,6 +140,64 @@ def test_candidate_result_cache_reuses_identical_snapshot_across_executors(
 
     assert first.ok and not first.cached
     assert second.ok and second.cached
+
+
+def test_auto_result_cache_reuses_when_only_unobserved_source_changes(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("strace") is None:
+        return
+    project = _project(tmp_path)
+    auto_dir = project / ".auto-agents"
+    auto_dir.mkdir()
+    (auto_dir / ".gitignore").write_text(
+        "state/gate_baseline_cache.sqlite3\n"
+        "state/gate_baseline_cache.sqlite3-*\n",
+        encoding="utf-8",
+    )
+    (project / "input.txt").write_text("one\n", encoding="utf-8")
+    (project / "unrelated.txt").write_text("first\n", encoding="utf-8")
+    _git(project, "add", "-A")
+    _git(project, "commit", "-m", "add cache probe inputs")
+    command = 'test "$(cat input.txt)" = one'
+    metadata = {
+        command: GateCommandMetadata(
+            cache_scope="source",
+            result_cache_scope="auto",
+        )
+    }
+    config = _config(tmp_path)
+    config.verification_policy_version = 3
+
+    with LocalGatePlanExecutor(
+        project,
+        config,
+        metadata,
+        environment_fingerprint="env-auto-1",
+    ) as executor:
+        first = executor.run(
+            command,
+            timeout_seconds=60,
+            adaptive_timeout_enabled=False,
+            idle_timeout_seconds=60,
+        )
+    (project / "unrelated.txt").write_text("second\n", encoding="utf-8")
+    with LocalGatePlanExecutor(
+        project,
+        config,
+        metadata,
+        environment_fingerprint="env-auto-1",
+    ) as executor:
+        second = executor.run(
+            command,
+            timeout_seconds=60,
+            adaptive_timeout_enabled=False,
+            idle_timeout_seconds=60,
+        )
+
+    assert first.ok and first.input_trace_complete
+    assert second.ok and second.cached
+    assert second.backend == "result-cache-observed-inputs"
 
 
 def test_serial_lane_preserves_ignored_producer_artifact(tmp_path: Path) -> None:

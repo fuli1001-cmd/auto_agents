@@ -12,7 +12,7 @@ from .config import gate_baseline_cache_path
 from .models import CommandResult
 
 
-RESULT_CACHE_VERSION = 1
+RESULT_CACHE_VERSION = 2
 MAX_AGE_SECONDS = 14 * 24 * 60 * 60
 MAX_ROWS = 20_000
 
@@ -79,11 +79,13 @@ class GateResultCache:
         cache_path: Optional[Path] = None,
         environment_fingerprint: str = "",
         context_fingerprint: str = "",
+        max_age_seconds: int = MAX_AGE_SECONDS,
     ) -> None:
         self.project_root = Path(project_root).resolve()
         self.cache_path = cache_path or gate_baseline_cache_path(self.project_root)
         self.environment_fingerprint = str(environment_fingerprint)
         self.context_fingerprint = str(context_fingerprint)
+        self.max_age_seconds = max(1, int(max_age_seconds))
         self.disabled = False
         self._lock = threading.Lock()
 
@@ -118,11 +120,11 @@ class GateResultCache:
                     FROM gate_result_successes
                     WHERE cache_key = ? AND updated_at >= ?
                     """,
-                    (key, now - MAX_AGE_SECONDS),
+                    (key, now - self.max_age_seconds),
                 ).fetchone()
                 if row is not None:
                     return self._cached_result(command, "result-cache-candidate")
-                if result_cache_scope != "observed_inputs":
+                if result_cache_scope not in {"observed_inputs", "auto"}:
                     return None
                 rows = connection.execute(
                     """
@@ -134,7 +136,7 @@ class GateResultCache:
                     ORDER BY updated_at DESC
                     LIMIT 20
                     """,
-                    (identity, now - MAX_AGE_SECONDS),
+                    (identity, now - self.max_age_seconds),
                 ).fetchall()
                 for candidate in rows:
                     manifest = json.loads(candidate[0] or "{}")
@@ -182,7 +184,7 @@ class GateResultCache:
         key = _candidate_key(identity, source_fingerprint, context)
         observed_inputs = (
             dict(result.observed_inputs)
-            if result_cache_scope == "observed_inputs"
+            if result_cache_scope in {"observed_inputs", "auto"}
             and result.input_trace_complete
             and not result.network_observed
             else {}
@@ -213,7 +215,7 @@ class GateResultCache:
                 )
                 connection.execute(
                     "DELETE FROM gate_result_successes WHERE updated_at < ?",
-                    (now - MAX_AGE_SECONDS,),
+                    (now - self.max_age_seconds,),
                 )
                 connection.execute(
                     """
@@ -234,12 +236,19 @@ class GateResultCache:
             return False
         for raw_path, expected in manifest.items():
             relative = str(raw_path).replace("\\", "/").strip()
+            missing = relative.startswith("!")
+            if missing:
+                relative = relative[1:]
             if (
                 not relative
                 or relative.startswith("/")
                 or ".." in Path(relative).parts
             ):
                 return False
+            if missing:
+                if (self.project_root / relative).exists():
+                    return False
+                continue
             if _path_digest(self.project_root / relative) != str(expected):
                 return False
         return True

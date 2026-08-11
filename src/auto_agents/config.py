@@ -216,7 +216,13 @@ DEFAULT_CONFIG = {
         "commands": [],
         "steps": [],
         "parallel_groups": [],
-        "verification_policy_version": 2,
+        "verification_policy_version": 3,
+        "incremental": {
+            "mode": "auto",
+            "warm_target_seconds": 900,
+            "shard_target_seconds": 300,
+            "cache_max_age_seconds": 1209600,
+        },
         "require_clean_git_before_task": True,
         "allow_agent_updates": True,
         "parallel_workers": "auto",
@@ -529,6 +535,24 @@ def load_project_config(project_root: Path) -> ProjectConfig:
     data = read_json(config_path(project_root), default=None)
     if data is None:
         raise FileNotFoundError(f"Missing config: {config_path(project_root)}")
+    gates = data.get("gates") if isinstance(data, dict) else None
+    migrated = False
+    if isinstance(gates, dict):
+        version = int(gates.get("verification_policy_version", 1) or 1)
+        if version == 2 and "incremental" not in gates:
+            gates["verification_policy_version"] = 3
+            gates["incremental"] = copy.deepcopy(
+                DEFAULT_CONFIG["gates"]["incremental"]
+            )
+            for step in gates.get("steps", []):
+                if (
+                    isinstance(step, dict)
+                    and step.get("result_cache_scope", "candidate") == "candidate"
+                ):
+                    step["result_cache_scope"] = "auto"
+            migrated = True
+    if migrated:
+        write_json(config_path(project_root), data)
     return ProjectConfig.from_dict(data)
 
 

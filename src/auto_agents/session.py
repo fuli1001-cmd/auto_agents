@@ -30,6 +30,7 @@ from .gates import (
     extract_failure_info,
     run_gate_plan,
 )
+from .gate_execution import GateSnapshotManager
 from .git_ops import changed_paths, commit_all, head_ref, worktree_fingerprint
 from .io_utils import read_text, write_text
 from .models import (
@@ -74,12 +75,18 @@ class Session:
         orchestrator: "Orchestrator",  # noqa: F821 – forward ref
         mode: str = "fix",
         print_agent_output: bool = False,
+        full_verify: bool = False,
     ) -> None:
         self.orch = orchestrator
         self.project_root = orchestrator.project_root
         self.config = orchestrator.config
         self.mode = mode
         self._print_agent_output = print_agent_output
+        self._full_verify = bool(full_verify)
+        # ``fix --full-verify`` keeps its existing session-wide semantics.
+        # Collab only bypasses certificates for the final attestation; progress
+        # checks must remain incremental so the interactive loop stays fast.
+        self.orch._force_full_verify = bool(full_verify and mode == "fix")
         self._current_state: Optional[SessionState] = None
         # Expose the same user-input helper used by the orchestrator.
         self._prompt_user = orchestrator._prompt_user
@@ -90,6 +97,44 @@ class Session:
                 self.config.gates.steps, self.project_root
             )
         return list(self.config.gates.commands)
+
+    def _session_gate_plan(self, scope: str):
+        """Resolve the gate plan used by a session verification scope."""
+        phase = "implement" if scope == "progress" else "final"
+        return self.orch._resolved_gate_plan(phase)
+
+    @staticmethod
+    def _logical_gate_commands(plan) -> List[str]:
+        """Return every unique command, including commands in parallel groups."""
+        return list(
+            dict.fromkeys(
+                list(plan.commands)
+                + [
+                    command
+                    for group in plan.parallel_groups
+                    for command in group.commands
+                ]
+            )
+        )
+
+    def _append_verification_log(
+        self,
+        state: SessionState,
+        action: str,
+        verify: Dict[str, object],
+    ) -> None:
+        """Persist verification outcome and execution/certificate metrics."""
+        state.execution_log.append({
+            "attempt": state.current_attempt,
+            "action": action,
+            "result": "pass" if verify["ok"] else str(verify["reason"]),
+            "verification_scope": str(verify.get("scope", "final")),
+            "logical_commands": int(verify.get("logical_commands", 0)),
+            "executed_commands": int(verify.get("executed_commands", 0)),
+            "certificate_hits": int(verify.get("certificate_hits", 0)),
+            "duration_seconds": float(verify.get("duration_seconds", 0.0)),
+            "timestamp": self._now(),
+        })
 
     # ── Public entry points ──────────────────────────────────────
 
@@ -277,6 +322,7 @@ class Session:
 
     def _phase_fix_execute(self, state: SessionState) -> SessionState:
         self._current_state = state
+        self.orch._apply_generated_verification_config()
         self._ensure_baseline(state)
         feedback = ""
         while True:
@@ -343,12 +389,7 @@ class Session:
             # Gate verify
             verify = self._run_verify()
             verify_reason = "" if verify["ok"] else str(verify["reason"])
-            state.execution_log.append({
-                "attempt": state.current_attempt,
-                "action": "verify",
-                "result": "pass" if verify["ok"] else verify_reason,
-                "timestamp": self._now(),
-            })
+            self._append_verification_log(state, "verify", verify)
             self._save(state)
 
             if verify["ok"]:
@@ -356,6 +397,7 @@ class Session:
                 state.status = "completed"
                 state.resolution = "fixed"
                 self._git_commit(state, "fix", reply=reply)
+                self._release_baseline(state)
                 self._print(f"Bug fix completed in session {state.session_id}.")
                 return state
 
@@ -379,7 +421,12 @@ class Session:
 
     def _phase_collab_loop(self, state: SessionState) -> SessionState:
         self._current_state = state
-        if self._gate_commands():
+        # Collab can be the first command after a v2 -> v3 policy migration.
+        # Materialize the generated verification config before resolving the
+        # plan or capturing the shared session baseline.
+        self.orch._apply_generated_verification_config()
+        final_plan = self._session_gate_plan("final")
+        if final_plan.commands or final_plan.parallel_groups:
             self._ensure_baseline(state)
         feedback = ""
         while True:
@@ -449,14 +496,8 @@ class Session:
                 self._print(f"\nAgent believes the goal is achieved: {achieved_match.group(1)}")
 
                 # Verify
-                verify = self._run_verify()
-                verify_status = "pass" if verify["ok"] else "fail"
-                state.execution_log.append({
-                    "attempt": state.current_attempt,
-                    "action": "verify",
-                    "result": verify_status,
-                    "timestamp": self._now(),
-                })
+                verify = self._run_verify(scope="final")
+                self._append_verification_log(state, "verify", verify)
                 self._save(state)
 
                 if not verify["ok"]:
@@ -470,7 +511,7 @@ class Session:
                     continue
 
                 state.stall_count = 0
-                self._print("Verification passed!")
+                self._print("Final verification passed!")
                 answer = self._prompt_user("Do you confirm the goal is achieved? (y/n) [y]: ", default="y")
                 if answer.strip().lower() not in ("n", "no"):
                     state.status = "completed"
@@ -496,13 +537,8 @@ class Session:
                 self._print(f"\nAgent:\n{reply.strip()}")
 
                 # Try to verify after the fix
-                verify = self._run_verify()
-                state.execution_log.append({
-                    "attempt": state.current_attempt,
-                    "action": "bug_fix_verify",
-                    "result": "pass" if verify["ok"] else str(verify["reason"]),
-                    "timestamp": self._now(),
-                })
+                verify = self._run_verify(scope="progress")
+                self._append_verification_log(state, "bug_fix_verify", verify)
                 self._save(state)
 
                 if verify["ok"]:
@@ -524,12 +560,27 @@ class Session:
             # General agent output (no special marker)
             self._print(f"\nAgent:\n{reply.strip()}")
             # Run verify to check progress
-            verify = self._run_verify()
+            verify = self._run_verify(scope="progress")
+            self._append_verification_log(state, "progress_verify", verify)
+            self._save(state)
             if verify["ok"]:
                 state.stall_count = 0
-                self._print("Verification passed after agent's changes!")
+                self._print("Progress verification passed after agent's changes!")
                 answer = self._prompt_user("Goal achieved? (y/n) [y]: ", default="y")
                 if answer.strip().lower() not in ("n", "no"):
+                    final_verify = self._run_verify(scope="final")
+                    self._append_verification_log(state, "final_verify", final_verify)
+                    self._save(state)
+                    if not final_verify["ok"]:
+                        final_reason = str(final_verify["reason"])
+                        self._print(f"Final verification failed: {final_reason}")
+                        self._print("Continuing the loop to fix final verification issues.")
+                        feedback, stop = self._collab_verify_failure(state, final_reason)
+                        if stop:
+                            self._print(stop)
+                            break
+                        continue
+                    self._print("Final verification passed!")
                     state.status = "completed"
                     self._git_commit(state, "collab", reply=reply)
                     self._release_baseline(state)
@@ -1342,28 +1393,40 @@ class Session:
             raise RuntimeError(f"Agent call failed ({label}): {detail}")
         return (result.summary or result.stdout).strip()
 
-    def _run_verify(self) -> Dict[str, object]:
+    def _run_verify(self, scope: str = "final") -> Dict[str, object]:
         """Run verification appropriate for the session mode.
 
-        For fix and collab sessions that have a baseline, this performs
-        two-layer verification:
-        1.  ``fix_verify_command`` — confirms the specific bug is fixed.
-        2.  Baseline-diff gates — runs all gate commands and checks for
-            *new* failures compared to the pre-fix baseline.
+        Collab progress checks use the implement plan; completion attestation
+        and all fix checks use the final plan. Both session modes compare gate
+        failures with the session-start baseline.
 
         Other session modes fall back to the original short-circuit gate
         runner.
         """
+        if scope not in {"progress", "final"}:
+            raise ValueError(f"unsupported session verification scope: {scope}")
+        if self.mode == "fix":
+            scope = "final"
+
         # Fix and collab modes use the baseline-diff path so pre-existing,
         # unrelated project failures do not become work for the session.
         if self.mode in {"fix", "collab"}:
-            return self._run_baseline_diff_verify()
+            return self._run_baseline_diff_verify(scope=scope)
 
-        if not self._gate_commands():
-            return {"ok": True, "reason": "no verification steps or commands configured"}
+        plan = self._session_gate_plan(scope)
+        if not plan.commands and not plan.parallel_groups:
+            return {
+                "ok": True,
+                "reason": "no verification steps or commands configured",
+                "scope": scope,
+                "logical_commands": 0,
+                "executed_commands": 0,
+                "certificate_hits": 0,
+                "duration_seconds": 0.0,
+            }
         return self.orch._run_task_verify()
 
-    # ── Baseline-diff verification (fix mode) ────────────────────
+    # ── Baseline-diff verification (fix / collab) ───────────────
 
     def _snapshot_baseline(self, state: SessionState) -> None:
         """Capture the current gate failures and git HEAD as the baseline.
@@ -1372,12 +1435,35 @@ class Session:
         *executing*, and again on resume if the git HEAD has moved.
         """
         self._print("Capturing baseline gate snapshot...")
-        gate_commands = self._gate_commands()
-        metadata = self.orch._resolved_gate_plan("final").metadata
-        with self.orch._gate_executor_context(metadata) as gate_executor:
+        plan = self._session_gate_plan("final")
+        baseline_commands = self._logical_gate_commands(plan)
+        if (
+            self.config.gates.verification_policy_version >= 3
+            and self.config.gates.incremental_mode == "auto"
+            and bool(self.config.gates.steps)
+        ):
+            manager = GateSnapshotManager(
+                self.project_root,
+                f"session-{state.session_id}-baseline",
+            )
+            snapshot = manager.create()
+            # Deliberately keep the ref until the session is complete. The
+            # baseline commands are evaluated lazily, and only for shards
+            # that fail on the candidate.
+            state.baseline_failures = []
+            state.baseline_git_ref = snapshot.ref_name
+            state.baseline_head_ref = head_ref(self.project_root)
+            state.baseline_commands = baseline_commands
+            self._print(
+                "Baseline source captured; gate execution is deferred until "
+                "a candidate shard fails."
+            )
+            self._save(state)
+            return
+        with self.orch._gate_executor_context(plan.metadata) as gate_executor:
             gate = run_gate_plan(
-                gate_commands,
-                self.config.gates.parallel_groups,
+                plan.commands,
+                plan.parallel_groups,
                 self.project_root,
                 collect_all=True,
                 parallel_workers=self.orch._gate_parallel_workers(),
@@ -1394,6 +1480,8 @@ class Session:
         )
         state.baseline_failures = extract_failure_ids(gate)
         state.baseline_git_ref = head_ref(self.project_root)
+        state.baseline_head_ref = state.baseline_git_ref
+        state.baseline_commands = baseline_commands
         if state.baseline_failures:
             self._print(
                 f"Baseline snapshot: {len(state.baseline_failures)} pre-existing failure(s) recorded."
@@ -1404,6 +1492,22 @@ class Session:
 
     def _ensure_baseline(self, state: SessionState) -> None:
         """Ensure a baseline snapshot exists, re-capturing if git HEAD moved."""
+        if (
+            self.config.gates.verification_policy_version >= 3
+            and self.config.gates.incremental_mode == "auto"
+            and bool(self.config.gates.steps)
+        ):
+            if state.baseline_git_ref:
+                probe = subprocess.run(
+                    ["git", "rev-parse", "--verify", state.baseline_git_ref],
+                    cwd=self.project_root,
+                    capture_output=True,
+                    text=True,
+                )
+                if probe.returncode == 0:
+                    return
+            self._snapshot_baseline(state)
+            return
         current_head = head_ref(self.project_root)
         if state.baseline_git_ref and state.baseline_git_ref == current_head:
             return  # baseline is still valid
@@ -1424,22 +1528,42 @@ class Session:
             text=True,
         )
 
-    def _run_baseline_diff_verify(self) -> Dict[str, object]:
-        """Two-layer verification for fix sessions.
+    def _run_baseline_diff_verify(self, scope: str = "final") -> Dict[str, object]:
+        """Baseline-diff verification for fix and collab sessions.
 
         Returns ``{"ok": True, ...}`` only if:
-        1.  ``fix_verify_command`` passes (if configured), AND
-        2.  running the full gates produces no *new* failures relative to
-            the stored baseline.
+        1.  ``fix_verify_command`` passes for fix sessions (if configured), AND
+        2.  the scope's gate plan produces no *new* failures relative to the
+            session-start baseline.
         """
-        # Retrieve the current in-memory state via the save/load round-trip
-        # is unnecessary — the caller already has it.  But _run_verify is
-        # called from the loop which doesn't pass state, so we load it.
-        # We'll refactor the signature after the feature is validated.
         state = self._current_state
+        if state is None:
+            raise RuntimeError("session verification requires an active session state")
+        started = time.monotonic()
+        logical_commands = 0
+        executed_commands = 0
+        certificate_hits = 0
+
+        def record_gate(gate_result) -> None:
+            nonlocal logical_commands, executed_commands, certificate_hits
+            logical_commands += len(gate_result.commands)
+            hits = sum(bool(result.cached) for result in gate_result.commands)
+            certificate_hits += hits
+            executed_commands += len(gate_result.commands) - hits
+
+        def outcome(ok: bool, reason: str) -> Dict[str, object]:
+            return {
+                "ok": ok,
+                "reason": reason,
+                "scope": scope,
+                "logical_commands": logical_commands,
+                "executed_commands": executed_commands,
+                "certificate_hits": certificate_hits,
+                "duration_seconds": round(time.monotonic() - started, 6),
+            }
 
         # Layer 1: targeted bug verification
-        if state.fix_verify_command:
+        if self.mode == "fix" and state.fix_verify_command:
             verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
             try:
                 with self.orch._gate_executor_context(
@@ -1457,55 +1581,115 @@ class Session:
                         gate_executor=gate_executor,
                     )
             except Exception as exc:
-                return {"ok": False, "reason": f"fix_verify_command error: {exc}"}
+                return outcome(False, f"fix_verify_command error: {exc}")
+            record_gate(targeted_gate)
             self.orch._classify_reported_infrastructure_failures(targeted_gate)
             if not targeted_gate.ok:
                 command_result = targeted_gate.commands[0]
                 if command_result.infrastructure_error:
-                    return {
-                        "ok": False,
-                        "reason": (
+                    return outcome(
+                        False,
+                        (
                             "fix_verify_command reported infrastructure failure: "
                             f"{command_result.infrastructure_failure_id or 'unknown'}"
                         ),
-                    }
+                    )
                 detail = (
                     command_result.stderr
                     or command_result.stdout
                     or targeted_gate.summary
                     or "non-zero exit"
                 ).strip()
-                return {
-                    "ok": False,
-                    "reason": f"fix_verify_command failed: {detail[:500]}",
-                }
+                return outcome(False, f"fix_verify_command failed: {detail[:500]}")
 
         # Layer 2: baseline-diff gate check
-        gate_commands = self._gate_commands()
-        if not gate_commands and not self.config.gates.parallel_groups:
-            return {"ok": True, "reason": "no verification steps or commands configured"}
-        metadata = self.orch._resolved_gate_plan("final").metadata
-        with self.orch._gate_executor_context(metadata) as gate_executor:
+        plan = self._session_gate_plan(scope)
+        if not plan.commands and not plan.parallel_groups:
+            return outcome(True, "no verification steps or commands configured")
+        metadata = plan.metadata
+        force_current_candidate = any(
+            self.orch._is_high_risk_review_path(path)
+            for path in changed_paths(self.project_root)
+        )
+        if self.mode == "collab" and scope == "final" and self._full_verify:
+            force_current_candidate = True
+        with self.orch._gate_executor_context(
+            metadata,
+            use_result_cache=not force_current_candidate,
+        ) as gate_executor:
             gate = run_gate_plan(
-                gate_commands,
-                self.config.gates.parallel_groups,
+                plan.commands,
+                plan.parallel_groups,
                 self.project_root,
                 collect_all=True,
                 parallel_workers=self.orch._gate_parallel_workers(),
                 command_timeout_seconds=self.config.gates.command_timeout_seconds,
                 adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
                 command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
-                progress=self.orch._gate_progress_callback("session verification"),
+                progress=self.orch._gate_progress_callback(
+                    f"session {scope} verification"
+                ),
                 gate_executor=gate_executor,
             )
+        record_gate(gate)
         self.orch._classify_reported_infrastructure_failures(gate)
+        if (
+            not gate.ok
+            and self.config.gates.verification_policy_version >= 3
+            and self.config.gates.incremental_mode == "auto"
+            and bool(self.config.gates.steps)
+            and state.baseline_git_ref
+        ):
+            failed_commands = list(
+                dict.fromkeys(
+                    result.command for result in gate.commands if not result.ok
+                )
+            )
+            failed_commands = [
+                command
+                for command in failed_commands
+                if command in set(state.baseline_commands)
+            ]
+            baseline_metadata = {
+                command: metadata.get(command, {}) for command in failed_commands
+            }
+            if failed_commands:
+                with self.orch._gate_executor_context(
+                    baseline_metadata,
+                    source_ref=state.baseline_git_ref,
+                ) as baseline_executor:
+                    baseline_gate = run_gate_plan(
+                        failed_commands,
+                        [],
+                        self.project_root,
+                        collect_all=True,
+                        parallel_workers=self.orch._gate_parallel_workers(),
+                        command_timeout_seconds=self.config.gates.command_timeout_seconds,
+                        adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
+                        command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+                        progress=self.orch._gate_progress_callback(
+                            "session lazy baseline verification"
+                        ),
+                        gate_executor=baseline_executor,
+                    )
+                self.orch._classify_reported_infrastructure_failures(baseline_gate)
+                record_gate(baseline_gate)
+                self.orch._raise_for_baseline_termination(
+                    baseline_gate,
+                    context="session lazy baseline verification",
+                )
+                state.baseline_failures = sorted(
+                    set(state.baseline_failures)
+                    | set(extract_failure_ids(baseline_gate))
+                )
+                self._save(state)
         extraction = extract_failure_info(gate)
         current_failures = extraction.failure_ids
         if not extraction.comparable and not gate.ok:
-            return {
-                "ok": False,
-                "reason": "non-comparable verification failure: failed command did not yield stable test-case failure ids",
-            }
+            return outcome(
+                False,
+                "non-comparable verification failure: failed command did not yield stable test-case failure ids",
+            )
         if (
             not gate.ok
             and extraction.comparable
@@ -1523,24 +1707,24 @@ class Session:
                 for item in state.baseline_failures
             )
         ):
-            return {
-                "ok": False,
-                "reason": (
+            return outcome(
+                False,
+                (
                     "verification failure identity changed from a command-level "
                     "baseline to stable test-case ids; baseline comparison is "
                     "non-comparable"
                 ),
-            }
+            )
         new_failures = sorted(set(current_failures) - set(state.baseline_failures))
         if new_failures:
-            return {
-                "ok": False,
-                "reason": (
+            return outcome(
+                False,
+                (
                     f"{len(new_failures)} new failure(s) introduced: "
                     + ", ".join(new_failures[:10])
                 ),
-            }
-        return {"ok": True, "reason": gate.summary}
+            )
+        return outcome(True, gate.summary)
 
     def _fix_verify_command_for_execution(self, command: str) -> str:
         stripped = command.strip()

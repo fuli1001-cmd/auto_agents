@@ -7,8 +7,8 @@
   "properties": {
     "verification_policy_version": {
       "type": "integer",
-      "enum": [1, 2],
-      "description": "Version 2 requires explicit executable task verification refs and safe concurrency declarations."
+      "enum": [1, 2, 3],
+      "description": "Version 3 adds verifiable incremental gate reuse and stable shards."
     },
     "test_strategy": {
       "type": "string"
@@ -79,7 +79,7 @@
           },
           "result_cache_scope": {
             "type": "string",
-            "enum": ["off", "candidate", "observed_inputs"]
+            "enum": ["off", "candidate", "observed_inputs", "auto"]
           },
           "resource_class": {
             "type": "string",

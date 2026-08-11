@@ -9,6 +9,7 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass, field, replace
 import fnmatch
+import hashlib
 import os
 import re
 import shlex
@@ -337,15 +338,20 @@ def expand_pytest_directory_steps(
     project_root: Path,
     *,
     max_batches_per_step: int = 8,
+    stable_shards: bool = False,
 ) -> List[VerificationStep]:
     expanded: List[VerificationStep] = []
     for step in steps:
+        stable_for_step = (
+            stable_shards
+            and step.result_cache_scope.strip().lower() != "off"
+        )
         runner = step.runner.strip().lower()
         kind = step.kind.strip().lower() or "test"
         if kind != "test" or runner != "pytest":
             expanded.append(step)
             continue
-        if step.max_batches == 1:
+        if step.max_batches == 1 and not stable_for_step:
             # Preserve the directory target so the runner's own discovery,
             # ignore configuration, and session fixtures remain authoritative.
             expanded.append(step)
@@ -376,12 +382,18 @@ def expand_pytest_directory_steps(
             replace(step, targets=[target], args=list(step.args))
             for target in fallback_targets
         )
-        expanded.extend(
-            replace(step, targets=batch, args=list(remaining_args))
-            for batch in _balanced_target_batches(
+        batch_limit = (
+            max_batches_per_step
+            if stable_for_step and step.max_batches == 1
+            else step.max_batches or max_batches_per_step
+        )
+        batches = (
+            _stable_target_shards(discovered_targets, max_shards=batch_limit)
+            if stable_for_step
+            else _balanced_target_batches(
                 discovered_targets,
                 project_root,
-                max_batches=step.max_batches or max_batches_per_step,
+                max_batches=batch_limit,
                 target_weights=_historical_target_weights(
                     step,
                     discovered_targets,
@@ -389,6 +401,10 @@ def expand_pytest_directory_steps(
                     project_root,
                 ),
             )
+        )
+        expanded.extend(
+            replace(step, targets=batch, args=list(remaining_args))
+            for batch in batches
         )
     return expanded
 
@@ -504,6 +520,28 @@ def _balanced_target_batches(
     return [sorted(batch) for batch in batches if batch]
 
 
+def _stable_target_shards(
+    targets: Sequence[str],
+    *,
+    max_shards: int,
+) -> list[list[str]]:
+    """Assign targets to durable shards that do not reshuffle with timings.
+
+    A stable hash keeps an unchanged test file in the same cache certificate
+    when timing history changes or another file is added.
+    """
+    unique_targets = sorted(set(targets))
+    if not unique_targets:
+        return []
+    shard_count = min(len(unique_targets), max(1, int(max_shards)))
+    shards: list[list[str]] = [[] for _ in range(shard_count)]
+    for target in unique_targets:
+        digest = hashlib.sha256(target.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:8], "big") % shard_count
+        shards[index].append(target)
+    return [sorted(shard) for shard in shards if shard]
+
+
 def _historical_target_weights(
     step: VerificationStep,
     targets: Sequence[str],
@@ -547,15 +585,20 @@ def expand_vitest_directory_steps(
     project_root: Path,
     *,
     max_batches_per_step: int = 8,
+    stable_shards: bool = False,
 ) -> List[VerificationStep]:
     expanded: list[VerificationStep] = []
     for step in steps:
+        stable_for_step = (
+            stable_shards
+            and step.result_cache_scope.strip().lower() != "off"
+        )
         runner = step.runner.strip().lower()
         kind = step.kind.strip().lower() or "test"
         if kind != "test" or runner != "vitest":
             expanded.append(step)
             continue
-        if step.max_batches == 1:
+        if step.max_batches == 1 and not stable_for_step:
             # Vitest config can exclude files that are visible on disk. A
             # single batch must retain directory discovery instead of turning
             # excluded files into explicit CLI filters.
@@ -589,12 +632,18 @@ def expand_vitest_directory_steps(
             replace(step, targets=[target], args=list(step.args))
             for target in fallback_targets
         )
-        expanded.extend(
-            replace(step, targets=batch, args=list(remaining_args))
-            for batch in _balanced_target_batches(
+        batch_limit = (
+            max_batches_per_step
+            if stable_for_step and step.max_batches == 1
+            else step.max_batches or max_batches_per_step
+        )
+        batches = (
+            _stable_target_shards(discovered_targets, max_shards=batch_limit)
+            if stable_for_step
+            else _balanced_target_batches(
                 discovered_targets,
                 project_root,
-                max_batches=step.max_batches or max_batches_per_step,
+                max_batches=batch_limit,
                 target_weights=_historical_target_weights(
                     step,
                     discovered_targets,
@@ -602,6 +651,10 @@ def expand_vitest_directory_steps(
                     project_root,
                 ),
             )
+        )
+        expanded.extend(
+            replace(step, targets=batch, args=list(remaining_args))
+            for batch in batches
         )
     return expanded
 
@@ -611,15 +664,18 @@ def expand_verification_directory_steps(
     project_root: Path,
     *,
     max_batches_per_step: int = 8,
+    stable_shards: bool = False,
 ) -> List[VerificationStep]:
     return expand_vitest_directory_steps(
         expand_pytest_directory_steps(
             steps,
             project_root,
             max_batches_per_step=max_batches_per_step,
+            stable_shards=stable_shards,
         ),
         project_root,
         max_batches_per_step=max_batches_per_step,
+        stable_shards=stable_shards,
     )
 
 
@@ -715,10 +771,15 @@ def resolve_gate_plan_from_verification_steps(
             else "source"
         )
         cache_scopes[command] = cache_scope
-        result_cache_order = {"observed_inputs": 0, "candidate": 1, "off": 2}
+        result_cache_order = {
+            "observed_inputs": 0,
+            "auto": 0,
+            "candidate": 1,
+            "off": 2,
+        }
         result_cache_scope = max(
             (
-                step.result_cache_scope.strip().lower() or "candidate"
+                step.result_cache_scope.strip().lower() or "auto"
                 for step in command_steps
             ),
             key=lambda value: result_cache_order.get(value, 2),

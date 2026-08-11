@@ -113,3 +113,48 @@ def test_observed_input_cache_invalidates_when_an_input_changes(tmp_path: Path) 
         )
         is None
     )
+
+
+def test_auto_cache_reuses_complete_inputs_and_tracks_negative_lookups(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src.txt"
+    source.write_text("one\n", encoding="utf-8")
+    cache = _cache(tmp_path)
+
+    import hashlib
+
+    digest = "file:" + hashlib.sha256(source.read_bytes()).hexdigest()
+    cache.record(
+        "check",
+        CommandResult(
+            command="check",
+            ok=True,
+            returncode=0,
+            observed_inputs={"src.txt": digest, "!optional.txt": "missing"},
+            input_trace_complete=True,
+        ),
+        source_fingerprint="source-1",
+        cache_scope="source",
+        result_cache_scope="auto",
+        metadata_signature="metadata-1",
+    )
+
+    hit = cache.lookup(
+        "check",
+        source_fingerprint="source-2",
+        cache_scope="source",
+        result_cache_scope="auto",
+        metadata_signature="metadata-1",
+    )
+    assert hit is not None
+    assert hit.backend == "result-cache-observed-inputs"
+
+    (tmp_path / "optional.txt").write_text("now present\n", encoding="utf-8")
+    assert cache.lookup(
+        "check",
+        source_fingerprint="source-3",
+        cache_scope="source",
+        result_cache_scope="auto",
+        metadata_signature="metadata-1",
+    ) is None

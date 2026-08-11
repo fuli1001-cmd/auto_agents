@@ -19,7 +19,7 @@ DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 TASK_ORIGINS = ("planned", "scope_split", "evidence_repair", "stage_recovery")
 VERIFICATION_CADENCES = ("implement_and_final", "final_only")
 VERIFICATION_CACHE_SCOPES = ("source", "run_context")
-VERIFICATION_RESULT_CACHE_SCOPES = ("off", "candidate", "observed_inputs")
+VERIFICATION_RESULT_CACHE_SCOPES = ("off", "candidate", "observed_inputs", "auto")
 VERIFICATION_SERIAL_REASONS = (
     "artifact_chain",
     "shared_mutable_state",
@@ -278,7 +278,7 @@ class VerificationStep:
     serial_reason: str = ""
     cadence: str = "implement_and_final"
     cache_scope: str = "run_context"
-    result_cache_scope: str = "candidate"
+    result_cache_scope: str = "auto"
     resource_class: str = "normal"
     cpu_slots: int = 0
     memory_mb: int = 0
@@ -303,7 +303,7 @@ class VerificationStep:
             serial_reason=str(data.get("serial_reason", "")),
             cadence=str(data.get("cadence", "implement_and_final")),
             cache_scope=str(data.get("cache_scope", "run_context")),
-            result_cache_scope=str(data.get("result_cache_scope", "candidate")),
+            result_cache_scope=str(data.get("result_cache_scope", "auto")),
             resource_class=str(data.get("resource_class", "normal")),
             cpu_slots=int(data.get("cpu_slots", 0) or 0),
             memory_mb=int(data.get("memory_mb", 0) or 0),
@@ -450,6 +450,10 @@ class GateConfig:
     parallel_workers: Union[int, str] = "auto"
     max_auto_workers: Union[int, str] = "auto"
     target_final_seconds: int = 0
+    incremental_mode: str = "auto"
+    warm_target_seconds: int = 900
+    shard_target_seconds: int = 300
+    cache_max_age_seconds: int = 14 * 24 * 60 * 60
     command_timeout_seconds: int = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS
     adaptive_timeout_enabled: bool = True
     command_idle_timeout_seconds: int = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS
@@ -494,6 +498,41 @@ class GateConfig:
                 else str(data.get("max_auto_workers", "auto"))
             ),
             target_final_seconds=max(0, int(data.get("target_final_seconds", 0) or 0)),
+            incremental_mode=str(
+                dict(data.get("incremental", {})).get("mode", "auto")
+                if isinstance(data.get("incremental", {}), dict)
+                else "auto"
+            ),
+            warm_target_seconds=max(
+                1,
+                int(
+                    dict(data.get("incremental", {})).get(
+                        "warm_target_seconds", 900
+                    )
+                    if isinstance(data.get("incremental", {}), dict)
+                    else 900
+                ),
+            ),
+            shard_target_seconds=max(
+                1,
+                int(
+                    dict(data.get("incremental", {})).get(
+                        "shard_target_seconds", 300
+                    )
+                    if isinstance(data.get("incremental", {}), dict)
+                    else 300
+                ),
+            ),
+            cache_max_age_seconds=max(
+                1,
+                int(
+                    dict(data.get("incremental", {})).get(
+                        "cache_max_age_seconds", 14 * 24 * 60 * 60
+                    )
+                    if isinstance(data.get("incremental", {}), dict)
+                    else 14 * 24 * 60 * 60
+                ),
+            ),
             command_timeout_seconds=command_timeout_seconds,
             adaptive_timeout_enabled=bool(data.get("adaptive_timeout_enabled", True)),
             command_idle_timeout_seconds=int(
@@ -530,6 +569,12 @@ class GateConfig:
             "parallel_workers": self.parallel_workers,
             "max_auto_workers": self.max_auto_workers,
             "target_final_seconds": self.target_final_seconds,
+            "incremental": {
+                "mode": self.incremental_mode,
+                "warm_target_seconds": self.warm_target_seconds,
+                "shard_target_seconds": self.shard_target_seconds,
+                "cache_max_age_seconds": self.cache_max_age_seconds,
+            },
             "command_timeout_seconds": self.command_timeout_seconds,
             "adaptive_timeout_enabled": self.adaptive_timeout_enabled,
             "command_idle_timeout_seconds": self.command_idle_timeout_seconds,
@@ -1052,6 +1097,7 @@ class RunState:
     task_review_cache: Dict[str, Dict[str, str]] = field(default_factory=dict)
     implement_verify_baseline_failures: List[str] = field(default_factory=list)
     implement_verify_baseline_ref: str = ""
+    verify_recovery_refs: List[str] = field(default_factory=list)
     plan_task_replacements: Dict[str, List[str]] = field(default_factory=dict)
     last_error: str = ""
     rejection_reason: str = ""
@@ -1094,6 +1140,9 @@ class RunState:
                 str(item) for item in data.get("implement_verify_baseline_failures", [])
             ],
             implement_verify_baseline_ref=str(data.get("implement_verify_baseline_ref", "")),
+            verify_recovery_refs=[
+                str(item) for item in data.get("verify_recovery_refs", [])
+            ],
             plan_task_replacements={
                 str(key): [str(item) for item in value]
                 for key, value in dict(data.get("plan_task_replacements", {})).items()
@@ -1160,6 +1209,7 @@ class RunState:
             },
             "implement_verify_baseline_failures": list(self.implement_verify_baseline_failures),
             "implement_verify_baseline_ref": self.implement_verify_baseline_ref,
+            "verify_recovery_refs": list(self.verify_recovery_refs),
             "plan_task_replacements": {
                 key: list(value) for key, value in self.plan_task_replacements.items()
             },
@@ -1204,6 +1254,8 @@ class SessionState:
     fix_verify_command: str = ""
     baseline_failures: List[str] = field(default_factory=list)
     baseline_git_ref: str = ""
+    baseline_head_ref: str = ""
+    baseline_commands: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "SessionState":
@@ -1233,6 +1285,8 @@ class SessionState:
             fix_verify_command=str(data.get("fix_verify_command", "")),
             baseline_failures=[str(f) for f in data.get("baseline_failures", [])],
             baseline_git_ref=str(data.get("baseline_git_ref", "")),
+            baseline_head_ref=str(data.get("baseline_head_ref", "")),
+            baseline_commands=[str(item) for item in data.get("baseline_commands", [])],
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1256,6 +1310,8 @@ class SessionState:
             "fix_verify_command": self.fix_verify_command,
             "baseline_failures": list(self.baseline_failures),
             "baseline_git_ref": self.baseline_git_ref,
+            "baseline_head_ref": self.baseline_head_ref,
+            "baseline_commands": list(self.baseline_commands),
         }
 
 

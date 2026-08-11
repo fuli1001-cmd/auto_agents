@@ -167,6 +167,36 @@ class BootstrapTests(unittest.TestCase):
             config = load_project_config(project_root)
             self.assertEqual(config.providers["copilot-cli"].idle_timeout_seconds, 3600)
 
+    def test_load_project_config_migrates_v2_gates_to_incremental_v3(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo")
+            config_file = config_path(project_root)
+            raw = json.loads(config_file.read_text(encoding="utf-8"))
+            raw["gates"]["verification_policy_version"] = 2
+            raw["gates"].pop("incremental", None)
+            raw["gates"]["steps"] = [
+                {
+                    "kind": "test",
+                    "runner": "pytest",
+                    "targets": ["tests/test_example.py"],
+                    "result_cache_scope": "candidate",
+                }
+            ]
+            config_file.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+
+            config = load_project_config(project_root)
+            persisted = json.loads(config_file.read_text(encoding="utf-8"))
+
+            self.assertEqual(config.gates.verification_policy_version, 3)
+            self.assertEqual(config.gates.incremental_mode, "auto")
+            self.assertEqual(config.gates.steps[0].result_cache_scope, "auto")
+            self.assertEqual(persisted["gates"]["verification_policy_version"], 3)
+            self.assertEqual(
+                persisted["gates"]["incremental"]["warm_target_seconds"],
+                900,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

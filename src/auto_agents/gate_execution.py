@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import secrets
 import shlex
 import shutil
@@ -164,13 +165,29 @@ class GateSnapshotManager:
         finally:
             index_path.unlink(missing_ok=True)
 
+    def use_ref(self, source_ref: str) -> GateSourceSnapshot:
+        """Use an immutable existing commit/ref as the plan source."""
+        commit = _run_git(
+            self.project_root, "rev-parse", "--verify", f"{source_ref}^{{commit}}"
+        ).stdout.strip()
+        tree = _run_git(
+            self.project_root, "rev-parse", "--verify", f"{commit}^{{tree}}"
+        ).stdout.strip()
+        self.snapshot = GateSourceSnapshot(
+            commit_sha=commit,
+            tree_sha=tree,
+            ref_name="",
+        )
+        return self.snapshot
+
     def close(self) -> None:
         if self.snapshot is None:
             return
-        try:
-            _run_git(self.project_root, "update-ref", "-d", self.snapshot.ref_name)
-        except RuntimeError:
-            pass
+        if self.snapshot.ref_name:
+            try:
+                _run_git(self.project_root, "update-ref", "-d", self.snapshot.ref_name)
+            except RuntimeError:
+                pass
         self.snapshot = None
 
 
@@ -203,6 +220,21 @@ def _metadata_signature(metadata: object) -> str:
         "artifact_globs": sorted(_metadata_list(metadata, "artifact_globs")),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _effective_result_cache_scope(metadata: object) -> str:
+    scope = str(getattr(metadata, "result_cache_scope", "off")).strip().lower()
+    if scope != "auto":
+        return scope
+    if (
+        str(getattr(metadata, "cache_scope", "run_context")).strip().lower()
+        != "source"
+        or _metadata_list(metadata, "artifact_globs")
+        or _metadata_list(metadata, "exclusive_resources")
+        or _metadata_list(metadata, "dynamic_ports")
+    ):
+        return "candidate"
+    return "auto"
 
 
 def _path_observation_digest(path: Path) -> str:
@@ -258,6 +290,19 @@ def _observed_input_manifest(
         ):
             continue
         if not resolved.exists():
+            # Negative lookups are inputs too: a later source change that
+            # creates the probed path must invalidate this certificate.
+            manifest[f"!{relative}"] = "missing"
+            parent = resolved.parent
+            try:
+                parent_relative = parent.relative_to(sandbox.resolve()).as_posix()
+            except ValueError:
+                continue
+            if parent.exists() and parent_relative not in {"", "."}:
+                try:
+                    manifest[parent_relative] = _path_observation_digest(parent)
+                except OSError:
+                    return {}, network_observed
             continue
         try:
             manifest[relative] = _path_observation_digest(resolved)
@@ -619,6 +664,8 @@ class LocalGatePlanExecutor:
         worker_id: str = "local",
         environment_fingerprint: str = "",
         result_context_fingerprint: str = "",
+        source_ref: str = "",
+        use_result_cache: bool = True,
     ) -> None:
         self.project_root = project_root.resolve()
         self.gate_config = gate_config
@@ -641,6 +688,8 @@ class LocalGatePlanExecutor:
             else discover_dependency_links(self.project_root)
         )
         self.worker_id = worker_id
+        self.source_ref = str(source_ref).strip()
+        self.use_result_cache = bool(use_result_cache)
         self.timing_store = GateTimingStore(
             self.project_root,
             environment_fingerprint=environment_fingerprint,
@@ -649,6 +698,7 @@ class LocalGatePlanExecutor:
             self.project_root,
             environment_fingerprint=environment_fingerprint,
             context_fingerprint=result_context_fingerprint,
+            max_age_seconds=gate_config.cache_max_age_seconds,
         )
         self._shared_sandboxes: dict[str, Path] = {}
         self._published_hashes: dict[str, str] = {}
@@ -656,7 +706,11 @@ class LocalGatePlanExecutor:
 
     def __enter__(self) -> "LocalGatePlanExecutor":
         self.worktree_root.mkdir(parents=True, exist_ok=True)
-        self.snapshot = self.snapshot_manager.create()
+        self.snapshot = (
+            self.snapshot_manager.use_ref(self.source_ref)
+            if self.source_ref
+            else self.snapshot_manager.create()
+        )
         return self
 
     def __exit__(self, _type, _value, _traceback) -> None:
@@ -689,7 +743,8 @@ class LocalGatePlanExecutor:
 
     def cached_result(self, command: str) -> Optional[CommandResult]:
         if (
-            self.gate_config.verification_policy_version < 2
+            not self.use_result_cache
+            or self.gate_config.verification_policy_version < 2
             or self.snapshot is None
         ):
             return None
@@ -700,9 +755,7 @@ class LocalGatePlanExecutor:
             cache_scope=str(
                 getattr(metadata, "cache_scope", "run_context")
             ).strip().lower(),
-            result_cache_scope=str(
-                getattr(metadata, "result_cache_scope", "off")
-            ).strip().lower(),
+            result_cache_scope=_effective_result_cache_scope(metadata),
             metadata_signature=_metadata_signature(metadata),
         )
 
@@ -712,7 +765,8 @@ class LocalGatePlanExecutor:
         result: CommandResult,
     ) -> None:
         if (
-            self.gate_config.verification_policy_version < 2
+            not self.use_result_cache
+            or self.gate_config.verification_policy_version < 2
             or self.snapshot is None
         ):
             return
@@ -724,9 +778,7 @@ class LocalGatePlanExecutor:
             cache_scope=str(
                 getattr(metadata, "cache_scope", "run_context")
             ).strip().lower(),
-            result_cache_scope=str(
-                getattr(metadata, "result_cache_scope", "off")
-            ).strip().lower(),
+            result_cache_scope=_effective_result_cache_scope(metadata),
             metadata_signature=_metadata_signature(metadata),
         )
 
@@ -873,11 +925,7 @@ class LocalGatePlanExecutor:
         cleanup = not bool(lane)
         try:
             metadata = self.metadata.get(command)
-            result_cache_scope = (
-                str(getattr(metadata, "result_cache_scope", "off"))
-                .strip()
-                .lower()
-            )
+            result_cache_scope = _effective_result_cache_scope(metadata)
             cached = self.cached_result(command)
             if cached is not None:
                 if progress is not None:
@@ -899,7 +947,7 @@ class LocalGatePlanExecutor:
             trace_path: Optional[Path] = None
             traced_command = isolated_command(command)
             if (
-                result_cache_scope == "observed_inputs"
+                result_cache_scope in {"observed_inputs", "auto"}
                 and shutil.which("strace")
             ):
                 trace_path = runtime_root / "input-trace.log"

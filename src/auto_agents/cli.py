@@ -717,6 +717,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Archive a blocked run and start a fresh run; refuses dirty project code.",
     )
+    run_parser.add_argument(
+        "--full-verify",
+        action="store_true",
+        help="Bypass incremental gate certificates and execute every final shard.",
+    )
 
     stop_parser = subparsers.add_parser(
         "stop",
@@ -800,6 +805,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print each agent output to stderr as it completes.",
     )
+    fix_parser.add_argument(
+        "--full-verify",
+        action="store_true",
+        help="Bypass incremental gate certificates for this fix session.",
+    )
 
     collab_parser = subparsers.add_parser("collab", help="User-agent collaborative debugging session.")
     collab_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -816,6 +826,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--print-agent-output",
         action="store_true",
         help="Print each agent output to stderr as it completes.",
+    )
+    collab_parser.add_argument(
+        "--full-verify",
+        action="store_true",
+        help=(
+            "Bypass incremental gate certificates only for collab's final "
+            "completion attestation."
+        ),
     )
 
     provider_resolve_parser = subparsers.add_parser(
@@ -1107,6 +1125,7 @@ def main(argv: list[str] | None = None) -> int:
                 doc_language=args.doc_language,
                 provider_kind=args.provider,
                 restart_blocked=bool(getattr(args, "restart_blocked", False)),
+                full_verify=bool(getattr(args, "full_verify", False)),
             )
             state_payload = state.to_dict()
             state_status = str(state_payload.get("status", ""))
@@ -1328,11 +1347,13 @@ def main(argv: list[str] | None = None) -> int:
                 session_id=args.session or "",
                 mode=mode,
             )
-            session = Session(
-                orchestrator,
-                mode=mode,
-                print_agent_output=bool(args.print_agent_output),
-            )
+            session_kwargs = {
+                "mode": mode,
+                "print_agent_output": bool(args.print_agent_output),
+            }
+            if bool(getattr(args, "full_verify", False)):
+                session_kwargs["full_verify"] = True
+            session = Session(orchestrator, **session_kwargs)
             if args.session:
                 state = session.resume(args.session)
             else:

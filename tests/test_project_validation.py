@@ -1972,6 +1972,49 @@ class ProjectValidationTests(unittest.TestCase):
                     self.assertEqual(notify.call_args.args[1]["status"], "completed")
                     self.assertEqual(notify.call_args.kwargs["command"], command)
 
+    def test_cli_collab_full_verify_reaches_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            received = {}
+
+            class FakeOrchestrator:
+                def __init__(self, project_root, agent_output_stream=None):
+                    self.project_root = project_root
+                    self._print_agent_output = False
+
+                def _ensure_agent_instructions_synced(self):
+                    return None
+
+            class FakeSession:
+                def __init__(
+                    self,
+                    orchestrator,
+                    mode,
+                    print_agent_output=False,
+                    full_verify=False,
+                ):
+                    received["mode"] = mode
+                    received["full_verify"] = full_verify
+
+                def offer_resume_or_new(self):
+                    return SessionState(
+                        session_id="collab-full-verify",
+                        mode="collab",
+                        status="completed",
+                    )
+
+            with (
+                patch("auto_agents.cli.Orchestrator", FakeOrchestrator),
+                patch("auto_agents.session.Session", FakeSession),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = main(
+                    ["collab", "--project", str(project_root), "--full-verify"]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(received, {"mode": "collab", "full_verify": True})
+
     def test_cli_session_command_notifies_failure_exception(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

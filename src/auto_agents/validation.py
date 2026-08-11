@@ -617,9 +617,9 @@ def validate_task_plan_payload(
     if (
         not isinstance(verification_policy_version, int)
         or isinstance(verification_policy_version, bool)
-        or verification_policy_version not in {1, 2}
+        or verification_policy_version not in {1, 2, 3}
     ):
-        errors.append("task plan verification_policy_version must be 1 or 2")
+        errors.append("task plan verification_policy_version must be 1, 2, or 3")
         verification_policy_version = 1
 
     test_strategy = payload.get("test_strategy")
@@ -1088,9 +1088,9 @@ def validate_project_config_payload(payload: object) -> List[str]:
         if (
             not isinstance(verification_policy_version, int)
             or isinstance(verification_policy_version, bool)
-            or verification_policy_version not in {1, 2}
+            or verification_policy_version not in {1, 2, 3}
         ):
-            errors.append("gates.verification_policy_version must be 1 or 2")
+            errors.append("gates.verification_policy_version must be 1, 2, or 3")
             verification_policy_version = 1
         commands = gates.get("commands")
         if not isinstance(commands, list) or any(not isinstance(item, str) for item in commands):
@@ -1143,6 +1143,30 @@ def validate_project_config_payload(payload: object) -> List[str]:
             or target_final_seconds < 0
         ):
             errors.append("gates.target_final_seconds must be an integer >= 0")
+        incremental = gates.get("incremental", {})
+        if not isinstance(incremental, dict):
+            errors.append("gates.incremental must be an object")
+        else:
+            mode = incremental.get("mode", "auto")
+            if mode not in {"auto", "off"}:
+                errors.append("gates.incremental.mode must be auto or off")
+            for field in (
+                "warm_target_seconds",
+                "shard_target_seconds",
+                "cache_max_age_seconds",
+            ):
+                value = incremental.get(
+                    field,
+                    900 if field == "warm_target_seconds" else (
+                        300 if field == "shard_target_seconds" else 1209600
+                    ),
+                )
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 1
+                ):
+                    errors.append(f"gates.incremental.{field} must be an integer >= 1")
         command_timeout_seconds = gates.get("command_timeout_seconds", 7200)
         if (
             not isinstance(command_timeout_seconds, int)

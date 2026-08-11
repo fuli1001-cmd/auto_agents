@@ -274,7 +274,7 @@ By default, implementation refuses to start if the target repository already has
 Use `--allow-dirty-tree` only when you explicitly want task work to proceed on top of an existing
 dirty workspace.
 
-During `plan`, the agent must write `verification_policy_version: 2`, `test_strategy`, and
+During `plan`, the agent must write `verification_policy_version: 3`, `test_strategy`, and
 structured `verification_steps` into
 `.auto-agents/state/task_plan.json`. By default the orchestrator derives runnable gate commands from
 those steps and stores both the structured steps and derived commands in `.auto-agents/config.json`,
@@ -296,9 +296,9 @@ context changes. Version 2 also requires every active task to own one or more ex
 `tests/test_api.py::test_contract`; a whole-file ref is accepted only when that file is an
 `implement_and_final` step.
 
-Broad Pytest and Vitest directory targets must use `cadence: "final_only"`. Before execution,
-auto_agents expands those targets into one step per discovered test file, which permits bounded
-parallel scheduling without assigning the entire release suite to every implementation task.
+Broad Pytest and Vitest directory targets must use `cadence: "final_only"`. Policy v3 expands
+them into stable hash shards. Unchanged files remain in the same shard when timing history changes,
+so successful shards form durable verification certificates instead of one monolithic suite result.
 
 Inspect persisted progress:
 
@@ -534,7 +534,10 @@ Review auto-escalation triggers (when configured as `balanced`):
 
 Setting review to `deep` or `max` overrides auto-escalation and uses that effort for every review.
 
-Implementation-stage verification baselines are cached per command in
+Under policy v3, implementation and fix baselines capture the immutable source first but do not run
+the suite eagerly. If a candidate shard fails, only that shard is evaluated on the baseline to
+distinguish a regression from a pre-existing failure. Successful candidate shards are cached per
+command in
 `.auto-agents/state/gate_baseline_cache.sqlite3`, keyed by the effective baseline ref, normalized
 command, execution mode, and collect-all behavior. Adding one command therefore runs only the new
 command. Source-scoped entries survive a plan rewind when the source fingerprint is unchanged;
@@ -544,7 +547,7 @@ fingerprint remain identical. The legacy JSON cache is ignored; the first run af
 captures one cold baseline. Cache corruption disables reuse and falls back to running the real
 commands.
 
-Under verification policy version 2, concurrency must be explicit. A
+Under verification policy version 2 or 3, concurrency must be explicit. A
 `verification_steps` entry is concurrent only when it sets `parallel_safe=true`; otherwise it must
 set `parallel_safe=false` and declare a `serial_reason` (`artifact_chain`,
 `shared_mutable_state`, `fixed_port`, `external_side_effect`, or `ordered_contract`). Safe entries
@@ -593,9 +596,15 @@ file or an implementation-session UUID is not accepted as completion evidence.
 ```json
 {
   "gates": {
-    "verification_policy_version": 2,
+    "verification_policy_version": 3,
     "target_final_seconds": 0,
     "max_auto_workers": "auto",
+    "incremental": {
+      "mode": "auto",
+      "warm_target_seconds": 900,
+      "shard_target_seconds": 300,
+      "cache_max_age_seconds": 1209600
+    },
     "isolation": {
       "enabled": true,
       "mode": "git_worktree",
@@ -617,7 +626,7 @@ Gate steps may also declare scheduling and artifact metadata:
   "parallel_safe": true,
   "max_batches": 4,
   "cache_scope": "source",
-  "result_cache_scope": "candidate",
+  "result_cache_scope": "auto",
   "resource_class": "heavy",
   "cpu_slots": 2,
   "memory_mb": 4096,
@@ -630,17 +639,27 @@ Gate steps may also declare scheduling and artifact metadata:
 }
 ```
 
-`max_batches` bounds directory expansion for one verification step. Zero or omission uses the
-worker-aware default; `1` keeps the discovered suite in one runner process when fixtures or media
-initialization cost more than test-level concurrency saves.
+`max_batches` bounds directory expansion for one verification step. In policy v3, cacheable
+directory suites use stable shards even when a legacy plan specified `1`; use
+`result_cache_scope: "off"` for a suite whose single-process semantics must always be preserved.
 
 `result_cache_scope` controls the success-only command result cache stored in the gate cache
-database. `candidate` reuses a success only for an identical source and semantic context;
+database. `auto` uses exact-candidate reuse everywhere and upgrades source-scoped commands to
+cross-candidate reuse only after a complete local filesystem trace proves all inputs unchanged;
+negative path lookups, dependency lock state, runtime identity, and network access participate in
+the certificate. `candidate` reuses a success only for an identical source and semantic context;
 `observed_inputs` can reuse across commits when Linux syscall tracing proves that every observed
 project input is unchanged and no network access occurred; `off` always executes. Validation only
 permits `observed_inputs` on source-scoped, parallel-safe checks without artifacts, exclusive
 resources, or dynamic ports. Failures, timeouts, mutations, infrastructure errors, and artifact
 producers are never cached.
+
+Final verification still attests every logical shard: cache hits count as certificate-backed
+successes, while misses execute synchronously. Use `run --full-verify` or `fix --full-verify` to
+bypass all result certificates and execute every current-candidate shard. With
+`collab --full-verify`, only the final completion attestation bypasses certificates; interactive
+progress checks remain incremental. Existing v2 project configs without an `incremental` block are
+migrated to v3 automatically when loaded.
 
 `cpu_slots` declares how many worker scheduling slots the command consumes. Zero or omission keeps
 the compatibility default: `resource_class=heavy` consumes two slots and normal commands consume
@@ -1297,13 +1316,21 @@ the browser"):
 
 1. **Converse** — describe the goal; the agent clarifies
 2. **Iterate** — the agent works toward the goal autonomously; when it needs user action (e.g. "open
-   the browser and check the result"), it pauses with `NEED_USER_ASSIST`; verified bug fixes are
-   committed as they happen; when it believes the goal is achieved it asks for your confirmation
-3. **Complete** — you confirm success and any remaining changes are committed
+   the browser and check the result"), it pauses with `NEED_USER_ASSIST`. Ordinary progress and
+   `BUG_FOUND` iterations run only `implement_and_final` gates, using the shared session-start lazy
+   baseline and successful shard certificates. Verified bug fixes are committed as they happen.
+3. **Complete** — `GOAL_ACHIEVED`, or your confirmation after an ordinary progress result, runs the
+   final plan including `final_only` gates. Changes are committed only after that final attestation
+   passes.
 
 ```bash
 python3 -m auto_agents collab --project /tmp/demo
+# Force physical execution only for the final completion attestation
+python3 -m auto_agents collab --project /tmp/demo --full-verify
 ```
+
+Each verification entry in the saved session log records its `progress` or `final` scope, logical
+command count, physically executed command count, certificate hits, and wall-clock duration.
 
 ### Provider research recovery (`provider-resolve`)
 

@@ -384,7 +384,41 @@ def gate_environment_fingerprint(
     environment_id: str,
     distributed: bool,
     extra_denylist: Sequence[str] = (),
+    project_root: Optional[Path] = None,
 ) -> str:
+    dependency_state: dict[str, str] = {}
+    if project_root is not None:
+        root = Path(project_root)
+        for relative in (
+            "pyproject.toml",
+            "poetry.lock",
+            "uv.lock",
+            "requirements.txt",
+            "environment.yml",
+            "environment.yaml",
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+        ):
+            path = root / relative
+            try:
+                if path.is_file():
+                    dependency_state[relative] = hashlib.sha256(
+                        path.read_bytes()
+                    ).hexdigest()
+            except OSError:
+                dependency_state[relative] = "unreadable"
+        conda_meta = root / ".conda" / "conda-meta"
+        try:
+            if conda_meta.is_dir():
+                dependency_state[".conda/conda-meta"] = hashlib.sha256(
+                    "\n".join(
+                        sorted(path.name for path in conda_meta.glob("*.json"))
+                    ).encode("utf-8")
+                ).hexdigest()
+        except OSError:
+            dependency_state[".conda/conda-meta"] = "unreadable"
     payload = {
         "isolation_mode": isolation_mode,
         "environment_id": environment_id,
@@ -393,6 +427,7 @@ def gate_environment_fingerprint(
         "environment": sorted(
             forwarded_environment(os.environ, extra_denylist).items()
         ),
+        "dependency_state": dependency_state,
     }
     encoded = json.dumps(
         payload,

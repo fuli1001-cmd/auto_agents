@@ -333,6 +333,7 @@ class Orchestrator:
         self._active_spec_file: Optional[Path] = None
         self._user_input_fn = user_input_fn
         self._allow_dirty_tree = False
+        self._force_full_verify = False
         # Run-level failover memory (in-memory only, never persisted)
         self._last_successful_provider: Optional[str] = None
         self._failed_providers: Set[str] = set()
@@ -359,6 +360,7 @@ class Orchestrator:
             environment_id=self.config.gates.distributed.mode,
             distributed=self.config.gates.distributed.enabled,
             extra_denylist=self.config.gates.distributed.extra_environment_denylist,
+            project_root=self.project_root,
         )
         self._gate_baseline_cache = GateBaselineCache(
             self.project_root,
@@ -1608,6 +1610,14 @@ class Orchestrator:
             limit=limit,
         )
         state.agent_attempts["verify_recovery"] = attempts
+        state.verify_recovery_refs = list(
+            dict.fromkeys(
+                f"cmd:{result.command}"
+                for result in verify_gate.commands
+                if not result.ok
+                and self._safe_execution_recovery_command(result.command)
+            )
+        )
         self._rewind_state_from_stage(state, "implement")
         state.rejected_stage = "implement"
         state.rejection_reason = feedback
@@ -1624,11 +1634,13 @@ class Orchestrator:
         doc_language: Optional[str] = None,
         provider_kind: Optional[str] = None,
         restart_blocked: bool = False,
+        full_verify: bool = False,
     ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
         self._ensure_agent_instructions_synced()
         self._print_agent_output = print_agent_output
         self._allow_dirty_tree = allow_dirty_tree
+        self._force_full_verify = bool(full_verify)
         try:
             self._cleanup_failed_verification_logs()
             if provider_kind is not None:
@@ -3826,7 +3838,10 @@ class Orchestrator:
             self.logger,
             f"gate:{context} commands={len(commands)} groups={len(parallel_groups)}",
         ):
-            with self._gate_executor_context(plan.metadata) as gate_executor:
+            with self._gate_executor_context(
+                plan.metadata,
+                use_result_cache=not self._force_full_verify,
+            ) as gate_executor:
                 gate = run_gate_plan(
                     commands,
                     parallel_groups,
@@ -3869,6 +3884,7 @@ class Orchestrator:
         *,
         collect_all: bool,
         context: str,
+        source_ref: str = "",
     ):
         self._apply_generated_verification_config()
         before_snapshot = self._worktree_change_snapshot()
@@ -3881,7 +3897,10 @@ class Orchestrator:
         with log_timing(self.logger, f"gate:{context} commands={len(commands)}"):
             known = self._resolved_gate_plan("final").metadata
             metadata = {command: known.get(command, {}) for command in commands}
-            with self._gate_executor_context(metadata) as gate_executor:
+            with self._gate_executor_context(
+                metadata,
+                source_ref=source_ref,
+            ) as gate_executor:
                 gate = run_gate_plan(
                     commands,
                     [],
@@ -4229,6 +4248,7 @@ class Orchestrator:
                         "invocations": 0,
                         "duration_seconds": 0.0,
                         "cache_hits": 0,
+                        "cache_hits_by_backend": {},
                         "failures": 0,
                         "contexts": {},
                         "workers": {},
@@ -4241,6 +4261,16 @@ class Orchestrator:
                 entry["cache_hits"] = int(entry["cache_hits"]) + int(
                     bool(getattr(result, "cached", False))
                 )
+                if bool(getattr(result, "cached", False)):
+                    cache_backend = str(
+                        getattr(result, "backend", "result-cache")
+                        or "result-cache"
+                    )
+                    cache_backends = dict(entry["cache_hits_by_backend"])
+                    cache_backends[cache_backend] = int(
+                        cache_backends.get(cache_backend, 0)
+                    ) + 1
+                    entry["cache_hits_by_backend"] = cache_backends
                 entry["failures"] = int(entry["failures"]) + int(
                     not bool(getattr(result, "ok", False))
                 )
@@ -4274,7 +4304,7 @@ class Orchestrator:
         final_seconds = float(self._performance_stages.get("verify", 0.0))
         target_seconds = max(0, int(self.config.gates.target_final_seconds))
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": run_id,
             "target_final_seconds": target_seconds,
             "final_verification": {
@@ -4295,6 +4325,10 @@ class Orchestrator:
             },
             "gates": {
                 "command_invocations": total_invocations,
+                "logical_commands_attested": total_invocations,
+                "executed_commands": total_invocations - cache_hits,
+                "certificate_hits": cache_hits,
+                "warm_target_seconds": self.config.gates.warm_target_seconds,
                 "duration_seconds": round(
                     sum(
                         float(item.get("duration_seconds", 0.0))
@@ -5917,8 +5951,13 @@ class Orchestrator:
         normalized = str(command or "").strip()
         return bool(normalized and "<redacted>" not in normalized.lower())
 
-    def _stage_recovery_verification_refs(self) -> List[str]:
+    def _stage_recovery_verification_refs(
+        self,
+        state: Optional[RunState] = None,
+    ) -> List[str]:
         """Return the configured proof surface for an orchestrator recovery task."""
+        if state is not None and state.verify_recovery_refs:
+            return list(dict.fromkeys(state.verify_recovery_refs))
         try:
             payload = load_task_plan(self.project_root)
             policy_version = max(
@@ -5927,6 +5966,11 @@ class Orchestrator:
         except (OSError, TypeError, ValueError):
             return []
         if policy_version < 2:
+            return []
+        if policy_version >= 3:
+            # A v3 recovery task is bound to the failed attestation. Falling
+            # back to every configured command would amplify one failure into
+            # another full-suite run.
             return []
 
         commands: List[str] = []
@@ -6437,11 +6481,15 @@ class Orchestrator:
     def _gate_executor_context(
         self,
         metadata: Optional[Dict[str, object]] = None,
+        *,
+        source_ref: str = "",
+        use_result_cache: bool = True,
     ):
+        use_result_cache = bool(use_result_cache and not self._force_full_verify)
         result_context_fingerprint = self._gate_result_context_fingerprint()
         if not self.config.gates.isolation.enabled:
             return contextlib.nullcontext(None)
-        if self.config.gates.distributed.enabled:
+        if self.config.gates.distributed.enabled and not source_ref:
             return DistributedGatePlanExecutor(
                 self.project_root,
                 self.config.gates,
@@ -6459,6 +6507,8 @@ class Orchestrator:
                 self._gate_baseline_cache.environment_fingerprint
             ),
             result_context_fingerprint=result_context_fingerprint,
+            source_ref=source_ref,
+            use_result_cache=use_result_cache,
         )
 
     def _gate_result_context_fingerprint(self) -> str:
@@ -6851,9 +6901,10 @@ class Orchestrator:
                         "Tests pass",
                     ],
                     task_origin="stage_recovery",
-                    verification_refs=self._stage_recovery_verification_refs(),
+                    verification_refs=self._stage_recovery_verification_refs(state),
                 )
             )
+            state.verify_recovery_refs = []
             state.rejected_stage = ""
             state.rejection_reason = ""
 
@@ -10103,6 +10154,43 @@ class Orchestrator:
             if extraction.failure_ids
             else []
         )
+        if (
+            task is not None
+            and not verify_gate.ok
+            and self.config.gates.verification_policy_version >= 3
+            and self.config.gates.incremental_mode == "auto"
+            and bool(self.config.gates.steps)
+            and task.verify_baseline_ref
+        ):
+            failed_commands = list(
+                dict.fromkeys(
+                    result.command for result in verify_gate.commands if not result.ok
+                )
+            )
+            baseline_gate, baseline_mutation_error = (
+                self._run_gate_commands_for_commands(
+                    failed_commands,
+                    collect_all=True,
+                    context=f"lazy task baseline verification ({task.task_id})",
+                    source_ref=self._git_ref_from_verify_baseline_ref(
+                        task.verify_baseline_ref
+                    ),
+                )
+            )
+            self._raise_for_baseline_termination(
+                baseline_gate,
+                context=f"lazy task baseline verification ({task.task_id})",
+            )
+            if baseline_mutation_error:
+                raise RuntimeError(baseline_mutation_error)
+            lazy_failures = self._validated_baseline_failures(
+                baseline_gate,
+                context=f"lazy task baseline verification ({task.task_id})",
+                task_id=task.task_id,
+            )
+            task.verify_baseline_failures = list(
+                dict.fromkeys([*task.verify_baseline_failures, *lazy_failures])
+            )
         baseline_failure_ids = (
             self._normalize_verify_failure_ids(task.verify_baseline_failures, verify_gate.summary)
             if task is not None and task.verify_baseline_failures
@@ -11411,6 +11499,15 @@ class Orchestrator:
         *,
         state: Optional[RunState] = None,
     ) -> bool:
+        if (
+            self.config.gates.verification_policy_version >= 3
+            and self.config.gates.incremental_mode == "auto"
+            and bool(self.config.gates.steps)
+            and task.verify_baseline_ref
+            and task.verify_baseline_schema_version
+            == VERIFY_BASELINE_SCHEMA_VERSION
+        ):
+            return False
         verification_context = ""
         if self._task_depends_on_requirements_audit(task):
             tasks = state.tasks if state is not None and state.tasks else self._load_tasks_from_plan()
@@ -11421,7 +11518,17 @@ class Orchestrator:
                 assume_done_task_ids=assumed,
             )
             verification_context = str(audit_result.get("input_context_sha256", ""))
-        baseline_ref = self._task_verify_baseline_ref(verification_context)
+        baseline_ref = (
+            state.implement_verify_baseline_ref
+            if (
+                state is not None
+                and self.config.gates.verification_policy_version >= 3
+                and self.config.gates.incremental_mode == "auto"
+                and self.config.gates.steps
+                and state.implement_verify_baseline_ref
+            )
+            else self._task_verify_baseline_ref(verification_context)
+        )
         task_commands = self._build_task_verify_commands(task)
         if (
             task.verify_baseline_ref == baseline_ref
@@ -11429,6 +11536,15 @@ class Orchestrator:
             == VERIFY_BASELINE_SCHEMA_VERSION
         ):
             return False
+        if (
+            self.config.gates.verification_policy_version >= 3
+            and self.config.gates.incremental_mode == "auto"
+            and bool(self.config.gates.steps)
+        ):
+            task.verify_baseline_failures = []
+            task.verify_baseline_ref = baseline_ref
+            task.verify_baseline_schema_version = VERIFY_BASELINE_SCHEMA_VERSION
+            return True
         if not task_commands:
             task.verify_baseline_ref = baseline_ref
             task.verify_baseline_schema_version = VERIFY_BASELINE_SCHEMA_VERSION
@@ -11501,6 +11617,26 @@ class Orchestrator:
         run_context_ref = self._task_verify_baseline_ref(
             str(audit_result.get("input_context_sha256", ""))
         )
+        if (
+            self.config.gates.verification_policy_version >= 3
+            and self.config.gates.incremental_mode == "auto"
+            and bool(self.config.gates.steps)
+        ):
+            changed = state.implement_verify_baseline_ref != run_context_ref
+            state.implement_verify_baseline_ref = run_context_ref
+            if state.implement_verify_baseline_failures:
+                state.implement_verify_baseline_failures = []
+                changed = True
+            for task in task_list:
+                if task.status != "done" and task.verify_baseline_failures:
+                    task.verify_baseline_failures = []
+                    changed = True
+            self.logger.info(
+                "[gate-baseline] policy=v3 mode=lazy ref=%s commands=%s",
+                self._git_ref_from_verify_baseline_ref(run_context_ref),
+                plan.unique_command_count,
+            )
+            return changed
         changed = False
         previous_ref = state.implement_verify_baseline_ref
         if previous_ref and any(
@@ -11612,6 +11748,12 @@ class Orchestrator:
         *,
         failure_ids: Iterable[str],
     ) -> None:
+        if (
+            self.config.gates.verification_policy_version >= 3
+            and self.config.gates.incremental_mode == "auto"
+            and self.config.gates.steps
+        ):
+            return
         # Roll the run-level reference forward while retaining the baseline
         # captured before implementation. Current-task failures must never be
         # absorbed as a new baseline, and aggregate data must not populate the
@@ -13044,11 +13186,35 @@ class Orchestrator:
         save_run_state(self.project_root, state)
 
     def _run_verify(self, state: RunState) -> RunState:
-        verify_gate, mutation_error = self._run_gate_commands(
-            collect_all=False,
-            context="verify stage commands",
-            phase="final",
+        previous_force_full = self._force_full_verify
+        baseline_sha = self._git_ref_from_verify_baseline_ref(
+            state.implement_verify_baseline_ref
         )
+        if baseline_sha and not previous_force_full:
+            changed = subprocess.run(
+                ["git", "diff", "--name-only", f"{baseline_sha}..HEAD"],
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+            )
+            if changed.returncode == 0 and any(
+                self._is_high_risk_review_path(path.strip())
+                for path in changed.stdout.splitlines()
+                if path.strip()
+            ):
+                self._force_full_verify = True
+                self.logger.info(
+                    "[gate-attestation] forcing current-candidate full verification "
+                    "because dependency/configuration inputs changed"
+                )
+        try:
+            verify_gate, mutation_error = self._run_gate_commands(
+                collect_all=False,
+                context="verify stage commands",
+                phase="final",
+            )
+        finally:
+            self._force_full_verify = previous_force_full
         if mutation_error:
             raise RuntimeError(mutation_error)
         infrastructure = first_infrastructure_command(verify_gate)
@@ -14037,7 +14203,7 @@ class Orchestrator:
                 ".auto-agents/docs/requirements_audit.md, .auto-agents/docs/review.md, "
                 "project_brief.md, architecture.md, requirements_trace.json, or any other "
                 "repository files to make the plan pass.",
-                "At the root of the JSON, set verification_policy_version=2 and also define test_strategy and verification_steps.",
+                "At the root of the JSON, set verification_policy_version=3 and also define test_strategy and verification_steps.",
                 "At the root of the JSON, set oracle_proof_schema_version to 2 for all new plans. auto_agents will bind each proof to the current requirement contract hash.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
                 "Every task that covers requirement_ids must include requirement_proofs. Each proof must include requirement_id, oracle_index (1-based) or exact acceptance_oracle, proof_type, oracle_strength, evidence_boundary, evidence_refs, status='planned', and forbidden_proxy_oracles copied from the bound requirement.",
@@ -14060,7 +14226,7 @@ class Orchestrator:
                 "Every active task must define verification_refs for the smallest executable proof surface it owns. Prefer exact selectors such as tests/test_api.py::test_contract. A whole test-file ref is allowed only when that same file is an implement_and_final verification target. Do not assign a broad directory or the entire suite to an individual task.",
                 "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist. A broad directory target such as ['tests'] is allowed only with cadence='final_only'; auto_agents expands Pytest and Vitest directories into per-file steps before running gates.",
                 "Give every verification step a concise non-empty purpose describing its proof surface. Declare concurrency explicitly. Set parallel_safe=true only when a step is independent from both the ordered serial lane and peer parallel checks, including shared databases, ports, mutable fixtures, snapshots, build outputs, producer/consumer artifacts, and other process-global state. Otherwise set parallel_safe=false and provide serial_reason as one of artifact_chain, shared_mutable_state, fixed_port, external_side_effect, or ordered_contract.",
-                "Classify verification cadence explicitly: use cadence='implement_and_final' for focused checks needed during implementation and cadence='final_only' for broad release suites. Directory suites may set max_batches=1 when repeated runner, fixture, media, or service initialization is more expensive than file-level concurrency; omit it or use 0 for the worker-aware default. Classify cache_scope='source' only when results depend solely on HEAD and tracked/untracked source content; use cache_scope='run_context' for requirements/task-state/config-sensitive checks. Use result_cache_scope='candidate' for normal success-only reuse, 'observed_inputs' only for source-only, parallel-safe checks with no artifacts, exclusive resources, or dynamic ports, and 'off' for checks that must always execute.",
+                "Classify verification cadence explicitly: use cadence='implement_and_final' for focused checks needed during implementation and cadence='final_only' for broad release suites. Policy v3 turns directory suites into stable cache shards, including legacy max_batches=1 suites. Classify cache_scope='source' only when results depend solely on source and dependency state; use cache_scope='run_context' for requirements/task-state/config-sensitive checks. Use result_cache_scope='auto' for normal success-only reuse: auto_agents records complete filesystem observations and only reuses a shard when every observed input still matches. Use 'candidate' for exact-tree-only reuse and 'off' for checks that must always execute.",
                 "Gate commands run in snapshot-backed worktrees. Use per-test relative temp paths and dynamically allocated port 0 whenever the same process can discover the bound port. When a child process requires a numeric port before launch, declare lowercase snake_case dynamic_ports names and make the test read AUTO_AGENTS_GATE_PORT_<UPPER_NAME>; keep a port-0 fallback for manual runs. Declaring dynamic_ports does not by itself make a step parallel-safe. Commands that intentionally share generated artifacts must remain parallel_safe=false and appear in producer-before-consumer order; commands that use unadapted fixed host ports, Docker daemons, or shared external accounts must declare host:/pool: exclusive_resources.",
                 "Declare requires for non-default tools such as ffmpeg or chrome and resource_class='heavy' for browser/FFmpeg workloads. Use cpu_slots only when a command needs an explicit scheduling capacity instead of the resource_class default. Memory checks are opt-in: memory_mb is the measured command working-set budget, memory_reserve_mb is the desired host reserve, and memory_guard must be 'off', 'advisory', or 'required'. Prefer advisory unless a dependable hard minimum is known; never invent a memory estimate. Declare artifact_globs only for ignored project-relative evidence that must survive sandbox cleanup. Never use absolute artifact paths or '..'.",
                 "Requirement proofs for ignored generated evidence must be portable across isolated gate worktrees. Reference stable current-run pointers or project-relative wildcard paths covered by the producing verification step's artifact_globs; never bind a proof to an implementation-session UUID. A pre-existing ignored file is not proof unless the current isolated verification publishes it.",
@@ -17173,20 +17339,41 @@ class Orchestrator:
             # "auto" distributed mode may still fall back to a small local
             # worker. Keep local/auto fan-out bounded; only a required cluster
             # is allowed to prepare a wider set of batches up front.
+            if verification_policy_version < 3:
+                verification_policy_version = 3
+                for step in steps:
+                    if step.result_cache_scope == "candidate":
+                        step.result_cache_scope = "auto"
+                payload["verification_policy_version"] = 3
+                raw_payload_steps = payload.get("verification_steps", [])
+                if isinstance(raw_payload_steps, list):
+                    for raw_step in raw_payload_steps:
+                        if (
+                            isinstance(raw_step, dict)
+                            and raw_step.get("result_cache_scope", "candidate")
+                            == "candidate"
+                        ):
+                            raw_step["result_cache_scope"] = "auto"
+                save_task_plan(self.project_root, payload)
             max_batch_cap = (
                 16
-                if self.config.gates.distributed.mode == "required"
+                if (
+                    verification_policy_version >= 3
+                    or self.config.gates.distributed.mode == "required"
+                )
                 else 4
             )
-            max_batches_per_step = min(
-                max_batch_cap,
-                max(1, self._gate_parallel_workers() * 2),
+            max_batches_per_step = (
+                max_batch_cap
+                if verification_policy_version >= 3
+                else min(max_batch_cap, max(1, self._gate_parallel_workers() * 2))
             )
             steps = (
                 expand_verification_directory_steps(
                     steps,
                     self.project_root,
                     max_batches_per_step=max_batches_per_step,
+                    stable_shards=verification_policy_version >= 3,
                 )
                 if verification_policy_version >= 2
                 else expand_pytest_directory_steps(
