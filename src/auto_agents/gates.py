@@ -10,9 +10,11 @@ from concurrent.futures import (
 from dataclasses import dataclass, field, replace
 import fnmatch
 import hashlib
+import json
 import os
 import re
 import shlex
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -458,6 +460,19 @@ def _vitest_files_for_target(
     resolved = candidate if candidate.is_absolute() else root / candidate
     if not resolved.is_dir():
         return []
+    package_root = _vitest_package_root(root, resolved)
+    if package_root is not None:
+        discovered = _vitest_list_files(
+            root,
+            package_root,
+            resolved,
+            exclude_patterns=exclude_patterns,
+        )
+        # If Vitest cannot be invoked, preserve the directory target so its
+        # own discovery remains authoritative. Expanding by raw filesystem
+        # globbing here would turn config-excluded files into explicit CLI
+        # targets, which bypasses Vitest's exclude contract.
+        return discovered or []
     suffix = re.compile(r"\.(?:test|spec)\.[cm]?[jt]sx?$", re.IGNORECASE)
     out: list[str] = []
     for path in sorted(item for item in resolved.rglob("*") if item.is_file()):
@@ -476,6 +491,118 @@ def _vitest_files_for_target(
             continue
         out.append(relative)
     return out
+
+
+_VITEST_CONFIG_NAMES = (
+    "vitest.config.ts",
+    "vitest.config.js",
+    "vitest.config.mts",
+    "vitest.config.mjs",
+    "vitest.config.cts",
+    "vitest.config.cjs",
+)
+
+
+def _vitest_package_root(project_root: Path, target: Path) -> Optional[Path]:
+    current = target.resolve()
+    while True:
+        if any((current / name).is_file() for name in _VITEST_CONFIG_NAMES):
+            return current
+        package_json = current / "package.json"
+        if package_json.is_file():
+            try:
+                payload = json.loads(package_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if isinstance(payload, dict):
+                scripts = payload.get("scripts")
+                dependencies = payload.get("dependencies")
+                dev_dependencies = payload.get("devDependencies")
+                if (
+                    isinstance(scripts, dict)
+                    and "vitest" in str(scripts.get("test", "")).lower()
+                ) or (
+                    isinstance(dependencies, dict)
+                    and "vitest" in dependencies
+                ) or (
+                    isinstance(dev_dependencies, dict)
+                    and "vitest" in dev_dependencies
+                ):
+                    return current
+        if current == project_root or current.parent == current:
+            return None
+        try:
+            current.relative_to(project_root)
+        except ValueError:
+            return None
+        current = current.parent
+
+
+def _vitest_list_files(
+    project_root: Path,
+    package_root: Path,
+    target: Path,
+    *,
+    exclude_patterns: Sequence[str],
+) -> Optional[List[str]]:
+    binary = package_root / "node_modules" / ".bin" / "vitest"
+    if not binary.is_file():
+        return None
+    try:
+        package_target = target.relative_to(package_root).as_posix() or "."
+    except ValueError:
+        return None
+    command = [
+        str(binary),
+        "list",
+        package_target,
+        "--filesOnly",
+        "--json",
+    ]
+    try:
+        package_prefix = package_root.relative_to(project_root).as_posix()
+    except ValueError:
+        package_prefix = ""
+    for pattern in exclude_patterns:
+        normalized = str(pattern).strip().removeprefix("./")
+        if package_prefix and normalized.startswith(f"{package_prefix}/"):
+            normalized = normalized[len(package_prefix) + 1 :]
+        if normalized:
+            command.extend(["--exclude", normalized])
+    try:
+        result = subprocess.run(
+            command,
+            cwd=package_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    files: list[str] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        raw_path = str(item.get("file", "")).strip()
+        if not raw_path:
+            continue
+        path = Path(raw_path)
+        resolved = path if path.is_absolute() else package_root / path
+        try:
+            relative = resolved.resolve().relative_to(project_root).as_posix()
+        except ValueError:
+            continue
+        files.append(relative)
+    return sorted(dict.fromkeys(files))
 
 
 def _balanced_target_batches(

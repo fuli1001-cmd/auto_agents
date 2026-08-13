@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import shlex
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -823,6 +826,87 @@ class GateTests(unittest.TestCase):
             self.assertEqual(steps[0].args, ["--reporter=dot"])
             self.assertTrue(steps[0].parallel_safe)
             self.assertEqual(steps[0].result_cache_scope, "candidate")
+
+    def test_expand_vitest_directory_steps_uses_config_aware_file_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_root = root / "workbench"
+            tests = package_root / "src"
+            binary = package_root / "node_modules" / ".bin" / "vitest"
+            tests.mkdir(parents=True)
+            binary.parent.mkdir(parents=True)
+            binary.write_text("", encoding="utf-8")
+            (package_root / "package.json").write_text(
+                '{"devDependencies":{"vitest":"3.1.1"}}\n',
+                encoding="utf-8",
+            )
+            (package_root / "vitest.config.ts").write_text(
+                'export default { test: { exclude: ["src/retired.test.ts"] } };\n',
+                encoding="utf-8",
+            )
+            included = tests / "included.test.ts"
+            retired = tests / "retired.test.ts"
+            included.write_text("", encoding="utf-8")
+            retired.write_text("", encoding="utf-8")
+            listed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps([{"file": str(included)}]),
+                stderr="",
+            )
+            step = VerificationStep(
+                kind="test",
+                runner="vitest",
+                targets=["workbench/src"],
+                max_batches=1,
+                result_cache_scope="auto",
+            )
+
+            with patch("auto_agents.gates.subprocess.run", return_value=listed) as run:
+                expanded = expand_vitest_directory_steps(
+                    [step],
+                    root,
+                    stable_shards=True,
+                )
+
+            self.assertEqual(
+                [target for item in expanded for target in item.targets],
+                ["workbench/src/included.test.ts"],
+            )
+            command = run.call_args.args[0]
+            self.assertEqual(
+                command[1:],
+                ["list", "src", "--filesOnly", "--json"],
+            )
+            self.assertEqual(run.call_args.kwargs["cwd"], package_root)
+
+    def test_expand_vitest_directory_preserves_target_without_local_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package_root = root / "workbench"
+            tests = package_root / "src"
+            tests.mkdir(parents=True)
+            (package_root / "vitest.config.ts").write_text(
+                'export default { test: { exclude: ["src/retired.test.ts"] } };\n',
+                encoding="utf-8",
+            )
+            (tests / "included.test.ts").write_text("", encoding="utf-8")
+            (tests / "retired.test.ts").write_text("", encoding="utf-8")
+            step = VerificationStep(
+                kind="test",
+                runner="vitest",
+                targets=["workbench/src"],
+                max_batches=1,
+                result_cache_scope="auto",
+            )
+
+            expanded = expand_vitest_directory_steps(
+                [step],
+                root,
+                stable_shards=True,
+            )
+
+            self.assertEqual(expanded, [step])
 
     def test_resolved_plan_preserves_v2_serial_and_result_cache_metadata(self) -> None:
         step = VerificationStep(
