@@ -25,6 +25,7 @@ from .config import (
     sort_sessions,
 )
 from .gates import (
+    build_failure_identity_diagnostic_command,
     commands_from_verification_steps,
     extract_failure_ids,
     extract_failure_info,
@@ -38,6 +39,7 @@ from .models import (
     AgentResult,
     SESSION_AGENT_ERROR_THRESHOLD,
     SESSION_STALL_THRESHOLD,
+    GateResult,
     SessionState,
 )
 from .requirements import (
@@ -124,7 +126,7 @@ class Session:
         verify: Dict[str, object],
     ) -> None:
         """Persist verification outcome and execution/certificate metrics."""
-        state.execution_log.append({
+        entry = {
             "attempt": state.current_attempt,
             "action": action,
             "result": "pass" if verify["ok"] else str(verify["reason"]),
@@ -134,7 +136,11 @@ class Session:
             "certificate_hits": int(verify.get("certificate_hits", 0)),
             "duration_seconds": float(verify.get("duration_seconds", 0.0)),
             "timestamp": self._now(),
-        })
+        }
+        for key in ("failure_kind", "raw_log_path", "retry_fix"):
+            if key in verify:
+                entry[key] = verify[key]
+        state.execution_log.append(entry)
 
     # ── Public entry points ──────────────────────────────────────
 
@@ -402,6 +408,13 @@ class Session:
                 return state
 
             self._print(f"Verification failed: {verify_reason}")
+            if verify.get("retry_fix") is False:
+                state.resolution = "verification_inconclusive"
+                self._print(
+                    "Verification could not establish a comparable regression; "
+                    "stopping without another fix-agent attempt."
+                )
+                break
             diff_hash = self._compute_diff_hash()
             verify_sig = self._compute_verify_sig(verify_reason)
             self._update_stall_state(state, diff_hash, verify_sig)
@@ -1551,8 +1564,12 @@ class Session:
             certificate_hits += hits
             executed_commands += len(gate_result.commands) - hits
 
-        def outcome(ok: bool, reason: str) -> Dict[str, object]:
-            return {
+        def outcome(
+            ok: bool,
+            reason: str,
+            **details: object,
+        ) -> Dict[str, object]:
+            result: Dict[str, object] = {
                 "ok": ok,
                 "reason": reason,
                 "scope": scope,
@@ -1561,6 +1578,59 @@ class Session:
                 "certificate_hits": certificate_hits,
                 "duration_seconds": round(time.monotonic() - started, 6),
             }
+            result.update(details)
+            return result
+
+        def run_identity_diagnostic(
+            gate_result: GateResult,
+            *,
+            label: str,
+            source_ref: str = "",
+        ) -> Optional[GateResult]:
+            commands = list(
+                dict.fromkeys(
+                    diagnostic
+                    for command_result in gate_result.commands
+                    if not command_result.ok
+                    and not command_result.termination_reason
+                    for diagnostic in [
+                        build_failure_identity_diagnostic_command(
+                            command_result.command
+                        )
+                    ]
+                    if diagnostic
+                )
+            )
+            if not commands:
+                return None
+            with self.orch._gate_executor_context(
+                {command: {} for command in commands},
+                source_ref=source_ref,
+                use_result_cache=False,
+            ) as diagnostic_executor:
+                diagnostic_gate = run_gate_plan(
+                    commands,
+                    [],
+                    self.project_root,
+                    collect_all=True,
+                    parallel_workers=self.orch._gate_parallel_workers(),
+                    command_timeout_seconds=(
+                        self.config.gates.command_timeout_seconds
+                    ),
+                    adaptive_timeout_enabled=(
+                        self.config.gates.adaptive_timeout_enabled
+                    ),
+                    command_idle_timeout_seconds=(
+                        self.config.gates.command_idle_timeout_seconds
+                    ),
+                    progress=self.orch._gate_progress_callback(label),
+                    gate_executor=diagnostic_executor,
+                )
+            record_gate(diagnostic_gate)
+            self.orch._classify_reported_infrastructure_failures(
+                diagnostic_gate
+            )
+            return diagnostic_gate
 
         # Layer 1: targeted bug verification
         if self.mode == "fix" and state.fix_verify_command:
@@ -1633,6 +1703,30 @@ class Session:
             )
         record_gate(gate)
         self.orch._classify_reported_infrastructure_failures(gate)
+        extraction = extract_failure_info(gate)
+        raw_output = self.orch._gate_raw_output(gate)
+        if not gate.ok and not extraction.comparable:
+            diagnostic_gate = run_identity_diagnostic(
+                gate,
+                label="session failure identity diagnostic",
+            )
+            if diagnostic_gate is not None:
+                diagnostic_output = self.orch._gate_raw_output(diagnostic_gate)
+                if diagnostic_output:
+                    raw_output = (
+                        f"{raw_output.rstrip()}\n\n"
+                        "=== Failure Identity Diagnostic ===\n"
+                        f"{diagnostic_output}"
+                    ).strip()
+                if diagnostic_gate.ok:
+                    return outcome(
+                        True,
+                        "transient gate failure cleared on one identity rerun",
+                        failure_kind="transient_verification",
+                    )
+                diagnostic_extraction = extract_failure_info(diagnostic_gate)
+                if diagnostic_extraction.comparable:
+                    extraction = diagnostic_extraction
         if (
             not gate.ok
             and self.config.gates.verification_policy_version >= 3
@@ -1678,42 +1772,101 @@ class Session:
                     baseline_gate,
                     context="session lazy baseline verification",
                 )
+                baseline_extraction = extract_failure_info(baseline_gate)
+                baseline_failures_to_add = baseline_extraction.failure_ids
+                if not baseline_gate.ok and not baseline_extraction.comparable:
+                    baseline_diagnostic = run_identity_diagnostic(
+                        baseline_gate,
+                        label="session lazy baseline identity diagnostic",
+                        source_ref=state.baseline_git_ref,
+                    )
+                    if baseline_diagnostic is not None:
+                        if baseline_diagnostic.ok:
+                            baseline_failures_to_add = []
+                        else:
+                            diagnostic_extraction = extract_failure_info(
+                                baseline_diagnostic
+                            )
+                            if diagnostic_extraction.comparable:
+                                baseline_extraction = diagnostic_extraction
+                                baseline_failures_to_add = (
+                                    diagnostic_extraction.failure_ids
+                                )
                 state.baseline_failures = sorted(
                     set(state.baseline_failures)
-                    | set(extract_failure_ids(baseline_gate))
+                    | set(baseline_failures_to_add)
                 )
                 self._save(state)
-        extraction = extract_failure_info(gate)
         current_failures = extraction.failure_ids
         if not extraction.comparable and not gate.ok:
+            failed_commands = [
+                result.command for result in gate.commands if not result.ok
+            ]
+            raw_log_path = self.orch._persist_failed_verification_log(
+                raw_output,
+                label="session-verify",
+            )
+            reason = (
+                "verification inconclusive after one identity rerun; failed "
+                "command did not yield stable test-case failure ids"
+                if diagnostic_gate is not None
+                else (
+                    "verification inconclusive; failed command has no supported "
+                    "stable-identity diagnostic"
+                )
+            )
+            if failed_commands:
+                reason += ": " + ", ".join(failed_commands[:3])
+            if raw_log_path:
+                reason += f"; raw log: {raw_log_path}"
             return outcome(
                 False,
-                "non-comparable verification failure: failed command did not yield stable test-case failure ids",
+                reason,
+                retry_fix=False,
+                failure_kind="verification_inconclusive",
+                raw_log_path=raw_log_path,
             )
+        failed_gate_commands = {
+            result.command for result in gate.commands if not result.ok
+        }
+        command_level_prefixes = (
+            "cmd:",
+            "cmd-timeout:",
+            "cmd-stalled:",
+            "cmd-terminated:",
+        )
+        relevant_non_comparable_baseline = any(
+            any(
+                failure_id == f"{prefix}{command}"
+                for prefix in command_level_prefixes
+                for command in failed_gate_commands
+            )
+            or failure_id.startswith(("infra:", "reason:"))
+            for failure_id in map(str, state.baseline_failures)
+        )
         if (
             not gate.ok
             and extraction.comparable
-            and any(
-                str(item).startswith(
-                    (
-                        "cmd:",
-                        "cmd-timeout:",
-                        "cmd-stalled:",
-                        "cmd-terminated:",
-                        "infra:",
-                        "reason:",
-                    )
-                )
-                for item in state.baseline_failures
-            )
+            and relevant_non_comparable_baseline
         ):
+            raw_log_path = self.orch._persist_failed_verification_log(
+                raw_output,
+                label="session-verify",
+            )
+            reason = (
+                "verification failure identity changed from a command-level "
+                "baseline to stable test-case ids; baseline comparison is "
+                "non-comparable: "
+                + ", ".join(current_failures[:10])
+            )
+            if raw_log_path:
+                reason += f"; raw log: {raw_log_path}"
             return outcome(
                 False,
-                (
-                    "verification failure identity changed from a command-level "
-                    "baseline to stable test-case ids; baseline comparison is "
-                    "non-comparable"
-                ),
+                reason,
+                retry_fix=False,
+                failure_kind="verification_inconclusive",
+                raw_log_path=raw_log_path,
             )
         new_failures = sorted(set(current_failures) - set(state.baseline_failures))
         if new_failures:

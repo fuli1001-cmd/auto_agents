@@ -359,6 +359,62 @@ class SessionFixFlowTests(unittest.TestCase):
         orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: next(inputs, ""))
         return Session(orchestrator, mode="fix")
 
+    def test_inconclusive_verification_does_not_start_another_fix_attempt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            session = Session(orchestrator, mode="fix")
+            state = SessionState(
+                session_id="inconclusive-fix",
+                mode="fix",
+                status="executing",
+            )
+
+            with (
+                patch.object(orchestrator, "_apply_generated_verification_config"),
+                patch.object(session, "_ensure_baseline"),
+                patch.object(
+                    session,
+                    "_call_agent",
+                    return_value="Applied the targeted fix.",
+                ) as call_agent,
+                patch.object(
+                    orchestrator,
+                    "_quick_verify_failure_details",
+                    return_value=None,
+                ),
+                patch.object(
+                    session,
+                    "_run_verify",
+                    return_value={
+                        "ok": False,
+                        "reason": "failure identity remains unresolved",
+                        "retry_fix": False,
+                        "failure_kind": "verification_inconclusive",
+                    },
+                ),
+                patch.object(session, "_compute_diff_hash") as diff_hash,
+            ):
+                result = session._phase_fix_execute(state)
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.resolution, "verification_inconclusive")
+            self.assertEqual(result.current_attempt, 1)
+            self.assertEqual(call_agent.call_count, 1)
+            diff_hash.assert_not_called()
+            verify_log = next(
+                entry
+                for entry in result.execution_log
+                if entry["action"] == "verify"
+            )
+            self.assertFalse(verify_log["retry_fix"])
+            self.assertEqual(
+                verify_log["failure_kind"],
+                "verification_inconclusive",
+            )
+
     def test_fix_flow_goal_clear_immediate(self) -> None:
         """Agent says GOAL_CLEAR on first round, then fix executes."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -2736,6 +2792,291 @@ class BaselineDiffVerifyTests(unittest.TestCase):
             self.assertEqual(result["executed_commands"], 0)
             self.assertEqual(result["certificate_hits"], 1)
             self.assertGreaterEqual(result["duration_seconds"], 0.0)
+
+    def test_non_comparable_failure_is_rerun_once_for_stable_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.verification_policy_version = 3
+            orchestrator.config.gates.steps = [
+                VerificationStep(
+                    kind="test",
+                    runner="pytest",
+                    targets=["tests/test_demo.py"],
+                    parallel_safe=False,
+                    serial_reason="ordered",
+                )
+            ]
+            command = "python -m pytest -q tests/test_demo.py"
+            diagnostic_command = (
+                "python -m pytest -vv -rA --tb=short "
+                "-o console_output_style=classic tests/test_demo.py"
+            )
+            failure_line = (
+                "FAILED tests/test_demo.py::test_example - AssertionError\n"
+            )
+            candidate_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout="pytest exited before printing a summary",
+                    )
+                ],
+                summary="command failed",
+            )
+            diagnostic_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=diagnostic_command,
+                        ok=False,
+                        returncode=1,
+                        stdout=failure_line,
+                    )
+                ],
+                summary="diagnostic failure",
+            )
+            baseline_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout=failure_line,
+                    )
+                ],
+                summary="baseline failure",
+            )
+            state = SessionState(
+                session_id="diagnostic-baseline",
+                mode="fix",
+                baseline_git_ref="baseline-ref",
+                baseline_commands=[command],
+            )
+            session = Session(orchestrator, mode="fix")
+            session._current_state = state
+            plan = SimpleNamespace(
+                commands=[command],
+                parallel_groups=[],
+                metadata={command: {}},
+            )
+
+            with (
+                patch.object(session, "_session_gate_plan", return_value=plan),
+                patch.object(
+                    orchestrator,
+                    "_gate_executor_context",
+                    return_value=nullcontext(None),
+                ),
+                patch("auto_agents.session.changed_paths", return_value=[]),
+                patch(
+                    "auto_agents.session.run_gate_plan",
+                    side_effect=[candidate_gate, diagnostic_gate, baseline_gate],
+                ) as run_plan,
+            ):
+                result = session._run_baseline_diff_verify()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(run_plan.call_count, 3)
+            self.assertEqual(
+                state.baseline_failures,
+                ["tests/test_demo.py::test_example"],
+            )
+
+    def test_non_comparable_failure_that_passes_identity_rerun_is_transient(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            command = "python -m pytest -q tests/test_demo.py"
+            candidate_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout="pytest exited before printing a summary",
+                    )
+                ],
+                summary="command failed",
+            )
+            rerun_gate = GateResult(
+                ok=True,
+                commands=[
+                    CommandResult(
+                        command=(
+                            "python -m pytest -vv -rA --tb=short "
+                            "-o console_output_style=classic tests/test_demo.py"
+                        ),
+                        ok=True,
+                        returncode=0,
+                    )
+                ],
+                summary="passed",
+            )
+            state = SessionState(session_id="transient-gate", mode="fix")
+            session = Session(orchestrator, mode="fix")
+            session._current_state = state
+            plan = SimpleNamespace(
+                commands=[command],
+                parallel_groups=[],
+                metadata={command: {}},
+            )
+
+            with (
+                patch.object(session, "_session_gate_plan", return_value=plan),
+                patch.object(
+                    orchestrator,
+                    "_gate_executor_context",
+                    return_value=nullcontext(None),
+                ),
+                patch("auto_agents.session.changed_paths", return_value=[]),
+                patch(
+                    "auto_agents.session.run_gate_plan",
+                    side_effect=[candidate_gate, rerun_gate],
+                ),
+            ):
+                result = session._run_baseline_diff_verify()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["failure_kind"], "transient_verification")
+
+    def test_unresolved_identity_stops_fix_retry_and_persists_raw_log(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            command = "python -m pytest -q tests/test_demo.py"
+            candidate_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stderr="worker exited without a pytest summary",
+                    )
+                ],
+                summary="command failed",
+            )
+            diagnostic_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=(
+                            "python -m pytest -vv -rA --tb=short "
+                            "-o console_output_style=classic tests/test_demo.py"
+                        ),
+                        ok=False,
+                        returncode=1,
+                        stderr="worker exited again without a pytest summary",
+                    )
+                ],
+                summary="diagnostic command failed",
+            )
+            state = SessionState(session_id="unresolved-gate", mode="fix")
+            session = Session(orchestrator, mode="fix")
+            session._current_state = state
+            plan = SimpleNamespace(
+                commands=[command],
+                parallel_groups=[],
+                metadata={command: {}},
+            )
+
+            with (
+                patch.object(session, "_session_gate_plan", return_value=plan),
+                patch.object(
+                    orchestrator,
+                    "_gate_executor_context",
+                    return_value=nullcontext(None),
+                ),
+                patch("auto_agents.session.changed_paths", return_value=[]),
+                patch(
+                    "auto_agents.session.run_gate_plan",
+                    side_effect=[candidate_gate, diagnostic_gate],
+                ),
+            ):
+                result = session._run_baseline_diff_verify()
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["retry_fix"])
+            self.assertEqual(
+                result["failure_kind"],
+                "verification_inconclusive",
+            )
+            self.assertIn(command, result["reason"])
+            raw_log = project_root / str(result["raw_log_path"])
+            self.assertTrue(raw_log.is_file())
+            self.assertIn(
+                "worker exited again without a pytest summary",
+                raw_log.read_text(encoding="utf-8"),
+            )
+
+    def test_unrelated_command_level_baseline_does_not_hide_new_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            command = "python -m pytest tests/test_new.py"
+            gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout=(
+                            "FAILED tests/test_new.py::test_regression - "
+                            "AssertionError\n"
+                        ),
+                    )
+                ],
+                summary="command failed",
+            )
+            state = SessionState(
+                session_id="unrelated-command-baseline",
+                mode="fix",
+                baseline_failures=["cmd:npm test -- unrelated-suite"],
+            )
+            session = Session(orchestrator, mode="fix")
+            session._current_state = state
+            plan = SimpleNamespace(
+                commands=[command],
+                parallel_groups=[],
+                metadata={command: {}},
+            )
+
+            with (
+                patch.object(session, "_session_gate_plan", return_value=plan),
+                patch.object(
+                    orchestrator,
+                    "_gate_executor_context",
+                    return_value=nullcontext(None),
+                ),
+                patch("auto_agents.session.changed_paths", return_value=[]),
+                patch("auto_agents.session.run_gate_plan", return_value=gate),
+            ):
+                result = session._run_baseline_diff_verify()
+
+            self.assertFalse(result["ok"])
+            self.assertNotEqual(
+                result.get("failure_kind"),
+                "verification_inconclusive",
+            )
+            self.assertIn(
+                "tests/test_new.py::test_regression",
+                result["reason"],
+            )
 
     def test_preexisting_failure_tolerated(self) -> None:
         """A gate failure that exists in the baseline should not block completion."""
