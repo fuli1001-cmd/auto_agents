@@ -207,6 +207,26 @@
           "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
         },
+        "release_worker": {
+          "type": "object",
+          "required": [
+            "enabled",
+            "auto_start",
+            "idle_delay_seconds",
+            "max_recovery_attempts",
+            "max_infrastructure_retries",
+            "background_parallel_workers"
+          ],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "auto_start": {"type": "boolean"},
+            "idle_delay_seconds": {"type": "integer", "minimum": 0},
+            "max_recovery_attempts": {"type": "integer", "minimum": 0},
+            "max_infrastructure_retries": {"type": "integer", "minimum": 0},
+            "background_parallel_workers": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        },
         "incremental": {
           "type": "object",
           "properties": {

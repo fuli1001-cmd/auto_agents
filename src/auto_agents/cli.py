@@ -42,6 +42,7 @@ from .notifications import (
 )
 from .orchestrator import Orchestrator
 from .frontend_design import load_frontend_design_lock, validate_frontend_design_artifacts
+from .foreground_activity import ForegroundActivity
 from .process_supervision import (
     ACTIVE_PROCESSES,
     RunInterruptedError,
@@ -56,7 +57,9 @@ from .run_lock import (
 from .release_attestation import (
     begin_release_verification,
     complete_release_verification,
+    enqueue_release_verification,
 )
+from .release_worker import ensure_release_worker, run_release_worker
 from .self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
@@ -89,6 +92,12 @@ def _default_project_name(project: Path) -> str:
 
 def _default_spec_file(project: Path) -> Path:
     return project / "spec.md"
+
+
+def _deferred_release_enabled(orchestrator: object) -> bool:
+    config = getattr(orchestrator, "config", None)
+    gates = getattr(config, "gates", None)
+    return getattr(gates, "release_verification_mode", "") == "deferred"
 
 
 def _confirm_prompt(project_root: Path, prompt: str, default: str = "n") -> str:
@@ -797,6 +806,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass existing proof certificates.",
     )
 
+    release_worker_parser = subparsers.add_parser(
+        "release-worker",
+        help="Process deferred release proofs and bounded automatic recovery.",
+    )
+    release_worker_parser.add_argument("--project", required=True)
+    release_worker_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Process the latest eligible candidate and exit.",
+    )
+
+    attest_parser = subparsers.add_parser(
+        "attest",
+        help="Require a passed release attestation for an immutable Git candidate.",
+    )
+    attest_parser.add_argument("--project", required=True)
+    attest_parser.add_argument(
+        "--require-release",
+        default="HEAD",
+        metavar="REF",
+        help="Git ref that must have a passed release attestation. Defaults to HEAD.",
+    )
+
     sync_parser = subparsers.add_parser(
         "sync-agent-instructions",
         help="Generate Codex and Copilot instruction files from .auto-agents/project-rules.md.",
@@ -1179,6 +1211,17 @@ def main(argv: list[str] | None = None) -> int:
             if state_status == "blocked":
                 print(_render_run_summary(project_root, state_payload))
                 return 3
+            if (
+                state_status == "completed"
+                and _deferred_release_enabled(orchestrator)
+                and not bool(getattr(args, "full_verify", False))
+            ):
+                enqueue_release_verification(
+                    project_root,
+                    source=f"run:{state.run_id}",
+                    affected_proof_ids=[],
+                )
+                ensure_release_worker(project_root)
             _safe_notify(notify_run_finished, project_root, state_payload)
             print(_render_run_summary(project_root, state_payload))
             return 0
@@ -1282,6 +1325,46 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, RuntimeError, ValueError) as error:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
+
+    if args.command == "release-worker":
+        return run_release_worker(
+            Path(args.project),
+            once=bool(args.once),
+            output=sys.stderr,
+        )
+
+    if args.command == "attest":
+        from .release_jobs import ReleaseJobStore, candidate_identity
+
+        project_root = Path(args.project).expanduser().resolve()
+        resolved = subprocess.run(
+            ["git", "rev-parse", "--verify", str(args.require_release)],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+        )
+        if resolved.returncode != 0:
+            payload = {"ok": False, "error": resolved.stderr.strip() or "Git ref not found"}
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 1
+        required_sha = resolved.stdout.strip()
+        latest = ReleaseJobStore(project_root).latest()
+        current_id, current_sha = candidate_identity(project_root)
+        ok = bool(
+            latest.get("status") == "passed"
+            and latest.get("candidate_sha") == required_sha
+            and (required_sha != current_sha or latest.get("candidate_id") == current_id)
+        )
+        payload = {
+            "ok": ok,
+            "required_ref": str(args.require_release),
+            "required_sha": required_sha,
+            "release": latest,
+        }
+        if not ok:
+            payload["error"] = "required Git candidate is not release_verified"
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if ok else 1
 
     if args.command == "sync-agent-instructions":
         try:
@@ -1389,7 +1472,9 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     if args.command in ("fix", "collab", "provider-resolve"):
+        foreground = ForegroundActivity(Path(args.project))
         try:
+            foreground.acquire()
             from .session import Session
 
             project_root = Path(args.project)
@@ -1423,6 +1508,11 @@ def main(argv: list[str] | None = None) -> int:
                 state.to_dict(),
                 command=args.command,
             )
+            if (
+                state.status == "completed"
+                and _deferred_release_enabled(orchestrator)
+            ):
+                ensure_release_worker(project_root)
             print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
@@ -1440,6 +1530,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
+        finally:
+            foreground.release()
 
     parser.error(f"Unsupported command: {args.command}")
     return 2

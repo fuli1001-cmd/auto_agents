@@ -37,10 +37,12 @@ The system optimizes for quality over throughput:
 5. `provider_research`: resolve required external provider contracts into local pinned references
 6. `implement`: execute one feature slice at a time, with per-task verification and independent agent review
 7. `visual_judge`: optionally compare explicit prototype/actual screenshot pairs
-8. `verify`: run a final local gate pass across the full project
+8. `verify`: attest changed-path affected proofs; blocking policy or `--full-verify` runs release synchronously
 9. `readme`: interactively generate a project README from the finalized repository state
 
 Review and commit happen inside the `implement` loop for each task, not as separate top-level stages.
+Deferred policy automatically coalesces the finalized commit into the release worker after the
+foreground workflow returns.
 
 ## Environment isolation policy
 
@@ -604,6 +606,14 @@ file or an implementation-session UUID is not accepted as completion evidence.
     "unmapped_change_policy": "fallback",
     "fallback_proof_ids": ["core.smoke"],
     "release_blocking_paths": ["migrations/**", "pyproject.toml"],
+    "release_worker": {
+      "enabled": true,
+      "auto_start": true,
+      "idle_delay_seconds": 120,
+      "max_recovery_attempts": 2,
+      "max_infrastructure_retries": 2,
+      "background_parallel_workers": 2
+    },
     "target_final_seconds": 0,
     "max_auto_workers": "auto",
     "incremental": {
@@ -669,11 +679,36 @@ diagnostics do not physically rerun the same failing proof; any source change in
 
 Interactive `fix`, `collab`, and `run` attest only proofs selected by the changed-path impact graph.
 No-diff collab checks execute nothing. Critical or configured release-blocking paths escalate to a
-synchronous release attestation. Otherwise a release attestation is queued in
-`.auto-agents/state/release_attestation.json` and can be processed independently:
+synchronous release attestation. Otherwise the latest candidate is coalesced into the crash-safe
+`.auto-agents/state/release_jobs.sqlite3` queue. When `gates.release_worker.enabled` and
+`auto_start` are true, the workflow automatically starts a low-priority worker after returning its
+affected result. The worker waits for the configured idle delay, verifies the immutable commit in
+an isolated worktree, and supersedes obsolete candidates instead of accumulating one full run per
+commit.
+
+The worker classifies release failures. Infrastructure failures are retried without editing code.
+Deterministic product/test failures enter bounded release recovery: an implementation agent edits
+only the isolated worktree, the worker reruns the failed commands and affected proofs, then reruns
+release. A fully verified recovery is integrated only when the main checkout is still clean and at
+the original candidate; otherwise the old job is superseded and the latest candidate is verified.
+Exhausted, ambiguous, or unsafe recovery becomes `needs_user`.
+
+The worker can also be processed explicitly:
 
 ```bash
 python3 -m auto_agents verify --project /tmp/demo --level release
+```
+
+Use the recovery-capable worker rather than raw `verify` for unattended processing:
+
+```bash
+python3 -m auto_agents release-worker --project /tmp/demo --once
+```
+
+Deployment must require a passed attestation for the exact clean candidate:
+
+```bash
+python3 -m auto_agents attest --project /tmp/demo --require-release HEAD
 ```
 
 Use `--fresh` on `verify`, or `--full-verify` on a workflow, to bypass certificates deliberately.

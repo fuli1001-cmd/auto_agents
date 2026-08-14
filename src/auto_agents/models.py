@@ -459,6 +459,34 @@ class InfrastructureFailureMarker:
 
 
 @dataclass
+class ReleaseWorkerConfig:
+    enabled: bool = False
+    auto_start: bool = False
+    idle_delay_seconds: int = 60
+    max_recovery_attempts: int = 2
+    max_infrastructure_retries: int = 2
+    background_parallel_workers: int = 1
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "ReleaseWorkerConfig":
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            auto_start=bool(data.get("auto_start", False)),
+            idle_delay_seconds=max(0, int(data.get("idle_delay_seconds", 60) or 0)),
+            max_recovery_attempts=max(0, int(data.get("max_recovery_attempts", 2) or 0)),
+            max_infrastructure_retries=max(
+                0, int(data.get("max_infrastructure_retries", 2) or 0)
+            ),
+            background_parallel_workers=max(
+                1, int(data.get("background_parallel_workers", 1) or 1)
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class GateConfig:
     commands: List[str] = field(default_factory=list)
     steps: List[VerificationStep] = field(default_factory=list)
@@ -474,6 +502,7 @@ class GateConfig:
     unmapped_change_policy: str = "fallback"
     fallback_proof_ids: List[str] = field(default_factory=list)
     release_blocking_paths: List[str] = field(default_factory=list)
+    release_worker: ReleaseWorkerConfig = field(default_factory=ReleaseWorkerConfig)
     incremental_mode: str = "auto"
     warm_target_seconds: int = 900
     shard_target_seconds: int = 300
@@ -535,6 +564,11 @@ class GateConfig:
             release_blocking_paths=[
                 str(item) for item in data.get("release_blocking_paths", [])
             ],
+            release_worker=ReleaseWorkerConfig.from_dict(
+                dict(data.get("release_worker", {}))
+                if isinstance(data.get("release_worker", {}), dict)
+                else {}
+            ),
             incremental_mode=str(
                 dict(data.get("incremental", {})).get("mode", "auto")
                 if isinstance(data.get("incremental", {}), dict)
@@ -611,6 +645,7 @@ class GateConfig:
             "unmapped_change_policy": self.unmapped_change_policy,
             "fallback_proof_ids": list(self.fallback_proof_ids),
             "release_blocking_paths": list(self.release_blocking_paths),
+            "release_worker": self.release_worker.to_dict(),
             "incremental": {
                 "mode": self.incremental_mode,
                 "warm_target_seconds": self.warm_target_seconds,

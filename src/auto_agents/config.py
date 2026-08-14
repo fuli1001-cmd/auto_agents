@@ -47,7 +47,11 @@ AUTO_GITIGNORE_ENTRIES = (
     "state/requirements_audit_cache.sqlite3-*",
     "state/repomap_cache.json",
     "state/parallel_tuning.json",
-    "state/release_attestation.json",
+    "state/release_jobs.sqlite3",
+    "state/release_jobs.sqlite3-shm",
+    "state/release_jobs.sqlite3-wal",
+    "state/release-worker.log",
+    "state/release-worker.lock",
 )
 LEGACY_AUTO_GITIGNORE_ENTRIES = {"state/run_state.json"}
 
@@ -223,6 +227,14 @@ DEFAULT_CONFIG = {
         "unmapped_change_policy": "fallback",
         "fallback_proof_ids": [],
         "release_blocking_paths": [],
+        "release_worker": {
+            "enabled": False,
+            "auto_start": False,
+            "idle_delay_seconds": 60,
+            "max_recovery_attempts": 2,
+            "max_infrastructure_retries": 2,
+            "background_parallel_workers": 1,
+        },
         "incremental": {
             "mode": "auto",
             "warm_target_seconds": 900,

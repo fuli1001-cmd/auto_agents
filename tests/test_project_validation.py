@@ -3476,7 +3476,9 @@ class ProjectValidationTests(unittest.TestCase):
                 "state/gate_baseline_cache.json\nstate/gate_baseline_cache.sqlite3\n"
                 "state/gate_baseline_cache.sqlite3-*\nstate/requirements_audit_cache.sqlite3\n"
                 "state/requirements_audit_cache.sqlite3-*\nstate/repomap_cache.json\n"
-                "state/parallel_tuning.json\nstate/release_attestation.json\n",
+                "state/parallel_tuning.json\nstate/release_jobs.sqlite3\n"
+                "state/release_jobs.sqlite3-shm\nstate/release_jobs.sqlite3-wal\n"
+                "state/release-worker.log\nstate/release-worker.lock\n",
             )
 
     def test_clarify_prompt_uses_selected_document_language(self) -> None:

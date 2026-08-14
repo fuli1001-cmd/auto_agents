@@ -107,8 +107,8 @@ from .verification_selection import (
 )
 from .release_attestation import (
     complete_release_verification,
+    current_release_attestation,
     enqueue_release_verification,
-    release_attestation_path,
 )
 from .execution_recovery import (
     ExecutionIncident,
@@ -326,6 +326,8 @@ class Orchestrator:
         project_root: Path,
         agent_output_stream: Optional[TextIO] = None,
         user_input_fn: Optional[Callable[[str], str]] = None,
+        gate_cache_path: Optional[Path] = None,
+        gate_preempt_requested: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.config = load_project_config(self.project_root)
@@ -360,6 +362,8 @@ class Orchestrator:
         self._active_run_log_path: Optional[Path] = None
         self._performance_stages: Dict[str, float] = {}
         self._performance_commands: Dict[str, Dict[str, object]] = {}
+        self._shared_gate_cache_path = gate_cache_path
+        self._gate_preempt_requested = gate_preempt_requested
         gate_environment = gate_environment_fingerprint(
             isolation_mode=(
                 self.config.gates.isolation.mode
@@ -373,12 +377,12 @@ class Orchestrator:
         )
         self._gate_baseline_cache = GateBaselineCache(
             self.project_root,
-            cache_path=gate_baseline_cache_path(self.project_root),
+            cache_path=(gate_cache_path or gate_baseline_cache_path(self.project_root)),
             environment_fingerprint=gate_environment,
         )
         self._gate_timing_store = GateTimingStore(
             self.project_root,
-            cache_path=gate_baseline_cache_path(self.project_root),
+            cache_path=(gate_cache_path or gate_baseline_cache_path(self.project_root)),
             environment_fingerprint=gate_environment,
         )
         self._parallel_gate_quarantine: Set[str] = (
@@ -3951,6 +3955,14 @@ class Orchestrator:
                     "ok": result.ok,
                     "cached": result.cached,
                     "duration_seconds": result.duration_seconds,
+                    "stdout": result.stdout[-12000:],
+                    "stderr": result.stderr[-12000:],
+                    "termination_reason": result.termination_reason,
+                    "infrastructure_failure": bool(
+                        result.infrastructure_failure_id
+                    ),
+                    "infrastructure_failure_id": result.infrastructure_failure_id,
+                    "comparable_failures": bool(result.comparable_failures),
                 }
                 for result in gate.commands
             ],
@@ -6624,6 +6636,8 @@ class Orchestrator:
             result_context_fingerprint=result_context_fingerprint,
             source_ref=source_ref,
             use_result_cache=use_result_cache,
+            cache_path=self._shared_gate_cache_path,
+            preempt_requested=self._gate_preempt_requested,
         )
 
     def _gate_result_context_fingerprint(self) -> str:
@@ -17616,10 +17630,7 @@ class Orchestrator:
 
     def status(self) -> Dict[str, object]:
         state = load_run_state(self.project_root)
-        release_attestation = read_json(
-            release_attestation_path(self.project_root),
-            default={},
-        )
+        release_attestation = current_release_attestation(self.project_root)
         runtime_interruptions = [
             entry
             for entry in state.recovery_loop_events
@@ -17633,11 +17644,7 @@ class Orchestrator:
             "approved_gates": state.approved_gates,
             "agent_attempts": state.agent_attempts,
             "last_error": state.last_error,
-            "release_attestation": (
-                release_attestation
-                if isinstance(release_attestation, dict)
-                else {}
-            ),
+            "release_attestation": release_attestation,
             "active_execution_incident_id": state.active_execution_incident_id,
             "execution_incidents": list(state.execution_incidents),
             "last_runtime_interruption": (

@@ -668,6 +668,8 @@ class LocalGatePlanExecutor:
         result_context_fingerprint: str = "",
         source_ref: str = "",
         use_result_cache: bool = True,
+        cache_path: Optional[Path] = None,
+        preempt_requested: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.gate_config = gate_config
@@ -692,12 +694,15 @@ class LocalGatePlanExecutor:
         self.worker_id = worker_id
         self.source_ref = str(source_ref).strip()
         self.use_result_cache = bool(use_result_cache)
+        self.preempt_requested = preempt_requested
         self.timing_store = GateTimingStore(
             self.project_root,
+            cache_path=cache_path,
             environment_fingerprint=environment_fingerprint,
         )
         self.result_cache = GateResultCache(
             self.project_root,
+            cache_path=cache_path,
             environment_fingerprint=environment_fingerprint,
             context_fingerprint=result_context_fingerprint,
             max_age_seconds=gate_config.cache_max_age_seconds,
@@ -933,6 +938,19 @@ class LocalGatePlanExecutor:
                 if progress is not None:
                     progress("cache_hit", command, 0.0)
                 return cached
+            if self.preempt_requested is not None and self.preempt_requested():
+                return CommandResult(
+                    command=command,
+                    ok=False,
+                    returncode=125,
+                    stderr="background release yielded to a foreground workflow",
+                    termination_reason="foreground_preempted",
+                    infrastructure_error=True,
+                    infrastructure_failure_id="foreground_preempted",
+                    job_id=job_id,
+                    worker_id=self.worker_id,
+                    backend="local-isolated",
+                )
             sandbox, _created = self._sandbox(lane, job_id)
             requested_profile = str(
                 dict(environment_overrides or {}).get(
@@ -973,29 +991,56 @@ class LocalGatePlanExecutor:
                         runtime_profile=requested_profile,
                         dynamic_ports=dynamic_ports,
                     )
-                    process = run_supervised_shell_command(
-                        traced_command,
-                        cwd=sandbox,
-                        env=env,
-                        timeout_seconds=timeout_seconds,
-                        adaptive_timeout_enabled=adaptive_timeout_enabled,
-                        idle_timeout_seconds=idle_timeout_seconds,
-                        kind="gate",
-                        cancel_event=cancel_event,
-                        progress=(
-                            (
-                                lambda event, elapsed: progress(
-                                    event, command, elapsed
+                    monitor_stop = threading.Event()
+                    foreground_preempted = threading.Event()
+                    monitor = None
+                    if self.preempt_requested is not None and cancel_event is not None:
+                        def monitor_foreground() -> None:
+                            while not monitor_stop.wait(0.5):
+                                if self.preempt_requested is not None and self.preempt_requested():
+                                    foreground_preempted.set()
+                                    cancel_event.set()
+                                    return
+
+                        monitor = threading.Thread(
+                            target=monitor_foreground,
+                            name="release-foreground-monitor",
+                            daemon=True,
+                        )
+                        monitor.start()
+                    try:
+                        process = run_supervised_shell_command(
+                            traced_command,
+                            cwd=sandbox,
+                            env=env,
+                            timeout_seconds=timeout_seconds,
+                            adaptive_timeout_enabled=adaptive_timeout_enabled,
+                            idle_timeout_seconds=idle_timeout_seconds,
+                            kind="gate",
+                            cancel_event=cancel_event,
+                            progress=(
+                                (
+                                    lambda event, elapsed: progress(
+                                        event, command, elapsed
+                                    )
                                 )
-                            )
-                            if progress is not None
-                            else None
-                        ),
-                    )
+                                if progress is not None
+                                else None
+                            ),
+                        )
+                    finally:
+                        monitor_stop.set()
+                        if monitor is not None:
+                            monitor.join(timeout=1.0)
             mutations = self._mutation_paths(sandbox)
             self._publish_diagnostics(sandbox, job_id)
             stderr = process.stderr
-            ok = process.returncode == 0 and not process.termination_reason
+            termination_reason = (
+                "foreground_preempted"
+                if foreground_preempted.is_set()
+                else process.termination_reason
+            )
+            ok = process.returncode == 0 and not termination_reason
             returncode = process.returncode
             artifacts: dict[str, str] = {}
             if ok:
@@ -1014,7 +1059,7 @@ class LocalGatePlanExecutor:
                 stdout=process.stdout,
                 stderr=stderr,
                 duration_seconds=process.duration_seconds,
-                termination_reason=process.termination_reason,
+                termination_reason=termination_reason,
                 timeout_seconds=process.timeout_seconds,
                 cleanup_incomplete=process.cleanup_incomplete,
                 last_activity_seconds=process.last_activity_seconds,
