@@ -53,6 +53,10 @@ from .run_lock import (
     RunAlreadyActiveError,
     stop_project_run,
 )
+from .release_attestation import (
+    begin_release_verification,
+    complete_release_verification,
+)
 from .self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
@@ -773,6 +777,26 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("validate", help="Validate config, plan, and required docs.")
     validate_parser.add_argument("--project", required=True, help="Target project directory.")
 
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Execute managed affected or release proof attestation.",
+    )
+    verify_parser.add_argument("--project", required=True, help="Target project directory.")
+    verify_parser.add_argument(
+        "--level",
+        choices=("affected", "release"),
+        default="affected",
+    )
+    verify_parser.add_argument(
+        "--changed-from",
+        help="Git ref used to calculate the affected path set.",
+    )
+    verify_parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Bypass existing proof certificates.",
+    )
+
     sync_parser = subparsers.add_parser(
         "sync-agent-instructions",
         help="Generate Codex and Copilot instruction files from .auto-agents/project-rules.md.",
@@ -1223,6 +1247,41 @@ def main(argv: list[str] | None = None) -> int:
         report = validation_report(Path(args.project))
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0 if report["ok"] else 1
+
+    if args.command == "verify":
+        try:
+            project_root = Path(args.project).expanduser().resolve()
+            changed_path_set = None
+            if args.changed_from:
+                process = subprocess.run(
+                    ["git", "diff", "--name-only", str(args.changed_from)],
+                    cwd=project_root,
+                    capture_output=True,
+                    text=True,
+                )
+                if process.returncode != 0:
+                    raise RuntimeError(process.stderr.strip() or "git diff failed")
+                changed_path_set = [
+                    line.strip() for line in process.stdout.splitlines() if line.strip()
+                ]
+            orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            if args.level == "release":
+                begin_release_verification(project_root)
+            result = orchestrator.run_verification(
+                level=args.level,
+                changed_path_set=changed_path_set,
+                fresh=bool(args.fresh),
+            )
+            if args.level == "release":
+                result["release_attestation"] = complete_release_verification(
+                    project_root,
+                    result,
+                )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+            return 0 if bool(result.get("ok")) else 1
+        except (OSError, RuntimeError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
 
     if args.command == "sync-agent-instructions":
         try:

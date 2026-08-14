@@ -210,7 +210,7 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("collapse distinct semantics", prompt)
             self.assertIn("nearby existing tests", prompt)
 
-    def test_review_prompt_uses_configured_command_for_verification_refs(self) -> None:
+    def test_review_prompt_delegates_verification_refs_to_orchestrator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -229,11 +229,12 @@ class ImplementPipelineTests(unittest.TestCase):
 
             prompt = orchestrator._build_task_prompt(task, "review")
 
-            self.assertIn(
+            self.assertNotIn(
                 "./.conda/bin/python -m pytest -q tests/test_api.py::ApiTests::test_contract",
                 prompt,
             )
-            self.assertIn("Do not substitute a bare global pytest executable", prompt)
+            self.assertIn("orchestrator owns execution of verification_refs", prompt)
+            self.assertIn("Do not run those refs manually", prompt)
 
     def test_review_prompt_includes_task_status_migration_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

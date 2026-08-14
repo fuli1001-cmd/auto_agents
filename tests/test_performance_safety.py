@@ -748,6 +748,8 @@ class GateOptimizationTests(unittest.TestCase):
             root = Path(tmp) / "demo"
             Orchestrator.init_project(root, "demo", "mock")
             orchestrator = Orchestrator(root)
+            orchestrator.config.gates.verification_policy_version = 3
+            orchestrator.config.gates.incremental_mode = "off"
             orchestrator.config.gates.steps = [
                 VerificationStep(
                     runner="pytest",

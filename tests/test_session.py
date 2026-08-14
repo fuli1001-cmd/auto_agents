@@ -2662,10 +2662,11 @@ class BaselineDiffVerifyTests(unittest.TestCase):
             self.assertEqual(len(state.baseline_commands), 1)
             session._release_baseline(state)
 
-    def test_collab_progress_plan_excludes_final_only_steps(self) -> None:
+    def test_collab_interactive_attestations_exclude_release_only_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.verification_policy_version = 3
             orchestrator.config.gates.steps = [
                 VerificationStep(
                     kind="test",
@@ -2693,8 +2694,7 @@ class BaselineDiffVerifyTests(unittest.TestCase):
 
             self.assertEqual(len(progress), 1)
             self.assertIn("tests/test_progress.py", progress[0])
-            self.assertEqual(len(final), 2)
-            self.assertTrue(any("tests/test_final.py" in command for command in final))
+            self.assertEqual(final, progress)
 
     def test_baseline_command_set_includes_parallel_group_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

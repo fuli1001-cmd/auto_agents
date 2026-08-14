@@ -150,7 +150,6 @@ class GateTimingStore:
         duration = float(result.duration_seconds or 0.0)
         if (
             self.disabled
-            or not result.ok
             or result.termination_reason
             or result.cleanup_incomplete
             or result.infrastructure_error

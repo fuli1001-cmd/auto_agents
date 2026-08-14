@@ -70,7 +70,13 @@ def _path_digest(path: Path) -> Optional[str]:
 
 
 class GateResultCache:
-    """Persistent success-only cache for isolated verification commands."""
+    """Persistent proof certificates for isolated verification commands.
+
+    Success certificates may be reused across candidates when a complete
+    observed-input manifest still matches. Stable failures are reusable only
+    for the exact candidate/environment, preventing duplicate diagnostics
+    without carrying a failure into a changed tree.
+    """
 
     def __init__(
         self,
@@ -114,6 +120,16 @@ class GateResultCache:
         now = int(time.time())
         try:
             with self._lock, self._connect() as connection:
+                certificate = connection.execute(
+                    """
+                    SELECT result_payload
+                    FROM gate_proof_certificates
+                    WHERE cache_key = ? AND updated_at >= ?
+                    """,
+                    (key, now - self.max_age_seconds),
+                ).fetchone()
+                if certificate is not None:
+                    return self._certificate_result(command, certificate[0])
                 row = connection.execute(
                     """
                     SELECT observed_inputs
@@ -162,7 +178,6 @@ class GateResultCache:
         if (
             self.disabled
             or result_cache_scope == "off"
-            or not result.ok
             or result.termination_reason
             or result.cleanup_incomplete
             or result.infrastructure_error
@@ -193,6 +208,50 @@ class GateResultCache:
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock, self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT OR REPLACE INTO gate_proof_certificates (
+                        cache_key, identity_key, command, source_fingerprint,
+                        context_fingerprint, result_payload, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        identity,
+                        str(command).strip(),
+                        source_fingerprint,
+                        context,
+                        json.dumps(
+                            {
+                                "ok": bool(result.ok),
+                                "returncode": int(result.returncode),
+                                "stdout": result.stdout[-200_000:],
+                                "stderr": result.stderr[-200_000:],
+                                "comparable_failures": bool(result.comparable_failures),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+                connection.execute(
+                    "DELETE FROM gate_proof_certificates WHERE updated_at < ?",
+                    (now - self.max_age_seconds,),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM gate_proof_certificates
+                    WHERE cache_key IN (
+                        SELECT cache_key FROM gate_proof_certificates
+                        ORDER BY updated_at DESC
+                        LIMIT -1 OFFSET ?
+                    )
+                    """,
+                    (MAX_ROWS,),
+                )
+                if not result.ok:
+                    return
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO gate_result_successes (
@@ -264,11 +323,45 @@ class GateResultCache:
             cached=True,
         )
 
+    @staticmethod
+    def _certificate_result(command: str, raw_payload: str) -> CommandResult:
+        payload = json.loads(raw_payload or "{}")
+        return CommandResult(
+            command=command,
+            ok=bool(payload.get("ok")),
+            returncode=int(payload.get("returncode", 0)),
+            stdout=str(payload.get("stdout", "")),
+            stderr=str(payload.get("stderr", "")),
+            comparable_failures=bool(payload.get("comparable_failures", False)),
+            duration_seconds=0.0,
+            backend="proof-certificate-candidate",
+            cached=True,
+        )
+
     def _connect(self) -> sqlite3.Connection:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(str(self.cache_path), timeout=2.0)
         connection.execute("PRAGMA busy_timeout = 2000")
         connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gate_proof_certificates (
+                cache_key TEXT PRIMARY KEY,
+                identity_key TEXT NOT NULL,
+                command TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                context_fingerprint TEXT NOT NULL,
+                result_payload TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS gate_proof_certificate_identity
+            ON gate_proof_certificates(identity_key, context_fingerprint, updated_at)
+            """
+        )
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS gate_result_successes (

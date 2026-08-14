@@ -47,6 +47,10 @@ from .requirements import (
     validate_provider_resolve_trace_transition,
     validate_requirements_trace_payload,
 )
+from .release_attestation import (
+    complete_release_verification,
+    enqueue_release_verification,
+)
 from .validation import _looks_like_python_command, _uses_project_local_conda
 
 _GOAL_CLEAR = re.compile(r"^GOAL_CLEAR\s*$", re.MULTILINE)
@@ -102,8 +106,22 @@ class Session:
 
     def _session_gate_plan(self, scope: str):
         """Resolve the gate plan used by a session verification scope."""
-        phase = "implement" if scope == "progress" else "final"
-        return self.orch._resolved_gate_plan(phase)
+        if scope == "release" or (
+            scope == "final"
+            and (
+                self._full_verify
+                or self.config.gates.release_verification_mode == "blocking"
+            )
+        ):
+            return self.orch._resolved_gate_plan("final", level="release")
+        return self.orch._resolved_gate_plan(
+            "implement",
+            level="affected",
+            changed_path_set=changed_paths(self.project_root),
+        )
+
+    def _release_gate_plan(self):
+        return self._session_gate_plan("release")
 
     @staticmethod
     def _logical_gate_commands(plan) -> List[str]:
@@ -403,6 +421,7 @@ class Session:
                 state.status = "completed"
                 state.resolution = "fixed"
                 self._git_commit(state, "fix", reply=reply)
+                self._record_release_attestation(state, verify)
                 self._release_baseline(state)
                 self._print(f"Bug fix completed in session {state.session_id}.")
                 return state
@@ -438,7 +457,7 @@ class Session:
         # Materialize the generated verification config before resolving the
         # plan or capturing the shared session baseline.
         self.orch._apply_generated_verification_config()
-        final_plan = self._session_gate_plan("final")
+        final_plan = self._release_gate_plan()
         if final_plan.commands or final_plan.parallel_groups:
             self._ensure_baseline(state)
         feedback = ""
@@ -529,6 +548,7 @@ class Session:
                 if answer.strip().lower() not in ("n", "no"):
                     state.status = "completed"
                     self._git_commit(state, "collab", reply=reply)
+                    self._record_release_attestation(state, verify)
                     self._release_baseline(state)
                     self._print(f"Collaborative session {state.session_id} completed successfully.")
                     return state
@@ -596,6 +616,7 @@ class Session:
                     self._print("Final verification passed!")
                     state.status = "completed"
                     self._git_commit(state, "collab", reply=reply)
+                    self._record_release_attestation(state, final_verify)
                     self._release_baseline(state)
                     self._print(f"Collaborative session {state.session_id} completed successfully.")
                     return state
@@ -1409,18 +1430,15 @@ class Session:
     def _run_verify(self, scope: str = "final") -> Dict[str, object]:
         """Run verification appropriate for the session mode.
 
-        Collab progress checks use the implement plan; completion attestation
-        and all fix checks use the final plan. Both session modes compare gate
-        failures with the session-start baseline.
+        Fix and collab both use affected-proof attestation. A release plan is
+        synchronous only for critical impact, blocking policy, or an explicit
+        ``--full-verify`` request.
 
         Other session modes fall back to the original short-circuit gate
         runner.
         """
         if scope not in {"progress", "final"}:
             raise ValueError(f"unsupported session verification scope: {scope}")
-        if self.mode == "fix":
-            scope = "final"
-
         # Fix and collab modes use the baseline-diff path so pre-existing,
         # unrelated project failures do not become work for the session.
         if self.mode in {"fix", "collab"}:
@@ -1448,7 +1466,7 @@ class Session:
         *executing*, and again on resume if the git HEAD has moved.
         """
         self._print("Capturing baseline gate snapshot...")
-        plan = self._session_gate_plan("final")
+        plan = self._release_gate_plan()
         baseline_commands = self._logical_gate_commands(plan)
         if (
             self.config.gates.verification_policy_version >= 3
@@ -1577,6 +1595,12 @@ class Session:
                 "executed_commands": executed_commands,
                 "certificate_hits": certificate_hits,
                 "duration_seconds": round(time.monotonic() - started, 6),
+                "attestation_level": getattr(plan, "verification_level", scope),
+                "proof_ids": list(getattr(plan, "proof_ids", [])),
+                "unmapped_paths": list(getattr(plan, "unmapped_paths", [])),
+                "forced_release_reason": str(
+                    getattr(plan, "forced_release_reason", "")
+                ),
             }
             result.update(details)
             return result
@@ -1632,12 +1656,16 @@ class Session:
             )
             return diagnostic_gate
 
+        # Resolve once so targeted and affected layers share identical proof
+        # metadata and therefore the same candidate certificate.
+        plan = self._session_gate_plan(scope)
+
         # Layer 1: targeted bug verification
         if self.mode == "fix" and state.fix_verify_command:
             verify_command = self._fix_verify_command_for_execution(state.fix_verify_command)
             try:
                 with self.orch._gate_executor_context(
-                    {verify_command: {}}
+                    {verify_command: plan.metadata.get(verify_command, {})}
                 ) as gate_executor:
                     targeted_gate = run_gate_plan(
                         [verify_command],
@@ -1673,16 +1701,10 @@ class Session:
                 return outcome(False, f"fix_verify_command failed: {detail[:500]}")
 
         # Layer 2: baseline-diff gate check
-        plan = self._session_gate_plan(scope)
         if not plan.commands and not plan.parallel_groups:
             return outcome(True, "no verification steps or commands configured")
         metadata = plan.metadata
-        force_current_candidate = any(
-            self.orch._is_high_risk_review_path(path)
-            for path in changed_paths(self.project_root)
-        )
-        if self.mode == "collab" and scope == "final" and self._full_verify:
-            force_current_candidate = True
+        force_current_candidate = bool(self._full_verify and scope == "final")
         with self.orch._gate_executor_context(
             metadata,
             use_result_cache=not force_current_candidate,
@@ -2174,6 +2196,25 @@ class Session:
             })
             self._save(state)
             return False
+
+    def _record_release_attestation(
+        self,
+        state: SessionState,
+        verify: Dict[str, object],
+    ) -> None:
+        if str(verify.get("attestation_level", "")) == "release":
+            payload = complete_release_verification(self.project_root, verify)
+        elif self.config.gates.release_verification_mode == "deferred":
+            payload = enqueue_release_verification(
+                self.project_root,
+                source=f"{self.mode}:{state.session_id}",
+                affected_proof_ids=[str(item) for item in verify.get("proof_ids", [])],
+            )
+        else:
+            return
+        # The session commit already captured its terminal state. The release
+        # queue is ignored runtime state, so do not dirty the tracked session
+        # record after committing the candidate.
 
     def _consolidate_goal(self, state: SessionState) -> str:
         """Build a consolidated goal description from the conversation."""

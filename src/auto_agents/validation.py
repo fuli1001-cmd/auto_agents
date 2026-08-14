@@ -22,9 +22,11 @@ from .models import (
     TASK_ORIGINS,
     VERIFICATION_CACHE_SCOPES,
     VERIFICATION_CADENCES,
+    VERIFICATION_LEVELS,
     VERIFICATION_MEMORY_GUARDS,
     VERIFICATION_RESULT_CACHE_SCOPES,
     VERIFICATION_RESOURCE_CLASSES,
+    VERIFICATION_RISKS,
     VERIFICATION_SERIAL_REASONS,
 )
 from .requirements import (
@@ -230,11 +232,24 @@ def validate_verification_steps(
     if not steps:
         return errors
     artifact_owners: Dict[str, str] = {}
+    proof_owners: Dict[str, str] = {}
     for index, raw_step in enumerate(steps, start=1):
         prefix = f"{field_name}[{index}]"
         if not isinstance(raw_step, dict):
             errors.append(f"{prefix} must be an object")
             continue
+        proof_id = str(raw_step.get("proof_id", "")).strip()
+        if policy_version >= 4:
+            if not re.fullmatch(r"[a-z][a-z0-9_.-]{2,127}", proof_id):
+                errors.append(
+                    f"{prefix}.proof_id must match [a-z][a-z0-9_.-]{{2,127}} under verification policy v4"
+                )
+            elif proof_id in proof_owners:
+                errors.append(
+                    f"{prefix}.proof_id duplicates {proof_owners[proof_id]}: {proof_id}"
+                )
+            else:
+                proof_owners[proof_id] = prefix
         kind = str(raw_step.get("kind", "test")).strip().lower()
         runner = str(raw_step.get("runner", "")).strip().lower()
         if kind != "test":
@@ -285,6 +300,50 @@ def validate_verification_steps(
         if cadence not in VERIFICATION_CADENCES:
             allowed = ", ".join(VERIFICATION_CADENCES)
             errors.append(f"{prefix}.cadence must be one of: {allowed}")
+        levels = raw_step.get("levels", [])
+        if policy_version >= 4 and (
+            not isinstance(levels, list)
+            or not levels
+            or any(str(item).strip().lower() not in VERIFICATION_LEVELS for item in levels)
+            or len({str(item).strip().lower() for item in levels}) != len(levels)
+        ):
+            errors.append(
+                f"{prefix}.levels must be a non-empty unique list containing affected and/or release"
+            )
+        impact_paths = raw_step.get("impact_paths", [])
+        if impact_paths is not None and (
+            not isinstance(impact_paths, list)
+            or any(not isinstance(item, str) or not item.strip() for item in impact_paths)
+        ):
+            errors.append(f"{prefix}.impact_paths must be a list of non-empty strings")
+        if (
+            policy_version >= 4
+            and isinstance(levels, list)
+            and "affected" in {str(item).strip().lower() for item in levels}
+            and (not isinstance(impact_paths, list) or not impact_paths)
+        ):
+            errors.append(
+                f"{prefix}.impact_paths is required for affected proofs under verification policy v4"
+            )
+        for pattern in impact_paths if isinstance(impact_paths, list) else []:
+            normalized_pattern = str(pattern).replace("\\", "/")
+            if normalized_pattern.startswith("/") or ".." in normalized_pattern.split("/"):
+                errors.append(
+                    f"{prefix}.impact_paths entries must be safe project-relative globs"
+                )
+        dependencies = raw_step.get("depends_on_proofs", [])
+        if dependencies is not None and (
+            not isinstance(dependencies, list)
+            or any(not isinstance(item, str) or not item.strip() for item in dependencies)
+        ):
+            errors.append(
+                f"{prefix}.depends_on_proofs must be a list of non-empty proof ids"
+            )
+        risk = str(raw_step.get("risk", "medium")).strip().lower()
+        if risk not in VERIFICATION_RISKS:
+            errors.append(
+                f"{prefix}.risk must be one of: {', '.join(VERIFICATION_RISKS)}"
+            )
         cache_scope = str(raw_step.get("cache_scope", "run_context")).strip().lower()
         if cache_scope not in VERIFICATION_CACHE_SCOPES:
             allowed = ", ".join(VERIFICATION_CACHE_SCOPES)
@@ -428,6 +487,15 @@ def validate_verification_steps(
                     errors.append(
                         f"{prefix}.result_cache_scope observed_inputs cannot use artifacts, "
                         "exclusive resources, or dynamic ports"
+                    )
+    if policy_version >= 4:
+        for index, raw_step in enumerate(steps, start=1):
+            if not isinstance(raw_step, dict):
+                continue
+            for dependency in raw_step.get("depends_on_proofs", []):
+                if dependency not in proof_owners:
+                    errors.append(
+                        f"{field_name}[{index}].depends_on_proofs references unknown proof_id: {dependency}"
                     )
     return errors
 
@@ -617,9 +685,9 @@ def validate_task_plan_payload(
     if (
         not isinstance(verification_policy_version, int)
         or isinstance(verification_policy_version, bool)
-        or verification_policy_version not in {1, 2, 3}
+        or verification_policy_version not in {1, 2, 3, 4}
     ):
-        errors.append("task plan verification_policy_version must be 1, 2, or 3")
+        errors.append("task plan verification_policy_version must be 1, 2, 3, or 4")
         verification_policy_version = 1
 
     test_strategy = payload.get("test_strategy")
@@ -1088,9 +1156,9 @@ def validate_project_config_payload(payload: object) -> List[str]:
         if (
             not isinstance(verification_policy_version, int)
             or isinstance(verification_policy_version, bool)
-            or verification_policy_version not in {1, 2, 3}
+            or verification_policy_version not in {1, 2, 3, 4}
         ):
-            errors.append("gates.verification_policy_version must be 1, 2, or 3")
+            errors.append("gates.verification_policy_version must be 1, 2, 3, or 4")
             verification_policy_version = 1
         commands = gates.get("commands")
         if not isinstance(commands, list) or any(not isinstance(item, str) for item in commands):
@@ -1143,6 +1211,47 @@ def validate_project_config_payload(payload: object) -> List[str]:
             or target_final_seconds < 0
         ):
             errors.append("gates.target_final_seconds must be an integer >= 0")
+        if verification_policy_version >= 4:
+            if gates.get("interactive_level", "affected") != "affected":
+                errors.append("gates.interactive_level must be affected under policy v4")
+            if gates.get("release_verification_mode", "deferred") not in {
+                "deferred",
+                "blocking",
+            }:
+                errors.append(
+                    "gates.release_verification_mode must be deferred or blocking"
+                )
+            if gates.get("unmapped_change_policy", "fallback") not in {
+                "fallback",
+                "release",
+            }:
+                errors.append(
+                    "gates.unmapped_change_policy must be fallback or release"
+                )
+            proof_ids = {
+                str(item.get("proof_id", "")).strip()
+                for item in gates.get("steps", [])
+                if isinstance(item, dict)
+            }
+            fallback_ids = gates.get("fallback_proof_ids", [])
+            if not isinstance(fallback_ids, list) or any(
+                not isinstance(item, str) or item not in proof_ids
+                for item in fallback_ids
+            ):
+                errors.append(
+                    "gates.fallback_proof_ids must reference configured proof ids"
+                )
+            blocking_paths = gates.get("release_blocking_paths", [])
+            if not isinstance(blocking_paths, list) or any(
+                not isinstance(item, str)
+                or not item.strip()
+                or item.startswith("/")
+                or ".." in item.replace("\\", "/").split("/")
+                for item in blocking_paths
+            ):
+                errors.append(
+                    "gates.release_blocking_paths must be safe project-relative globs"
+                )
         incremental = gates.get("incremental", {})
         if not isinstance(incremental, dict):
             errors.append("gates.incremental must be an object")

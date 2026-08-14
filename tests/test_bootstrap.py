@@ -49,11 +49,11 @@ class BootstrapTests(unittest.TestCase):
             auto_gitignore = (auto_dir(project_root) / ".gitignore").read_text(encoding="utf-8")
             self.assertEqual(
                 auto_gitignore,
-                "failed-verification-logs/\nruns/\nstate/sessions/\n"
+                "failed-verification-logs/\nruns/\n"
                 "state/gate_baseline_cache.json\nstate/gate_baseline_cache.sqlite3\n"
                 "state/gate_baseline_cache.sqlite3-*\nstate/requirements_audit_cache.sqlite3\n"
                 "state/requirements_audit_cache.sqlite3-*\nstate/repomap_cache.json\n"
-                "state/parallel_tuning.json\n",
+                "state/parallel_tuning.json\nstate/release_attestation.json\n",
             )
             task_archive_ignore = subprocess.run(
                 ["git", "check-ignore", "-q", ".auto-agents/history/task_plans/run-001.json"],
@@ -89,7 +89,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(run_state_archive_ignore.returncode, 0)
             self.assertEqual(run_log_ignore.returncode, 0)
             self.assertEqual(failed_log_ignore.returncode, 0)
-            self.assertEqual(session_ignore.returncode, 0)
+            self.assertEqual(session_ignore.returncode, 1)
             gitignore = (project_root / ".gitignore").read_text(encoding="utf-8")
             self.assertIn(".env", gitignore)
             self.assertIn(".conda/", gitignore)

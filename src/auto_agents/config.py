@@ -47,6 +47,7 @@ AUTO_GITIGNORE_ENTRIES = (
     "state/requirements_audit_cache.sqlite3-*",
     "state/repomap_cache.json",
     "state/parallel_tuning.json",
+    "state/release_attestation.json",
 )
 LEGACY_AUTO_GITIGNORE_ENTRIES = {"state/run_state.json"}
 
@@ -216,7 +217,12 @@ DEFAULT_CONFIG = {
         "commands": [],
         "steps": [],
         "parallel_groups": [],
-        "verification_policy_version": 3,
+        "verification_policy_version": 4,
+        "interactive_level": "affected",
+        "release_verification_mode": "deferred",
+        "unmapped_change_policy": "fallback",
+        "fallback_proof_ids": [],
+        "release_blocking_paths": [],
         "incremental": {
             "mode": "auto",
             "warm_target_seconds": 900,

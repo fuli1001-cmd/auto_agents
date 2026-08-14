@@ -36,7 +36,7 @@ def test_gate_timing_uses_median_of_latest_seven_successes(
     assert store.estimate("pytest tests/test_demo.py", metadata) == 5.0
 
 
-def test_gate_timing_excludes_failures_and_separates_resource_signatures(
+def test_gate_timing_includes_finite_failures_and_separates_resource_signatures(
     tmp_path: Path,
 ) -> None:
     store = GateTimingStore(
@@ -53,7 +53,7 @@ def test_gate_timing_excludes_failures_and_separates_resource_signatures(
         normal,
     )
 
-    assert store.estimate("pytest tests/test_demo.py", normal) == 12.0
+    assert store.estimate("pytest tests/test_demo.py", normal) == 6.5
     assert store.estimate("pytest tests/test_demo.py", heavy) is None
 
     other_environment = GateTimingStore(
@@ -66,7 +66,7 @@ def test_gate_timing_excludes_failures_and_separates_resource_signatures(
     ) is None
     assert other_environment.estimate_any_environment(
         "pytest tests/test_demo.py", normal
-    ) == 12.0
+    ) == 6.5
 
 
 def test_parallel_quarantine_is_environment_scoped_and_persistent(

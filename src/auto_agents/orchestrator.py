@@ -101,6 +101,15 @@ from .gate_execution import (
 )
 from .distributed_gates import DistributedGatePlanExecutor
 from .workers import gate_environment_fingerprint
+from .verification_selection import (
+    remove_release_target_overlap,
+    select_verification_steps,
+)
+from .release_attestation import (
+    complete_release_verification,
+    enqueue_release_verification,
+    release_attestation_path,
+)
 from .execution_recovery import (
     ExecutionIncident,
     ExecutionIncidentStore,
@@ -3798,6 +3807,8 @@ class Orchestrator:
         collect_all: bool,
         context: str,
         phase: Optional[str] = None,
+        level: Optional[str] = None,
+        changed_path_set: Optional[Iterable[str]] = None,
     ):
         self._apply_generated_verification_config()
         if phase is None:
@@ -3808,7 +3819,11 @@ class Orchestrator:
                 else "final"
             )
         before_snapshot = self._worktree_change_snapshot()
-        plan = self._resolved_gate_plan(phase)
+        plan = self._resolved_gate_plan(
+            phase,
+            level=level,
+            changed_path_set=changed_path_set,
+        )
         commands = plan.commands
         parallel_groups = plan.parallel_groups
         scope_counts = {
@@ -3877,6 +3892,69 @@ class Orchestrator:
                 f"{self._changed_path_preview(changed)}"
             )
         return gate, reason
+
+    def run_verification(
+        self,
+        *,
+        level: str,
+        changed_path_set: Optional[Iterable[str]] = None,
+        fresh: bool = False,
+    ) -> Dict[str, object]:
+        """Execute one managed proof attestation and report physical reuse."""
+        previous_force_full = self._force_full_verify
+        self._force_full_verify = bool(fresh)
+        started = time.monotonic()
+        try:
+            plan = self._resolved_gate_plan(
+                "final" if level == "release" else "implement",
+                level=level,
+                changed_path_set=changed_path_set,
+            )
+            if not plan.commands and not plan.parallel_groups:
+                return {
+                    "ok": True,
+                    "reason": "no changed proof surface",
+                    "attestation_level": plan.verification_level,
+                    "proof_ids": plan.proof_ids,
+                    "unmapped_paths": plan.unmapped_paths,
+                    "logical_commands": 0,
+                    "executed_commands": 0,
+                    "certificate_hits": 0,
+                    "duration_seconds": 0.0,
+                }
+            gate, mutation_error = self._run_gate_commands(
+                collect_all=True,
+                context=f"{level} proof attestation",
+                phase="final" if level == "release" else "implement",
+                level=level,
+                changed_path_set=changed_path_set,
+            )
+        finally:
+            self._force_full_verify = previous_force_full
+        hits = sum(bool(result.cached) for result in gate.commands)
+        reason = mutation_error or gate.summary
+        return {
+            "ok": bool(gate.ok and not mutation_error),
+            "reason": reason,
+            "attestation_level": plan.verification_level,
+            "proof_ids": plan.proof_ids,
+            "changed_paths": plan.changed_paths,
+            "unmapped_paths": plan.unmapped_paths,
+            "forced_release_reason": plan.forced_release_reason,
+            "logical_commands": len(gate.commands),
+            "executed_commands": len(gate.commands) - hits,
+            "certificate_hits": hits,
+            "duration_seconds": round(time.monotonic() - started, 6),
+            "commands": [
+                {
+                    "command": result.command,
+                    "ok": result.ok,
+                    "cached": result.cached,
+                    "duration_seconds": result.duration_seconds,
+                }
+                for result in gate.commands
+            ],
+        }
 
     def _run_gate_commands_for_commands(
         self,
@@ -6336,18 +6414,48 @@ class Orchestrator:
     def _default_gate_commands(self) -> List[str]:
         return list(self.config.gates.commands)
 
-    def _resolved_gate_plan(self, phase: str) -> ResolvedGatePlan:
+    def _resolved_gate_plan(
+        self,
+        phase: str,
+        *,
+        level: Optional[str] = None,
+        changed_path_set: Optional[Iterable[str]] = None,
+    ) -> ResolvedGatePlan:
         """Resolve one deduplicated plan for the requested execution phase."""
         if phase not in {"implement", "final"}:
             raise ValueError(f"unsupported gate plan phase: {phase}")
 
         steps = list(self.config.gates.steps)
+        has_structured_steps = bool(steps)
+        selection = None
+        if steps and self.config.gates.verification_policy_version >= 4:
+            requested_level = level or (
+                "affected" if phase == "implement" else "release"
+            )
+            candidate_paths = (
+                list(changed_path_set)
+                if changed_path_set is not None
+                else (
+                    changed_paths(self.project_root)
+                    if requested_level == "affected"
+                    else []
+                )
+            )
+            selection = select_verification_steps(
+                steps,
+                self.project_root,
+                self.config.gates,
+                level=requested_level,
+                changed_paths=candidate_paths,
+            )
+            steps = selection.steps
         manual_groups = [
             group
             for group in self.config.gates.parallel_groups
             if not group.name.startswith("steps-")
+            and (selection is None or selection.level == "release")
         ]
-        if steps:
+        if has_structured_steps:
             resolved = resolve_gate_plan_from_verification_steps(
                 steps,
                 self.project_root,
@@ -6431,6 +6539,13 @@ class Orchestrator:
             raw_command_count=raw_count,
             metadata=metadata,
             result_cache_scopes=result_cache_scopes,
+            verification_level=(selection.level if selection is not None else phase),
+            proof_ids=(selection.proof_ids if selection is not None else []),
+            changed_paths=(selection.changed_paths if selection is not None else []),
+            unmapped_paths=(selection.unmapped_paths if selection is not None else []),
+            forced_release_reason=(
+                selection.forced_release_reason if selection is not None else ""
+            ),
         )
 
     @staticmethod
@@ -13190,28 +13305,31 @@ class Orchestrator:
         baseline_sha = self._git_ref_from_verify_baseline_ref(
             state.implement_verify_baseline_ref
         )
-        if baseline_sha and not previous_force_full:
+        changed_path_set: List[str] = []
+        if baseline_sha:
             changed = subprocess.run(
                 ["git", "diff", "--name-only", f"{baseline_sha}..HEAD"],
                 cwd=self.project_root,
                 capture_output=True,
                 text=True,
             )
-            if changed.returncode == 0 and any(
-                self._is_high_risk_review_path(path.strip())
-                for path in changed.stdout.splitlines()
-                if path.strip()
-            ):
-                self._force_full_verify = True
-                self.logger.info(
-                    "[gate-attestation] forcing current-candidate full verification "
-                    "because dependency/configuration inputs changed"
-                )
+            if changed.returncode == 0:
+                changed_path_set = [
+                    path.strip() for path in changed.stdout.splitlines() if path.strip()
+                ]
+        requested_level = (
+            "release"
+            if previous_force_full
+            or self.config.gates.release_verification_mode == "blocking"
+            else "affected"
+        )
         try:
             verify_gate, mutation_error = self._run_gate_commands(
-                collect_all=False,
+                collect_all=True,
                 context="verify stage commands",
-                phase="final",
+                phase="final" if requested_level == "release" else "implement",
+                level=requested_level,
+                changed_path_set=changed_path_set,
             )
         finally:
             self._force_full_verify = previous_force_full
@@ -13244,7 +13362,11 @@ class Orchestrator:
         state.current_stage = "verify"
         state.stage_summaries["verify"] = summary.strip()
         state.last_error = ""
-        final_plan = self._resolved_gate_plan("final")
+        final_plan = self._resolved_gate_plan(
+            "final" if requested_level == "release" else "implement",
+            level=requested_level,
+            changed_path_set=changed_path_set,
+        )
         if not verify_gate.ok:
             state.status = "failed"
             raw_output = self._gate_raw_output(verify_gate)
@@ -13332,6 +13454,23 @@ class Orchestrator:
             state.stage_summaries["requirements_audit"] = audit_report.strip()
         state.agent_attempts.pop("requirements_audit_recovery", None)
         state.agent_attempts.pop("verify_recovery", None)
+        hits = sum(bool(result.cached) for result in verify_gate.commands)
+        attestation_result = {
+            "ok": True,
+            "reason": verify_gate.summary,
+            "proof_ids": final_plan.proof_ids,
+            "logical_commands": len(verify_gate.commands),
+            "executed_commands": len(verify_gate.commands) - hits,
+            "certificate_hits": hits,
+        }
+        if final_plan.verification_level == "release":
+            complete_release_verification(self.project_root, attestation_result)
+        elif self.config.gates.release_verification_mode == "deferred":
+            enqueue_release_verification(
+                self.project_root,
+                source=f"run:{state.run_id}",
+                affected_proof_ids=final_plan.proof_ids,
+            )
         return state
 
     def _load_tasks_from_plan(self) -> List[TaskSpec]:
@@ -14203,7 +14342,7 @@ class Orchestrator:
                 ".auto-agents/docs/requirements_audit.md, .auto-agents/docs/review.md, "
                 "project_brief.md, architecture.md, requirements_trace.json, or any other "
                 "repository files to make the plan pass.",
-                "At the root of the JSON, set verification_policy_version=3 and also define test_strategy and verification_steps.",
+                "At the root of the JSON, set verification_policy_version=4 and also define test_strategy and verification_steps.",
                 "At the root of the JSON, set oracle_proof_schema_version to 2 for all new plans. auto_agents will bind each proof to the current requirement contract hash.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
                 "Every task that covers requirement_ids must include requirement_proofs. Each proof must include requirement_id, oracle_index (1-based) or exact acceptance_oracle, proof_type, oracle_strength, evidence_boundary, evidence_refs, status='planned', and forbidden_proxy_oracles copied from the bound requirement.",
@@ -14226,7 +14365,7 @@ class Orchestrator:
                 "Every active task must define verification_refs for the smallest executable proof surface it owns. Prefer exact selectors such as tests/test_api.py::test_contract. A whole test-file ref is allowed only when that same file is an implement_and_final verification target. Do not assign a broad directory or the entire suite to an individual task.",
                 "For Python verification, use verification_steps entries with kind='test' and runner='pytest'; do not use unittest as the planned runner. Prefer one target per test file when test files already exist. A broad directory target such as ['tests'] is allowed only with cadence='final_only'; auto_agents expands Pytest and Vitest directories into per-file steps before running gates.",
                 "Give every verification step a concise non-empty purpose describing its proof surface. Declare concurrency explicitly. Set parallel_safe=true only when a step is independent from both the ordered serial lane and peer parallel checks, including shared databases, ports, mutable fixtures, snapshots, build outputs, producer/consumer artifacts, and other process-global state. Otherwise set parallel_safe=false and provide serial_reason as one of artifact_chain, shared_mutable_state, fixed_port, external_side_effect, or ordered_contract.",
-                "Classify verification cadence explicitly: use cadence='implement_and_final' for focused checks needed during implementation and cadence='final_only' for broad release suites. Policy v3 turns directory suites into stable cache shards, including legacy max_batches=1 suites. Classify cache_scope='source' only when results depend solely on source and dependency state; use cache_scope='run_context' for requirements/task-state/config-sensitive checks. Use result_cache_scope='auto' for normal success-only reuse: auto_agents records complete filesystem observations and only reuses a shard when every observed input still matches. Use 'candidate' for exact-tree-only reuse and 'off' for checks that must always execute.",
+                "Under verification policy v4 every step must have a stable unique proof_id, levels containing affected and/or release, risk=low|medium|high|critical, and explicit impact_paths for affected proofs. Focused proofs should normally use levels=['affected']; duration-balanced exhaustive shards use levels=['release']. Do not put the same test surface in both levels. depends_on_proofs declares proof prerequisites. Classify cache_scope='source' only when results depend solely on source and dependency state; use cache_scope='run_context' for requirements/task-state/config-sensitive checks. Use result_cache_scope='auto' for managed proof-certificate reuse.",
                 "Gate commands run in snapshot-backed worktrees. Use per-test relative temp paths and dynamically allocated port 0 whenever the same process can discover the bound port. When a child process requires a numeric port before launch, declare lowercase snake_case dynamic_ports names and make the test read AUTO_AGENTS_GATE_PORT_<UPPER_NAME>; keep a port-0 fallback for manual runs. Declaring dynamic_ports does not by itself make a step parallel-safe. Commands that intentionally share generated artifacts must remain parallel_safe=false and appear in producer-before-consumer order; commands that use unadapted fixed host ports, Docker daemons, or shared external accounts must declare host:/pool: exclusive_resources.",
                 "Declare requires for non-default tools such as ffmpeg or chrome and resource_class='heavy' for browser/FFmpeg workloads. Use cpu_slots only when a command needs an explicit scheduling capacity instead of the resource_class default. Memory checks are opt-in: memory_mb is the measured command working-set budget, memory_reserve_mb is the desired host reserve, and memory_guard must be 'off', 'advisory', or 'required'. Prefer advisory unless a dependable hard minimum is known; never invent a memory estimate. Declare artifact_globs only for ignored project-relative evidence that must survive sandbox cleanup. Never use absolute artifact paths or '..'.",
                 "Requirement proofs for ignored generated evidence must be portable across isolated gate worktrees. Reference stable current-run pointers or project-relative wildcard paths covered by the producing verification step's artifact_globs; never bind a proof to an implementation-session UUID. A pre-existing ignored file is not proof unless the current isolated verification publishes it.",
@@ -14530,11 +14669,9 @@ class Orchestrator:
         if task.verification_refs:
             common.extend(
                 [
-                    "Verification refs command for this task:",
-                    self._build_task_proof_evidence_command(task.verification_refs),
-                    "When checking verification_refs manually, use the command above or the "
-                    "project's configured verification command rewritten to those refs. Do not "
-                    "substitute a bare global pytest executable or a different Python environment.",
+                    "The orchestrator owns execution of verification_refs and records their proof "
+                    "certificates. Do not run those refs manually; implement the change and let the "
+                    "managed verification step provide one canonical result and retry feedback.",
                 ]
             )
         if requirement_context:
@@ -14578,7 +14715,7 @@ class Orchestrator:
                 "Example final response block:\nORACLE_PROOF_UPDATES:\n```json\n[{\"requirement_id\":\"REQ-001\",\"oracle_index\":1,\"status\":\"verified\",\"proof_type\":\"integration_test\",\"oracle_strength\":\"behavioral\",\"evidence_boundary\":\"system_boundary\",\"evidence_refs\":[\"tests/test_public_api.py::test_behavior\"],\"proxy_oracles\":[]}]\n```",
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
-                "Run the current task's focused verification_refs while implementing. Do not repeatedly run a broad final_only suite unless retry feedback shows that broader diagnosis is required; auto_agents runs release verification at the final gate.",
+                "Do not run verification_refs or broad suites inside the implementation agent. auto_agents executes each owned proof once after the candidate is ready and reuses that certificate in review and attestation.",
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
                 "When task status migration context is present, migrate only repository tests that assert stale task status. Do not edit orchestrator-owned .auto-agents state snapshots to force that transition early.",
                 "Tests should validate observable behavior (API contracts, input/output, side-effects), not internal implementation details.",
@@ -17382,6 +17519,17 @@ class Orchestrator:
                     max_batches_per_step=max_batches_per_step,
                 )
             )
+            if verification_policy_version >= 4:
+                release_steps = [
+                    step for step in steps if "release" in step.levels
+                ]
+                normalized_release = remove_release_target_overlap(
+                    release_steps,
+                    steps,
+                )
+                steps = [
+                    step for step in steps if "release" not in step.levels
+                ] + normalized_release
             if not self.config.gates.allow_agent_updates:
                 return
             try:
@@ -17468,6 +17616,10 @@ class Orchestrator:
 
     def status(self) -> Dict[str, object]:
         state = load_run_state(self.project_root)
+        release_attestation = read_json(
+            release_attestation_path(self.project_root),
+            default={},
+        )
         runtime_interruptions = [
             entry
             for entry in state.recovery_loop_events
@@ -17481,6 +17633,11 @@ class Orchestrator:
             "approved_gates": state.approved_gates,
             "agent_attempts": state.agent_attempts,
             "last_error": state.last_error,
+            "release_attestation": (
+                release_attestation
+                if isinstance(release_attestation, dict)
+                else {}
+            ),
             "active_execution_incident_id": state.active_execution_incident_id,
             "execution_incidents": list(state.execution_incidents),
             "last_runtime_interruption": (

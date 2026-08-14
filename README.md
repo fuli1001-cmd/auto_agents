@@ -274,7 +274,7 @@ By default, implementation refuses to start if the target repository already has
 Use `--allow-dirty-tree` only when you explicitly want task work to proceed on top of an existing
 dirty workspace.
 
-During `plan`, the agent must write `verification_policy_version: 3`, `test_strategy`, and
+During `plan`, the agent must write `verification_policy_version: 4`, `test_strategy`, and
 structured `verification_steps` into
 `.auto-agents/state/task_plan.json`. By default the orchestrator derives runnable gate commands from
 those steps and stores both the structured steps and derived commands in `.auto-agents/config.json`,
@@ -286,9 +286,11 @@ JavaScript and TypeScript verification steps must use `runner: "vitest"`. Legacy
 `verification_commands` are still accepted for compatibility, but new plans should not generate
 free-form shell verification commands.
 
-Each step may also declare `cadence` and `cache_scope`. `cadence: "implement_and_final"`
-(the default) runs during implementation baselines and final verification;
-`cadence: "final_only"` reserves broad release suites for the final verify stage. Use
+Each v4 step declares a stable `proof_id`, `levels`, `impact_paths`, and `risk`. Focused checks use
+`levels: ["affected"]`; exhaustive duration-balanced shards use `levels: ["release"]`. When an
+exact affected selector shares a file with a release shard, auto_agents removes that selector from
+the release command; a whole-file affected proof removes the file from release entirely.
+`depends_on_proofs` expresses proof prerequisites. Use
 `cache_scope: "source"` only for checks whose result depends solely on the source/worktree;
 the conservative default, `cache_scope: "run_context"`, also invalidates when requirement or task
 context changes. Version 2 also requires every active task to own one or more executable
@@ -296,7 +298,7 @@ context changes. Version 2 also requires every active task to own one or more ex
 `tests/test_api.py::test_contract`; a whole-file ref is accepted only when that file is an
 `implement_and_final` step.
 
-Broad Pytest and Vitest directory targets must use `cadence: "final_only"`. Policy v3 expands
+Broad Pytest and Vitest directory targets belong to the release level. Policy v4 expands
 them into stable hash shards. Unchanged files remain in the same shard when timing history changes,
 so successful shards form durable verification certificates instead of one monolithic suite result.
 
@@ -534,7 +536,7 @@ Review auto-escalation triggers (when configured as `balanced`):
 
 Setting review to `deep` or `max` overrides auto-escalation and uses that effort for every review.
 
-Under policy v3, implementation and fix baselines capture the immutable source first but do not run
+Under policy v4, implementation and fix baselines capture the immutable source first but do not run
 the suite eagerly. If a candidate shard fails, only that shard is evaluated on the baseline to
 distinguish a regression from a pre-existing failure. Successful candidate shards are cached per
 command in
@@ -547,7 +549,7 @@ fingerprint remain identical. The legacy JSON cache is ignored; the first run af
 captures one cold baseline. Cache corruption disables reuse and falls back to running the real
 commands.
 
-Under verification policy version 2 or 3, concurrency must be explicit. A
+Under verification policy version 4, concurrency must be explicit. A
 `verification_steps` entry is concurrent only when it sets `parallel_safe=true`; otherwise it must
 set `parallel_safe=false` and declare a `serial_reason` (`artifact_chain`,
 `shared_mutable_state`, `fixed_port`, `external_side_effect`, or `ordered_contract`). Safe entries
@@ -596,7 +598,12 @@ file or an implementation-session UUID is not accepted as completion evidence.
 ```json
 {
   "gates": {
-    "verification_policy_version": 3,
+    "verification_policy_version": 4,
+    "interactive_level": "affected",
+    "release_verification_mode": "deferred",
+    "unmapped_change_policy": "fallback",
+    "fallback_proof_ids": ["core.smoke"],
+    "release_blocking_paths": ["migrations/**", "pyproject.toml"],
     "target_final_seconds": 0,
     "max_auto_workers": "auto",
     "incremental": {
@@ -620,9 +627,14 @@ Gate steps may also declare scheduling and artifact metadata:
 
 ```json
 {
+  "proof_id": "browser.project-flow",
   "kind": "test",
   "runner": "vitest",
   "targets": ["workbench/src/e2e/example.test.ts"],
+  "levels": ["affected"],
+  "impact_paths": ["workbench/src/**"],
+  "depends_on_proofs": [],
+  "risk": "high",
   "parallel_safe": true,
   "max_batches": 4,
   "cache_scope": "source",
@@ -639,27 +651,32 @@ Gate steps may also declare scheduling and artifact metadata:
 }
 ```
 
-`max_batches` bounds directory expansion for one verification step. In policy v3, cacheable
+`max_batches` bounds directory expansion for one verification step. In policy v4, cacheable
 directory suites use stable shards even when a legacy plan specified `1`; use
 `result_cache_scope: "off"` for a suite whose single-process semantics must always be preserved.
 
-`result_cache_scope` controls the success-only command result cache stored in the gate cache
-database. `auto` uses exact-candidate reuse everywhere and upgrades source-scoped commands to
+`result_cache_scope` controls proof certificates stored in the gate cache database. `auto` uses
+exact-candidate reuse everywhere and upgrades successful source-scoped commands to
 cross-candidate reuse only after a complete local filesystem trace proves all inputs unchanged;
 negative path lookups, dependency lock state, runtime identity, and network access participate in
-the certificate. `candidate` reuses a success only for an identical source and semantic context;
+the certificate. `candidate` reuses a stable result only for an identical source and semantic context;
 `observed_inputs` can reuse across commits when Linux syscall tracing proves that every observed
 project input is unchanged and no network access occurred; `off` always executes. Validation only
 permits `observed_inputs` on source-scoped, parallel-safe checks without artifacts, exclusive
-resources, or dynamic ports. Failures, timeouts, mutations, infrastructure errors, and artifact
-producers are never cached.
+resources, or dynamic ports. Timeouts, mutations, infrastructure errors, and artifact producers are
+never cached. Stable finite failures are certified only for the exact candidate so repeated
+diagnostics do not physically rerun the same failing proof; any source change invalidates them.
 
-Final verification still attests every logical shard: cache hits count as certificate-backed
-successes, while misses execute synchronously. Use `run --full-verify` or `fix --full-verify` to
-bypass all result certificates and execute every current-candidate shard. With
-`collab --full-verify`, only the final completion attestation bypasses certificates; interactive
-progress checks remain incremental. Existing v2 project configs without an `incremental` block are
-migrated to v3 automatically when loaded.
+Interactive `fix`, `collab`, and `run` attest only proofs selected by the changed-path impact graph.
+No-diff collab checks execute nothing. Critical or configured release-blocking paths escalate to a
+synchronous release attestation. Otherwise a release attestation is queued in
+`.auto-agents/state/release_attestation.json` and can be processed independently:
+
+```bash
+python3 -m auto_agents verify --project /tmp/demo --level release
+```
+
+Use `--fresh` on `verify`, or `--full-verify` on a workflow, to bypass certificates deliberately.
 
 `cpu_slots` declares how many worker scheduling slots the command consumes. Zero or omission keeps
 the compatibility default: `resource_class=heavy` consumes two slots and normal commands consume
@@ -1302,7 +1319,7 @@ Interactive bug-fix loop:
    **not actually a bug** (e.g., expected behavior, configuration issue), it will explain
    its reasoning and ask for your confirmation before closing the session
 2. **Execute** — the agent applies a targeted fix with convergence-based retry (see below)
-3. **Verify** — configured gate commands are run to confirm the fix
+3. **Verify** — the targeted command and changed-path `affected` proofs attest the candidate
 4. **Commit** — changes are committed on success
 
 ```bash
@@ -1317,11 +1334,11 @@ the browser"):
 1. **Converse** — describe the goal; the agent clarifies
 2. **Iterate** — the agent works toward the goal autonomously; when it needs user action (e.g. "open
    the browser and check the result"), it pauses with `NEED_USER_ASSIST`. Ordinary progress and
-   `BUG_FOUND` iterations run only `implement_and_final` gates, using the shared session-start lazy
+   `BUG_FOUND` iterations run only affected proofs, using the shared session-start lazy
    baseline and successful shard certificates. Verified bug fixes are committed as they happen.
-3. **Complete** — `GOAL_ACHIEVED`, or your confirmation after an ordinary progress result, runs the
-   final plan including `final_only` gates. Changes are committed only after that final attestation
-   passes.
+3. **Complete** — `GOAL_ACHIEVED`, or your confirmation after ordinary progress, reuses the same
+   affected-proof certificates. The candidate is committed immediately; exhaustive release proofs
+   are deferred unless policy or risk requires them synchronously.
 
 ```bash
 python3 -m auto_agents collab --project /tmp/demo

@@ -18,6 +18,8 @@ SESSION_HARD_CEILING = {"fix": 15, "collab": 25, "provider_resolve": 15}
 DOCUMENT_LANGUAGE_OPTIONS = ("en", "zh")
 TASK_ORIGINS = ("planned", "scope_split", "evidence_repair", "stage_recovery")
 VERIFICATION_CADENCES = ("implement_and_final", "final_only")
+VERIFICATION_LEVELS = ("affected", "release")
+VERIFICATION_RISKS = ("low", "medium", "high", "critical")
 VERIFICATION_CACHE_SCOPES = ("source", "run_context")
 VERIFICATION_RESULT_CACHE_SCOPES = ("off", "candidate", "observed_inputs", "auto")
 VERIFICATION_SERIAL_REASONS = (
@@ -267,6 +269,7 @@ class ProviderConfig:
 
 @dataclass
 class VerificationStep:
+    proof_id: str = ""
     kind: str = "test"
     runner: str = ""
     purpose: str = ""
@@ -277,6 +280,10 @@ class VerificationStep:
     max_batches: int = 0
     serial_reason: str = ""
     cadence: str = "implement_and_final"
+    levels: List[str] = field(default_factory=list)
+    impact_paths: List[str] = field(default_factory=list)
+    depends_on_proofs: List[str] = field(default_factory=list)
+    risk: str = "medium"
     cache_scope: str = "run_context"
     result_cache_scope: str = "auto"
     resource_class: str = "normal"
@@ -292,6 +299,7 @@ class VerificationStep:
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "VerificationStep":
         return cls(
+            proof_id=str(data.get("proof_id", "")),
             kind=str(data.get("kind", "test")),
             runner=str(data.get("runner", "")),
             purpose=str(data.get("purpose", "")),
@@ -302,6 +310,12 @@ class VerificationStep:
             max_batches=int(data.get("max_batches", 0) or 0),
             serial_reason=str(data.get("serial_reason", "")),
             cadence=str(data.get("cadence", "implement_and_final")),
+            levels=[str(item) for item in data.get("levels", [])],
+            impact_paths=[str(item) for item in data.get("impact_paths", [])],
+            depends_on_proofs=[
+                str(item) for item in data.get("depends_on_proofs", [])
+            ],
+            risk=str(data.get("risk", "medium")),
             cache_scope=str(data.get("cache_scope", "run_context")),
             result_cache_scope=str(data.get("result_cache_scope", "auto")),
             resource_class=str(data.get("resource_class", "normal")),
@@ -321,6 +335,7 @@ class VerificationStep:
 
     def to_dict(self) -> Dict[str, object]:
         return {
+            "proof_id": self.proof_id,
             "kind": self.kind,
             "runner": self.runner,
             "purpose": self.purpose,
@@ -330,6 +345,10 @@ class VerificationStep:
             "max_batches": self.max_batches,
             "serial_reason": self.serial_reason,
             "cadence": self.cadence,
+            "levels": list(self.levels),
+            "impact_paths": list(self.impact_paths),
+            "depends_on_proofs": list(self.depends_on_proofs),
+            "risk": self.risk,
             "cache_scope": self.cache_scope,
             "result_cache_scope": self.result_cache_scope,
             "resource_class": self.resource_class,
@@ -450,6 +469,11 @@ class GateConfig:
     parallel_workers: Union[int, str] = "auto"
     max_auto_workers: Union[int, str] = "auto"
     target_final_seconds: int = 0
+    interactive_level: str = "affected"
+    release_verification_mode: str = "deferred"
+    unmapped_change_policy: str = "fallback"
+    fallback_proof_ids: List[str] = field(default_factory=list)
+    release_blocking_paths: List[str] = field(default_factory=list)
     incremental_mode: str = "auto"
     warm_target_seconds: int = 900
     shard_target_seconds: int = 300
@@ -498,6 +522,19 @@ class GateConfig:
                 else str(data.get("max_auto_workers", "auto"))
             ),
             target_final_seconds=max(0, int(data.get("target_final_seconds", 0) or 0)),
+            interactive_level=str(data.get("interactive_level", "affected")),
+            release_verification_mode=str(
+                data.get("release_verification_mode", "deferred")
+            ),
+            unmapped_change_policy=str(
+                data.get("unmapped_change_policy", "fallback")
+            ),
+            fallback_proof_ids=[
+                str(item) for item in data.get("fallback_proof_ids", [])
+            ],
+            release_blocking_paths=[
+                str(item) for item in data.get("release_blocking_paths", [])
+            ],
             incremental_mode=str(
                 dict(data.get("incremental", {})).get("mode", "auto")
                 if isinstance(data.get("incremental", {}), dict)
@@ -569,6 +606,11 @@ class GateConfig:
             "parallel_workers": self.parallel_workers,
             "max_auto_workers": self.max_auto_workers,
             "target_final_seconds": self.target_final_seconds,
+            "interactive_level": self.interactive_level,
+            "release_verification_mode": self.release_verification_mode,
+            "unmapped_change_policy": self.unmapped_change_policy,
+            "fallback_proof_ids": list(self.fallback_proof_ids),
+            "release_blocking_paths": list(self.release_blocking_paths),
             "incremental": {
                 "mode": self.incremental_mode,
                 "warm_target_seconds": self.warm_target_seconds,

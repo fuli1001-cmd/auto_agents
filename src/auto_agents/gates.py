@@ -99,6 +99,8 @@ class FailureExtraction:
 
 @dataclass
 class GateCommandMetadata:
+    proof_ids: List[str] = field(default_factory=list)
+    risk: str = "medium"
     resource_class: str = "normal"
     cpu_slots: int = 0
     memory_mb: int = 0
@@ -121,6 +123,11 @@ class ResolvedGatePlan:
     raw_command_count: int
     metadata: dict[str, GateCommandMetadata] = field(default_factory=dict)
     result_cache_scopes: dict[str, str] = field(default_factory=dict)
+    verification_level: str = "release"
+    proof_ids: List[str] = field(default_factory=list)
+    changed_paths: List[str] = field(default_factory=list)
+    unmapped_paths: List[str] = field(default_factory=list)
+    forced_release_reason: str = ""
 
     @property
     def unique_command_count(self) -> int:
@@ -381,7 +388,7 @@ def expand_pytest_directory_steps(
                 discovered_targets.append(test_file)
                 seen_targets.add(test_file)
         expanded.extend(
-            replace(step, targets=[target], args=list(step.args))
+            _expanded_proof_step(step, [target], list(step.args))
             for target in fallback_targets
         )
         batch_limit = (
@@ -405,7 +412,7 @@ def expand_pytest_directory_steps(
             )
         )
         expanded.extend(
-            replace(step, targets=batch, args=list(remaining_args))
+            _expanded_proof_step(step, batch, list(remaining_args))
             for batch in batches
         )
     return expanded
@@ -669,6 +676,28 @@ def _stable_target_shards(
     return [sorted(shard) for shard in shards if shard]
 
 
+def _expanded_proof_step(
+    step: VerificationStep,
+    targets: Sequence[str],
+    args: Sequence[str],
+) -> VerificationStep:
+    proof_id = step.proof_id
+    if proof_id and (list(targets) != step.targets or list(args) != step.args):
+        suffix = hashlib.sha256(
+            json.dumps(
+                {"targets": sorted(targets), "args": list(args)},
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:10]
+        proof_id = f"{proof_id}.shard-{suffix}"
+    return replace(
+        step,
+        proof_id=proof_id,
+        targets=list(targets),
+        args=list(args),
+    )
+
+
 def _historical_target_weights(
     step: VerificationStep,
     targets: Sequence[str],
@@ -756,7 +785,7 @@ def expand_vitest_directory_steps(
                 discovered_targets.append(test_file)
                 seen_targets.add(test_file)
         expanded.extend(
-            replace(step, targets=[target], args=list(step.args))
+            _expanded_proof_step(step, [target], list(step.args))
             for target in fallback_targets
         )
         batch_limit = (
@@ -780,7 +809,7 @@ def expand_vitest_directory_steps(
             )
         )
         expanded.extend(
-            replace(step, targets=batch, args=list(remaining_args))
+            _expanded_proof_step(step, batch, list(remaining_args))
             for batch in batches
         )
     return expanded
@@ -933,6 +962,20 @@ def resolve_gate_plan_from_verification_steps(
             key=lambda value: memory_guard_order.get(value, 0),
         )
         metadata[command] = GateCommandMetadata(
+            proof_ids=list(
+                dict.fromkeys(
+                    step.proof_id for step in command_steps if step.proof_id
+                )
+            ),
+            risk=max(
+                (step.risk.strip().lower() or "medium" for step in command_steps),
+                key=lambda value: {
+                    "low": 0,
+                    "medium": 1,
+                    "high": 2,
+                    "critical": 3,
+                }.get(value, 1),
+            ),
             resource_class=resource_class,
             cpu_slots=max((step.cpu_slots for step in command_steps), default=0),
             memory_mb=max((step.memory_mb for step in command_steps), default=0),

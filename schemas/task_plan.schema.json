@@ -7,8 +7,8 @@
   "properties": {
     "verification_policy_version": {
       "type": "integer",
-      "enum": [1, 2, 3],
-      "description": "Version 3 adds verifiable incremental gate reuse and stable shards."
+      "enum": [1, 2, 3, 4],
+      "description": "Version 4 adds affected/release proof attestation and impact selection."
     },
     "test_strategy": {
       "type": "string"
@@ -26,6 +26,10 @@
         "type": "object",
         "required": ["kind", "runner"],
         "properties": {
+          "proof_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{2,127}$"
+          },
           "kind": {
             "type": "string",
             "enum": ["test"]
@@ -72,6 +76,25 @@
           "cadence": {
             "type": "string",
             "enum": ["implement_and_final", "final_only"]
+          },
+          "levels": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "enum": ["affected", "release"]}
+          },
+          "impact_paths": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1}
+          },
+          "depends_on_proofs": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1}
+          },
+          "risk": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "critical"]
           },
           "cache_scope": {
             "type": "string",

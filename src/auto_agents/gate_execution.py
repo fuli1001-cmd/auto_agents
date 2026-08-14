@@ -205,6 +205,8 @@ def _metadata_resource_class(metadata: object) -> str:
 
 def _metadata_signature(metadata: object) -> str:
     payload = {
+        "proof_ids": sorted(_metadata_list(metadata, "proof_ids")),
+        "risk": str(getattr(metadata, "risk", "medium")),
         "resource_class": _metadata_resource_class(metadata),
         "cpu_slots": int(getattr(metadata, "cpu_slots", 0) or 0),
         "memory_mb": int(getattr(metadata, "memory_mb", 0) or 0),
