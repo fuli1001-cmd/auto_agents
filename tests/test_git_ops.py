@@ -1,4 +1,5 @@
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from auto_agents.git_ops import (
     head_ref,
     list_worktrees,
     ref_exists,
+    reconcile_managed_worktree,
     remove_worktree,
     update_ref,
 )
@@ -58,6 +60,62 @@ class GitOpsWorktreeTests(unittest.TestCase):
 
             remove_worktree(project_root, worktree_path)
             self.assertNotIn(str(worktree_path), list_worktrees(project_root))
+
+    def test_reconcile_removes_registered_worktree_after_directory_disappears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            commit_all(project_root, "test: init")
+            managed_root = Path(tmp) / "managed"
+            worktree_path = managed_root / "release-job"
+            add_worktree(project_root, worktree_path)
+            shutil.rmtree(worktree_path)
+            self.assertIn(str(worktree_path), list_worktrees(project_root))
+
+            removed = reconcile_managed_worktree(
+                project_root,
+                worktree_path,
+                managed_root=managed_root,
+            )
+
+            self.assertTrue(removed)
+            self.assertNotIn(str(worktree_path), list_worktrees(project_root))
+
+    def test_reconcile_preserves_existing_registered_worktree_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            commit_all(project_root, "test: init")
+            managed_root = Path(tmp) / "managed"
+            worktree_path = managed_root / "release-job"
+            add_worktree(project_root, worktree_path)
+            try:
+                self.assertFalse(
+                    reconcile_managed_worktree(
+                        project_root,
+                        worktree_path,
+                        managed_root=managed_root,
+                    )
+                )
+                self.assertTrue(worktree_path.exists())
+                self.assertIn(str(worktree_path), list_worktrees(project_root))
+            finally:
+                remove_worktree(project_root, worktree_path)
+
+    def test_reconcile_rejects_path_outside_managed_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            managed_root = Path(tmp) / "managed"
+
+            with self.assertRaisesRegex(RuntimeError, "outside managed root"):
+                reconcile_managed_worktree(
+                    project_root,
+                    Path(tmp) / "outside" / "release-job",
+                    managed_root=managed_root,
+                )
 
     def test_parallel_worker_reconciles_stale_registered_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

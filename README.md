@@ -693,6 +693,12 @@ release. A fully verified recovery is integrated only when the main checkout is 
 the original candidate; otherwise the old job is superseded and the latest candidate is verified.
 Exhausted, ambiguous, or unsafe recovery becomes `needs_user`.
 
+If the process or machine stops, the durable job remains active until the worker is started again.
+At startup the sole worker lease requeues abandoned work and reconciles the exact managed release
+worktree path, including the case where `/tmp` was cleared but Git still has a stale registration.
+Completed proof certificates remain reusable; the interrupted command itself starts again. This
+restart reconciliation does not spend infrastructure or LLM recovery budget.
+
 The worker can also be processed explicitly:
 
 ```bash

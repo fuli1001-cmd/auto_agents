@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Iterable
@@ -260,6 +261,52 @@ def list_worktrees(project_root: Path) -> list[str]:
         if line.startswith("worktree "):
             paths.append(line[len("worktree ") :].strip())
     return paths
+
+
+def reconcile_managed_worktree(
+    project_root: Path,
+    worktree_path: Path,
+    *,
+    managed_root: Path,
+    remove_existing: bool = False,
+) -> bool:
+    """Remove an abandoned worktree only inside an explicit managed root.
+
+    Missing directories may still be registered in Git after a reboot. Existing
+    worktrees are preserved by default; a caller holding the corresponding
+    worker lease may opt in to removing its exact abandoned path.
+    """
+    project = Path(project_root).resolve()
+    root = Path(managed_root).resolve()
+    path = Path(worktree_path).resolve()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as error:
+        raise RuntimeError(
+            f"refusing to reconcile worktree outside managed root: {path}"
+        ) from error
+    if not relative.parts or path in {root, project}:
+        raise RuntimeError(f"refusing to reconcile unsafe managed worktree path: {path}")
+
+    registered = {Path(item).resolve() for item in list_worktrees(project)}
+    if path in registered:
+        if path.exists() and not remove_existing:
+            return False
+        remove_worktree(project, path, force=True)
+    elif path.exists():
+        if not remove_existing:
+            return False
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+    else:
+        return False
+
+    remaining = {Path(item).resolve() for item in list_worktrees(project)}
+    if path in remaining or path.exists():
+        raise RuntimeError(f"managed worktree cleanup did not remove {path}")
+    return True
 
 
 def commit_changed_paths(project_root: Path, commit_sha: str) -> list[str]:

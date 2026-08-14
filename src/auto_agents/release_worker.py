@@ -17,6 +17,7 @@ from .git_ops import (
     add_worktree,
     commit_all_except,
     head_ref,
+    reconcile_managed_worktree,
     remove_worktree,
     working_tree_clean,
 )
@@ -139,14 +140,15 @@ def _process_job(
         store.defer(job_id, reason="foreground workflow is active; release worker yielded")
         return
 
-    worktree_root = (
-        Path(tempfile.gettempdir())
-        / "auto-agents-release-worktrees"
-        / str(job_id)
-    )
+    managed_worktree_root = Path(tempfile.gettempdir()) / "auto-agents-release-worktrees"
+    worktree_root = managed_worktree_root / str(job_id)
     dependency_links = discover_dependency_links(project_root)
-    if worktree_root.exists():
-        remove_worktree(project_root, worktree_root, force=True)
+    reconcile_managed_worktree(
+        project_root,
+        worktree_root,
+        managed_root=managed_worktree_root,
+        remove_existing=True,
+    )
     add_worktree(project_root, worktree_root, ref=candidate_sha)
     recovery_commit = ""
     try:

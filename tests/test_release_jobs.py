@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import io
 import contextlib
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -11,6 +12,7 @@ from unittest.mock import Mock, patch
 from auto_agents.cli import main
 from auto_agents.foreground_activity import ForegroundActivity, foreground_active
 from auto_agents.gate_execution import LocalGatePlanExecutor
+from auto_agents.git_ops import add_worktree, list_worktrees
 from auto_agents.models import GateConfig
 from auto_agents.release_jobs import ReleaseJobStore
 from auto_agents.release_worker import (
@@ -160,6 +162,14 @@ def test_release_worker_marks_isolated_candidate_passed() -> None:
         job = store.enqueue(source="run:test", affected_proof_ids=[])
         claimed = store.claim_latest()
         assert claimed is not None
+        stale_path = (
+            Path(tempfile.gettempdir())
+            / "auto-agents-release-worktrees"
+            / str(claimed["job_id"])
+        )
+        add_worktree(root, stale_path, ref=str(claimed["candidate_sha"]))
+        shutil.rmtree(stale_path)
+        assert str(stale_path) in list_worktrees(root)
 
         class FakeOrchestrator:
             def __init__(
@@ -200,6 +210,7 @@ def test_release_worker_marks_isolated_candidate_passed() -> None:
             _process_job(root, store, claimed, stream=io.StringIO())
 
         assert store.get(str(job["job_id"]))["status"] == "passed"
+        assert str(stale_path) not in list_worktrees(root)
 
 
 def test_release_worker_routes_unrecoverable_failure_to_needs_user() -> None:
