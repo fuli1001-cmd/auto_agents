@@ -403,6 +403,41 @@ def test_codex_decoder_extracts_session_and_tool_events():
         list(decoder.feed("stdout", "not-json\n"))
 
 
+def test_codex_decoder_leaves_transient_reconnect_to_cli(tmp_path):
+    decoder = CodexProgressDecoder()
+    message = (
+        "Reconnecting... 2/5 (stream disconnected before completion: "
+        "IO error: peer closed connection without sending TLS close_notify)"
+    )
+    events = list(
+        decoder.feed(
+            "stdout",
+            json.dumps({"type": "error", "message": message}) + "\n",
+        )
+    )
+
+    assert events[0].kind == "activity"
+    assert events[0].detail == message
+    clock = [0.0]
+    supervisor = _supervisor(tmp_path, clock, SmartTimeoutConfig(), decoder)
+    with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
+        supervisor.observe_events(events)
+        assert supervisor.poll() is None
+
+
+def test_codex_decoder_still_terminates_non_retryable_error():
+    decoder = CodexProgressDecoder()
+    event = list(
+        decoder.feed(
+            "stdout",
+            '{"type":"turn.failed","error":{"message":"quota exhausted"}}\n',
+        )
+    )[0]
+
+    assert event.kind == "error"
+    assert event.detail == "quota exhausted"
+
+
 def test_copilot_decoder_extracts_session_and_tool_events():
     decoder = CopilotProgressDecoder()
     session = list(

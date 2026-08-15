@@ -26,6 +26,7 @@ from auto_agents.config import (
     run_path,
     save_project_config,
     save_run_state,
+    save_task_plan,
     task_plan_path,
 )
 from auto_agents.git_ops import working_tree_clean
@@ -42,6 +43,7 @@ from auto_agents.models import (
     RunState,
     SessionState,
     TaskSpec,
+    VerificationStep,
 )
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.run_lock import (
@@ -3394,6 +3396,112 @@ class ProjectValidationTests(unittest.TestCase):
 
             orchestrator = Orchestrator(project_root)
             self.assertIsInstance(orchestrator.adapter, CopilotCliAdapter)
+
+    def test_generated_verification_config_persists_valid_shard_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            schema_tests = project_root / "tests" / "schema"
+            schema_tests.mkdir(parents=True)
+            for index in range(8):
+                (schema_tests / f"test_{index}.py").write_text("", encoding="utf-8")
+            (project_root / "tests" / "test_api.py").write_text(
+                "def test_contract(): pass\n",
+                encoding="utf-8",
+            )
+
+            config = load_project_config(project_root)
+            config.gates.verification_policy_version = 4
+            config.gates.fallback_proof_ids = ["legacy.proof"]
+            save_project_config(project_root, config)
+            source_steps = [
+                VerificationStep(
+                    proof_id="affected.schema",
+                    runner="pytest",
+                    targets=["tests/schema"],
+                    levels=["affected"],
+                    impact_paths=["src/schema/**"],
+                    parallel_safe=True,
+                    cache_scope="source",
+                    result_cache_scope="auto",
+                ),
+                VerificationStep(
+                    proof_id="affected.api",
+                    runner="pytest",
+                    targets=["tests/test_api.py::test_contract"],
+                    levels=["affected"],
+                    impact_paths=["src/api/**"],
+                    depends_on_proofs=["affected.schema"],
+                    parallel_safe=True,
+                    cache_scope="source",
+                    result_cache_scope="auto",
+                ),
+            ]
+            save_task_plan(
+                project_root,
+                {
+                    "tasks": [],
+                    "verification_policy_version": 4,
+                    "verification_steps": [step.to_dict() for step in source_steps],
+                },
+            )
+
+            Orchestrator(project_root)._apply_generated_verification_config()
+
+            persisted = load_project_config(project_root)
+            schema_proofs = [
+                step.proof_id
+                for step in persisted.gates.steps
+                if step.proof_id.startswith("affected.schema.shard-")
+            ]
+            api = next(
+                step
+                for step in persisted.gates.steps
+                if step.proof_id == "affected.api"
+            )
+            self.assertGreater(len(schema_proofs), 1)
+            self.assertEqual(api.depends_on_proofs, schema_proofs)
+            self.assertEqual(
+                persisted.gates.fallback_proof_ids,
+                [
+                    step.proof_id
+                    for step in persisted.gates.steps
+                    if "affected" in step.levels
+                ],
+            )
+            errors = validate_project_config_payload(
+                json.loads(config_path(project_root).read_text(encoding="utf-8"))
+            )
+            self.assertFalse(
+                any(
+                    "unknown proof_id" in error or "fallback_proof_ids" in error
+                    for error in errors
+                ),
+                errors,
+            )
+
+    def test_preflight_reconciles_generated_verification_before_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_apply_generated_verification_config",
+                ) as reconcile,
+                patch(
+                    "auto_agents.orchestrator.validation_report",
+                    return_value={"ok": True, "errors": [], "warnings": []},
+                ),
+            ):
+                orchestrator._ensure_preconditions(state, spec_file, False)
+
+            reconcile.assert_called_once_with()
 
     def test_orchestrator_model_label_for_copilot_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

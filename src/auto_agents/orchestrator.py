@@ -84,6 +84,8 @@ from .gates import (
     resolve_gate_plan_from_verification_steps,
     expand_pytest_directory_steps,
     expand_verification_directory_steps,
+    remap_expanded_proof_dependencies,
+    remap_expanded_proof_ids,
     first_infrastructure_command,
     first_terminated_command,
     run_gate_plan,
@@ -224,6 +226,7 @@ _FAILOVER_PATTERN = re.compile(
     r"|service.unavailable|not.found|No such file|ENOENT"
     r"|no.last.agent.message|wrote.empty.content|empty.response"
     r"|connection.error|connect.error|websocket.*failed.to.connect|failed.to.conne"
+    r"|stream.disconnected|tls.*(?:unexpected.eof|close.notify)|peer.closed.connection"
     r"|timed?\s*out|stalled"
     r"|provider.protocol.error|prompt.transport.error"
     r"|smart.timeout|semantic.stall|provider.idle|tool.stall"
@@ -259,7 +262,8 @@ _FAILOVER_EXPLICIT_QUOTA_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _FAILOVER_CONNECTION_PATTERN = re.compile(
-    r"websocket.*failed to connect|connection.error|connect.error|failed to conne",
+    r"websocket.*failed.to.connect|connection.error|connect.error|failed.to.conne"
+    r"|stream.disconnected|tls.*(?:unexpected.eof|close.notify)|peer.closed.connection",
     re.IGNORECASE,
 )
 _FAILOVER_AVAILABILITY_PATTERN = re.compile(
@@ -1972,6 +1976,12 @@ class Orchestrator:
 
         if skip_validate:
             return
+
+        # Verification steps are generated from the task plan, then expanded
+        # into durable shards. Reconcile that generated graph before validating
+        # the persisted config so a prior run cannot leave the next startup
+        # blocked on stale parent-proof references.
+        self._apply_generated_verification_config()
 
         report = validation_report(
             self.project_root,
@@ -17484,6 +17494,7 @@ class Orchestrator:
                 if isinstance(item, dict)
             ]
         if steps:
+            source_steps = list(steps)
             verification_policy_version = max(
                 1, int(payload.get("verification_policy_version", 1) or 1)
             )
@@ -17544,6 +17555,24 @@ class Orchestrator:
                 steps = [
                     step for step in steps if "release" not in step.levels
                 ] + normalized_release
+            steps = remap_expanded_proof_dependencies(source_steps, steps)
+            fallback_proof_ids, unknown_fallback_ids = remap_expanded_proof_ids(
+                source_steps,
+                steps,
+                self.config.gates.fallback_proof_ids,
+                preserve_unknown=False,
+            )
+            if unknown_fallback_ids:
+                # A new task plan can replace every proof from the previous
+                # iteration. For unmapped changes, running all current affected
+                # proofs is the conservative replacement for stale fallbacks.
+                fallback_proof_ids = list(
+                    dict.fromkeys(
+                        step.proof_id
+                        for step in steps
+                        if step.proof_id and "affected" in step.levels
+                    )
+                )
             if not self.config.gates.allow_agent_updates:
                 return
             try:
@@ -17571,6 +17600,7 @@ class Orchestrator:
                 self.config.gates.steps == steps
                 and self.config.gates.commands == commands
                 and self.config.gates.parallel_groups == next_groups
+                and self.config.gates.fallback_proof_ids == fallback_proof_ids
             ):
                 return
             self.config.gates.steps = steps
@@ -17579,6 +17609,7 @@ class Orchestrator:
             )
             self.config.gates.commands = commands
             self.config.gates.parallel_groups = next_groups
+            self.config.gates.fallback_proof_ids = fallback_proof_ids
             save_project_config(self.project_root, self.config)
             return
         commands = payload.get("verification_commands", [])

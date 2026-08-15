@@ -700,6 +700,64 @@ def _expanded_proof_step(
     )
 
 
+def remap_expanded_proof_ids(
+    source_steps: Sequence[VerificationStep],
+    expanded_steps: Sequence[VerificationStep],
+    proof_ids: Sequence[str],
+    *,
+    preserve_unknown: bool = True,
+) -> tuple[list[str], list[str]]:
+    """Map source proof ids to every durable proof produced from that source.
+
+    Directory sharding and release-overlap removal may both suffix a proof id.
+    References must follow those generated ids or the persisted verification
+    graph will fail policy-v4 validation on the next process start.
+    """
+    source_ids = [step.proof_id for step in source_steps if step.proof_id]
+    expanded_ids = [step.proof_id for step in expanded_steps if step.proof_id]
+    expanded_set = set(expanded_ids)
+    descendants = {
+        source_id: [
+            proof_id
+            for proof_id in expanded_ids
+            if proof_id == source_id
+            or proof_id.startswith(f"{source_id}.shard-")
+            or proof_id.startswith(f"{source_id}.remaining-")
+        ]
+        for source_id in source_ids
+    }
+    remapped: list[str] = []
+    unknown: list[str] = []
+    for proof_id in proof_ids:
+        if proof_id in descendants:
+            replacements = descendants[proof_id]
+        elif proof_id in expanded_set:
+            replacements = [proof_id]
+        else:
+            unknown.append(proof_id)
+            replacements = [proof_id] if preserve_unknown else []
+        for replacement in replacements:
+            if replacement not in remapped:
+                remapped.append(replacement)
+    return remapped, unknown
+
+
+def remap_expanded_proof_dependencies(
+    source_steps: Sequence[VerificationStep],
+    expanded_steps: Sequence[VerificationStep],
+) -> list[VerificationStep]:
+    """Return expanded steps whose dependencies reference final proof ids."""
+    remapped: list[VerificationStep] = []
+    for step in expanded_steps:
+        dependencies, _unknown = remap_expanded_proof_ids(
+            source_steps,
+            expanded_steps,
+            step.depends_on_proofs,
+        )
+        remapped.append(replace(step, depends_on_proofs=dependencies))
+    return remapped
+
+
 def _historical_target_weights(
     step: VerificationStep,
     targets: Sequence[str],

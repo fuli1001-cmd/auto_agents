@@ -247,6 +247,22 @@ class TestIsFailoverError(unittest.TestCase):
             "connection",
         )
 
+    def test_tls_stream_disconnect_is_connection_error(self):
+        r = _make_result(
+            ok=False,
+            returncode=-1,
+            stderr=(
+                "Reconnecting... 2/5 (stream disconnected before completion: "
+                "IO error: peer closed connection without sending TLS close_notify)"
+            ),
+            termination=AgentTermination(reason="provider_error"),
+        )
+        self.assertTrue(Orchestrator._is_failover_error(r))
+        self.assertEqual(
+            Orchestrator._failover_error_category(r),
+            "connection",
+        )
+
 
 class TestFailoverErrorLabel(unittest.TestCase):
     def test_timeout_label(self):

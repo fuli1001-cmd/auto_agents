@@ -20,7 +20,10 @@ from auto_agents.gates import (
     extract_failure_ids,
     extract_failure_info,
     expand_pytest_directory_steps,
+    expand_verification_directory_steps,
     expand_vitest_directory_steps,
+    remap_expanded_proof_dependencies,
+    remap_expanded_proof_ids,
     resolve_gate_plan_from_verification_steps,
     run_commands,
     run_gate_plan,
@@ -803,6 +806,56 @@ class GateTests(unittest.TestCase):
                 sorted(target for item in first for target in item.targets),
                 [f"tests/test_{index}.py" for index in range(8)],
             )
+
+    def test_expanded_proof_references_follow_every_stable_shard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            schema_tests = root / "tests" / "schema"
+            schema_tests.mkdir(parents=True)
+            for index in range(8):
+                (schema_tests / f"test_{index}.py").write_text("", encoding="utf-8")
+            source = [
+                VerificationStep(
+                    proof_id="affected.schema",
+                    runner="pytest",
+                    targets=["tests/schema"],
+                    levels=["affected"],
+                    result_cache_scope="auto",
+                ),
+                VerificationStep(
+                    proof_id="affected.api",
+                    runner="pytest",
+                    targets=["tests/test_api.py::test_contract"],
+                    levels=["affected"],
+                    depends_on_proofs=["affected.schema"],
+                    result_cache_scope="auto",
+                ),
+            ]
+
+            expanded = expand_verification_directory_steps(
+                source,
+                root,
+                max_batches_per_step=4,
+                stable_shards=True,
+            )
+            remapped = remap_expanded_proof_dependencies(source, expanded)
+            schema_proofs = [
+                step.proof_id
+                for step in remapped
+                if step.proof_id.startswith("affected.schema.shard-")
+            ]
+            api = next(step for step in remapped if step.proof_id == "affected.api")
+
+            self.assertGreater(len(schema_proofs), 1)
+            self.assertEqual(api.depends_on_proofs, schema_proofs)
+            fallback, unknown = remap_expanded_proof_ids(
+                source,
+                remapped,
+                ["affected.schema", "legacy.proof"],
+                preserve_unknown=False,
+            )
+            self.assertEqual(fallback, schema_proofs)
+            self.assertEqual(unknown, ["legacy.proof"])
 
     def test_expand_vitest_directory_steps_splits_files_and_honors_excludes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

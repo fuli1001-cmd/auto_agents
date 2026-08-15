@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 from dataclasses import replace
 from typing import Callable, List, Optional
@@ -18,6 +19,19 @@ from ..models import (
 )
 from .base import AgentAdapter, run_subprocess_with_optional_streaming
 from ..supervision import ProgressDecoder
+
+
+_CODEX_RECONNECTING_ERROR = re.compile(
+    r"\breconnecting\.\.\.\s*\d+\s*/\s*\d+\b",
+    re.IGNORECASE,
+)
+
+
+def _codex_error_message(event: dict) -> str:
+    message = event.get("message") or ""
+    if not message and isinstance(event.get("error"), dict):
+        message = event["error"].get("message", "")
+    return str(message)
 
 
 class CodexProgressDecoder(ProgressDecoder):
@@ -44,7 +58,17 @@ class CodexProgressDecoder(ProgressDecoder):
                 ),
             )
         if event_type in {"error", "turn.failed"}:
-            return (AgentProgressEvent(kind="error", detail=event_type),)
+            message = _codex_error_message(event)
+            if event_type == "error" and _CODEX_RECONNECTING_ERROR.search(message):
+                return (
+                    AgentProgressEvent(
+                        kind="activity",
+                        detail=message or "provider reconnecting",
+                    ),
+                )
+            return (
+                AgentProgressEvent(kind="error", detail=message or event_type),
+            )
         if event_type in {"item.started", "item.completed"}:
             item = event.get("item", {})
             if not isinstance(item, dict):
@@ -235,9 +259,7 @@ class CodexAdapter(AgentAdapter):
                     if isinstance(text, str) and text:
                         callback(stream_name, text if text.endswith("\n") else text + "\n")
             elif event_type in ("error", "turn.failed"):
-                msg = event.get("message") or ""
-                if not msg and isinstance(event.get("error"), dict):
-                    msg = event["error"].get("message", "")
+                msg = _codex_error_message(event)
                 if msg:
                     callback("stderr", msg + "\n")
         return filtered
@@ -277,9 +299,7 @@ class CodexAdapter(AgentAdapter):
                         output_tokens=int(usage_payload.get("output_tokens", 0) or 0),
                     )
             elif event_type in ("error", "turn.failed"):
-                msg = event.get("message") or ""
-                if not msg and isinstance(event.get("error"), dict):
-                    msg = event["error"].get("message", "")
+                msg = _codex_error_message(event)
                 if msg:
                     error_messages.append(msg)
 
