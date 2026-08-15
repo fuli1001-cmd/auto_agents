@@ -29,7 +29,7 @@ VERIFICATION_SERIAL_REASONS = (
     "external_side_effect",
     "ordered_contract",
 )
-VERIFICATION_RESOURCE_CLASSES = ("normal", "heavy")
+VERIFICATION_RESOURCE_CLASSES = ("normal", "heavy", "exclusive")
 VERIFICATION_MEMORY_GUARDS = ("off", "advisory", "required")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity-claude", "antigravity-gemini")
 DEFAULT_EFFORTS = {

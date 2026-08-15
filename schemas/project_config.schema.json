@@ -333,7 +333,7 @@
               },
               "resource_class": {
                 "type": "string",
-                "enum": ["normal", "heavy"]
+                "enum": ["normal", "heavy", "exclusive"]
               },
               "requires": {
                 "type": "array",

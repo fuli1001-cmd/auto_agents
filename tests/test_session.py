@@ -2889,6 +2889,75 @@ class BaselineDiffVerifyTests(unittest.TestCase):
                 ["tests/test_demo.py::test_example"],
             )
 
+    def test_lazy_baseline_runs_candidate_only_failed_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.verification_policy_version = 3
+            orchestrator.config.gates.incremental_mode = "auto"
+            orchestrator.config.gates.steps = [
+                VerificationStep(
+                    kind="test",
+                    runner="pytest",
+                    targets=["tests/test_newly_selected.py"],
+                    parallel_safe=False,
+                    serial_reason="ordered",
+                )
+            ]
+            command = "python -m pytest -q tests/test_newly_selected.py"
+            failure_line = (
+                "FAILED tests/test_newly_selected.py::test_existing_failure "
+                "- AssertionError\n"
+            )
+            failed_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout=failure_line,
+                        comparable_failures=True,
+                    )
+                ],
+                summary="failure",
+            )
+            state = SessionState(
+                session_id="candidate-only-baseline",
+                mode="fix",
+                baseline_git_ref="baseline-ref",
+                baseline_commands=[],
+            )
+            session = Session(orchestrator, mode="fix")
+            session._current_state = state
+            plan = SimpleNamespace(
+                commands=[command],
+                parallel_groups=[],
+                metadata={command: {}},
+            )
+
+            with (
+                patch.object(session, "_session_gate_plan", return_value=plan),
+                patch.object(
+                    orchestrator,
+                    "_gate_executor_context",
+                    return_value=nullcontext(None),
+                ),
+                patch("auto_agents.session.changed_paths", return_value=[]),
+                patch(
+                    "auto_agents.session.run_gate_plan",
+                    side_effect=[failed_gate, failed_gate],
+                ) as run_plan,
+            ):
+                result = session._run_baseline_diff_verify()
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(run_plan.call_count, 2)
+            self.assertEqual(
+                state.baseline_failures,
+                ["tests/test_newly_selected.py::test_existing_failure"],
+            )
+
     def test_non_comparable_failure_that_passes_identity_rerun_is_transient(
         self,
     ) -> None:

@@ -673,9 +673,9 @@ the certificate. `candidate` reuses a stable result only for an identical source
 `observed_inputs` can reuse across commits when Linux syscall tracing proves that every observed
 project input is unchanged and no network access occurred; `off` always executes. Validation only
 permits `observed_inputs` on source-scoped, parallel-safe checks without artifacts, exclusive
-resources, or dynamic ports. Timeouts, mutations, infrastructure errors, and artifact producers are
-never cached. Stable finite failures are certified only for the exact candidate so repeated
-diagnostics do not physically rerun the same failing proof; any source change invalidates them.
+resources, or dynamic ports. Failed proofs, timeouts, mutations, infrastructure errors, and
+artifact producers are never cached. A failed proof therefore executes again during verification
+recovery instead of replaying a stale negative result.
 
 Interactive `fix`, `collab`, and `run` attest only proofs selected by the changed-path impact graph.
 No-diff collab checks execute nothing. Critical or configured release-blocking paths escalate to a
@@ -721,7 +721,10 @@ Use `--fresh` on `verify`, or `--full-verify` on a workflow, to bypass certifica
 
 `cpu_slots` declares how many worker scheduling slots the command consumes. Zero or omission keeps
 the compatibility default: `resource_class=heavy` consumes two slots and normal commands consume
-one. It is a capacity declaration, not CPU affinity or an exact core reservation.
+one. `resource_class=exclusive` also consumes one slot, but waits until every other proof has
+finished and prevents another proof from starting until it exits. Use it for timing-sensitive or
+host-saturating tests whose correctness depends on uncontended execution. These are scheduling
+declarations, not CPU affinity or exact core reservations.
 
 Memory checks are opt-in and use MiB. `memory_mb` is the command's expected working-set budget and
 `memory_reserve_mb` is memory that should remain available for the OS and other processes.

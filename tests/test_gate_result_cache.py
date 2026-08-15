@@ -18,7 +18,7 @@ def _cache(tmp_path: Path) -> GateResultCache:
     )
 
 
-def test_candidate_cache_reuses_stable_failure_only_for_exact_candidate(tmp_path: Path) -> None:
+def test_candidate_cache_never_reuses_failed_proof(tmp_path: Path) -> None:
     cache = _cache(tmp_path)
     failed = CommandResult(command="check", ok=False, returncode=1)
     cache.record(
@@ -29,15 +29,14 @@ def test_candidate_cache_reuses_stable_failure_only_for_exact_candidate(tmp_path
         result_cache_scope="candidate",
         metadata_signature="metadata-1",
     )
-    failed_hit = cache.lookup(
+    assert cache.lookup(
         "check",
         source_fingerprint="source-1",
         cache_scope="run_context",
         result_cache_scope="candidate",
         metadata_signature="metadata-1",
-    )
-    assert failed_hit is not None
-    assert not failed_hit.ok and failed_hit.cached
+    ) is None
+
     assert cache.lookup(
         "check",
         source_fingerprint="source-2",

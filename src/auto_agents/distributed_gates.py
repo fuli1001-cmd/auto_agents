@@ -279,13 +279,13 @@ class DistributedGatePlanExecutor:
     def required_slots(self, command: str) -> int:
         return self._required_slots(command)
 
+    def exclusive(self, command: str) -> bool:
+        return self._resource_class(command) == "exclusive"
+
     def _resource_class(self, command: str) -> str:
         metadata = self.metadata.get(command)
-        return (
-            "heavy"
-            if str(getattr(metadata, "resource_class", "normal")).lower() == "heavy"
-            else "normal"
-        )
+        value = str(getattr(metadata, "resource_class", "normal")).strip().lower()
+        return value if value in {"heavy", "exclusive"} else "normal"
 
     def _required_slots(self, command: str) -> int:
         declared = self._metadata_int(command, "cpu_slots")

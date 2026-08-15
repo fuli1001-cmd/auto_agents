@@ -12,7 +12,7 @@ from .config import gate_baseline_cache_path
 from .models import CommandResult
 
 
-RESULT_CACHE_VERSION = 2
+RESULT_CACHE_VERSION = 3
 MAX_AGE_SECONDS = 14 * 24 * 60 * 60
 MAX_ROWS = 20_000
 
@@ -73,9 +73,9 @@ class GateResultCache:
     """Persistent proof certificates for isolated verification commands.
 
     Success certificates may be reused across candidates when a complete
-    observed-input manifest still matches. Stable failures are reusable only
-    for the exact candidate/environment, preventing duplicate diagnostics
-    without carrying a failure into a changed tree.
+    observed-input manifest still matches. Failed proofs are never reused:
+    they must execute again so a transient or timing-sensitive failure cannot
+    become a sticky negative result that blocks verification recovery.
     """
 
     def __init__(
@@ -184,6 +184,7 @@ class GateResultCache:
             or result.mutation_paths
             or result.artifacts
             or result.cached
+            or not result.ok
         ):
             return
         identity = _identity(
@@ -250,8 +251,6 @@ class GateResultCache:
                     """,
                     (MAX_ROWS,),
                 )
-                if not result.ok:
-                    return
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO gate_result_successes (

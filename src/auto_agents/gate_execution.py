@@ -200,7 +200,7 @@ def _metadata_list(metadata: object, name: str) -> list[str]:
 
 def _metadata_resource_class(metadata: object) -> str:
     value = str(getattr(metadata, "resource_class", "normal")).strip().lower()
-    return "heavy" if value == "heavy" else "normal"
+    return value if value in {"heavy", "exclusive"} else "normal"
 
 
 def _metadata_signature(metadata: object) -> str:
@@ -744,6 +744,9 @@ class LocalGatePlanExecutor:
         if declared > 0:
             return declared
         return 2 if _metadata_resource_class(metadata) == "heavy" else 1
+
+    def exclusive(self, command: str) -> bool:
+        return _metadata_resource_class(self.metadata.get(command)) == "exclusive"
 
     def record_timing(self, command: str, result: CommandResult) -> None:
         self.timing_store.record(command, result, self.metadata.get(command))

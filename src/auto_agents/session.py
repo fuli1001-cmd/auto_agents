@@ -1761,11 +1761,6 @@ class Session:
                     result.command for result in gate.commands if not result.ok
                 )
             )
-            failed_commands = [
-                command
-                for command in failed_commands
-                if command in set(state.baseline_commands)
-            ]
             baseline_metadata = {
                 command: metadata.get(command, {}) for command in failed_commands
             }

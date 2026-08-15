@@ -43,12 +43,14 @@ class _RecordingGateExecutor:
         slots: dict[str, int] | None = None,
         capacity: int = 2,
         estimates: dict[str, float] | None = None,
+        exclusive: set[str] | None = None,
     ) -> None:
         self.durations = durations
         self.failures = failures or set()
         self.slots = slots or {}
         self._capacity = capacity
         self.estimates = estimates or {}
+        self.exclusive_commands = exclusive or set()
         self.events: list[tuple[str, str, str, float]] = []
         self.running_slots = 0
         self.max_running_slots = 0
@@ -59,6 +61,9 @@ class _RecordingGateExecutor:
 
     def required_slots(self, command: str) -> int:
         return self.slots.get(command, 1)
+
+    def exclusive(self, command: str) -> bool:
+        return command in self.exclusive_commands
 
     def estimated_duration(self, command: str) -> float | None:
         return self.estimates.get(command)
@@ -925,6 +930,21 @@ class GateTests(unittest.TestCase):
         self.assertEqual(plan.metadata[command].serial_reason, "shared_mutable_state")
         self.assertEqual(plan.result_cache_scopes[command], "off")
 
+    def test_resolved_plan_preserves_exclusive_resource_class(self) -> None:
+        step = VerificationStep(
+            kind="test",
+            runner="pytest",
+            targets=["tests/test_timing_sensitive.py"],
+            parallel_safe=False,
+            serial_reason="shared_mutable_state",
+            resource_class="exclusive",
+        )
+
+        plan = resolve_gate_plan_from_verification_steps([step], phase="final")
+        command = plan.commands[0]
+
+        self.assertEqual(plan.metadata[command].resource_class, "exclusive")
+
     def test_verification_step_ignores_freeform_command_field(self) -> None:
         command = command_from_verification_step(
             VerificationStep(
@@ -1117,6 +1137,42 @@ class GateTests(unittest.TestCase):
             event_times[("finish", "parallel-one")],
             event_times[("finish", "serial-two")],
         )
+
+    def test_isolated_gate_plan_runs_exclusive_command_without_overlap(self) -> None:
+        executor = _RecordingGateExecutor(
+            {
+                "serial-exclusive": 0.04,
+                "parallel-one": 0.04,
+                "parallel-two": 0.04,
+            },
+            capacity=2,
+            exclusive={"serial-exclusive"},
+        )
+
+        result = run_gate_plan(
+            ["serial-exclusive"],
+            [
+                GateParallelGroup(
+                    name="checks",
+                    commands=["parallel-one", "parallel-two"],
+                )
+            ],
+            Path("/tmp"),
+            collect_all=True,
+            parallel_workers=2,
+            gate_executor=executor,
+        )
+
+        self.assertTrue(result.ok)
+        event_times = {
+            (event, command): timestamp
+            for event, command, _lane, timestamp in executor.events
+        }
+        self.assertGreaterEqual(
+            event_times[("start", "parallel-one")],
+            event_times[("finish", "serial-exclusive")],
+        )
+        self.assertEqual(executor.max_running_slots, 2)
 
     def test_isolated_gate_plan_preserves_group_barriers_during_overlap(self) -> None:
         executor = _RecordingGateExecutor(

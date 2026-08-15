@@ -77,6 +77,8 @@ class GateCommandExecutor(Protocol):
 
     def required_slots(self, command: str) -> int: ...
 
+    def exclusive(self, command: str) -> bool: ...
+
     def run(
         self,
         command: str,
@@ -942,7 +944,12 @@ def resolve_gate_plan_from_verification_steps(
         )
         result_cache_scopes[command] = result_cache_scope
         resource_class = (
-            "heavy"
+            "exclusive"
+            if any(
+                step.resource_class.strip().lower() == "exclusive"
+                for step in command_steps
+            )
+            else "heavy"
             if any(
                 step.resource_class.strip().lower() == "heavy"
                 or any(
@@ -1489,6 +1496,16 @@ def _executor_estimated_duration(
         return None
 
 
+def _executor_exclusive(
+    gate_executor: GateCommandExecutor,
+    command: str,
+) -> bool:
+    exclusive = getattr(gate_executor, "exclusive", None)
+    if not callable(exclusive):
+        return False
+    return bool(exclusive(command))
+
+
 def _ordered_parallel_commands(
     gate_executor: GateCommandExecutor,
     commands: Sequence[str],
@@ -1606,6 +1623,10 @@ def _run_overlapped_gate_plan(
             made_progress = False
             if not stop_dispatch:
                 used_slots = sum(item.slots for item in running.values())
+                exclusive_running = any(
+                    _executor_exclusive(gate_executor, item.command)
+                    for item in running.values()
+                )
                 serial_running = any(
                     item.lane == "serial" for item in running.values()
                 )
@@ -1613,12 +1634,19 @@ def _run_overlapped_gate_plan(
                     serial_next < len(commands)
                     and not serial_running
                     and len(running) < job_capacity
+                    and not exclusive_running
                 ):
                     command = commands[serial_next]
                     slots = _executor_required_slots(
                         gate_executor, command, slot_capacity
                     )
-                    if used_slots + slots <= slot_capacity:
+                    command_exclusive = _executor_exclusive(
+                        gate_executor, command
+                    )
+                    if (
+                        used_slots + slots <= slot_capacity
+                        and (not command_exclusive or not running)
+                    ):
                         submit(
                             pool,
                             _ScheduledGateCommand(
@@ -1632,7 +1660,11 @@ def _run_overlapped_gate_plan(
                         used_slots += slots
                         made_progress = True
 
-                if group_index < len(pending_groups):
+                exclusive_running = any(
+                    _executor_exclusive(gate_executor, item.command)
+                    for item in running.values()
+                )
+                if group_index < len(pending_groups) and not exclusive_running:
                     pending = pending_groups[group_index]
                     while pending and len(running) < job_capacity:
                         selected_position = next(
@@ -1644,6 +1676,12 @@ def _run_overlapped_gate_plan(
                                     gate_executor, command, slot_capacity
                                 )
                                 <= slot_capacity
+                                and (
+                                    not _executor_exclusive(
+                                        gate_executor, command
+                                    )
+                                    or not running
+                                )
                             ),
                             None,
                         )
@@ -1671,6 +1709,12 @@ def _run_overlapped_gate_plan(
                                         slot_capacity,
                                     )
                                     <= slot_capacity
+                                    and (
+                                        not _executor_exclusive(
+                                            gate_executor, command
+                                        )
+                                        or not running
+                                    )
                                 ),
                                 None,
                             )
@@ -1694,6 +1738,8 @@ def _run_overlapped_gate_plan(
                                 )
                                 used_slots += slots
                                 made_progress = True
+                                if _executor_exclusive(gate_executor, command):
+                                    break
                                 continue
                             break
                         command_index, command = pending.pop(selected_position)
@@ -1712,6 +1758,8 @@ def _run_overlapped_gate_plan(
                         )
                         used_slots += slots
                         made_progress = True
+                        if _executor_exclusive(gate_executor, command):
+                            break
 
             advance_completed_groups()
             all_serial_done = serial_next >= len(commands)
