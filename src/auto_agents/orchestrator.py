@@ -237,7 +237,7 @@ _FAILOVER_PATTERN = re.compile(
 )
 
 VERIFY_BASELINE_SCHEMA_VERSION = 1
-IMPLEMENTATION_SCOPE_POLICY_VERSION = 2
+IMPLEMENTATION_SCOPE_POLICY_VERSION = 3
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
 _NON_COMPARABLE_BASELINE_PREFIXES = (
@@ -2618,7 +2618,12 @@ class Orchestrator:
                 },
             )
             state.plan_task_replacements = self._derive_plan_task_replacements(prior_tasks, state.tasks)
-            if self._normalize_task_origins(state.tasks, state):
+            origins_changed = self._normalize_task_origins(state.tasks, state)
+            ownership_changed = self._inherit_plan_replacement_mutable_artifacts(
+                prior_tasks,
+                state.tasks,
+            )
+            if origins_changed or ownership_changed:
                 self._persist_tasks(state.tasks)
             self._emit_plan_task_count(state.tasks)
         return state
@@ -3793,6 +3798,128 @@ class Orchestrator:
             if normalized and normalized not in artifacts:
                 artifacts.append(normalized)
         return artifacts
+
+    def _is_inheritable_mutable_artifact(self, path: object) -> bool:
+        normalized = self._normalize_mutable_artifact_path(path)
+        if not normalized or normalized.startswith("/"):
+            return False
+        parts = normalized.split("/")
+        if ".." in parts or any(char in normalized for char in "*?[]"):
+            return False
+        if normalized == self._active_spec_relative_path():
+            return False
+        if normalized.startswith("specs/"):
+            return False
+        if normalized == ".auto-agents" or normalized.startswith(".auto-agents/"):
+            return False
+        return normalized != "DESIGN.md"
+
+    @staticmethod
+    def _mutable_artifact_recovery_text(task: TaskSpec) -> str:
+        parts = [task.description, task.review_summary, *task.acceptance]
+        parts.extend(str(ref) for ref in task.verification_refs)
+        for proof in task.requirement_proofs:
+            if not isinstance(proof, dict):
+                continue
+            parts.extend(str(ref) for ref in (proof.get("evidence_refs", []) or []))
+        for history in (task.review_history, task.recovery_history):
+            for entry in history:
+                if not isinstance(entry, dict):
+                    continue
+                parts.extend(
+                    str(entry.get(key, ""))
+                    for key in ("summary", "review", "reason")
+                )
+                failure_ids = entry.get("failure_ids", [])
+                if isinstance(failure_ids, list):
+                    parts.extend(str(item) for item in failure_ids)
+        return "\n".join(part for part in parts if part)
+
+    def _verification_artifact_paths(self, values: Iterable[str]) -> Set[str]:
+        text = "\n".join(str(value) for value in values if str(value).strip())
+        return {
+            self._normalize_mutable_artifact_path(path)
+            for path in self._extract_verify_implicated_paths(text)
+            if self._normalize_mutable_artifact_path(path)
+        }
+
+    @staticmethod
+    def _recovery_text_mentions_path(text: str, path: str) -> bool:
+        return bool(
+            re.search(
+                rf"(?:(?<=^)|(?<=[\s`'\"(])){re.escape(path)}(?=$|[\s:`'\"),])",
+                str(text or ""),
+                flags=re.MULTILINE,
+            )
+        )
+
+    def _recovery_mutable_artifacts(
+        self,
+        tasks: Iterable[TaskSpec],
+        *,
+        feedback: str,
+        verification_refs: Iterable[str] = (),
+    ) -> List[str]:
+        """Inherit only previously authorized artifacts implicated by recovery evidence."""
+        feedback_text = str(feedback or "")
+        recovery_paths = self._verification_artifact_paths(
+            [feedback_text, *[str(ref) for ref in verification_refs]]
+        )
+        inherited: List[str] = []
+        for source in tasks:
+            source_paths = self._verification_artifact_paths(
+                [
+                    *[str(ref) for ref in source.verification_refs],
+                    *[
+                        str(ref)
+                        for proof in source.requirement_proofs
+                        if isinstance(proof, dict)
+                        for ref in (proof.get("evidence_refs", []) or [])
+                    ],
+                ]
+            )
+            for raw_path in self._effective_task_mutable_artifacts(source):
+                artifact = self._normalize_mutable_artifact_path(raw_path)
+                if (
+                    not self._is_inheritable_mutable_artifact(artifact)
+                    or artifact in inherited
+                ):
+                    continue
+                if self._recovery_text_mentions_path(
+                    feedback_text, artifact
+                ) or recovery_paths.intersection(source_paths):
+                    inherited.append(artifact)
+        return inherited
+
+    def _backfill_mutable_artifact_ownership(self, tasks: List[TaskSpec]) -> List[str]:
+        """Materialize legacy ownership and carry it across persisted recovery tasks."""
+        repaired_ids: List[str] = []
+        for task in tasks:
+            inferred = [
+                path
+                for path in self._legacy_recovery_mutable_artifacts(task)
+                if self._is_inheritable_mutable_artifact(path)
+            ]
+            if inferred:
+                task.mutable_artifacts.extend(
+                    path for path in inferred if path not in task.mutable_artifacts
+                )
+                repaired_ids.append(task.task_id)
+
+        for task in tasks:
+            if task.task_origin != "stage_recovery" or task.status == "done":
+                continue
+            inherited = self._recovery_mutable_artifacts(
+                (source for source in tasks if source is not task),
+                feedback=self._mutable_artifact_recovery_text(task),
+                verification_refs=task.verification_refs,
+            )
+            additions = [path for path in inherited if path not in task.mutable_artifacts]
+            if additions:
+                task.mutable_artifacts.extend(additions)
+                if task.task_id not in repaired_ids:
+                    repaired_ids.append(task.task_id)
+        return repaired_ids
 
     def _task_mutable_artifact_errors(self, task: TaskSpec) -> List[str]:
         errors: List[str] = []
@@ -7340,6 +7467,9 @@ class Orchestrator:
             "     covered by the split children (in which case remove the duplicate).",
             "  10. Ensure every child still carries requirement_ids that cover the parent's",
             "     requirement_ids.",
+            "  11. Preserve the parent's mutable_artifacts on the replacement children. Do not",
+            "     add new artifact authority; every parent-owned artifact must remain owned by",
+            "     at least one child after the split.",
             "",
             "Repeating review blockers that forced this rollback:",
             last_review.strip() or "(no review summary captured)",
@@ -7370,6 +7500,8 @@ class Orchestrator:
 
         if state.rejected_stage == "implement" and state.rejection_reason:
             is_full_verify_recovery = "Failure type: full_verification" in state.rejection_reason
+            recovery_feedback = state.rejection_reason
+            recovery_verification_refs = self._stage_recovery_verification_refs(state)
             tasks.append(
                 TaskSpec(
                     task_id=f"fix-rejection-{int(time.time()*1000)}",
@@ -7383,19 +7515,27 @@ class Orchestrator:
                         if is_full_verify_recovery
                         else "The release was rejected."
                     )
-                    + f"\n\nFeedback:\n{state.rejection_reason}\n\nPlease fix these issues.",
+                    + f"\n\nFeedback:\n{recovery_feedback}\n\nPlease fix these issues.",
                     acceptance=[
                         "Feedback is fully addressed",
                         "Business code and repository tests are aligned with active requirements",
                         "Tests pass",
                     ],
                     task_origin="stage_recovery",
-                    verification_refs=self._stage_recovery_verification_refs(state),
+                    verification_refs=recovery_verification_refs,
+                    mutable_artifacts=self._recovery_mutable_artifacts(
+                        tasks,
+                        feedback=recovery_feedback,
+                        verification_refs=recovery_verification_refs,
+                    ),
                 )
             )
             state.verify_recovery_refs = []
             state.rejected_stage = ""
             state.rejection_reason = ""
+            self._persist_tasks(tasks)
+            state.tasks = tasks
+            save_run_state(self.project_root, state)
 
         state.tasks = tasks
         tasks_by_id = {task.task_id: task for task in tasks}
@@ -7449,8 +7589,14 @@ class Orchestrator:
     def _load_implementation_tasks(self, state: RunState) -> List[TaskSpec]:
         plan_tasks = self._load_tasks_from_plan()
         origins_changed = self._normalize_task_origins(plan_tasks, state)
-        if origins_changed:
+        repaired_ownership = self._backfill_mutable_artifact_ownership(plan_tasks)
+        if origins_changed or repaired_ownership:
             self._persist_tasks(plan_tasks)
+        if repaired_ownership:
+            self.logger.info(
+                "[mutable-artifacts] restored ownership tasks=%s",
+                ",".join(repaired_ownership),
+            )
         if not state.tasks:
             return plan_tasks
         def comparable(task: TaskSpec) -> Dict[str, object]:
@@ -13968,7 +14114,7 @@ class Orchestrator:
                     if isinstance(raw_ids, list)
                     else []
                 )
-                repair_ids.update(ids)
+                repair_ids.update(task_id for task_id in ids if task_id != owner.task_id)
                 try:
                     round_number = max(0, int(entry.get("round", 0) or 0))
                 except (TypeError, ValueError):
@@ -14005,7 +14151,26 @@ class Orchestrator:
             desired = task.task_origin
             if desired not in {"planned", "scope_split", "evidence_repair", "stage_recovery"}:
                 desired = "planned"
-            if task.task_id in repair_ids:
+            stage_recovery_contract = (
+                not task.parent_task_id.strip()
+                and (
+                    (
+                        task.title.strip() == "Fix full verification failure"
+                        and "Full verification failed after all planned tasks were implemented."
+                        in task.description
+                    )
+                    or (
+                        task.title.strip() == "Fix issues after release rejection"
+                        and (
+                            "The release was rejected." in task.description
+                            or "requirements audit failed" in task.description
+                        )
+                    )
+                )
+            )
+            if stage_recovery_contract:
+                desired = "stage_recovery"
+            elif task.task_id in repair_ids:
                 desired = "evidence_repair"
             elif (
                 desired == "planned"
@@ -14192,6 +14357,40 @@ class Orchestrator:
             retired_id: sorted(set(children))
             for retired_id, children in replacements.items()
         }
+
+    def _inherit_plan_replacement_mutable_artifacts(
+        self,
+        previous_tasks: Iterable[TaskSpec],
+        current_tasks: Iterable[TaskSpec],
+    ) -> List[str]:
+        """Preserve a retired parent's artifact authority on its split children."""
+        previous_list = list(previous_tasks)
+        current_list = list(current_tasks)
+        replacements = self._derive_plan_task_replacements(previous_list, current_list)
+        previous_by_id = {task.task_id: task for task in previous_list}
+        current_by_id = {task.task_id: task for task in current_list}
+        repaired_ids: List[str] = []
+        for parent_id, child_ids in replacements.items():
+            parent = previous_by_id.get(parent_id)
+            if parent is None:
+                continue
+            inherited = [
+                path
+                for path in self._effective_task_mutable_artifacts(parent)
+                if self._is_inheritable_mutable_artifact(path)
+            ]
+            for child_id in child_ids:
+                child = current_by_id.get(child_id)
+                if child is None:
+                    continue
+                additions = [
+                    path for path in inherited if path not in child.mutable_artifacts
+                ]
+                if not additions:
+                    continue
+                child.mutable_artifacts.extend(additions)
+                repaired_ids.append(child.task_id)
+        return repaired_ids
 
     @staticmethod
     def _looks_like_test_path(path: str) -> bool:
@@ -14570,6 +14769,7 @@ class Orchestrator:
         current_payload = load_task_plan(self.project_root)
         task_list = list(tasks)
         self._backfill_stage_recovery_verification_refs(task_list)
+        self._backfill_mutable_artifact_ownership(task_list)
         payload = []
         for task in task_list:
             item = task.to_dict()

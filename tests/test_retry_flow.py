@@ -2633,6 +2633,261 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertEqual(orchestrator._effective_task_mutable_artifacts(task), ["spec.md"])
 
+    def test_stage_recovery_inherits_only_previously_authorized_implicated_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            iteration_spec = project_root / "specs" / "iteration.md"
+            write_text(iteration_spec, "# Immutable iteration input\n")
+            write_text(project_root / "spec.md", "# Public contract\n")
+            write_text(project_root / "tests" / "test_docs.py", "def test_docs(): pass\n")
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = iteration_spec.resolve()
+            owner = TaskSpec(
+                task_id="task-docs",
+                title="Synchronize public docs",
+                description="Keep public duration docs current.",
+                acceptance=["spec.md defines the public contract"],
+                status="done",
+                review_summary="AssertionError: spec.md misses requested_duration_sec",
+                requirement_proofs=[{"evidence_refs": ["spec.md"]}],
+                verification_refs=["tests/test_docs.py::test_docs"],
+            )
+            recovery = TaskSpec(
+                task_id="fix-rejection-1",
+                title="Fix full verification failure",
+                description="Full verification failed in tests/test_docs.py.",
+                acceptance=["Tests pass"],
+                status="blocked",
+                task_origin="stage_recovery",
+                verification_refs=[
+                    "cmd:./.conda/bin/python -m pytest -q tests/test_docs.py"
+                ],
+                recovery_history=[
+                    {"review": "AssertionError: spec.md misses requested_duration_sec"}
+                ],
+            )
+
+            repaired = orchestrator._backfill_mutable_artifact_ownership(
+                [owner, recovery]
+            )
+
+            self.assertEqual(owner.mutable_artifacts, ["spec.md"])
+            self.assertEqual(recovery.mutable_artifacts, ["spec.md"])
+            self.assertEqual(repaired, ["task-docs", "fix-rejection-1"])
+
+    def test_recovery_feedback_cannot_grant_unowned_or_immutable_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            iteration_spec = project_root / "specs" / "iteration.md"
+            write_text(iteration_spec, "# Immutable iteration input\n")
+            write_text(project_root / "spec.md", "# Public contract\n")
+            write_text(project_root / "tests" / "test_other.py", "def test_other(): pass\n")
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = iteration_spec.resolve()
+            owner = TaskSpec(
+                task_id="task-docs",
+                title="Synchronize public docs",
+                description="Synchronize the public contract.",
+                acceptance=["Public contract is current."],
+                mutable_artifacts=["spec.md"],
+                verification_refs=["tests/test_docs.py::test_docs"],
+            )
+
+            inherited = orchestrator._recovery_mutable_artifacts(
+                [owner],
+                feedback=(
+                    "specs/iteration.md misses a clause; DESIGN.md and secrets.md "
+                    "also need edits"
+                ),
+                verification_refs=["tests/test_other.py::test_other"],
+            )
+
+            self.assertEqual(inherited, [])
+
+    def test_split_children_inherit_parent_mutable_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            iteration_spec = project_root / "specs" / "iteration.md"
+            write_text(iteration_spec, "# Immutable iteration input\n")
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = iteration_spec.resolve()
+            parent = TaskSpec(
+                task_id="task-docs",
+                title="Synchronize public docs",
+                description="Synchronize the public contract.",
+                acceptance=["Public contract is current."],
+                mutable_artifacts=["spec.md"],
+            )
+            child = TaskSpec(
+                task_id="task-docs-a",
+                title="Synchronize the public spec",
+                description="Implement the split documentation slice.",
+                acceptance=["Public contract is current."],
+                parent_task_id="task-docs",
+                task_origin="scope_split",
+            )
+
+            repaired = orchestrator._inherit_plan_replacement_mutable_artifacts(
+                [parent], [child]
+            )
+
+            self.assertEqual(repaired, ["task-docs-a"])
+            self.assertEqual(child.mutable_artifacts, ["spec.md"])
+
+    def test_persisted_stage_recovery_can_update_inherited_public_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            iteration_spec = project_root / "specs" / "iteration.md"
+            write_text(iteration_spec, "# Immutable iteration input\n")
+            write_text(project_root / "tests" / "test_docs.py", "def test_docs(): pass\n")
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = iteration_spec.resolve()
+            orchestrator.adapter = PublicSpecImplementAdapter(project_root)
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-docs",
+                            "title": "Synchronize public docs",
+                            "description": "Keep public duration docs current.",
+                            "acceptance": ["spec.md defines the public contract"],
+                            "status": "done",
+                            "commit_message": "",
+                            "requirement_proofs": [{"evidence_refs": ["spec.md"]}],
+                            "verification_refs": ["tests/test_docs.py::test_docs"],
+                            "review_summary": "spec.md misses requested_duration_sec",
+                        },
+                        {
+                            "task_id": "fix-rejection-1",
+                            "title": "Fix full verification failure",
+                            "description": "Full verification reports spec.md misses the contract.",
+                            "acceptance": ["Tests pass"],
+                            "status": "pending",
+                            "commit_message": "",
+                            "task_origin": "stage_recovery",
+                            "verification_refs": [],
+                            "mutable_artifacts": [],
+                        },
+                    ]
+                },
+            )
+            commit_all(project_root, "test: seed recovery ownership baseline")
+            state = load_run_state(project_root)
+            state.resume_context["spec_file"] = str(iteration_spec)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            save_run_state(project_root, state)
+
+            result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            recovery = next(
+                task for task in result.tasks if task.task_id == "fix-rejection-1"
+            )
+            self.assertEqual(recovery.status, "done")
+            self.assertEqual(recovery.mutable_artifacts, ["spec.md"])
+            self.assertEqual(
+                (project_root / "spec.md").read_text(encoding="utf-8"),
+                "# Updated public product spec\n",
+            )
+            self.assertIn(
+                "Current task explicitly owns these otherwise-protected public artifacts: spec.md",
+                orchestrator.adapter.implement_prompt,
+            )
+            persisted = json.loads(
+                task_plan_path(project_root).read_text(encoding="utf-8")
+            )
+            persisted_recovery = next(
+                task
+                for task in persisted["tasks"]
+                if task["task_id"] == "fix-rejection-1"
+            )
+            self.assertEqual(persisted_recovery["mutable_artifacts"], ["spec.md"])
+
+    def test_new_stage_recovery_persists_inherited_artifacts_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            iteration_spec = project_root / "specs" / "iteration.md"
+            write_text(iteration_spec, "# Immutable iteration input\n")
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = iteration_spec.resolve()
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-docs",
+                            "title": "Synchronize public docs",
+                            "description": "Synchronize the public contract.",
+                            "acceptance": ["Public contract is current."],
+                            "status": "done",
+                            "commit_message": "",
+                            "mutable_artifacts": ["spec.md"],
+                        }
+                    ]
+                },
+            )
+            state = load_run_state(project_root)
+            state.resume_context["spec_file"] = str(iteration_spec)
+            state.status = "paused"
+            state.rejected_stage = "implement"
+            state.rejection_reason = (
+                "Failure type: full_verification\n"
+                "AssertionError: spec.md misses requested_duration_sec"
+            )
+
+            with patch.object(orchestrator, "_commit_planning_baseline_if_needed"):
+                result = orchestrator._run_implementation_loop(state, max_tasks=0)
+
+            recovery = result.tasks[-1]
+            self.assertEqual(recovery.task_origin, "stage_recovery")
+            self.assertEqual(recovery.mutable_artifacts, ["spec.md"])
+            persisted = json.loads(
+                task_plan_path(project_root).read_text(encoding="utf-8")
+            )
+            self.assertEqual(persisted["tasks"][-1]["mutable_artifacts"], ["spec.md"])
+
+    def test_self_requeue_history_does_not_reclassify_stage_recovery_as_repair(self) -> None:
+        stage_recovery = TaskSpec(
+            task_id="fix-stage-recovery",
+            title="Fix full verification failure",
+            description=(
+                "Full verification failed after all planned tasks were implemented.\n\n"
+                "Feedback:\nThe public contract is stale."
+            ),
+            acceptance=["Tests pass"],
+            task_origin="evidence_repair",
+            recovery_history=[
+                {
+                    "result": "requeued",
+                    "repair_task_ids": ["fix-stage-recovery", "repair-child"],
+                }
+            ],
+        )
+        repair = TaskSpec(
+            task_id="repair-child",
+            title="Repair proof evidence",
+            description="Repair the failing proof.",
+            acceptance=["Proof passes"],
+            parent_task_id="fix-stage-recovery",
+        )
+
+        changed = Orchestrator._normalize_task_origins(
+            [stage_recovery, repair]
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(stage_recovery.task_origin, "stage_recovery")
+        self.assertEqual(repair.task_origin, "evidence_repair")
+
     def test_verify_implicated_paths_include_public_documents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -6382,6 +6637,56 @@ class RetryFlowTests(unittest.TestCase):
             self.assertTrue(reopened)
             self.assertEqual(task.recovery_epoch, 1)
             self.assertEqual(task.recovery_round, 0)
+
+    def test_recovered_artifact_ownership_reopens_terminal_recovery_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            iteration_spec = project_root / "specs" / "iteration.md"
+            write_text(iteration_spec, "# Immutable iteration input\n")
+            write_text(project_root / "spec.md", "# Public contract\n")
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = iteration_spec.resolve()
+            owner = TaskSpec(
+                task_id="task-docs",
+                title="Synchronize public docs",
+                description="Synchronize the public contract.",
+                acceptance=["Public contract is current."],
+                status="done",
+                mutable_artifacts=["spec.md"],
+            )
+            recovery = TaskSpec(
+                task_id="fix-rejection-1",
+                title="Fix full verification failure",
+                description="Full verification reports spec.md misses the contract.",
+                acceptance=["Tests pass"],
+                status="blocked",
+                task_origin="stage_recovery",
+                recovery_round=2,
+            )
+            old_fingerprint = orchestrator._recovery_evidence_fingerprint(recovery)
+            recovery.recovery_history.append(
+                {
+                    "epoch": 0,
+                    "round": 3,
+                    "result": "exhausted",
+                    "evidence_fingerprint": old_fingerprint,
+                }
+            )
+            state = load_run_state(project_root)
+
+            repaired = orchestrator._backfill_mutable_artifact_ownership(
+                [owner, recovery]
+            )
+            reopened = orchestrator._reopen_recovery_epoch_if_evidence_changed(
+                state, [owner, recovery], recovery
+            )
+
+            self.assertEqual(repaired, ["fix-rejection-1"])
+            self.assertEqual(recovery.mutable_artifacts, ["spec.md"])
+            self.assertTrue(reopened)
+            self.assertEqual(recovery.recovery_epoch, 1)
+            self.assertEqual(recovery.recovery_round, 0)
 
     def test_review_rejected_repair_stops_after_configured_recovery_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1090,7 +1090,10 @@ The orchestrator validates task IDs, duplicate entries, acceptance lists, and al
 the implementation loop starts. The exact active `--spec-file` and every iteration input under
 `specs/**` remain immutable. A task may update a separate top-level public `spec.md` only when it
 declares `"mutable_artifacts": ["spec.md"]`; this cannot override `.auto-agents/**`, `DESIGN.md`, or
-the active input spec.
+the active input spec. If an owning task is later rolled back or split, auto_agents persists that
+authorization and carries it only to related recovery/replacement tasks whose failure evidence
+implicates the same artifact or one of the owning task's verification paths. Failure output cannot
+grant new artifact authority.
 
 The plan root can also define:
 
