@@ -6284,20 +6284,38 @@ class Orchestrator:
         incident = self._incident_store(state).load(incident_id) if incident_id else None
         if (
             incident is None
-            or not str(incident.task_id).strip()
             or incident.head_ref != head_ref(self.project_root)
             or not incident.worktree_fingerprint
             or incident.worktree_fingerprint != worktree_fingerprint(self.project_root)
         ):
             return {}
 
+        source_task_id = str(incident.task_id).strip()
+        source_inferred = False
+        if not source_task_id:
+            # Older baseline incidents did not retain their task identity. The
+            # exact checkpoint match above plus one ready in-progress task is
+            # the only unambiguous evidence that the dirty tree is managed.
+            candidates = [
+                item
+                for item in tasks
+                if item.status == "in_progress"
+                and self._in_progress_implementation_is_ready(state, item)
+            ]
+            if len(candidates) != 1:
+                return {}
+            source_task_id = candidates[0].task_id
+            source_inferred = True
+
         handoff = self._capture_execution_recovery_worktree_handoff(
             state,
             tasks,
-            source_task_id=incident.task_id,
+            source_task_id=source_task_id,
         )
         if not handoff:
             return {}
+        if source_inferred:
+            handoff["source_task_inferred"] = True
         handoff["migrated_from_incident_checkpoint"] = True
         marker["worktree_handoff"] = handoff
         state.tasks = tasks

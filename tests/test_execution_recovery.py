@@ -1190,7 +1190,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
 
             execute.assert_not_called()
 
-    def test_legacy_recovery_restores_handoff_from_incident_checkpoint(self) -> None:
+    def test_legacy_recovery_infers_unique_dirty_worktree_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
             Orchestrator.init_project(root, "project", "mock")
@@ -1214,7 +1214,6 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 stage="implement",
                 context="task verification",
                 command="python -m pytest -q tests/test_owned.py",
-                task_id=source.task_id,
                 head_ref=head_ref(root),
                 worktree_fingerprint=worktree_fingerprint(root),
                 recovery_round=1,
@@ -1273,6 +1272,82 @@ class ExecutionRecoveryTests(unittest.TestCase):
             marker = orchestrator._execution_recovery_marker(recovery)
             self.assertTrue(
                 marker["worktree_handoff"]["migrated_from_incident_checkpoint"]
+            )
+            self.assertTrue(
+                marker["worktree_handoff"]["source_task_inferred"]
+            )
+            self.assertEqual(
+                marker["worktree_handoff"]["source_task_id"],
+                source.task_id,
+            )
+
+    def test_legacy_recovery_does_not_claim_ambiguous_dirty_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            sources = [
+                TaskSpec(
+                    task_id=f"source-{index}",
+                    title=f"Source {index}",
+                    description="Produces candidate changes before verification.",
+                    acceptance=["The verification command passes."],
+                    status="in_progress",
+                )
+                for index in (1, 2)
+            ]
+            for source in sources:
+                orchestrator._set_implementation_ready_marker(state, source, True)
+            (root / "partial.txt").write_text(
+                "ambiguous checkpoint\n",
+                encoding="utf-8",
+            )
+            incident = ExecutionIncident(
+                incident_id="ambiguous-incident",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q tests/test_owned.py",
+                head_ref=head_ref(root),
+                worktree_fingerprint=worktree_fingerprint(root),
+                recovery_round=1,
+                status="recovering",
+            )
+            ExecutionIncidentStore(root, state.run_id).save(incident, state)
+            recovery = TaskSpec(
+                task_id="persisted-recovery",
+                title="Persisted recovery",
+                description="Recovers a previously interrupted verification.",
+                acceptance=["The original verification command passes."],
+                status="pending",
+                task_origin="stage_recovery",
+                recovery_history=[
+                    recovery_task_marker(
+                        incident.incident_id,
+                        incident.command,
+                        recovery_round=incident.recovery_round,
+                    )
+                ],
+                verification_refs=[f"cmd:{incident.command}"],
+            )
+            tasks = [recovery, *sources]
+            state.tasks = tasks
+            orchestrator._persist_tasks(tasks)
+            save_run_state(root, state)
+
+            self.assertFalse(
+                orchestrator._execution_recovery_worktree_handoff_matches(
+                    state,
+                    tasks,
+                    recovery,
+                )
+            )
+            self.assertNotIn(
+                "worktree_handoff",
+                orchestrator._execution_recovery_marker(recovery),
             )
 
     def test_prebaseline_lane_does_not_run_the_same_baseline_first(self) -> None:
