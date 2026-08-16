@@ -4986,6 +4986,17 @@ class Orchestrator:
         return requeued_task_ids
 
     @staticmethod
+    def _requeued_task_id(state: RunState) -> str:
+        route = state.last_recovery_route
+        if (
+            not isinstance(route, dict)
+            or str(route.get("outcome", ""))
+            not in {"requeued", "self_repair_requeued"}
+        ):
+            return ""
+        return str(route.get("task_id") or route.get("lineage_id") or "").strip()
+
+    @staticmethod
     def _self_repair_requeued_task_id(state: RunState) -> str:
         route = state.last_recovery_route
         if (
@@ -4993,7 +5004,61 @@ class Orchestrator:
             or str(route.get("outcome", "")) != "self_repair_requeued"
         ):
             return ""
-        return str(route.get("task_id") or route.get("lineage_id") or "").strip()
+        return Orchestrator._requeued_task_id(state)
+
+    def _requeued_route_owns_task(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> bool:
+        if self._requeued_task_id(state) != task.task_id:
+            return False
+        route = state.last_recovery_route
+        if str(route.get("outcome", "")) == "self_repair_requeued":
+            return task.status in {"pending", "in_progress"}
+
+        route_epoch = int(route.get("epoch", 0) or 0)
+        route_round = int(route.get("round", 0) or 0)
+        return bool(
+            task.status in {"pending", "in_progress"}
+            and route_epoch == int(task.recovery_epoch)
+            and route_round == int(task.recovery_round)
+            and any(
+                isinstance(entry, dict)
+                and str(entry.get("result", "")) == "requeued"
+                and int(entry.get("epoch", 0) or 0) == route_epoch
+                and int(entry.get("round", 0) or 0) == route_round
+                for entry in task.recovery_history
+            )
+        )
+
+    def _restore_requeued_task_retry_ownership(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> bool:
+        """Restore the retained worktree owner from a durable requeue route."""
+
+        task_id = self._requeued_task_id(state)
+        if not task_id:
+            return False
+        task = next(
+            (
+                candidate
+                for candidate in tasks
+                if candidate.task_id == task_id
+            ),
+            None,
+        )
+        if task is None or not self._requeued_route_owns_task(state, task):
+            return False
+
+        retry_ids = self._parallel_sequential_retry_ids(state)
+        reordered = list(dict.fromkeys([task_id, *retry_ids]))
+        if reordered == retry_ids:
+            return False
+        self._set_parallel_sequential_retry_ids(state, reordered)
+        return True
 
     def _restore_interrupted_self_repair_retry_ownership(
         self,
@@ -7199,7 +7264,26 @@ class Orchestrator:
             state.rejection_reason = ""
 
         state.tasks = tasks
-        self._commit_planning_baseline_if_needed(tasks)
+        tasks_by_id = {task.task_id: task for task in tasks}
+        retry_ids = self._parallel_sequential_retry_ids(state)
+        retained_retry_ids = [
+            task_id
+            for task_id in retry_ids
+            if task_id in tasks_by_id and tasks_by_id[task_id].status != "done"
+        ]
+        retry_state_changed = retained_retry_ids != retry_ids
+        if retry_state_changed:
+            self._set_parallel_sequential_retry_ids(state, retained_retry_ids)
+        restored_requeue = self._restore_requeued_task_retry_ownership(state, tasks)
+        if restored_requeue:
+            self.logger.info(
+                "[recovery] restored retained worktree ownership task=%s",
+                self._requeued_task_id(state),
+            )
+        if retry_state_changed or restored_requeue:
+            save_run_state(self.project_root, state)
+        if not self._parallel_sequential_retry_ids(state):
+            self._commit_planning_baseline_if_needed(tasks)
         self._normalize_legacy_execution_recovery_tasks(state, tasks)
         if state.status in {"paused", "blocked"}:
             return state
@@ -7255,7 +7339,19 @@ class Orchestrator:
         max_tasks: Optional[int],
     ) -> RunState:
         processed = 0
-        for task in tasks:
+        tasks_by_id = {task.task_id: task for task in tasks}
+        retry_ids = self._parallel_sequential_retry_ids(state)
+        retry_tasks = [
+            tasks_by_id[task_id]
+            for task_id in retry_ids
+            if task_id in tasks_by_id and tasks_by_id[task_id].status != "done"
+        ]
+        retry_task_ids = {task.task_id for task in retry_tasks}
+        ordered_tasks = [
+            *retry_tasks,
+            *(task for task in tasks if task.task_id not in retry_task_ids),
+        ]
+        for task in ordered_tasks:
             if task.status == "done":
                 continue
             if not self._has_task_budget(max_tasks, processed):
@@ -7774,7 +7870,7 @@ class Orchestrator:
             else self._should_resume_task(state, task)
         )
         sequential_retry_ids = self._parallel_sequential_retry_ids(state)
-        route_retry = self._self_repair_requeued_task_id(state) == task.task_id
+        route_retry = self._requeued_route_owns_task(state, task)
         if route_retry and task.task_id not in sequential_retry_ids:
             sequential_retry_ids = [*sequential_retry_ids, task.task_id]
             self._set_parallel_sequential_retry_ids(state, sequential_retry_ids)
@@ -10016,6 +10112,14 @@ class Orchestrator:
             task_ids=[task.task_id],
         )
         state.task_review_cache.pop(task.task_id, None)
+        # A judged retry keeps the failed candidate in the main worktree.  The
+        # pending status starts a fresh implementation lifecycle, while this
+        # durable lane marker preserves worktree ownership and scheduler priority.
+        retry_ids = self._parallel_sequential_retry_ids(state)
+        self._set_parallel_sequential_retry_ids(
+            state,
+            [task.task_id, *retry_ids],
+        )
         self._persist_tasks(tasks)
         state.tasks = tasks
         state.current_stage = "implement"

@@ -3765,6 +3765,110 @@ class RetryFlowTests(unittest.TestCase):
                 state.resume_context,
             )
 
+    def test_review_requeue_owns_dirty_tree_before_next_pending_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+
+            config = orchestrator.config
+            config.gates.commands = []
+            config.execution.parallel_tasks.enabled = True
+            config.execution.parallel_tasks.workers = 2
+            config.execution.recovery.max_rounds = 2
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "next-task",
+                            "title": "Start unrelated work",
+                            "description": "This task requires a clean worktree.",
+                            "acceptance": ["Unrelated work is complete."],
+                            "depends_on": [],
+                            "status": "pending",
+                            "commit_message": "",
+                            "test_generated": True,
+                        },
+                        {
+                            "task_id": "reviewed-task",
+                            "title": "Continue reviewed work",
+                            "description": "Address the latest review feedback.",
+                            "acceptance": ["The reviewed artifact is corrected."],
+                            "depends_on": [],
+                            "status": "in_progress",
+                            "commit_message": "",
+                            "test_generated": True,
+                        },
+                    ]
+                },
+            )
+            commit_all(project_root, "test: seed review recovery")
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            reviewed = state.tasks[1]
+            baseline_ref = head_ref(project_root)
+            write_text(project_root / "artifact.txt", "retained candidate\n")
+
+            with patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                return_value={
+                    "decision": "CONTINUE",
+                    "reason": "One bounded correction remains.",
+                    "actionable_items": ["Correct the reviewed artifact."],
+                    "split_axis": [],
+                    "source": "provider",
+                },
+            ):
+                requeued = orchestrator._recover_review_rejected_task(
+                    state,
+                    state.tasks,
+                    reviewed,
+                    {
+                        "reason": "review rejected the task",
+                        "review": "The reviewed artifact still needs correction.",
+                    },
+                )
+
+            self.assertTrue(requeued)
+            self.assertEqual(
+                state.resume_context["parallel_sequential_retry_tasks"],
+                [reviewed.task_id],
+            )
+
+            # Simulate a persisted requeue written by an older orchestrator,
+            # before retry ownership was recorded separately from the route.
+            state.resume_context.pop("parallel_sequential_retry_tasks")
+            save_run_state(project_root, state)
+
+            resumed = Orchestrator(project_root)
+            resumed.adapter = BlockedRetryAdapter(project_root)
+            result = resumed._run_implementation_loop(
+                load_run_state(project_root),
+                max_tasks=1,
+            )
+
+            by_id = {task.task_id: task for task in result.tasks}
+            self.assertEqual(by_id["reviewed-task"].status, "done")
+            self.assertEqual(by_id["next-task"].status, "pending")
+            self.assertEqual(resumed.adapter.implement_calls, 1)
+            commit_count = subprocess.run(
+                ["git", "rev-list", "--count", f"{baseline_ref}..HEAD"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            self.assertEqual(commit_count, "1")
+            self.assertNotIn(
+                "parallel_sequential_retry_tasks",
+                result.resume_context,
+            )
+
     def test_pending_task_reports_changed_paths_when_clean_tree_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
