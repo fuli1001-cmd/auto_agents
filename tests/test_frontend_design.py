@@ -28,6 +28,7 @@ from auto_agents.frontend_design import (
     frontend_design_artifact_hashes,
     load_frontend_design_lock,
     parse_catalog_entries,
+    selected_surface_specs,
     validate_catalog_selection,
     validate_frontend_design_artifacts,
     validate_prototype_manifest,
@@ -65,22 +66,30 @@ class PrototypeAdapter(AgentAdapter):
         elif request.attempt_id.startswith("prototype-generate"):
             root = frontend_prototype_dir(self.project_root)
             write_text(root / "index.html", HTML)
-            write_text(root / "home.html", HTML)
+            trace = json.loads(
+                requirements_trace_path(self.project_root).read_text(encoding="utf-8")
+            )
+            surfaces = selected_surface_specs(trace, max_pages=3)
+            pages = []
+            for index, surface in enumerate(surfaces, start=1):
+                filename = "home.html" if index == 1 else f"surface-{index}.html"
+                write_text(root / filename, HTML)
+                pages.append(
+                    {
+                        "id": surface["id"],
+                        "title": surface["name"],
+                        "route": surface["route"],
+                        "html_ref": f".auto-agents/docs/frontend_prototype/{filename}",
+                        "requirement_ids": surface["requirement_ids"],
+                    }
+                )
             write_json(
                 root / "manifest.json",
                 {
                     "version": 1,
                     "index_ref": ".auto-agents/docs/frontend_prototype/index.html",
                     "viewports": ["1440x900", "390x844"],
-                    "pages": [
-                        {
-                            "id": "surface-home",
-                            "title": "Home",
-                            "route": "/",
-                            "html_ref": ".auto-agents/docs/frontend_prototype/home.html",
-                            "requirement_ids": ["REQ-001"],
-                        }
-                    ],
+                    "pages": pages,
                 },
             )
         write_text(request.output_path, "ok\n")
@@ -362,6 +371,144 @@ class FrontendDesignTests(unittest.TestCase):
                 task.task_id,
                 state.resume_context.get("implementation_ready_tasks", {}),
             )
+
+    def test_stale_approved_contract_rewinds_before_frontend_task_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_text(root / "spec.md", "# Existing frontend redesign\n")
+            write_text(root / "src/pages/Home.tsx", "export const Home = () => <main />")
+            write_text(root / "specs/prototype/home.html", HTML)
+            write_text(design_md_path(root), "# User design\n")
+            write_frontend_fidelity_trace(root)
+
+            orchestrator = Orchestrator(root)
+            orchestrator.adapter = PrototypeAdapter(root)
+            state = load_run_state(root)
+            state.resume_context[
+                Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT
+            ] = True
+            orchestrator._run_prototype_stage(state, root / "spec.md")
+            approved = orchestrator.approve("prototype")
+
+            trace = json.loads(requirements_trace_path(root).read_text(encoding="utf-8"))
+            trace["frontend_scope"]["surfaces"][0]["requirement_ids"].append("REQ-002")
+            trace["requirements"].append(
+                {
+                    "id": "REQ-002",
+                    "status": "active",
+                    "priority": "mandatory",
+                    "text": "Add a new interaction to the existing home surface.",
+                    "acceptance_oracles": ["The interaction matches a newly approved prototype."],
+                    "oracle_type": "mixed",
+                    "oracle_strength": "human",
+                    "evidence_boundary": "system_boundary",
+                    "forbidden_proxy_oracles": [],
+                    "notes": "",
+                }
+            )
+            write_json(requirements_trace_path(root), trace)
+            task = TaskSpec(
+                task_id="task-redesign",
+                title="Implement the new interaction",
+                description="Consume the redesigned approved surface.",
+                acceptance=["The interaction matches the new prototype."],
+                requirement_ids=["REQ-002"],
+                status="pending",
+            )
+            approved.current_stage = "implement"
+            approved.stage_summaries = {
+                "clarify": "done",
+                "prototype": "Reused the approved contract.",
+                "design": "done",
+                "plan": "done",
+                "provider_research": "done",
+            }
+            approved.approved_gates = ["requirements", "prototype", "architecture", "release"]
+            approved.tasks = [task]
+
+            with patch.object(
+                orchestrator, "_ensure_evidence_preflight"
+            ) as evidence_preflight:
+                result = orchestrator._execute_task_in_main_worktree(
+                    approved, [task], task
+                )
+
+            evidence_preflight.assert_not_called()
+            self.assertIs(result, approved)
+            self.assertEqual(approved.current_stage, "prototype")
+            self.assertEqual(approved.approved_gates, ["requirements"])
+            self.assertTrue(
+                approved.resume_context[
+                    Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT
+                ]
+            )
+
+    def test_existing_frontend_redesign_regenerates_stale_contract_and_requires_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_text(root / "spec.md", "# Existing frontend redesign\n")
+            write_text(root / "src/pages/Home.tsx", "export const Home = () => <main />")
+            write_text(root / "specs/prototype/home.html", HTML)
+            write_text(design_md_path(root), "# User design\n")
+            write_frontend_fidelity_trace(root)
+
+            orchestrator = Orchestrator(root)
+            orchestrator.adapter = PrototypeAdapter(root)
+            state = load_run_state(root)
+            state.resume_context[
+                Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT
+            ] = True
+            orchestrator._run_prototype_stage(state, root / "spec.md")
+            approved = orchestrator.approve("prototype")
+
+            trace = json.loads(requirements_trace_path(root).read_text(encoding="utf-8"))
+            trace["frontend_scope"]["surfaces"][0]["requirement_ids"].append("REQ-002")
+            trace["requirements"].append(
+                {
+                    "id": "REQ-002",
+                    "status": "active",
+                    "priority": "mandatory",
+                    "text": "Add a new interaction to the existing home surface.",
+                    "acceptance_oracles": ["The interaction matches a newly approved prototype."],
+                    "oracle_type": "mixed",
+                    "oracle_strength": "human",
+                    "evidence_boundary": "system_boundary",
+                    "forbidden_proxy_oracles": [],
+                    "notes": "",
+                }
+            )
+            write_json(requirements_trace_path(root), trace)
+            approved.stage_summaries = {"clarify": "done"}
+            approved.current_stage = "clarify"
+            approved.approved_gates = [
+                "requirements",
+                "prototype",
+                "architecture",
+                "release",
+            ]
+            save_run_state(root, approved)
+
+            adapter = PrototypeAdapter(root)
+            orchestrator.adapter = adapter
+            result = orchestrator.run(
+                root / "spec.md",
+                auto_approve=True,
+                skip_validate=True,
+            )
+
+            self.assertEqual(result.status, "paused")
+            self.assertEqual(result.pending_approval, "prototype")
+            self.assertEqual(result.approved_gates, ["requirements"])
+            self.assertNotIn("design", result.stage_summaries)
+            self.assertTrue(
+                any(call.startswith("prototype-generate") for call in adapter.calls)
+            )
+            lock = load_frontend_design_lock(root)
+            self.assertEqual(lock["status"], "pending_approval")
+            self.assertIn("REQ-002", lock["prototype"]["pages"][0]["requirement_ids"])
+            self.assertIn("specs/prototype/home.html", lock["source"]["refs"])
 
     def test_parallel_scheduler_checks_contract_before_evidence_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

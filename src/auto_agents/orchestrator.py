@@ -137,6 +137,7 @@ from .frontend_design import (
     frontend_design_contract_sha256,
     frontend_scope_requested,
     load_frontend_design_lock,
+    missing_frontend_design_contract_requirement_ids,
     selected_surface_specs,
     sha256_file,
     user_design_assets,
@@ -2197,7 +2198,7 @@ class Orchestrator:
     def _run_prototype_stage(self, state: RunState, spec_file: Path) -> RunState:
         trace = load_requirements_trace(self.project_root, normalize=False)
         state.current_stage = "prototype"
-        contract_recovery = bool(
+        recovery_requested = bool(
             state.resume_context.get(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, False)
         )
         rejection_feedback = ""
@@ -2211,6 +2212,46 @@ class Orchestrator:
             state.last_error = ""
             return state
 
+        surfaces = selected_surface_specs(
+            trace,
+            max_pages=self.config.frontend_design.max_pages,
+        )
+        required_ids = [
+            str(requirement_id).strip()
+            for surface in surfaces
+            for requirement_id in surface.get("requirement_ids", []) or []
+            if str(requirement_id).strip()
+        ]
+        prior_lock = load_frontend_design_lock(self.project_root)
+        missing_ids = missing_frontend_design_contract_requirement_ids(
+            prior_lock,
+            required_ids,
+        )
+        stale_approved_contract = bool(
+            approved_frontend_design(self.project_root) and missing_ids
+        )
+        contract_recovery = recovery_requested or stale_approved_contract
+        if contract_recovery and prior_lock.get("status") == "approved":
+            state.resume_context[self.FRONTEND_CONTRACT_RECOVERY_CONTEXT] = True
+            prior_lock["status"] = "pending_approval"
+            prior_lock["redesign_requested_at"] = utc_now_iso()
+            prior_lock["redesign_requirement_ids"] = missing_ids
+            prior_lock.pop("approved_at", None)
+            prior_lock.pop("approval", None)
+            prior_lock.pop("contract_sha256", None)
+            write_json(frontend_design_lock_path(self.project_root), prior_lock)
+            prototype_approval_index = APPROVAL_ORDER.index("prototype")
+            downstream_approvals = set(APPROVAL_ORDER[prototype_approval_index:])
+            state.approved_gates = [
+                gate for gate in state.approved_gates if gate not in downstream_approvals
+            ]
+            save_run_state(self.project_root, state)
+            sync_agent_instructions(self.project_root)
+            self.logger.info(
+                "[frontend-contract] route=prototype reason=approved-contract-missing-requirements ids=%s",
+                ",".join(missing_ids) or "contract-recovery",
+            )
+
         discovery = discover_existing_frontend(self.project_root)
         # Existing frontends normally skip greenfield prototyping. A task-level
         # prerequisite rewind is different: it must produce the missing lock
@@ -2222,7 +2263,7 @@ class Orchestrator:
             )
             state.last_error = ""
             return state
-        if approved_frontend_design(self.project_root):
+        if approved_frontend_design(self.project_root) and not contract_recovery:
             state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
             state.stage_summaries["prototype"] = "Reused the approved, pinned frontend design contract."
             state.last_error = ""
@@ -2252,7 +2293,7 @@ class Orchestrator:
             source_refs = [*assets, design_ref]
         elif (
             not reselect
-            and prior_lock.get("status") == "pending_approval"
+            and prior_lock.get("status") in {"pending_approval", "approved"}
             and isinstance(prior_lock.get("source"), dict)
             and prior_lock.get("source", {}).get("kind") == "awesome-design-md"
             and design_md_path(self.project_root).is_file()
@@ -2328,10 +2369,6 @@ class Orchestrator:
             selection_ref = ".auto-agents/docs/frontend_design/selection.md"
             source_refs = [design_ref]
 
-        surfaces = selected_surface_specs(
-            trace,
-            max_pages=self.config.frontend_design.max_pages,
-        )
         generation_prompt = self._prototype_generation_prompt(
             spec_file=spec_file,
             surfaces=surfaces,
@@ -7123,11 +7160,27 @@ class Orchestrator:
         return state
 
     def _task_requires_frontend_design_contract(self, task: TaskSpec) -> bool:
+        return bool(self._task_frontend_design_requirement_ids(task))
+
+    def _task_frontend_design_requirement_ids(self, task: TaskSpec) -> List[str]:
         trace_payload = load_requirements_trace(self.project_root)
         frontend_requirement_ids = set(
             frontend_fidelity_requirement_ids(trace_payload)
         )
-        return bool(frontend_requirement_ids.intersection(task.requirement_ids))
+        for surface in selected_surface_specs(
+            trace_payload,
+            max_pages=self.config.frontend_design.max_pages,
+        ):
+            frontend_requirement_ids.update(
+                str(requirement_id).strip()
+                for requirement_id in surface.get("requirement_ids", []) or []
+                if str(requirement_id).strip()
+            )
+        return [
+            requirement_id
+            for requirement_id in task.requirement_ids
+            if requirement_id in frontend_requirement_ids
+        ]
 
     def _route_frontend_design_contract_prerequisite(
         self,
@@ -7136,9 +7189,15 @@ class Orchestrator:
         task: TaskSpec,
     ) -> Optional[RunState]:
         """Route contract-bound tasks before evidence preflight or implementation."""
-        if not self._task_requires_frontend_design_contract(task):
+        task_requirement_ids = self._task_frontend_design_requirement_ids(task)
+        if not task_requirement_ids:
             return None
-        if approved_frontend_design(self.project_root):
+        lock = load_frontend_design_lock(self.project_root)
+        missing_ids = missing_frontend_design_contract_requirement_ids(
+            lock,
+            task_requirement_ids,
+        )
+        if approved_frontend_design(self.project_root) and not missing_ids:
             state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
             return None
 
@@ -7156,9 +7215,9 @@ class Orchestrator:
         state.rejection_reason = ""
         state.last_error = ""
 
-        lock = load_frontend_design_lock(self.project_root)
         pending_contract_ready = (
             lock.get("status") == "pending_approval"
+            and not missing_ids
             and not validate_frontend_design_artifacts(
                 self.project_root,
                 lock,

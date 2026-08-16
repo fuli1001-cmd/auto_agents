@@ -261,6 +261,23 @@ def user_design_assets(project_root: Path, trace_payload: object, *, spec_text: 
     if root_design.is_file() and not managed_design:
         assets.append("DESIGN.md")
 
+    if isinstance(lock_source, Mapping) and lock_source.get("kind") == "user":
+        for raw_ref in lock_source.get("refs", []) or []:
+            ref = str(raw_ref).strip()
+            if not ref or ref in assets:
+                continue
+            if ref.startswith(".auto-agents/docs/frontend_prototype/"):
+                continue
+            if ref.lower().startswith(("http://", "https://")):
+                if "figma.com/" in ref.lower():
+                    assets.append(ref)
+                continue
+            candidate = Path(ref)
+            if not candidate.is_absolute():
+                candidate = project_root / candidate
+            if candidate.exists():
+                assets.append(ref)
+
     if isinstance(trace_payload, Mapping):
         for surface in trace_payload.get("frontend_surfaces", []) or []:
             if not isinstance(surface, Mapping):
@@ -318,6 +335,40 @@ def approved_frontend_design(project_root: Path) -> bool:
     if not expected or expected != frontend_design_contract_sha256(lock):
         return False
     return not validate_frontend_design_artifacts(project_root, lock, require_approved=False)
+
+
+def frontend_design_contract_requirement_ids(lock_payload: object) -> List[str]:
+    if not isinstance(lock_payload, Mapping):
+        return []
+    prototype = lock_payload.get("prototype")
+    pages = prototype.get("pages") if isinstance(prototype, Mapping) else None
+    if not isinstance(pages, list):
+        return []
+    requirement_ids: List[str] = []
+    for page in pages:
+        raw_ids = page.get("requirement_ids") if isinstance(page, Mapping) else None
+        if not isinstance(raw_ids, list):
+            continue
+        for item in raw_ids:
+            requirement_id = str(item).strip()
+            if requirement_id and requirement_id not in requirement_ids:
+                requirement_ids.append(requirement_id)
+    return requirement_ids
+
+
+def missing_frontend_design_contract_requirement_ids(
+    lock_payload: object,
+    required_ids: object,
+) -> List[str]:
+    covered_ids = set(frontend_design_contract_requirement_ids(lock_payload))
+    if not isinstance(required_ids, (list, tuple, set, frozenset)):
+        return []
+    normalized_ids = [str(item or "").strip() for item in required_ids]
+    return [
+        requirement_id
+        for requirement_id in dict.fromkeys(normalized_ids)
+        if requirement_id and requirement_id not in covered_ids
+    ]
 
 
 def frontend_design_artifact_hashes(project_root: Path) -> Dict[str, str]:
