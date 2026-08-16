@@ -237,6 +237,7 @@ _FAILOVER_PATTERN = re.compile(
 )
 
 VERIFY_BASELINE_SCHEMA_VERSION = 1
+IMPLEMENTATION_SCOPE_POLICY_VERSION = 2
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
 _NON_COMPARABLE_BASELINE_PREFIXES = (
@@ -1317,10 +1318,21 @@ class Orchestrator:
             return "verify"
         return "implement"
 
-    @classmethod
-    def _is_immutable_input_spec_path(cls, path: object) -> bool:
-        normalized = cls._normalize_audit_blocker_path(path)
-        return normalized == "spec.md" or normalized.startswith("specs/")
+    def _active_spec_relative_path(self) -> str:
+        active_spec = self._current_audit_spec()
+        if active_spec is None:
+            return "spec.md"
+        try:
+            return self._relative_repo_path(active_spec)
+        except ValueError:
+            return ""
+
+    def _is_immutable_input_spec_path(self, path: object) -> bool:
+        normalized = self._normalize_audit_blocker_path(path)
+        if normalized.startswith("specs/"):
+            return True
+        active_spec = self._active_spec_relative_path()
+        return bool(active_spec) and normalized == active_spec
 
     @classmethod
     def _unsafe_forbidden_pattern_recovery_reason(cls, blocker: Dict[str, object]) -> str:
@@ -1344,21 +1356,20 @@ class Orchestrator:
             return authoritative.strip().lower() in {"false", "0", "no"}
         return False
 
-    @classmethod
-    def _audit_issue_route(cls, blocker: Dict[str, object]) -> Tuple[Optional[str], str]:
+    def _audit_issue_route(self, blocker: Dict[str, object]) -> Tuple[Optional[str], str]:
         kind = str(blocker.get("kind", "")).strip()
         message = str(blocker.get("message", "")).strip() or "requirements audit blocker"
         if kind in {"forbidden_pattern_safety", "forbidden_pattern_timeout"}:
             return "clarify", ""
         if kind == "forbidden_pattern":
-            if cls._is_non_authoritative_forbidden_pattern_blocker(blocker):
+            if self._is_non_authoritative_forbidden_pattern_blocker(blocker):
                 return None, ""
-            if cls._is_immutable_input_spec_path(blocker.get("path")):
+            if self._is_immutable_input_spec_path(blocker.get("path")):
                 return "clarify", ""
-            unsafe_reason = cls._unsafe_forbidden_pattern_recovery_reason(blocker)
+            unsafe_reason = self._unsafe_forbidden_pattern_recovery_reason(blocker)
             if unsafe_reason:
                 return None, f"{message}; automatic recovery is unsafe because {unsafe_reason}"
-            return cls._forbidden_pattern_owner_stage(blocker), ""
+            return self._forbidden_pattern_owner_stage(blocker), ""
         if kind == "task_coverage":
             return "plan", ""
         if kind == "requirement_contract_drift":
@@ -1378,8 +1389,7 @@ class Orchestrator:
             return "plan", ""
         return None, f"{message}; no automatic recovery route is defined for blocker kind '{kind or 'unknown'}'"
 
-    @staticmethod
-    def _audit_blocker_feedback(blocker: Dict[str, object]) -> str:
+    def _audit_blocker_feedback(self, blocker: Dict[str, object]) -> str:
         kind = str(blocker.get("kind", "")).strip()
         if kind == "forbidden_pattern_safety":
             reason = str(blocker.get("reason", "")).strip() or "unsafe or invalid definition"
@@ -1394,17 +1404,17 @@ class Orchestrator:
             )
         if kind == "forbidden_pattern":
             path = str(blocker.get("path", "")).strip() or "unknown path"
-            if Orchestrator._is_non_authoritative_forbidden_pattern_blocker(blocker):
+            if self._is_non_authoritative_forbidden_pattern_blocker(blocker):
                 return f"forbidden pattern found in {path} (corroboration-only; not a recovery target)"
-            if Orchestrator._is_immutable_input_spec_path(path):
+            if self._is_immutable_input_spec_path(path):
                 return (
                     f"forbidden pattern found in {path} "
                     "(immutable input spec; repair the derived requirements trace via clarify)"
                 )
-            unsafe_reason = Orchestrator._unsafe_forbidden_pattern_recovery_reason(blocker)
+            unsafe_reason = self._unsafe_forbidden_pattern_recovery_reason(blocker)
             if unsafe_reason:
                 return f"forbidden pattern found in {path} (not auto-fixable: {unsafe_reason})"
-            owner_stage = Orchestrator._forbidden_pattern_owner_stage(blocker)
+            owner_stage = self._forbidden_pattern_owner_stage(blocker)
             return f"forbidden pattern found in {path} (owned by {owner_stage})"
         return str(blocker.get("message", "")).strip() or "requirements audit blocker"
 
@@ -3694,9 +3704,10 @@ class Orchestrator:
             "spec.md",
             "specs",
         ]
-        if self._active_spec_file is not None:
+        active_spec = self._current_audit_spec()
+        if active_spec is not None:
             try:
-                restore_relatives.append(self._relative_repo_path(self._active_spec_file))
+                restore_relatives.append(self._relative_repo_path(active_spec))
             except ValueError:
                 pass
         for relative in restore_relatives:
@@ -3733,12 +3744,86 @@ class Orchestrator:
             return True
         if normalized == "spec.md" or normalized.startswith("specs/"):
             return True
-        if self._active_spec_file is not None:
-            try:
-                return normalized == self._relative_repo_path(self._active_spec_file)
-            except ValueError:
-                return False
-        return False
+        return normalized == self._active_spec_relative_path()
+
+    @staticmethod
+    def _normalize_mutable_artifact_path(path: object) -> str:
+        normalized = str(path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized
+
+    def _legacy_recovery_mutable_artifacts(self, task: TaskSpec) -> List[str]:
+        """Recover old plans that explicitly proved a public spec but lacked ownership metadata."""
+        if task.mutable_artifacts or self._active_spec_relative_path() in {"", "spec.md"}:
+            return []
+        contract_parts = [task.description, *task.acceptance, *task.expected_test_migrations]
+        for proof in task.requirement_proofs:
+            if not isinstance(proof, dict):
+                continue
+            contract_parts.extend(
+                str(ref) for ref in (proof.get("evidence_refs", []) or [])
+            )
+        contract_text = "\n".join(contract_parts)
+        if "spec.md" not in contract_text:
+            return []
+        feedback_parts = [task.review_summary]
+        feedback_parts.extend(
+            str(entry.get("summary", ""))
+            for entry in task.review_history
+            if isinstance(entry, dict)
+        )
+        feedback_parts.extend(
+            str(entry.get("review", ""))
+            for entry in task.recovery_history
+            if isinstance(entry, dict)
+        )
+        feedback = "\n".join(feedback_parts).lower()
+        if "spec.md" not in feedback or not any(
+            marker in feedback
+            for marker in ("misses", "missing", "stale", "outdated", "未解决", "没有定义", "仍使用")
+        ):
+            return []
+        return ["spec.md"]
+
+    def _effective_task_mutable_artifacts(self, task: TaskSpec) -> List[str]:
+        artifacts: List[str] = []
+        for raw_path in [*task.mutable_artifacts, *self._legacy_recovery_mutable_artifacts(task)]:
+            normalized = self._normalize_mutable_artifact_path(raw_path)
+            if normalized and normalized not in artifacts:
+                artifacts.append(normalized)
+        return artifacts
+
+    def _task_mutable_artifact_errors(self, task: TaskSpec) -> List[str]:
+        errors: List[str] = []
+        active_spec = self._active_spec_relative_path()
+        for raw_path in task.mutable_artifacts:
+            normalized = self._normalize_mutable_artifact_path(raw_path)
+            parts = normalized.split("/")
+            if (
+                not normalized
+                or normalized.startswith("/")
+                or ".." in parts
+                or any(char in normalized for char in "*?[]")
+            ):
+                errors.append(
+                    f"mutable_artifacts entry '{raw_path}' must be an exact project-relative path"
+                )
+            elif normalized == active_spec:
+                errors.append(
+                    f"mutable_artifacts entry '{raw_path}' is the active input spec and must remain immutable"
+                )
+            elif normalized.startswith("specs/"):
+                errors.append(
+                    f"mutable_artifacts entry '{raw_path}' is an immutable iteration spec"
+                )
+            elif normalized.startswith(".auto-agents/") or normalized == ".auto-agents":
+                errors.append(
+                    f"mutable_artifacts entry '{raw_path}' is orchestrator-owned"
+                )
+            elif normalized == "DESIGN.md":
+                errors.append("mutable_artifacts cannot override the approved DESIGN.md contract")
+        return errors
 
     def _is_clarify_conversation_restorable_scope_violation_path(self, path: str) -> bool:
         normalized = str(path).replace("\\", "/").strip()
@@ -3757,6 +3842,7 @@ class Orchestrator:
         stage_key: str,
         run_id: str,
         task_origin: str = "",
+        mutable_artifacts: Iterable[str] = (),
     ) -> Tuple[List[str], Callable[[str], bool]]:
         run_prefix = f".auto-agents/runs/{run_id}/"
         brief_path = self._relative_repo_path(docs_dir(self.project_root) / "project_brief.md")
@@ -3771,13 +3857,24 @@ class Orchestrator:
         run_state_rel = self._relative_repo_path(run_state_path(self.project_root))
         auto_gitignore_rel = ".auto-agents/.gitignore"
         protected_input_specs = {"spec.md"}
-        if self._active_spec_file is not None:
-            try:
-                protected_input_specs.add(self._relative_repo_path(self._active_spec_file))
-            except ValueError:
-                pass
+        active_spec = self._active_spec_relative_path()
+        if active_spec:
+            protected_input_specs.add(active_spec)
+        declared_mutable = {
+            self._normalize_mutable_artifact_path(path)
+            for path in mutable_artifacts
+            if self._normalize_mutable_artifact_path(path)
+        }
 
         def is_implementation_owned_path(path: str) -> bool:
+            if (
+                path in declared_mutable
+                and path != active_spec
+                and not path.startswith("specs/")
+                and not path.startswith(".auto-agents/")
+                and path != "DESIGN.md"
+            ):
+                return True
             return (
                 not path.startswith(".auto-agents/")
                 and not path.startswith("specs/")
@@ -3856,6 +3953,11 @@ class Orchestrator:
             return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel, readme_path}
 
         if stage == "implement":
+            mutable_description = (
+                "explicit mutable artifacts: " + ", ".join(sorted(declared_mutable))
+                if declared_mutable
+                else "no protected public artifacts are mutable"
+            )
             if task_origin == "evidence_repair":
                 allowed = [
                     f"{run_prefix}**",
@@ -3864,7 +3966,8 @@ class Orchestrator:
                     plan_path,
                     provider_lock_path,
                     f"{provider_refs_prefix}**",
-                    "any non-.auto-agents project path except input specs (spec.md, specs/**, active spec file)",
+                    "any non-.auto-agents project path except input specs (immutable iteration/active specs)",
+                    mutable_description,
                 ]
                 return allowed, (
                     lambda path: path.startswith(run_prefix)
@@ -3876,7 +3979,8 @@ class Orchestrator:
                 f"{run_prefix}**",
                 run_state_rel,
                 auto_gitignore_rel,
-                "any non-.auto-agents project path except input specs (spec.md, specs/**, active spec file)",
+                "any non-.auto-agents project path except input specs (immutable iteration/active specs)",
+                mutable_description,
             ]
             return allowed, (
                 lambda path: path.startswith(run_prefix)
@@ -3895,6 +3999,7 @@ class Orchestrator:
         run_id: str,
         before_snapshot: Dict[str, str],
         task_origin: str = "",
+        mutable_artifacts: Iterable[str] = (),
     ) -> None:
         violation = self._stage_mutation_scope_violation(
             stage=stage,
@@ -3902,6 +4007,7 @@ class Orchestrator:
             run_id=run_id,
             before_snapshot=before_snapshot,
             task_origin=task_origin,
+            mutable_artifacts=mutable_artifacts,
         )
         if violation is None:
             return
@@ -3920,6 +4026,7 @@ class Orchestrator:
         run_id: str,
         before_snapshot: Dict[str, str],
         task_origin: str = "",
+        mutable_artifacts: Iterable[str] = (),
     ) -> Optional[Tuple[List[str], List[str]]]:
         after_snapshot = self._worktree_change_snapshot()
         delta_paths = self._guarded_snapshot_delta_paths(before_snapshot, after_snapshot)
@@ -3930,6 +4037,7 @@ class Orchestrator:
             stage_key=stage_key,
             run_id=run_id,
             task_origin=task_origin,
+            mutable_artifacts=mutable_artifacts,
         )
         offending = [path for path in delta_paths if not is_allowed(path)]
         if not offending:
@@ -8769,6 +8877,15 @@ class Orchestrator:
             worker._print_agent_output = self._print_agent_output
             worker._allow_dirty_tree = self._allow_dirty_tree
             worker_state = RunState.from_dict(state.to_dict())
+            source_active_spec = self._current_audit_spec(state)
+            if source_active_spec is not None:
+                try:
+                    active_relative = source_active_spec.relative_to(self.project_root)
+                except ValueError:
+                    worker._active_spec_file = source_active_spec
+                else:
+                    worker._active_spec_file = (worktree_path / active_relative).resolve()
+                    worker_state.resume_context["spec_file"] = str(worker._active_spec_file)
             worker_tasks = [TaskSpec.from_dict(item.to_dict()) for item in tasks]
             worker_state.tasks = worker_tasks
             save_run_state(worktree_path, worker_state)
@@ -9125,6 +9242,7 @@ class Orchestrator:
         task.verify_baseline_failures = list(updated.verify_baseline_failures)
         task.verify_baseline_ref = updated.verify_baseline_ref
         task.expected_test_migrations = list(updated.expected_test_migrations)
+        task.mutable_artifacts = list(updated.mutable_artifacts)
         task.requirement_proofs = list(updated.requirement_proofs)
         task.verification_refs = list(updated.verification_refs)
         task.scratchpad = updated.scratchpad
@@ -9512,6 +9630,7 @@ class Orchestrator:
                     recovery_epoch=int(task.recovery_epoch),
                     recovery_round=round_number,
                     verification_refs=list(group),
+                    mutable_artifacts=self._effective_task_mutable_artifacts(task),
                 )
             )
 
@@ -9593,6 +9712,7 @@ class Orchestrator:
             "requirement_proofs": task.requirement_proofs,
             "verification_refs": task.verification_refs,
             "expected_test_migrations": task.expected_test_migrations,
+            "mutable_artifacts": task.mutable_artifacts,
             "scope_boundaries": task.scope_boundaries,
         }
         payload = {
@@ -9602,6 +9722,7 @@ class Orchestrator:
             "recovery": {
                 "enabled": bool(self.config.execution.recovery.enabled),
                 "max_rounds": int(self.config.execution.recovery.max_rounds),
+                "implementation_scope_policy_version": IMPLEMENTATION_SCOPE_POLICY_VERSION,
             },
         }
         return hashlib.sha256(
@@ -12255,6 +12376,24 @@ class Orchestrator:
             normalized = str(relative)
             if normalized not in paths:
                 paths.append(normalized)
+        artifact_pattern = re.compile(
+            r"(?:(?<=^)|(?<=[\s`'\"(]))"
+            r"((?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\."
+            r"(?:md|json|ya?ml|toml|py|tsx?|jsx?|go|rs|java|kt|sql|html|css))"
+            r"(?=$|[\s:`'\"),])",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        for raw_path in artifact_pattern.findall(raw_output):
+            candidate = (project_root / raw_path).resolve()
+            if not candidate.is_file():
+                continue
+            try:
+                relative = candidate.relative_to(project_root)
+            except ValueError:
+                continue
+            normalized = str(relative)
+            if normalized not in paths:
+                paths.append(normalized)
         for raw_path in re.findall(r"(?:(?<=^)|(?<=[\s`'\"(]))((?:tests?|__tests__)/[^\s:`'\")]+)", raw_output, re.MULTILINE):
             candidate = (project_root / raw_path).resolve()
             if not candidate.exists():
@@ -14679,7 +14818,8 @@ class Orchestrator:
                 "CRITICAL — COVERAGE VERIFICATION: when determining whether a done task covers a brief requirement, you MUST compare the requirement against the task's ACCEPTANCE CRITERIA and REVIEW SUMMARY, not its title or description alone. A task titled 'Real X Integration' does NOT cover a requirement for actual real-model output if its acceptance criteria only verify adapter switching, infrastructure patterns, or fixture/stub results rather than actual external API calls producing real output.",
                 "If the brief explicitly states that a capability must be 'real' / 'production' / '真实' / '公网', verify that the done task's acceptance criteria confirm actual external API calls producing real output — not just adapter infrastructure or fixture-based testing.",
                 "Before generating the task list, produce a COVERAGE ANALYSIS in your final summary response (NOT in the JSON file): for each key requirement in the brief's current iteration scope, state which done task covers it (citing the specific acceptance criterion that proves delivery) or mark it as UNCOVERED. Any UNCOVERED requirement MUST result in a new task.",
-                "Each task must contain task_id, title, description, acceptance, status, commit_message.",
+                "Each task must contain task_id, title, description, acceptance, status, commit_message, and mutable_artifacts. Use mutable_artifacts=[] unless implementation must update an otherwise-protected public artifact such as top-level spec.md.",
+                "mutable_artifacts entries must be exact project-relative files. Never grant the active input spec, specs/** iteration inputs, .auto-agents/**, or DESIGN.md. When the active input is under specs/** and a requirement explicitly synchronizes the public top-level spec.md, declare mutable_artifacts=['spec.md'] on that task.",
                 "Set task_origin='planned', recovery_epoch=0, and recovery_round=0 on every newly planned task. These fields are orchestrator-owned lineage metadata and must not be inferred from task_id spelling.",
                 "A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined.",
                 "",
@@ -14715,8 +14855,11 @@ class Orchestrator:
                         "When existing completed tasks are present, cross-reference the brief and architecture against those done tasks to identify ONLY the scope not yet covered. Do NOT create tasks for capabilities already delivered by completed tasks.",
                     ])
             if self.config.execution.parallel_tasks.enabled:
-                lines[lines.index("Each task must contain task_id, title, description, acceptance, status, commit_message.")] = (
-                    "Each task must contain task_id, title, description, acceptance, status, commit_message, depends_on."
+                required_task_fields = next(
+                    line for line in lines if line.startswith("Each task must contain task_id")
+                )
+                lines[lines.index(required_task_fields)] = (
+                    "Each task must contain task_id, title, description, acceptance, status, commit_message, depends_on, and mutable_artifacts. Use mutable_artifacts=[] unless the task explicitly owns an otherwise-protected public artifact."
                 )
                 lines.insert(
                     lines.index("A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined."),
@@ -14948,6 +15091,8 @@ class Orchestrator:
         task_json = json.dumps(task.to_dict(), indent=2, ensure_ascii=False)
         requirement_context = format_requirement_context(requirements_for_task(self.project_root, task))
         task_status_migration_context = self._build_task_status_migration_context(task)
+        active_spec = self._active_spec_relative_path() or "(external active spec)"
+        mutable_artifacts = self._effective_task_mutable_artifacts(task)
         common = [
             f"Project root: {self.project_root}",
             f"Project brief: {brief}",
@@ -14966,7 +15111,14 @@ class Orchestrator:
             "current-run pointer or a project-relative wildcard covered by the current verification "
             "step's artifact_globs. Do not cite an implementation-session UUID. The current isolated "
             "verification must publish every ignored supporting evidence ref before completion.",
+            f"Immutable run input spec: {active_spec}",
+            "Iteration inputs under specs/** are immutable and must never be edited during implementation.",
         ]
+        if mutable_artifacts:
+            common.append(
+                "Current task explicitly owns these otherwise-protected public artifacts: "
+                + ", ".join(mutable_artifacts)
+            )
         if task.verification_refs:
             common.extend(
                 [
@@ -15031,7 +15183,7 @@ class Orchestrator:
                 "Do not use '.conda' as a generic directory, pip target, virtualenv, or venv path. It must remain a real conda prefix created with 'conda create -p ./.conda ...', including '.conda/conda-meta'.",
                 "Keep mutable local test/runtime artifacts (for example sqlite DBs, temp configs, fixtures, and caches) under ignored temp/data paths such as ./.tmp/, ./.tmp-tests/, or ./.data/ instead of tracked repo-root files.",
                 "For any other stack, keep dependencies and tool state local to the repository and never rely on global installs.",
-                "Do not modify input specification files (spec.md, specs/**, or the active spec file). They are run inputs, not implementation targets.",
+                "Do not modify the exact active input spec or any specs/** iteration input. A top-level spec.md may be updated only when it is listed in the current task's mutable_artifacts above.",
                 "Do not modify .auto-agents state files except through ORACLE_PROOF_UPDATES or when explicitly requested.",
                 "Do not modify .auto-agents docs/state/config files or planning artifacts directly as part of implementation. Keep orchestrator-owned files untouched.",
                 "Final response: 3 short bullets describing what changed.",
@@ -15109,6 +15261,20 @@ class Orchestrator:
         resume_existing: bool = False,
         gate_recheck_first: bool = False,
     ) -> Dict[str, object]:
+        mutation_contract_errors = self._task_mutable_artifact_errors(task)
+        if mutation_contract_errors:
+            reason = "task mutation contract is not executable: " + "; ".join(
+                mutation_contract_errors
+            )
+            return {
+                "ok": False,
+                "review": reason,
+                "reason": reason,
+                "failure_ids": [],
+                "comparable_failures": False,
+                "contract_scope_issue": True,
+                "rewind_to_plan": True,
+            }
         max_attempts = self._max_attempts("implement")
         feedback = ""
         current_proof_evidence = self._run_task_proof_evidence(task) if task.review_summary.strip() else None
@@ -15165,6 +15331,7 @@ class Orchestrator:
                     stage_key=f"implement-{task.task_id}",
                     prompt=implement_prompt,
                     task_origin=task.task_origin,
+                    mutable_artifacts=self._effective_task_mutable_artifacts(task),
                 )
                 if not result.ok:
                     last_reason = result.stderr or result.summary or "implementation failed"
@@ -16166,6 +16333,7 @@ class Orchestrator:
         run_id: Optional[str] = None,
         effort: Optional[str] = None,
         task_origin: str = "",
+        mutable_artifacts: Iterable[str] = (),
     ) -> AgentResult:
         attempts = self._max_attempts(stage)
         active_run_id = run_id or (state.run_id if state is not None else load_run_state(self.project_root).run_id)
@@ -16219,6 +16387,7 @@ class Orchestrator:
                     run_id=active_run_id,
                     before_snapshot=snapshot_before,
                     task_origin=task_origin,
+                    mutable_artifacts=mutable_artifacts,
                 )
                 if violation is not None:
                     offending, allowed_scope = violation

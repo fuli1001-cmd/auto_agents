@@ -2111,14 +2111,18 @@ class RequirementsTraceTests(unittest.TestCase):
         self.assertIn("tasks[].result", report)
 
     def test_oracle_proof_audit_blockers_route_to_plan(self) -> None:
-        for kind in ("oracle_proof_missing", "oracle_proof_invalid"):
-            with self.subTest(kind=kind):
-                route, hard_failure = Orchestrator._audit_issue_route(
-                    {"kind": kind, "message": "proof blocker"}
-                )
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            for kind in ("oracle_proof_missing", "oracle_proof_invalid"):
+                with self.subTest(kind=kind):
+                    route, hard_failure = orchestrator._audit_issue_route(
+                        {"kind": kind, "message": "proof blocker"}
+                    )
 
-                self.assertEqual(route, "plan")
-                self.assertEqual(hard_failure, "")
+                    self.assertEqual(route, "plan")
+                    self.assertEqual(hard_failure, "")
 
     def test_verify_failure_with_oracle_proof_text_is_auditable(self) -> None:
         self.assertTrue(

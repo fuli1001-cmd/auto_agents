@@ -1084,9 +1084,13 @@ continuation limit, normal failover applies. Set
 - `acceptance`
 - `status`
 - `commit_message`
+- `mutable_artifacts` (normally `[]`; exact project-relative public artifacts the task must update)
 
 The orchestrator validates task IDs, duplicate entries, acceptance lists, and allowed statuses before
-the implementation loop starts.
+the implementation loop starts. The exact active `--spec-file` and every iteration input under
+`specs/**` remain immutable. A task may update a separate top-level public `spec.md` only when it
+declares `"mutable_artifacts": ["spec.md"]`; this cannot override `.auto-agents/**`, `DESIGN.md`, or
+the active input spec.
 
 The plan root can also define:
 

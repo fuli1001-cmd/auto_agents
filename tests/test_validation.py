@@ -8,6 +8,22 @@ from auto_agents.validation import task_plan_warnings, validate_task_plan_payloa
 
 
 class TaskPlanValidationTests(unittest.TestCase):
+    def test_mutable_artifacts_require_exact_project_relative_non_orchestrator_paths(self) -> None:
+        task = {
+            "task_id": "task-001",
+            "title": "Update public docs",
+            "description": "Synchronize the public product specification.",
+            "acceptance": ["The public contract is current."],
+            "status": "pending",
+            "commit_message": "docs: update public contract",
+            "mutable_artifacts": ["../spec.md", "docs/*.md", ".auto-agents/state/run_state.json"],
+        }
+
+        errors = validate_task_plan_payload({"tasks": [task]})
+
+        self.assertEqual(sum("exact project-relative path" in error for error in errors), 2)
+        self.assertTrue(any("orchestrator-owned" in error for error in errors))
+
     def test_accepts_valid_plan(self) -> None:
         payload = {
             "tasks": [

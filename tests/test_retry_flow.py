@@ -1057,6 +1057,33 @@ class RecoveringProtectedInputMutationImplementAdapter:
         )
 
 
+class PublicSpecImplementAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.implement_prompt = ""
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            self.implement_prompt = request.prompt
+            write_text(self.project_root / "artifact.txt", "good\n")
+            write_text(self.project_root / "spec.md", "# Updated public product spec\n")
+            summary = "updated the declared public product spec\n"
+        elif request.stage == "review":
+            summary = "DECISION: pass\nLooks good.\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class RecoveringHistoryMutationImplementAdapter:
     def __init__(self, project_root: Path, archive_path: Path) -> None:
         self.project_root = project_root
@@ -2498,6 +2525,127 @@ class RetryFlowTests(unittest.TestCase):
                     ".auto-agents/docs/provider_references/provider.md"
                 )
             )
+
+    def test_implement_stage_allows_declared_public_spec_when_iteration_spec_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            iteration_spec = project_root / "specs" / "iteration.md"
+            write_text(iteration_spec, "# Immutable iteration input\n")
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = iteration_spec.resolve()
+            state = load_run_state(project_root)
+
+            _scope, is_allowed = orchestrator._stage_mutation_policy(
+                stage="implement",
+                stage_key="implement-task-001",
+                run_id=state.run_id,
+                mutable_artifacts=["spec.md"],
+            )
+
+            self.assertTrue(is_allowed("spec.md"))
+            self.assertFalse(is_allowed("specs/iteration.md"))
+
+    def test_task_mutable_artifacts_cannot_override_active_or_iteration_specs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            active_spec = project_root / "custom-spec.md"
+            write_text(active_spec, "# Active input\n")
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = active_spec.resolve()
+            task = TaskSpec(
+                task_id="task-001",
+                title="Invalid ownership",
+                description="Attempt to mutate protected inputs.",
+                acceptance=["Protected inputs remain immutable."],
+                mutable_artifacts=["custom-spec.md", "specs/history.md", "DESIGN.md"],
+            )
+
+            errors = orchestrator._task_mutable_artifact_errors(task)
+
+            self.assertTrue(any("active input spec" in error for error in errors))
+            self.assertTrue(any("immutable iteration spec" in error for error in errors))
+            self.assertTrue(any("DESIGN.md" in error for error in errors))
+
+    def test_declared_public_spec_survives_implementation_ownership_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            iteration_spec = project_root / "specs" / "iteration.md"
+            write_text(iteration_spec, "# Immutable iteration input\n")
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = iteration_spec.resolve()
+            orchestrator.adapter = PublicSpecImplementAdapter(project_root)
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Update public product spec",
+                            "description": "Synchronize the public product contract.",
+                            "acceptance": ["spec.md contains the current contract"],
+                            "mutable_artifacts": ["spec.md"],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            state = load_run_state(project_root)
+            state.resume_context["spec_file"] = str(iteration_spec)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            save_run_state(project_root, state)
+
+            result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertEqual(result.tasks[0].status, "done")
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(
+                (project_root / "spec.md").read_text(encoding="utf-8"),
+                "# Updated public product spec\n",
+            )
+            self.assertIn("Immutable run input spec: specs/iteration.md", orchestrator.adapter.implement_prompt)
+            self.assertIn("Current task explicitly owns", orchestrator.adapter.implement_prompt)
+
+    def test_legacy_blocked_doc_task_recovers_public_spec_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            iteration_spec = project_root / "specs" / "iteration.md"
+            write_text(iteration_spec, "# Immutable iteration input\n")
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = iteration_spec.resolve()
+            task = TaskSpec(
+                task_id="task-docs",
+                title="Synchronize public docs",
+                description="Keep public duration docs current.",
+                acceptance=["spec.md and README.md define the public contract"],
+                status="blocked",
+                review_summary="AssertionError: spec.md misses requested_duration_sec",
+                requirement_proofs=[{"evidence_refs": ["spec.md", "README.md"]}],
+            )
+
+            self.assertEqual(orchestrator._effective_task_mutable_artifacts(task), ["spec.md"])
+
+    def test_verify_implicated_paths_include_public_documents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(project_root / "spec.md", "# Public product spec\n")
+            orchestrator = Orchestrator(project_root)
+
+            paths = orchestrator._extract_verify_implicated_paths(
+                "AssertionError: spec.md misses requested_duration_sec\n"
+                "FAILED tests/test_docs.py::test_public_contract"
+            )
+
+            self.assertIn("spec.md", paths)
 
     def test_implement_stage_retries_after_auto_agents_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6202,6 +6350,39 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.last_recovery_route["epoch"], 1)
             self.assertEqual(state.last_recovery_route["outcome"], "requeued")
 
+    def test_scope_policy_version_change_reopens_terminal_recovery_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-docs",
+                title="Synchronize public docs",
+                description="Update spec.md.",
+                acceptance=["Public docs pass their contract tests."],
+                status="blocked",
+                recovery_round=2,
+            )
+            with patch("auto_agents.orchestrator.IMPLEMENTATION_SCOPE_POLICY_VERSION", 1):
+                old_fingerprint = orchestrator._recovery_evidence_fingerprint(task)
+            task.recovery_history.append(
+                {
+                    "epoch": 0,
+                    "round": 3,
+                    "result": "exhausted",
+                    "evidence_fingerprint": old_fingerprint,
+                }
+            )
+            state = load_run_state(project_root)
+
+            reopened = orchestrator._reopen_recovery_epoch_if_evidence_changed(
+                state, [task], task
+            )
+
+            self.assertTrue(reopened)
+            self.assertEqual(task.recovery_epoch, 1)
+            self.assertEqual(task.recovery_round, 0)
+
     def test_review_rejected_repair_stops_after_configured_recovery_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -6388,17 +6569,21 @@ class RetryFlowTests(unittest.TestCase):
             "app/service.py": "implement",
         }
 
-        for path, expected_stage in cases.items():
-            with self.subTest(path=path):
-                stage, hard_failure = Orchestrator._audit_issue_route(
-                    {
-                        "kind": "forbidden_pattern",
-                        "message": f"forbidden pattern found in {path}",
-                        "path": path,
-                    }
-                )
-                self.assertEqual(stage, expected_stage)
-                self.assertEqual(hard_failure, "")
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            for path, expected_stage in cases.items():
+                with self.subTest(path=path):
+                    stage, hard_failure = orchestrator._audit_issue_route(
+                        {
+                            "kind": "forbidden_pattern",
+                            "message": f"forbidden pattern found in {path}",
+                            "path": path,
+                        }
+                    )
+                    self.assertEqual(stage, expected_stage)
+                    self.assertEqual(hard_failure, "")
 
     def test_requirements_audit_forbidden_pattern_on_diagnostics_is_not_recoverable(self) -> None:
         paths = [
@@ -6406,19 +6591,23 @@ class RetryFlowTests(unittest.TestCase):
             ".auto-agents/docs/review.md",
         ]
 
-        for path in paths:
-            with self.subTest(path=path):
-                blocker = {
-                    "kind": "forbidden_pattern",
-                    "message": f"forbidden pattern found in {path}",
-                    "path": path,
-                }
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            for path in paths:
+                with self.subTest(path=path):
+                    blocker = {
+                        "kind": "forbidden_pattern",
+                        "message": f"forbidden pattern found in {path}",
+                        "path": path,
+                    }
 
-                stage, hard_failure = Orchestrator._audit_issue_route(blocker)
+                    stage, hard_failure = orchestrator._audit_issue_route(blocker)
 
-                self.assertIsNone(stage)
-                self.assertIn("automatic recovery is unsafe", hard_failure)
-                self.assertNotIn("owned by implement", Orchestrator._audit_blocker_feedback(blocker))
+                    self.assertIsNone(stage)
+                    self.assertIn("automatic recovery is unsafe", hard_failure)
+                    self.assertNotIn("owned by implement", orchestrator._audit_blocker_feedback(blocker))
 
     def test_requirements_audit_forbidden_pattern_on_immutable_spec_routes_to_clarify(self) -> None:
         paths = [
@@ -6426,38 +6615,66 @@ class RetryFlowTests(unittest.TestCase):
             "specs/2026-07-05-iter-01.md",
         ]
 
-        for path in paths:
-            with self.subTest(path=path):
-                blocker = {
-                    "kind": "forbidden_pattern",
-                    "message": f"forbidden pattern found in {path}",
-                    "path": path,
-                }
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            for path in paths:
+                with self.subTest(path=path):
+                    blocker = {
+                        "kind": "forbidden_pattern",
+                        "message": f"forbidden pattern found in {path}",
+                        "path": path,
+                    }
 
-                stage, hard_failure = Orchestrator._audit_issue_route(blocker)
+                    stage, hard_failure = orchestrator._audit_issue_route(blocker)
 
-                self.assertEqual(stage, "clarify")
-                self.assertEqual(hard_failure, "")
-                self.assertIn("immutable input spec", Orchestrator._audit_blocker_feedback(blocker))
-                self.assertNotIn("owned by implement", Orchestrator._audit_blocker_feedback(blocker))
+                    self.assertEqual(stage, "clarify")
+                    self.assertEqual(hard_failure, "")
+                    self.assertIn("immutable input spec", orchestrator._audit_blocker_feedback(blocker))
+                    self.assertNotIn("owned by implement", orchestrator._audit_blocker_feedback(blocker))
+
+    def test_requirements_audit_routes_non_active_public_spec_to_implementation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            active_spec = project_root / "specs" / "iteration.md"
+            write_text(active_spec, "# Iteration input\n")
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = active_spec.resolve()
+            blocker = {
+                "kind": "forbidden_pattern",
+                "message": "forbidden pattern found in spec.md",
+                "path": "spec.md",
+            }
+
+            stage, hard_failure = orchestrator._audit_issue_route(blocker)
+
+            self.assertEqual(stage, "implement")
+            self.assertEqual(hard_failure, "")
+            self.assertIn("owned by implement", orchestrator._audit_blocker_feedback(blocker))
 
     def test_requirements_audit_pattern_definition_failures_route_to_clarify(self) -> None:
-        for kind in ("forbidden_pattern_safety", "forbidden_pattern_timeout"):
-            with self.subTest(kind=kind):
-                blocker = {
-                    "kind": kind,
-                    "message": "unsafe literal must not be repeated",
-                    "reason": "DOTALL combined with an unbounded wildcard is unsafe",
-                    "path": ".auto-agents/state/requirements_trace.json",
-                }
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            for kind in ("forbidden_pattern_safety", "forbidden_pattern_timeout"):
+                with self.subTest(kind=kind):
+                    blocker = {
+                        "kind": kind,
+                        "message": "unsafe literal must not be repeated",
+                        "reason": "DOTALL combined with an unbounded wildcard is unsafe",
+                        "path": ".auto-agents/state/requirements_trace.json",
+                    }
 
-                stage, hard_failure = Orchestrator._audit_issue_route(blocker)
-                feedback = Orchestrator._audit_blocker_feedback(blocker)
+                    stage, hard_failure = orchestrator._audit_issue_route(blocker)
+                    feedback = orchestrator._audit_blocker_feedback(blocker)
 
-                self.assertEqual(stage, "clarify")
-                self.assertEqual(hard_failure, "")
-                self.assertIn("owned by clarify", feedback)
-                self.assertNotIn("unsafe literal must not be repeated", feedback)
+                    self.assertEqual(stage, "clarify")
+                    self.assertEqual(hard_failure, "")
+                    self.assertIn("owned by clarify", feedback)
+                    self.assertNotIn("unsafe literal must not be repeated", feedback)
 
     def test_requirements_audit_route_ignores_non_authoritative_immutable_spec_hit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

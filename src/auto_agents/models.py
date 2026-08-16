@@ -100,6 +100,7 @@ class TaskSpec:
     recovery_epoch: int = 0
     recovery_round: int = 0
     expected_test_migrations: List[str] = field(default_factory=list)
+    mutable_artifacts: List[str] = field(default_factory=list)
     requirement_proofs: List[Dict[str, object]] = field(default_factory=list)
     verification_refs: List[str] = field(default_factory=list)
     scratchpad: str = ""
@@ -151,6 +152,7 @@ class TaskSpec:
             recovery_epoch=max(0, int(data.get("recovery_epoch", 0) or 0)),
             recovery_round=max(0, int(data.get("recovery_round", 0) or 0)),
             expected_test_migrations=[str(item) for item in data.get("expected_test_migrations", [])],
+            mutable_artifacts=[str(item) for item in data.get("mutable_artifacts", [])],
             requirement_proofs=requirement_proofs,
             verification_refs=[str(item) for item in data.get("verification_refs", [])],
             scratchpad=str(data.get("scratchpad", "")),

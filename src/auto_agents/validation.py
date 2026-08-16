@@ -831,6 +831,31 @@ def validate_task_plan_payload(
             or any(not isinstance(item, str) or not item.strip() for item in requirement_ids)
         ):
             errors.append(f"{prefix} requirement_ids must be a list of non-empty strings")
+        mutable_artifacts = task.get("mutable_artifacts", [])
+        if mutable_artifacts is not None and (
+            not isinstance(mutable_artifacts, list)
+            or any(not isinstance(item, str) or not item.strip() for item in mutable_artifacts)
+        ):
+            errors.append(f"{prefix} mutable_artifacts must be a list of non-empty strings")
+        elif isinstance(mutable_artifacts, list):
+            for raw_path in mutable_artifacts:
+                normalized = str(raw_path).strip().replace("\\", "/")
+                while normalized.startswith("./"):
+                    normalized = normalized[2:]
+                parts = normalized.split("/")
+                if (
+                    not normalized
+                    or normalized.startswith("/")
+                    or ".." in parts
+                    or any(char in normalized for char in "*?[]")
+                ):
+                    errors.append(
+                        f"{prefix} mutable_artifacts entry '{raw_path}' must be an exact project-relative path"
+                    )
+                elif normalized.startswith(".auto-agents/") or normalized == ".auto-agents":
+                    errors.append(
+                        f"{prefix} mutable_artifacts entry '{raw_path}' cannot grant access to orchestrator-owned paths"
+                    )
         verification_refs = task.get("verification_refs", [])
         if verification_refs is not None and (
             not isinstance(verification_refs, list)
