@@ -4748,7 +4748,13 @@ class Orchestrator:
 
         return emit
 
-    def _raise_for_baseline_termination(self, gate: GateResult, *, context: str) -> None:
+    def _raise_for_baseline_termination(
+        self,
+        gate: GateResult,
+        *,
+        context: str,
+        task_id: str = "",
+    ) -> None:
         infrastructure = first_infrastructure_command(gate)
         if infrastructure is not None:
             raise GateCommandInfrastructureError(
@@ -4758,6 +4764,7 @@ class Orchestrator:
                 result=infrastructure,
                 context=context,
                 baseline=True,
+                task_id=task_id,
             )
         result = next(
             (
@@ -4785,6 +4792,7 @@ class Orchestrator:
             result=result,
             context=context,
             baseline=True,
+            task_id=task_id,
         )
 
     def _incident_store(self, state: RunState) -> ExecutionIncidentStore:
@@ -10717,6 +10725,7 @@ class Orchestrator:
             self._raise_for_baseline_termination(
                 baseline_gate,
                 context=f"lazy task baseline verification ({task.task_id})",
+                task_id=task.task_id,
             )
             if baseline_mutation_error:
                 raise RuntimeError(baseline_mutation_error)
@@ -12111,6 +12120,7 @@ class Orchestrator:
         self._raise_for_baseline_termination(
             gate,
             context=f"task baseline verification commands ({task.task_id})",
+            task_id=task.task_id,
         )
         if mutation_error:
             raise RuntimeError(mutation_error)

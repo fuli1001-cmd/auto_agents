@@ -17,7 +17,15 @@ from auto_agents.execution_recovery import (
     provider_incident,
     recovery_task_marker,
 )
-from auto_agents.models import AgentResult, AgentTermination, CommandResult, RunState, TaskSpec
+from auto_agents.models import (
+    AgentResult,
+    AgentTermination,
+    CommandResult,
+    GateResult,
+    RunState,
+    TaskSpec,
+    VerificationStep,
+)
 from auto_agents.gates import (
     GateCommandInfrastructureError,
     GateCommandTimeoutError,
@@ -854,11 +862,19 @@ class ExecutionRecoveryTests(unittest.TestCase):
             )
             self.assertTrue(orchestrator.validate()["ok"])
 
-    def test_task_recovery_carries_its_exact_dirty_worktree_checkpoint(self) -> None:
+    def test_lazy_baseline_recovery_carries_its_exact_dirty_worktree_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
             Orchestrator.init_project(root, "project", "mock")
             orchestrator = Orchestrator(root)
+            command = "python -m pytest -q tests/test_owned.py"
+            orchestrator.config.gates.steps = [
+                VerificationStep(proof_id="owned", command=command)
+            ]
+            owned_test = root / "tests" / "test_owned.py"
+            owned_test.parent.mkdir(parents=True)
+            owned_test.write_text("def test_contract():\n    assert True\n", encoding="utf-8")
+            commit_all(root, "test: add owned verification baseline")
             state = load_run_state(root)
             source = TaskSpec(
                 task_id="source-task",
@@ -866,25 +882,59 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 description="Produces a partial implementation before verification.",
                 acceptance=["The verification command passes."],
                 status="in_progress",
-                task_origin="stage_recovery",
+                verification_refs=[f"cmd:{command}"],
+                verify_baseline_ref=head_ref(root),
             )
             orchestrator._persist_tasks([source])
             state.tasks = [source]
             orchestrator._set_implementation_ready_marker(state, source, True)
             (root / "partial.txt").write_text("owned recovery changes\n", encoding="utf-8")
-            incident = ExecutionIncident(
-                incident_id="next-incident",
-                run_id=state.run_id,
-                source="gate",
-                kind="gate_reported_infrastructure_error",
-                stage="implement",
-                context="task verification",
-                command="python -m pytest -q tests/test_owned.py",
-                task_id=source.task_id,
-                recovery_round=1,
+            current_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout="FAILED tests/test_owned.py::test_contract\n",
+                    )
+                ],
+                summary="FAILED tests/test_owned.py::test_contract",
+            )
+            infrastructure = CommandResult(
+                command=command,
+                ok=False,
+                returncode=1,
+                stderr=(
+                    "AUTO_AGENTS_INFRA_FAILURE id=verification_contract_failed "
+                    "repair_scope=verification_contract: stale baseline contract"
+                ),
+            )
+            classify_reported_infrastructure_failure(infrastructure)
+            baseline_gate = GateResult(
+                ok=False,
+                commands=[infrastructure],
+                summary="verification infrastructure failed",
             )
 
-            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+            with (
+                patch.object(
+                    orchestrator,
+                    "_run_gate_commands_for_commands",
+                    side_effect=[(current_gate, ""), (baseline_gate, "")],
+                ),
+                self.assertRaises(GateCommandInfrastructureError) as raised,
+            ):
+                orchestrator._run_task_verify(source, state=state)
+
+            self.assertEqual(raised.exception.task_id, source.task_id)
+            self.assertTrue(
+                orchestrator._handle_gate_execution_incident(
+                    state,
+                    "implement",
+                    raised.exception,
+                )
+            )
 
             tasks = orchestrator._load_tasks_from_plan()
             recovery = tasks[0]
