@@ -46,6 +46,7 @@ from .config import (
     archived_run_state_path,
     archived_task_plan_path,
     bootstrap_project,
+    conversation_history_path,
     docs_dir,
     design_md_path,
     frontend_design_docs_dir,
@@ -1168,6 +1169,126 @@ class Orchestrator:
             state.current_stage = "verify"
         return True
 
+    def _missing_selected_frontend_contract_requirement_ids(
+        self,
+        trace_payload: object,
+        lock_payload: object,
+    ) -> List[str]:
+        required_ids = [
+            str(requirement_id).strip()
+            for surface in selected_surface_specs(
+                trace_payload,
+                max_pages=self.config.frontend_design.max_pages,
+            )
+            for requirement_id in surface.get("requirement_ids", []) or []
+            if str(requirement_id).strip()
+        ]
+        return missing_frontend_design_contract_requirement_ids(
+            lock_payload,
+            required_ids,
+        )
+
+    @staticmethod
+    def _is_missing_frontend_contract_preflight_feedback(
+        feedback: str,
+        missing_ids: Iterable[str],
+    ) -> bool:
+        lowered = str(feedback or "").lower()
+        if "evidence preflight requested clarify" not in lowered:
+            return False
+        if not any(
+            marker in lowered
+            for marker in ("prototype", "manifest", "design lock", "design-lock", "frontend")
+        ):
+            return False
+        return any(
+            str(requirement_id).strip().lower() in lowered
+            for requirement_id in missing_ids
+            if str(requirement_id).strip()
+        )
+
+    def _normalize_stale_frontend_contract_clarify_resume(
+        self,
+        state: RunState,
+    ) -> bool:
+        if (
+            state.status == "completed"
+            or state.current_stage != "clarify"
+            or "clarify" in state.stage_summaries
+            or state.pending_approval
+            or "requirements" not in state.approved_gates
+        ):
+            return False
+
+        trace = load_requirements_trace(self.project_root, normalize=False)
+        lock = load_frontend_design_lock(self.project_root)
+        missing_ids = self._missing_selected_frontend_contract_requirement_ids(
+            trace,
+            lock,
+        )
+        if not missing_ids:
+            return False
+
+        last_error = state.last_error.strip()
+        if last_error.lower().startswith("run interrupted"):
+            last_error = ""
+        active_feedback = state.rejection_reason.strip() or last_error
+        if active_feedback:
+            if not self._is_missing_frontend_contract_preflight_feedback(
+                active_feedback,
+                missing_ids,
+            ):
+                return False
+        else:
+            history = read_json(
+                conversation_history_path(self.project_root, state.run_id),
+                default=[],
+            )
+            latest_user_feedback = ""
+            if isinstance(history, list):
+                for item in reversed(history):
+                    if not isinstance(item, dict):
+                        continue
+                    role = str(item.get("role", "")).strip().lower()
+                    if role == "user":
+                        latest_user_feedback = str(item.get("content", ""))
+                        break
+            if not self._is_missing_frontend_contract_preflight_feedback(
+                latest_user_feedback,
+                missing_ids,
+            ):
+                return False
+
+        self._rewind_state_from_stage(state, "prototype")
+        state.stage_summaries["clarify"] = (
+            "Reused the current clarified requirements and routed the stale frontend "
+            "design contract to prototype redesign."
+        )
+        prototype_approval_index = APPROVAL_ORDER.index("prototype")
+        downstream_approvals = set(APPROVAL_ORDER[prototype_approval_index:])
+        state.approved_gates = [
+            gate for gate in state.approved_gates if gate not in downstream_approvals
+        ]
+        state.resume_context[self.FRONTEND_CONTRACT_RECOVERY_CONTEXT] = True
+        state.rejected_stage = ""
+        state.rejection_reason = ""
+        state.last_error = ""
+        state.last_recovery_route = {
+            "outcome": "frontend_contract_recovery",
+            "from_stage": "clarify",
+            "to_stage": "prototype",
+            "requirement_ids": missing_ids,
+            "reason": (
+                "a legacy evidence-preflight clarify requested frontend design artifacts "
+                "that the prototype stage must generate"
+            ),
+        }
+        self.logger.info(
+            "[frontend-contract] route=prototype reason=normalize-stale-clarify ids=%s",
+            ",".join(missing_ids),
+        )
+        return True
+
     @staticmethod
     def _normalize_audit_blocker_path(path: object) -> str:
         normalized = str(path or "").strip().replace("\\", "/")
@@ -1726,6 +1847,8 @@ class Orchestrator:
                 save_run_state(self.project_root, state)
             if self._normalize_blocked_requirements_audit_recovery_resume(state):
                 save_run_state(self.project_root, state)
+            if self._normalize_stale_frontend_contract_clarify_resume(state):
+                save_run_state(self.project_root, state)
             pattern_recovery = self._route_forbidden_pattern_definition_recovery(state)
             if pattern_recovery:
                 save_run_state(self.project_root, state)
@@ -2216,16 +2339,10 @@ class Orchestrator:
             trace,
             max_pages=self.config.frontend_design.max_pages,
         )
-        required_ids = [
-            str(requirement_id).strip()
-            for surface in surfaces
-            for requirement_id in surface.get("requirement_ids", []) or []
-            if str(requirement_id).strip()
-        ]
         prior_lock = load_frontend_design_lock(self.project_root)
-        missing_ids = missing_frontend_design_contract_requirement_ids(
+        missing_ids = self._missing_selected_frontend_contract_requirement_ids(
+            trace,
             prior_lock,
-            required_ids,
         )
         stale_approved_contract = bool(
             approved_frontend_design(self.project_root) and missing_ids
@@ -2635,9 +2752,6 @@ class Orchestrator:
         )
 
     def _run_interactive_clarify(self, state: RunState, spec_file: Path) -> RunState:
-        from .config import conversation_history_path
-        import json
-        
         history_path = conversation_history_path(self.project_root, state.run_id)
         history = []
         if history_path.exists():

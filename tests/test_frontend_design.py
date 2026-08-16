@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.adapters.base import AgentAdapter
 from auto_agents.config import (
+    conversation_history_path,
     design_md_path,
     frontend_design_lock_path,
     frontend_prototype_dir,
@@ -480,7 +481,27 @@ class FrontendDesignTests(unittest.TestCase):
                 }
             )
             write_json(requirements_trace_path(root), trace)
-            approved.stage_summaries = {"clarify": "done"}
+            write_text(
+                conversation_history_path(root, approved.run_id),
+                json.dumps(
+                    [
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous requirements output was rejected.\n"
+                                "Feedback:\nEvidence preflight requested CLARIFY for "
+                                "task-redesign: approved prototype/manifest does not bind REQ-002."
+                            ),
+                        },
+                        {
+                            "role": "agent",
+                            "content": "Please provide approved prototype artifacts or defer the UI.",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+            )
+            approved.stage_summaries = {}
             approved.current_stage = "clarify"
             approved.approved_gates = [
                 "requirements",
@@ -504,6 +525,9 @@ class FrontendDesignTests(unittest.TestCase):
             self.assertNotIn("design", result.stage_summaries)
             self.assertTrue(
                 any(call.startswith("prototype-generate") for call in adapter.calls)
+            )
+            self.assertFalse(
+                any(call.startswith("clarify-conv") for call in adapter.calls)
             )
             lock = load_frontend_design_lock(root)
             self.assertEqual(lock["status"], "pending_approval")
