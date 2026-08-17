@@ -172,6 +172,14 @@ from .models import (
     VerificationStep,
 )
 from .provider_limits import ParallelTuningStore, provider_limit
+from .persistence import (
+    PersistenceContractError,
+    build_persistence_action_manifest,
+    detect_persistence_schema_changes,
+    execute_persistence_action,
+    persistence_candidate_fingerprint,
+    persistence_change_strategy,
+)
 from .supervision import process_start_identity
 from .requirements import (
     external_doc_requirements,
@@ -207,6 +215,7 @@ from .validation import (
     _unwrap_conda_run,
     project_config_warnings,
     validate_required_document,
+    validate_persistence_plan_contract,
     validate_task_dependencies,
     validate_task_plan_with_requirements,
     validate_verification_command_paths,
@@ -524,12 +533,15 @@ class Orchestrator:
                 inferred_gate = state.pending_approval
             elif state.status == "paused":
                 candidate = APPROVAL_BY_STAGE.get(state.current_stage, "")
-                if candidate == "prototype" or candidate in self.config.approvals.enabled:
+                if candidate in {"prototype", "persistence-reset"} or candidate in self.config.approvals.enabled:
                     inferred_gate = candidate
         active_gate = gate or inferred_gate
         if not active_gate:
             raise RuntimeError("No approval gate could be inferred. Pass --gate explicitly.")
-        if active_gate != "prototype" and active_gate not in self.config.approvals.enabled:
+        if (
+            active_gate not in {"prototype", "persistence-reset"}
+            and active_gate not in self.config.approvals.enabled
+        ):
             raise RuntimeError(f"Unknown approval gate: {active_gate}")
         if active_gate == "prototype":
             lock = load_frontend_design_lock(self.project_root)
@@ -549,6 +561,14 @@ class Orchestrator:
             lock["approval"] = {"method": "cli", "gate": "prototype"}
             lock["contract_sha256"] = frontend_design_contract_sha256(lock)
             write_json(frontend_design_lock_path(self.project_root), lock)
+        if active_gate == "persistence-reset":
+            approval = state.persistence_actions.get("_clean_break_approval", {})
+            if not approval or str(approval.get("status", "")) != "pending_approval":
+                raise RuntimeError("No pending clean-break persistence action to approve.")
+            approval["status"] = "approved"
+            approval["approved_at"] = utc_now_iso()
+            approval["approval"] = "cli"
+            state.persistence_actions["_clean_break_approval"] = approval
         if active_gate not in state.approved_gates:
             state.approved_gates.append(active_gate)
         if state.pending_approval == active_gate:
@@ -1979,7 +1999,10 @@ class Orchestrator:
                     save_run_state(self.project_root, state)
                     return state
                 pending_gate = APPROVAL_BY_STAGE.get(stage)
-                gate_enabled = pending_gate == "prototype" or pending_gate in self.config.approvals.enabled
+                gate_enabled = (
+                    pending_gate in {"prototype", "persistence-reset"}
+                    or pending_gate in self.config.approvals.enabled
+                )
                 if pending_gate == "prototype":
                     gate_enabled = (
                         load_frontend_design_lock(self.project_root).get("status")
@@ -8257,6 +8280,28 @@ class Orchestrator:
                 )
             )
 
+        try:
+            self._run_task_persistence_action(state, task)
+        except PersistenceContractError as error:
+            if state.pending_approval == "persistence-reset":
+                task.status = "pending"
+                task.review_summary = str(gate_result["review"])
+                self._persist_tasks(tasks)
+                save_run_state(self.project_root, state)
+                return state
+            task.status = "blocked"
+            task.review_summary = str(error)
+            self._persist_tasks(tasks)
+            save_run_state(self.project_root, state)
+            self._emit_task_blocked(task, str(error))
+            raise RuntimeError(
+                self._format_task_failure_error(
+                    task,
+                    reason=str(error),
+                    review_summary=task.review_summary,
+                )
+            ) from error
+
         task.status = "done"
         self._clear_task_failure_checkpoint(state, task.task_id)
         self._clear_implementation_ready_marker(state, task)
@@ -8296,6 +8341,12 @@ class Orchestrator:
         )
 
     def _parallel_execution_fallback_reason(self, tasks: List[TaskSpec]) -> str:
+        if any(
+            task.status != "done"
+            and persistence_change_strategy(task.persistence_change) != "none"
+            for task in tasks
+        ):
+            return "persistence schema tasks require exclusive sequential execution"
         workers = self._parallel_worker_count()
         if workers < 2:
             config = self.config.execution.parallel_tasks
@@ -9427,6 +9478,7 @@ class Orchestrator:
         task.verify_baseline_schema_version = (
             updated.verify_baseline_schema_version
         )
+        task.persistence_change = dict(updated.persistence_change)
 
     def _apply_parallel_task_snapshot(self, task: TaskSpec, payload: Dict[str, object]) -> None:
         self._copy_parallel_task_snapshot_fields(task, payload)
@@ -9886,6 +9938,7 @@ class Orchestrator:
             "expected_test_migrations": task.expected_test_migrations,
             "mutable_artifacts": task.mutable_artifacts,
             "scope_boundaries": task.scope_boundaries,
+            "persistence_change": task.persistence_change,
         }
         payload = {
             "head": head_ref(self.project_root),
@@ -13173,6 +13226,8 @@ class Orchestrator:
             return False
         if mode == "all":
             return True
+        if persistence_change_strategy(task.persistence_change) != "none":
+            return True
         requirements = requirements_for_task(self.project_root, task)
         for requirement in requirements:
             strength = str(requirement.get("oracle_strength", "")).strip()
@@ -13441,7 +13496,10 @@ class Orchestrator:
         }
         if normalized in high_risk_names:
             return True
-        return normalized.startswith(".github/")
+        return bool(
+            normalized.startswith((".github/", "migrations/", "alembic/versions/", "db/migrate/"))
+            or normalized.endswith((".sql", "schema.prisma", "schema.rb"))
+        )
 
     def _git_text(self, *args: str) -> str:
         process = subprocess.run(
@@ -14778,6 +14836,10 @@ class Orchestrator:
         next_payload = {"tasks": payload}
         if isinstance(current_payload.get("oracle_proof_schema_version"), int):
             next_payload["oracle_proof_schema_version"] = current_payload["oracle_proof_schema_version"]
+        if isinstance(current_payload.get("persistence_contract_version"), int):
+            next_payload["persistence_contract_version"] = current_payload[
+                "persistence_contract_version"
+            ]
         if isinstance(current_payload.get("verification_policy_version"), int):
             next_payload["verification_policy_version"] = current_payload[
                 "verification_policy_version"
@@ -14926,6 +14988,8 @@ class Orchestrator:
                 "Only update project_brief.md and requirements_trace.json in this stage; do not modify project code, tests, or other repository documents.",
                 "Preserve the exact top-level and section headings already present in the file.",
                 "The requirements trace is the downstream execution contract. It must be valid JSON with version=1 and a requirements list.",
+                "When the requested work creates or changes a persistent database schema, record a top-level persistence_decisions entry with a stable PERSIST-NNN id, configured target_ids, one strategy (initial_schema, startup_compatible, clean_break, or external_operator), source, and status='active'.",
+                "A persistence strategy must come from the input spec or an explicit user clarification. Never infer data-loss permission. If no strategy is stated, ask the user before finalizing requirements; --auto-approve does not choose a strategy.",
                 "Every active requirement must have id, text, source, status, priority, acceptance_oracles, oracle_type, oracle_strength, evidence_boundary, forbidden_proxy_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields. If a requirement needs multiple provider documents, also set provider_references to a list of local provider reference paths; do not join multiple paths into provider_reference with punctuation.",
                 "Use stable IDs like REQ-001. Mark hard requirements as priority='mandatory'. Use status='active', 'deferred', or 'superseded'.",
                 "If the requested scope includes frontend pages or screens, add top-level frontend_scope={requested:true,surfaces:[...]}. Each surface must include a stable id, name, route when known, priority (core/primary/secondary/optional), purpose, key_states, and non-empty requirement_ids. Set requested=false with surfaces=[] when no frontend work is requested.",
@@ -15012,6 +15076,10 @@ class Orchestrator:
                 "repository files to make the plan pass.",
                 "At the root of the JSON, set verification_policy_version=4 and also define test_strategy and verification_steps.",
                 "At the root of the JSON, set oracle_proof_schema_version to 2 for all new plans. auto_agents will bind each proof to the current requirement contract hash.",
+                "At the root of the JSON, set persistence_contract_version=1. Every active task must include persistence_change. Use {'strategy':'none'} when it does not alter persistent schema.",
+                "A schema-changing task must copy strategy, decision_id, and target_ids from one active persistence_decisions entry and add to_version, migration_artifacts, and legacy_fixture_refs. The planner may not invent or change the user's strategy.",
+                "startup_compatible and external_operator tasks must prove upgrade from a legacy fixture, data preservation, idempotency, and current read/write behavior. clean_break tasks must prove explicit reset, empty current-schema initialization, and actionable incompatible-schema behavior; fresh-database-only tests are insufficient.",
+                "Map every non-initial persistence task's legacy_fixture_refs to a risk='critical', parallel_safe=false verification step with serial_reason='shared_mutable_state' or 'ordered_contract'.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
                 "Every task that covers requirement_ids must include requirement_proofs. Each proof must include requirement_id, oracle_index (1-based) or exact acceptance_oracle, proof_type, oracle_strength, evidence_boundary, evidence_refs, status='planned', and forbidden_proxy_oracles copied from the bound requirement.",
                 "All active mandatory requirements in requirements_trace.json must be covered by either archived verified done-task proof or at least one current task requirement_ids entry unless the requirement is explicitly deferred or superseded.",
@@ -15046,7 +15114,7 @@ class Orchestrator:
                 "CRITICAL — COVERAGE VERIFICATION: when determining whether a done task covers a brief requirement, you MUST compare the requirement against the task's ACCEPTANCE CRITERIA and REVIEW SUMMARY, not its title or description alone. A task titled 'Real X Integration' does NOT cover a requirement for actual real-model output if its acceptance criteria only verify adapter switching, infrastructure patterns, or fixture/stub results rather than actual external API calls producing real output.",
                 "If the brief explicitly states that a capability must be 'real' / 'production' / '真实' / '公网', verify that the done task's acceptance criteria confirm actual external API calls producing real output — not just adapter infrastructure or fixture-based testing.",
                 "Before generating the task list, produce a COVERAGE ANALYSIS in your final summary response (NOT in the JSON file): for each key requirement in the brief's current iteration scope, state which done task covers it (citing the specific acceptance criterion that proves delivery) or mark it as UNCOVERED. Any UNCOVERED requirement MUST result in a new task.",
-                "Each task must contain task_id, title, description, acceptance, status, commit_message, and mutable_artifacts. Use mutable_artifacts=[] unless implementation must update an otherwise-protected public artifact such as top-level spec.md.",
+                "Each task must contain task_id, title, description, acceptance, status, commit_message, mutable_artifacts, and persistence_change. Use mutable_artifacts=[] unless implementation must update an otherwise-protected public artifact such as top-level spec.md.",
                 "mutable_artifacts entries must be exact project-relative files. Never grant the active input spec, specs/** iteration inputs, .auto-agents/**, or DESIGN.md. When the active input is under specs/** and a requirement explicitly synchronizes the public top-level spec.md, declare mutable_artifacts=['spec.md'] on that task.",
                 "Set task_origin='planned', recovery_epoch=0, and recovery_round=0 on every newly planned task. These fields are orchestrator-owned lineage metadata and must not be inferred from task_id spelling.",
                 "A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined.",
@@ -15087,7 +15155,7 @@ class Orchestrator:
                     line for line in lines if line.startswith("Each task must contain task_id")
                 )
                 lines[lines.index(required_task_fields)] = (
-                    "Each task must contain task_id, title, description, acceptance, status, commit_message, depends_on, and mutable_artifacts. Use mutable_artifacts=[] unless the task explicitly owns an otherwise-protected public artifact."
+                    "Each task must contain task_id, title, description, acceptance, status, commit_message, depends_on, mutable_artifacts, and persistence_change. Use mutable_artifacts=[] unless the task explicitly owns an otherwise-protected public artifact."
                 )
                 lines.insert(
                     lines.index("A good plan may contain only a few tasks for a small target or many tasks for a broad target, as long as the slicing remains disciplined."),
@@ -15400,6 +15468,7 @@ class Orchestrator:
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
                 "When task status migration context is present, migrate only repository tests that assert stale task status. Do not edit orchestrator-owned .auto-agents state snapshots to force that transition early.",
                 "Tests should validate observable behavior (API contracts, input/output, side-effects), not internal implementation details.",
+                "PERSISTENCE CONTRACT: obey Task JSON persistence_change exactly. Do not change strategy or target_ids. For startup_compatible/external_operator implement idempotent legacy upgrade and version guards. For clean_break implement the declared reset/initialize contract without silently deleting data from ordinary application startup.",
                 "Before adding or changing tests, inspect nearby repository tests for the same API fields, state-machine outputs, and public payload keys. Preserve existing semantic distinctions unless the task explicitly changes the contract.",
                 "Do not collapse layered semantics in assertions. Distinguish internal failure reasons/error codes from outward-facing state labels, next-action hints, and user-action flags unless the repository already defines them as the same contract.",
                 "Python proof tests must be deterministic under the project's configured verification command. Do not rely on pytest-only or unittest-only ambient state; explicitly configure test adapters, environment variables, and dependency injection needed by the test.",
@@ -15436,6 +15505,7 @@ class Orchestrator:
                 "Also fail if a new or edited test contradicts nearby existing tests for the same public payload fields without an explicit contract change in the task scope.",
                 "For Python projects, fail tests that depend on runner-specific ambient state, shared fixed "
                 "sqlite/temp paths, or real external services instead of explicit test fakes/adapters.",
+                "PERSISTENCE AUDIT: If persistence_change.strategy is not none, fail unless the implementation matches the user-approved strategy and tests start from a legacy schema fixture (except initial_schema). Fresh-database-only schema checks cannot prove an upgrade or controlled clean break.",
                 "If plan migration context lists retired task IDs, stale repository tests that still reference those retired IDs or the pre-split task-plan structure are also a 'DECISION: fail' issue.",
                 "If task status migration context is present, review stale repository test assertions only. Do NOT fail solely because orchestrator-owned .auto-agents state snapshots still show `in_progress` during review.",
                 "SCOPE RULE: Your review scope is bounded by the acceptance criteria in the Task JSON plus the bound requirements and acceptance oracles above. "
@@ -15481,6 +15551,143 @@ class Orchestrator:
             return prompt
 
         raise RuntimeError(f"Unsupported task stage: {stage}")
+
+    def _persistence_contract_issue(self, task: TaskSpec) -> str:
+        findings = detect_persistence_schema_changes(self.project_root)
+        if not findings:
+            return ""
+        strategy = persistence_change_strategy(task.persistence_change)
+        if strategy != "none":
+            return ""
+        evidence = "; ".join(
+            f"{finding.path}: {finding.evidence}" for finding in findings[:6]
+        )
+        return (
+            "implementation changed persistent schema while Task JSON declares "
+            f"persistence_change.strategy=none: {evidence}. "
+            "A user-approved persistence strategy is required before implementation can continue."
+        )
+
+    def _run_task_persistence_action(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> Dict[str, object]:
+        strategy = persistence_change_strategy(task.persistence_change)
+        if strategy in {"none", "initial_schema"}:
+            return {"ok": True, "executed": False, "strategy": strategy}
+        candidate_fingerprint = persistence_candidate_fingerprint(self.project_root)
+        manifest = build_persistence_action_manifest(
+            self.project_root,
+            task.persistence_change,
+            self.config.persistence,
+            candidate_fingerprint=candidate_fingerprint,
+        )
+        fingerprint = str(manifest["fingerprint"])
+        prior = state.persistence_actions.get(task.task_id, {})
+        if (
+            str(prior.get("fingerprint", "")) == fingerprint
+            and str(prior.get("status", "")) == "verified"
+        ):
+            return dict(prior.get("result", {})) or {
+                "ok": True,
+                "executed": False,
+                "strategy": strategy,
+            }
+
+        auto_approve = bool(state.resume_context.get("auto_approve", False))
+        if strategy == "clean_break":
+            planned_changes = [
+                item.persistence_change
+                for item in state.tasks
+                if persistence_change_strategy(item.persistence_change) == "clean_break"
+            ] or [task.persistence_change]
+            approval_payload = {
+                "changes": planned_changes,
+                "targets": [
+                    target.to_dict() for target in self.config.persistence.targets
+                ],
+            }
+            approval_fingerprint = hashlib.sha256(
+                json.dumps(
+                    approval_payload, ensure_ascii=False, sort_keys=True
+                ).encode("utf-8")
+            ).hexdigest()
+            approval = state.persistence_actions.get("_clean_break_approval", {})
+            approved = (
+                str(approval.get("fingerprint", "")) == approval_fingerprint
+                and str(approval.get("status", "")) == "approved"
+            )
+            if not approved and auto_approve:
+                approval = {
+                    "fingerprint": approval_fingerprint,
+                    "status": "approved",
+                    "approval": "auto",
+                    "approved_at": utc_now_iso(),
+                    "summary": approval_payload,
+                }
+                state.persistence_actions["_clean_break_approval"] = approval
+                approved = True
+            if not approved:
+                answer = self._prompt_user(
+                    "Clean break will permanently delete and rebuild all registered "
+                    "development/test targets in this run:\n"
+                    + json.dumps(approval_payload, indent=2, ensure_ascii=False)
+                    + "\nApprove this complete reset? (y/n) [n]: ",
+                    default="n",
+                )
+                if answer.strip().lower() not in {"y", "yes"}:
+                    state.persistence_actions["_clean_break_approval"] = {
+                        "fingerprint": approval_fingerprint,
+                        "status": "pending_approval",
+                        "summary": approval_payload,
+                    }
+                    state.pending_approval = "persistence-reset"
+                    state.status = "paused"
+                    save_run_state(self.project_root, state)
+                    raise PersistenceContractError(
+                        "clean break reset requires persistence-reset approval"
+                    )
+                state.persistence_actions["_clean_break_approval"] = {
+                    "fingerprint": approval_fingerprint,
+                    "status": "approved",
+                    "approval": "interactive",
+                    "approved_at": utc_now_iso(),
+                    "summary": approval_payload,
+                }
+                if "persistence-reset" not in state.approved_gates:
+                    state.approved_gates.append("persistence-reset")
+
+        state.persistence_actions[task.task_id] = {
+            "fingerprint": fingerprint,
+            "status": "approved",
+            "strategy": strategy,
+            "manifest": manifest,
+            "approved_at": utc_now_iso(),
+            "approval": "auto" if auto_approve else "interactive",
+        }
+        save_run_state(self.project_root, state)
+        try:
+            result = execute_persistence_action(
+                self.project_root,
+                task.persistence_change,
+                self.config.persistence,
+            )
+        except PersistenceContractError as error:
+            state.persistence_actions[task.task_id].update(
+                status="failed",
+                failed_at=utc_now_iso(),
+                error=str(error),
+            )
+            save_run_state(self.project_root, state)
+            raise
+        state.persistence_actions[task.task_id].update(
+            status="verified",
+            verified_at=utc_now_iso(),
+            result=result,
+        )
+        save_run_state(self.project_root, state)
+        return result
 
     def _execute_task_with_retries(
         self,
@@ -15596,6 +15803,19 @@ class Orchestrator:
                         )
                         continue
                     self._persist_tasks(state.tasks if state.tasks else [task])
+
+                persistence_issue = self._persistence_contract_issue(task)
+                if persistence_issue:
+                    return {
+                        "ok": False,
+                        "review": persistence_issue,
+                        "reason": persistence_issue,
+                        "failure_ids": ["persistence_schema_strategy_missing"],
+                        "comparable_failures": False,
+                        "rewind_to_stage": "clarify",
+                        "expected_owner_stage": "clarify",
+                        "rewind_reason": persistence_issue,
+                    }
 
                 if not self._implement_touched_code(task) and not proof_updates_applied:
                     empty_diff_streak += 1
@@ -17879,6 +18099,15 @@ class Orchestrator:
             trace,
             enforce_active_task_granularity=True,
             historical_tasks=load_archived_done_task_payloads(self.project_root) + prior_done_tasks,
+        )
+        errors.extend(
+            validate_persistence_plan_contract(
+                payload,
+                trace,
+                configured_targets=[
+                    target.to_dict() for target in self.config.persistence.targets
+                ],
+            )
         )
         raw_steps = payload.get("verification_steps", [])
         if isinstance(raw_steps, list) and raw_steps:

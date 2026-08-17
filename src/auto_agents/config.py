@@ -99,6 +99,7 @@ ARCHITECTURE_TEMPLATE = """# Architecture
 
 
 TASK_PLAN_TEMPLATE = {
+    "persistence_contract_version": 1,
     "tasks": [
         {
             "task_id": "task-001",
@@ -108,13 +109,15 @@ TASK_PLAN_TEMPLATE = {
             "depends_on": [],
             "acceptance": ["State one concrete acceptance criterion."],
             "status": "pending",
-            "commit_message": ""
+            "commit_message": "",
+            "persistence_change": {"strategy": "none"},
         }
     ]
 }
 
 REQUIREMENTS_TRACE_TEMPLATE = {
     "version": 1,
+    "persistence_decisions": [],
     "requirements": [],
 }
 
@@ -332,7 +335,7 @@ DEFAULT_CONFIG = {
         },
     },
     "approvals": {
-        "enabled": ["requirements", "prototype", "architecture", "release"],
+        "enabled": ["requirements", "prototype", "architecture", "persistence-reset", "release"],
     },
     "retries": {
         "default_max_attempts": 2,
@@ -352,6 +355,9 @@ DEFAULT_CONFIG = {
         "max_pages": 3,
         "viewports": ["1440x900", "390x844"],
         "network_timeout_seconds": 30,
+    },
+    "persistence": {
+        "targets": [],
     },
 }
 

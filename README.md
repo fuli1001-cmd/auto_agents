@@ -1101,9 +1101,40 @@ The plan root can also define:
 - `verification_policy_version`
 - `verification_steps`
 - `oracle_proof_schema_version`
+- `persistence_contract_version`
 
 Those fields are required for completed plan output and are preserved when task status is updated
 during implementation.
+
+## Persistent schema changes
+
+New plans use `persistence_contract_version: 1`. Every active task declares
+`persistence_change.strategy`; ordinary tasks use `none`, while schema work references a
+user-approved `persistence_decisions` entry from the requirements trace. Supported strategies are
+`initial_schema`, `startup_compatible`, `clean_break`, and `external_operator`. If the spec does not
+choose a strategy, auto_agents pauses for clarification instead of inferring permission to migrate
+or discard data. A post-implementation diff scan catches undeclared SQL DDL and common migration
+artifacts before verification or commit.
+
+Database targets are human-classified in `.auto-agents/config.json`, never inferred from a path or
+DSN name. Register one interactively with:
+
+```bash
+python3 -m auto_agents persistence-configure --project /tmp/demo
+```
+
+Targets declare `environment=development|test|production` and use either `local_file` or
+`compose_service`. Commands are stored as argv arrays, not shell strings, and secrets remain in
+environment variables. Development/test targets may be upgraded automatically after the candidate
+passes focused verification and review. Production targets are always generate-only, including
+under `--auto-approve`.
+
+`clean_break` is limited to registered development/test targets. auto_agents displays one complete
+destructive manifest, then deletes and rebuilds only validated project-owned, git-ignored paths or
+registered compose services. `run`, `fix`, and `collab` accept `--auto-approve` to approve that
+manifest automatically. Without it, a declined reset pauses at `persistence-reset` and can be
+resumed with `approve --gate persistence-reset`. Clean-break data is deleted directly; no implicit
+backup is created.
 
 Across iterations, `state/task_plan.json` is the active plan for the current run, not a permanent
 history table. When a completed project starts a new iteration, auto_agents archives the previous

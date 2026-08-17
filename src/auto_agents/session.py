@@ -32,7 +32,7 @@ from .gates import (
     run_gate_plan,
 )
 from .gate_execution import GateSnapshotManager
-from .git_ops import changed_paths, commit_all, head_ref, worktree_fingerprint
+from .git_ops import changed_paths, commit_all, head_ref
 from .io_utils import read_text, write_text
 from .models import (
     AgentRequest,
@@ -41,6 +41,14 @@ from .models import (
     SESSION_STALL_THRESHOLD,
     GateResult,
     SessionState,
+)
+from .persistence import (
+    PersistenceContractError,
+    build_persistence_action_manifest,
+    detect_persistence_schema_changes,
+    execute_persistence_action,
+    persistence_candidate_fingerprint,
+    persistence_change_strategy,
 )
 from .requirements import (
     load_requirements_trace,
@@ -51,7 +59,11 @@ from .release_attestation import (
     complete_release_verification,
     enqueue_release_verification,
 )
-from .validation import _looks_like_python_command, _uses_project_local_conda
+from .validation import (
+    _looks_like_python_command,
+    _uses_project_local_conda,
+    validate_persistence_change,
+)
 
 _GOAL_CLEAR = re.compile(r"^GOAL_CLEAR\s*$", re.MULTILINE)
 _NOT_A_BUG = re.compile(r"^NOT_A_BUG:\s*(.+)$", re.MULTILINE)
@@ -66,6 +78,7 @@ _BUG_FOUND = re.compile(r"^BUG_FOUND:\s*(.+)$", re.MULTILINE)
 _GOAL_ACHIEVED = re.compile(r"^GOAL_ACHIEVED:\s*(.+)$", re.MULTILINE)
 _FIX_VERIFY = re.compile(r"^FIX_VERIFY:\s*(.+)$", re.MULTILINE)
 _COMMIT_MESSAGE = re.compile(r"^COMMIT_MESSAGE:\s*(.+)$", re.MULTILINE)
+_PERSISTENCE_CHANGE = re.compile(r"^PERSISTENCE_CHANGE:\s*(\{.*\})\s*$", re.MULTILINE)
 _SHELL_CONTROL_TOKENS = re.compile(r"[|;&<>`\n]")
 
 
@@ -82,6 +95,7 @@ class Session:
         mode: str = "fix",
         print_agent_output: bool = False,
         full_verify: bool = False,
+        auto_approve: bool = False,
     ) -> None:
         self.orch = orchestrator
         self.project_root = orchestrator.project_root
@@ -89,6 +103,7 @@ class Session:
         self.mode = mode
         self._print_agent_output = print_agent_output
         self._full_verify = bool(full_verify)
+        self._auto_approve = bool(auto_approve)
         # ``fix --full-verify`` keeps its existing session-wide semantics.
         # Collab only bypasses certificates for the final attestation; progress
         # checks must remain incremental so the interactive loop stays fast.
@@ -122,6 +137,111 @@ class Session:
 
     def _release_gate_plan(self):
         return self._session_gate_plan("release")
+
+    def _session_persistence_issue(self, state: SessionState) -> str:
+        findings = detect_persistence_schema_changes(self.project_root)
+        if not findings or persistence_change_strategy(state.persistence_change) != "none":
+            return ""
+        evidence = "; ".join(
+            f"{finding.path}: {finding.evidence}" for finding in findings[:6]
+        )
+        return (
+            "The session changed persistent schema without a user-approved strategy: "
+            f"{evidence}. Choose a persistence strategy before more writes or verification."
+        )
+
+    def _apply_session_persistence_marker(
+        self, state: SessionState, reply: str
+    ) -> str:
+        match = _PERSISTENCE_CHANGE.search(reply)
+        if not match:
+            return ""
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError as error:
+            return f"PERSISTENCE_CHANGE JSON is invalid: {error}"
+        errors = validate_persistence_change(
+            payload,
+            "session.persistence_change",
+            required=True,
+        )
+        if errors:
+            return "Invalid persistence contract: " + "; ".join(errors)
+        target_errors = self._session_persistence_target_errors(payload)
+        if target_errors:
+            return "Invalid persistence targets: " + "; ".join(target_errors)
+        state.persistence_change = dict(payload)
+        self._save(state)
+        return ""
+
+    def _session_persistence_target_errors(
+        self, payload: Dict[str, object]
+    ) -> List[str]:
+        strategy = persistence_change_strategy(payload)
+        if strategy == "none":
+            return []
+        errors: List[str] = []
+        for raw_target_id in payload.get("target_ids", []):
+            target_id = str(raw_target_id).strip()
+            target = self.config.persistence.target(target_id)
+            if target is None:
+                errors.append(
+                    f"target {target_id} is not configured; run persistence-configure"
+                )
+            elif strategy == "clean_break" and target.environment == "production":
+                errors.append(f"clean_break cannot target production: {target_id}")
+        return errors
+
+    def _run_session_persistence_action(self, state: SessionState) -> Dict[str, object]:
+        strategy = persistence_change_strategy(state.persistence_change)
+        if strategy in {"none", "initial_schema"}:
+            return {"ok": True, "strategy": strategy, "executed": False}
+        candidate_fingerprint = persistence_candidate_fingerprint(self.project_root)
+        manifest = build_persistence_action_manifest(
+            self.project_root,
+            state.persistence_change,
+            self.config.persistence,
+            candidate_fingerprint=candidate_fingerprint,
+        )
+        fingerprint = str(manifest["fingerprint"])
+        prior = state.persistence_actions.get("session", {})
+        if prior.get("fingerprint") == fingerprint and prior.get("status") == "verified":
+            return dict(prior.get("result", {}))
+        if strategy == "clean_break" and not state.auto_approve:
+            answer = self._prompt_user(
+                "Clean break will permanently delete and rebuild these registered "
+                "development/test targets:\n"
+                + json.dumps(manifest, indent=2, ensure_ascii=False)
+                + "\nApprove this complete reset? (y/n) [n]: ",
+                default="n",
+            )
+            if answer.strip().lower() not in {"y", "yes"}:
+                raise PersistenceContractError("clean break reset was not approved")
+        state.persistence_actions["session"] = {
+            "fingerprint": fingerprint,
+            "status": "approved",
+            "manifest": manifest,
+            "approval": "auto" if state.auto_approve else "interactive",
+            "approved_at": self._now(),
+        }
+        self._save(state)
+        try:
+            result = execute_persistence_action(
+                self.project_root,
+                state.persistence_change,
+                self.config.persistence,
+            )
+        except PersistenceContractError as error:
+            state.persistence_actions["session"].update(
+                status="failed", error=str(error), failed_at=self._now()
+            )
+            self._save(state)
+            raise
+        state.persistence_actions["session"].update(
+            status="verified", result=result, verified_at=self._now()
+        )
+        self._save(state)
+        return result
 
     @staticmethod
     def _logical_gate_commands(plan) -> List[str]:
@@ -165,6 +285,8 @@ class Session:
     def start(self) -> SessionState:
         """Create a new session and drive it to completion (or interruption)."""
         state = create_session(self.project_root, self.mode)
+        state.auto_approve = self._auto_approve
+        self._save(state)
         self._print(f"Session {state.session_id} started in {state.mode} mode.")
         return self._drive(state)
 
@@ -176,6 +298,8 @@ class Session:
         where the previous run left off while preserving all prior context.
         """
         state = load_session_state(self.project_root, session_id)
+        state.auto_approve = bool(state.auto_approve or self._auto_approve)
+        self._save(state)
         if state.status == "completed":
             self._print(f"Session {session_id} is already completed.")
             return state
@@ -315,12 +439,55 @@ class Session:
                     continue
 
             if _GOAL_CLEAR.search(reply):
+                persistence_match = _PERSISTENCE_CHANGE.search(reply)
+                if persistence_match:
+                    try:
+                        persistence_change = json.loads(persistence_match.group(1))
+                    except json.JSONDecodeError as error:
+                        state.conversation.append(
+                            {
+                                "role": "user",
+                                "content": f"PERSISTENCE_CHANGE JSON is invalid: {error}",
+                            }
+                        )
+                        self._save(state)
+                        continue
+                    persistence_errors = validate_persistence_change(
+                        persistence_change,
+                        "session.persistence_change",
+                        required=True,
+                    )
+                    if persistence_errors:
+                        state.conversation.append(
+                            {
+                                "role": "user",
+                                "content": "Invalid persistence contract: "
+                                + "; ".join(persistence_errors),
+                            }
+                        )
+                        self._save(state)
+                        continue
+                    target_errors = self._session_persistence_target_errors(
+                        persistence_change
+                    )
+                    if target_errors:
+                        state.conversation.append(
+                            {
+                                "role": "user",
+                                "content": "Invalid persistence targets: "
+                                + "; ".join(target_errors),
+                            }
+                        )
+                        self._save(state)
+                        continue
+                    state.persistence_change = dict(persistence_change)
                 # Extract optional FIX_VERIFY command from the reply
                 fv_match = _FIX_VERIFY.search(reply)
                 if fv_match and self.mode == "fix":
                     state.fix_verify_command = fv_match.group(1).strip()
                 display = _GOAL_CLEAR.sub("", reply)
-                display = _FIX_VERIFY.sub("", display).strip()
+                display = _FIX_VERIFY.sub("", display)
+                display = _PERSISTENCE_CHANGE.sub("", display).strip()
                 if display:
                     self._print(f"\nAgent:\n{display}")
                 self._print("\nAgent has understood the goal. Proceeding to execution.")
@@ -385,6 +552,28 @@ class Session:
             })
             self._save(state)
 
+            marker_error = self._apply_session_persistence_marker(state, reply)
+            if marker_error:
+                feedback = marker_error
+                self._print(marker_error)
+                continue
+            persistence_issue = self._session_persistence_issue(state)
+            if persistence_issue:
+                self._print(persistence_issue)
+                state.status = "waiting_user"
+                self._save(state)
+                user_reply = self._prompt_user(
+                    "Choose startup_compatible, clean_break, or external_operator and identify the registered target(s): ",
+                    multiline=True,
+                )
+                state.conversation.append(
+                    {"role": "user", "content": user_reply.strip() or persistence_issue}
+                )
+                state.status = "executing"
+                self._save(state)
+                feedback = persistence_issue
+                continue
+
             # Quick verify
             quick_fail = self.orch._quick_verify_failure_details()
             if quick_fail:
@@ -418,6 +607,7 @@ class Session:
 
             if verify["ok"]:
                 self._print("Verification passed!")
+                self._run_session_persistence_action(state)
                 state.status = "completed"
                 state.resolution = "fixed"
                 self._git_commit(state, "fix", reply=reply)
@@ -502,6 +692,28 @@ class Session:
             })
             self._save(state)
 
+            marker_error = self._apply_session_persistence_marker(state, reply)
+            if marker_error:
+                feedback = marker_error
+                self._print(marker_error)
+                continue
+            persistence_issue = self._session_persistence_issue(state)
+            if persistence_issue:
+                self._print(persistence_issue)
+                state.status = "waiting_user"
+                self._save(state)
+                user_reply = self._prompt_user(
+                    "Choose startup_compatible, clean_break, or external_operator and identify the registered target(s): ",
+                    multiline=True,
+                )
+                state.conversation.append(
+                    {"role": "user", "content": user_reply.strip() or persistence_issue}
+                )
+                state.status = "executing"
+                self._save(state)
+                feedback = persistence_issue
+                continue
+
             # Check for NEED_USER_ASSIST — counts as progress
             assist_match = _NEED_USER_ASSIST.search(reply)
             if assist_match:
@@ -546,6 +758,7 @@ class Session:
                 self._print("Final verification passed!")
                 answer = self._prompt_user("Do you confirm the goal is achieved? (y/n) [y]: ", default="y")
                 if answer.strip().lower() not in ("n", "no"):
+                    self._run_session_persistence_action(state)
                     state.status = "completed"
                     self._git_commit(state, "collab", reply=reply)
                     self._record_release_attestation(state, verify)
@@ -614,6 +827,7 @@ class Session:
                             break
                         continue
                     self._print("Final verification passed!")
+                    self._run_session_persistence_action(state)
                     state.status = "completed"
                     self._git_commit(state, "collab", reply=reply)
                     self._record_release_attestation(state, final_verify)
@@ -1046,6 +1260,7 @@ class Session:
                 "exists. This should target the specific bug described, not the whole test suite. "
                 "Examples: a pytest invocation with -k filter, a curl command, a grep check, etc.",
                 "- Match the repository's existing verification conventions when choosing FIX_VERIFY.",
+                "- Before GOAL_CLEAR, determine whether the fix will create or change persistent schema. Output one single-line PERSISTENCE_CHANGE JSON object. Use {'strategy':'none'} when it will not. A non-none strategy must reflect an explicit user decision and include decision_id, target_ids, to_version, migration_artifacts, and legacy_fixture_refs.",
                 "- If the project uses a local conda env at ./.conda, every Python-oriented "
                 "FIX_VERIFY command must run inside it via 'conda run -p ./.conda ...'.",
             ])
@@ -1057,6 +1272,7 @@ class Session:
                 lines.extend(f"  - {command}" for command in gate_commands)
         lines.extend([
             "- Always explain your understanding before asking questions or declaring ready.",
+            "- Never infer permission to discard or migrate persistent data. If a schema strategy is missing, ask the user before declaring GOAL_CLEAR.",
             self.orch._document_language_instruction(),
         ])
         return "\n".join(lines)
@@ -1313,6 +1529,7 @@ class Session:
             "4. If you discover a bug, output 'BUG_FOUND: <description>' and fix it",
             "5. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",
             "6. Provide a brief status update of what you did",
+            "7. Before any persistent schema change, output a single-line PERSISTENCE_CHANGE JSON contract based on an explicit user strategy. Use {'strategy':'none'} when no persistent schema changes are in scope.",
             "",
             "EXECUTION SAFETY RULES (critical — follow strictly):",
             "- Set a timeout for EVERY HTTP request or polling loop (max 60s per request, 5 min total for repeated polling).",
@@ -2029,6 +2246,7 @@ class Session:
         """Commit verified project changes while the collab loop continues."""
         if not changed_paths(self.project_root):
             return False
+        self._run_session_persistence_action(state)
         return self._git_commit(state, prefix, reply=reply)
 
     def _extract_commit_summary(self, text: str) -> str:
@@ -2051,7 +2269,13 @@ class Session:
         candidates: List[str] = []
         for raw_line in text.splitlines():
             line = " ".join(raw_line.strip().split())
-            if not line or line == "GOAL_CLEAR" or line.startswith("FIX_VERIFY:") or line.startswith("COMMIT_MESSAGE:"):
+            if (
+                not line
+                or line == "GOAL_CLEAR"
+                or line.startswith("FIX_VERIFY:")
+                or line.startswith("COMMIT_MESSAGE:")
+                or line.startswith("PERSISTENCE_CHANGE:")
+            ):
                 continue
             if any(pattern.match(line) for pattern in (_GOAL_ACHIEVED, _BUG_FOUND, _NOT_A_BUG, _NEED_USER_ASSIST)):
                 continue

@@ -18,6 +18,9 @@ from .models import (
     APPROVAL_ORDER,
     DEFAULT_EFFORTS,
     DOCUMENT_LANGUAGE_OPTIONS,
+    PERSISTENCE_ENVIRONMENTS,
+    PERSISTENCE_STRATEGIES,
+    PERSISTENCE_TARGET_KINDS,
     SMART_TIMEOUT_PROGRESS_PROTOCOL,
     TASK_ORIGINS,
     VERIFICATION_CACHE_SCOPES,
@@ -52,6 +55,7 @@ DEFAULTED_EFFORT_STAGES = {
 }
 MAX_ACCEPTANCE_WITHOUT_SCOPE_RATIONALE = 5
 MAX_ACCEPTANCE_HARD_LIMIT = 7
+PERSISTENCE_COMMAND_TOKEN_PATTERN = re.compile(r"[|;&<>`\n\r]")
 REQUIRED_DOC_HEADINGS = {
     "project_brief.md": ("# Project Brief", "## Problem", "## MVP Scope", "## Non-Goals", "## Constraints"),
     "architecture.md": ("# Architecture", "## System Boundary", "## Core Modules", "## Data Flow", "## Risks"),
@@ -89,6 +93,89 @@ PYTEST_VALUE_OPTIONS = {
     "-k",
     "-m",
 }
+
+
+def _safe_project_relative_path(value: object) -> bool:
+    normalized = str(value or "").strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return bool(
+        normalized
+        and not normalized.startswith(("/", "~"))
+        and ".." not in normalized.split("/")
+        and not any(character in normalized for character in "*?[]")
+    )
+
+
+def _validate_persistence_argv(value: object, prefix: str) -> List[str]:
+    if not isinstance(value, list):
+        return [f"{prefix} must be a list of argv strings"]
+    errors: List[str] = []
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not item.strip()
+            or PERSISTENCE_COMMAND_TOKEN_PATTERN.search(item)
+        ):
+            errors.append(
+                f"{prefix} must contain non-empty argv tokens without shell control characters"
+            )
+            break
+    return errors
+
+
+def validate_persistence_change(
+    value: object,
+    prefix: str,
+    *,
+    required: bool,
+) -> List[str]:
+    if value is None and not required:
+        return []
+    if not isinstance(value, dict):
+        return [f"{prefix} must be an object"]
+    strategy = str(value.get("strategy", "")).strip()
+    if strategy not in PERSISTENCE_STRATEGIES:
+        return [
+            f"{prefix}.strategy must be one of: {', '.join(PERSISTENCE_STRATEGIES)}"
+        ]
+    errors: List[str] = []
+    if strategy == "none":
+        unexpected = sorted(set(value) - {"strategy"})
+        if unexpected:
+            errors.append(
+                f"{prefix} strategy=none cannot declare: {', '.join(unexpected)}"
+            )
+        return errors
+
+    for field_name in ("decision_id", "to_version"):
+        if not isinstance(value.get(field_name), str) or not str(value[field_name]).strip():
+            errors.append(f"{prefix}.{field_name} must be a non-empty string")
+    for field_name in ("target_ids", "migration_artifacts"):
+        items = value.get(field_name)
+        if (
+            not isinstance(items, list)
+            or not items
+            or any(not isinstance(item, str) or not item.strip() for item in items)
+        ):
+            errors.append(f"{prefix}.{field_name} must be a non-empty list of strings")
+    artifacts = value.get("migration_artifacts", [])
+    if isinstance(artifacts, list):
+        for artifact in artifacts:
+            if isinstance(artifact, str) and not _safe_project_relative_path(artifact):
+                errors.append(
+                    f"{prefix}.migration_artifacts entry '{artifact}' must be an exact project-relative path"
+                )
+    fixtures = value.get("legacy_fixture_refs", [])
+    if strategy != "initial_schema" and (
+        not isinstance(fixtures, list)
+        or not fixtures
+        or any(not isinstance(item, str) or not item.strip() for item in fixtures)
+    ):
+        errors.append(
+            f"{prefix}.legacy_fixture_refs must contain executable legacy-schema proof refs"
+        )
+    return errors
 
 
 def _looks_like_python_workflow(test_strategy: object, commands: object) -> bool:
@@ -681,6 +768,11 @@ def validate_task_plan_payload(
     if not isinstance(payload, dict):
         return ["task plan root must be a JSON object"]
 
+    persistence_contract_version = payload.get("persistence_contract_version", 0)
+    if persistence_contract_version not in {0, 1}:
+        errors.append("task plan persistence_contract_version must be 1 when provided")
+        persistence_contract_version = 0
+
     verification_policy_version = payload.get("verification_policy_version", 1)
     if (
         not isinstance(verification_policy_version, int)
@@ -764,6 +856,17 @@ def validate_task_plan_payload(
         if not isinstance(task, dict):
             errors.append(f"{prefix} must be an object")
             continue
+
+        errors.extend(
+            validate_persistence_change(
+                task.get("persistence_change"),
+                f"{prefix}.persistence_change",
+                required=(
+                    persistence_contract_version == 1
+                    and str(task.get("status", "pending")) != "done"
+                ),
+            )
+        )
 
         missing = sorted(required_fields - set(task.keys()))
         if missing:
@@ -969,6 +1072,149 @@ def validate_task_plan_with_requirements(
                     historical_tasks=historical_tasks,
                 )
             )
+            errors.extend(
+                validate_persistence_plan_contract(plan_payload, trace_payload)
+            )
+    return errors
+
+
+def validate_persistence_plan_contract(
+    plan_payload: object,
+    trace_payload: object,
+    *,
+    configured_target_ids: Iterable[str] = (),
+    configured_targets: Iterable[dict] = (),
+) -> List[str]:
+    if not isinstance(plan_payload, dict) or not isinstance(trace_payload, dict):
+        return []
+    decisions_raw = trace_payload.get("persistence_decisions", [])
+    if not isinstance(decisions_raw, list):
+        return ["requirements trace persistence_decisions must be a list"]
+    errors: List[str] = []
+    decisions: Dict[str, dict] = {}
+    for index, decision in enumerate(decisions_raw, start=1):
+        prefix = f"persistence_decisions[{index}]"
+        if not isinstance(decision, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+        decision_id = str(decision.get("id", "")).strip()
+        strategy = str(decision.get("strategy", "")).strip()
+        targets = decision.get("target_ids", [])
+        status = str(decision.get("status", "")).strip()
+        if not re.fullmatch(r"PERSIST-[0-9]{3,}", decision_id):
+            errors.append(f"{prefix}.id must match PERSIST-NNN")
+        elif decision_id in decisions:
+            errors.append(f"{prefix}.id duplicates '{decision_id}'")
+        if strategy not in set(PERSISTENCE_STRATEGIES) - {"none"}:
+            errors.append(f"{prefix}.strategy is invalid")
+        if (
+            not isinstance(targets, list)
+            or not targets
+            or any(not isinstance(item, str) or not item.strip() for item in targets)
+        ):
+            errors.append(f"{prefix}.target_ids must be a non-empty list")
+        if status not in {"active", "superseded"}:
+            errors.append(f"{prefix}.status must be active or superseded")
+        if decision_id:
+            decisions[decision_id] = decision
+
+    target_map = {
+        str(item.get("id", "")): item
+        for item in configured_targets
+        if isinstance(item, dict) and str(item.get("id", ""))
+    }
+    known_targets = {
+        *{str(item) for item in configured_target_ids if str(item)},
+        *target_map,
+    }
+    verification_steps = [
+        item
+        for item in plan_payload.get("verification_steps", [])
+        if isinstance(item, dict)
+    ]
+    for index, task in enumerate(plan_payload.get("tasks", []), start=1):
+        if not isinstance(task, dict) or str(task.get("status", "pending")) == "done":
+            continue
+        change = task.get("persistence_change")
+        if not isinstance(change, dict):
+            continue
+        strategy = str(change.get("strategy", "none")).strip()
+        if strategy in {"", "none"}:
+            continue
+        decision_id = str(change.get("decision_id", "")).strip()
+        decision = decisions.get(decision_id)
+        prefix = f"task #{index}.persistence_change"
+        if not decision or str(decision.get("status", "")) != "active":
+            errors.append(f"{prefix}.decision_id must reference an active persistence decision")
+            continue
+        task_targets = sorted(str(item) for item in change.get("target_ids", []))
+        decision_targets = sorted(str(item) for item in decision.get("target_ids", []))
+        if strategy != str(decision.get("strategy", "")):
+            errors.append(f"{prefix}.strategy must match persistence decision {decision_id}")
+        if task_targets != decision_targets:
+            errors.append(f"{prefix}.target_ids must match persistence decision {decision_id}")
+        if known_targets:
+            missing = sorted(set(task_targets) - known_targets)
+            if missing:
+                errors.append(
+                    f"{prefix}.target_ids reference unconfigured targets: {', '.join(missing)}"
+                )
+        fixture_paths = {
+            str(ref).split("::", 1)[0]
+            for ref in change.get("legacy_fixture_refs", [])
+            if str(ref).strip()
+        }
+        critical_steps = [
+            step
+            for step in verification_steps
+            if str(step.get("risk", "")) == "critical"
+            and fixture_paths.intersection(
+                str(target).split("::", 1)[0]
+                for target in step.get("targets", [])
+            )
+        ]
+        if strategy != "initial_schema" and not critical_steps:
+            errors.append(
+                f"{prefix} legacy fixture proof must map to a critical verification step"
+            )
+        for step in critical_steps:
+            if step.get("parallel_safe") is not False:
+                errors.append(
+                    f"{prefix} critical persistence verification must set parallel_safe=false"
+                )
+            if str(step.get("serial_reason", "")) not in {
+                "shared_mutable_state",
+                "ordered_contract",
+            }:
+                errors.append(
+                    f"{prefix} critical persistence verification requires shared_mutable_state or ordered_contract serial_reason"
+                )
+        for target_id in task_targets:
+            target = target_map.get(target_id)
+            if not target:
+                continue
+            environment = str(target.get("environment", ""))
+            kind = str(target.get("kind", ""))
+            if strategy == "clean_break":
+                if environment == "production":
+                    errors.append(
+                        f"{prefix} clean_break cannot target production: {target_id}"
+                    )
+                if not target.get("initialize_argv") or not target.get("verify_argv"):
+                    errors.append(
+                        f"{prefix} clean_break target {target_id} requires initialize_argv and verify_argv"
+                    )
+                if kind == "compose_service" and not target.get("reset_argv"):
+                    errors.append(
+                        f"{prefix} compose clean_break target {target_id} requires reset_argv"
+                    )
+            elif strategy in {"startup_compatible", "external_operator"}:
+                if environment != "production" and (
+                    not target.get("apply_argv") or not target.get("verify_argv")
+                ):
+                    errors.append(
+                        f"{prefix} automatic target {target_id} requires apply_argv and verify_argv"
+                    )
     return errors
 
 
@@ -1071,6 +1317,89 @@ def _allow_empty_task_plan_for_iteration(project_root: Path) -> bool:
     if current_stage not in {"clarify", "prototype", "design", "plan"}:
         return False
     return str(state_payload.get("status", "pending")).strip() != "completed"
+
+
+def validate_persistence_config_payload(payload: object) -> List[str]:
+    if payload is None:
+        return []
+    if not isinstance(payload, dict):
+        return ["persistence must be an object"]
+    targets = payload.get("targets", [])
+    if not isinstance(targets, list):
+        return ["persistence.targets must be a list"]
+    errors: List[str] = []
+    seen: set[str] = set()
+    for index, target in enumerate(targets, start=1):
+        prefix = f"persistence.targets[{index}]"
+        if not isinstance(target, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+        target_id = str(target.get("id", "")).strip()
+        if not TASK_ID_PATTERN.fullmatch(target_id):
+            errors.append(f"{prefix}.id must be a safe non-empty identifier")
+        elif target_id in seen:
+            errors.append(f"{prefix}.id duplicates '{target_id}'")
+        seen.add(target_id)
+        environment = str(target.get("environment", "")).strip()
+        if environment not in PERSISTENCE_ENVIRONMENTS:
+            errors.append(
+                f"{prefix}.environment must be one of: {', '.join(PERSISTENCE_ENVIRONMENTS)}"
+            )
+        kind = str(target.get("kind", "")).strip()
+        if kind not in PERSISTENCE_TARGET_KINDS:
+            errors.append(
+                f"{prefix}.kind must be one of: {', '.join(PERSISTENCE_TARGET_KINDS)}"
+            )
+        locator = target.get("locator")
+        if not isinstance(locator, dict):
+            errors.append(f"{prefix}.locator must be an object")
+            locator = {}
+        if kind == "local_file":
+            path = locator.get("path")
+            path_env = locator.get("path_env")
+            if bool(path) == bool(path_env):
+                errors.append(
+                    f"{prefix}.locator must declare exactly one of path or path_env"
+                )
+            if path and not _safe_project_relative_path(path):
+                errors.append(f"{prefix}.locator.path must be project-relative")
+            if path_env and not re.fullmatch(r"[A-Z][A-Z0-9_]*", str(path_env)):
+                errors.append(f"{prefix}.locator.path_env must be an environment variable name")
+        elif kind == "compose_service":
+            compose_file = locator.get("compose_file")
+            services = locator.get("services")
+            if not _safe_project_relative_path(compose_file):
+                errors.append(f"{prefix}.locator.compose_file must be project-relative")
+            if (
+                not isinstance(services, list)
+                or not services
+                or any(not isinstance(item, str) or not item.strip() for item in services)
+            ):
+                errors.append(f"{prefix}.locator.services must be a non-empty list")
+        paths = target.get("associated_paths", [])
+        if not isinstance(paths, list):
+            errors.append(f"{prefix}.associated_paths must be a list")
+        else:
+            for path in paths:
+                if not _safe_project_relative_path(path):
+                    errors.append(
+                        f"{prefix}.associated_paths entry '{path}' must be project-relative"
+                    )
+        for field_name in (
+            "apply_argv",
+            "initialize_argv",
+            "reset_argv",
+            "verify_argv",
+        ):
+            errors.extend(
+                _validate_persistence_argv(
+                    target.get(field_name, []), f"{prefix}.{field_name}"
+                )
+            )
+        timeout = target.get("timeout_seconds", 300)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
+            errors.append(f"{prefix}.timeout_seconds must be an integer >= 1")
+    return errors
 
 
 def validate_project_config_payload(payload: object) -> List[str]:
@@ -1839,6 +2168,8 @@ def validate_project_config_payload(payload: object) -> List[str]:
             if not isinstance(timeout, int) or timeout < 1 or timeout > 300:
                 errors.append("frontend_design.network_timeout_seconds must be an integer from 1 to 300")
 
+    errors.extend(validate_persistence_config_payload(payload.get("persistence")))
+
     return errors
 
 
@@ -1969,6 +2300,27 @@ def validate_project_root(
         )
         errors.extend(trace_errors)
         errors.extend(validate_frontend_scope(trace_payload))
+        if isinstance(plan_payload, dict) and isinstance(config_payload, dict):
+            persistence = config_payload.get("persistence", {})
+            targets = (
+                persistence.get("targets", [])
+                if isinstance(persistence, dict)
+                else []
+            )
+            errors.extend(
+                validate_persistence_plan_contract(
+                    plan_payload,
+                    trace_payload,
+                    configured_target_ids=[
+                        str(item.get("id", ""))
+                        for item in targets
+                        if isinstance(item, dict)
+                    ],
+                    configured_targets=[
+                        item for item in targets if isinstance(item, dict)
+                    ],
+                )
+            )
 
     frontend_lock = load_frontend_design_lock(root)
     if frontend_lock.get("status") == "approved":

@@ -697,6 +697,54 @@
         }
       },
       "additionalProperties": false
+    },
+    "persistence": {
+      "type": "object",
+      "required": ["targets"],
+      "properties": {
+        "targets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "environment", "kind", "locator"],
+            "properties": {
+              "id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{1,63}$"},
+              "environment": {
+                "type": "string",
+                "enum": ["development", "test", "production"]
+              },
+              "kind": {
+                "type": "string",
+                "enum": ["local_file", "compose_service"]
+              },
+              "locator": {"type": "object"},
+              "associated_paths": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "apply_argv": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "initialize_argv": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "reset_argv": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "verify_argv": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "timeout_seconds": {"type": "integer", "minimum": 1}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

@@ -23,7 +23,7 @@ from .config import (
     task_plan_path,
 )
 from .io_utils import read_json, read_text, write_json, write_text
-from .models import TaskSpec
+from .models import PERSISTENCE_STRATEGIES, TaskSpec
 from .requirements_audit_cache import RequirementsAuditCache
 
 
@@ -597,6 +597,36 @@ def validate_requirements_trace_payload(
     version = payload.get("version")
     if not isinstance(version, int) or version < 1:
         errors.append("requirements trace version must be an integer >= 1")
+
+    decisions = payload.get("persistence_decisions", [])
+    if not isinstance(decisions, list):
+        errors.append("requirements trace persistence_decisions must be a list")
+    else:
+        seen_decisions: set[str] = set()
+        for index, decision in enumerate(decisions, start=1):
+            prefix = f"persistence decision #{index}"
+            if not isinstance(decision, dict):
+                errors.append(f"{prefix} must be an object")
+                continue
+            decision_id = str(decision.get("id", "")).strip()
+            if not re.fullmatch(r"PERSIST-[0-9]{3,}", decision_id):
+                errors.append(f"{prefix} id must match PERSIST-NNN")
+            elif decision_id in seen_decisions:
+                errors.append(f"{prefix} duplicates id '{decision_id}'")
+            seen_decisions.add(decision_id)
+            if str(decision.get("strategy", "")) not in set(PERSISTENCE_STRATEGIES) - {"none"}:
+                errors.append(f"{prefix} has an invalid strategy")
+            targets = decision.get("target_ids")
+            if (
+                not isinstance(targets, list)
+                or not targets
+                or any(not isinstance(item, str) or not item.strip() for item in targets)
+            ):
+                errors.append(f"{prefix} target_ids must be a non-empty list")
+            if str(decision.get("status", "")) not in {"active", "superseded"}:
+                errors.append(f"{prefix} status must be active or superseded")
+            if not isinstance(decision.get("source"), str) or not str(decision.get("source", "")).strip():
+                errors.append(f"{prefix} source must be a non-empty string")
 
     requirements = payload.get("requirements")
     if not isinstance(requirements, list):

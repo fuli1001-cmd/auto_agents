@@ -8,7 +8,7 @@ from .repomap.config import RepoMapConfig
 
 
 STAGE_ORDER = ["clarify", "prototype", "design", "plan", "provider_research", "implement", "visual_judge", "verify", "readme"]
-APPROVAL_ORDER = ["requirements", "prototype", "architecture", "release"]
+APPROVAL_ORDER = ["requirements", "prototype", "architecture", "persistence-reset", "release"]
 SESSION_MODES = ("fix", "collab", "provider_resolve")
 SESSION_STATUSES = ("conversing", "executing", "verifying", "waiting_user", "completed", "failed")
 DEFAULT_SESSION_MAX_ATTEMPTS = {"fix": 4, "collab": 10, "provider_resolve": 8}
@@ -31,6 +31,15 @@ VERIFICATION_SERIAL_REASONS = (
 )
 VERIFICATION_RESOURCE_CLASSES = ("normal", "heavy", "exclusive")
 VERIFICATION_MEMORY_GUARDS = ("off", "advisory", "required")
+PERSISTENCE_STRATEGIES = (
+    "none",
+    "initial_schema",
+    "startup_compatible",
+    "clean_break",
+    "external_operator",
+)
+PERSISTENCE_ENVIRONMENTS = ("development", "test", "production")
+PERSISTENCE_TARGET_KINDS = ("local_file", "compose_service")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity-claude", "antigravity-gemini")
 DEFAULT_EFFORTS = {
     "clarify": "deep",
@@ -109,6 +118,9 @@ class TaskSpec:
     evidence_preflight: Dict[str, object] = field(default_factory=dict)
     verify_retry_epoch: int = 0
     verify_baseline_schema_version: int = 0
+    persistence_change: Dict[str, object] = field(
+        default_factory=lambda: {"strategy": "none"}
+    )
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -173,6 +185,12 @@ class TaskSpec:
             verify_baseline_schema_version=max(
                 0, int(data.get("verify_baseline_schema_version", 0) or 0)
             ),
+            persistence_change=(
+                dict(data.get("persistence_change", {}))
+                if isinstance(data.get("persistence_change", {}), dict)
+                else {"strategy": "none"}
+            )
+            or {"strategy": "none"},
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -686,7 +704,13 @@ class GitConfig:
 @dataclass
 class ApprovalConfig:
     enabled: List[str] = field(
-        default_factory=lambda: ["requirements", "prototype", "architecture", "release"]
+        default_factory=lambda: [
+            "requirements",
+            "prototype",
+            "architecture",
+            "persistence-reset",
+            "release",
+        ]
     )
 
     @classmethod
@@ -1001,6 +1025,77 @@ class ExecutionConfig:
 
 
 @dataclass
+class PersistenceTargetConfig:
+    target_id: str
+    environment: str
+    kind: str
+    locator: Dict[str, object] = field(default_factory=dict)
+    associated_paths: List[str] = field(default_factory=list)
+    apply_argv: List[str] = field(default_factory=list)
+    initialize_argv: List[str] = field(default_factory=list)
+    reset_argv: List[str] = field(default_factory=list)
+    verify_argv: List[str] = field(default_factory=list)
+    timeout_seconds: int = 300
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "PersistenceTargetConfig":
+        return cls(
+            target_id=str(data.get("id", "")),
+            environment=str(data.get("environment", "")),
+            kind=str(data.get("kind", "")),
+            locator=(
+                dict(data.get("locator", {}))
+                if isinstance(data.get("locator", {}), dict)
+                else {}
+            ),
+            associated_paths=[str(item) for item in data.get("associated_paths", [])],
+            apply_argv=[str(item) for item in data.get("apply_argv", [])],
+            initialize_argv=[str(item) for item in data.get("initialize_argv", [])],
+            reset_argv=[str(item) for item in data.get("reset_argv", [])],
+            verify_argv=[str(item) for item in data.get("verify_argv", [])],
+            timeout_seconds=max(1, int(data.get("timeout_seconds", 300) or 300)),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "id": self.target_id,
+            "environment": self.environment,
+            "kind": self.kind,
+            "locator": dict(self.locator),
+            "associated_paths": list(self.associated_paths),
+            "apply_argv": list(self.apply_argv),
+            "initialize_argv": list(self.initialize_argv),
+            "reset_argv": list(self.reset_argv),
+            "verify_argv": list(self.verify_argv),
+            "timeout_seconds": self.timeout_seconds,
+        }
+
+
+@dataclass
+class PersistenceConfig:
+    targets: List[PersistenceTargetConfig] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "PersistenceConfig":
+        return cls(
+            targets=[
+                PersistenceTargetConfig.from_dict(dict(item))
+                for item in data.get("targets", [])
+                if isinstance(item, dict)
+            ]
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"targets": [target.to_dict() for target in self.targets]}
+
+    def target(self, target_id: str) -> Optional[PersistenceTargetConfig]:
+        return next(
+            (target for target in self.targets if target.target_id == target_id),
+            None,
+        )
+
+
+@dataclass
 class ProjectConfig:
     project_name: str
     providers: Dict[str, ProviderConfig] = field(
@@ -1073,6 +1168,7 @@ class ProjectConfig:
     visual_judge: VisualJudgeConfig = field(default_factory=VisualJudgeConfig)
     frontend_design: FrontendDesignConfig = field(default_factory=FrontendDesignConfig)
     repo_map: RepoMapConfig = field(default_factory=RepoMapConfig)
+    persistence: PersistenceConfig = field(default_factory=PersistenceConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ProjectConfig":
@@ -1117,7 +1213,14 @@ class ProjectConfig:
                 dict(
                     data.get(
                         "approvals",
-                        {"enabled": ["requirements", "architecture", "release"]},
+                        {
+                            "enabled": [
+                                "requirements",
+                                "architecture",
+                                "persistence-reset",
+                                "release",
+                            ]
+                        },
                     )
                 )
             ),
@@ -1127,6 +1230,11 @@ class ProjectConfig:
                 dict(data.get("frontend_design", {}))
             ),
             repo_map=RepoMapConfig.from_dict(dict(data.get("repo_map", {}))),
+            persistence=PersistenceConfig.from_dict(
+                dict(data.get("persistence", {}))
+                if isinstance(data.get("persistence", {}), dict)
+                else {}
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1144,6 +1252,7 @@ class ProjectConfig:
             "visual_judge": self.visual_judge.to_dict(),
             "frontend_design": self.frontend_design.to_dict(),
             "repo_map": self.repo_map.to_dict(),
+            "persistence": self.persistence.to_dict(),
         }
 
     @property
@@ -1194,6 +1303,7 @@ class RunState:
     task_failure_checkpoints: Dict[str, Dict[str, object]] = field(
         default_factory=dict
     )
+    persistence_actions: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -1269,6 +1379,11 @@ class RunState:
                 ).items()
                 if isinstance(value, dict)
             },
+            persistence_actions={
+                str(key): dict(value)
+                for key, value in dict(data.get("persistence_actions", {})).items()
+                if isinstance(value, dict)
+            },
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1309,6 +1424,9 @@ class RunState:
                 key: dict(value)
                 for key, value in self.task_failure_checkpoints.items()
             },
+            "persistence_actions": {
+                key: dict(value) for key, value in self.persistence_actions.items()
+            },
         }
 
 
@@ -1335,6 +1453,11 @@ class SessionState:
     baseline_git_ref: str = ""
     baseline_head_ref: str = ""
     baseline_commands: List[str] = field(default_factory=list)
+    persistence_change: Dict[str, object] = field(
+        default_factory=lambda: {"strategy": "none"}
+    )
+    persistence_actions: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    auto_approve: bool = False
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "SessionState":
@@ -1366,6 +1489,18 @@ class SessionState:
             baseline_git_ref=str(data.get("baseline_git_ref", "")),
             baseline_head_ref=str(data.get("baseline_head_ref", "")),
             baseline_commands=[str(item) for item in data.get("baseline_commands", [])],
+            persistence_change=(
+                dict(data.get("persistence_change", {}))
+                if isinstance(data.get("persistence_change", {}), dict)
+                else {"strategy": "none"}
+            )
+            or {"strategy": "none"},
+            persistence_actions={
+                str(key): dict(value)
+                for key, value in dict(data.get("persistence_actions", {})).items()
+                if isinstance(value, dict)
+            },
+            auto_approve=bool(data.get("auto_approve", False)),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1391,6 +1526,11 @@ class SessionState:
             "baseline_git_ref": self.baseline_git_ref,
             "baseline_head_ref": self.baseline_head_ref,
             "baseline_commands": list(self.baseline_commands),
+            "persistence_change": dict(self.persistence_change),
+            "persistence_actions": {
+                key: dict(value) for key, value in self.persistence_actions.items()
+            },
+            "auto_approve": self.auto_approve,
         }
 
 

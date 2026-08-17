@@ -21,6 +21,7 @@ from .config import (
     frontend_design_docs_dir,
     frontend_design_lock_path,
     frontend_prototype_dir,
+    load_project_config,
     load_run_state,
     project_brief_path,
     requirements_audit_path,
@@ -28,6 +29,7 @@ from .config import (
     run_path,
     run_state_path,
     save_run_state,
+    save_project_config,
     task_plan_path,
 )
 from .config import supported_provider_kinds
@@ -41,6 +43,7 @@ from .notifications import (
     notify_session_started,
 )
 from .orchestrator import Orchestrator
+from .models import PersistenceTargetConfig
 from .frontend_design import load_frontend_design_lock, validate_frontend_design_artifacts
 from .foreground_activity import ForegroundActivity
 from .process_supervision import (
@@ -69,7 +72,7 @@ from .self_repair import (
     auto_agents_repo_root,
     classify_auto_agents_error,
 )
-from .validation import validation_report
+from .validation import validate_persistence_config_payload, validation_report
 from .worker_cluster import (
     WORKER_API_PORT,
     create_pairing_invite,
@@ -118,6 +121,86 @@ def _format_command(*parts: str) -> str:
 
 def _load_cli_dotenv() -> None:
     load_dotenv([Path.cwd() / ".env"])
+
+
+def _configure_persistence_target(args: argparse.Namespace) -> dict:
+    project_root = Path(args.project).expanduser().resolve()
+    orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+    prompt = orchestrator._prompt_user
+
+    target_id = str(args.target_id).strip() or prompt(
+        "Persistence target id (for example local-sqlite): "
+    ).strip()
+    environment = str(args.environment).strip() or prompt(
+        "Environment (development/test/production): "
+    ).strip()
+    kind = str(args.kind).strip() or prompt(
+        "Target kind (local_file/compose_service): "
+    ).strip()
+
+    if kind == "local_file":
+        path = str(args.path).strip()
+        path_env = str(args.path_env).strip()
+        if not path and not path_env:
+            value = prompt(
+                "Project-relative database path, or prefix an env name with '$' (for example .data/app.db): "
+            ).strip()
+            if value.startswith("$"):
+                path_env = value[1:]
+            else:
+                path = value
+        locator = {key: value for key, value in {"path": path, "path_env": path_env}.items() if value}
+    else:
+        compose_file = str(args.compose_file).strip() or prompt(
+            "Project-relative compose file: "
+        ).strip()
+        services = list(args.service)
+        if not services:
+            services = [
+                item.strip()
+                for item in prompt("Comma-separated database service names: ").split(",")
+                if item.strip()
+            ]
+        locator = {"compose_file": compose_file, "services": services}
+
+    def command_argv(raw: str, label: str) -> list[str]:
+        value = str(raw).strip()
+        if not value and not bool(args.auto_approve):
+            value = prompt(f"{label} command (blank when not applicable): ").strip()
+        return shlex.split(value) if value else []
+
+    target = PersistenceTargetConfig(
+        target_id=target_id,
+        environment=environment,
+        kind=kind,
+        locator=locator,
+        associated_paths=[str(item) for item in args.associated_path],
+        apply_argv=command_argv(args.apply_command, "Migration/apply"),
+        initialize_argv=command_argv(args.initialize_command, "Initialize"),
+        reset_argv=command_argv(args.reset_command, "Reset"),
+        verify_argv=command_argv(args.verify_command, "Verify"),
+        timeout_seconds=int(args.timeout_seconds),
+    )
+    config = load_project_config(project_root)
+    remaining = [item for item in config.persistence.targets if item.target_id != target_id]
+    candidate_targets = [*remaining, target]
+    errors = validate_persistence_config_payload(
+        {"targets": [item.to_dict() for item in candidate_targets]}
+    )
+    if errors:
+        raise ValueError("invalid persistence target: " + "; ".join(errors))
+
+    summary = json.dumps(target.to_dict(), indent=2, ensure_ascii=False)
+    if not bool(args.auto_approve):
+        answer = prompt(
+            f"Register this persistence target?\n{summary}\n(y/n) [n]: ",
+            default="n",
+        )
+        if answer.strip().lower() not in {"y", "yes"}:
+            return {"ok": False, "cancelled": True, "target": target.to_dict()}
+    config.persistence.targets = candidate_targets
+    save_project_config(project_root, config)
+    return {"ok": True, "target": target.to_dict()}
 
 
 def _render_key_files(project_root: Path, state_payload: dict[str, object]) -> list[str]:
@@ -866,6 +949,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Bypass incremental gate certificates for this fix session.",
     )
+    fix_parser.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="Automatically approve a declared development/test persistence action.",
+    )
 
     collab_parser = subparsers.add_parser("collab", help="User-agent collaborative debugging session.")
     collab_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -891,6 +979,39 @@ def build_parser() -> argparse.ArgumentParser:
             "completion attestation."
         ),
     )
+    collab_parser.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="Automatically approve a declared development/test persistence action.",
+    )
+
+    persistence_parser = subparsers.add_parser(
+        "persistence-configure",
+        help="Register a human-classified persistence target.",
+    )
+    persistence_parser.add_argument("--project", required=True)
+    persistence_parser.add_argument("--id", dest="target_id", default="")
+    persistence_parser.add_argument(
+        "--environment",
+        choices=("development", "test", "production"),
+        default="",
+    )
+    persistence_parser.add_argument(
+        "--kind",
+        choices=("local_file", "compose_service"),
+        default="",
+    )
+    persistence_parser.add_argument("--path", default="")
+    persistence_parser.add_argument("--path-env", default="")
+    persistence_parser.add_argument("--compose-file", default="")
+    persistence_parser.add_argument("--service", action="append", default=[])
+    persistence_parser.add_argument("--associated-path", action="append", default=[])
+    persistence_parser.add_argument("--apply-command", default="")
+    persistence_parser.add_argument("--initialize-command", default="")
+    persistence_parser.add_argument("--reset-command", default="")
+    persistence_parser.add_argument("--verify-command", default="")
+    persistence_parser.add_argument("--timeout-seconds", type=int, default=300)
+    persistence_parser.add_argument("--auto-approve", action="store_true")
 
     provider_resolve_parser = subparsers.add_parser(
         "provider-resolve",
@@ -999,6 +1120,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _load_cli_dotenv()
+
+    if args.command == "persistence-configure":
+        try:
+            payload = _configure_persistence_target(args)
+        except (OSError, RuntimeError, ValueError) as error:
+            payload = {"ok": False, "error": str(error)}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if bool(payload.get("ok")) else 1
 
     if args.command == "cluster":
         try:
@@ -1495,6 +1624,8 @@ def main(argv: list[str] | None = None) -> int:
                 "mode": mode,
                 "print_agent_output": bool(args.print_agent_output),
             }
+            if bool(getattr(args, "auto_approve", False)):
+                session_kwargs["auto_approve"] = True
             if bool(getattr(args, "full_verify", False)):
                 session_kwargs["full_verify"] = True
             session = Session(orchestrator, **session_kwargs)

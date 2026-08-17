@@ -140,6 +140,11 @@
       "minimum": 1,
       "description": "Enables strict requirement oracle proof validation for new task plans."
     },
+    "persistence_contract_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Requires every active task to declare its persistence schema impact."
+    },
     "tasks": {
       "type": "array",
       "minItems": 1,
@@ -368,6 +373,39 @@
           "scope_boundaries": {
             "type": "string",
             "description": "Explicitly out-of-scope concerns for this task, guiding review boundaries."
+          },
+          "persistence_change": {
+            "type": "object",
+            "required": ["strategy"],
+            "properties": {
+              "strategy": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "initial_schema",
+                  "startup_compatible",
+                  "clean_break",
+                  "external_operator"
+                ]
+              },
+              "decision_id": {"type": "string", "minLength": 1},
+              "target_ids": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {"type": "string", "minLength": 1}
+              },
+              "to_version": {"type": "string", "minLength": 1},
+              "migration_artifacts": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "legacy_fixture_refs": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              }
+            },
+            "additionalProperties": false
           }
         },
         "additionalProperties": true
