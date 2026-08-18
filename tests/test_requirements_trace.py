@@ -18,6 +18,10 @@ from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, ProviderConfig, TaskSpec
 from auto_agents.frontend_fidelity import validate_frontend_fidelity_trace
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.provider_contract import (
+    PROVIDER_REFERENCE_CONTRACT_VERSION,
+    PROVIDER_REFERENCE_V2_HEADINGS,
+)
 from auto_agents.requirements import (
     audit_requirements,
     load_requirements_trace,
@@ -3703,7 +3707,15 @@ class RequirementsTraceTests(unittest.TestCase):
 
             def run(self, request):
                 self.calls += 1
-                write_text(self.project_root / self.reference, "# Provider\n\nrefreshed\n")
+                reference_lines = ["# Provider"]
+                for heading in PROVIDER_REFERENCE_V2_HEADINGS:
+                    reference_lines.extend(
+                        ["", f"## {heading}", "", "Not applicable: refreshed fixture."]
+                    )
+                write_text(
+                    self.project_root / self.reference,
+                    "\n".join(reference_lines) + "\n",
+                )
                 write_json(
                     provider_references_lock_path(self.project_root),
                     {
@@ -3712,6 +3724,7 @@ class RequirementsTraceTests(unittest.TestCase):
                             "provider": {
                                 "path": self.reference,
                                 "status": "verified",
+                                "contract_version": PROVIDER_REFERENCE_CONTRACT_VERSION,
                                 "retrieved_at": "2026-04-11T00:00:00Z",
                                 "source_urls": ["https://example.com/official"],
                                 "notes": "refreshed after review",

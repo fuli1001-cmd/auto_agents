@@ -36,6 +36,10 @@ from auto_agents.models import (
     VerificationStep,
 )
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.provider_contract import (
+    PROVIDER_REFERENCE_CONTRACT_VERSION,
+    PROVIDER_REFERENCE_V2_HEADINGS,
+)
 from auto_agents.validation import validation_report
 
 
@@ -1807,7 +1811,12 @@ class AuditRecoveryAdapter:
             self.provider_research_calls += 1
             reference_path = self.project_root / ".auto-agents" / "docs" / "provider_references" / "provider.md"
             reference_path.parent.mkdir(parents=True, exist_ok=True)
-            write_text(reference_path, "# Provider reference\n")
+            reference_lines = ["# Provider reference"]
+            for heading in PROVIDER_REFERENCE_V2_HEADINGS:
+                reference_lines.extend(
+                    ["", f"## {heading}", "", "Not applicable: recovery fixture."]
+                )
+            write_text(reference_path, "\n".join(reference_lines) + "\n")
             write_json(
                 provider_references_lock_path(self.project_root),
                 {
@@ -1816,6 +1825,7 @@ class AuditRecoveryAdapter:
                         "provider": {
                             "path": ".auto-agents/docs/provider_references/provider.md",
                             "status": "verified",
+                            "contract_version": PROVIDER_REFERENCE_CONTRACT_VERSION,
                             "retrieved_at": "2026-04-11T00:00:00Z",
                             "source_urls": ["https://example.com/official"],
                             "notes": "",

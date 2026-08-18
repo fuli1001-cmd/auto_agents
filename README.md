@@ -44,6 +44,24 @@ Review and commit happen inside the `implement` loop for each task, not as separ
 Deferred policy automatically coalesces the finalized commit into the release worker after the
 foreground workflow returns.
 
+## Provider content-safety contract
+
+New or refreshed external-provider references use contract version 2. In addition to authentication,
+request, response, and error details, each reference must document prompt/content construction,
+content-policy outcomes, semantic error routing, and the retry/recovery matrix. The provider-research
+gate rejects a refreshed reference that omits those sections or does not set `contract_version: 2`
+in its lock entry. Existing verified legacy references remain reusable until a run creates or refreshes
+them.
+
+Clarify, design, plan, implement, review, fix, and collab prompts share the same provider boundary
+rules: body-level provider semantics take precedence over coarse HTTP fallback; recognizable safety
+or refusal outcomes remain distinct from malformed requests and transient failures; unchanged
+safety-blocked requests are never retried blindly; and any transformed retry must be explicitly
+bounded by the product/provider contract. Generated provider-facing content should be positive-first,
+deduplicated, and selected from templates compatible with the typed subject. Provider-specific codes,
+messages, and transformations belong in the target project's pinned provider reference, not in
+auto_agents core.
+
 ## Environment isolation policy
 
 The workflow now treats environment isolation as a hard rule rather than a suggestion.

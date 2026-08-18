@@ -172,6 +172,13 @@ from .models import (
     VerificationStep,
 )
 from .provider_limits import ParallelTuningStore, provider_limit
+from .provider_contract import (
+    format_provider_reference_v2_errors,
+    provider_policy_prompt_lines,
+    provider_reference_contract_version,
+    provider_reference_lock_entry,
+    validate_provider_reference_v2,
+)
 from .persistence import (
     PersistenceContractError,
     build_persistence_action_manifest,
@@ -12899,6 +12906,11 @@ class Orchestrator:
 
         provider_references_dir(self.project_root).mkdir(parents=True, exist_ok=True)
         prompt = self._build_provider_research_prompt(unresolved)
+        upgrade_reference_paths = {
+            reference
+            for requirement in unresolved
+            for reference in provider_reference_paths(requirement)
+        }
         if state.rejected_stage == "provider_research" and state.rejection_reason:
             prompt += (
                 "\n\nThe previous provider research output was rejected. Please address this feedback:\n"
@@ -12914,6 +12926,7 @@ class Orchestrator:
             validation_feedback=lambda agent_result: self._provider_research_validation_feedback(
                 agent_result,
                 requirement_ids=current_requirement_ids,
+                upgrade_reference_paths=upgrade_reference_paths,
             ),
             effort=self.config.efforts.get("provider_research", "deep"),
         )
@@ -13028,6 +13041,25 @@ class Orchestrator:
                         }
                     )
                     continue
+                lock_entry = provider_reference_lock_entry(lock, reference)
+                if (
+                    provider_reference_contract_version(lock_entry)
+                    >= 2
+                ):
+                    contract_errors = validate_provider_reference_v2(
+                        ref_path,
+                        lock_entry,
+                    )
+                    if contract_errors:
+                        blockers.append(
+                            {
+                                "requirement_id": req_id,
+                                "reference": reference,
+                                "status": "invalid_contract",
+                                "reason": "; ".join(contract_errors),
+                            }
+                        )
+                        continue
                 if not self._is_resolved_provider_reference_status(normalized_status):
                     blockers.append(
                         {
@@ -14817,6 +14849,7 @@ class Orchestrator:
             "If official docs are unavailable or ambiguous, write a blocked/needs_user_input reference with the exact missing information and recovery options.",
             "Update provider_references.lock.json with one entry per provider reference. Each entry must include path, status, retrieved_at, source_urls, and notes.",
             "Allowed lock statuses: verified, blocked, needs_user_input, ambiguous, deferred, temporary_stub, assumption_approved.",
+            *provider_policy_prompt_lines("provider_research"),
             "Final response: 3 short bullets summarizing references created or blockers found.",
             "",
             req_context,
@@ -15000,6 +15033,7 @@ class Orchestrator:
                 "If a requirement needs one external provider protocol or official API doc, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/. If it needs several provider docs, set provider_references to local paths under that directory and keep provider_reference empty or set to the primary path.",
                 "Use oracle_type to name the primary proof mechanism (for example deterministic_test, integration_test, runtime_evidence, judge_model, benchmark, human_review, or mixed). Use oracle_strength to record the minimum acceptable fidelity (proxy, behavioral, semantic, or human). Use evidence_boundary to say where proof must come from (internal_state, system_boundary, or external_side_effect). Record any checks that must NOT be treated as sufficient in forbidden_proxy_oracles.",
                 "For requirements that remove, forbid, or replace old behavior, add precise forbidden_patterns regexes for stale terms or old semantic claims so requirements audit can scan code, tests, and docs. Prefer narrow patterns that catch positive stale claims without matching the new negative requirement text. Never combine DOTALL with unbounded .* or .+ spans; use explicit bounded spans such as [\\s\\S]{0,500}? when cross-line context is required.",
+                *provider_policy_prompt_lines("clarify"),
                 self._clarify_spec_instruction(spec_kind),
                 self._document_language_instruction(),
             ]
@@ -15041,6 +15075,7 @@ class Orchestrator:
                 "Preserve the exact top-level and section headings already present in the file.",
                 "Architecture.md must not contradict any active mandatory requirement, acceptance oracle, forbidden proxy oracle, or forbidden_patterns entry in requirements_trace.json.",
                 "For each new or updated active mandatory requirement that changes architecture semantics, remove or rewrite stale architecture text and document the current contract.",
+                *provider_policy_prompt_lines("design"),
                 self._design_spec_instruction(spec_kind),
                 self._document_language_instruction(),
             ]
@@ -15091,6 +15126,7 @@ class Orchestrator:
                 "For negative contract requirements such as 'must not contain', '不得', '不包含', or '不返回', preserve every concrete field/path/API token from the requirement in the task acceptance. For example, a requirement that forbids `tasks[].result` is NOT covered by only omitting `retry_trace`.",
                 "Preserve each bound requirement's oracle_type, oracle_strength, evidence_boundary, and forbidden_proxy_oracles when slicing tasks. Requirements that demand semantic or human-strength proof are NOT satisfied by proxy checks, internal-state-only checks, config-only checks, or metadata/log snapshots. Requirements that demand system_boundary or external_side_effect evidence are NOT covered unless the task acceptance requires proof at that boundary.",
                 "If a requirement has external_docs_required=true, create at least one implementation task that consumes its provider_reference/provider_references and tests against those protocol references.",
+                *provider_policy_prompt_lines("plan"),
                 "Choose the smallest practical automated verification strategy for this stack.",
                 "If this is a Python project, require a project-local conda env at ./.conda.",
                 "If tests or runtime helpers need mutable local artifacts (for example sqlite DBs, temp configs, fixtures, caches, or downloaded samples), place them under ignored temp/data paths such as ./.tmp/, ./.tmp-tests/, or ./.data/ rather than tracked repo-root files.",
@@ -15475,6 +15511,7 @@ class Orchestrator:
                 "Python tests must not contact real external services by accident. Use explicit fakes/mocks or test adapters for object storage, providers, databases, and network clients.",
                 "Use per-test unique temp paths for mutable artifacts such as sqlite databases, object-storage roots, caches, and generated fixtures so repeated, resumed, or mixed-runner verification cannot reuse stale state.",
                 "For external provider integrations, use the listed provider_reference/provider_references files as the source of truth. Do not search for alternate docs or invent protocol details unless the reference is marked insufficient; stop and report missing documentation instead.",
+                *provider_policy_prompt_lines("implement"),
                 "For protocol/direct-integration tasks, add contract tests that verify outbound request shape, auth/header behavior, response normalization, and forbidden legacy payloads where applicable.",
                 "If this is a Python project, create and use a project-local conda env at ./.conda and install packages only inside it.",
                 "Do not use '.conda' as a generic directory, pip target, virtualenv, or venv path. It must remain a real conda prefix created with 'conda create -p ./.conda ...', including '.conda/conda-meta'.",
@@ -15518,6 +15555,7 @@ class Orchestrator:
                 "or requirement ID/oracle/proof entry that is not satisfied. If no acceptance criterion or requirement oracle is violated but you have advisory concerns, "
                 "issue 'DECISION: pass' with those concerns listed as '[NON-BLOCKING]' notes.",
                 "For external provider integrations, verify the code and tests against the provider_reference/provider_references files. Fail if the implementation invents protocol fields, reuses a legacy private gateway payload, or tests only mock an internal gateway contract.",
+                *provider_policy_prompt_lines("review"),
                 "Also fail when the implementation uses a weaker oracle than the requirement allows (for example: proxy-only checks for semantic/human requirements, internal-state-only checks for system_boundary/external_side_effect requirements, or any check explicitly listed in forbidden_proxy_oracles).",
                 "Also fail frontend/prototype visual fidelity proofs when evidence_refs lack page-level visual evidence such as browser screenshots, visual snapshots, Playwright checks, or equivalent rendered-surface validation. Payload-only tests, route existence, or component-count checks cannot be the sole proof for matching a prototype.",
                 "If visual_evidence is present for prototype fidelity, check that it pairs prototype_image_ref and actual_image_ref for the same surface/viewport and the same intended UI state; incorrect, missing, layout-stability-only, or state-transition-only screenshot pairs are blocking for visual fidelity requirements. Non-comparison screenshots should be marked purpose='layout_stability'/'state_transition' with visual_judge=false instead of being treated as prototype_fidelity.",
@@ -18168,6 +18206,7 @@ class Orchestrator:
         _: AgentResult,
         *,
         requirement_ids: Optional[Iterable[str]] = None,
+        upgrade_reference_paths: Optional[Iterable[str]] = None,
     ) -> Optional[str]:
         trace = load_requirements_trace(self.project_root)
         lock = load_provider_references_lock(self.project_root)
@@ -18177,6 +18216,11 @@ class Orchestrator:
             else None
         )
         missing = []
+        upgrade_paths = (
+            {str(item).strip() for item in upgrade_reference_paths if str(item).strip()}
+            if upgrade_reference_paths is not None
+            else set()
+        )
         refs = lock.get("references", {}) if isinstance(lock, dict) else {}
         if not isinstance(refs, dict):
             return "provider_references.lock.json must contain a 'references' object"
@@ -18195,6 +18239,16 @@ class Orchestrator:
                 ref_path = self.project_root / reference
                 if not ref_path.exists():
                     missing.append(f"{req_id}: missing provider reference file {reference}")
+                if reference in upgrade_paths:
+                    missing.extend(
+                        format_provider_reference_v2_errors(
+                            reference,
+                            validate_provider_reference_v2(
+                                ref_path,
+                                provider_reference_lock_entry(lock, reference),
+                            ),
+                        )
+                    )
         if missing:
             bullets = "\n".join(f"- {item}" for item in missing)
             return (

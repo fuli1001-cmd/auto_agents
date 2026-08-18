@@ -50,6 +50,7 @@ from .persistence import (
     persistence_candidate_fingerprint,
     persistence_change_strategy,
 )
+from .provider_contract import provider_policy_prompt_lines
 from .requirements import (
     load_requirements_trace,
     validate_provider_resolve_trace_transition,
@@ -1354,6 +1355,7 @@ class Session:
             "- record approval context in notes, never in source, text, or another proof-bearing contract field",
             "- contract_sha256 and provider lock consumer contract hashes are engine-owned; do not calculate or edit them",
             "- do not add, remove, reorder, reactivate, or supersede requirements in provider-resolve",
+            *provider_policy_prompt_lines("provider_research"),
             "",
             "Final response: brief status update of what you changed and why.",
         ])
@@ -1388,6 +1390,7 @@ class Session:
             "2. Apply the minimal fix",
             "3. Update or add tests to cover the fix",
             "4. Do not modify .auto-agents state files",
+            *provider_policy_prompt_lines("fix"),
             "If this is a Python project, use the project-local conda env at ./.conda and install packages only inside it.",
             "",
             "Final response: short summary of what you changed and why.",
@@ -1540,6 +1543,7 @@ class Session:
             "- If you start background servers, verify they are healthy (e.g., curl health-check) before using them.",
             "- Report progress after each significant action so progress is visible.",
             "- If an operation is taking too long or keeps failing, stop and output BUG_FOUND with the error details.",
+            *provider_policy_prompt_lines("collab"),
             "",
             "If this is a Python project, use the project-local conda env at ./.conda and install packages only inside it.",
             "Do not modify .auto-agents state files.",
