@@ -9734,6 +9734,23 @@ class Orchestrator:
                 reason="execution.recovery.enabled is false",
             )
             return False
+
+        task_index = next(
+            (
+                index
+                for index, candidate in enumerate(tasks)
+                if candidate.task_id == task.task_id
+            ),
+            None,
+        )
+        if task_index is None:
+            raise RuntimeError(
+                "cannot schedule recovery for a task that is absent from the active plan; "
+                f"task_id={task.task_id}"
+            )
+        # State reloads replace TaskSpec instances. Recovery identity is the stable
+        # task_id, not equality across mutable status, dependency, and history fields.
+        task = tasks[task_index]
         if reason == "review rejected the task":
             return self._recover_review_rejected_task(
                 state,
@@ -9865,8 +9882,7 @@ class Orchestrator:
                 )
             )
 
-        insert_at = tasks.index(task)
-        tasks[insert_at:insert_at] = repair_tasks
+        tasks[task_index:task_index] = repair_tasks
         task.status = "pending"
         task.commit_sha = ""
         task.recovery_round = round_number

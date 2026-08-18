@@ -46,6 +46,7 @@ from .orchestrator import Orchestrator
 from .models import PersistenceTargetConfig
 from .frontend_design import load_frontend_design_lock, validate_frontend_design_artifacts
 from .foreground_activity import ForegroundActivity
+from .git_ops import changed_paths
 from .process_supervision import (
     ACTIVE_PROCESSES,
     RunInterruptedError,
@@ -64,6 +65,7 @@ from .release_attestation import (
 )
 from .release_worker import ensure_release_worker, run_release_worker
 from .self_repair import (
+    SELF_REPAIR_DISABLED_ENV,
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
     SelfRepairTriageResult,
@@ -121,6 +123,58 @@ def _format_command(*parts: str) -> str:
 
 def _load_cli_dotenv() -> None:
     load_dotenv([Path.cwd() / ".env"])
+
+
+SELF_REPAIR_STRICT_ENV = "AUTO_AGENTS_SELF_REPAIR_STRICT"
+
+
+def _truthy_environment_flag(values: dict[str, str], name: str) -> bool:
+    return str(values.get(name, "")).strip().lower() in {"1", "true", "yes"}
+
+
+def _preflight_automatic_self_repair(args, *, env: Optional[dict[str, str]] = None) -> Optional[int]:
+    """Warn early when a run cannot use the automatic self-repair path."""
+    if getattr(args, "command", "") != "run":
+        return None
+
+    values = os.environ if env is None else env
+    if _truthy_environment_flag(values, SELF_REPAIR_DISABLED_ENV):
+        return None
+
+    repo_root = auto_agents_repo_root()
+    try:
+        dirty = changed_paths(repo_root)
+    except RuntimeError as error:
+        detail = f"could not inspect {repo_root}: {error}"
+    else:
+        if not dirty:
+            return None
+        preview = ", ".join(dirty[:8])
+        if len(dirty) > 8:
+            preview += f", ... ({len(dirty)} paths total)"
+        detail = f"working tree is not clean; changed paths: {preview}"
+
+    message = (
+        "automatic auto_agents self-repair is unavailable because "
+        f"{detail}. Normal run can continue, but an auto_agents-owned failure "
+        "cannot be repaired automatically until this repository is clean."
+    )
+    strict = bool(getattr(args, "strict_self_repair", False)) or _truthy_environment_flag(
+        values,
+        SELF_REPAIR_STRICT_ENV,
+    )
+    if strict:
+        print(
+            json.dumps(
+                {"ok": False, "error": f"self-repair preflight failed: {message}"},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 2
+
+    print(f"WARNING: {message}", file=sys.stderr)
+    return None
 
 
 def _configure_persistence_target(args: argparse.Namespace) -> dict:
@@ -561,6 +615,8 @@ def _run_command_for_self_repair_resume(args) -> list[str]:
         command.extend(["--doc-language", str(args.doc_language)])
     if bool(getattr(args, "no_repo_map", False)):
         command.append("--no-repo-map")
+    if bool(getattr(args, "strict_self_repair", False)):
+        command.append("--strict-self-repair")
     return command
 
 
@@ -817,6 +873,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--full-verify",
         action="store_true",
         help="Bypass incremental gate certificates and execute every final shard.",
+    )
+    run_parser.add_argument(
+        "--strict-self-repair",
+        action="store_true",
+        help=(
+            "Fail before starting when automatic self-repair is enabled but the "
+            "auto_agents repository is not clean."
+        ),
     )
 
     stop_parser = subparsers.add_parser(
@@ -1120,6 +1184,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _load_cli_dotenv()
+
+    self_repair_preflight_exit = _preflight_automatic_self_repair(args)
+    if self_repair_preflight_exit is not None:
+        return self_repair_preflight_exit
 
     if args.command == "persistence-configure":
         try:

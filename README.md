@@ -1359,6 +1359,13 @@ show an auto_agents routing invariant mismatch, and that invariant repair is cap
 Before a destructive review/scope rewind, the engine preserves the task, failure IDs, changed paths,
 owner route, and worktree fingerprint under the run's `recovery_incidents/` directory.
 
+At `run` startup, auto_agents checks whether its own repository is clean whenever automatic
+self-repair is enabled. A dirty auto_agents checkout produces an immediate warning: the normal target
+run continues, but automatic self-repair remains unavailable until the checkout is clean. Use
+`--strict-self-repair` (or `AUTO_AGENTS_SELF_REPAIR_STRICT=1`) to fail at startup instead of continuing.
+The `fix` and `collab` commands do not currently invoke automatic auto_agents self-repair, so this
+preflight applies only to `run`.
+
 Implementation resume is task-aware rather than fully transactional:
 
 - if a task is already marked `in_progress`, the next run first tries to continue from

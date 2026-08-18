@@ -12,7 +12,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.cli import main
+from auto_agents.cli import (
+    SELF_REPAIR_STRICT_ENV,
+    _preflight_automatic_self_repair,
+    build_parser,
+    main,
+)
 from auto_agents.adapters.codex import CodexAdapter
 from auto_agents.config import (
     DEFAULT_CONFIG,
@@ -1136,6 +1141,73 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(exit_code, 3)
             self.assertFalse(payload["ok"])
             self.assertIn("Expecting property name enclosed in double quotes", payload["error"])
+
+    def test_dirty_auto_agents_checkout_warns_before_run_but_allows_normal_work(self) -> None:
+        args = build_parser().parse_args(["run", "--project", "/tmp/demo"])
+        stderr = io.StringIO()
+
+        with (
+            patch("auto_agents.cli.changed_paths", return_value=["README.md", "src/change.py"]),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = _preflight_automatic_self_repair(args, env={})
+
+        self.assertIsNone(exit_code)
+        self.assertIn("Normal run can continue", stderr.getvalue())
+        self.assertIn("README.md", stderr.getvalue())
+        self.assertIn("automatic auto_agents self-repair is unavailable", stderr.getvalue())
+
+    def test_strict_self_repair_rejects_dirty_checkout_before_run(self) -> None:
+        stdout = io.StringIO()
+
+        with (
+            patch.dict(os.environ, {SELF_REPAIR_DISABLED_ENV: ""}, clear=False),
+            patch("auto_agents.cli.changed_paths", return_value=["src/change.py"]),
+            patch(
+                "auto_agents.cli.Orchestrator",
+                side_effect=AssertionError("strict preflight must run before orchestration"),
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = main(
+                ["run", "--project", "/tmp/demo", "--strict-self-repair"]
+            )
+
+        self.assertEqual(exit_code, 2)
+        payload = json.loads(stdout.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertIn("self-repair preflight failed", payload["error"])
+        self.assertIn("src/change.py", payload["error"])
+
+    def test_self_repair_preflight_respects_disable_env_and_session_scope(self) -> None:
+        parser = build_parser()
+        run_args = parser.parse_args(["run", "--project", "/tmp/demo"])
+        with patch(
+            "auto_agents.cli.changed_paths",
+            side_effect=AssertionError("disabled self-repair must not inspect its checkout"),
+        ):
+            self.assertIsNone(
+                _preflight_automatic_self_repair(
+                    run_args,
+                    env={SELF_REPAIR_DISABLED_ENV: "true"},
+                )
+            )
+
+        for command in ("fix", "collab"):
+            with self.subTest(command=command):
+                args = parser.parse_args([command, "--project", "/tmp/demo"])
+                with patch(
+                    "auto_agents.cli.changed_paths",
+                    side_effect=AssertionError(
+                        "commands without self-repair must not inspect its checkout"
+                    ),
+                ):
+                    self.assertIsNone(
+                        _preflight_automatic_self_repair(
+                            args,
+                            env={SELF_REPAIR_STRICT_ENV: "true"},
+                        )
+                    )
 
     def test_self_repair_classifier_accepts_gate_scope_mismatch_only(self) -> None:
         scope_error = (

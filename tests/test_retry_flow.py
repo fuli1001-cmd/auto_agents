@@ -6105,6 +6105,57 @@ class RetryFlowTests(unittest.TestCase):
                 stream.getvalue(),
             )
 
+    def test_recovery_scheduling_resolves_stale_task_instance_by_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            failure_id = "tests/test_contract.py::test_observable_contract"
+            current_task = TaskSpec(
+                task_id="task-349",
+                title="Current task",
+                description="Verify the provider reference.",
+                acceptance=["The observable contract passes."],
+                status="pending",
+                verification_refs=[failure_id],
+            )
+            stale_task = TaskSpec(
+                task_id="task-349",
+                title="Current task",
+                description="Verify the provider reference.",
+                acceptance=["The observable contract passes."],
+                status="in_progress",
+                depends_on=["completed-old-repair"],
+                verification_refs=[failure_id],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [current_task]
+
+            scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                state,
+                state.tasks,
+                stale_task,
+                {
+                    "reason": "1 new verification failure vs task baseline",
+                    "review": "The observable contract still fails.",
+                    "failure_ids": [failure_id],
+                    "comparable_failures": True,
+                },
+            )
+
+            self.assertTrue(scheduled)
+            self.assertEqual(
+                [task.task_id for task in state.tasks],
+                ["repair-task-349-r1-1", "task-349"],
+            )
+            canonical = state.tasks[1]
+            self.assertIs(canonical, current_task)
+            self.assertEqual(canonical.status, "pending")
+            self.assertEqual(canonical.depends_on, ["repair-task-349-r1-1"])
+            self.assertEqual(canonical.recovery_round, 1)
+            self.assertEqual(canonical.verify_retry_epoch, 1)
+            self.assertEqual(stale_task.status, "in_progress")
+
     def test_verification_failed_evidence_repair_reenters_judged_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
