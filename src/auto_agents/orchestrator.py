@@ -282,6 +282,7 @@ class StageOwnershipRouteError(RuntimeError):
 
 VERIFY_BASELINE_SCHEMA_VERSION = 1
 IMPLEMENTATION_SCOPE_POLICY_VERSION = 4
+EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT = 2
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
 _NON_COMPARABLE_BASELINE_PREFIXES = (
@@ -13736,18 +13737,26 @@ class Orchestrator:
                 raise ValueError("invalid EVIDENCE_PREFLIGHT response")
             required_mutations = parsed.get("required_mutations", [])
             if isinstance(required_mutations, list):
-                mutation_paths = [
-                    str(item.get("path", "")).strip()
-                    for item in required_mutations
-                    if isinstance(item, dict) and str(item.get("path", "")).strip()
-                ]
-                owner_stage = self._scope_violation_rewind_stage(mutation_paths)
+                owner_stage, mutation_paths = (
+                    self._actionable_preflight_upstream_mutations(
+                        task,
+                        required_mutations,
+                    )
+                )
                 if owner_stage:
                     parsed["decision"] = "ROUTE"
                     parsed["target_stage"] = owner_stage
                     parsed["reason"] = (
                         f"{parsed['reason']} Required mutation(s) are owned by "
                         f"{owner_stage}: {', '.join(mutation_paths)}"
+                    )
+                elif parsed.get("decision") == "ROUTE" and required_mutations:
+                    parsed["decision"] = "READY"
+                    parsed["target_stage"] = ""
+                    parsed["reason"] = (
+                        f"{parsed['reason']} All requested upstream mutations already "
+                        "satisfy their bound contracts; remaining mutations are "
+                        "implementation-owned."
                     )
             self._emit_agent_metrics(
                 stage_key,
@@ -13783,6 +13792,12 @@ class Orchestrator:
 
         parsed["fingerprint"] = fingerprint
         task.evidence_preflight = parsed
+        if parsed["decision"] == "READY":
+            route_history = state.resume_context.get("evidence_preflight_routes", {})
+            if isinstance(route_history, dict) and task.task_id in route_history:
+                route_history.pop(task.task_id, None)
+                state.resume_context["evidence_preflight_routes"] = route_history
+                save_run_state(self.project_root, state)
         self._persist_tasks(state.tasks if state.tasks else [task])
         self.logger.info(
             "[evidence-preflight] task=%s cache=miss decision=%s checklist=%s",
@@ -13791,6 +13806,75 @@ class Orchestrator:
             len(parsed.get("checklist", [])),
         )
         return parsed if parsed["decision"] != "READY" else None
+
+    def _actionable_preflight_upstream_mutations(
+        self,
+        task: TaskSpec,
+        required_mutations: Iterable[object],
+    ) -> Tuple[str, List[str]]:
+        """Return only unresolved mutations owned by a pre-implement stage."""
+        trace = load_requirements_trace(self.project_root)
+        task_requirement_ids = {
+            str(requirement_id).strip()
+            for requirement_id in task.requirement_ids
+            if str(requirement_id).strip()
+        }
+        expected_provider_refs: Set[str] = set()
+        for requirement in external_doc_requirements(trace):
+            requirement_id = str(requirement.get("id", "")).strip()
+            if task_requirement_ids and requirement_id not in task_requirement_ids:
+                continue
+            expected_provider_refs.update(
+                self._normalize_audit_blocker_path(path)
+                for path in provider_reference_paths(requirement)
+                if self._normalize_audit_blocker_path(path)
+            )
+
+        blockers = self.provider_research_blockers(
+            requirement_ids=task_requirement_ids or None
+        )
+        blocked_provider_refs = {
+            self._normalize_audit_blocker_path(blocker.get("reference", ""))
+            for blocker in blockers
+            if self._normalize_audit_blocker_path(blocker.get("reference", ""))
+        }
+        provider_lock = self._normalize_audit_blocker_path(
+            self._relative_repo_path(provider_references_lock_path(self.project_root))
+        )
+
+        actionable: List[str] = []
+        owners: Set[str] = set()
+        for item in required_mutations:
+            if not isinstance(item, dict):
+                continue
+            path = self._normalize_audit_blocker_path(item.get("path", ""))
+            if not path:
+                continue
+            owner = self._forbidden_pattern_owner_stage({"path": path})
+            if owner == "provider_research":
+                known_satisfied_reference = (
+                    path in expected_provider_refs
+                    and path not in blocked_provider_refs
+                )
+                satisfied_lock = (
+                    path == provider_lock
+                    and bool(expected_provider_refs)
+                    and not blockers
+                )
+                if known_satisfied_reference or satisfied_lock:
+                    continue
+            if (
+                owner in STAGE_ORDER
+                and STAGE_ORDER.index(owner) < STAGE_ORDER.index("implement")
+            ):
+                owners.add(owner)
+                actionable.append(path)
+
+        if not actionable:
+            return "", []
+        if len(owners) == 1:
+            return next(iter(owners)), list(dict.fromkeys(actionable))
+        return "plan", list(dict.fromkeys(actionable))
 
     def _build_evidence_preflight_prompt(self, task: TaskSpec) -> str:
         requirement_context = format_requirement_context(
@@ -13872,6 +13956,49 @@ class Orchestrator:
             if decision == "ROUTE"
             else "plan" if decision == "SPLIT" else "clarify"
         )
+        route_paths = sorted(
+            {
+                self._normalize_audit_blocker_path(item.get("path", ""))
+                for item in result.get("required_mutations", []) or []
+                if isinstance(item, dict)
+                and self._normalize_audit_blocker_path(item.get("path", ""))
+            }
+        )
+        route_identity = hashlib.sha256(
+            json.dumps(
+                {
+                    "task_id": task.task_id,
+                    "target_stage": target_stage,
+                    "paths": route_paths,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        route_history = state.resume_context.get("evidence_preflight_routes", {})
+        if not isinstance(route_history, dict):
+            route_history = {}
+        prior = route_history.get(task.task_id, {})
+        repeat = (
+            int(prior.get("repeat", 0) or 0) + 1
+            if isinstance(prior, dict)
+            and str(prior.get("identity", "")) == route_identity
+            else 1
+        )
+        route_history[task.task_id] = {
+            "identity": route_identity,
+            "repeat": repeat,
+            "target_stage": target_stage,
+            "paths": route_paths,
+        }
+        state.resume_context["evidence_preflight_routes"] = route_history
+        if repeat >= EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT:
+            state.last_error = (
+                "evidence preflight made no progress: the same owner-stage route "
+                f"repeated for {task.task_id}; target_stage={target_stage}; "
+                f"paths={', '.join(route_paths) or '(none)'}"
+            )
+            save_run_state(self.project_root, state)
+            raise RuntimeError(state.last_error)
         task.status = "pending"
         self._persist_tasks(tasks)
         self._rewind_state_from_stage(state, target_stage)

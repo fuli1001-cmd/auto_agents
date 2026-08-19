@@ -849,6 +849,70 @@ class GateOptimizationTests(unittest.TestCase):
 
 
 class EvidencePreflightTests(unittest.TestCase):
+    def _provider_contract_task(
+        self,
+        root: Path,
+        *,
+        valid_reference: bool,
+    ) -> tuple[Orchestrator, TaskSpec]:
+        Orchestrator.init_project(root, "demo", "mock")
+        reference = ".auto-agents/docs/provider_references/image.md"
+        requirement = _requirement("")
+        requirement.update(
+            external_docs_required=True,
+            provider_reference=reference,
+            forbidden_patterns=[],
+        )
+        write_json(
+            root / ".auto-agents" / "state" / "requirements_trace.json",
+            {"version": 1, "requirements": [requirement]},
+        )
+        if valid_reference:
+            headings = (
+                "Status",
+                "Retrieved at",
+                "Official sources",
+                "Authentication",
+                "Request",
+                "Response",
+                "Prompt / Content Construction",
+                "Safety / Content Policy",
+                "Semantic Error Routing",
+                "Retry / Recovery Matrix",
+                "Contract Test Requirements",
+                "Unknowns / Ambiguities",
+            )
+            markdown = "# Provider\n" + "".join(
+                f"\n## {heading}\n\nNot applicable: covered by this fixture.\n"
+                for heading in headings
+            )
+        else:
+            markdown = "# Broken provider reference\n"
+        write_text(root / reference, markdown)
+        write_json(
+            root / ".auto-agents" / "state" / "provider_references.lock.json",
+            {
+                "version": 1,
+                "references": {
+                    "image": {
+                        "path": reference,
+                        "status": "verified",
+                        "contract_version": 2,
+                        "retrieved_at": "2026-08-19T00:00:00Z",
+                        "source_urls": ["https://provider.example/docs"],
+                        "notes": "fixture",
+                    }
+                },
+            },
+        )
+        return Orchestrator(root), TaskSpec(
+            task_id="task-provider",
+            title="Provider contract",
+            description="Consume the provider reference and add its contract test.",
+            acceptance=["Provider contract is proven."],
+            requirement_ids=["REQ-001"],
+        )
+
     def test_parse_ready_and_reject_invalid_payload(self) -> None:
         parsed = Orchestrator._parse_evidence_preflight(
             'EVIDENCE_PREFLIGHT: {"decision":"READY","reason":"feasible","checklist":["boundary test"]}'
@@ -868,6 +932,70 @@ class EvidencePreflightTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed["decision"], "ROUTE")
         self.assertEqual(parsed["target_stage"], "provider_research")
+
+    def test_satisfied_provider_mutations_do_not_route_implementation_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator, task = self._provider_contract_task(
+                root,
+                valid_reference=True,
+            )
+
+            owner, paths = orchestrator._actionable_preflight_upstream_mutations(
+                task,
+                [
+                    {
+                        "path": ".auto-agents/docs/provider_references/image.md",
+                        "reason": "refresh reference",
+                    },
+                    {
+                        "path": ".auto-agents/state/provider_references.lock.json",
+                        "reason": "refresh lock",
+                    },
+                    {
+                        "path": "tests/test_provider.py",
+                        "reason": "add contract proof",
+                    },
+                ],
+            )
+
+            self.assertEqual(owner, "")
+            self.assertEqual(paths, [])
+
+    def test_invalid_provider_mutations_route_to_provider_research(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator, task = self._provider_contract_task(
+                root,
+                valid_reference=False,
+            )
+
+            owner, paths = orchestrator._actionable_preflight_upstream_mutations(
+                task,
+                [
+                    {
+                        "path": ".auto-agents/docs/provider_references/image.md",
+                        "reason": "repair reference",
+                    },
+                    {
+                        "path": ".auto-agents/state/provider_references.lock.json",
+                        "reason": "repair lock",
+                    },
+                    {
+                        "path": "tests/test_provider.py",
+                        "reason": "add contract proof",
+                    },
+                ],
+            )
+
+            self.assertEqual(owner, "provider_research")
+            self.assertEqual(
+                paths,
+                [
+                    ".auto-agents/docs/provider_references/image.md",
+                    ".auto-agents/state/provider_references.lock.json",
+                ],
+            )
 
     def test_routing_happens_before_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -890,6 +1018,32 @@ class EvidencePreflightTests(unittest.TestCase):
             )
             self.assertEqual(routed.current_stage, "plan")
             self.assertEqual(task.status, "pending")
+
+    def test_repeated_identical_preflight_route_stops_without_looping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            from auto_agents.config import load_run_state
+
+            state = load_run_state(root)
+            task = orchestrator._load_tasks_from_plan()[0]
+            tasks = [task]
+            result = {
+                "decision": "ROUTE",
+                "target_stage": "provider_research",
+                "reason": "reference requires refresh",
+                "required_mutations": [
+                    {
+                        "path": ".auto-agents/docs/provider_references/image.md",
+                        "reason": "refresh reference",
+                    }
+                ],
+            }
+
+            orchestrator._route_evidence_preflight(state, tasks, task, result)
+            with self.assertRaisesRegex(RuntimeError, "made no progress"):
+                orchestrator._route_evidence_preflight(state, tasks, task, result)
 
     def test_cached_ready_result_skips_provider_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
