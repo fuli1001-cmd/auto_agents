@@ -306,7 +306,7 @@ def load_frontend_design_lock(project_root: Path) -> dict:
 
 
 def frontend_design_contract_payload(lock_payload: Mapping[str, object]) -> Dict[str, object]:
-    return {
+    payload = {
         "version": lock_payload.get("version"),
         "source": lock_payload.get("source"),
         "candidates": lock_payload.get("candidates"),
@@ -315,6 +315,9 @@ def frontend_design_contract_payload(lock_payload: Mapping[str, object]) -> Dict
         "prototype": lock_payload.get("prototype"),
         "artifact_sha256": lock_payload.get("artifact_sha256"),
     }
+    if str(lock_payload.get("variant_id", "")).strip():
+        payload["variant_id"] = str(lock_payload["variant_id"]).strip()
+    return payload
 
 
 def frontend_design_contract_sha256(lock_payload: Mapping[str, object]) -> str:
@@ -452,7 +455,13 @@ def validate_frontend_design_artifacts(
     return errors
 
 
-def validate_prototype_manifest(project_root: Path, payload: object, *, max_pages: int) -> List[str]:
+def validate_prototype_manifest(
+    project_root: Path,
+    payload: object,
+    *,
+    max_pages: int,
+    prototype_root: Optional[Path] = None,
+) -> List[str]:
     errors: List[str] = []
     if not isinstance(payload, Mapping):
         return ["frontend prototype manifest must be an object"]
@@ -468,7 +477,11 @@ def validate_prototype_manifest(project_root: Path, payload: object, *, max_page
     ):
         errors.append("frontend prototype manifest viewports must be WIDTHxHEIGHT strings")
 
-    prototype_root = frontend_prototype_dir(project_root).resolve()
+    prototype_root = (
+        prototype_root.resolve()
+        if prototype_root is not None
+        else frontend_prototype_dir(project_root).resolve()
+    )
     seen_ids = set()
     seen_refs = set()
     for index, page in enumerate(pages, start=1):

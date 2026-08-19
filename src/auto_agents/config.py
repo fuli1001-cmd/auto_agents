@@ -442,6 +442,14 @@ def frontend_prototype_dir(project_root: Path) -> Path:
     return docs_dir(project_root) / "frontend_prototype"
 
 
+def frontend_prototype_variants_dir(project_root: Path) -> Path:
+    return docs_dir(project_root) / "frontend_prototype_variants"
+
+
+def frontend_prototype_variants_registry_path(project_root: Path) -> Path:
+    return state_dir(project_root) / "frontend_prototype_variants.json"
+
+
 def frontend_design_cache_dir(project_root: Path) -> Path:
     return auto_dir(project_root) / "cache" / "awesome-design-md"
 

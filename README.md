@@ -357,19 +357,32 @@ Reject a paused gate and provide explicit unstructured feedback for the agent:
 python3 -m auto_agents reject --project /tmp/demo --gate requirements --reason "Add a PostgreSQL database."
 ```
 
-For a generated frontend prototype, preview it locally before approving:
+For generated frontend prototypes, preview the comparison gallery before approving:
 
 ```bash
-python3 -m auto_agents prototype-preview --project /tmp/demo
-python3 -m auto_agents approve --project /tmp/demo --gate prototype
+python3 -m auto_agents prototype preview --project /tmp/demo
+python3 -m auto_agents prototype list --project /tmp/demo
+python3 -m auto_agents approve --project /tmp/demo --gate prototype --variant <variant-id>
 ```
 
-A normal prototype rejection retains the selected design and regenerates the pages from the
-feedback. Request an explicit catalog redesign with `--reselect-design`:
+Generate another candidate without overwriting the existing one. The prompt is used to decide,
+and record, whether the candidate can reuse the base `DESIGN.md` or needs a different catalog
+design system:
+
+```bash
+python3 -m auto_agents prototype generate --project /tmp/demo \
+  --prompt "Use a quieter editorial direction with more whitespace."
+```
+
+Rejecting a prototype candidate is permanent: its files are deleted and only an audit tombstone
+is retained. Reject several candidates with repeated `--variant`, or reject every candidate except
+one with `--all-except`:
 
 ```bash
 python3 -m auto_agents reject --project /tmp/demo --gate prototype \
-  --reason "Use a quieter editorial direction." --reselect-design
+  --variant <variant-id> --reason "Too visually dense."
+python3 -m auto_agents reject --project /tmp/demo --gate prototype \
+  --all-except <variant-id> --reason "Keep only the selected direction."
 ```
 
 If the run is currently paused on a manual gate, `approve` and `reject` can infer the gate from the persisted run
@@ -1193,14 +1206,20 @@ scores exactly three catalog candidates, and copies the selected upstream `DESIG
 byte. The catalog snapshot is cached under ignored `.auto-agents/cache/`; if neither GitHub nor a
 complete cache is available, the run pauses without inventing a fallback design.
 
-The stage then generates up to three core, self-contained static HTML pages under
-`.auto-agents/docs/frontend_prototype/`. Remote assets, CDNs, external scripts, and file URLs are
-rejected. Review them with `prototype-preview`; this gate always requires an explicit `approve`,
-even when the run uses `--auto-approve`. Approval stamps artifact hashes and a contract hash in
-`.auto-agents/state/frontend_design.lock.json`. Subsequent architecture, planning, implementation,
-and review prompts must follow the approved prototype and `DESIGN.md`; validation fails if an
-approved artifact is modified. The pinned catalog version remains unchanged across later runs until
-the user explicitly rejects/reselects the design.
+The stage then generates up to three core, self-contained static HTML pages in an immutable variant
+package under `.auto-agents/docs/frontend_prototype_variants/<variant-id>/`. Remote assets, CDNs,
+external scripts, and file URLs are rejected. While the prototype gate is paused, `prototype
+generate --prompt ...` can add comparison variants without overwriting earlier candidates. The
+prompt drives an auditable `reuse` versus `reselect` design decision. `prototype preview` serves a
+gallery with two-up comparison, and `prototype list` reports IDs, prompts, sources, and sizes.
+
+This gate always requires an explicit `approve`, even when the run uses `--auto-approve`. Approval
+requires a variant ID when several candidates exist, projects the selected package to the legacy
+`DESIGN.md` and `.auto-agents/docs/frontend_prototype/` paths, stamps artifact and contract hashes
+in `.auto-agents/state/frontend_design.lock.json`, and permanently rejects/deletes all unselected
+candidate files. Subsequent architecture, planning, implementation, and review prompts must follow
+that single approved contract; validation fails if an approved artifact is modified. Additional
+variants cannot be generated or selected again during the same iteration.
 
 After approval, the prototype pages are projected into the existing `frontend_surfaces` array in
 `state/requirements_trace.json`. Each surface names the page/screen, source prototype ref, known

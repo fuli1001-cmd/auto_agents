@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -16,10 +19,12 @@ from auto_agents.config import (
     design_md_path,
     frontend_design_lock_path,
     frontend_prototype_dir,
+    frontend_prototype_variants_registry_path,
     load_run_state,
     requirements_trace_path,
     save_run_state,
 )
+from auto_agents.cli import build_parser, main
 from auto_agents.frontend_design import (
     CatalogEntry,
     CatalogSnapshot,
@@ -37,6 +42,13 @@ from auto_agents.frontend_design import (
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentRequest, AgentResult, TaskSpec
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.prototype_variants import (
+    candidate_variants,
+    gallery_html,
+    load_registry,
+    registry_variants,
+    variant_dir,
+)
 
 
 HTML = "<!doctype html><html><head><meta name='viewport' content='width=device-width'></head><body>ok</body></html>"
@@ -53,8 +65,10 @@ class PrototypeAdapter(AgentAdapter):
     def run(self, request: AgentRequest) -> AgentResult:
         self.calls.append(request.attempt_id)
         if request.attempt_id.startswith("prototype-select"):
+            match = re.search(r"Write JSON only to: (.+)", request.prompt)
+            selection_path = Path(match.group(1).strip()) if match else self.project_root / ".auto-agents/docs/frontend_design/selection.json"
             write_json(
-                self.project_root / ".auto-agents/docs/frontend_design/selection.json",
+                selection_path,
                 {
                     "selected_slug": "alpha",
                     "candidates": [
@@ -65,8 +79,11 @@ class PrototypeAdapter(AgentAdapter):
                 },
             )
         elif request.attempt_id.startswith("prototype-generate"):
-            root = frontend_prototype_dir(self.project_root)
-            write_text(root / "index.html", HTML)
+            match = re.search(r"Write all output only inside: (.+)", request.prompt)
+            root = Path(match.group(1).strip()) if match else frontend_prototype_dir(self.project_root)
+            variant_marker = root.parent.name
+            variant_html = HTML.replace("ok", variant_marker)
+            write_text(root / "index.html", variant_html)
             trace = json.loads(
                 requirements_trace_path(self.project_root).read_text(encoding="utf-8")
             )
@@ -74,13 +91,13 @@ class PrototypeAdapter(AgentAdapter):
             pages = []
             for index, surface in enumerate(surfaces, start=1):
                 filename = "home.html" if index == 1 else f"surface-{index}.html"
-                write_text(root / filename, HTML)
+                write_text(root / filename, variant_html)
                 pages.append(
                     {
                         "id": surface["id"],
                         "title": surface["name"],
                         "route": surface["route"],
-                        "html_ref": f".auto-agents/docs/frontend_prototype/{filename}",
+                        "html_ref": (root / filename).relative_to(self.project_root).as_posix(),
                         "requirement_ids": surface["requirement_ids"],
                     }
                 )
@@ -88,7 +105,7 @@ class PrototypeAdapter(AgentAdapter):
                 root / "manifest.json",
                 {
                     "version": 1,
-                    "index_ref": ".auto-agents/docs/frontend_prototype/index.html",
+                    "index_ref": (root / "index.html").relative_to(self.project_root).as_posix(),
                     "viewports": ["1440x900", "390x844"],
                     "pages": pages,
                 },
@@ -191,6 +208,138 @@ def frontend_task(*, status: str = "in_progress") -> TaskSpec:
 
 
 class FrontendDesignTests(unittest.TestCase):
+    def test_prototype_cli_parses_generate_and_lists_virtual_legacy_without_migration(self) -> None:
+        args = build_parser().parse_args(
+            ["prototype", "generate", "--project", "/tmp/demo", "--prompt", "calmer"]
+        )
+        self.assertEqual(args.prototype_command, "generate")
+        self.assertEqual(args.prompt, "calmer")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_text(design_md_path(root), "# User design\n")
+            prototype = frontend_prototype_dir(root)
+            write_text(prototype / "index.html", HTML)
+            write_text(prototype / "home.html", HTML)
+            pages = [{"id": "home", "title": "Home", "route": "/", "html_ref": ".auto-agents/docs/frontend_prototype/home.html", "requirement_ids": ["REQ-001"]}]
+            write_json(prototype / "manifest.json", {"version": 1, "index_ref": ".auto-agents/docs/frontend_prototype/index.html", "viewports": ["1440x900"], "pages": pages})
+            lock = {"version": 1, "status": "pending_approval", "source": {"kind": "user", "refs": ["DESIGN.md"]}, "design_path": "DESIGN.md", "prototype": {"manifest_ref": ".auto-agents/docs/frontend_prototype/manifest.json", "index_ref": ".auto-agents/docs/frontend_prototype/index.html", "viewports": ["1440x900"], "pages": pages}}
+            lock["artifact_sha256"] = frontend_design_artifact_hashes(root)
+            write_json(frontend_design_lock_path(root), lock)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(main(["prototype", "list", "--project", str(root)]), 0)
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["variants"][0]["legacy_virtual"])
+            self.assertFalse(frontend_prototype_variants_registry_path(root).exists())
+
+    def test_multiple_variants_are_compared_and_approval_deletes_unselected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_text(root / "spec.md", "# New frontend\n")
+            write_text(design_md_path(root), "# User design\n")
+            write_frontend_trace(root)
+            state = load_run_state(root)
+            state.stage_summaries = {"clarify": "done"}
+            state.approved_gates = ["requirements"]
+            state.resume_context["spec_file"] = str(root / "spec.md")
+            save_run_state(root, state)
+
+            orchestrator = Orchestrator(root)
+            orchestrator.adapter = PrototypeAdapter(root)
+            paused = orchestrator.run(root / "spec.md", auto_approve=True, skip_validate=True)
+            first = candidate_variants(load_registry(root))[0]
+            second = orchestrator.generate_prototype_variant(
+                prompt="Reduce controls and add more whitespace.",
+                name="Calm",
+                base_variant_id=str(first["id"]),
+            )
+            registry = load_registry(root)
+            self.assertEqual(len(candidate_variants(registry)), 2)
+            self.assertEqual(second["design_decision"]["design_action"], "reuse")
+            self.assertIn(str(first["id"]), gallery_html(root, registry))
+            self.assertIn(str(second["id"]), gallery_html(root, registry))
+
+            approved = orchestrator.approve(
+                "prototype",
+                prototype_variant_id=str(second["id"]),
+            )
+            self.assertIn("prototype", approved.approved_gates)
+            registry = load_registry(root)
+            statuses = {str(item["id"]): str(item["status"]) for item in registry_variants(registry)}
+            self.assertEqual(statuses[str(second["id"])], "approved")
+            self.assertEqual(statuses[str(first["id"])], "rejected")
+            self.assertFalse(variant_dir(root, str(first["id"])).exists())
+            self.assertEqual(load_frontend_design_lock(root)["variant_id"], second["id"])
+            with self.assertRaisesRegex(RuntimeError, "only be generated while the prototype gate is paused"):
+                orchestrator.generate_prototype_variant(prompt="another")
+
+    def test_prompt_can_automatically_reselect_design(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_text(root / "spec.md", "# New frontend\n")
+            write_text(design_md_path(root), "# User design\n")
+            write_frontend_trace(root)
+            state = load_run_state(root)
+            state.status = "paused"
+            state.current_stage = "prototype"
+            state.pending_approval = "prototype"
+            state.resume_context["spec_file"] = str(root / "spec.md")
+            save_run_state(root, state)
+            orchestrator = Orchestrator(root)
+            orchestrator.adapter = PrototypeAdapter(root)
+            orchestrator._run_prototype_stage(state, root / "spec.md")
+            base = candidate_variants(load_registry(root))[0]
+
+            catalog = Path(tmp) / "catalog"
+            write_text(catalog / "LICENSE", "MIT\n")
+            entries = []
+            for slug in ("alpha", "beta", "gamma"):
+                write_text(catalog / f"design-md/{slug}/DESIGN.md", f"# {slug}\n")
+                entries.append(CatalogEntry(slug.title(), slug, "SaaS", slug, f"design-md/{slug}/DESIGN.md"))
+            snapshot = CatalogSnapshot("VoltAgent/awesome-design-md", "main", "d" * 40, catalog, tuple(entries), False)
+            with patch("auto_agents.orchestrator.AwesomeDesignCatalogClient.load", return_value=snapshot):
+                variant = orchestrator.generate_prototype_variant(
+                    prompt="换一套视觉语言，使用极简风格。",
+                    base_variant_id=str(base["id"]),
+                )
+            self.assertEqual(variant["design_decision"]["design_action"], "reselect")
+            self.assertEqual(variant["source"]["kind"], "awesome-design-md")
+
+    def test_reject_deletes_candidate_and_keeps_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_text(root / "spec.md", "# New frontend\n")
+            write_text(design_md_path(root), "# User design\n")
+            write_frontend_trace(root)
+            state = load_run_state(root)
+            state.status = "pending"
+            state.current_stage = "prototype"
+            state.resume_context["spec_file"] = str(root / "spec.md")
+            orchestrator = Orchestrator(root)
+            orchestrator.adapter = PrototypeAdapter(root)
+            orchestrator._run_prototype_stage(state, root / "spec.md")
+            state.status = "paused"
+            state.pending_approval = "prototype"
+            save_run_state(root, state)
+            variant = candidate_variants(load_registry(root))[0]
+
+            rejected = orchestrator.reject(
+                "prototype",
+                "not suitable",
+                prototype_variant_ids=[str(variant["id"])],
+            )
+            self.assertEqual(rejected.status, "pending")
+            self.assertEqual(rejected.rejected_stage, "prototype")
+            self.assertFalse(variant_dir(root, str(variant["id"])).exists())
+            tombstone = registry_variants(load_registry(root))[0]
+            self.assertEqual(tombstone["status"], "rejected")
+            self.assertTrue(tombstone["artifacts_deleted"])
+
     def test_catalog_network_failure_uses_complete_cache_or_pauses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -318,9 +467,11 @@ class FrontendDesignTests(unittest.TestCase):
             self.assertEqual(result.status, "paused")
             self.assertEqual(result.pending_approval, "prototype")
             self.assertNotIn("design", result.stage_summaries)
-            self.assertEqual(load_frontend_design_lock(root)["source"]["kind"], "user")
+            variants = candidate_variants(load_registry(root))
+            self.assertEqual(len(variants), 1)
+            self.assertEqual(variants[0]["source"]["kind"], "user")
             trace = json.loads(requirements_trace_path(root).read_text(encoding="utf-8"))
-            self.assertEqual(trace["frontend_surfaces"][0]["prototype_refs"][0], ".auto-agents/docs/frontend_prototype/home.html")
+            self.assertNotIn("frontend_surfaces", trace)
 
     def test_missing_contract_rewinds_before_frontend_task_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -529,10 +680,9 @@ class FrontendDesignTests(unittest.TestCase):
             self.assertFalse(
                 any(call.startswith("clarify-conv") for call in adapter.calls)
             )
-            lock = load_frontend_design_lock(root)
-            self.assertEqual(lock["status"], "pending_approval")
-            self.assertIn("REQ-002", lock["prototype"]["pages"][0]["requirement_ids"])
-            self.assertIn("specs/prototype/home.html", lock["source"]["refs"])
+            variant = candidate_variants(load_registry(root))[0]
+            self.assertIn("REQ-002", variant["prototype"]["pages"][0]["requirement_ids"])
+            self.assertIn("specs/prototype/home.html", variant["source"]["refs"])
 
     def test_parallel_scheduler_checks_contract_before_evidence_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -598,9 +748,8 @@ class FrontendDesignTests(unittest.TestCase):
 
             state = orchestrator._run_prototype_stage(state, root / "spec.md")
 
-            lock = load_frontend_design_lock(root)
-            self.assertEqual(lock["status"], "pending_approval")
-            self.assertTrue(lock["trigger"]["existing_frontend"])
+            variant = candidate_variants(load_registry(root))[0]
+            self.assertEqual(variant["status"], "candidate")
             self.assertTrue(
                 any(call.startswith("prototype-generate") for call in adapter.calls)
             )
@@ -660,11 +809,10 @@ class FrontendDesignTests(unittest.TestCase):
             with patch("auto_agents.orchestrator.AwesomeDesignCatalogClient.load", return_value=snapshot):
                 state = orchestrator._run_prototype_stage(state, root / "spec.md")
 
-            self.assertEqual(design_md_path(root).read_bytes(), b"# Exact upstream bytes\r\n")
-            lock = load_frontend_design_lock(root)
-            self.assertEqual(lock["source"]["commit_sha"], "b" * 40)
-            self.assertEqual(lock["source"]["slug"], "alpha")
-            self.assertFalse(validate_frontend_design_artifacts(root, lock, require_approved=False))
+            variant = candidate_variants(load_registry(root))[0]
+            self.assertEqual((variant_dir(root, variant["id"]) / "DESIGN.md").read_bytes(), b"# Exact upstream bytes\r\n")
+            self.assertEqual(variant["source"]["commit_sha"], "b" * 40)
+            self.assertEqual(variant["source"]["slug"], "alpha")
 
     def test_approval_pins_artifacts_and_tampering_is_detected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -716,15 +864,8 @@ class FrontendDesignTests(unittest.TestCase):
             self.assertIn("prototype", approved.approved_gates)
             self.assertIn("approved DESIGN.md", (root / "AGENTS.md").read_text(encoding="utf-8"))
 
-            rejected = Orchestrator(root).reject("prototype", "make it calmer")
-            self.assertFalse(rejected.resume_context["reselect_frontend_design"])
-            self.assertEqual(load_frontend_design_lock(root)["status"], "pending_approval")
-            rejected = Orchestrator(root).reject(
-                "prototype",
-                "choose a different system",
-                reselect_design=True,
-            )
-            self.assertTrue(rejected.resume_context["reselect_frontend_design"])
+            with self.assertRaisesRegex(RuntimeError, "No frontend prototype candidate"):
+                Orchestrator(root).reject("prototype", "make it calmer")
 
             write_text(prototype / "home.html", HTML.replace("ok", "tampered"))
             errors = validate_frontend_design_artifacts(

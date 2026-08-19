@@ -17,10 +17,7 @@ from typing import Optional
 
 from .config import (
     architecture_path,
-    design_md_path,
-    frontend_design_docs_dir,
-    frontend_design_lock_path,
-    frontend_prototype_dir,
+    frontend_prototype_variants_registry_path,
     load_project_config,
     load_run_state,
     project_brief_path,
@@ -44,7 +41,13 @@ from .notifications import (
 )
 from .orchestrator import Orchestrator
 from .models import PersistenceTargetConfig
-from .frontend_design import load_frontend_design_lock, validate_frontend_design_artifacts
+from .prototype_variants import (
+    LIVE_VARIANT_STATUSES,
+    PrototypeGalleryHandler,
+    candidate_variants,
+    load_registry,
+    registry_variants,
+)
 from .foreground_activity import ForegroundActivity
 from .git_ops import changed_paths
 from .process_supervision import (
@@ -123,6 +126,60 @@ def _format_command(*parts: str) -> str:
 
 def _load_cli_dotenv() -> None:
     load_dotenv([Path.cwd() / ".env"])
+
+
+def _serve_prototype_gallery(project_root: Path, host: str, port: int) -> int:
+    registry = load_registry(project_root, include_virtual_legacy=True)
+    live = registry_variants(registry, statuses=LIVE_VARIANT_STATUSES)
+    if not live:
+        print(
+            json.dumps(
+                {"ok": False, "error": "No live frontend prototype variants are available."},
+                indent=2,
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    handler = functools.partial(
+        PrototypeGalleryHandler,
+        project_root=project_root,
+        registry=registry,
+    )
+    server = http.server.ThreadingHTTPServer((host, port), handler)
+    bound_host, bound_port = server.server_address[:2]
+    print(f"Prototype gallery: http://{bound_host}:{bound_port}/", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+def _interactive_variant_id(
+    orchestrator: Orchestrator,
+    variants: list[dict[str, object]],
+    *,
+    action: str,
+) -> str:
+    if len(variants) == 1:
+        return str(variants[0].get("id", ""))
+    lines = [f"Select a frontend prototype variant to {action}:"]
+    for index, item in enumerate(variants, start=1):
+        lines.append(f"  {index}. {item.get('name') or item.get('id')} ({item.get('id')})")
+    if action == "approve":
+        lines.append("Approving one variant permanently rejects and deletes every other candidate.")
+    answer = orchestrator._prompt_user("\n".join(lines) + "\nVariant number or id: ").strip()
+    if answer.isdigit() and 1 <= int(answer) <= len(variants):
+        return str(variants[int(answer) - 1].get("id", ""))
+    if any(str(item.get("id", "")) == answer for item in variants):
+        return answer
+    raise RuntimeError(
+        "Multiple frontend prototype variants are available; pass --variant explicitly. Candidates: "
+        + ", ".join(str(item.get("id", "")) for item in variants)
+    )
 
 
 SELF_REPAIR_STRICT_ENV = "AUTO_AGENTS_SELF_REPAIR_STRICT"
@@ -271,11 +328,14 @@ def _render_key_files(project_root: Path, state_payload: dict[str, object]) -> l
         key_files.append(architecture_path(project_root))
     elif pending_approval == "prototype":
         prototype_files = [
-            design_md_path(project_root),
-            frontend_design_docs_dir(project_root) / "selection.md",
-            frontend_prototype_dir(project_root) / "index.html",
-            frontend_design_lock_path(project_root),
+            frontend_prototype_variants_registry_path(project_root),
         ]
+        registry = load_registry(project_root, include_virtual_legacy=True)
+        for variant in candidate_variants(registry):
+            prototype = variant.get("prototype", {})
+            index_ref = str(prototype.get("index_ref", "")) if isinstance(prototype, dict) else ""
+            if index_ref:
+                prototype_files.append(project_root / index_ref)
         key_files.extend(path for path in prototype_files if path.exists())
     elif pending_approval == "release":
         key_files.extend([
@@ -315,6 +375,8 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
             "--gate",
             pending_approval,
         )
+        if pending_approval == "prototype":
+            approve_cmd += " --variant <variant-id>"
         reject_cmd = _format_command(
             "python3",
             "-m",
@@ -327,6 +389,8 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
             "--reason",
             "<feedback>",
         )
+        if pending_approval == "prototype":
+            reject_cmd += " --variant <variant-id>"
         lines = [
             f"Run paused: approval required for {pending_approval}.",
             "",
@@ -339,6 +403,16 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
                     "- Preview prototypes: "
                     + _format_command(
                         "python3", "-m", "auto_agents", "prototype-preview",
+                        "--project", str(project_root),
+                    )
+                    + "\n- Generate another prototype: "
+                    + _format_command(
+                        "python3", "-m", "auto_agents", "prototype", "generate",
+                        "--project", str(project_root), "--prompt", "<design direction>",
+                    )
+                    + "\n- List prototype variants: "
+                    + _format_command(
+                        "python3", "-m", "auto_agents", "prototype", "list",
                         "--project", str(project_root),
                     )
                 ]
@@ -901,6 +975,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--gate",
         help="Gate name to approve. Defaults to the current pending gate inferred from run state.",
     )
+    approve_parser.add_argument(
+        "--variant",
+        default="",
+        help="Frontend prototype variant ID. Required non-interactively when multiple candidates exist.",
+    )
 
     reject_parser = subparsers.add_parser("reject", help="Reject a pending manual gate and provide feedback.")
     reject_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -913,19 +992,58 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Reason for rejection. This feedback will be provided to the agent on the next run.",
     )
+    reject_target = reject_parser.add_mutually_exclusive_group()
+    reject_target.add_argument(
+        "--variant",
+        action="append",
+        default=[],
+        help="Frontend prototype variant to reject and delete. May be repeated.",
+    )
+    reject_target.add_argument(
+        "--all-except",
+        default="",
+        help="Reject and delete every frontend prototype candidate except this ID.",
+    )
     reject_parser.add_argument(
         "--reselect-design",
         action="store_true",
-        help="For a prototype rejection, select a new catalog DESIGN.md before regenerating pages.",
+        help="Deprecated compatibility hint; describe the desired visual change in --reason instead.",
     )
 
     preview_parser = subparsers.add_parser(
         "prototype-preview",
-        help="Serve the generated static frontend prototype for local review.",
+        help="Compatibility alias for the frontend prototype comparison gallery.",
     )
     preview_parser.add_argument("--project", required=True, help="Target project directory.")
     preview_parser.add_argument("--host", default="127.0.0.1", help="Bind host. Defaults to loopback.")
     preview_parser.add_argument("--port", type=int, default=0, help="Bind port. Defaults to an available port.")
+
+    prototype_parser = subparsers.add_parser(
+        "prototype",
+        help="Generate, list, and preview frontend prototype variants.",
+    )
+    prototype_subparsers = prototype_parser.add_subparsers(
+        dest="prototype_command",
+        required=True,
+    )
+    prototype_generate = prototype_subparsers.add_parser(
+        "generate",
+        help="Generate an additional candidate without overwriting existing variants.",
+    )
+    prototype_generate.add_argument("--project", required=True, help="Target project directory.")
+    prototype_generate.add_argument("--prompt", required=True, help="Visual direction for the new candidate.")
+    prototype_generate.add_argument("--name", default="", help="Optional display name for the candidate.")
+    prototype_generate.add_argument("--from", dest="base_variant", default="", help="Base candidate ID.")
+
+    prototype_list = prototype_subparsers.add_parser("list", help="List frontend prototype variants.")
+    prototype_list.add_argument("--project", required=True, help="Target project directory.")
+    prototype_list.add_argument("--all", action="store_true", help="Include rejected tombstones.")
+    prototype_list.add_argument("--json", action="store_true", help="Emit JSON (currently the default output).")
+
+    prototype_preview = prototype_subparsers.add_parser("preview", help="Preview and compare live variants.")
+    prototype_preview.add_argument("--project", required=True, help="Target project directory.")
+    prototype_preview.add_argument("--host", default="127.0.0.1", help="Bind host. Defaults to loopback.")
+    prototype_preview.add_argument("--port", type=int, default=0, help="Bind port. Defaults to an available port.")
 
     status_parser = subparsers.add_parser("status", help="Show the current orchestrator state.")
     status_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -1295,51 +1413,87 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "approve":
         orchestrator = Orchestrator(Path(args.project))
-        state = orchestrator.approve(args.gate)
+        gate = args.gate or load_run_state(Path(args.project)).pending_approval
+        variant_id = str(args.variant).strip()
+        if gate == "prototype" and not variant_id:
+            variants = candidate_variants(
+                load_registry(Path(args.project), include_virtual_legacy=True)
+            )
+            variant_id = _interactive_variant_id(
+                orchestrator,
+                variants,
+                action="approve",
+            )
+        state = orchestrator.approve(
+            args.gate,
+            prototype_variant_id=variant_id,
+        )
         print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
         return 0
 
     if args.command == "reject":
         orchestrator = Orchestrator(Path(args.project))
+        gate = args.gate or load_run_state(Path(args.project)).pending_approval
+        variant_ids = list(args.variant)
+        if gate == "prototype" and not variant_ids and not args.all_except:
+            variants = candidate_variants(
+                load_registry(Path(args.project), include_virtual_legacy=True)
+            )
+            variant_ids = [
+                _interactive_variant_id(orchestrator, variants, action="reject")
+            ]
         state = orchestrator.reject(
             args.gate,
             args.reason,
             reselect_design=bool(args.reselect_design),
+            prototype_variant_ids=variant_ids,
+            prototype_all_except=str(args.all_except),
         )
         print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
         return 0
+
+    if args.command == "prototype":
+        project_root = Path(args.project).expanduser().resolve()
+        if args.prototype_command == "list":
+            registry = load_registry(project_root, include_virtual_legacy=True)
+            variants = registry_variants(registry)
+            if not args.all:
+                variants = [item for item in variants if item.get("status") != "rejected"]
+            print(
+                json.dumps(
+                    {
+                        "version": registry.get("version", 1),
+                        "approved_variant_id": registry.get("approved_variant_id", ""),
+                        "variants": variants,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        if args.prototype_command == "preview":
+            if args.port < 0 or args.port > 65535:
+                parser.error("--port must be between 0 and 65535")
+            return _serve_prototype_gallery(project_root, args.host, args.port)
+        try:
+            with ProjectRunLock(project_root):
+                orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+                entry = orchestrator.generate_prototype_variant(
+                    prompt=args.prompt,
+                    name=args.name,
+                    base_variant_id=args.base_variant,
+                )
+            print(json.dumps({"ok": True, "variant": entry}, indent=2, ensure_ascii=False))
+            return 0
+        except (OSError, RuntimeError, ValueError, RunAlreadyActiveError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
 
     if args.command == "prototype-preview":
         project_root = Path(args.project).expanduser().resolve()
         if args.port < 0 or args.port > 65535:
             parser.error("--port must be between 0 and 65535")
-        lock = load_frontend_design_lock(project_root)
-        errors = validate_frontend_design_artifacts(
-            project_root,
-            lock,
-            require_approved=False,
-        )
-        if errors:
-            print(
-                json.dumps({"ok": False, "errors": errors}, indent=2, ensure_ascii=False),
-                file=sys.stderr,
-            )
-            return 1
-        prototype_root = frontend_prototype_dir(project_root)
-        handler = functools.partial(
-            http.server.SimpleHTTPRequestHandler,
-            directory=str(prototype_root),
-        )
-        server = http.server.ThreadingHTTPServer((args.host, args.port), handler)
-        host, port = server.server_address[:2]
-        print(f"Prototype preview: http://{host}:{port}/", flush=True)
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            server.server_close()
-        return 0
+        return _serve_prototype_gallery(project_root, args.host, args.port)
 
     if args.command == "run":
         orchestrator = None

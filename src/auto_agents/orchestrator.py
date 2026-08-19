@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import contextlib
 import fnmatch
 import json
@@ -17,7 +18,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Set, TextIO, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Set, TextIO, Tuple
 
 from .adapters import (
     AgentAdapter,
@@ -186,6 +187,24 @@ from .persistence import (
     execute_persistence_action,
     persistence_candidate_fingerprint,
     persistence_change_strategy,
+)
+from .prototype_variants import (
+    add_variant,
+    approve_variant_in_registry,
+    build_variant_entry,
+    candidate_variants,
+    ensure_registry,
+    find_variant,
+    load_registry,
+    materialize_variant,
+    new_variant_id,
+    package_ref,
+    reject_variants,
+    validate_variant,
+    variant_design_docs_dir,
+    variant_design_path,
+    variant_dir,
+    variant_prototype_dir,
 )
 from .supervision import process_start_identity
 from .requirements import (
@@ -541,7 +560,12 @@ class Orchestrator:
         sync_agent_instructions(root)
         return root
 
-    def approve(self, gate: Optional[str] = None) -> RunState:
+    def approve(
+        self,
+        gate: Optional[str] = None,
+        *,
+        prototype_variant_id: str = "",
+    ) -> RunState:
         state = load_run_state(self.project_root)
         inferred_gate = ""
         if not gate:
@@ -560,23 +584,49 @@ class Orchestrator:
         ):
             raise RuntimeError(f"Unknown approval gate: {active_gate}")
         if active_gate == "prototype":
-            lock = load_frontend_design_lock(self.project_root)
-            errors = validate_frontend_design_artifacts(
+            registry = ensure_registry(
                 self.project_root,
-                lock,
-                require_approved=False,
                 max_pages=self.config.frontend_design.max_pages,
             )
-            if errors:
-                raise RuntimeError(
-                    "Cannot approve the frontend prototype:\n"
-                    + "\n".join(f"- {error}" for error in errors)
-                )
+            candidates = candidate_variants(registry)
+            selected_id = str(prototype_variant_id).strip()
+            if not selected_id:
+                if len(candidates) != 1:
+                    raise RuntimeError(
+                        "Multiple frontend prototype variants are awaiting review; "
+                        "pass --variant explicitly. Candidates: "
+                        + ", ".join(str(item.get("id", "")) for item in candidates)
+                    )
+                selected_id = str(candidates[0].get("id", ""))
+            selected = find_variant(registry, selected_id)
+            if str(selected.get("status", "")) != "candidate":
+                raise RuntimeError(f"Frontend prototype variant {selected_id} is not a candidate.")
+            lock = materialize_variant(
+                self.project_root,
+                selected,
+                max_pages=self.config.frontend_design.max_pages,
+            )
             lock["status"] = "approved"
             lock["approved_at"] = utc_now_iso()
-            lock["approval"] = {"method": "cli", "gate": "prototype"}
+            lock["approval"] = {
+                "method": "cli",
+                "gate": "prototype",
+                "variant_id": selected_id,
+            }
             lock["contract_sha256"] = frontend_design_contract_sha256(lock)
             write_json(frontend_design_lock_path(self.project_root), lock)
+            trace = load_requirements_trace(self.project_root, normalize=False)
+            trace["frontend_surfaces"] = derived_frontend_surfaces(lock)
+            write_json(requirements_trace_path(self.project_root), trace)
+            removed = approve_variant_in_registry(
+                self.project_root,
+                registry,
+                selected_id,
+            )
+            state.stage_summaries["prototype"] = (
+                f"Approved frontend prototype variant {selected_id}; "
+                f"rejected and deleted {len(removed)} unselected variant(s)."
+            )
         if active_gate == "persistence-reset":
             approval = state.persistence_actions.get("_clean_break_approval", {})
             if not approval or str(approval.get("status", "")) != "pending_approval":
@@ -603,6 +653,8 @@ class Orchestrator:
         reason: str = "",
         *,
         reselect_design: bool = False,
+        prototype_variant_ids: Iterable[str] = (),
+        prototype_all_except: str = "",
     ) -> RunState:
         state = load_run_state(self.project_root)
         inferred_gate = ""
@@ -622,6 +674,68 @@ class Orchestrator:
         if not target_stage:
             raise RuntimeError(f"Cannot determine stage for gate: {active_gate}")
 
+        if active_gate == "prototype":
+            if not str(reason).strip() and not reselect_design:
+                raise ValueError("A non-empty --reason is required when rejecting a prototype variant.")
+            registry = ensure_registry(
+                self.project_root,
+                max_pages=self.config.frontend_design.max_pages,
+            )
+            candidates = candidate_variants(registry)
+            if not candidates:
+                raise RuntimeError("No frontend prototype candidate is available to reject.")
+            requested = [str(item).strip() for item in prototype_variant_ids if str(item).strip()]
+            keep_id = str(prototype_all_except).strip()
+            if keep_id:
+                kept = find_variant(registry, keep_id)
+                if str(kept.get("status", "")) != "candidate":
+                    raise RuntimeError(f"Frontend prototype variant {keep_id} is not a candidate.")
+                requested = [
+                    str(item.get("id", ""))
+                    for item in candidates
+                    if str(item.get("id", "")) != keep_id
+                ]
+                if not requested:
+                    state.pending_approval = "prototype"
+                    state.status = "paused"
+                    save_run_state(self.project_root, state)
+                    return state
+            if not requested:
+                if len(candidates) != 1:
+                    raise RuntimeError(
+                        "Multiple frontend prototype variants are awaiting review; "
+                        "pass --variant or --all-except. Candidates: "
+                        + ", ".join(str(item.get("id", "")) for item in candidates)
+                    )
+                requested = [str(candidates[0].get("id", ""))]
+            feedback = str(reason).strip()
+            if reselect_design:
+                feedback = (
+                    feedback + "\nSelect a materially different visual design system."
+                ).strip()
+                self.logger.warning(
+                    "--reselect-design is deprecated; express the desired visual direction in --reason."
+                )
+            rejected = reject_variants(
+                self.project_root,
+                registry,
+                requested,
+                reason=feedback,
+            )
+            remaining = candidate_variants(registry)
+            if remaining:
+                state.pending_approval = "prototype"
+                state.status = "paused"
+                state.current_stage = "prototype"
+                state.rejected_stage = ""
+                state.rejection_reason = ""
+                state.stage_summaries["prototype"] = (
+                    f"Rejected and deleted {len(rejected)} frontend prototype variant(s); "
+                    f"{len(remaining)} candidate(s) remain."
+                )
+                save_run_state(self.project_root, state)
+                return state
+
         # Reset the rejected stage and all downstream stage outputs so run()
         # can rebuild the pipeline from the right point.
         self._rewind_state_from_stage(state, target_stage)
@@ -636,16 +750,8 @@ class Orchestrator:
         state.rejection_reason = reason
         state.rejected_stage = target_stage
         if active_gate == "prototype":
-            lock = load_frontend_design_lock(self.project_root)
-            if lock:
-                lock["status"] = "pending_approval"
-                lock["rejected_at"] = utc_now_iso()
-                lock["rejection_reason"] = reason
-                lock.pop("approved_at", None)
-                lock.pop("approval", None)
-                lock.pop("contract_sha256", None)
-                write_json(frontend_design_lock_path(self.project_root), lock)
-            state.resume_context["reselect_frontend_design"] = bool(reselect_design)
+            state.rejection_reason = feedback
+            state.resume_context.pop("reselect_frontend_design", None)
         save_run_state(self.project_root, state)
         return state
 
@@ -2044,9 +2150,13 @@ class Orchestrator:
                     or pending_gate in self.config.approvals.enabled
                 )
                 if pending_gate == "prototype":
-                    gate_enabled = (
-                        load_frontend_design_lock(self.project_root).get("status")
-                        == "pending_approval"
+                    gate_enabled = bool(
+                        candidate_variants(
+                            load_registry(
+                                self.project_root,
+                                include_virtual_legacy=True,
+                            )
+                        )
                     )
                 if pending_gate and gate_enabled and stage in state.stage_summaries:
                     if (auto_approve and pending_gate != "prototype") or pending_gate in state.approved_gates:
@@ -2252,9 +2362,10 @@ class Orchestrator:
             lines.extend(
                 [
                     f"The user explicitly rejected the prior catalog design `{excluded_slug}`. Do not select it again.",
-                    "User redesign feedback: " + (rejection_feedback or "select a materially different design direction"),
                 ]
             )
+        if rejection_feedback:
+            lines.append("User design direction: " + rejection_feedback)
         lines.append("Final response: one short sentence naming the selected slug.")
         return "\n".join(lines)
 
@@ -2264,12 +2375,13 @@ class Orchestrator:
         spec_file: Path,
         surfaces: List[Dict[str, object]],
         source_refs: List[str],
+        prototype_root: Optional[Path] = None,
+        variant_prompt: str = "",
     ) -> str:
-        prototype_root = frontend_prototype_dir(self.project_root)
+        prototype_root = prototype_root or frontend_prototype_dir(self.project_root)
         manifest = prototype_root / "manifest.json"
         index = prototype_root / "index.html"
-        return "\n".join(
-            [
+        lines = [
                 "Create approval-ready, standalone static HTML prototypes for this project's new frontend.",
                 f"Read the product spec: {spec_file}",
                 f"Read the project brief: {docs_dir(self.project_root) / 'project_brief.md'}",
@@ -2287,24 +2399,45 @@ class Orchestrator:
                 "Do not edit DESIGN.md, project source code, tests, or any file outside the prototype directory.",
                 "Final response: 3 short bullets listing the prototype pages.",
             ]
-        )
+        if variant_prompt:
+            lines.extend(
+                [
+                    "",
+                    "This is an additional comparison variant. Apply the following user direction "
+                    "without changing product scope or required surfaces:",
+                    variant_prompt,
+                ]
+            )
+        return "\n".join(lines)
 
-    def _user_design_derivation_prompt(self, spec_file: Path, assets: List[str]) -> str:
+    def _user_design_derivation_prompt(
+        self,
+        spec_file: Path,
+        assets: List[str],
+        *,
+        output_path: Optional[Path] = None,
+    ) -> str:
+        output_path = output_path or design_md_path(self.project_root)
         return "\n".join(
             [
                 "Derive a concise project visual design system from the user's existing design/prototype assets.",
                 f"Read the product spec: {spec_file}",
                 f"Read the project brief: {docs_dir(self.project_root) / 'project_brief.md'}",
                 "User-owned visual sources, in precedence order: " + ", ".join(assets),
-                f"Write only: {design_md_path(self.project_root)}",
+                f"Write only: {output_path}",
                 "Preserve the supplied visual direction. Document colors, typography, spacing, layout, components, states, responsive behavior, accessibility, and prohibited visual drift. Do not invent product behavior or override the requirements trace.",
                 "Do not edit prototypes, project code, tests, or any other file.",
                 "Final response: one short sentence confirming DESIGN.md was derived.",
             ]
         )
 
-    def _user_design_validation_feedback(self, _: AgentResult) -> Optional[str]:
-        path = design_md_path(self.project_root)
+    def _user_design_validation_feedback(
+        self,
+        _: AgentResult,
+        *,
+        output_path: Optional[Path] = None,
+    ) -> Optional[str]:
+        path = output_path or design_md_path(self.project_root)
         if not path.is_file() or len(read_text(path).strip()) < 80:
             return "Derived DESIGN.md must exist and contain a substantive visual design system."
         return None
@@ -2314,13 +2447,16 @@ class Orchestrator:
         _: AgentResult,
         *,
         expected_surfaces: Optional[List[Dict[str, object]]] = None,
+        prototype_root: Optional[Path] = None,
     ) -> Optional[str]:
-        manifest_path = frontend_prototype_dir(self.project_root) / "manifest.json"
+        prototype_root = prototype_root or frontend_prototype_dir(self.project_root)
+        manifest_path = prototype_root / "manifest.json"
         payload = read_json(manifest_path, default={})
         errors = validate_prototype_manifest(
             self.project_root,
             payload,
             max_pages=self.config.frontend_design.max_pages,
+            prototype_root=prototype_root,
         )
         index_ref = str(payload.get("index_ref", "")) if isinstance(payload, dict) else ""
         if not index_ref or not (self.project_root / index_ref).is_file():
@@ -2360,8 +2496,9 @@ class Orchestrator:
         snapshot: object,
         selected: object,
         candidates: List[Dict[str, object]],
+        output_dir: Optional[Path] = None,
     ) -> None:
-        output_dir = frontend_design_docs_dir(self.project_root)
+        output_dir = output_dir or frontend_design_docs_dir(self.project_root)
         output_dir.mkdir(parents=True, exist_ok=True)
         lines = [
             "# Frontend design selection",
@@ -2390,6 +2527,319 @@ class Orchestrator:
                 lines.append("")
         write_text(output_dir / "selection.md", "\n".join(lines).rstrip() + "\n")
         shutil.copyfile(snapshot.root / "LICENSE", output_dir / "awesome-design-md.LICENSE")
+
+    @staticmethod
+    def _automatic_variant_design_decision(
+        prompt: str,
+        *,
+        base_variant_id: str,
+    ) -> Dict[str, object]:
+        normalized = re.sub(r"\s+", " ", str(prompt or "").strip().lower())
+        reselect_markers = (
+            "different design",
+            "different visual",
+            "new design system",
+            "new visual language",
+            "materially different",
+            "换一套",
+            "全新设计",
+            "不同设计",
+            "不同视觉",
+            "视觉语言",
+            "极简风格",
+            "编辑式",
+            "品牌化",
+        )
+        signals = [marker for marker in reselect_markers if marker in normalized]
+        action = "reselect" if signals else "reuse"
+        rationale = (
+            "The prompt requests a materially different visual system."
+            if action == "reselect"
+            else "The prompt can be satisfied within the base design system."
+        )
+        return {
+            "design_action": action,
+            "base_variant_id": base_variant_id,
+            "rationale": rationale,
+            "prompt_signals": signals,
+        }
+
+    def _create_prototype_variant(
+        self,
+        *,
+        state: RunState,
+        spec_file: Path,
+        surfaces: List[Dict[str, object]],
+        prompt: str,
+        name: str,
+        base_variant: Optional[Mapping[str, object]] = None,
+        initial: bool = False,
+    ) -> Dict[str, object]:
+        variant_id = new_variant_id()
+        root = variant_dir(self.project_root, variant_id)
+        design_docs_root = variant_design_docs_dir(self.project_root, variant_id)
+        prototype_root = variant_prototype_dir(self.project_root, variant_id)
+        root.mkdir(parents=True, exist_ok=False)
+        design_docs_root.mkdir(parents=True)
+        prototype_root.mkdir(parents=True)
+        parent_id = str(base_variant.get("id", "")) if isinstance(base_variant, Mapping) else ""
+        decision = self._automatic_variant_design_decision(
+            prompt,
+            base_variant_id=parent_id,
+        )
+        if initial or base_variant is None:
+            decision = {
+                "design_action": "initial",
+                "base_variant_id": "",
+                "rationale": "Initial prototype design selection.",
+                "prompt_signals": [],
+            }
+
+        source: Dict[str, object]
+        candidate_records: List[Dict[str, object]] = []
+        try:
+            trace = load_requirements_trace(self.project_root, normalize=False)
+            assets = user_design_assets(
+                self.project_root,
+                trace,
+                spec_text=read_text(spec_file),
+            ) if initial else []
+            if initial and assets:
+                if design_md_path(self.project_root).is_file():
+                    shutil.copy2(
+                        design_md_path(self.project_root),
+                        variant_design_path(self.project_root, variant_id),
+                    )
+                    derived_design = False
+                else:
+                    derived_design = True
+                    self._run_agent_with_retries(
+                        state=state,
+                        stage="prototype",
+                        stage_key=f"prototype-user-design-{variant_id}",
+                        prompt=self._user_design_derivation_prompt(
+                            spec_file,
+                            assets,
+                            output_path=variant_design_path(self.project_root, variant_id),
+                        ),
+                        validation_feedback=lambda result: self._user_design_validation_feedback(
+                            result,
+                            output_path=variant_design_path(self.project_root, variant_id),
+                        ),
+                    )
+                source = {"kind": "user", "refs": assets, "derived_design": derived_design}
+            elif decision["design_action"] == "reuse" and isinstance(base_variant, Mapping):
+                base_id = str(base_variant.get("id", ""))
+                shutil.copy2(
+                    variant_design_path(self.project_root, base_id),
+                    variant_design_path(self.project_root, variant_id),
+                )
+                base_docs = variant_design_docs_dir(self.project_root, base_id)
+                if base_docs.is_dir():
+                    shutil.rmtree(design_docs_root)
+                    shutil.copytree(base_docs, design_docs_root)
+                root_source: object = base_variant.get("source", {})
+                while (
+                    isinstance(root_source, Mapping)
+                    and root_source.get("kind") == "variant-reuse"
+                    and isinstance(root_source.get("base_source"), Mapping)
+                ):
+                    root_source = root_source["base_source"]
+                root_source_copy = copy.deepcopy(root_source)
+                copied_license = design_docs_root / "awesome-design-md.LICENSE"
+                if isinstance(root_source_copy, dict) and copied_license.is_file():
+                    root_source_copy["license_path"] = package_ref(
+                        self.project_root,
+                        copied_license,
+                    )
+                source = {
+                    "kind": "variant-reuse",
+                    "base_variant_id": base_id,
+                    "base_source": root_source_copy,
+                    "content_sha256": sha256_file(variant_design_path(self.project_root, variant_id)),
+                }
+                candidate_records = [
+                    dict(item)
+                    for item in base_variant.get("candidates", []) or []
+                    if isinstance(item, Mapping)
+                ]
+            else:
+                try:
+                    snapshot = AwesomeDesignCatalogClient(
+                        self.project_root,
+                        repository=self.config.frontend_design.catalog_repository,
+                        requested_ref=self.config.frontend_design.catalog_ref,
+                        timeout_seconds=self.config.frontend_design.network_timeout_seconds,
+                    ).load()
+                except FrontendDesignUnavailable:
+                    # A prompt that requires a new system must never silently fall back.
+                    raise
+                selection_path = design_docs_root / "selection.json"
+                excluded_slug = ""
+                if isinstance(base_variant, Mapping):
+                    base_source = base_variant.get("source", {})
+                    while (
+                        isinstance(base_source, Mapping)
+                        and base_source.get("kind") == "variant-reuse"
+                        and isinstance(base_source.get("base_source"), Mapping)
+                    ):
+                        base_source = base_source["base_source"]
+                    if isinstance(base_source, Mapping):
+                        excluded_slug = str(base_source.get("slug", "")).strip()
+                self._run_agent_with_retries(
+                    state=state,
+                    stage="prototype",
+                    stage_key=f"prototype-select-{variant_id}",
+                    prompt=self._prototype_selection_prompt(
+                        snapshot,
+                        selection_path,
+                        spec_file,
+                        rejection_feedback=prompt,
+                        excluded_slug=excluded_slug,
+                    ),
+                    validation_feedback=lambda _result: self._catalog_selection_feedback(
+                        selection_path,
+                        snapshot,
+                        excluded_slug=excluded_slug,
+                    ),
+                )
+                selected, candidates = validate_catalog_selection(
+                    read_json(selection_path, default={}),
+                    snapshot,
+                )
+                candidate_records = candidates
+                shutil.copyfile(
+                    snapshot.root / selected.design_path,
+                    variant_design_path(self.project_root, variant_id),
+                )
+                self._write_catalog_selection_report(
+                    snapshot=snapshot,
+                    selected=selected,
+                    candidates=candidates,
+                    output_dir=design_docs_root,
+                )
+                source = {
+                    "kind": "awesome-design-md",
+                    "repository": snapshot.repository,
+                    "requested_ref": snapshot.requested_ref,
+                    "commit_sha": snapshot.commit_sha,
+                    "slug": selected.slug,
+                    "upstream_path": selected.design_path,
+                    "content_sha256": sha256_file(variant_design_path(self.project_root, variant_id)),
+                    "license_path": package_ref(
+                        self.project_root,
+                        design_docs_root / "awesome-design-md.LICENSE",
+                    ),
+                    "from_cache": snapshot.from_cache,
+                }
+
+            generation_prompt = self._prototype_generation_prompt(
+                spec_file=spec_file,
+                surfaces=surfaces,
+                source_refs=[package_ref(self.project_root, variant_design_path(self.project_root, variant_id))],
+                prototype_root=prototype_root,
+                variant_prompt=prompt,
+            )
+            self._run_agent_with_retries(
+                state=state,
+                stage="prototype",
+                stage_key=f"prototype-generate-{variant_id}",
+                prompt=generation_prompt,
+                validation_feedback=lambda result: self._prototype_manifest_validation_feedback(
+                    result,
+                    expected_surfaces=surfaces,
+                    prototype_root=prototype_root,
+                ),
+            )
+            entry = build_variant_entry(
+                self.project_root,
+                variant_id,
+                name=name or f"Variant {variant_id[-6:]}",
+                status="candidate",
+                run_id=state.run_id,
+                prompt=prompt,
+                parent_variant_id=parent_id,
+                source=source,
+                candidates=candidate_records,
+                design_decision=decision,
+                max_pages=self.config.frontend_design.max_pages,
+            )
+            errors = validate_variant(
+                self.project_root,
+                entry,
+                max_pages=self.config.frontend_design.max_pages,
+            )
+            if errors:
+                raise RuntimeError(
+                    "Generated frontend prototype variant is invalid:\n"
+                    + "\n".join(f"- {error}" for error in errors)
+                )
+            registry = ensure_registry(
+                self.project_root,
+                max_pages=self.config.frontend_design.max_pages,
+            )
+            add_variant(self.project_root, registry, entry)
+            return entry
+        except Exception:
+            if root.is_dir():
+                shutil.rmtree(root)
+            raise
+
+    def generate_prototype_variant(
+        self,
+        *,
+        prompt: str,
+        name: str = "",
+        base_variant_id: str = "",
+    ) -> Dict[str, object]:
+        state = load_run_state(self.project_root)
+        if state.status != "paused" or state.pending_approval != "prototype":
+            raise RuntimeError(
+                "Additional frontend prototype variants can only be generated while the prototype gate is paused."
+            )
+        if "prototype" in state.approved_gates:
+            raise RuntimeError("The frontend prototype is already approved for this iteration.")
+        direction = str(prompt).strip()
+        if not direction:
+            raise ValueError("--prompt must be non-empty")
+        registry = ensure_registry(
+            self.project_root,
+            max_pages=self.config.frontend_design.max_pages,
+        )
+        candidates = candidate_variants(registry)
+        base_id = str(base_variant_id).strip()
+        if not base_id:
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    "Multiple frontend prototype variants are available; pass --from. Candidates: "
+                    + ", ".join(str(item.get("id", "")) for item in candidates)
+                )
+            base = candidates[0]
+        else:
+            base = find_variant(registry, base_id)
+            if str(base.get("status", "")) != "candidate":
+                raise RuntimeError(f"Frontend prototype variant {base_id} is not a candidate.")
+        raw_spec = str(state.resume_context.get("spec_file", "")).strip()
+        spec_file = Path(raw_spec) if raw_spec else self.project_root / "spec.md"
+        trace = load_requirements_trace(self.project_root, normalize=False)
+        surfaces = selected_surface_specs(trace, max_pages=self.config.frontend_design.max_pages)
+        entry = self._create_prototype_variant(
+            state=state,
+            spec_file=spec_file,
+            surfaces=surfaces,
+            prompt=direction,
+            name=name,
+            base_variant=base,
+            initial=False,
+        )
+        total = len(candidate_variants(load_registry(self.project_root, include_virtual_legacy=False)))
+        state.stage_summaries["prototype"] = (
+            f"Generated frontend prototype variant {entry['id']}; {total} candidate(s) await approval."
+        )
+        state.status = "paused"
+        state.pending_approval = "prototype"
+        save_run_state(self.project_root, state)
+        return entry
 
     def _run_prototype_stage(self, state: RunState, spec_file: Path) -> RunState:
         trace = load_requirements_trace(self.project_root, normalize=False)
@@ -2459,155 +2909,40 @@ class Orchestrator:
             state.last_error = ""
             return state
 
-        spec_text = read_text(spec_file)
-        assets = user_design_assets(self.project_root, trace, spec_text=spec_text)
-        prior_lock = load_frontend_design_lock(self.project_root)
-        reselect = bool(state.resume_context.pop("reselect_frontend_design", False))
-        source: Dict[str, object]
-        design_ref = ""
-        selection_ref = ""
-        candidate_records: List[Dict[str, object]] = []
+        registry = ensure_registry(
+            self.project_root,
+            max_pages=self.config.frontend_design.max_pages,
+        )
+        existing_candidates = candidate_variants(registry)
+        if existing_candidates and not rejection_feedback:
+            state.stage_summaries["prototype"] = (
+                f"Reused {len(existing_candidates)} generated frontend prototype candidate(s); "
+                "manual approval required."
+            )
+            state.last_error = ""
+            return state
 
-        if assets:
-            derived_design = not design_md_path(self.project_root).is_file()
-            if derived_design:
-                self._run_agent_with_retries(
-                    state=state,
-                    stage="prototype",
-                    stage_key="prototype-user-design",
-                    prompt=self._user_design_derivation_prompt(spec_file, assets),
-                    validation_feedback=self._user_design_validation_feedback,
-                )
-            source = {"kind": "user", "refs": assets, "derived_design": derived_design}
-            design_ref = "DESIGN.md"
-            source_refs = [*assets, design_ref]
-        elif (
-            not reselect
-            and prior_lock.get("status") in {"pending_approval", "approved"}
-            and isinstance(prior_lock.get("source"), dict)
-            and prior_lock.get("source", {}).get("kind") == "awesome-design-md"
-            and design_md_path(self.project_root).is_file()
-        ):
-            source = dict(prior_lock["source"])
-            design_ref = "DESIGN.md"
-            selection_ref = str(prior_lock.get("selection_path", ""))
-            candidate_records = [
-                dict(item)
-                for item in prior_lock.get("candidates", []) or []
-                if isinstance(item, dict)
-            ]
-            source_refs = [design_ref]
-        else:
-            try:
-                snapshot = AwesomeDesignCatalogClient(
-                    self.project_root,
-                    repository=self.config.frontend_design.catalog_repository,
-                    requested_ref=self.config.frontend_design.catalog_ref,
-                    timeout_seconds=self.config.frontend_design.network_timeout_seconds,
-                ).load()
-            except FrontendDesignUnavailable as error:
-                self._block_run(
-                    state,
-                    owner="external_provider",
-                    category="frontend_catalog_unavailable",
-                    reason=str(error),
-                )
-                return state
-
-            selection_path = frontend_design_docs_dir(self.project_root) / "selection.json"
-            selection_path.parent.mkdir(parents=True, exist_ok=True)
-            excluded_slug = ""
-            if reselect and isinstance(prior_lock.get("source"), dict):
-                excluded_slug = str(prior_lock.get("source", {}).get("slug", "")).strip()
-            self._run_agent_with_retries(
+        try:
+            entry = self._create_prototype_variant(
                 state=state,
-                stage="prototype",
-                stage_key="prototype-select",
-                prompt=self._prototype_selection_prompt(
-                    snapshot,
-                    selection_path,
-                    spec_file,
-                    rejection_feedback=rejection_feedback,
-                    excluded_slug=excluded_slug,
-                ),
-                validation_feedback=lambda _result: self._catalog_selection_feedback(
-                    selection_path,
-                    snapshot,
-                    excluded_slug=excluded_slug,
-                ),
+                spec_file=spec_file,
+                surfaces=surfaces,
+                prompt=rejection_feedback,
+                name="",
+                base_variant=(existing_candidates[-1] if existing_candidates else None),
+                initial=not bool(existing_candidates),
             )
-            selected, candidates = validate_catalog_selection(read_json(selection_path, default={}), snapshot)
-            candidate_records = candidates
-            shutil.copyfile(snapshot.root / selected.design_path, design_md_path(self.project_root))
-            self._write_catalog_selection_report(
-                snapshot=snapshot,
-                selected=selected,
-                candidates=candidates,
+        except FrontendDesignUnavailable as error:
+            self._block_run(
+                state,
+                owner="external_provider",
+                category="frontend_catalog_unavailable",
+                reason=str(error),
             )
-            source = {
-                "kind": "awesome-design-md",
-                "repository": snapshot.repository,
-                "requested_ref": snapshot.requested_ref,
-                "commit_sha": snapshot.commit_sha,
-                "slug": selected.slug,
-                "upstream_path": selected.design_path,
-                "content_sha256": sha256_file(design_md_path(self.project_root)),
-                "license_path": ".auto-agents/docs/frontend_design/awesome-design-md.LICENSE",
-                "from_cache": snapshot.from_cache,
-            }
-            design_ref = "DESIGN.md"
-            selection_ref = ".auto-agents/docs/frontend_design/selection.md"
-            source_refs = [design_ref]
-
-        generation_prompt = self._prototype_generation_prompt(
-            spec_file=spec_file,
-            surfaces=surfaces,
-            source_refs=source_refs,
-        )
-        if rejection_feedback:
-            generation_prompt += (
-                "\n\nThe previous prototype was rejected. Address this feedback while preserving "
-                f"the selected visual source of truth:\n{rejection_feedback}\n"
-            )
-        self._run_agent_with_retries(
-            state=state,
-            stage="prototype",
-            stage_key="prototype-generate",
-            prompt=generation_prompt,
-            validation_feedback=lambda result: self._prototype_manifest_validation_feedback(
-                result,
-                expected_surfaces=surfaces,
-            ),
-        )
-        manifest_path = frontend_prototype_dir(self.project_root) / "manifest.json"
-        manifest = read_json(manifest_path, default={})
-        lock: Dict[str, object] = {
-            "version": 1,
-            "status": "pending_approval",
-            "created_at": utc_now_iso(),
-            "trigger": {
-                "frontend_requested": True,
-                "existing_frontend": discovery.existing_frontend,
-                "discovery_evidence": list(discovery.evidence),
-            },
-            "source": source,
-            "candidates": candidate_records,
-            "design_path": design_ref,
-            "selection_path": selection_ref,
-            "prototype": {
-                "manifest_ref": ".auto-agents/docs/frontend_prototype/manifest.json",
-                "index_ref": str(manifest.get("index_ref", "")),
-                "viewports": list(self.config.frontend_design.viewports),
-                "pages": list(manifest.get("pages", [])),
-            },
-        }
-        lock["artifact_sha256"] = frontend_design_artifact_hashes(self.project_root)
-        write_json(frontend_design_lock_path(self.project_root), lock)
-        trace["frontend_surfaces"] = derived_frontend_surfaces(lock)
-        write_json(requirements_trace_path(self.project_root), trace)
+            return state
         state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
         state.stage_summaries["prototype"] = (
-            f"Generated {len(lock['prototype']['pages'])} static prototype page(s); manual approval required."
+            f"Generated frontend prototype variant {entry['id']}; manual approval required."
         )
         state.last_error = ""
         return state
@@ -4044,6 +4379,7 @@ class Orchestrator:
         provider_refs_prefix = self._relative_repo_path(provider_references_dir(self.project_root)).rstrip("/") + "/"
         frontend_docs_prefix = self._relative_repo_path(frontend_design_docs_dir(self.project_root)).rstrip("/") + "/"
         frontend_prototype_prefix = self._relative_repo_path(frontend_prototype_dir(self.project_root)).rstrip("/") + "/"
+        frontend_variants_prefix = ".auto-agents/docs/frontend_prototype_variants/"
         run_state_rel = self._relative_repo_path(run_state_path(self.project_root))
         auto_gitignore_rel = ".auto-agents/.gitignore"
         protected_input_specs = {"spec.md"}
@@ -4080,24 +4416,27 @@ class Orchestrator:
             return allowed, lambda path: path.startswith(run_prefix) or path in {run_state_rel, auto_gitignore_rel}
 
         if stage == "prototype":
-            if stage_key == "prototype-select":
-                allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, f"{frontend_docs_prefix}**"]
+            if stage_key.startswith("prototype-select"):
+                allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, f"{frontend_docs_prefix}**", f"{frontend_variants_prefix}**"]
                 return allowed, (
                     lambda path: path.startswith(run_prefix)
                     or path in {run_state_rel, auto_gitignore_rel}
                     or path.startswith(frontend_docs_prefix)
+                    or path.startswith(frontend_variants_prefix)
                 )
-            if stage_key == "prototype-user-design":
-                allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, "DESIGN.md"]
+            if stage_key.startswith("prototype-user-design"):
+                allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, "DESIGN.md", f"{frontend_variants_prefix}**"]
                 return allowed, (
                     lambda path: path.startswith(run_prefix)
                     or path in {run_state_rel, auto_gitignore_rel, "DESIGN.md"}
+                    or path.startswith(frontend_variants_prefix)
                 )
-            allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, f"{frontend_prototype_prefix}**"]
+            allowed = [f"{run_prefix}**", run_state_rel, auto_gitignore_rel, f"{frontend_prototype_prefix}**", f"{frontend_variants_prefix}**"]
             return allowed, (
                 lambda path: path.startswith(run_prefix)
                 or path in {run_state_rel, auto_gitignore_rel}
                 or path.startswith(frontend_prototype_prefix)
+                or path.startswith(frontend_variants_prefix)
             )
 
         if stage == "design":
@@ -7765,15 +8104,16 @@ class Orchestrator:
         state.rejection_reason = ""
         state.last_error = ""
 
-        pending_contract_ready = (
-            lock.get("status") == "pending_approval"
-            and not missing_ids
-            and not validate_frontend_design_artifacts(
+        registry = load_registry(self.project_root, include_virtual_legacy=True)
+        pending_candidates = candidate_variants(registry)
+        pending_contract_ready = bool(pending_candidates) and all(
+            not validate_variant(
                 self.project_root,
-                lock,
-                require_approved=False,
+                candidate,
                 max_pages=self.config.frontend_design.max_pages,
             )
+            for candidate in pending_candidates
+            if not bool(candidate.get("legacy_virtual"))
         )
         if pending_contract_ready:
             state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
@@ -18790,6 +19130,10 @@ class Orchestrator:
 
     def status(self) -> Dict[str, object]:
         state = load_run_state(self.project_root)
+        prototype_registry = load_registry(
+            self.project_root,
+            include_virtual_legacy=True,
+        )
         release_attestation = current_release_attestation(self.project_root)
         runtime_interruptions = [
             entry
@@ -18813,6 +19157,22 @@ class Orchestrator:
             "tasks": [task.to_dict() for task in state.tasks],
             "changed_files": changed_files(self.project_root) if is_repo(self.project_root) else "",
             "runtime": runtime_status(self.project_root),
+            "frontend_prototypes": {
+                "approved_variant_id": prototype_registry.get("approved_variant_id", ""),
+                "candidates": [
+                    {
+                        "id": item.get("id", ""),
+                        "name": item.get("name", ""),
+                        "design_action": (
+                            item.get("design_decision", {}).get("design_action", "")
+                            if isinstance(item.get("design_decision"), dict)
+                            else ""
+                        ),
+                        "size_bytes": item.get("size_bytes", 0),
+                    }
+                    for item in candidate_variants(prototype_registry)
+                ],
+            },
         }
 
     def validate(self) -> Dict[str, object]:
