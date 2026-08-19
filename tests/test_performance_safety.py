@@ -856,6 +856,19 @@ class EvidencePreflightTests(unittest.TestCase):
         self.assertEqual(parsed["decision"], "READY")
         self.assertIsNone(Orchestrator._parse_evidence_preflight("READY"))
 
+    def test_parse_owner_stage_route_with_required_mutation(self) -> None:
+        parsed = Orchestrator._parse_evidence_preflight(
+            "EVIDENCE_PREFLIGHT: "
+            '{"decision":"ROUTE","target_stage":"provider_research",'
+            '"reason":"reference is incomplete","checklist":[],'
+            '"required_mutations":[{"path":".auto-agents/docs/provider_references/image.md",'
+            '"reason":"add rule provenance"}]}'
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["decision"], "ROUTE")
+        self.assertEqual(parsed["target_stage"], "provider_research")
+
     def test_routing_happens_before_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"

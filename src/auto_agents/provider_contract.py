@@ -23,6 +23,16 @@ PROVIDER_REFERENCE_V2_HEADINGS = (
 )
 
 _HEADING_PATTERN = re.compile(r"^##\s+(.+?)\s*#*\s*$", re.MULTILINE)
+_PROVENANCE_LABEL_PATTERN = re.compile(r"\*\*\[([^\]]+)\]\*\*")
+_NUMBERED_RULE_PATTERN = re.compile(r"^\d+[.)]\s+")
+_TABLE_SEPARATOR_PATTERN = re.compile(r"^:?-{3,}:?$")
+
+_PROVENANCE_SECTIONS = (
+    "Prompt / Content Construction",
+    "Safety / Content Policy",
+    "Semantic Error Routing",
+    "Retry / Recovery Matrix",
+)
 
 
 def provider_reference_lock_entry(
@@ -84,6 +94,105 @@ def validate_provider_reference_v2(
             errors.append(f"missing required section: {heading}")
         elif not sections[normalized]:
             errors.append(f"required section is empty: {heading}")
+    for heading in _PROVENANCE_SECTIONS:
+        section = sections.get(_normalize_heading(heading), "")
+        if not section or _is_explained_not_applicable(section):
+            continue
+        if heading == "Retry / Recovery Matrix":
+            errors.extend(_validate_recovery_provenance(section))
+        else:
+            errors.extend(_validate_rule_provenance(heading, section))
+    return errors
+
+
+def _provenance_kinds(text: str) -> set[str]:
+    kinds: set[str] = set()
+    for raw_label in _PROVENANCE_LABEL_PATTERN.findall(text):
+        label = raw_label.strip().lower()
+        if "official" in label or "source=official" in label:
+            kinds.add("official")
+        if "observed" in label or "source=observed" in label:
+            kinds.add("observed")
+        if (
+            "assumption" in label
+            or "unknown" in label
+            or "source=assumption" in label
+        ):
+            kinds.add("assumption")
+        if "policy" in label or "source=local-policy" in label:
+            kinds.add("local-policy")
+    return kinds
+
+
+def _is_explained_not_applicable(section: str) -> bool:
+    text = " ".join(section.split()).strip()
+    match = re.match(r"(?i)^not applicable\s*[:\u2014-]\s*(.+)$", text)
+    return bool(match and len(match.group(1).strip()) >= 8)
+
+
+def _is_table_separator(line: str) -> bool:
+    if not line.startswith("|"):
+        return False
+    cells = [cell.strip() for cell in line.strip("|").split("|")]
+    return bool(cells) and all(_TABLE_SEPARATOR_PATTERN.fullmatch(cell) for cell in cells)
+
+
+def _validate_rule_provenance(heading: str, section: str) -> list[str]:
+    errors: list[str] = []
+    for line_number, raw_line in enumerate(section.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or _is_table_separator(line):
+            continue
+        if line.startswith("|"):
+            # Tables in these sections carry provenance per data row. Header rows
+            # are descriptive and do not need a source label.
+            if "official" in line.lower() or "provenance" in line.lower() or "source" in line.lower():
+                continue
+        is_rule = line.startswith("- ") or bool(_NUMBERED_RULE_PATTERN.match(line))
+        is_prose = not line.startswith("|")
+        if (is_rule or is_prose) and not _provenance_kinds(line):
+            errors.append(
+                f"{heading} line {line_number} lacks direct provenance"
+            )
+    return errors
+
+
+def _validate_recovery_provenance(section: str) -> list[str]:
+    errors: list[str] = []
+    table_lines = [line.strip() for line in section.splitlines() if line.strip().startswith("|")]
+    if not table_lines:
+        return ["Retry / Recovery Matrix must contain a sourced table"]
+
+    header_cells = [cell.strip() for cell in table_lines[0].strip("|").split("|")]
+    provenance_indexes = [
+        index
+        for index, cell in enumerate(header_cells)
+        if cell.lower() in {"source", "provenance"}
+    ]
+    if not provenance_indexes:
+        errors.append("Retry / Recovery Matrix must include a Source or Provenance column")
+    else:
+        provenance_index = provenance_indexes[0]
+        for row_number, row in enumerate(table_lines[2:], start=3):
+            cells = [cell.strip() for cell in row.strip("|").split("|")]
+            if len(cells) != len(header_cells):
+                errors.append(
+                    f"Retry / Recovery Matrix row {row_number} has an inconsistent column count"
+                )
+                continue
+            if not _provenance_kinds(cells[provenance_index]):
+                errors.append(
+                    f"Retry / Recovery Matrix row {row_number} lacks provenance"
+                )
+
+    for line_number, raw_line in enumerate(section.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("|"):
+            continue
+        if not _provenance_kinds(line):
+            errors.append(
+                f"Retry / Recovery Matrix narrative line {line_number} lacks direct provenance"
+            )
     return errors
 
 
@@ -107,6 +216,7 @@ def provider_policy_prompt_lines(stage: str) -> list[str]:
         "plan": [
             "Create owned task acceptance and executable system-boundary proofs for provider safety signals returned under non-canonical HTTP statuses, positive-first typed prompt compilation, deduplication, and bounded recovery without unchanged safety retries.",
             "Do not treat configuration text, internal policy metadata, or a fake success response as proof of the final outbound content or safety-error routing.",
+            "Provider references and their lock are provider_research-owned read-only inputs during implementation. Plan implementation tasks to consume and test them, never to refresh or rewrite them.",
         ],
         "provider_research": [
             f"Every created or refreshed provider reference must use contract_version={PROVIDER_REFERENCE_CONTRACT_VERSION} in its lock entry.",
@@ -115,10 +225,12 @@ def provider_policy_prompt_lines(stage: str) -> list[str]:
             + ".",
             "If prompt/content construction or content policy is not applicable, state 'Not applicable' with a concrete reason; do not omit the section.",
             "The Semantic Error Routing and Retry / Recovery Matrix sections must distinguish provider body semantics from HTTP fallback and record unchanged versus transformed retry behavior. Unknown behavior must stay explicit and cannot be marked verified by invention.",
+            "Every normative paragraph, bullet, and numbered rule in the four provider content-safety sections must carry direct official, observed, assumption/unknown, or local-policy provenance. Retry / Recovery Matrix must include a Source or Provenance column with a sourced value on every data row.",
         ],
         "implement": [
             "For provider integrations, implement and test the provider-reference safety/error matrix at the serialized request/response boundary. Preserve stable semantic categories and bounded redacted evidence.",
             "Do not satisfy a safety requirement by expanding a long list of policy-sensitive negative phrases into every outbound prompt or by applying a human-specific fallback template to animals, objects, or other incompatible subject types.",
+            "Treat .auto-agents provider references as read-only provider_research-owned inputs. If a bound reference is incomplete, report it for owner-stage recovery instead of weakening tests or editing the reference during implementation.",
         ],
         "review": [
             "Fail the review when a provider integration classifies only by HTTP status despite a recognizable body-level safety/refusal signal, retries an unchanged safety-blocked request, or lacks the provider-reference v2 system-boundary tests owned by the task.",

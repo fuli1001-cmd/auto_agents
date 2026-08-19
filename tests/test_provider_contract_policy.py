@@ -28,6 +28,43 @@ def _reference_markdown() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _sourced_reference_markdown() -> str:
+    sections: dict[str, str] = {
+        "Prompt / Content Construction": (
+            "**[Provider official]** The request accepts a prompt.\n\n"
+            "- **[Local policy]** Compile the prompt before sending it."
+        ),
+        "Safety / Content Policy": (
+            "**[Provider official]** Structured refusals use a stable code.\n\n"
+            "**[Project observed]** A compatibility gateway returned a wrapped refusal.\n\n"
+            "**[Local policy]** Ambiguous refusals fail closed."
+        ),
+        "Semantic Error Routing": (
+            "**[Local policy]** Parse the bounded body before HTTP fallback.\n\n"
+            "1. **[Provider official]** A stable refusal code is documented; "
+            "**[Local policy]** map it to the safety category.\n"
+            "2. **[Compatibility assumption]** A wrapped status token is equivalent."
+        ),
+        "Retry / Recovery Matrix": (
+            "| Outcome | Retry | Provenance |\n"
+            "| --- | --- | --- |\n"
+            "| Safety refusal | Forbidden | **[Local policy]** |\n\n"
+            "**[Local policy]** Retry budgets remain independent."
+        ),
+    }
+    lines = ["# Provider contract"]
+    for heading in PROVIDER_REFERENCE_V2_HEADINGS:
+        lines.extend(
+            [
+                "",
+                f"## {heading}",
+                "",
+                sections.get(heading, "Not applicable: covered by this fixture."),
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
 class ProviderContractPolicyTests(unittest.TestCase):
     def test_v2_reference_requires_version_nonempty_sections_and_allows_explained_na(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -53,6 +90,43 @@ class ProviderContractPolicyTests(unittest.TestCase):
                     },
                 ),
                 [],
+            )
+
+    def test_v2_reference_requires_rule_and_recovery_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "provider.md"
+            lock_entry = {
+                "path": "provider.md",
+                "status": "verified",
+                "contract_version": PROVIDER_REFERENCE_CONTRACT_VERSION,
+            }
+
+            write_text(reference, _sourced_reference_markdown())
+            self.assertEqual(validate_provider_reference_v2(reference, lock_entry), [])
+
+            missing_routing_source = _sourced_reference_markdown().replace(
+                "2. **[Compatibility assumption]** A wrapped status token is equivalent.",
+                "2. A wrapped status token is equivalent.",
+            )
+            write_text(reference, missing_routing_source)
+            errors = validate_provider_reference_v2(reference, lock_entry)
+            self.assertTrue(
+                any("Semantic Error Routing" in item and "provenance" in item for item in errors),
+                errors,
+            )
+
+            missing_matrix_source = _sourced_reference_markdown().replace(
+                "| Outcome | Retry | Provenance |",
+                "| Outcome | Retry |",
+            ).replace(
+                "| --- | --- | --- |\n| Safety refusal | Forbidden | **[Local policy]** |",
+                "| --- | --- |\n| Safety refusal | Forbidden |",
+            )
+            write_text(reference, missing_matrix_source)
+            errors = validate_provider_reference_v2(reference, lock_entry)
+            self.assertTrue(
+                any("Source or Provenance column" in item for item in errors),
+                errors,
             )
 
     def test_provider_research_enforces_v2_only_for_created_or_refreshed_references(self) -> None:

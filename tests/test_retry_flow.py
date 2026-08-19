@@ -2458,7 +2458,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("stage readme modified files outside its ownership during readme-propose", str(ctx.exception))
             self.assertIn("README.md", str(ctx.exception))
 
-    def test_implement_stage_rejects_auto_agents_mutation(self) -> None:
+    def test_implement_stage_routes_auto_agents_mutation_to_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -2489,15 +2489,12 @@ class RetryFlowTests(unittest.TestCase):
 
             state = load_run_state(project_root)
             state.tasks = orchestrator._load_tasks_from_plan()
-            with self.assertRaises(RuntimeError) as ctx:
-                orchestrator._run_implementation_loop(state, max_tasks=1)
+            recovered = orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            self.assertIn("implement-task-001 exhausted retries", str(ctx.exception))
-            self.assertIn(".auto-agents/state/task_plan.json", str(ctx.exception))
-            self.assertEqual(
-                orchestrator.adapter.implement_calls,
-                orchestrator._max_attempts("implement"),
-            )
+            self.assertEqual(recovered.current_stage, "plan")
+            self.assertEqual(recovered.rejected_stage, "plan")
+            self.assertIn(".auto-agents/state/task_plan.json", recovered.rejection_reason)
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
             self.assertIn(
                 "\"task_id\": \"task-001\"",
                 task_plan_path(project_root).read_text(encoding="utf-8"),
@@ -2530,7 +2527,7 @@ class RetryFlowTests(unittest.TestCase):
                 task_origin="evidence_repair",
             )
             self.assertTrue(repair_is_allowed(".auto-agents/state/task_plan.json"))
-            self.assertTrue(
+            self.assertFalse(
                 repair_is_allowed(
                     ".auto-agents/docs/provider_references/provider.md"
                 )
@@ -2912,7 +2909,7 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertIn("spec.md", paths)
 
-    def test_implement_stage_retries_after_auto_agents_mutation(self) -> None:
+    def test_implement_stage_routes_task_plan_mutation_to_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -2945,14 +2942,12 @@ class RetryFlowTests(unittest.TestCase):
             state.tasks = orchestrator._load_tasks_from_plan()
             result = orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            self.assertEqual(result.tasks[0].status, "done")
-            self.assertEqual(orchestrator.adapter.implement_calls, 2)
-            self.assertEqual(
-                (project_root / "artifact.txt").read_text(encoding="utf-8"),
-                "good\n",
-            )
+            self.assertEqual(result.tasks[0].status, "pending")
+            self.assertEqual(result.current_stage, "plan")
+            self.assertEqual(result.rejected_stage, "plan")
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
             self.assertIn(
-                "\"status\": \"done\"",
+                "\"task_id\": \"task-001\"",
                 task_plan_path(project_root).read_text(encoding="utf-8"),
             )
 
@@ -2997,7 +2992,7 @@ class RetryFlowTests(unittest.TestCase):
                 original_config,
             )
 
-    def test_implement_stage_restores_review_and_spec_mutation_before_retry(self) -> None:
+    def test_implement_stage_routes_protected_spec_mutation_to_clarify(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -3036,12 +3031,14 @@ class RetryFlowTests(unittest.TestCase):
             state.tasks = orchestrator._load_tasks_from_plan()
             result = orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            self.assertEqual(result.tasks[0].status, "done")
-            self.assertEqual(orchestrator.adapter.implement_calls, 2)
-            self.assertEqual(orchestrator.adapter.review_input_before_review, original_review)
+            self.assertEqual(result.tasks[0].status, "pending")
+            self.assertEqual(result.current_stage, "clarify")
+            self.assertEqual(result.rejected_stage, "clarify")
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(orchestrator.adapter.review_input_before_review, "")
             self.assertEqual(
                 (project_root / ".auto-agents" / "docs" / "review.md").read_text(encoding="utf-8"),
-                "Looks good.\n",
+                original_review,
             )
             self.assertEqual(
                 (project_root / "specs" / "2026-05-07-iter-01.md").read_text(encoding="utf-8"),
@@ -4403,7 +4400,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.tasks[0].status, "done")
             self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "fixed")
 
-    def test_repair_task_can_update_provider_reference_artifact(self) -> None:
+    def test_repair_task_routes_provider_reference_mutation_to_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -4433,10 +4430,11 @@ class RetryFlowTests(unittest.TestCase):
                 / "provider_references"
                 / "apiyi_gpt_image_2.md"
             )
-            self.assertTrue(result["ok"])
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["rewind_to_stage"], "provider_research")
             self.assertEqual(orchestrator.adapter.implement_calls, 1)
-            self.assertEqual(orchestrator.adapter.review_calls, 1)
-            self.assertIn("gpt-image-2-vip", reference_path.read_text(encoding="utf-8"))
+            self.assertEqual(orchestrator.adapter.review_calls, 0)
+            self.assertFalse(reference_path.exists())
 
     def test_repair_task_can_update_task_plan_proof_refs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7162,6 +7160,18 @@ class RetryFlowTests(unittest.TestCase):
         )
 
         self.assertEqual(Orchestrator._review_feedback_rewind_stage(summary), "design")
+
+    def test_review_feedback_normalizes_absolute_provider_reference_links(self) -> None:
+        summary = (
+            "DECISION: fail\n"
+            "[provider reference](/home/example/demo/.auto-agents/docs/"
+            "provider_references/image.md:42) lacks rule-level provenance."
+        )
+
+        self.assertEqual(
+            Orchestrator._review_feedback_rewind_stage(summary),
+            "provider_research",
+        )
 
     def test_review_feedback_does_not_guess_clarify_from_requirements_audit_wording(self) -> None:
         summary = (

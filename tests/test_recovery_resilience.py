@@ -405,6 +405,75 @@ class RecoveryResilienceTests(unittest.TestCase):
             self.assertIn(apiyi_reference, feedback)
             self.assertNotIn(unrelated_reference, feedback)
 
+    def test_doc_only_provider_proof_routes_without_test_name_heuristics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            failure_id = "tests/test_contract.py::test_req_210_sources_are_separated"
+            reference = ".auto-agents/docs/provider_references/image.md"
+            task = TaskSpec(
+                task_id="task-provider-doc",
+                title="provider documentation contract",
+                description="",
+                acceptance=[],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-210",
+                        "oracle_index": 1,
+                        "evidence_refs": [failure_id, reference],
+                    }
+                ],
+            )
+
+            stage, feedback = orchestrator._verification_failure_owner_route(
+                task,
+                {
+                    "reason": f"1 new verification failure: {failure_id}",
+                    "failure_ids": [failure_id],
+                    "new_failure_ids": [failure_id],
+                    "baseline_comparison_comparable": True,
+                },
+            )
+
+            self.assertEqual(stage, "provider_research")
+            self.assertIn(reference, feedback)
+
+    def test_behavioral_provider_proof_with_application_source_stays_in_implement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            failure_id = "tests/test_provider.py::test_serialized_request"
+            task = TaskSpec(
+                task_id="task-provider-runtime",
+                title="provider runtime",
+                description="",
+                acceptance=[],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-211",
+                        "oracle_index": 1,
+                        "evidence_refs": [
+                            failure_id,
+                            ".auto-agents/docs/provider_references/image.md",
+                            "app/provider.py",
+                        ],
+                    }
+                ],
+            )
+
+            stage, feedback = orchestrator._verification_failure_owner_route(
+                task,
+                {
+                    "reason": f"1 new verification failure: {failure_id}",
+                    "failure_ids": [failure_id],
+                    "new_failure_ids": [failure_id],
+                    "baseline_comparison_comparable": True,
+                },
+            )
+
+            self.assertEqual(stage, "")
+            self.assertEqual(feedback, "")
+
     def test_misrouted_provider_resume_restores_lock_and_returns_to_implement(
         self,
     ) -> None:

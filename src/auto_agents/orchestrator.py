@@ -252,8 +252,17 @@ _FAILOVER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+class StageOwnershipRouteError(RuntimeError):
+    """A stage mutated an artifact owned by an earlier pipeline stage."""
+
+    def __init__(self, owner_stage: str, paths: Iterable[str], message: str) -> None:
+        super().__init__(message)
+        self.owner_stage = str(owner_stage)
+        self.paths = [str(path) for path in paths]
+
+
 VERIFY_BASELINE_SCHEMA_VERSION = 1
-IMPLEMENTATION_SCOPE_POLICY_VERSION = 3
+IMPLEMENTATION_SCOPE_POLICY_VERSION = 4
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
 _NON_COMPARABLE_BASELINE_PREFIXES = (
@@ -1320,9 +1329,33 @@ class Orchestrator:
     @staticmethod
     def _normalize_audit_blocker_path(path: object) -> str:
         normalized = str(path or "").strip().replace("\\", "/")
+        normalized = normalized.strip("<>")
         while normalized.startswith("./"):
             normalized = normalized[2:]
+        # Review agents emit clickable absolute Markdown links. Keep ownership
+        # classification project-relative for every orchestrator-owned artifact
+        # even when the leading project root is not available to this helper.
+        auto_agents_marker = "/.auto-agents/"
+        if auto_agents_marker in normalized:
+            normalized = ".auto-agents/" + normalized.split(
+                auto_agents_marker, maxsplit=1
+            )[1]
         return normalized
+
+    def _scope_violation_rewind_stage(self, paths: Iterable[str]) -> str:
+        owners: Set[str] = set()
+        for raw_path in paths:
+            path = self._normalize_audit_blocker_path(raw_path)
+            if self._is_immutable_input_spec_path(path):
+                owners.add("clarify")
+                continue
+            owner = self._forbidden_pattern_owner_stage({"path": path})
+            if (
+                owner in STAGE_ORDER
+                and STAGE_ORDER.index(owner) < STAGE_ORDER.index("implement")
+            ):
+                owners.add(owner)
+        return next(iter(owners)) if len(owners) == 1 else ""
 
     @classmethod
     def _forbidden_pattern_owner_stage(cls, blocker: Dict[str, object]) -> str:
@@ -4121,15 +4154,12 @@ class Orchestrator:
                     run_state_rel,
                     auto_gitignore_rel,
                     plan_path,
-                    provider_lock_path,
-                    f"{provider_refs_prefix}**",
                     "any non-.auto-agents project path except input specs (immutable iteration/active specs)",
                     mutable_description,
                 ]
                 return allowed, (
                     lambda path: path.startswith(run_prefix)
-                    or path in {run_state_rel, auto_gitignore_rel, plan_path, provider_lock_path}
-                    or path.startswith(provider_refs_prefix)
+                    or path in {run_state_rel, auto_gitignore_rel, plan_path}
                     or is_implementation_owned_path(path)
                 )
             allowed = [
@@ -13364,6 +13394,21 @@ class Orchestrator:
             parsed = self._parse_evidence_preflight(result.summary or result.stdout)
             if parsed is None:
                 raise ValueError("invalid EVIDENCE_PREFLIGHT response")
+            required_mutations = parsed.get("required_mutations", [])
+            if isinstance(required_mutations, list):
+                mutation_paths = [
+                    str(item.get("path", "")).strip()
+                    for item in required_mutations
+                    if isinstance(item, dict) and str(item.get("path", "")).strip()
+                ]
+                owner_stage = self._scope_violation_rewind_stage(mutation_paths)
+                if owner_stage:
+                    parsed["decision"] = "ROUTE"
+                    parsed["target_stage"] = owner_stage
+                    parsed["reason"] = (
+                        f"{parsed['reason']} Required mutation(s) are owned by "
+                        f"{owner_stage}: {', '.join(mutation_paths)}"
+                    )
             self._emit_agent_metrics(
                 stage_key,
                 result,
@@ -13420,8 +13465,10 @@ class Orchestrator:
                 "Choose READY when the task is implementable and provide a concrete proof checklist.",
                 "Choose SPLIT when independently verifiable proof surfaces require separate task slices.",
                 "Choose CLARIFY only when a product decision or external contract is genuinely missing.",
+                "Choose ROUTE when implementation requires changing an artifact owned by an earlier stage; set target_stage to clarify, prototype, design, plan, or provider_research.",
+                "Always list required_mutations as objects with exact project-relative path and reason. Provider references under .auto-agents are read-only implementation inputs owned by provider_research.",
                 "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
-                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY\",\"reason\":\"...\",\"checklist\":[\"...\"]}",
+                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\"}]}",
                 f"Task JSON:\n{json.dumps(task.to_dict(), indent=2, ensure_ascii=False)}",
                 requirement_context,
             ]
@@ -13442,17 +13489,33 @@ class Orchestrator:
             decision = str(payload.get("decision", "")).strip().upper()
             reason = str(payload.get("reason", "")).strip()
             checklist = payload.get("checklist", [])
+            target_stage = str(payload.get("target_stage", "")).strip()
+            required_mutations = payload.get("required_mutations", [])
             if (
-                decision not in {"READY", "SPLIT", "CLARIFY"}
+                decision not in {"READY", "SPLIT", "CLARIFY", "ROUTE"}
                 or not reason
                 or not isinstance(checklist, list)
                 or any(not isinstance(item, str) or not item.strip() for item in checklist)
+                or not isinstance(required_mutations, list)
+                or any(
+                    not isinstance(item, dict)
+                    or not str(item.get("path", "")).strip()
+                    or not str(item.get("reason", "")).strip()
+                    for item in required_mutations
+                )
+                or (
+                    decision == "ROUTE"
+                    and target_stage
+                    not in {"clarify", "prototype", "design", "plan", "provider_research"}
+                )
             ):
                 return None
             return {
                 "decision": decision,
+                "target_stage": target_stage,
                 "reason": reason,
                 "checklist": [str(item).strip() for item in checklist],
+                "required_mutations": [dict(item) for item in required_mutations],
             }
         return None
 
@@ -13464,7 +13527,11 @@ class Orchestrator:
         result: Dict[str, object],
     ) -> RunState:
         decision = str(result.get("decision", "")).strip().upper()
-        target_stage = "plan" if decision == "SPLIT" else "clarify"
+        target_stage = (
+            str(result.get("target_stage", "")).strip()
+            if decision == "ROUTE"
+            else "plan" if decision == "SPLIT" else "clarify"
+        )
         task.status = "pending"
         self._persist_tasks(tasks)
         self._rewind_state_from_stage(state, target_stage)
@@ -13833,6 +13900,54 @@ class Orchestrator:
             return next(iter(owners))
         return ""
 
+    def _provider_reference_proof_dependencies_for_failures(
+        self,
+        task: TaskSpec,
+        failure_ids: Iterable[str],
+    ) -> Set[str]:
+        """Resolve doc-only proof failures without guessing from test names.
+
+        A behavioral provider proof commonly cites application source as well as
+        its reference and must remain implementation-owned. A deterministic
+        document-contract proof cites only its test plus provider-research-owned
+        artifacts, so it can be routed safely to the upstream owner.
+        """
+        active_failures = {
+            str(failure_id).strip()
+            for failure_id in failure_ids
+            if str(failure_id).strip()
+        }
+        if not active_failures:
+            return set()
+
+        matched_references: Set[str] = set()
+        for proof in task.requirement_proofs:
+            if not isinstance(proof, dict):
+                continue
+            refs = [
+                str(ref).strip()
+                for ref in proof.get("evidence_refs", []) or []
+                if str(ref).strip()
+            ]
+            if not any(ref in active_failures for ref in refs):
+                continue
+
+            provider_refs: Set[str] = set()
+            implementation_support: Set[str] = set()
+            for ref in refs:
+                path, _selector = self._split_evidence_ref(ref)
+                path = self._normalize_audit_blocker_path(path)
+                if not path or self._looks_like_pytest_evidence_ref(ref):
+                    continue
+                owner = self._forbidden_pattern_owner_stage({"path": path})
+                if owner == "provider_research":
+                    provider_refs.add(path)
+                elif owner == "implement":
+                    implementation_support.add(path)
+            if provider_refs and not implementation_support:
+                matched_references.update(provider_refs)
+        return matched_references
+
     def _verification_failure_owner_route(
         self,
         task: TaskSpec,
@@ -13880,19 +13995,24 @@ class Orchestrator:
             )
             if value
         )
+        proof_references = self._provider_reference_proof_dependencies_for_failures(
+            task,
+            active_failure_ids,
+        )
         provider_signal = re.search(
             r"provider[_ -]?reference|canonical[_ -]?reference|"
             r"canonical provider|\.auto-agents/docs/provider_references/",
             current_evidence,
             flags=re.IGNORECASE,
         )
-        if not provider_signal:
+        if not provider_signal and not proof_references:
             return "", ""
 
         scoped_evidence = "\n".join(
             [current_evidence, *sorted(set(task.requirement_ids))]
         )
-        references = set(
+        references = set(proof_references)
+        references.update(
             self._provider_reference_paths_from_review(scoped_evidence)
         )
         normalized_evidence = re.sub(
@@ -15814,14 +15934,39 @@ class Orchestrator:
                         "Do not dismiss tightly coupled regressions in explicitly implicated paths as out of scope. "
                         "Then, proceed to implement the plan."
                     )
-                result = self._run_agent_with_retries(
-                    state=state,
-                    stage="implement",
-                    stage_key=f"implement-{task.task_id}",
-                    prompt=implement_prompt,
-                    task_origin=task.task_origin,
-                    mutable_artifacts=self._effective_task_mutable_artifacts(task),
-                )
+                try:
+                    result = self._run_agent_with_retries(
+                        state=state,
+                        stage="implement",
+                        stage_key=f"implement-{task.task_id}",
+                        prompt=implement_prompt,
+                        task_origin=task.task_origin,
+                        mutable_artifacts=self._effective_task_mutable_artifacts(task),
+                    )
+                except StageOwnershipRouteError as error:
+                    reason = str(error)
+                    return {
+                        "ok": False,
+                        "review": reason,
+                        "reason": reason,
+                        "failure_ids": [
+                            f"artifact-owner:{path}" for path in error.paths
+                        ],
+                        "comparable_failures": False,
+                        "rewind_to_stage": error.owner_stage,
+                        "expected_owner_stage": error.owner_stage,
+                        "rewind_reason": reason,
+                        "provider_reference_paths": (
+                            [
+                                path
+                                for path in error.paths
+                                if self._forbidden_pattern_owner_stage({"path": path})
+                                == "provider_research"
+                            ]
+                            if error.owner_stage == "provider_research"
+                            else []
+                        ),
+                    }
                 if not result.ok:
                     last_reason = result.stderr or result.summary or "implementation failed"
                     feedback = self._format_retry_feedback(
@@ -16906,6 +17051,17 @@ class Orchestrator:
                             "Do not edit orchestrator-owned .auto-agents state, docs, config, planning files, "
                             "or input specs during implementation; update repository code/tests instead."
                         )
+                        owner_stage = self._scope_violation_rewind_stage(offending)
+                        if owner_stage:
+                            raise StageOwnershipRouteError(
+                                owner_stage,
+                                offending,
+                                (
+                                    f"{last_error} The changed artifact(s) are owned by "
+                                    f"{owner_stage}; rewind to that stage instead of retrying "
+                                    "implementation."
+                                ),
+                            )
                         feedback = last_error
                         continue
                     if (
