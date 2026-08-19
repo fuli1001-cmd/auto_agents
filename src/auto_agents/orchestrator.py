@@ -18863,6 +18863,7 @@ class Orchestrator:
         refs = lock.get("references", {}) if isinstance(lock, dict) else {}
         if not isinstance(refs, dict):
             return "provider_references.lock.json must contain a 'references' object"
+        validated_references: Set[str] = set()
         for requirement in external_doc_requirements(trace):
             req_id = str(requirement.get("id", "")).strip()
             if allowed_ids is not None and req_id not in allowed_ids:
@@ -18872,6 +18873,9 @@ class Orchestrator:
                 missing.append(f"{req_id}: missing provider_reference")
                 continue
             for reference in references:
+                if reference in validated_references:
+                    continue
+                validated_references.add(reference)
                 status = provider_reference_status(lock, reference)
                 if status == "missing":
                     missing.append(f"{req_id}: no lock entry for {reference}")
@@ -18888,6 +18892,7 @@ class Orchestrator:
                             ),
                         )
                     )
+        missing = list(dict.fromkeys(missing))
         if missing:
             bullets = "\n".join(f"- {item}" for item in missing)
             return (

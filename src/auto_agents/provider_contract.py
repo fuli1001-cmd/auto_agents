@@ -24,6 +24,10 @@ PROVIDER_REFERENCE_V2_HEADINGS = (
 
 _HEADING_PATTERN = re.compile(r"^##\s+(.+?)\s*#*\s*$", re.MULTILINE)
 _PROVENANCE_LABEL_PATTERN = re.compile(r"\*\*\[([^\]]+)\]\*\*")
+_MALFORMED_PROVENANCE_LABEL_PATTERN = re.compile(
+    r"\*\*(?:Provenance|Source)\s*:\s*\[([^\]]+)\]\*\*",
+    re.IGNORECASE,
+)
 _NUMBERED_RULE_PATTERN = re.compile(r"^\d+[.)]\s+")
 _TABLE_SEPARATOR_PATTERN = re.compile(r"^:?-{3,}:?$")
 
@@ -124,6 +128,25 @@ def _provenance_kinds(text: str) -> set[str]:
     return kinds
 
 
+def _malformed_provenance_labels(text: str) -> list[str]:
+    return [
+        label.strip()
+        for label in _MALFORMED_PROVENANCE_LABEL_PATTERN.findall(text)
+        if label.strip()
+    ]
+
+
+def _malformed_provenance_error(
+    location: str,
+    labels: Iterable[str],
+) -> str:
+    label = next((str(item).strip() for item in labels if str(item).strip()), "label")
+    return (
+        f"{location} uses unsupported provenance syntax "
+        f"'**Provenance: [{label}]**'; use canonical '**[{label}]**'"
+    )
+
+
 def _is_explained_not_applicable(section: str) -> bool:
     text = " ".join(section.split()).strip()
     match = re.match(r"(?i)^not applicable\s*[:\u2014-]\s*(.+)$", text)
@@ -142,6 +165,15 @@ def _validate_rule_provenance(heading: str, section: str) -> list[str]:
     for line_number, raw_line in enumerate(section.splitlines(), start=1):
         line = raw_line.strip()
         if not line or _is_table_separator(line):
+            continue
+        malformed_labels = _malformed_provenance_labels(line)
+        if malformed_labels:
+            errors.append(
+                _malformed_provenance_error(
+                    f"{heading} line {line_number}",
+                    malformed_labels,
+                )
+            )
             continue
         if line.startswith("|"):
             # Tables in these sections carry provenance per data row. Header rows
@@ -180,7 +212,16 @@ def _validate_recovery_provenance(section: str) -> list[str]:
                     f"Retry / Recovery Matrix row {row_number} has an inconsistent column count"
                 )
                 continue
-            if not _provenance_kinds(cells[provenance_index]):
+            provenance_cell = cells[provenance_index]
+            malformed_labels = _malformed_provenance_labels(provenance_cell)
+            if malformed_labels:
+                errors.append(
+                    _malformed_provenance_error(
+                        f"Retry / Recovery Matrix row {row_number}",
+                        malformed_labels,
+                    )
+                )
+            elif not _provenance_kinds(provenance_cell):
                 errors.append(
                     f"Retry / Recovery Matrix row {row_number} lacks provenance"
                 )
@@ -189,7 +230,15 @@ def _validate_recovery_provenance(section: str) -> list[str]:
         line = raw_line.strip()
         if not line or line.startswith("|"):
             continue
-        if not _provenance_kinds(line):
+        malformed_labels = _malformed_provenance_labels(line)
+        if malformed_labels:
+            errors.append(
+                _malformed_provenance_error(
+                    f"Retry / Recovery Matrix narrative line {line_number}",
+                    malformed_labels,
+                )
+            )
+        elif not _provenance_kinds(line):
             errors.append(
                 f"Retry / Recovery Matrix narrative line {line_number} lacks direct provenance"
             )
@@ -226,6 +275,7 @@ def provider_policy_prompt_lines(stage: str) -> list[str]:
             "If prompt/content construction or content policy is not applicable, state 'Not applicable' with a concrete reason; do not omit the section.",
             "The Semantic Error Routing and Retry / Recovery Matrix sections must distinguish provider body semantics from HTTP fallback and record unchanged versus transformed retry behavior. Unknown behavior must stay explicit and cannot be marked verified by invention.",
             "Every normative paragraph, bullet, and numbered rule in the four provider content-safety sections must carry direct official, observed, assumption/unknown, or local-policy provenance. Retry / Recovery Matrix must include a Source or Provenance column with a sourced value on every data row.",
+            "Use canonical bold-bracket provenance labels such as **[OpenAI official]**, **[APIYI official]**, **[SDGP observed]**, **[SDGP compatibility assumption]**, and **[SDGP policy]**. The wrapper form **Provenance: [OpenAI official]** (or **Source: [OpenAI official]**) is invalid and must not be used.",
         ],
         "implement": [
             "For provider integrations, implement and test the provider-reference safety/error matrix at the serialized request/response boundary. Preserve stable semantic categories and bounded redacted evidence.",

@@ -129,6 +129,95 @@ class ProviderContractPolicyTests(unittest.TestCase):
                 errors,
             )
 
+            malformed_routing_source = _sourced_reference_markdown().replace(
+                "1. **[Provider official]** A stable refusal code is documented; ",
+                "1. **Provenance: [Provider official]** A stable refusal code is documented; ",
+            )
+            write_text(reference, malformed_routing_source)
+            errors = validate_provider_reference_v2(reference, lock_entry)
+            self.assertEqual(
+                sum("unsupported provenance syntax" in item for item in errors),
+                1,
+                errors,
+            )
+            self.assertTrue(any("**[Provider official]**" in item for item in errors))
+
+            malformed_matrix_source = _sourced_reference_markdown().replace(
+                "| Safety refusal | Forbidden | **[Local policy]** |",
+                "| Safety refusal | Forbidden | **Source: [Local policy]** |",
+            )
+            write_text(reference, malformed_matrix_source)
+            errors = validate_provider_reference_v2(reference, lock_entry)
+            self.assertTrue(
+                any(
+                    "Retry / Recovery Matrix row 3 uses unsupported provenance syntax"
+                    in item
+                    for item in errors
+                ),
+                errors,
+            )
+
+    def test_provider_research_validation_deduplicates_shared_reference_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            reference = ".auto-agents/docs/provider_references/image.md"
+            malformed = _sourced_reference_markdown().replace(
+                "1. **[Provider official]** A stable refusal code is documented; ",
+                "1. **Provenance: [Provider official]** A stable refusal code is documented; ",
+            )
+            write_text(project_root / reference, malformed)
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": requirement_id,
+                            "status": "active",
+                            "external_docs_required": True,
+                            "provider_reference": reference,
+                        }
+                        for requirement_id in ("REQ-001", "REQ-002")
+                    ],
+                },
+            )
+            write_json(
+                provider_references_lock_path(project_root),
+                {
+                    "version": 1,
+                    "references": {
+                        "image": {
+                            "path": reference,
+                            "status": "verified",
+                            "contract_version": PROVIDER_REFERENCE_CONTRACT_VERSION,
+                            "retrieved_at": "2026-08-20T00:00:00Z",
+                            "source_urls": ["https://provider.example/docs"],
+                            "notes": "shared fixture",
+                        }
+                    },
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+            result = AgentResult(
+                ok=True,
+                command=[],
+                output_path=project_root / "out.md",
+                summary="",
+            )
+
+            feedback = orchestrator._provider_research_validation_feedback(
+                result,
+                upgrade_reference_paths=[reference],
+            )
+
+            self.assertIsNotNone(feedback)
+            self.assertEqual(
+                (feedback or "").count("unsupported provenance syntax"),
+                1,
+                feedback,
+            )
+
     def test_provider_research_enforces_v2_only_for_created_or_refreshed_references(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -234,6 +323,9 @@ class ProviderContractPolicyTests(unittest.TestCase):
             research_prompt = orchestrator._build_provider_research_prompt([requirement])
             self.assertIn("contract_version=2", research_prompt)
             self.assertIn("Semantic Error Routing", research_prompt)
+            self.assertIn("**[OpenAI official]**", research_prompt)
+            self.assertIn("**Provenance: [OpenAI official]**", research_prompt)
+            self.assertIn("is invalid", research_prompt)
 
             task = TaskSpec(
                 task_id="task-001",
