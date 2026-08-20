@@ -240,8 +240,9 @@ from .validation import (
     PYTEST_VALUE_OPTIONS,
     _unwrap_conda_run,
     project_config_warnings,
-    validate_required_document,
+    validate_active_persistence_target_readiness,
     validate_persistence_plan_contract,
+    validate_required_document,
     validate_task_dependencies,
     validate_task_plan_with_requirements,
     validate_verification_command_paths,
@@ -2035,6 +2036,14 @@ class Orchestrator:
             if pattern_recovery:
                 save_run_state(self.project_root, state)
             if not restarted_before_preconditions:
+                pending_before_preconditions = self._pending_stages(state)
+                if (
+                    pending_before_preconditions
+                    and pending_before_preconditions[0] == "plan"
+                    and self._block_for_persistence_configuration(state)
+                ):
+                    save_run_state(self.project_root, state)
+                    return state
                 self._ensure_preconditions(
                     state,
                     spec_file=spec_file,
@@ -2973,6 +2982,8 @@ class Orchestrator:
             return self._run_interactive_clarify(state, spec_file)
         if stage == "design" and self._route_forbidden_pattern_definition_recovery(state):
             return state
+        if stage == "plan" and self._block_for_persistence_configuration(state):
+            return state
 
         is_iteration = self._is_iteration_run(state)
         prior_tasks = list(state.tasks)
@@ -3031,6 +3042,36 @@ class Orchestrator:
                 self._persist_tasks(state.tasks)
             self._emit_plan_task_count(state.tasks)
         return state
+
+    def _block_for_persistence_configuration(self, state: RunState) -> bool:
+        trace = load_requirements_trace(self.project_root)
+        errors = validate_active_persistence_target_readiness(
+            trace,
+            configured_targets=[
+                target.to_dict() for target in self.config.persistence.targets
+            ],
+        )
+        if not errors:
+            return False
+        bullets = "\n".join(f"- {item}" for item in errors)
+        reason = (
+            "Persistence target configuration is incomplete for an active decision. "
+            "Planning was not started because task_plan.json cannot repair project configuration.\n"
+            f"{bullets}\n"
+            "Update the registered target with persistence-configure, including the required "
+            "strategy commands, then rerun the same auto-agents command."
+        )
+        fingerprint = "sha256:" + hashlib.sha256(reason.encode("utf-8")).hexdigest()
+        state.current_stage = "plan"
+        self._block_run(
+            state,
+            owner="target_project",
+            category="persistence_configuration_required",
+            reason=reason,
+            fingerprint=fingerprint,
+        )
+        self.logger.error(reason)
+        return True
 
     def _current_audit_spec(self, state: Optional[RunState] = None) -> Optional[Path]:
         if self._active_spec_file is not None:

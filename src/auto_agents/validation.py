@@ -1237,28 +1237,93 @@ def validate_persistence_plan_contract(
             target = target_map.get(target_id)
             if not target:
                 continue
-            environment = str(target.get("environment", ""))
-            kind = str(target.get("kind", ""))
-            if strategy == "clean_break":
-                if environment == "production":
-                    errors.append(
-                        f"{prefix} clean_break cannot target production: {target_id}"
-                    )
-                if not target.get("initialize_argv") or not target.get("verify_argv"):
-                    errors.append(
-                        f"{prefix} clean_break target {target_id} requires initialize_argv and verify_argv"
-                    )
-                if kind == "compose_service" and not target.get("reset_argv"):
-                    errors.append(
-                        f"{prefix} compose clean_break target {target_id} requires reset_argv"
-                    )
-            elif strategy in {"startup_compatible", "external_operator"}:
-                if environment != "production" and (
-                    not target.get("apply_argv") or not target.get("verify_argv")
-                ):
-                    errors.append(
-                        f"{prefix} automatic target {target_id} requires apply_argv and verify_argv"
-                    )
+            errors.extend(
+                _persistence_target_strategy_errors(
+                    strategy,
+                    target_id,
+                    target,
+                    prefix,
+                )
+            )
+    return errors
+
+
+def _persistence_target_strategy_errors(
+    strategy: str,
+    target_id: str,
+    target: dict,
+    prefix: str,
+) -> List[str]:
+    errors: List[str] = []
+    environment = str(target.get("environment", ""))
+    kind = str(target.get("kind", ""))
+    if strategy == "clean_break":
+        if environment == "production":
+            errors.append(f"{prefix} clean_break cannot target production: {target_id}")
+        if not target.get("initialize_argv") or not target.get("verify_argv"):
+            errors.append(
+                f"{prefix} clean_break target {target_id} requires initialize_argv and verify_argv"
+            )
+        if kind == "compose_service" and not target.get("reset_argv"):
+            errors.append(
+                f"{prefix} compose clean_break target {target_id} requires reset_argv"
+            )
+    elif strategy in {"startup_compatible", "external_operator"}:
+        if environment != "production" and (
+            not target.get("apply_argv") or not target.get("verify_argv")
+        ):
+            errors.append(
+                f"{prefix} automatic target {target_id} requires apply_argv and verify_argv"
+            )
+    return errors
+
+
+def validate_active_persistence_target_readiness(
+    trace_payload: object,
+    *,
+    configured_targets: Iterable[dict],
+) -> List[str]:
+    """Validate that active persistence decisions can execute before planning starts."""
+    if not isinstance(trace_payload, dict):
+        return []
+    decisions = trace_payload.get("persistence_decisions", [])
+    if not isinstance(decisions, list):
+        return []
+    target_map = {
+        str(item.get("id", "")): item
+        for item in configured_targets
+        if isinstance(item, dict) and str(item.get("id", ""))
+    }
+    errors: List[str] = []
+    for decision in decisions:
+        if not isinstance(decision, dict) or str(decision.get("status", "")) != "active":
+            continue
+        strategy = str(decision.get("strategy", "")).strip()
+        if strategy in {"", "none", "initial_schema"}:
+            continue
+        decision_id = str(decision.get("id", "")).strip() or "<unknown>"
+        prefix = f"persistence decision {decision_id}"
+        target_ids = decision.get("target_ids", [])
+        if not isinstance(target_ids, list):
+            continue
+        for raw_target_id in target_ids:
+            target_id = str(raw_target_id).strip()
+            if not target_id:
+                continue
+            target = target_map.get(target_id)
+            if target is None:
+                errors.append(
+                    f"{prefix} references unconfigured target {target_id}; run persistence-configure"
+                )
+                continue
+            errors.extend(
+                _persistence_target_strategy_errors(
+                    strategy,
+                    target_id,
+                    target,
+                    prefix,
+                )
+            )
     return errors
 
 

@@ -45,6 +45,7 @@ from auto_agents.persistence_rebind import (
 from auto_agents.requirements import validate_requirements_trace_payload
 from auto_agents.session import Session
 from auto_agents.validation import (
+    validate_active_persistence_target_readiness,
     validate_persistence_config_payload,
     validate_persistence_plan_contract,
     validate_task_plan_payload,
@@ -131,6 +132,131 @@ def _legacy_persistence_project(root: Path) -> None:
 
 
 class PersistenceContractModelTests(unittest.TestCase):
+    def test_active_clean_break_decision_requires_ready_target_commands(self) -> None:
+        trace = {
+            "persistence_decisions": [
+                {
+                    "id": "PERSIST-002",
+                    "strategy": "clean_break",
+                    "target_ids": ["local-sqlite-test"],
+                    "status": "active",
+                }
+            ]
+        }
+        target = {
+            "id": "local-sqlite-test",
+            "environment": "test",
+            "kind": "local_file",
+            "initialize_argv": [],
+            "verify_argv": [],
+        }
+
+        errors = validate_active_persistence_target_readiness(
+            trace,
+            configured_targets=[target],
+        )
+
+        self.assertEqual(
+            errors,
+            [
+                "persistence decision PERSIST-002 clean_break target local-sqlite-test "
+                "requires initialize_argv and verify_argv"
+            ],
+        )
+
+        target["initialize_argv"] = ["tool", "init"]
+        target["verify_argv"] = ["tool", "verify"]
+        self.assertEqual(
+            validate_active_persistence_target_readiness(
+                trace,
+                configured_targets=[target],
+            ),
+            [],
+        )
+
+    def test_initial_schema_and_superseded_decisions_do_not_require_commands(self) -> None:
+        trace = {
+            "persistence_decisions": [
+                {
+                    "id": "PERSIST-001",
+                    "strategy": "initial_schema",
+                    "target_ids": ["local-sqlite-test"],
+                    "status": "active",
+                },
+                {
+                    "id": "PERSIST-002",
+                    "strategy": "clean_break",
+                    "target_ids": ["local-sqlite-test"],
+                    "status": "superseded",
+                },
+            ]
+        }
+        target = {
+            "id": "local-sqlite-test",
+            "environment": "test",
+            "kind": "local_file",
+            "initialize_argv": [],
+            "verify_argv": [],
+        }
+
+        self.assertEqual(
+            validate_active_persistence_target_readiness(
+                trace,
+                configured_targets=[target],
+            ),
+            [],
+        )
+
+    def test_plan_stage_blocks_before_agent_when_active_target_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            config = load_project_config(root)
+            config.persistence.targets = [
+                PersistenceTargetConfig(
+                    target_id="local-sqlite-test",
+                    environment="test",
+                    kind="local_file",
+                    locator={"path": ".tmp-tests/app.sqlite3"},
+                )
+            ]
+            save_project_config(root, config)
+            write_json(
+                requirements_trace_path(root),
+                {
+                    "version": 1,
+                    "persistence_decisions": [
+                        {
+                            "id": "PERSIST-002",
+                            "strategy": "clean_break",
+                            "target_ids": ["local-sqlite-test"],
+                            "source": "explicit user choice",
+                            "status": "active",
+                        }
+                    ],
+                    "requirements": [],
+                },
+            )
+            spec_file = root / "spec.md"
+            spec_file.write_text("# Spec\n", encoding="utf-8")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+
+            with patch.object(orchestrator, "_run_agent_with_retries") as run_agent:
+                returned = orchestrator._run_agent_stage("plan", state, spec_file)
+
+            run_agent.assert_not_called()
+            self.assertEqual(returned.status, "blocked")
+            self.assertEqual(returned.current_stage, "plan")
+            self.assertNotIn("plan", returned.agent_attempts)
+            self.assertEqual(
+                returned.active_blocker["category"],
+                "persistence_configuration_required",
+            )
+            self.assertEqual(returned.active_blocker["owner"], "target_project")
+            self.assertIn("persistence-configure", returned.last_error)
+            self.assertIn("initialize_argv and verify_argv", returned.last_error)
+
     def test_models_round_trip_persistence_contracts(self) -> None:
         target = PersistenceTargetConfig(
             target_id="local-db",
