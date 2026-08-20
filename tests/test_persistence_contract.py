@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.cli import build_parser, main
-from auto_agents.config import load_project_config
-from auto_agents.config import load_run_state
+from auto_agents.config import (
+    load_project_config,
+    load_run_state,
+    requirements_trace_path,
+    run_state_path,
+    save_project_config,
+    task_plan_path,
+)
+from auto_agents.io_utils import read_json, write_json
 from auto_agents.models import (
     PersistenceConfig,
     PersistenceTargetConfig,
@@ -28,6 +37,11 @@ from auto_agents.persistence import (
     execute_persistence_action,
     persistence_candidate_fingerprint,
 )
+from auto_agents.persistence_rebind import (
+    PersistenceRebindError,
+    _replace_json_batch,
+    rebind_legacy_persistence_decision,
+)
 from auto_agents.requirements import validate_requirements_trace_payload
 from auto_agents.session import Session
 from auto_agents.validation import (
@@ -41,6 +55,79 @@ def _git_init(root: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+
+
+def _legacy_persistence_project(root: Path) -> None:
+    Orchestrator.init_project(root, "demo", "mock")
+    config = load_project_config(root)
+    config.persistence.targets = [
+        PersistenceTargetConfig(
+            target_id="local-sqlite-test",
+            environment="test",
+            kind="local_file",
+            locator={"path": ".tmp-tests/app.sqlite3"},
+        )
+    ]
+    save_project_config(root, config)
+    legacy_targets = ["REQ-001", "REQ-002"]
+    change = {
+        "strategy": "initial_schema",
+        "decision_id": "PERSIST-001",
+        "target_ids": list(legacy_targets),
+        "to_version": "1",
+        "migration_artifacts": ["migrations/0001.py"],
+        "legacy_fixture_refs": [],
+    }
+    task = {
+        "task_id": "task-002",
+        "title": "Initial schema",
+        "description": "Create the initial schema.",
+        "acceptance": ["Schema is explicit."],
+        "status": "pending",
+        "commit_message": "feat: schema",
+        "persistence_change": dict(change),
+    }
+    write_json(
+        requirements_trace_path(root),
+        {
+            "version": 1,
+            "persistence_decisions": [
+                {
+                    "id": "PERSIST-001",
+                    "target_ids": list(legacy_targets),
+                    "strategy": "initial_schema",
+                    "source": "legacy generated run",
+                    "status": "active",
+                }
+            ],
+            "requirements": [],
+        },
+    )
+    write_json(
+        task_plan_path(root),
+        {
+            "persistence_contract_version": 1,
+            "tasks": [task],
+        },
+    )
+    write_json(
+        run_state_path(root),
+        RunState(
+            run_id="run-001",
+            status="blocked",
+            current_stage="implement",
+            tasks=[TaskSpec.from_dict(task)],
+            last_error=(
+                "preflight validation failed: target_ids must reference "
+                "persistence targets, not requirement IDs"
+            ),
+            active_blocker={
+                "owner": "target_project",
+                "category": "invalid_target_persistence_metadata",
+                "status": "blocked",
+            },
+        ).to_dict(),
+    )
 
 
 class PersistenceContractModelTests(unittest.TestCase):
@@ -245,6 +332,14 @@ class PersistenceContractModelTests(unittest.TestCase):
 
         self.assertTrue(any("not requirement IDs: REQ-212" in error for error in plan_errors))
         self.assertTrue(any("not requirement IDs: REQ-212" in error for error in contract_errors))
+        self.assertTrue(
+            any(
+                "persistence-configure" in error
+                and "persistence-rebind" in error
+                and "PERSIST-001" in error
+                for error in contract_errors
+            )
+        )
 
     def test_clean_break_rejects_production_target(self) -> None:
         plan = {
@@ -691,6 +786,207 @@ class PersistenceExecutionTests(unittest.TestCase):
                 TaskSpec("task-1", "Change", "Change", ["works"])
             )
             self.assertIn("user-approved persistence strategy", issue)
+
+
+class PersistenceRebindTests(unittest.TestCase):
+    def test_batch_replace_restores_every_file_after_commit_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = [root / "one.json", root / "two.json", root / "three.json"]
+            for index, path in enumerate(paths, start=1):
+                write_json(path, {"value": f"old-{index}"})
+            before = {path: path.read_bytes() for path in paths}
+            real_replace = os.replace
+            failed = False
+
+            def fail_second_staged_replace(source, destination):
+                nonlocal failed
+                source_path = Path(source)
+                destination_path = Path(destination)
+                if (
+                    not failed
+                    and source_path.name.endswith(".staged")
+                    and destination_path.name == "two.json"
+                ):
+                    failed = True
+                    raise OSError("simulated commit failure")
+                return real_replace(source, destination)
+
+            with patch(
+                "auto_agents.persistence_rebind.os.replace",
+                side_effect=fail_second_staged_replace,
+            ):
+                with self.assertRaisesRegex(
+                    PersistenceRebindError,
+                    "failed to commit persistence rebind transaction",
+                ):
+                    _replace_json_batch(
+                        {
+                            path: {"value": f"new-{index}"}
+                            for index, path in enumerate(paths, start=1)
+                        }
+                    )
+
+            for path, content in before.items():
+                self.assertEqual(path.read_bytes(), content)
+            self.assertEqual(
+                [path for path in root.iterdir() if path.name.startswith(".")],
+                [],
+            )
+
+    def test_rebind_updates_trace_plan_and_run_state_and_clears_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            _legacy_persistence_project(root)
+
+            result = rebind_legacy_persistence_decision(
+                root,
+                decision_id="PERSIST-001",
+                target_ids=["local-sqlite-test"],
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["blocker_cleared"])
+            trace = read_json(requirements_trace_path(root))
+            plan = read_json(task_plan_path(root))
+            state = read_json(run_state_path(root))
+            self.assertEqual(
+                trace["persistence_decisions"][0]["target_ids"],
+                ["local-sqlite-test"],
+            )
+            self.assertEqual(
+                plan["tasks"][0]["persistence_change"]["target_ids"],
+                ["local-sqlite-test"],
+            )
+            self.assertEqual(
+                state["tasks"][0]["persistence_change"]["target_ids"],
+                ["local-sqlite-test"],
+            )
+            self.assertEqual(state["status"], "pending")
+            self.assertEqual(state["active_blocker"], {})
+            self.assertEqual(state["last_error"], "")
+            receipt = state["resume_context"]["persistence_rebinds"][
+                "PERSIST-001"
+            ]
+            self.assertEqual(
+                receipt["from_target_ids"],
+                ["REQ-001", "REQ-002"],
+            )
+
+            repeated = rebind_legacy_persistence_decision(
+                root,
+                decision_id="PERSIST-001",
+                target_ids=["local-sqlite-test"],
+            )
+
+            self.assertTrue(repeated["no_op"])
+            repeated_state = read_json(run_state_path(root))
+            self.assertEqual(
+                repeated_state["resume_context"]["persistence_rebinds"][
+                    "PERSIST-001"
+                ],
+                receipt,
+            )
+
+    def test_rebind_requires_registered_target_without_writing_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            _legacy_persistence_project(root)
+            before = {
+                path: path.read_bytes()
+                for path in (
+                    requirements_trace_path(root),
+                    task_plan_path(root),
+                    run_state_path(root),
+                )
+            }
+
+            with self.assertRaisesRegex(
+                PersistenceRebindError,
+                "run persistence-configure first",
+            ):
+                rebind_legacy_persistence_decision(
+                    root,
+                    decision_id="PERSIST-001",
+                    target_ids=["missing-target"],
+                )
+
+            for path, content in before.items():
+                self.assertEqual(path.read_bytes(), content)
+
+    def test_rebind_refuses_to_replace_established_target_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            _legacy_persistence_project(root)
+            trace = read_json(requirements_trace_path(root))
+            trace["persistence_decisions"][0]["target_ids"] = [
+                "established-db"
+            ]
+            write_json(requirements_trace_path(root), trace)
+
+            with self.assertRaisesRegex(
+                PersistenceRebindError,
+                "refusing to change an established target binding",
+            ):
+                rebind_legacy_persistence_decision(
+                    root,
+                    decision_id="PERSIST-001",
+                    target_ids=["local-sqlite-test"],
+                )
+
+    def test_validation_failure_leaves_all_canonical_files_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            _legacy_persistence_project(root)
+            plan = read_json(task_plan_path(root))
+            plan["tasks"][0]["title"] = ""
+            write_json(task_plan_path(root), plan)
+            before = {
+                path: path.read_bytes()
+                for path in (
+                    requirements_trace_path(root),
+                    task_plan_path(root),
+                    run_state_path(root),
+                )
+            }
+
+            with self.assertRaisesRegex(
+                PersistenceRebindError,
+                "persistence rebind validation failed",
+            ):
+                rebind_legacy_persistence_decision(
+                    root,
+                    decision_id="PERSIST-001",
+                    target_ids=["local-sqlite-test"],
+                )
+
+            for path, content in before.items():
+                self.assertEqual(path.read_bytes(), content)
+
+    def test_cli_rebind_uses_registered_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            _legacy_persistence_project(root)
+
+            exit_code = main(
+                [
+                    "persistence-rebind",
+                    "--project",
+                    str(root),
+                    "--decision",
+                    "PERSIST-001",
+                    "--target",
+                    "local-sqlite-test",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                read_json(requirements_trace_path(root))[
+                    "persistence_decisions"
+                ][0]["target_ids"],
+                ["local-sqlite-test"],
+            )
 
 
 class PersistenceCLITests(unittest.TestCase):

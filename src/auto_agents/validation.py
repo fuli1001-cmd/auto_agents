@@ -1106,6 +1106,7 @@ def validate_persistence_plan_contract(
         return ["requirements trace persistence_decisions must be a list"]
     errors: List[str] = []
     decisions: Dict[str, dict] = {}
+    legacy_decision_ids: List[str] = []
     for index, decision in enumerate(decisions_raw, start=1):
         prefix = f"persistence_decisions[{index}]"
         if not isinstance(decision, dict):
@@ -1139,10 +1140,20 @@ def validate_persistence_plan_contract(
                     f"{prefix}.target_ids must reference persistence targets, not requirement IDs: "
                     + ", ".join(requirement_ids)
                 )
+                if decision_id:
+                    legacy_decision_ids.append(decision_id)
         if status not in {"active", "superseded"}:
             errors.append(f"{prefix}.status must be active or superseded")
         if decision_id:
             decisions[decision_id] = decision
+
+    if legacy_decision_ids:
+        errors.append(
+            "legacy persistence metadata requires explicit target selection: "
+            "register the intended target with persistence-configure, then run "
+            "persistence-rebind for "
+            + ", ".join(dict.fromkeys(legacy_decision_ids))
+        )
 
     target_map = {
         str(item.get("id", "")): item

@@ -1154,6 +1154,24 @@ DSN name. Register one interactively with:
 python3 -m auto_agents persistence-configure --project /tmp/demo
 ```
 
+Runs created by older auto_agents versions may have incorrectly stored
+`REQ-NNN` requirement IDs in `persistence_decisions[].target_ids`. After a
+human has registered the intended target, rebind that legacy decision
+explicitly:
+
+```bash
+python3 -m auto_agents persistence-rebind \
+  --project /tmp/demo \
+  --decision PERSIST-001 \
+  --target local-sqlite
+```
+
+The rebind command accepts only registered targets and only migrates a legacy
+all-`REQ-*` binding. It validates the requirements trace and task plan before
+atomically updating the trace, active plan, and run-state task snapshot. It
+also clears the matching legacy-metadata blocker so the saved run can resume.
+It refuses to replace an already established non-legacy target binding.
+
 Targets declare `environment=development|test|production` and use either `local_file` or
 `compose_service`. Commands are stored as argv arrays, not shell strings, and secrets remain in
 environment variables. Development/test targets may be upgraded automatically after the candidate

@@ -41,6 +41,7 @@ from .notifications import (
 )
 from .orchestrator import Orchestrator
 from .models import PersistenceTargetConfig
+from .persistence_rebind import rebind_legacy_persistence_decision
 from .prototype_variants import (
     LIVE_VARIANT_STATUSES,
     PrototypeGalleryHandler,
@@ -1195,6 +1196,22 @@ def build_parser() -> argparse.ArgumentParser:
     persistence_parser.add_argument("--timeout-seconds", type=int, default=300)
     persistence_parser.add_argument("--auto-approve", action="store_true")
 
+    persistence_rebind_parser = subparsers.add_parser(
+        "persistence-rebind",
+        help=(
+            "Explicitly bind a legacy REQ-* persistence decision to "
+            "registered persistence targets."
+        ),
+    )
+    persistence_rebind_parser.add_argument("--project", required=True)
+    persistence_rebind_parser.add_argument("--decision", required=True)
+    persistence_rebind_parser.add_argument(
+        "--target",
+        action="append",
+        required=True,
+        help="Registered persistence target id; repeat for multiple targets.",
+    )
+
     provider_resolve_parser = subparsers.add_parser(
         "provider-resolve",
         help="Conversational recovery for a blocked provider_research stage.",
@@ -1309,8 +1326,34 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "persistence-configure":
         try:
-            payload = _configure_persistence_target(args)
-        except (OSError, RuntimeError, ValueError) as error:
+            project_root = Path(args.project).expanduser().resolve()
+            with ProjectRunLock(project_root):
+                payload = _configure_persistence_target(args)
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            RunAlreadyActiveError,
+        ) as error:
+            payload = {"ok": False, "error": str(error)}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if bool(payload.get("ok")) else 1
+
+    if args.command == "persistence-rebind":
+        try:
+            project_root = Path(args.project).expanduser().resolve()
+            with ProjectRunLock(project_root):
+                payload = rebind_legacy_persistence_decision(
+                    project_root,
+                    decision_id=args.decision,
+                    target_ids=args.target,
+                )
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            RunAlreadyActiveError,
+        ) as error:
             payload = {"ok": False, "error": str(error)}
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if bool(payload.get("ok")) else 1
