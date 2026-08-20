@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 import sys
@@ -432,6 +433,11 @@ class RecoveryResilienceTests(unittest.TestCase):
                     "failure_ids": [failure_id],
                     "new_failure_ids": [failure_id],
                     "baseline_comparison_comparable": True,
+                    "proof_evidence": {
+                        "ok": False,
+                        "failed_refs": [failure_id],
+                        "passed_refs": [reference],
+                    },
                 },
             )
 
@@ -474,6 +480,256 @@ class RecoveryResilienceTests(unittest.TestCase):
             self.assertEqual(stage, "")
             self.assertEqual(feedback, "")
 
+    def test_mixed_behavioral_proof_with_passing_provider_doc_stays_in_implement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            failure_id = (
+                "tests/integration/test_initial_schema.py::"
+                "test_startup_does_not_mutate_schema"
+            )
+            reference = (
+                ".auto-agents/docs/provider_references/"
+                "selected-cloud-and-infrastructure.md"
+            )
+            task = TaskSpec(
+                task_id="task-002",
+                title="initial schema",
+                description="",
+                acceptance=[],
+                requirement_ids=["REQ-012"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-012",
+                        "oracle_index": 5,
+                        "proof_type": "mixed",
+                        "oracle_strength": "behavioral",
+                        "evidence_boundary": "system_boundary",
+                        "evidence_refs": [
+                            failure_id,
+                            ".auto-agents/docs/architecture.md",
+                            reference,
+                        ],
+                    }
+                ],
+            )
+
+            stage, feedback = orchestrator._verification_failure_owner_route(
+                task,
+                {
+                    "reason": f"1 new verification failure: {failure_id}",
+                    "failure_ids": [failure_id],
+                    "new_failure_ids": [failure_id],
+                    "baseline_comparison_comparable": True,
+                    "proof_evidence": {
+                        "ok": False,
+                        "failed_refs": [failure_id],
+                        "passed_refs": [
+                            ".auto-agents/docs/architecture.md",
+                            reference,
+                        ],
+                    },
+                },
+            )
+
+            self.assertEqual(stage, "")
+            self.assertEqual(feedback, "")
+
+    def test_mixed_behavioral_proof_without_saved_evidence_stays_in_implement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            failure_id = "tests/test_schema.py::test_startup_contract"
+            reference = ".auto-agents/docs/provider_references/cloud.md"
+            task = TaskSpec(
+                task_id="task-legacy",
+                title="legacy blocked run",
+                description="",
+                acceptance=[],
+                requirement_proofs=[
+                    {
+                        "proof_type": "mixed",
+                        "oracle_strength": "behavioral",
+                        "evidence_boundary": "system_boundary",
+                        "evidence_refs": [failure_id, reference],
+                    }
+                ],
+            )
+
+            stage, feedback = orchestrator._verification_failure_owner_route(
+                task,
+                {
+                    "reason": f"1 new verification failure: {failure_id}",
+                    "failure_ids": [failure_id],
+                    "new_failure_ids": [failure_id],
+                    "baseline_comparison_comparable": True,
+                },
+            )
+
+            self.assertEqual(stage, "")
+            self.assertEqual(feedback, "")
+
+    def test_semantic_failure_signature_distinguishes_same_pytest_node(self) -> None:
+        failure_id = "tests/test_schema.py::test_startup_contract"
+
+        first = Orchestrator._verification_failure_semantic_signature(
+            [failure_id],
+            raw_output=(
+                "E   TypeError: traceback assignment failed\n"
+                "tests/test_schema.py:269: TypeError"
+            ),
+        )
+        second = Orchestrator._verification_failure_semantic_signature(
+            [failure_id],
+            raw_output=(
+                "E   AssertionError: assert False\n"
+                "tests/test_schema.py:388: AssertionError"
+            ),
+        )
+
+        self.assertNotEqual(first, second)
+
+    def test_recovery_loop_requires_same_semantic_failure_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            state = RunState(run_id="run-001")
+            task = TaskSpec(
+                task_id="task-002",
+                title="candidate",
+                description="",
+                acceptance=[],
+                requirement_ids=["REQ-012"],
+            )
+            failure_id = "tests/test_schema.py::test_startup_contract"
+
+            first = orchestrator._record_recovery_loop_event(
+                state,
+                task=task,
+                target_stage="provider_research",
+                review_text="provider.md",
+                failure_ids=[failure_id],
+                failure_signature="traceback-type-error",
+                artifact_fingerprints={"provider.md": "same"},
+            )
+            second = orchestrator._record_recovery_loop_event(
+                state,
+                task=task,
+                target_stage="provider_research",
+                review_text="provider.md",
+                failure_ids=[failure_id],
+                failure_signature="missing-cause-assertion",
+                artifact_fingerprints={"provider.md": "same"},
+            )
+            third = orchestrator._record_recovery_loop_event(
+                state,
+                task=task,
+                target_stage="provider_research",
+                review_text="provider.md",
+                failure_ids=[failure_id],
+                failure_signature="missing-cause-assertion",
+                artifact_fingerprints={"provider.md": "same"},
+            )
+
+            self.assertFalse(first)
+            self.assertFalse(second)
+            self.assertTrue(third)
+
+    def test_review_rewind_uses_task_attempt_base_and_pre_reset_owner_hashes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            reference = (
+                ".auto-agents/docs/provider_references/provider.md"
+            )
+            reference_path = root / reference
+            lock_path = root / ".auto-agents/state/provider_references.lock.json"
+            write_text(reference_path, "old provider contract\n")
+            write_json(
+                lock_path,
+                {
+                    "version": 1,
+                    "references": {
+                        "provider": {
+                            "path": reference,
+                            "status": "verified",
+                            "notes": "old",
+                        }
+                    },
+                },
+            )
+            old_ref = commit_all(root, "old baseline")
+            write_text(root / "completed-task.txt", "keep me\n")
+            write_text(reference_path, "refreshed provider contract\n")
+            write_json(
+                lock_path,
+                {
+                    "version": 1,
+                    "references": {
+                        "provider": {
+                            "path": reference,
+                            "status": "verified",
+                            "notes": "refreshed",
+                        }
+                    },
+                },
+            )
+            attempt_base = commit_all(root, "provider refresh")
+            expected_reference_hash = hashlib.sha256(
+                reference_path.read_bytes()
+            ).hexdigest()
+            write_text(root / "failed-candidate.py", "broken = True\n")
+
+            task = TaskSpec(
+                task_id="task-002",
+                title="candidate",
+                description="",
+                acceptance=[],
+                requirement_ids=["REQ-012"],
+                status="in_progress",
+                verify_baseline_ref=f"{old_ref}:context",
+            )
+            state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[task],
+            )
+            orchestrator._set_task_attempt_base_ref(
+                state,
+                task,
+                attempt_base,
+            )
+
+            result = orchestrator._handle_review_stage_rewind(
+                state,
+                task,
+                [task],
+                {
+                    "reason": "provider contract failed",
+                    "review": reference,
+                    "failure_ids": ["tests/test_provider.py::test_contract"],
+                    "provider_reference_paths": [reference],
+                },
+                "provider_research",
+            )
+
+            self.assertIs(result, state)
+            self.assertEqual(head_ref(root), attempt_base)
+            self.assertTrue((root / "completed-task.txt").is_file())
+            self.assertFalse((root / "failed-candidate.py").exists())
+            self.assertEqual(task.verify_baseline_ref, "")
+            self.assertEqual(task.verify_baseline_failures, [])
+            self.assertEqual(
+                state.recovery_loop_events[-1]["artifact_fingerprints"][reference],
+                expected_reference_hash,
+            )
+
     def test_misrouted_provider_resume_restores_lock_and_returns_to_implement(
         self,
     ) -> None:
@@ -513,7 +769,7 @@ class RecoveryResilienceTests(unittest.TestCase):
             )
             state = RunState(
                 run_id="run-001",
-                status="failed",
+                status="blocked",
                 current_stage="provider_research",
                 tasks=[task],
                 stage_summaries={
@@ -523,6 +779,11 @@ class RecoveryResilienceTests(unittest.TestCase):
                     "plan": "done",
                 },
                 last_error="run interrupted by SIGINT",
+                active_blocker={
+                    "owner": "target_project",
+                    "category": "target_recovery_exhausted",
+                    "status": "blocked",
+                },
             )
             marker = (
                 "Needs refresh: review rejected task task-303 and requested "
@@ -552,6 +813,16 @@ class RecoveryResilienceTests(unittest.TestCase):
                 "src/e2e/video-home-prototype-fidelity.test.ts > "
                 "create_failure_and_validation_errors_remain_user_visible"
             )
+            task.requirement_proofs = [
+                {
+                    "requirement_id": "REQ-303",
+                    "oracle_index": 1,
+                    "proof_type": "mixed",
+                    "oracle_strength": "behavioral",
+                    "evidence_boundary": "system_boundary",
+                    "evidence_refs": [frontend_failure, reference],
+                }
+            ]
             write_json(
                 incident_dir / "incident-001.json",
                 {
@@ -595,6 +866,7 @@ class RecoveryResilienceTests(unittest.TestCase):
             self.assertIn("provider_research", state.stage_summaries)
             self.assertNotIn("implement", state.stage_summaries)
             self.assertEqual(state.last_error, "")
+            self.assertEqual(state.active_blocker, {})
             self.assertIn(
                 "incident-001",
                 state.resume_context["review_route_reclassifications"],

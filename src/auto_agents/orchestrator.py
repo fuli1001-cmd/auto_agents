@@ -1118,9 +1118,14 @@ class Orchestrator:
             "baseline_failure_ids",
             "new_failure_ids",
             "baseline_comparison_comparable",
+            "failure_signature",
         ):
             if key in incident:
                 route_result[key] = incident.get(key)
+        if isinstance(incident.get("proof_evidence"), dict):
+            route_result["proof_evidence"] = dict(
+                incident.get("proof_evidence", {})
+            )
         route_stage, _feedback = self._verification_failure_owner_route(
             task,
             route_result,
@@ -3651,6 +3656,69 @@ class Orchestrator:
                 fingerprints[relative_path] = "unreadable"
         return fingerprints
 
+    @staticmethod
+    def _verification_failure_semantic_signature(
+        failure_ids: Iterable[str],
+        *,
+        raw_output: str = "",
+        reason: str = "",
+    ) -> str:
+        normalized_ids = sorted(
+            {str(item).strip() for item in failure_ids if str(item).strip()}
+        )
+
+        def normalize_detail(value: str) -> str:
+            detail = " ".join(value.split()).strip()
+            detail = re.sub(r"0x[0-9a-fA-F]+", "<address>", detail)
+            detail = re.sub(
+                r"/(?:tmp|var/tmp)/[^\s:'\"]+",
+                "<tmp-path>",
+                detail,
+            )
+            detail = re.sub(
+                r"gate-[0-9a-fA-F]+|pytest-\d+",
+                "<run-id>",
+                detail,
+            )
+            return detail[:500]
+
+        exception_pattern = re.compile(
+            r"^(?:E\s+)?(?:>\s*)?"
+            r"((?:AssertionError|RuntimeError|TypeError|ValueError|KeyError|"
+            r"IndexError|StopIteration|AttributeError|NameError|ImportError|"
+            r"ModuleNotFoundError|sqlite3\.[A-Za-z]+Error|OSError|SyntaxError)"
+            r"(?:\s*:\s*.*)?)$"
+        )
+        details: List[str] = []
+        for raw_line in str(raw_output or "").splitlines():
+            match = exception_pattern.match(raw_line.strip())
+            if not match:
+                continue
+            detail = normalize_detail(match.group(1))
+            if detail and detail not in details:
+                details.append(detail)
+
+        locations: List[str] = []
+        for path, line in re.findall(
+            r"(?m)^((?:tests?|__tests__)/[^\s:]+):([0-9]+):",
+            str(raw_output or ""),
+        ):
+            normalized_path = path.replace("\\", "/")
+            location = f"{normalized_path}:{line}"
+            if location not in locations:
+                locations.append(location)
+
+        payload: Dict[str, object] = {"failure_ids": normalized_ids}
+        if details:
+            payload["details"] = details[:6]
+        if locations:
+            payload["locations"] = locations[-4:]
+        if not normalized_ids and not details and not locations:
+            payload["reason"] = normalize_detail(reason)
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+
     def _persist_rewind_incident(
         self,
         state: RunState,
@@ -3706,6 +3774,9 @@ class Orchestrator:
                 for item in gate_result.get("failure_ids", []) or []
                 if str(item).strip()
             ],
+            "failure_signature": str(
+                gate_result.get("failure_signature", "")
+            ).strip(),
             "current_failure_ids": [
                 str(item).strip()
                 for item in gate_result.get("current_failure_ids", []) or []
@@ -3735,6 +3806,11 @@ class Orchestrator:
             "reason": str(gate_result.get("reason", "")).strip(),
             "review": str(gate_result.get("review", "")).strip(),
             "rewind_reason": str(gate_result.get("rewind_reason", "")).strip(),
+            "proof_evidence": (
+                dict(gate_result.get("proof_evidence", {}))
+                if isinstance(gate_result.get("proof_evidence"), dict)
+                else {}
+            ),
         }
         write_json(path, payload)
         return self._relative_repo_path(path)
@@ -3805,18 +3881,24 @@ class Orchestrator:
         target_stage: str,
         review_text: str,
         failure_ids: Iterable[str] = (),
+        failure_signature: str = "",
+        artifact_fingerprints: Optional[Dict[str, str]] = None,
     ) -> bool:
         normalized_failures = sorted(
             {str(item).strip() for item in failure_ids if str(item).strip()}
         )
         failure_material = "\n".join(normalized_failures)
-        failure_fp = (
+        failure_fp = str(failure_signature).strip() or (
             hashlib.sha256(failure_material.encode("utf-8")).hexdigest()[:16]
             if failure_material
             else self._review_fingerprint(review_text)
         )
         artifact_paths = self._owner_artifact_paths_for_stage(target_stage, review_text)
-        fingerprints = self._artifact_fingerprints(artifact_paths)
+        fingerprints = (
+            dict(artifact_fingerprints)
+            if artifact_fingerprints is not None
+            else self._artifact_fingerprints(artifact_paths)
+        )
         scope_material = json.dumps(
             {
                 "target_stage": target_stage,
@@ -3833,6 +3915,7 @@ class Orchestrator:
             "requirement_ids": sorted(set(task.requirement_ids)),
             "failure_ids": normalized_failures,
             "failure_fingerprint": failure_fp,
+            "failure_signature": failure_fp,
             "scope_key": scope_key,
             "artifact_fingerprints": fingerprints,
         }
@@ -8611,6 +8694,12 @@ class Orchestrator:
         if restored_checkpoint_ref:
             resume_existing = True
 
+        self._set_task_attempt_base_ref(
+            state,
+            task,
+            head_ref(self.project_root) or "HEAD",
+        )
+
         gate_result = self._execute_task_with_retries(
             state,
             task,
@@ -8683,6 +8772,7 @@ class Orchestrator:
         task.status = "done"
         self._clear_task_failure_checkpoint(state, task.task_id)
         self._clear_implementation_ready_marker(state, task)
+        self._clear_task_attempt_base_ref(state, task)
         task.review_summary = str(gate_result["review"])
         commit_message = task.commit_message or self.config.git.commit_message_template.format(
             task_id=task.task_id,
@@ -9229,8 +9319,11 @@ class Orchestrator:
             "task_id": task.task_id,
             "ref": checkpoint_ref if has_candidate_changes else "",
             "commit_sha": checkpoint_sha,
-            "base_ref": self._git_ref_from_verify_baseline_ref(
-                task.verify_baseline_ref
+            "base_ref": (
+                self._task_attempt_base_ref(state, task)
+                or self._git_ref_from_verify_baseline_ref(
+                    task.verify_baseline_ref
+                )
             ),
             "changed_paths": list(candidate_paths),
             "has_candidate_changes": has_candidate_changes,
@@ -9442,6 +9535,15 @@ class Orchestrator:
             ),
         }
         for key in (
+            "current_failure_ids",
+            "baseline_failure_ids",
+            "new_failure_ids",
+            "baseline_comparison_comparable",
+            "raw_output",
+            "raw_log_path",
+            "failure_signature",
+            "provider_reference_paths",
+            "route_source",
             "rewind_to_stage",
             "expected_owner_stage",
             "rewind_reason",
@@ -10958,8 +11060,10 @@ class Orchestrator:
         if target_stage not in STAGE_ORDER or STAGE_ORDER.index(target_stage) >= STAGE_ORDER.index("implement"):
             return None
 
+        attempt_base_ref = self._task_attempt_base_ref(state, task)
         baseline_ref = (
-            task.verify_baseline_ref
+            attempt_base_ref
+            or task.verify_baseline_ref
             or state.implement_verify_baseline_ref
             or state.stage_summaries.get("implement_baseline_ref", "")
         )
@@ -10967,6 +11071,35 @@ class Orchestrator:
             rewind_ref = head_ref(self.project_root) or "HEAD"
         else:
             rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
+        review_text = str(gate_result.get("review", ""))
+        if target_stage == "provider_research":
+            explicit_provider_paths = sorted(
+                {
+                    self._normalize_relative_artifact_path(item)
+                    for item in gate_result.get(
+                        "provider_reference_paths", []
+                    )
+                    or []
+                    if self._normalize_relative_artifact_path(item)
+                }
+            )
+            owner_artifact_paths = (
+                explicit_provider_paths
+                + [".auto-agents/state/provider_references.lock.json"]
+                if explicit_provider_paths
+                else self._owner_artifact_paths_for_stage(
+                    target_stage,
+                    review_text,
+                )
+            )
+        else:
+            owner_artifact_paths = self._owner_artifact_paths_for_stage(
+                target_stage,
+                review_text,
+            )
+        owner_artifact_fingerprints = self._artifact_fingerprints(
+            owner_artifact_paths
+        )
         incident_path = self._persist_rewind_incident(
             state,
             task=task,
@@ -10979,8 +11112,6 @@ class Orchestrator:
                 "review-stage rewind failed to restore the baseline before "
                 f"returning task {task.task_id} to {target_stage}. Resolved git ref: {rewind_ref}."
             )
-
-        review_text = str(gate_result.get("review", ""))
 
         task.status = "pending"
         task.review_summary = review_text
@@ -10998,6 +11129,14 @@ class Orchestrator:
             f"Pre-rewind incident: {incident_path}",
         ]
         self._rewind_state_from_stage(state, target_stage)
+        if STAGE_ORDER.index(target_stage) < STAGE_ORDER.index("implement"):
+            for pending_task in tasks:
+                if pending_task.status == "done":
+                    continue
+                pending_task.verify_baseline_ref = ""
+                pending_task.verify_baseline_failures = []
+                pending_task.verify_baseline_schema_version = 0
+            self._persist_tasks(tasks)
         state.rejected_stage = target_stage
         state.rejection_reason = "\n".join(line for line in reason_lines if line is not None).strip()
         state.last_error = f"review rejected task {task.task_id}; rewinding to {target_stage}"
@@ -11027,6 +11166,10 @@ class Orchestrator:
             target_stage=target_stage,
             review_text=state.rejection_reason,
             failure_ids=gate_result.get("failure_ids", []) or [],
+            failure_signature=str(
+                gate_result.get("failure_signature", "")
+            ).strip(),
+            artifact_fingerprints=owner_artifact_fingerprints,
         )
         if loop_detected:
             expected_owner = str(gate_result.get("expected_owner_stage", "")).strip()
@@ -14371,13 +14514,16 @@ class Orchestrator:
         self,
         task: TaskSpec,
         failure_ids: Iterable[str],
+        *,
+        proof_evidence: Optional[Dict[str, object]] = None,
     ) -> Set[str]:
         """Resolve doc-only proof failures without guessing from test names.
 
-        A behavioral provider proof commonly cites application source as well as
-        its reference and must remain implementation-owned. A deterministic
-        document-contract proof cites only its test plus provider-research-owned
-        artifacts, so it can be routed safely to the upstream owner.
+        Structured provider-reference failures take precedence. Behavioral
+        system-boundary proofs remain implementation-owned when only their
+        runtime check failed, including legacy incidents without structured
+        evidence. Deterministic document-contract proofs may still route to the
+        upstream provider owner.
         """
         active_failures = {
             str(failure_id).strip()
@@ -14387,6 +14533,15 @@ class Orchestrator:
         if not active_failures:
             return set()
 
+        failed_evidence_refs = {
+            str(item).strip()
+            for item in (
+                proof_evidence.get("failed_refs", [])
+                if isinstance(proof_evidence, dict)
+                else []
+            )
+            if str(item).strip()
+        }
         matched_references: Set[str] = set()
         for proof in task.requirement_proofs:
             if not isinstance(proof, dict):
@@ -14411,6 +14566,31 @@ class Orchestrator:
                     provider_refs.add(path)
                 elif owner == "implement":
                     implementation_support.add(path)
+            explicitly_failed_provider_refs = (
+                provider_refs & failed_evidence_refs
+            )
+            if explicitly_failed_provider_refs:
+                matched_references.update(explicitly_failed_provider_refs)
+                continue
+
+            proof_type = str(proof.get("proof_type", "")).strip()
+            proof_strength = str(proof.get("oracle_strength", "")).strip()
+            proof_boundary = str(proof.get("evidence_boundary", "")).strip()
+            behavioral_system_proof = (
+                proof_type
+                in {
+                    "integration_test",
+                    "runtime_evidence",
+                    "benchmark",
+                    "mixed",
+                }
+                and proof_strength in {"behavioral", "semantic", "human"}
+                and proof_boundary
+                in {"system_boundary", "external_side_effect"}
+            )
+            if behavioral_system_proof:
+                continue
+
             if provider_refs and not implementation_support:
                 matched_references.update(provider_refs)
         return matched_references
@@ -14462,9 +14642,15 @@ class Orchestrator:
             )
             if value
         )
+        proof_evidence = (
+            verify_result.get("proof_evidence")
+            if isinstance(verify_result.get("proof_evidence"), dict)
+            else None
+        )
         proof_references = self._provider_reference_proof_dependencies_for_failures(
             task,
             active_failure_ids,
+            proof_evidence=proof_evidence,
         )
         provider_signal = re.search(
             r"provider[_ -]?reference|canonical[_ -]?reference|"
@@ -16550,6 +16736,14 @@ class Orchestrator:
 
             verify_result = self._run_task_verify(task, state=state)
             if not verify_result["ok"]:
+                if (
+                    not isinstance(verify_result.get("proof_evidence"), dict)
+                    and isinstance(current_proof_evidence, dict)
+                ):
+                    verify_result = dict(verify_result)
+                    verify_result["proof_evidence"] = dict(
+                        current_proof_evidence
+                    )
                 last_reason = str(verify_result["reason"])
                 failure_ids = self._normalize_verify_failure_ids(
                     verify_result.get("failure_ids", []),
@@ -16630,6 +16824,28 @@ class Orchestrator:
                             verify_result.get(
                                 "baseline_comparison_comparable",
                                 comparable_failures,
+                            )
+                        ),
+                        "raw_output": str(
+                            verify_result.get("raw_output", "")
+                        ),
+                        "raw_log_path": str(
+                            verify_result.get("raw_log_path", "")
+                        ),
+                        "proof_evidence": (
+                            dict(verify_result.get("proof_evidence", {}))
+                            if isinstance(
+                                verify_result.get("proof_evidence"), dict
+                            )
+                            else {}
+                        ),
+                        "failure_signature": (
+                            self._verification_failure_semantic_signature(
+                                failure_ids,
+                                raw_output=str(
+                                    verify_result.get("raw_output", "")
+                                ),
+                                reason=last_reason,
                             )
                         ),
                         "provider_reference_paths": provider_reference_paths,
@@ -19468,6 +19684,49 @@ class Orchestrator:
         markers = state.resume_context.get("implementation_ready_tasks")
         return dict(markers) if isinstance(markers, dict) else {}
 
+    @staticmethod
+    def _task_attempt_base_refs(state: RunState) -> Dict[str, str]:
+        raw = state.resume_context.get("task_attempt_base_refs")
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(task_id): str(ref).strip()
+            for task_id, ref in raw.items()
+            if str(task_id).strip() and str(ref).strip()
+        }
+
+    def _set_task_attempt_base_ref(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        ref: str,
+    ) -> None:
+        normalized = str(ref).strip()
+        if not normalized:
+            return
+        refs = self._task_attempt_base_refs(state)
+        refs[task.task_id] = normalized
+        state.resume_context["task_attempt_base_refs"] = refs
+
+    def _task_attempt_base_ref(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> str:
+        return self._task_attempt_base_refs(state).get(task.task_id, "")
+
+    def _clear_task_attempt_base_ref(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> None:
+        refs = self._task_attempt_base_refs(state)
+        refs.pop(task.task_id, None)
+        if refs:
+            state.resume_context["task_attempt_base_refs"] = refs
+        else:
+            state.resume_context.pop("task_attempt_base_refs", None)
+
     def _set_implementation_ready_marker(
         self,
         state: RunState,
@@ -19524,3 +19783,13 @@ class Orchestrator:
             task_id = key.removeprefix("implement-")
             if allowed_ids is None or task_id in allowed_ids:
                 state.agent_attempts.pop(key, None)
+        attempt_refs = Orchestrator._task_attempt_base_refs(state)
+        if allowed_ids is None:
+            attempt_refs.clear()
+        else:
+            for task_id in allowed_ids:
+                attempt_refs.pop(task_id, None)
+        if attempt_refs:
+            state.resume_context["task_attempt_base_refs"] = attempt_refs
+        else:
+            state.resume_context.pop("task_attempt_base_refs", None)
