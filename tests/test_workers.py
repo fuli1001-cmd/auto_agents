@@ -259,6 +259,77 @@ def test_worker_probe_reports_ffmpeg_and_ffprobe_capabilities(
     assert probe["runtimes"]["ffprobe"] == "ffprobe version test"
 
 
+def test_worker_probe_reports_docker_only_when_daemon_is_reachable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "AUTO_AGENTS_WORKER_CONFIG",
+        str(_worker_config(tmp_path)),
+    )
+    monkeypatch.setattr(
+        "auto_agents.workers.shutil.which",
+        lambda program: "/usr/bin/docker" if program == "docker" else None,
+    )
+
+    def healthy_run(command, **_kwargs):
+        if command[0] != "/usr/bin/docker":
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="Python 3.11.0\n",
+                stderr="",
+            )
+        assert command == [
+            "/usr/bin/docker",
+            "version",
+            "--format",
+            "{{.Server.Version}}",
+        ]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="27.5.1\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("auto_agents.workers.subprocess.run", healthy_run)
+
+    probe = worker_probe()
+
+    assert "docker" in probe["capabilities"]
+    assert probe["runtimes"]["docker"] == "27.5.1"
+
+
+def test_worker_probe_rejects_docker_client_without_reachable_daemon(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "AUTO_AGENTS_WORKER_CONFIG",
+        str(_worker_config(tmp_path)),
+    )
+    monkeypatch.setattr(
+        "auto_agents.workers.shutil.which",
+        lambda program: "/usr/bin/docker" if program == "docker" else None,
+    )
+
+    def unavailable_run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr="Cannot connect to the Docker daemon",
+        )
+
+    monkeypatch.setattr("auto_agents.workers.subprocess.run", unavailable_run)
+
+    probe = worker_probe()
+
+    assert "docker" not in probe["capabilities"]
+    assert "docker" not in probe["runtimes"]
+
+
 def test_worker_slot_lease_reports_persistent_memory_pressure(
     tmp_path: Path,
     monkeypatch,

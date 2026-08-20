@@ -780,6 +780,12 @@ def worker_probe(environment_id: str = "") -> dict[str, object]:
         "node": [shutil.which("node") or "", "--version"],
         "ffmpeg": [shutil.which("ffmpeg") or "", "-version"],
         "ffprobe": [shutil.which("ffprobe") or "", "-version"],
+        "docker": [
+            shutil.which("docker") or "",
+            "version",
+            "--format",
+            "{{.Server.Version}}",
+        ],
         "chrome": [
             shutil.which("google-chrome")
             or shutil.which("chromium")
@@ -805,6 +811,12 @@ def worker_probe(environment_id: str = "") -> dict[str, object]:
             runtimes[name] = (
                 result.stdout.strip() or result.stderr.strip()
             ).splitlines()[0][:300]
+            if name == "docker" and runtimes[name]:
+                # A Docker client alone cannot run container-backed proofs.
+                # `docker version` with a Server template succeeds only when
+                # the daemon is reachable, so advertise the capability after
+                # that stronger probe rather than after PATH discovery.
+                capabilities.add("docker")
     return {
         "ok": ok,
         "protocol_version": WORKER_PROTOCOL_VERSION,
