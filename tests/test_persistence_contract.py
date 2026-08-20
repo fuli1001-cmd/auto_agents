@@ -159,6 +159,93 @@ class PersistenceContractModelTests(unittest.TestCase):
         errors = validate_persistence_plan_contract(plan, trace, configured_targets=[target])
         self.assertTrue(any("must match" in error for error in errors))
 
+    def test_schema_task_rejects_empty_configured_target_set(self) -> None:
+        change = {
+            "strategy": "startup_compatible",
+            "decision_id": "PERSIST-001",
+            "target_ids": ["local-db"],
+            "to_version": "v2",
+            "migration_artifacts": ["src/db.py"],
+            "legacy_fixture_refs": ["tests/test_db.py::test_upgrade"],
+        }
+        plan = {
+            "verification_steps": [
+                {
+                    "targets": ["tests/test_db.py"],
+                    "risk": "critical",
+                    "parallel_safe": False,
+                    "serial_reason": "shared_mutable_state",
+                }
+            ],
+            "tasks": [{"status": "pending", "persistence_change": change}],
+        }
+        trace = {
+            "persistence_decisions": [
+                {
+                    "id": "PERSIST-001",
+                    "target_ids": ["local-db"],
+                    "strategy": "startup_compatible",
+                    "source": "user clarification",
+                    "status": "active",
+                }
+            ]
+        }
+
+        errors = validate_persistence_plan_contract(
+            plan, trace, configured_targets=[]
+        )
+
+        self.assertTrue(any("unconfigured targets: local-db" in error for error in errors))
+
+    def test_persistence_contract_rejects_requirement_ids_as_targets(self) -> None:
+        change = {
+            "strategy": "startup_compatible",
+            "decision_id": "PERSIST-001",
+            "target_ids": ["REQ-212"],
+            "to_version": "v2",
+            "migration_artifacts": ["src/db.py"],
+            "legacy_fixture_refs": ["tests/test_db.py::test_upgrade"],
+        }
+        plan = {
+            "persistence_contract_version": 1,
+            "verification_steps": [
+                {
+                    "targets": ["tests/test_db.py"],
+                    "risk": "critical",
+                    "parallel_safe": False,
+                    "serial_reason": "ordered_contract",
+                }
+            ],
+            "tasks": [
+                {
+                    "task_id": "task-db",
+                    "title": "Schema",
+                    "description": "Upgrade schema",
+                    "acceptance": ["works"],
+                    "status": "pending",
+                    "commit_message": "feat: schema",
+                    "persistence_change": change,
+                }
+            ],
+        }
+        trace = {
+            "persistence_decisions": [
+                {
+                    "id": "PERSIST-001",
+                    "target_ids": ["REQ-212"],
+                    "strategy": "startup_compatible",
+                    "source": "user clarification",
+                    "status": "active",
+                }
+            ]
+        }
+
+        plan_errors = validate_task_plan_payload(plan)
+        contract_errors = validate_persistence_plan_contract(plan, trace)
+
+        self.assertTrue(any("not requirement IDs: REQ-212" in error for error in plan_errors))
+        self.assertTrue(any("not requirement IDs: REQ-212" in error for error in contract_errors))
+
     def test_clean_break_rejects_production_target(self) -> None:
         plan = {
             "verification_steps": [
@@ -249,6 +336,21 @@ diff --git a/tests/test_db.py b/tests/test_db.py
 """
         findings = detect_persistence_schema_changes(Path.cwd(), diff_text=diff)
         self.assertEqual([finding.path for finding in findings], ["app/infrastructure/sqlite.py", "app/infrastructure/sqlite.py"])
+
+    def test_ignores_python_statements_that_look_like_text_columns(self) -> None:
+        diff = """diff --git a/app/domain/models.py b/app/domain/models.py
+--- a/app/domain/models.py
++++ b/app/domain/models.py
+@@ -1,0 +2,3 @@
++if text is None:
++    return "other"
++return text
+"""
+
+        self.assertEqual(
+            detect_persistence_schema_changes(Path.cwd(), diff_text=diff),
+            [],
+        )
 
     def test_candidate_fingerprint_ignores_orchestrator_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -521,6 +623,24 @@ class PersistenceCLITests(unittest.TestCase):
             }
         )
         self.assertTrue(any("shell control" in error for error in errors))
+
+    def test_config_validation_rejects_requirement_id_as_target_id(self) -> None:
+        errors = validate_persistence_config_payload(
+            {
+                "targets": [
+                    {
+                        "id": "req-212",
+                        "environment": "development",
+                        "kind": "local_file",
+                        "locator": {"path": ".data/app.db"},
+                        "apply_argv": ["tool", "migrate"],
+                        "verify_argv": ["tool", "verify"],
+                    }
+                ]
+            }
+        )
+
+        self.assertTrue(any("not a requirement ID" in error for error in errors))
 
     def test_session_marker_requires_registered_nonproduction_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

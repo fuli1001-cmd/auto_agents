@@ -56,6 +56,7 @@ DEFAULTED_EFFORT_STAGES = {
 MAX_ACCEPTANCE_WITHOUT_SCOPE_RATIONALE = 5
 MAX_ACCEPTANCE_HARD_LIMIT = 7
 PERSISTENCE_COMMAND_TOKEN_PATTERN = re.compile(r"[|;&<>`\n\r]")
+REQUIREMENT_ID_PATTERN = re.compile(r"^REQ-[0-9]+$", re.IGNORECASE)
 REQUIRED_DOC_HEADINGS = {
     "project_brief.md": ("# Project Brief", "## Problem", "## MVP Scope", "## Non-Goals", "## Constraints"),
     "architecture.md": ("# Architecture", "## System Boundary", "## Core Modules", "## Data Flow", "## Risks"),
@@ -159,6 +160,19 @@ def validate_persistence_change(
             or any(not isinstance(item, str) or not item.strip() for item in items)
         ):
             errors.append(f"{prefix}.{field_name} must be a non-empty list of strings")
+    target_ids = value.get("target_ids", [])
+    if isinstance(target_ids, list):
+        requirement_ids = sorted(
+            str(item).strip()
+            for item in target_ids
+            if isinstance(item, str)
+            and REQUIREMENT_ID_PATTERN.fullmatch(item.strip())
+        )
+        if requirement_ids:
+            errors.append(
+                f"{prefix}.target_ids must reference persistence targets, not requirement IDs: "
+                + ", ".join(requirement_ids)
+            )
     artifacts = value.get("migration_artifacts", [])
     if isinstance(artifacts, list):
         for artifact in artifacts:
@@ -1082,8 +1096,8 @@ def validate_persistence_plan_contract(
     plan_payload: object,
     trace_payload: object,
     *,
-    configured_target_ids: Iterable[str] = (),
-    configured_targets: Iterable[dict] = (),
+    configured_target_ids: Iterable[str] | None = None,
+    configured_targets: Iterable[dict] | None = None,
 ) -> List[str]:
     if not isinstance(plan_payload, dict) or not isinstance(trace_payload, dict):
         return []
@@ -1113,6 +1127,18 @@ def validate_persistence_plan_contract(
             or any(not isinstance(item, str) or not item.strip() for item in targets)
         ):
             errors.append(f"{prefix}.target_ids must be a non-empty list")
+        elif isinstance(targets, list):
+            requirement_ids = sorted(
+                str(item).strip()
+                for item in targets
+                if isinstance(item, str)
+                and REQUIREMENT_ID_PATTERN.fullmatch(item.strip())
+            )
+            if requirement_ids:
+                errors.append(
+                    f"{prefix}.target_ids must reference persistence targets, not requirement IDs: "
+                    + ", ".join(requirement_ids)
+                )
         if status not in {"active", "superseded"}:
             errors.append(f"{prefix}.status must be active or superseded")
         if decision_id:
@@ -1120,13 +1146,20 @@ def validate_persistence_plan_contract(
 
     target_map = {
         str(item.get("id", "")): item
-        for item in configured_targets
+        for item in (configured_targets or ())
         if isinstance(item, dict) and str(item.get("id", ""))
     }
     known_targets = {
-        *{str(item) for item in configured_target_ids if str(item)},
+        *{
+            str(item)
+            for item in (configured_target_ids or ())
+            if str(item)
+        },
         *target_map,
     }
+    target_configuration_supplied = (
+        configured_target_ids is not None or configured_targets is not None
+    )
     verification_steps = [
         item
         for item in plan_payload.get("verification_steps", [])
@@ -1153,7 +1186,7 @@ def validate_persistence_plan_contract(
             errors.append(f"{prefix}.strategy must match persistence decision {decision_id}")
         if task_targets != decision_targets:
             errors.append(f"{prefix}.target_ids must match persistence decision {decision_id}")
-        if known_targets:
+        if target_configuration_supplied:
             missing = sorted(set(task_targets) - known_targets)
             if missing:
                 errors.append(
@@ -1337,6 +1370,10 @@ def validate_persistence_config_payload(payload: object) -> List[str]:
         target_id = str(target.get("id", "")).strip()
         if not TASK_ID_PATTERN.fullmatch(target_id):
             errors.append(f"{prefix}.id must be a safe non-empty identifier")
+        elif REQUIREMENT_ID_PATTERN.fullmatch(target_id):
+            errors.append(
+                f"{prefix}.id must identify a persistence target, not a requirement ID"
+            )
         elif target_id in seen:
             errors.append(f"{prefix}.id duplicates '{target_id}'")
         seen.add(target_id)

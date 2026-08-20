@@ -32,8 +32,12 @@ SCHEMA_CODE_PATH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 SCHEMA_COLUMN_PATTERN = re.compile(
-    r"^[`\"']?[A-Za-z_][A-Za-z0-9_]*[`\"']?\s+"
-    r"(?:INTEGER|INT|TEXT|REAL|BLOB|BOOLEAN|BOOL|VARCHAR|CHAR|TIMESTAMP|DATETIME|JSON|UUID)\b",
+    r"^(?!(?:if|elif|else|for|while|return|yield|raise|assert|with|from|import|"
+    r"class|def|async|await|try|except|finally|match|case)\b)"
+    r"[`\"']?[A-Za-z_][A-Za-z0-9_]*[`\"']?\s+"
+    r"(?:INTEGER|INT|TEXT|REAL|BLOB|BOOLEAN|BOOL|VARCHAR|CHAR|TIMESTAMP|DATETIME|JSON|UUID)\b"
+    r"(?=\s*(?:\([^)]*\)\s*)?(?:,|$|NOT\b|NULL\b|PRIMARY\b|UNIQUE\b|DEFAULT\b|"
+    r"REFERENCES\b|CHECK\b|COLLATE\b|GENERATED\b|AUTOINCREMENT\b))",
     re.IGNORECASE,
 )
 _IGNORED_DETECTION_PREFIXES = (
