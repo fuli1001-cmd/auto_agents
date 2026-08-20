@@ -375,6 +375,129 @@ diff --git a/tests/test_db.py b/tests/test_db.py
 
 
 class PersistenceExecutionTests(unittest.TestCase):
+    def test_valid_pytest_selector_is_collected_before_apply_and_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "apply.py").write_text(
+                "from pathlib import Path\nPath('applied').write_text('yes')\n",
+                encoding="utf-8",
+            )
+            (root / "test_db.py").write_text(
+                "def test_current_contract():\n    assert True\n",
+                encoding="utf-8",
+            )
+            target = PersistenceTargetConfig(
+                target_id="local",
+                environment="development",
+                kind="local_file",
+                locator={"path": ".data/app.db"},
+                apply_argv=[sys.executable, "apply.py"],
+                verify_argv=[
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "test_db.py::test_current_contract",
+                ],
+            )
+
+            result = execute_persistence_action(
+                root,
+                {
+                    "strategy": "startup_compatible",
+                    "decision_id": "PERSIST-001",
+                    "target_ids": ["local"],
+                    "to_version": "v2",
+                },
+                PersistenceConfig([target]),
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertTrue((root / "applied").exists())
+
+    def test_stale_pytest_selector_is_rejected_before_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "apply.py").write_text(
+                "from pathlib import Path\nPath('applied').write_text('yes')\n",
+                encoding="utf-8",
+            )
+            (root / "test_db.py").write_text(
+                "def test_current_contract():\n    assert True\n",
+                encoding="utf-8",
+            )
+            target = PersistenceTargetConfig(
+                target_id="local",
+                environment="development",
+                kind="local_file",
+                locator={"path": ".data/app.db"},
+                apply_argv=[sys.executable, "apply.py"],
+                verify_argv=[
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "test_db.py::test_removed_contract",
+                ],
+            )
+
+            with self.assertRaises(PersistenceContractError) as raised:
+                execute_persistence_action(
+                    root,
+                    {
+                        "strategy": "startup_compatible",
+                        "decision_id": "PERSIST-001",
+                        "target_ids": ["local"],
+                        "to_version": "v2",
+                    },
+                    PersistenceConfig([target]),
+                )
+
+            self.assertIn("configuration is stale", str(raised.exception))
+            self.assertIn("run persistence-configure", str(raised.exception))
+            self.assertFalse((root / "applied").exists())
+
+    def test_all_targets_are_preflighted_before_the_first_target_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "apply.py").write_text(
+                "from pathlib import Path\nPath('applied').write_text('yes')\n",
+                encoding="utf-8",
+            )
+            first = PersistenceTargetConfig(
+                target_id="first",
+                environment="development",
+                kind="local_file",
+                locator={"path": ".data/first.db"},
+                apply_argv=[sys.executable, "apply.py"],
+                verify_argv=["true"],
+            )
+            invalid_second = PersistenceTargetConfig(
+                target_id="second",
+                environment="development",
+                kind="local_file",
+                locator={"path": ".data/second.db"},
+                apply_argv=[],
+                verify_argv=["true"],
+            )
+
+            with self.assertRaisesRegex(
+                PersistenceContractError,
+                "startup_compatible target second requires apply_argv",
+            ):
+                execute_persistence_action(
+                    root,
+                    {
+                        "strategy": "startup_compatible",
+                        "decision_id": "PERSIST-001",
+                        "target_ids": ["first", "second"],
+                        "to_version": "v2",
+                    },
+                    PersistenceConfig([first, invalid_second]),
+                )
+
+            self.assertFalse((root / "applied").exists())
+
     def test_clean_break_deletes_registered_ignored_data_and_reinitializes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

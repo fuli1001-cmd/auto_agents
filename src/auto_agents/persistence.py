@@ -319,6 +319,7 @@ def execute_persistence_action(
     if strategy in {"none", "initial_schema"}:
         return {"ok": True, "strategy": strategy, "targets": [], "executed": False}
     targets = persistence_targets_for_change(config, change)
+    _preflight_persistence_targets(root, strategy, targets)
     results: List[Dict[str, object]] = []
     for target in targets:
         if target.environment == "production":
@@ -371,6 +372,89 @@ def execute_persistence_action(
         target_result["status"] = "verified"
         results.append(target_result)
     return {"ok": True, "strategy": strategy, "targets": results, "executed": True}
+
+
+def _preflight_persistence_targets(
+    root: Path,
+    strategy: str,
+    targets: Sequence[PersistenceTargetConfig],
+) -> None:
+    """Validate every automatic target before any target can mutate persistent data."""
+    for target in targets:
+        if target.environment == "production":
+            continue
+        commands: List[tuple[str, Sequence[str]]] = []
+        if strategy == "clean_break":
+            if target.kind == "compose_service" and not target.reset_argv:
+                raise PersistenceContractError(
+                    f"compose clean_break target {target.target_id} requires reset_argv"
+                )
+            if target.reset_argv:
+                commands.append(("reset", target.reset_argv))
+            _destructive_target_paths(root, target)
+            if not target.initialize_argv:
+                raise PersistenceContractError(
+                    f"clean_break target {target.target_id} requires initialize_argv"
+                )
+            commands.append(("initialize", target.initialize_argv))
+        else:
+            if not target.apply_argv:
+                raise PersistenceContractError(
+                    f"{strategy} target {target.target_id} requires apply_argv"
+                )
+            commands.append(("apply", target.apply_argv))
+        if not target.verify_argv:
+            raise PersistenceContractError(
+                f"persistence target {target.target_id} requires verify_argv"
+            )
+        commands.append(("verify", target.verify_argv))
+        for step, argv in commands:
+            _validate_runtime_argv(argv, target.target_id, step)
+            _preflight_pytest_command(root, target, step, argv)
+
+
+def _preflight_pytest_command(
+    root: Path,
+    target: PersistenceTargetConfig,
+    step: str,
+    argv: Sequence[str],
+) -> None:
+    if not _is_pytest_command(argv) or not any(".py::" in item for item in argv):
+        return
+    collect_argv = [*argv, "--collect-only"]
+    try:
+        process = subprocess.run(
+            collect_argv,
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=target.timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PersistenceContractError(
+            f"persistence {step} preflight failed for {target.target_id}: {error}"
+        ) from error
+    if process.returncode != 0:
+        detail = (process.stderr or process.stdout or "pytest collection failed")[-2000:]
+        raise PersistenceContractError(
+            f"persistence {step} configuration is stale for {target.target_id}: "
+            "pytest could not collect the configured selector(s) before any persistence "
+            f"action was executed: {detail.strip()}; run persistence-configure"
+        )
+
+
+def _is_pytest_command(argv: Sequence[str]) -> bool:
+    if not argv:
+        return False
+    executable = Path(str(argv[0])).name.lower()
+    if executable in {"pytest", "pytest.exe", "py.test", "py.test.exe"}:
+        return True
+    return (
+        executable in {"python", "python3", "python.exe", "python3.exe"}
+        or executable.startswith("python3.")
+    ) and len(argv) >= 3 and list(argv[1:3]) == ["-m", "pytest"]
 
 
 def _run_target_command(
