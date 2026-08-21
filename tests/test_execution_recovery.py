@@ -39,6 +39,7 @@ from auto_agents.git_ops import (
     worktree_fingerprint,
 )
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.validation import validate_task_dependencies
 from auto_agents.config import (
     load_run_state,
     load_task_plan,
@@ -1946,6 +1947,59 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 ["cmd:echo recovery-proof"],
             )
             self.assertTrue(resumed.validate()["ok"])
+
+    def test_self_repair_resume_repairs_dependencies_left_by_task_pruning(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            completed = TaskSpec(
+                task_id="completed-proof",
+                title="Completed proof",
+                description="Already verified behavior.",
+                acceptance=["The behavior remains verified."],
+                status="done",
+            )
+            pending = TaskSpec(
+                task_id="release-gate",
+                title="Release gate",
+                description="Verify the remaining release contract.",
+                acceptance=["The release contract passes."],
+                depends_on=["pruned-duplicate", completed.task_id],
+            )
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [completed, pending]
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "dangling_dependencies_after_task_pruning",
+                "status": "blocked",
+            }
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(root, state)
+
+            marked = orchestrator.mark_self_repair_applied("repair123")
+            self.assertTrue(orchestrator._resume_blocked_run(marked))
+
+            self.assertEqual(marked.tasks[1].depends_on, [completed.task_id])
+            self.assertEqual(
+                marked.active_blocker["repaired_dependency_references"],
+                [
+                    {
+                        "task_id": pending.task_id,
+                        "removed_task_ids": ["pruned-duplicate"],
+                    }
+                ],
+            )
+            persisted_tasks = load_task_plan(root)["tasks"]
+            self.assertEqual(
+                persisted_tasks[1]["depends_on"],
+                [completed.task_id],
+            )
+            self.assertEqual(validate_task_dependencies(persisted_tasks), [])
 
     def test_self_repair_resume_removes_tracked_dependency_self_link(
         self,

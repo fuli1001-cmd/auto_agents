@@ -78,6 +78,7 @@ from auto_agents.self_repair import (
 from auto_agents.validation import (
     validate_required_document,
     validate_project_config_payload,
+    validate_task_dependencies,
     validate_task_plan_payload,
     validation_report,
 )
@@ -4346,6 +4347,7 @@ class ProjectValidationTests(unittest.TestCase):
                 ],
                 "status": "pending",
                 "commit_message": "",
+                "depends_on": ["task-002", "task-001"],
             }
             write_json(
                 task_plan_path(project_root),
@@ -4367,6 +4369,8 @@ class ProjectValidationTests(unittest.TestCase):
                 ["task-001", "task-003"],
             )
             self.assertEqual(payload["tasks"][0]["status"], "done")
+            self.assertEqual(payload["tasks"][1]["depends_on"], ["task-001"])
+            self.assertEqual(validate_task_dependencies(payload["tasks"]), [])
 
     def test_plan_validation_uses_current_run_done_tasks_as_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

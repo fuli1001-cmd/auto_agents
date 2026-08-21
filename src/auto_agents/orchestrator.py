@@ -286,6 +286,9 @@ IMPLEMENTATION_SCOPE_POLICY_VERSION = 4
 EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT = 2
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
+_DANGLING_DEPENDENCIES_AFTER_TASK_PRUNING = (
+    "dangling_dependencies_after_task_pruning"
+)
 _NON_COMPARABLE_BASELINE_PREFIXES = (
     "cmd-timeout:",
     "cmd-stalled:",
@@ -5680,6 +5683,80 @@ class Orchestrator:
         save_run_state(self.project_root, state)
         return state
 
+    @staticmethod
+    def _remove_pruned_task_dependency_references(
+        tasks: Iterable[object],
+        pruned_task_ids: Iterable[str],
+    ) -> Dict[str, List[str]]:
+        pruned_ids = {
+            str(task_id).strip()
+            for task_id in pruned_task_ids
+            if str(task_id).strip()
+        }
+        if not pruned_ids:
+            return {}
+
+        repaired: Dict[str, List[str]] = {}
+        for task in tasks:
+            if isinstance(task, TaskSpec):
+                task_id = task.task_id.strip()
+                dependencies = list(task.depends_on)
+            elif isinstance(task, dict):
+                task_id = str(task.get("task_id", "")).strip()
+                raw_dependencies = task.get("depends_on")
+                if not isinstance(raw_dependencies, list):
+                    continue
+                dependencies = list(raw_dependencies)
+            else:
+                continue
+
+            removed = [
+                dependency.strip()
+                for dependency in dependencies
+                if isinstance(dependency, str)
+                and dependency.strip() in pruned_ids
+            ]
+            if not removed:
+                continue
+            retained = [
+                dependency
+                for dependency in dependencies
+                if not (
+                    isinstance(dependency, str)
+                    and dependency.strip() in pruned_ids
+                )
+            ]
+            if isinstance(task, TaskSpec):
+                task.depends_on = [str(dependency) for dependency in retained]
+            else:
+                task["depends_on"] = retained
+            if task_id:
+                repaired[task_id] = list(dict.fromkeys(removed))
+        return repaired
+
+    def _repair_dangling_dependencies_after_task_pruning(
+        self,
+        tasks: List[TaskSpec],
+        blocker: Dict[str, object],
+    ) -> Dict[str, List[str]]:
+        if str(blocker.get("category", "")).strip() != (
+            _DANGLING_DEPENDENCIES_AFTER_TASK_PRUNING
+        ):
+            return {}
+
+        known_ids = {
+            task.task_id.strip()
+            for task in tasks
+            if task.task_id.strip()
+        }
+        missing_ids = {
+            dependency.strip()
+            for task in tasks
+            for dependency in task.depends_on
+            if dependency.strip() and dependency.strip() not in known_ids
+        }
+        return self._remove_pruned_task_dependency_references(tasks, missing_ids)
+
     def _prepare_self_repair_task_retries(
         self,
         state: RunState,
@@ -5709,6 +5786,23 @@ class Orchestrator:
                     if isinstance(item, dict)
                 ]
 
+        dependency_repairs = self._repair_dangling_dependencies_after_task_pruning(
+            tasks,
+            blocker,
+        )
+        if dependency_repairs:
+            blocker["repaired_dependency_references"] = [
+                {
+                    "task_id": task_id,
+                    "removed_task_ids": removed_ids,
+                }
+                for task_id, removed_ids in dependency_repairs.items()
+            ]
+            self.logger.info(
+                "[self-repair] removed dangling dependencies left by task pruning: %s",
+                ",".join(dependency_repairs),
+            )
+
         requeued_task_ids: List[str] = []
         if state.current_stage == "implement":
             for task in tasks:
@@ -5725,6 +5819,10 @@ class Orchestrator:
                 state.task_review_cache.pop(task.task_id, None)
                 requeued_task_ids.append(task.task_id)
 
+        if requeued_task_ids or dependency_repairs:
+            state.tasks = tasks
+            self._persist_tasks(tasks)
+
         if requeued_task_ids:
             # Requeueing resets blocked tasks to pending for a fresh verification
             # lifecycle, but their uncommitted main-worktree edits still belong to
@@ -5734,8 +5832,6 @@ class Orchestrator:
                 state,
                 [*sequential_retry_ids, *requeued_task_ids],
             )
-            state.tasks = tasks
-            self._persist_tasks(tasks)
             route = dict(state.last_recovery_route)
             if (
                 str(route.get("task_id", "")) in requeued_task_ids
@@ -15777,6 +15873,10 @@ class Orchestrator:
             retained.append(item)
 
         next_tasks = list(prior_by_id.values()) + retained
+        dependency_repairs = self._remove_pruned_task_dependency_references(
+            next_tasks,
+            dropped_task_ids,
+        )
         if next_tasks == raw_tasks:
             return
 
@@ -15787,6 +15887,11 @@ class Orchestrator:
             self.logger.info(
                 "[plan] pruned current-run duplicate tasks already covered by done proof: "
                 + ", ".join(dropped_task_ids)
+            )
+        if dependency_repairs:
+            self.logger.info(
+                "[plan] removed dependencies on pruned tasks from: "
+                + ", ".join(dependency_repairs)
             )
 
     def _stage_output_path(self, run_id: str, stage: str) -> Path:
