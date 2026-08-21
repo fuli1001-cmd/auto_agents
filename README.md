@@ -810,7 +810,13 @@ address that another computer cannot reach, create it with
 `auto-agents cluster pair --host <reachable-LAN-IP>`.
 
 Slot counts are chosen automatically from CPU and memory. Use `worker serve --slots N` only to apply
-an explicit per-computer cap. The first job for a new dependency fingerprint may be slower: workers
+an explicit per-computer cap. Local slot leases are shared across projects and processes. A command
+that fits the worker's declared capacity but cannot atomically acquire its requested slots waits for
+up to `gates.worker_slot_wait_timeout_seconds` instead of reporting an infrastructure failure after
+a short fixed delay. Holder records contain the owning project/run/job and command hash; they are
+removed on release, and stale metadata is removed only after the corresponding OS lock is confirmed
+free. Requests larger than the worker's total capacity fail immediately as impossible. The first job
+for a new dependency fingerprint may be slower: workers
 create a cached Python environment from the controller's project-local `.conda` package freeze and
 run `npm ci` for discovered `package-lock.json` files. Workers therefore need compatible Linux/WSL
 runtimes and network access to the configured package registries. Later jobs reuse that immutable
@@ -876,10 +882,16 @@ projects are 900 seconds without observable output/CPU activity and a 7200-secon
   "gates": {
     "adaptive_timeout_enabled": true,
     "command_idle_timeout_seconds": 900,
-    "command_timeout_seconds": 7200
+    "command_timeout_seconds": 7200,
+    "worker_slot_wait_timeout_seconds": 7200
   }
 }
 ```
+
+The slot-wait budget is separate from command execution time: queueing does not consume a test's
+runtime ceiling. Waiting remains cancellable through the normal run-stop path and emits periodic
+holder diagnostics. This lets concurrent projects share a worker without turning ordinary capacity
+contention into a repair incident.
 
 On a stall or ceiling timeout, auto_agents terminates the entire command process group with bounded
 `SIGTERM`/`SIGKILL` cleanup and persists a structured execution incident. Deterministic rules route

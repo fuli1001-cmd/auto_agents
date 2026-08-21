@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import subprocess
@@ -37,8 +38,29 @@ from auto_agents.workers import (
     worker_execute,
     worker_probe,
     worker_query,
+    worker_slot_snapshot,
     worker_stage,
 )
+
+
+def _hold_worker_slot(
+    root: str,
+    ready,
+    release,
+) -> None:
+    with WorkerSlotLease(
+        Path(root),
+        "shared-worker",
+        slots=2,
+        required=1,
+        timeout_seconds=2,
+        owner_metadata={
+            "project_root": "/tmp/other-project",
+            "run_id": "other-run",
+        },
+    ):
+        ready.set()
+        release.wait(timeout=5)
 
 
 def _git(project: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -419,6 +441,112 @@ def test_worker_slot_lease_honors_cancellation(
             pass
 
 
+def test_worker_slot_lease_waits_for_cross_process_capacity_and_records_holder(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("fork")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_worker_slot,
+        args=(str(tmp_path), ready, release),
+    )
+    holder.start()
+    try:
+        assert ready.wait(timeout=2)
+        snapshot = worker_slot_snapshot(
+            tmp_path,
+            "shared-worker",
+            2,
+            cleanup_stale=False,
+        )
+        assert snapshot["available"] == 1
+        busy = [
+            item
+            for item in snapshot["slots"]
+            if not item["available"]
+        ]
+        assert len(busy) == 1
+        assert busy[0]["holder"]["project_root"] == "/tmp/other-project"
+        assert busy[0]["holder"]["run_id"] == "other-run"
+
+        acquired = threading.Event()
+        failure: list[BaseException] = []
+
+        def acquire_all_slots() -> None:
+            try:
+                with WorkerSlotLease(
+                    tmp_path,
+                    "shared-worker",
+                    slots=2,
+                    required=2,
+                    timeout_seconds=2,
+                    owner_metadata={"run_id": "waiting-run"},
+                ):
+                    acquired.set()
+            except BaseException as error:
+                failure.append(error)
+
+        waiter = threading.Thread(target=acquire_all_slots)
+        waiter.start()
+        assert not acquired.wait(timeout=0.2)
+        release.set()
+        waiter.join(timeout=2)
+
+        assert not waiter.is_alive()
+        assert not failure
+        assert acquired.is_set()
+        final = worker_slot_snapshot(tmp_path, "shared-worker", 2)
+        assert final["available"] == 2
+        assert not list(
+            (tmp_path / "slots" / "shared-worker").glob("*.owner.json")
+        )
+    finally:
+        release.set()
+        holder.join(timeout=2)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(timeout=2)
+
+
+def test_worker_slot_snapshot_removes_stale_holder_metadata(tmp_path: Path) -> None:
+    slot_root = tmp_path / "slots" / "shared-worker"
+    slot_root.mkdir(parents=True)
+    (slot_root / "0.lock").touch()
+    owner_path = slot_root / "0.owner.json"
+    owner_path.write_text(
+        json.dumps(
+            {
+                "lease_id": "stale",
+                "pid": 999999,
+                "project_root": "/tmp/stale-project",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = worker_slot_snapshot(tmp_path, "shared-worker", 1)
+
+    assert snapshot["available"] == 1
+    assert not owner_path.exists()
+
+
+def test_worker_slot_lease_rejects_impossible_declared_capacity(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="requirement exceeds declared capacity.*required=3 capacity=2",
+    ):
+        with WorkerSlotLease(
+            tmp_path,
+            "shared-worker",
+            slots=2,
+            required=3,
+        ):
+            pass
+
+
 def test_distributed_executor_uses_controller_as_local_worker(
     tmp_path: Path,
     monkeypatch,
@@ -550,6 +678,72 @@ def test_distributed_executor_prefers_declared_cpu_slots(
 
     assert executor._required_slots(command) == 3
     assert executor._memory_policy(command) == (4096, 1024, "required")
+
+
+def test_distributed_local_worker_uses_configured_cross_process_slot_wait(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project = _project(tmp_path)
+    worker_config = _worker_config(tmp_path)
+    monkeypatch.setenv("AUTO_AGENTS_WORKER_CONFIG", str(worker_config))
+    command = "heavy command"
+    executor = DistributedGatePlanExecutor(
+        project,
+        GateConfig(worker_slot_wait_timeout_seconds=321),
+        {command: GateCommandMetadata(resource_class="heavy")},
+        run_id="run-slot-wait",
+    )
+    captured: dict[str, object] = {}
+
+    class FakeLease:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        "auto_agents.distributed_gates.WorkerSlotLease",
+        FakeLease,
+    )
+    monkeypatch.setattr(
+        executor.local,
+        "run",
+        lambda *args, **kwargs: CommandResult(
+            command=command,
+            ok=True,
+            returncode=0,
+        ),
+    )
+    endpoint = WorkerEndpoint(
+        worker_id="test-worker",
+        transport="local",
+        max_slots=2,
+        capabilities=("docker", "ffmpeg"),
+    )
+
+    result = executor._run_on_endpoint(
+        endpoint,
+        command,
+        lane="serial",
+        timeout_seconds=30,
+        adaptive_timeout_enabled=False,
+        idle_timeout_seconds=10,
+        cancel_event=None,
+        progress=None,
+    )
+
+    assert result.ok
+    kwargs = captured["kwargs"]
+    assert kwargs["timeout_seconds"] == 321
+    assert kwargs["owner_metadata"]["project_root"] == str(project)
+    assert kwargs["owner_metadata"]["run_id"] == "run-slot-wait"
+    assert kwargs["owner_metadata"]["lane"] == "serial"
 
 
 def test_distributed_executor_slot_wait_honors_cancellation(

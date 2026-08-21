@@ -250,6 +250,7 @@ DEFAULT_CONFIG = {
         "max_auto_workers": "auto",
         "target_final_seconds": 0,
         "command_timeout_seconds": 7200,
+        "worker_slot_wait_timeout_seconds": 7200,
         "adaptive_timeout_enabled": True,
         "command_idle_timeout_seconds": 900,
         "reported_infrastructure_markers": [],

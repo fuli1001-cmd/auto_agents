@@ -1750,6 +1750,18 @@ def validate_project_config_payload(payload: object) -> List[str]:
             or command_timeout_seconds < 1
         ):
             errors.append("gates.command_timeout_seconds must be an integer >= 1")
+        slot_wait_timeout = gates.get(
+            "worker_slot_wait_timeout_seconds",
+            command_timeout_seconds,
+        )
+        if (
+            not isinstance(slot_wait_timeout, int)
+            or isinstance(slot_wait_timeout, bool)
+            or slot_wait_timeout < 1
+        ):
+            errors.append(
+                "gates.worker_slot_wait_timeout_seconds must be an integer >= 1"
+            )
         adaptive_timeout = gates.get("adaptive_timeout_enabled", True)
         if not isinstance(adaptive_timeout, bool):
             errors.append("gates.adaptive_timeout_enabled must be a boolean")

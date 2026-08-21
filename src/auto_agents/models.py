@@ -528,6 +528,7 @@ class GateConfig:
     shard_target_seconds: int = 300
     cache_max_age_seconds: int = 14 * 24 * 60 * 60
     command_timeout_seconds: int = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS
+    worker_slot_wait_timeout_seconds: int = DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS
     adaptive_timeout_enabled: bool = True
     command_idle_timeout_seconds: int = DEFAULT_GATE_COMMAND_IDLE_TIMEOUT_SECONDS
     reported_infrastructure_markers: List[InfrastructureFailureMarker] = field(
@@ -625,6 +626,15 @@ class GateConfig:
                 ),
             ),
             command_timeout_seconds=command_timeout_seconds,
+            worker_slot_wait_timeout_seconds=max(
+                1,
+                int(
+                    data.get(
+                        "worker_slot_wait_timeout_seconds",
+                        command_timeout_seconds,
+                    )
+                ),
+            ),
             adaptive_timeout_enabled=bool(data.get("adaptive_timeout_enabled", True)),
             command_idle_timeout_seconds=int(
                 data.get(
@@ -673,6 +683,7 @@ class GateConfig:
                 "cache_max_age_seconds": self.cache_max_age_seconds,
             },
             "command_timeout_seconds": self.command_timeout_seconds,
+            "worker_slot_wait_timeout_seconds": self.worker_slot_wait_timeout_seconds,
             "adaptive_timeout_enabled": self.adaptive_timeout_enabled,
             "command_idle_timeout_seconds": self.command_idle_timeout_seconds,
             "reported_infrastructure_markers": [

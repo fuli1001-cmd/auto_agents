@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -577,6 +578,9 @@ class DistributedGatePlanExecutor:
             "memory_mb": memory_mb,
             "memory_reserve_mb": memory_reserve_mb,
             "memory_guard": memory_guard,
+            "worker_slot_wait_timeout_seconds": (
+                self.gate_config.worker_slot_wait_timeout_seconds
+            ),
             "environment_manifest": self.environment_manifest,
             "environment": environment,
             "timeout_seconds": timeout_seconds,
@@ -602,7 +606,12 @@ class DistributedGatePlanExecutor:
         client = self.clients[endpoint.worker_id]
         client.submit(manifest)
         accepted = True
-        deadline = time.monotonic() + float(timeout_seconds) + 90
+        deadline = (
+            time.monotonic()
+            + float(self.gate_config.worker_slot_wait_timeout_seconds)
+            + float(timeout_seconds)
+            + 90
+        )
         cancellation_sent = False
         last_record: dict[str, object] = {}
         while time.monotonic() < deadline:
@@ -685,7 +694,20 @@ class DistributedGatePlanExecutor:
                 memory_mb=memory_mb,
                 memory_reserve_mb=memory_reserve_mb,
                 memory_guard=memory_guard,
+                timeout_seconds=(
+                    self.gate_config.worker_slot_wait_timeout_seconds
+                ),
                 cancel_event=cancel_event,
+                owner_metadata={
+                    "project_root": str(self.project_root),
+                    "run_id": self.run_id,
+                    "plan_id": self.local.plan_id,
+                    "lane": lane,
+                    "backend": "local-isolated",
+                    "command_sha256": hashlib.sha256(
+                        command.encode("utf-8")
+                    ).hexdigest(),
+                },
             ):
                 local_overrides = dict(environment_overrides or {})
                 path_prepend = local_overrides.pop("AUTO_AGENTS_PATH_PREPEND", "")

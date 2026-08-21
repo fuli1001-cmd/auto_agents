@@ -752,22 +752,28 @@ class ProjectValidationTests(unittest.TestCase):
     def test_gate_command_timeout_defaults_to_7200_seconds(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
         payload["gates"].pop("command_timeout_seconds", None)
+        payload["gates"].pop("worker_slot_wait_timeout_seconds", None)
 
         config = ProjectConfig.from_dict(payload)
 
         self.assertEqual(config.gates.command_timeout_seconds, 7200)
+        self.assertEqual(config.gates.worker_slot_wait_timeout_seconds, 7200)
         self.assertEqual(config.gates.command_idle_timeout_seconds, 900)
         self.assertTrue(config.gates.adaptive_timeout_enabled)
 
     def test_validate_project_config_payload_rejects_invalid_gate_timeout(self) -> None:
-        for invalid in (0, -1, True, "1800"):
-            with self.subTest(value=invalid):
-                payload = copy.deepcopy(DEFAULT_CONFIG)
-                payload["gates"]["command_timeout_seconds"] = invalid
-                errors = validate_project_config_payload(payload)
-                self.assertTrue(
-                    any("gates.command_timeout_seconds" in item for item in errors)
-                )
+        for field in (
+            "command_timeout_seconds",
+            "worker_slot_wait_timeout_seconds",
+        ):
+            for invalid in (0, -1, True, "1800"):
+                with self.subTest(field=field, value=invalid):
+                    payload = copy.deepcopy(DEFAULT_CONFIG)
+                    payload["gates"][field] = invalid
+                    errors = validate_project_config_payload(payload)
+                    self.assertTrue(
+                        any(f"gates.{field}" in item for item in errors)
+                    )
 
     def test_validate_project_config_payload_rejects_invalid_sync_agent_instructions_effort(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)

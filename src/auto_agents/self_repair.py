@@ -178,9 +178,14 @@ def self_repair_runtime_evidence() -> dict[str, object]:
 
     advertised: list[str] = []
     advertised_max_slots = 0
+    worker_slot_state: dict[str, object] = {}
     worker_error = ""
     try:
-        from .workers import worker_probe
+        from .workers import (
+            load_local_worker_config,
+            worker_probe,
+            worker_slot_snapshot,
+        )
 
         probe = worker_probe("")
         advertised = sorted(
@@ -189,6 +194,12 @@ def self_repair_runtime_evidence() -> dict[str, object]:
             if str(item).strip()
         )
         advertised_max_slots = max(0, int(probe.get("max_slots", 0) or 0))
+        worker_config = load_local_worker_config()
+        worker_slot_state = worker_slot_snapshot(
+            worker_config.managed_root,
+            worker_config.worker_id,
+            worker_config.max_slots,
+        )
     except (OSError, RuntimeError, TypeError, ValueError) as error:
         worker_error = str(error)[:500]
     healthy = sorted(
@@ -200,6 +211,7 @@ def self_repair_runtime_evidence() -> dict[str, object]:
         "host": host,
         "worker_advertised_capabilities": advertised,
         "worker_advertised_max_slots": advertised_max_slots,
+        "worker_slot_state": worker_slot_state,
         "healthy_not_advertised": sorted(set(healthy) - set(advertised)),
         "advertised_not_healthy": sorted(
             set(advertised).intersection(host) - set(healthy)
@@ -720,6 +732,7 @@ class AutoAgentsSelfRepairJudge:
                 "Normal target-project bugs, requirements failures, external provider failures, and missing user input are not self-repairable.",
                 "The existing blocker owner and earlier incident diagnosis are preliminary evidence, not authoritative routing decisions. Overturn them only when concrete runtime/source evidence demonstrates an auto_agents invariant or reporting defect.",
                 "A healthy_not_advertised runtime capability is strong evidence of an auto_agents worker-probe/reporting defect when that mismatch caused dispatch rejection.",
+                "A busy worker slot with live holder metadata is ordinary cross-process capacity contention, not an auto_agents defect. Missing/stale ownership, impossible capacity math, or a lock that remains after its owner exits may demonstrate a slot-lifecycle defect.",
                 "Classify ownership of the terminal transition separately from ownership of the underlying review findings.",
                 "A review may correctly identify target-project defects while the terminal transition is still auto_agents-owned when structured evidence proves an eligible recovery route was skipped.",
                 "A review failure is self-repairable only when evidence shows an orchestrator invariant, routing, ownership, or lifecycle defect; exhausted or judge-stopped target recovery is not self-repairable.",

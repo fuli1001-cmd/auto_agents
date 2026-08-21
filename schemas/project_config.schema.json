@@ -407,6 +407,11 @@
           "minimum": 1,
           "default": 7200
         },
+        "worker_slot_wait_timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 7200
+        },
         "adaptive_timeout_enabled": {
           "type": "boolean",
           "default": true

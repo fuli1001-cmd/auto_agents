@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import uuid
 from typing import BinaryIO, Mapping, Optional, Sequence
 
 from .gate_execution import (
@@ -493,6 +494,56 @@ def _read_json(path: Path) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
+def worker_slot_snapshot(
+    root: Path,
+    worker_id: str,
+    slots: int,
+    *,
+    cleanup_stale: bool = True,
+) -> dict[str, object]:
+    """Return cross-process slot availability and safe holder metadata."""
+    slot_root = root / "slots" / worker_id
+    slot_root.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, object]] = []
+    for index in range(max(1, slots)):
+        lock_path = slot_root / f"{index}.lock"
+        owner_path = slot_root / f"{index}.owner.json"
+        handle = lock_path.open("a+")
+        available = False
+        try:
+            try:
+                fcntl.flock(
+                    handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                owner = _read_json(owner_path)
+            else:
+                available = True
+                owner = _read_json(owner_path)
+                if cleanup_stale and owner_path.exists():
+                    owner_path.unlink(missing_ok=True)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+        entry: dict[str, object] = {
+            "slot": index,
+            "available": available,
+        }
+        if not available:
+            entry["holder"] = owner or {"status": "locked_without_metadata"}
+        elif owner:
+            entry["stale_holder"] = owner
+        entries.append(entry)
+    return {
+        "worker_id": worker_id,
+        "capacity": max(1, slots),
+        "available": sum(bool(item["available"]) for item in entries),
+        "busy": sum(not bool(item["available"]) for item in entries),
+        "slots": entries,
+    }
+
+
 class WorkerSlotLease:
     def __init__(
         self,
@@ -506,11 +557,12 @@ class WorkerSlotLease:
         memory_guard: str = "off",
         timeout_seconds: float = 30.0,
         cancel_event: Optional[threading.Event] = None,
+        owner_metadata: Optional[Mapping[str, object]] = None,
     ) -> None:
         self.root = root
         self.worker_id = worker_id
         self.slots = max(1, slots)
-        self.required = max(1, min(required, self.slots))
+        self.required = max(1, required)
         self.memory_mb = max(0, int(memory_mb))
         self.memory_reserve_mb = max(0, int(memory_reserve_mb))
         self.memory_guard = str(memory_guard).strip().lower() or "off"
@@ -522,12 +574,23 @@ class WorkerSlotLease:
             )
         self.timeout_seconds = max(0.0, timeout_seconds)
         self.cancel_event = cancel_event
+        self.lease_id = uuid.uuid4().hex
+        self.owner_metadata = dict(owner_metadata or {})
         self.handles: list[object] = []
+        self._handle_slots: dict[int, int] = {}
 
     def __enter__(self) -> "WorkerSlotLease":
         slot_root = self.root / "slots" / self.worker_id
         slot_root.mkdir(parents=True, exist_ok=True)
+        if self.required > self.slots:
+            raise RuntimeError(
+                "worker slot requirement exceeds declared capacity: "
+                f"required={self.required} capacity={self.slots} "
+                f"worker={self.worker_id}"
+            )
         deadline = time.monotonic() + self.timeout_seconds
+        started = time.monotonic()
+        next_wait_report = started
         memory_threshold = (
             (self.memory_mb + self.memory_reserve_mb) * 1024**2
             if self.memory_guard != "off"
@@ -590,6 +653,8 @@ class WorkerSlotLease:
                             handle.close()
                             continue
                         self.handles.append(handle)
+                        self._handle_slots[id(handle)] = index
+                        self._write_owner(slot_root, index)
                     if len(self.handles) >= self.required:
                         return self
                     self._release()
@@ -599,13 +664,76 @@ class WorkerSlotLease:
                 finally:
                     allocation_handle.close()
             if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    "worker slots remained unavailable for "
-                    f"{self.timeout_seconds:.1f}s: "
-                    f"{self.required} of {self.slots} slots required"
+                snapshot = worker_slot_snapshot(
+                    self.root,
+                    self.worker_id,
+                    self.slots,
                 )
+                raise RuntimeError(
+                    "worker slot wait budget exhausted after "
+                    f"{self.timeout_seconds:.1f}s: required={self.required} "
+                    f"capacity={self.slots} available={snapshot['available']} "
+                    f"busy={snapshot['busy']} worker={self.worker_id} "
+                    "holders="
+                    + json.dumps(
+                        [
+                            item
+                            for item in snapshot["slots"]
+                            if not bool(item["available"])
+                        ],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+            now = time.monotonic()
+            if now >= next_wait_report:
+                snapshot = worker_slot_snapshot(
+                    self.root,
+                    self.worker_id,
+                    self.slots,
+                )
+                LOGGER.info(
+                    "worker slots are busy; waiting for capacity "
+                    "worker=%s required=%s capacity=%s available=%s "
+                    "elapsed_seconds=%.1f holders=%s",
+                    self.worker_id,
+                    self.required,
+                    self.slots,
+                    snapshot["available"],
+                    now - started,
+                    json.dumps(
+                        [
+                            item
+                            for item in snapshot["slots"]
+                            if not bool(item["available"])
+                        ],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                )
+                next_wait_report = now + 30.0
             self._wait(0.2)
         return self
+
+    def _write_owner(self, slot_root: Path, index: int) -> None:
+        payload = {
+            **self.owner_metadata,
+            "lease_id": self.lease_id,
+            "worker_id": self.worker_id,
+            "slot": index,
+            "pid": os.getpid(),
+            "acquired_at": time.time(),
+        }
+        try:
+            _write_json_atomic(slot_root / f"{index}.owner.json", payload)
+        except (OSError, TypeError, ValueError) as error:
+            LOGGER.warning(
+                "could not persist worker slot holder metadata "
+                "worker=%s slot=%s: %s",
+                self.worker_id,
+                index,
+                error,
+            )
 
     def _wait(self, seconds: float) -> None:
         remaining = max(
@@ -619,7 +747,18 @@ class WorkerSlotLease:
 
     def _release(self) -> None:
         for handle in self.handles:
+            index = self._handle_slots.pop(id(handle), -1)
             try:
+                if index >= 0:
+                    owner_path = (
+                        self.root
+                        / "slots"
+                        / self.worker_id
+                        / f"{index}.owner.json"
+                    )
+                    owner = _read_json(owner_path)
+                    if str(owner.get("lease_id", "")) == self.lease_id:
+                        owner_path.unlink(missing_ok=True)
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             finally:
                 handle.close()
@@ -1364,12 +1503,22 @@ def worker_execute(
     keep_sandbox = bool(lane)
     try:
         declared_slots = max(0, int(manifest.get("cpu_slots", 0) or 0))
+        slot_wait_timeout_seconds = max(
+            1.0,
+            float(
+                manifest.get(
+                    "worker_slot_wait_timeout_seconds",
+                    7200,
+                )
+            ),
+        )
         memory_mb = max(0, int(manifest.get("memory_mb", 0) or 0))
         memory_reserve_mb = max(
             0, int(manifest.get("memory_reserve_mb", 0) or 0)
         )
     except (TypeError, ValueError):
         declared_slots = 0
+        slot_wait_timeout_seconds = 7200.0
         memory_mb = 0
         memory_reserve_mb = 0
     required_slots = declared_slots or (
@@ -1397,7 +1546,18 @@ def worker_execute(
             memory_mb=memory_mb,
             memory_reserve_mb=memory_reserve_mb,
             memory_guard=memory_guard,
+            timeout_seconds=slot_wait_timeout_seconds,
             cancel_event=cancel_event,
+            owner_metadata={
+                "project_key": str(manifest.get("project_key", "")),
+                "plan_id": str(manifest.get("plan_id", "")),
+                "job_id": job_id,
+                "lane": lane,
+                "backend": "lan-worker",
+                "command_sha256": hashlib.sha256(
+                    command.encode("utf-8")
+                ).hexdigest(),
+            },
         ):
             mirror, sandbox, _created = _worker_sandbox(config, manifest)
             if isinstance(manifest.get("environment_manifest"), dict):
