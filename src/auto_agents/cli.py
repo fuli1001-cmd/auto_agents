@@ -844,12 +844,15 @@ def _triage_terminal_run_error(
             reason="provider triage is unavailable before orchestrator initialization",
             provider_error="orchestrator initialization did not complete",
         )
+    traceback_text = traceback.format_exc()
+    if traceback_text.strip() == "NoneType: None":
+        traceback_text = ""
     result = adjudicate_auto_agents_error(
         orchestrator,
         target_project_root=project_root,
         error=error,
         state=state,
-        traceback_text=traceback.format_exc(),
+        traceback_text=traceback_text,
     )
     if state is not None and state.run_id.strip():
         try:
@@ -873,6 +876,25 @@ def _triage_terminal_run_error(
     if result.provider_error:
         print(f"Self-repair triage provider error: {result.provider_error}", file=sys.stderr)
     return result
+
+
+def _record_blocked_self_repair_triage(
+    project_root: Path,
+    triage: SelfRepairTriageResult,
+) -> None:
+    """Attach the final meta-triage decision without replacing the blocker."""
+    try:
+        state = load_run_state(project_root)
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        blocker["self_repair_triage"] = triage.to_dict()
+        state.active_blocker = blocker
+        save_run_state(project_root, state)
+    except Exception:
+        pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1584,25 +1606,29 @@ def main(argv: list[str] | None = None) -> int:
                 if isinstance(state_payload.get("active_blocker", {}), dict)
                 else {}
             )
-            if state_status == "blocked" and str(
-                blocker.get("owner", "")
-            ) == "auto_agents":
-                decision = SelfRepairDecision(
-                    eligible=True,
-                    category=str(blocker.get("category", "") or "execution_incident"),
-                    reason=str(blocker.get("reason", "") or state_payload.get("last_error", "")),
-                    fingerprint=str(blocker.get("fingerprint", "")),
-                    repeat_count=int(blocker.get("occurrence_count", 0) or 0),
+            if state_status == "blocked":
+                blocked_error = RuntimeError(
+                    str(
+                        blocker.get("reason", "")
+                        or state_payload.get("last_error", "")
+                        or "run blocked without a reason"
+                    )
                 )
-                return _auto_repair_auto_agents_and_resume(
+                triage = _triage_terminal_run_error(
                     project_root,
                     orchestrator,
-                    RuntimeError(str(state_payload.get("last_error", ""))),
-                    decision,
-                    args,
-                    run_lock,
+                    blocked_error,
                 )
-            if state_status == "blocked":
+                if triage.decision.eligible:
+                    return _auto_repair_auto_agents_and_resume(
+                        project_root,
+                        orchestrator,
+                        blocked_error,
+                        triage.decision,
+                        args,
+                        run_lock,
+                    )
+                _record_blocked_self_repair_triage(project_root, triage)
                 print(_render_run_summary(project_root, state_payload))
                 return 3
             if (

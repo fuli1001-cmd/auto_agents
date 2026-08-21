@@ -73,6 +73,7 @@ from auto_agents.self_repair import (
     adjudicate_auto_agents_error,
     classify_auto_agents_error,
     parse_self_repair_judgment,
+    self_repair_runtime_evidence,
 )
 from auto_agents.validation import (
     validate_required_document,
@@ -1385,6 +1386,27 @@ class ProjectValidationTests(unittest.TestCase):
         )
         self.assertFalse(product_failure.eligible)
 
+    def test_persisted_auto_agents_blocker_is_eligible_when_provider_triage_falls_back(self) -> None:
+        state = RunState(
+            run_id="run-123",
+            status="blocked",
+            last_error="generic engine failure",
+            active_blocker={
+                "owner": "auto_agents",
+                "category": "generic_engine_failure",
+                "status": "blocked",
+            },
+        )
+
+        decision = classify_auto_agents_error(
+            state.last_error,
+            state=state,
+            env={},
+        )
+
+        self.assertTrue(decision.eligible)
+        self.assertEqual(decision.category, "generic_engine_failure")
+
     def test_provider_self_repair_judgment_requires_high_confidence_composite_gate(self) -> None:
         payload = {
             "decision": "SELF_REPAIR",
@@ -1398,6 +1420,20 @@ class ProjectValidationTests(unittest.TestCase):
         }
         judgment = parse_self_repair_judgment(json.dumps(payload))
         self.assertTrue(judgment.approved)
+
+        infrastructure = dict(payload)
+        infrastructure.update(
+            {
+                "decision": "DO_NOT_REPAIR",
+                "owner": "verification_infrastructure",
+                "generic": False,
+                "safe_to_self_repair": False,
+                "category": "worker_capacity_unavailable",
+            }
+        )
+        self.assertFalse(
+            parse_self_repair_judgment(json.dumps(infrastructure)).approved
+        )
 
         for field, value in (
             ("decision", "DO_NOT_REPAIR"),
@@ -1593,6 +1629,83 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("The required public API wording is present.", prompt)
             self.assertIn("acceptance oracle #3 has no valid verified proof", prompt)
             self.assertNotIn("unrelated implementation blocker", prompt)
+
+    def test_provider_triage_includes_full_active_execution_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            incident_id = "incident-worker-capability"
+            incident_path = (
+                run_path(project_root, "triage-run")
+                / "recovery_incidents"
+                / f"{incident_id}.json"
+            )
+            write_json(
+                incident_path,
+                {
+                    "incident_id": incident_id,
+                    "kind": "gate_infrastructure_error",
+                    "command": "pytest test_real_minio",
+                    "diagnosis": {"owner": "verification_infrastructure"},
+                    "process_snapshot": {
+                        "required_slots": 2,
+                        "required_capabilities": ["docker", "ffmpeg"],
+                        "infrastructure_attempts": [
+                            {
+                                "worker_id": "local",
+                                "capabilities": ["ffmpeg"],
+                            }
+                        ],
+                    },
+                },
+            )
+            payload = {
+                "decision": "DO_NOT_REPAIR",
+                "owner": "verification_infrastructure",
+                "generic": False,
+                "safe_to_self_repair": False,
+                "confidence": 0.9,
+                "category": "worker_capacity_unavailable",
+                "reason": "no source defect was proven",
+                "evidence": ["worker attempt evidence"],
+            }
+
+            class FakeOrchestrator:
+                config = type("Config", (), {"efforts": {"self_repair": "max"}})()
+
+                def _call_with_failover(self, request):
+                    self.request = request
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=json.dumps(payload),
+                    )
+
+            state = RunState(
+                run_id="triage-run",
+                status="blocked",
+                active_execution_incident_id=incident_id,
+            )
+            orchestrator = FakeOrchestrator()
+
+            with patch(
+                "auto_agents.self_repair.self_repair_runtime_evidence",
+                return_value={"healthy_not_advertised": ["docker"]},
+            ):
+                adjudicate_auto_agents_error(
+                    orchestrator,
+                    target_project_root=project_root,
+                    error="no eligible worker",
+                    state=state,
+                    env={},
+                )
+
+            prompt = orchestrator.request.prompt
+            self.assertIn('"active_execution_incident"', prompt)
+            self.assertIn('"required_slots": 2', prompt)
+            self.assertIn('"required_capabilities"', prompt)
+            self.assertIn('"healthy_not_advertised"', prompt)
 
     def test_valid_provider_rejection_overrides_eligible_heuristic(self) -> None:
         scope_error = (
@@ -1920,6 +2033,182 @@ class ProjectValidationTests(unittest.TestCase):
                 resume_run.call_args.kwargs["pass_fd"],
                 int(resume_env[RUN_LOCK_FD_ENV]),
             )
+
+    def test_cli_meta_triages_non_auto_agents_blocker_and_resumes_after_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            def mock_run(_self, *args, **kwargs):
+                state = load_run_state(project_root)
+                state.status = "blocked"
+                state.current_stage = "implement"
+                state.last_error = "no eligible worker has required docker capability"
+                state.active_blocker = {
+                    "owner": "verification_infrastructure",
+                    "category": "gate_infrastructure_error",
+                    "reason": state.last_error,
+                    "status": "blocked",
+                }
+                save_run_state(project_root, state)
+                return state
+
+            triage = SelfRepairTriageResult(
+                decision=SelfRepairDecision(
+                    True,
+                    category="worker_capability_false_negative",
+                    reason="worker probe omitted a healthy host capability",
+                    fingerprint="blocked-triage-fingerprint",
+                    repeat_count=1,
+                ),
+                source="provider",
+                reason="provider approved self-repair",
+                judgment=SelfRepairJudgment(
+                    decision="SELF_REPAIR",
+                    owner="auto_agents",
+                    generic=True,
+                    safe_to_self_repair=True,
+                    confidence=0.97,
+                    category="worker_capability_false_negative",
+                    reason="worker probe omitted a healthy host capability",
+                    evidence=["docker is healthy but absent from worker capabilities"],
+                ),
+            )
+
+            class FakeSelfRepairRunner:
+                repo_root = Path("/tmp/auto_agents_repo")
+
+                def __init__(self, orchestrator, **kwargs):
+                    self.kwargs = kwargs
+
+                def run(self):
+                    return SelfRepairResult(
+                        ok=True,
+                        status="completed",
+                        reason="repaired",
+                        category="worker_capability_false_negative",
+                        commit_sha="def123456789",
+                        summary="fixed worker probe",
+                        verification="tests passed",
+                    )
+
+            with (
+                patch.object(Orchestrator, "run", mock_run),
+                patch(
+                    "auto_agents.cli._triage_terminal_run_error",
+                    return_value=triage,
+                ) as triage_run,
+                patch("auto_agents.cli.AutoAgentsSelfRepairRunner", FakeSelfRepairRunner),
+                patch("auto_agents.cli._run_self_repair_resume_process", return_value=0) as resume_run,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main(
+                    ["run", "--project", str(project_root), "--spec-file", str(spec_file)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            triage_run.assert_called_once()
+            self.assertIn("no eligible worker", str(triage_run.call_args.args[2]))
+            resume_run.assert_called_once()
+            repaired_state = load_run_state(project_root)
+            self.assertEqual(repaired_state.status, "pending")
+            self.assertEqual(repaired_state.active_blocker["owner"], "auto_agents")
+            self.assertEqual(
+                repaired_state.active_blocker["self_repair_commit"],
+                "def123456789",
+            )
+
+    def test_cli_preserves_blocker_and_records_rejected_meta_triage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            def mock_run(_self, *args, **kwargs):
+                state = load_run_state(project_root)
+                state.status = "blocked"
+                state.last_error = "production credentials are missing"
+                state.active_blocker = {
+                    "owner": "user_input",
+                    "category": "credentials_required",
+                    "reason": state.last_error,
+                    "status": "blocked",
+                }
+                save_run_state(project_root, state)
+                return state
+
+            triage = SelfRepairTriageResult(
+                decision=SelfRepairDecision(
+                    False,
+                    category="credentials_required",
+                    reason="credentials require user input",
+                ),
+                source="provider",
+                reason="provider rejected self-repair",
+                judgment=SelfRepairJudgment(
+                    decision="DO_NOT_REPAIR",
+                    owner="user_input",
+                    generic=False,
+                    safe_to_self_repair=False,
+                    confidence=0.99,
+                    category="credentials_required",
+                    reason="credentials require user input",
+                    evidence=["no production credential was supplied"],
+                ),
+            )
+
+            with (
+                patch.object(Orchestrator, "run", mock_run),
+                patch(
+                    "auto_agents.cli._triage_terminal_run_error",
+                    return_value=triage,
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main(
+                    ["run", "--project", str(project_root), "--spec-file", str(spec_file)]
+                )
+
+            self.assertEqual(exit_code, 3)
+            blocked_state = load_run_state(project_root)
+            self.assertEqual(blocked_state.active_blocker["owner"], "user_input")
+            self.assertEqual(
+                blocked_state.active_blocker["self_repair_triage"]["judgment"]["decision"],
+                "DO_NOT_REPAIR",
+            )
+
+    def test_self_repair_runtime_evidence_detects_worker_capability_mismatch(self) -> None:
+        def fake_run(command, **_kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="27.5.1\n",
+                stderr="",
+            )
+
+        with (
+            patch(
+                "auto_agents.self_repair.shutil.which",
+                side_effect=lambda program: "/usr/bin/docker" if program == "docker" else None,
+            ),
+            patch("auto_agents.self_repair.subprocess.run", side_effect=fake_run),
+            patch(
+                "auto_agents.workers.worker_probe",
+                return_value={"capabilities": ["ffmpeg", "python"]},
+            ),
+        ):
+            evidence = self_repair_runtime_evidence()
+
+        self.assertEqual(evidence["healthy_not_advertised"], ["docker"])
+        self.assertEqual(
+            evidence["worker_advertised_capabilities"],
+            ["ffmpeg", "python"],
+        )
 
     def test_cli_gate_timeout_enters_unified_triage_and_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

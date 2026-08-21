@@ -152,8 +152,8 @@ Before starting another implementation cycle, an adaptive read-only judge return
 `REPLAN`, or `STOP`. Deterministic no-progress checks and `execution.recovery.max_rounds` remain hard
 limits even if the judge requests more work. A terminal lineage can open a new epoch only after its
 contract or repository evidence fingerprint changes. Product-code and generated-test failures stay
-owned by the target project; auto_agents self-repair is considered only when structured recovery
-state reports an orchestrator routing invariant violation.
+owned by the target project; auto_agents self-repair is considered only when terminal meta-triage
+finds strong source, runtime, or structured recovery evidence of a generic engine defect.
 
 The top-level `verify` stage still runs the full configured verification suite before release. If
 that full suite fails, auto_agents now treats it as a recovery signal instead of immediately
@@ -912,12 +912,16 @@ bounded by `execution.recovery.max_rounds`; inconclusive or exhausted recovery p
 looping. A host-level `SIGKILL` still requires a later CLI invocation because no in-process code can
 continue after the host has removed the process.
 
-Incidents are persisted under `.auto-agents/runs/<run-id>/recovery_incidents/`. Target-project
-failures use bounded task recovery, auto_agents-owned failures enter verified self-repair, and
-environment or external failures exit with run status `blocked`. After resolving a blocker, rerun
-`python3 -m auto_agents run --project /tmp/demo`; the saved checkpoint and run options resume
-without a separate recovery dialogue. Recovery never weakens checks, changes credentials/global
-environment, or raises the absolute safety ceiling.
+Incidents are persisted under `.auto-agents/runs/<run-id>/recovery_incidents/`. Every terminal
+exception and controlled `blocked` result receives one read-only self-repair meta-triage before the
+CLI exits. Earlier owner labels are preliminary evidence: the judge may reclassify a blocker as an
+auto_agents defect only when source or runtime evidence proves a generic, safely testable engine
+failure. Approved defects enter verified self-repair and resume from the saved checkpoint in a new
+process; rejected judgments are attached to the original blocker without replacing its owner or
+reason. Target-project failures keep bounded task recovery, while credentials, destructive
+production decisions, unavailable external services, and unsupported host repairs still stop for
+the appropriate owner. Recovery never weakens checks, changes credentials/global environment, or
+raises the absolute safety ceiling.
 
 Forbidden-pattern requirements use timeout-capable regex matching with per-pattern/file and total
 audit limits. Broad DOTALL wildcards and nested unbounded quantifiers fail closed with a diagnostic;
@@ -1383,16 +1387,18 @@ clarification blocker if active requirements and repository tests disagree in a 
 oracles cannot resolve. After the configured recovery budget is exhausted, auto_agents rewinds to
 `clarify` instead of looping indefinitely.
 
-When a `run` fails with a conservative auto_agents-owned signal, such as a gate-scope
-classification error produced by the orchestrator itself, the CLI can start an automatic
-auto_agents self-repair pass. That pass edits and verifies the auto_agents repository only, commits
-the generic repair, sends an Enterprise WeChat summary when notifications are configured, and then
-restarts the original `run` command in a fresh process. It does not edit the target project and is
-allowed to continue across different auto_agents-owned failures. Recovery-loop identity is based on
-the owner stage, requirement IDs, stable failure IDs, and owner-artifact fingerprints rather than
-task IDs or changing review prose. A repeated failure with unchanged owner artifacts stops as a
-target-project no-progress condition. Automatic self-repair is attempted only when diagnostics also
-show an auto_agents routing invariant mismatch, and that invariant repair is capped at one attempt.
+When a `run` reaches any blocking terminal state, the CLI asks the read-only meta-triage judge to
+verify the underlying owner before returning control to the user. The evidence includes the saved
+blocker and incident, run-log tail, relevant requirement-audit findings, both repositories' changed
+paths, and an independent comparison of healthy host runtimes against worker-advertised
+capabilities. This catches false infrastructure attribution such as a healthy runtime omitted by a
+worker probe. A high-confidence auto_agents judgment starts an automatic self-repair pass. That pass
+edits and verifies the auto_agents repository only, commits the generic repair, sends an Enterprise
+WeChat summary when notifications are configured, and restarts the original `run` command in a fresh
+process. It does not edit the target project and is allowed to continue across different
+auto_agents-owned failures. Recovery-loop identity is based on the owner stage, requirement IDs,
+stable failure IDs, and owner-artifact fingerprints rather than task IDs or changing review prose.
+A repeated failure with unchanged evidence remains bounded by the self-repair fingerprint budget.
 Before a destructive review/scope rewind, the engine preserves the task, failure IDs, changed paths,
 owner route, and worktree fingerprint under the run's `recovery_incidents/` directory.
 
