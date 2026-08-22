@@ -14,12 +14,19 @@ from .frontend_design import (
     validate_frontend_scope,
 )
 from .io_utils import read_json, read_text
+from .persistence import (
+    persistence_compatibility_policy,
+    persistence_storage_transition,
+)
 from .models import (
     APPROVAL_ORDER,
     DEFAULT_EFFORTS,
     DOCUMENT_LANGUAGE_OPTIONS,
     PERSISTENCE_ENVIRONMENTS,
+    PERSISTENCE_COMPATIBILITY_POLICIES,
+    PERSISTENCE_STORAGE_TRANSITIONS,
     PERSISTENCE_STRATEGIES,
+    PERSISTENCE_TARGET_LIFECYCLES,
     PERSISTENCE_TARGET_KINDS,
     SMART_TIMEOUT_PROGRESS_PROTOCOL,
     TASK_ORIGINS,
@@ -135,6 +142,8 @@ def validate_persistence_change(
         return []
     if not isinstance(value, dict):
         return [f"{prefix} must be an object"]
+    if "storage_transition" in value or "compatibility_policy" in value:
+        return _validate_persistence_change_v2(value, prefix)
     strategy = str(value.get("strategy", "")).strip()
     if strategy not in PERSISTENCE_STRATEGIES:
         return [
@@ -189,6 +198,102 @@ def validate_persistence_change(
         errors.append(
             f"{prefix}.legacy_fixture_refs must contain executable legacy-schema proof refs"
         )
+    return errors
+
+
+def _validate_persistence_change_v2(value: dict, prefix: str) -> List[str]:
+    transition = str(value.get("storage_transition", "")).strip()
+    policy = str(value.get("compatibility_policy", "")).strip()
+    errors: List[str] = []
+    if transition not in PERSISTENCE_STORAGE_TRANSITIONS:
+        errors.append(
+            f"{prefix}.storage_transition must be one of: "
+            + ", ".join(PERSISTENCE_STORAGE_TRANSITIONS)
+        )
+    if policy not in PERSISTENCE_COMPATIBILITY_POLICIES:
+        errors.append(
+            f"{prefix}.compatibility_policy must be one of: "
+            + ", ".join(PERSISTENCE_COMPATIBILITY_POLICIES)
+        )
+    allowed = {
+        "none": {"not_applicable", "backward_compatible", "dual_read", "reject_legacy"},
+        "initialize": {"not_applicable"},
+        "migrate_in_place": {"backward_compatible", "migrate_all", "dual_read"},
+        "rebuild": {"reject_legacy"},
+        "external_operator": {"operator_defined"},
+    }
+    if transition in allowed and policy not in allowed[transition]:
+        errors.append(
+            f"{prefix} incompatible storage_transition={transition} "
+            f"and compatibility_policy={policy}"
+        )
+    if transition == "none" and policy == "not_applicable":
+        unexpected = sorted(
+            set(value) - {"storage_transition", "compatibility_policy"}
+        )
+        if unexpected:
+            errors.append(
+                f"{prefix} no-op persistence change cannot declare: {', '.join(unexpected)}"
+            )
+        return errors
+
+    for field_name in ("decision_id", "to_version"):
+        if not isinstance(value.get(field_name), str) or not str(value[field_name]).strip():
+            errors.append(f"{prefix}.{field_name} must be a non-empty string")
+    targets = value.get("target_ids")
+    if (
+        not isinstance(targets, list)
+        or not targets
+        or any(not isinstance(item, str) or not item.strip() for item in targets)
+    ):
+        errors.append(f"{prefix}.target_ids must be a non-empty list of strings")
+
+    migrations = value.get("migration_artifacts", [])
+    if not isinstance(migrations, list):
+        errors.append(f"{prefix}.migration_artifacts must be a list")
+    else:
+        for index, artifact in enumerate(migrations, start=1):
+            artifact_prefix = f"{prefix}.migration_artifacts[{index}]"
+            if not isinstance(artifact, dict):
+                errors.append(f"{artifact_prefix} must be an object")
+                continue
+            if str(artifact.get("kind", "")) not in {
+                "baseline", "schema", "data", "required_seed"
+            }:
+                errors.append(f"{artifact_prefix}.kind is invalid")
+            if not str(artifact.get("id", "")).strip():
+                errors.append(f"{artifact_prefix}.id must be non-empty")
+            if not _safe_project_relative_path(artifact.get("path")):
+                errors.append(f"{artifact_prefix}.path must be an exact project-relative path")
+            unexpected = sorted(set(artifact) - {"id", "path", "kind"})
+            if unexpected:
+                errors.append(f"{artifact_prefix} cannot declare: {', '.join(unexpected)}")
+    if transition == "initialize" and not any(
+        isinstance(item, dict) and item.get("kind") == "baseline"
+        for item in migrations if isinstance(migrations, list)
+    ):
+        errors.append(f"{prefix} initialize requires a baseline migration artifact")
+    if transition == "migrate_in_place" and not migrations:
+        errors.append(f"{prefix} migrate_in_place requires migration_artifacts")
+
+    contracts = value.get("contract_artifacts", [])
+    if not isinstance(contracts, list) or any(
+        not _safe_project_relative_path(item) for item in contracts
+    ):
+        errors.append(f"{prefix}.contract_artifacts must contain exact project-relative paths")
+    if transition == "none" and policy != "not_applicable" and not contracts:
+        errors.append(f"{prefix} contract-only changes require contract_artifacts")
+
+    fixtures = value.get("legacy_fixture_refs", [])
+    if transition in {"migrate_in_place", "rebuild"} or policy in {
+        "backward_compatible", "migrate_all", "dual_read", "reject_legacy"
+    }:
+        if (
+            not isinstance(fixtures, list)
+            or not fixtures
+            or any(not isinstance(item, str) or not item.strip() for item in fixtures)
+        ):
+            errors.append(f"{prefix}.legacy_fixture_refs must contain executable proof refs")
     return errors
 
 
@@ -783,8 +888,8 @@ def validate_task_plan_payload(
         return ["task plan root must be a JSON object"]
 
     persistence_contract_version = payload.get("persistence_contract_version", 0)
-    if persistence_contract_version not in {0, 1}:
-        errors.append("task plan persistence_contract_version must be 1 when provided")
+    if persistence_contract_version not in {0, 1, 2}:
+        errors.append("task plan persistence_contract_version must be 1 or 2 when provided")
         persistence_contract_version = 0
 
     verification_policy_version = payload.get("verification_policy_version", 1)
@@ -1114,13 +1219,20 @@ def validate_persistence_plan_contract(
             continue
         decision_id = str(decision.get("id", "")).strip()
         strategy = str(decision.get("strategy", "")).strip()
+        transition = persistence_storage_transition(decision)
+        policy = persistence_compatibility_policy(decision)
         targets = decision.get("target_ids", [])
         status = str(decision.get("status", "")).strip()
         if not re.fullmatch(r"PERSIST-[0-9]{3,}", decision_id):
             errors.append(f"{prefix}.id must match PERSIST-NNN")
         elif decision_id in decisions:
             errors.append(f"{prefix}.id duplicates '{decision_id}'")
-        if strategy not in set(PERSISTENCE_STRATEGIES) - {"none"}:
+        if "storage_transition" in decision or "compatibility_policy" in decision:
+            if transition not in PERSISTENCE_STORAGE_TRANSITIONS:
+                errors.append(f"{prefix}.storage_transition is invalid")
+            if policy not in PERSISTENCE_COMPATIBILITY_POLICIES:
+                errors.append(f"{prefix}.compatibility_policy is invalid")
+        elif strategy not in set(PERSISTENCE_STRATEGIES) - {"none"}:
             errors.append(f"{prefix}.strategy is invalid")
         if (
             not isinstance(targets, list)
@@ -1176,6 +1288,23 @@ def validate_persistence_plan_contract(
         for item in plan_payload.get("verification_steps", [])
         if isinstance(item, dict)
     ]
+    pending_targets = {
+        target_id
+        for target_id, target in target_map.items()
+        if str(target.get("lifecycle", "ready")) == "pending_bootstrap"
+    }
+    bootstrap_targets: set[str] = {
+        str(target_id)
+        for task in plan_payload.get("tasks", [])
+        if isinstance(task, dict)
+        and isinstance(task.get("persistence_interface"), dict)
+        and persistence_storage_transition(task.get("persistence_change")) == "initialize"
+        for target_id in (
+            task.get("persistence_change", {}).get("target_ids", [])
+            if isinstance(task.get("persistence_change"), dict)
+            else []
+        )
+    }
     for index, task in enumerate(plan_payload.get("tasks", []), start=1):
         if not isinstance(task, dict) or str(task.get("status", "pending")) == "done":
             continue
@@ -1183,7 +1312,9 @@ def validate_persistence_plan_contract(
         if not isinstance(change, dict):
             continue
         strategy = str(change.get("strategy", "none")).strip()
-        if strategy in {"", "none"}:
+        transition = persistence_storage_transition(change)
+        policy = persistence_compatibility_policy(change)
+        if transition == "none" and policy == "not_applicable":
             continue
         decision_id = str(change.get("decision_id", "")).strip()
         decision = decisions.get(decision_id)
@@ -1193,8 +1324,14 @@ def validate_persistence_plan_contract(
             continue
         task_targets = sorted(str(item) for item in change.get("target_ids", []))
         decision_targets = sorted(str(item) for item in decision.get("target_ids", []))
-        if strategy != str(decision.get("strategy", "")):
-            errors.append(f"{prefix}.strategy must match persistence decision {decision_id}")
+        if transition != persistence_storage_transition(decision):
+            errors.append(
+                f"{prefix}.storage_transition must match persistence decision {decision_id}"
+            )
+        if policy != persistence_compatibility_policy(decision):
+            errors.append(
+                f"{prefix}.compatibility_policy must match persistence decision {decision_id}"
+            )
         if task_targets != decision_targets:
             errors.append(f"{prefix}.target_ids must match persistence decision {decision_id}")
         if target_configuration_supplied:
@@ -1217,7 +1354,7 @@ def validate_persistence_plan_contract(
                 for target in step.get("targets", [])
             )
         ]
-        if strategy != "initial_schema" and not critical_steps:
+        if transition != "initialize" and not critical_steps:
             errors.append(
                 f"{prefix} legacy fixture proof must map to a critical verification step"
             )
@@ -1239,12 +1376,18 @@ def validate_persistence_plan_contract(
                 continue
             errors.extend(
                 _persistence_target_strategy_errors(
-                    strategy,
+                    transition if "storage_transition" in change else strategy,
                     target_id,
                     target,
                     prefix,
                 )
             )
+    missing_bootstrap = sorted(pending_targets - bootstrap_targets)
+    if missing_bootstrap:
+        errors.append(
+            "pending persistence targets require an initialize task with "
+            "persistence_interface: " + ", ".join(missing_bootstrap)
+        )
     return errors
 
 
@@ -1257,24 +1400,51 @@ def _persistence_target_strategy_errors(
     errors: List[str] = []
     environment = str(target.get("environment", ""))
     kind = str(target.get("kind", ""))
-    if strategy == "clean_break":
+    is_v2 = int(target.get("interface_version", 1) or 1) >= 2 or strategy in {
+        "initialize", "migrate_in_place", "rebuild"
+    }
+    transition = strategy if is_v2 else {
+        "initial_schema": "initialize",
+        "startup_compatible": "migrate_in_place",
+        "clean_break": "rebuild",
+        "external_operator": "external_operator",
+    }.get(strategy, "none")
+    if not is_v2 and strategy == "initial_schema":
+        return errors
+    if str(target.get("lifecycle", "ready")) != "ready":
+        return errors
+    if transition == "rebuild":
         if environment == "production":
-            errors.append(f"{prefix} clean_break cannot target production: {target_id}")
+            errors.append(f"{prefix} rebuild cannot target production: {target_id}")
         if not target.get("initialize_argv") or not target.get("verify_argv"):
             errors.append(
-                f"{prefix} clean_break target {target_id} requires initialize_argv and verify_argv"
+                f"{prefix} {'rebuild' if is_v2 else 'clean_break'} target {target_id} "
+                "requires initialize_argv and verify_argv"
             )
         if kind == "compose_service" and not target.get("reset_argv"):
             errors.append(
-                f"{prefix} compose clean_break target {target_id} requires reset_argv"
+                f"{prefix} compose {'rebuild' if is_v2 else 'clean_break'} "
+                f"target {target_id} requires reset_argv"
             )
-    elif strategy in {"startup_compatible", "external_operator"}:
+    elif transition == "initialize":
         if environment != "production" and (
-            not target.get("apply_argv") or not target.get("verify_argv")
+            not target.get("initialize_argv") or not target.get("verify_argv")
         ):
             errors.append(
-                f"{prefix} automatic target {target_id} requires apply_argv and verify_argv"
+                f"{prefix} initialize target {target_id} requires initialize_argv and verify_argv"
             )
+    elif transition in {"migrate_in_place", "external_operator"}:
+        migrate = target.get("migrate_argv") or target.get("apply_argv")
+        if environment != "production" and (
+            not migrate or not target.get("verify_argv")
+        ):
+            errors.append(
+                f"{prefix} automatic target {target_id} requires "
+                f"{'migrate_argv' if is_v2 else 'apply_argv'} and verify_argv"
+            )
+    if is_v2 and int(target.get("interface_version", 1) or 1) >= 2:
+        if not target.get("status_argv"):
+            errors.append(f"{prefix} protocol v2 target {target_id} requires status_argv")
     return errors
 
 
@@ -1299,7 +1469,8 @@ def validate_active_persistence_target_readiness(
         if not isinstance(decision, dict) or str(decision.get("status", "")) != "active":
             continue
         strategy = str(decision.get("strategy", "")).strip()
-        if strategy in {"", "none", "initial_schema"}:
+        transition = persistence_storage_transition(decision)
+        if transition in {"", "none"}:
             continue
         decision_id = str(decision.get("id", "")).strip() or "<unknown>"
         prefix = f"persistence decision {decision_id}"
@@ -1318,7 +1489,7 @@ def validate_active_persistence_target_readiness(
                 continue
             errors.extend(
                 _persistence_target_strategy_errors(
-                    strategy,
+                    transition if "storage_transition" in decision else strategy,
                     target_id,
                     target,
                     prefix,
@@ -1499,6 +1670,8 @@ def validate_persistence_config_payload(payload: object) -> List[str]:
                         f"{prefix}.associated_paths entry '{path}' must be project-relative"
                     )
         for field_name in (
+            "status_argv",
+            "migrate_argv",
             "apply_argv",
             "initialize_argv",
             "reset_argv",
@@ -1509,6 +1682,30 @@ def validate_persistence_config_payload(payload: object) -> List[str]:
                     target.get(field_name, []), f"{prefix}.{field_name}"
                 )
             )
+        interface_version = target.get("interface_version", 1)
+        if interface_version not in {1, 2}:
+            errors.append(f"{prefix}.interface_version must be 1 or 2")
+        lifecycle = str(target.get("lifecycle", "ready"))
+        if lifecycle not in PERSISTENCE_TARGET_LIFECYCLES:
+            errors.append(
+                f"{prefix}.lifecycle must be one of: {', '.join(PERSISTENCE_TARGET_LIFECYCLES)}"
+            )
+        roots = target.get("migration_roots", [])
+        if not isinstance(roots, list) or any(
+            not _safe_project_relative_path(item) for item in roots
+        ):
+            errors.append(f"{prefix}.migration_roots must contain project-relative paths")
+        if interface_version == 2 and lifecycle == "ready":
+            for field_name in (
+                "status_argv",
+                "initialize_argv",
+                "migrate_argv",
+                "verify_argv",
+            ):
+                if not target.get(field_name):
+                    errors.append(f"{prefix}.{field_name} is required for a ready v2 target")
+            if not roots:
+                errors.append(f"{prefix}.migration_roots is required for a ready v2 target")
         timeout = target.get("timeout_seconds", 300)
         if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 1:
             errors.append(f"{prefix}.timeout_seconds must be an integer >= 1")

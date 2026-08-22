@@ -99,7 +99,7 @@ ARCHITECTURE_TEMPLATE = """# Architecture
 
 
 TASK_PLAN_TEMPLATE = {
-    "persistence_contract_version": 1,
+    "persistence_contract_version": 2,
     "tasks": [
         {
             "task_id": "task-001",
@@ -110,13 +110,17 @@ TASK_PLAN_TEMPLATE = {
             "acceptance": ["State one concrete acceptance criterion."],
             "status": "pending",
             "commit_message": "",
-            "persistence_change": {"strategy": "none"},
+            "persistence_change": {
+                "storage_transition": "none",
+                "compatibility_policy": "not_applicable",
+            },
         }
     ]
 }
 
 REQUIREMENTS_TRACE_TEMPLATE = {
     "version": 1,
+    "persistence_contract_version": 2,
     "persistence_decisions": [],
     "requirements": [],
 }

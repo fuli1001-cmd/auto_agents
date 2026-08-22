@@ -727,6 +727,16 @@
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
               },
+              "interface_version": {"type": "integer", "enum": [1, 2]},
+              "lifecycle": {"type": "string", "enum": ["pending_bootstrap", "ready"]},
+              "status_argv": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "migrate_argv": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
               "apply_argv": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
@@ -740,6 +750,10 @@
                 "items": {"type": "string", "minLength": 1}
               },
               "verify_argv": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              },
+              "migration_roots": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
               },

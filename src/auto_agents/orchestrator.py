@@ -164,6 +164,7 @@ from .models import (
     ProviderConfig,
     ProviderFailoverConfig,
     ProjectConfig,
+    PersistenceTargetConfig,
     GateParallelGroup,
     GateResult,
     RunState,
@@ -185,8 +186,10 @@ from .persistence import (
     build_persistence_action_manifest,
     detect_persistence_schema_changes,
     execute_persistence_action,
+    migration_artifact_immutability_errors,
     persistence_candidate_fingerprint,
     persistence_change_strategy,
+    persistence_storage_transition,
 )
 from .prototype_variants import (
     add_variant,
@@ -241,6 +244,7 @@ from .validation import (
     _unwrap_conda_run,
     project_config_warnings,
     validate_active_persistence_target_readiness,
+    validate_persistence_config_payload,
     validate_persistence_plan_contract,
     validate_required_document,
     validate_task_dependencies,
@@ -3048,6 +3052,8 @@ class Orchestrator:
 
     def _block_for_persistence_configuration(self, state: RunState) -> bool:
         trace = load_requirements_trace(self.project_root)
+        if self._approve_persistence_target_proposals(trace):
+            self.config = load_project_config(self.project_root)
         errors = validate_active_persistence_target_readiness(
             trace,
             configured_targets=[
@@ -3074,6 +3080,55 @@ class Orchestrator:
             fingerprint=fingerprint,
         )
         self.logger.error(reason)
+        return True
+
+    def _approve_persistence_target_proposals(self, trace: object) -> bool:
+        if not isinstance(trace, dict):
+            return False
+        proposals = trace.get("persistence_target_proposals", [])
+        if not isinstance(proposals, list):
+            return False
+        configured = {target.target_id for target in self.config.persistence.targets}
+        pending = [
+            item
+            for item in proposals
+            if isinstance(item, dict) and str(item.get("id", "")) not in configured
+        ]
+        if not pending:
+            return False
+        answer = self._prompt_user(
+            "Register these provider-proposed persistence targets as pending bootstrap?\n"
+            + json.dumps(pending, indent=2, ensure_ascii=False)
+            + "\nThis confirms target identity and deletion scope only; runner commands "
+            "must still be implemented and verified. (y/n) [n]: ",
+            default="n",
+        )
+        if answer.strip().lower() not in {"y", "yes"}:
+            return False
+        candidates = list(self.config.persistence.targets)
+        for item in pending:
+            candidates.append(
+                PersistenceTargetConfig(
+                    target_id=str(item.get("id", "")),
+                    environment=str(item.get("environment", "")),
+                    kind=str(item.get("kind", "")),
+                    locator=dict(item.get("locator", {})),
+                    associated_paths=[
+                        str(path) for path in item.get("associated_paths", [])
+                    ],
+                    interface_version=2,
+                    lifecycle="pending_bootstrap",
+                )
+            )
+        errors = validate_persistence_config_payload(
+            {"targets": [target.to_dict() for target in candidates]}
+        )
+        if errors:
+            raise PersistenceContractError(
+                "invalid persistence target proposal: " + "; ".join(errors)
+            )
+        self.config.persistence.targets = candidates
+        save_project_config(self.project_root, self.config)
         return True
 
     def _current_audit_spec(self, state: Optional[RunState] = None) -> Optional[Path]:
@@ -15956,8 +16011,9 @@ class Orchestrator:
                 "Only update project_brief.md and requirements_trace.json in this stage; do not modify project code, tests, or other repository documents.",
                 "Preserve the exact top-level and section headings already present in the file.",
                 "The requirements trace is the downstream execution contract. It must be valid JSON with version=1 and a requirements list.",
-                "When the requested work creates or changes a persistent database schema, record a top-level persistence_decisions entry with a stable PERSIST-NNN id, configured target_ids, one strategy (initial_schema, startup_compatible, clean_break, or external_operator), source, and status='active'. target_ids must be IDs already registered under config.json persistence.targets; they identify storage environments, never REQ-NNN requirement IDs. If no persistence target is configured, do not invent one: report that persistence-configure is required.",
-                "A persistence strategy must come from the input spec or an explicit user clarification. Never infer data-loss permission. If no strategy is stated, ask the user before finalizing requirements; --auto-approve does not choose a strategy.",
+                "When requested work affects persistent schema, data, required seed data, or a serialized contract, use persistence_contract_version=2 and record a PERSIST-NNN decision with configured target_ids, storage_transition (none, initialize, migrate_in_place, rebuild, or external_operator), compatibility_policy (not_applicable, backward_compatible, migrate_all, dual_read, reject_legacy, or operator_defined), source, and status='active'. target_ids identify human-approved storage environments, never REQ-NNN IDs.",
+                "Storage transition and compatibility policy must come from the input spec or explicit user clarification. Never infer data-loss permission. rebuild always means deleting/resetting the registered target and initializing it from the immutable migration chain; a provider or payload contract cutover that retains the database uses storage_transition=none with compatibility_policy=reject_legacy. --auto-approve does not choose either dimension.",
+                "If persistence is required and no suitable configured target exists, add a top-level persistence_target_proposals entry with id, environment, kind, locator, and associated_paths. The orchestrator will require explicit human confirmation and register it as pending_bootstrap; do not treat a proposal as deletion approval or a ready runner.",
                 "Every active requirement must have id, text, source, status, priority, acceptance_oracles, oracle_type, oracle_strength, evidence_boundary, forbidden_proxy_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields. If a requirement needs multiple provider documents, also set provider_references to a list of local provider reference paths; do not join multiple paths into provider_reference with punctuation.",
                 "Use stable IDs like REQ-001. Mark hard requirements as priority='mandatory'. Use status='active', 'deferred', or 'superseded'.",
                 "If the requested scope includes frontend pages or screens, add top-level frontend_scope={requested:true,surfaces:[...]}. Each surface must include a stable id, name, route when known, priority (core/primary/secondary/optional), purpose, key_states, and non-empty requirement_ids. Set requested=false with surfaces=[] when no frontend work is requested.",
@@ -16046,9 +16102,10 @@ class Orchestrator:
                 "repository files to make the plan pass.",
                 "At the root of the JSON, set verification_policy_version=4 and also define test_strategy and verification_steps.",
                 "At the root of the JSON, set oracle_proof_schema_version to 2 for all new plans. auto_agents will bind each proof to the current requirement contract hash.",
-                "At the root of the JSON, set persistence_contract_version=1. Every active task must include persistence_change. Use {'strategy':'none'} when it does not alter persistent schema.",
-                "A schema-changing task must copy strategy, decision_id, and target_ids from one active persistence_decisions entry and add to_version, migration_artifacts, and legacy_fixture_refs. The planner may not invent or change the user's strategy. target_ids identify configured persistence environments, never REQ-NNN requirement IDs.",
-                "startup_compatible and external_operator tasks must prove upgrade from a legacy fixture, data preservation, idempotency, and current read/write behavior. clean_break tasks must prove explicit reset, empty current-schema initialization, and actionable incompatible-schema behavior; fresh-database-only tests are insufficient.",
+                "At the root of the JSON, set persistence_contract_version=2. Every active task must include persistence_change. Use {'storage_transition':'none','compatibility_policy':'not_applicable'} for ordinary tasks.",
+                "A persistence task must copy storage_transition, compatibility_policy, decision_id, and target_ids from an active decision and add to_version, which is always the target runner's expected latest storage version. When a serialized payload/protocol has its own version, record it separately as contract_to_version. Declare executable migration_artifacts as {id,path,kind}, where kind is baseline, schema, data, or required_seed; declare non-migration serialized contract files separately as contract_artifacts. Existing migrations are immutable and future changes append a new migration.",
+                "initialize tasks must create the target-native runner, immutable baseline, migration ledger, checksum/fingerprint verification, and status/initialize/migrate/verify JSON protocol. migrate_in_place tasks prove upgrade from a legacy fixture, data preservation, idempotency, and current read/write behavior. rebuild tasks prove explicit reset and empty current-schema initialization. Application startup must verify schema read-only and never run migrations.",
+                "When an initialize task targets lifecycle=pending_bootstrap, include persistence_interface with interface_version=2, exact status_argv/initialize_argv/migrate_argv/reset_argv/verify_argv arrays, and migration_roots. After the task passes review the orchestrator validates and promotes that target to ready before executing initialize.",
                 "Map every non-initial persistence task's legacy_fixture_refs to a risk='critical', parallel_safe=false verification step with serial_reason='shared_mutable_state' or 'ordered_contract'.",
                 "Every new non-done task must include requirement_ids listing the requirements it covers.",
                 "Every task that covers requirement_ids must include requirement_proofs. Each proof must include requirement_id, oracle_index (1-based) or exact acceptance_oracle, proof_type, oracle_strength, evidence_boundary, evidence_refs, status='planned', and forbidden_proxy_oracles copied from the bound requirement.",
@@ -16439,7 +16496,7 @@ class Orchestrator:
                 "When plan migration context is present, you MUST also migrate any repository tests that still reference retired task IDs or pre-split task-plan structure covered by this task.",
                 "When task status migration context is present, migrate only repository tests that assert stale task status. Do not edit orchestrator-owned .auto-agents state snapshots to force that transition early.",
                 "Tests should validate observable behavior (API contracts, input/output, side-effects), not internal implementation details.",
-                "PERSISTENCE CONTRACT: obey Task JSON persistence_change exactly. Do not change strategy or target_ids. For startup_compatible/external_operator implement idempotent legacy upgrade and version guards. For clean_break implement the declared reset/initialize contract without silently deleting data from ordinary application startup.",
+                "PERSISTENCE CONTRACT: obey Task JSON persistence_change exactly. Do not change storage_transition, compatibility_policy, or target_ids. Implement target-native immutable migrations and version guards. rebuild is the only automatic delete-and-initialize transition; application startup must remain read-only for schema.",
                 "Before adding or changing tests, inspect nearby repository tests for the same API fields, state-machine outputs, and public payload keys. Preserve existing semantic distinctions unless the task explicitly changes the contract.",
                 "Do not collapse layered semantics in assertions. Distinguish internal failure reasons/error codes from outward-facing state labels, next-action hints, and user-action flags unless the repository already defines them as the same contract.",
                 "Python proof tests must be deterministic under the project's configured verification command. Do not rely on pytest-only or unittest-only ambient state; explicitly configure test adapters, environment variables, and dependency injection needed by the test.",
@@ -16526,6 +16583,11 @@ class Orchestrator:
         raise RuntimeError(f"Unsupported task stage: {stage}")
 
     def _persistence_contract_issue(self, task: TaskSpec) -> str:
+        immutable_errors = migration_artifact_immutability_errors(
+            self.project_root, task.persistence_change
+        )
+        if immutable_errors:
+            return "; ".join(immutable_errors)
         findings = detect_persistence_schema_changes(self.project_root)
         if not findings:
             return ""
@@ -16546,9 +16608,19 @@ class Orchestrator:
         state: RunState,
         task: TaskSpec,
     ) -> Dict[str, object]:
+        self._activate_task_persistence_interface(task)
         strategy = persistence_change_strategy(task.persistence_change)
-        if strategy in {"none", "initial_schema"}:
-            return {"ok": True, "executed": False, "strategy": strategy}
+        transition = persistence_storage_transition(task.persistence_change)
+        if transition == "none" or (
+            "storage_transition" not in task.persistence_change
+            and strategy == "initial_schema"
+        ):
+            return {
+                "ok": True,
+                "executed": False,
+                "strategy": strategy,
+                "storage_transition": transition,
+            }
         candidate_fingerprint = persistence_candidate_fingerprint(self.project_root)
         manifest = build_persistence_action_manifest(
             self.project_root,
@@ -16569,11 +16641,11 @@ class Orchestrator:
             }
 
         auto_approve = bool(state.resume_context.get("auto_approve", False))
-        if strategy == "clean_break":
+        if transition == "rebuild":
             planned_changes = [
                 item.persistence_change
                 for item in state.tasks
-                if persistence_change_strategy(item.persistence_change) == "clean_break"
+                if persistence_storage_transition(item.persistence_change) == "rebuild"
             ] or [task.persistence_change]
             approval_payload = {
                 "changes": planned_changes,
@@ -16661,6 +16733,62 @@ class Orchestrator:
         )
         save_run_state(self.project_root, state)
         return result
+
+    def _activate_task_persistence_interface(self, task: TaskSpec) -> None:
+        interface = task.persistence_interface
+        if not interface:
+            return
+        if persistence_storage_transition(task.persistence_change) != "initialize":
+            raise PersistenceContractError(
+                "persistence_interface is only valid on an initialize task"
+            )
+        target_ids = task.persistence_change.get("target_ids", [])
+        if not isinstance(target_ids, list) or not target_ids:
+            raise PersistenceContractError(
+                "persistence bootstrap task has no target_ids"
+            )
+        changed = False
+        command_fields = (
+            "status_argv",
+            "initialize_argv",
+            "migrate_argv",
+            "reset_argv",
+            "verify_argv",
+            "migration_roots",
+        )
+        for raw_target_id in target_ids:
+            target_id = str(raw_target_id)
+            target = self.config.persistence.target(target_id)
+            if target is None:
+                raise PersistenceContractError(
+                    f"persistence target is not configured: {target_id}"
+                )
+            if target.lifecycle == "ready":
+                for field_name in command_fields:
+                    declared = [str(item) for item in interface.get(field_name, [])]
+                    if declared and declared != list(getattr(target, field_name)):
+                        raise PersistenceContractError(
+                            f"ready persistence target {target_id} does not match "
+                            f"task persistence_interface.{field_name}"
+                        )
+                continue
+            target.interface_version = 2
+            for field_name in command_fields:
+                setattr(
+                    target,
+                    field_name,
+                    [str(item) for item in interface.get(field_name, [])],
+                )
+            target.lifecycle = "ready"
+            changed = True
+        if not changed:
+            return
+        errors = validate_persistence_config_payload(self.config.persistence.to_dict())
+        if errors:
+            raise PersistenceContractError(
+                "invalid task persistence_interface: " + "; ".join(errors)
+            )
+        save_project_config(self.project_root, self.config)
 
     def _execute_task_with_retries(
         self,

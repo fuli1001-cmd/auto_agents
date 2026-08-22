@@ -23,7 +23,12 @@ from .config import (
     task_plan_path,
 )
 from .io_utils import read_json, read_text, write_json, write_text
-from .models import PERSISTENCE_STRATEGIES, TaskSpec
+from .models import (
+    PERSISTENCE_COMPATIBILITY_POLICIES,
+    PERSISTENCE_STORAGE_TRANSITIONS,
+    PERSISTENCE_STRATEGIES,
+    TaskSpec,
+)
 from .requirements_audit_cache import RequirementsAuditCache
 
 
@@ -614,7 +619,12 @@ def validate_requirements_trace_payload(
             elif decision_id in seen_decisions:
                 errors.append(f"{prefix} duplicates id '{decision_id}'")
             seen_decisions.add(decision_id)
-            if str(decision.get("strategy", "")) not in set(PERSISTENCE_STRATEGIES) - {"none"}:
+            if "storage_transition" in decision or "compatibility_policy" in decision:
+                if str(decision.get("storage_transition", "")) not in PERSISTENCE_STORAGE_TRANSITIONS:
+                    errors.append(f"{prefix} has an invalid storage_transition")
+                if str(decision.get("compatibility_policy", "")) not in PERSISTENCE_COMPATIBILITY_POLICIES:
+                    errors.append(f"{prefix} has an invalid compatibility_policy")
+            elif str(decision.get("strategy", "")) not in set(PERSISTENCE_STRATEGIES) - {"none"}:
                 errors.append(f"{prefix} has an invalid strategy")
             targets = decision.get("target_ids")
             if (

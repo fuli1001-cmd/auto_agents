@@ -142,7 +142,7 @@
     },
     "persistence_contract_version": {
       "type": "integer",
-      "const": 1,
+      "enum": [1, 2],
       "description": "Requires every active task to declare its persistence schema impact."
     },
     "tasks": {
@@ -376,7 +376,10 @@
           },
           "persistence_change": {
             "type": "object",
-            "required": ["strategy"],
+            "anyOf": [
+              {"required": ["strategy"]},
+              {"required": ["storage_transition", "compatibility_policy"]}
+            ],
             "properties": {
               "strategy": {
                 "type": "string",
@@ -388,6 +391,14 @@
                   "external_operator"
                 ]
               },
+              "storage_transition": {
+                "type": "string",
+                "enum": ["none", "initialize", "migrate_in_place", "rebuild", "external_operator"]
+              },
+              "compatibility_policy": {
+                "type": "string",
+                "enum": ["not_applicable", "backward_compatible", "migrate_all", "dual_read", "reject_legacy", "operator_defined"]
+              },
               "decision_id": {"type": "string", "minLength": 1},
               "target_ids": {
                 "type": "array",
@@ -396,7 +407,26 @@
                 "items": {"type": "string", "minLength": 1}
               },
               "to_version": {"type": "string", "minLength": 1},
+              "contract_to_version": {"type": "string", "minLength": 1},
               "migration_artifacts": {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {"type": "string", "minLength": 1},
+                    {
+                      "type": "object",
+                      "required": ["id", "path", "kind"],
+                      "properties": {
+                        "id": {"type": "string", "minLength": 1},
+                        "path": {"type": "string", "minLength": 1},
+                        "kind": {"type": "string", "enum": ["baseline", "schema", "data", "required_seed"]}
+                      },
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              },
+              "contract_artifacts": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
               },
@@ -404,6 +434,20 @@
                 "type": "array",
                 "items": {"type": "string", "minLength": 1}
               }
+            },
+            "additionalProperties": false
+          },
+          "persistence_interface": {
+            "type": "object",
+            "required": ["interface_version", "status_argv", "initialize_argv", "migrate_argv", "verify_argv", "migration_roots"],
+            "properties": {
+              "interface_version": {"const": 2},
+              "status_argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+              "initialize_argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+              "migrate_argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+              "reset_argv": {"type": "array", "items": {"type": "string", "minLength": 1}},
+              "verify_argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+              "migration_roots": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
             },
             "additionalProperties": false
           }

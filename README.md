@@ -1155,13 +1155,34 @@ during implementation.
 
 ## Persistent schema changes
 
-New plans use `persistence_contract_version: 1`. Every active task declares
-`persistence_change.strategy`; ordinary tasks use `none`, while schema work references a
-user-approved `persistence_decisions` entry from the requirements trace. Supported strategies are
-`initial_schema`, `startup_compatible`, `clean_break`, and `external_operator`. If the spec does not
-choose a strategy, auto_agents pauses for clarification instead of inferring permission to migrate
-or discard data. A post-implementation diff scan catches undeclared SQL DDL and common migration
-artifacts before verification or commit.
+New projects use persistence contract v2. The contract separates the storage
+transition (`none`, `initialize`, `migrate_in_place`, `rebuild`, or
+`external_operator`) from the compatibility policy (`not_applicable`,
+`backward_compatible`, `migrate_all`, `dual_read`, `reject_legacy`, or
+`operator_defined`). `rebuild` is the only transition that deletes a target;
+a breaking JSON/provider contract that retains its database uses
+`storage_transition=none` with `compatibility_policy=reject_legacy`.
+
+When a project first introduces persistence, its first persistence task must
+create a target-native migration runner, immutable baseline, migration ledger,
+and `status`/`initialize`/`migrate`/`verify` commands. Ready v2 commands emit one
+JSON protocol object containing the current/latest version, pending migrations,
+applied checksums, and schema fingerprint. Application startup verifies the
+schema read-only; migrations are explicit deployment or auto_agents actions.
+
+Versioned schema, data, and required-seed migrations are forward-only. Once a
+migration exists at the task baseline it cannot be edited; subsequent changes
+append a new migration. Demo/test seed data is not part of the deployment
+migration chain.
+
+Legacy v1 plans remain readable and use `persistence_change.strategy` with
+`initial_schema`, `startup_compatible`, `clean_break`, and `external_operator`.
+Use `persistence-upgrade-contract` with one explicit policy mapping per active
+decision to atomically migrate active config/trace/plan/run-state metadata to
+v2; archived plans remain immutable. If a spec does not choose both v2
+dimensions, auto_agents pauses instead of inferring permission to migrate or
+discard data. A post-implementation diff scan catches undeclared SQL DDL and
+common migration artifacts before verification or commit.
 
 Database targets are human-classified in `.auto-agents/config.json`, never inferred from a path or
 DSN name. Register one interactively with:

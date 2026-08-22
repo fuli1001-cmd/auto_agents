@@ -38,6 +38,22 @@ PERSISTENCE_STRATEGIES = (
     "clean_break",
     "external_operator",
 )
+PERSISTENCE_STORAGE_TRANSITIONS = (
+    "none",
+    "initialize",
+    "migrate_in_place",
+    "rebuild",
+    "external_operator",
+)
+PERSISTENCE_COMPATIBILITY_POLICIES = (
+    "not_applicable",
+    "backward_compatible",
+    "migrate_all",
+    "dual_read",
+    "reject_legacy",
+    "operator_defined",
+)
+PERSISTENCE_TARGET_LIFECYCLES = ("pending_bootstrap", "ready")
 PERSISTENCE_ENVIRONMENTS = ("development", "test", "production")
 PERSISTENCE_TARGET_KINDS = ("local_file", "compose_service")
 SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity-claude", "antigravity-gemini")
@@ -119,8 +135,12 @@ class TaskSpec:
     verify_retry_epoch: int = 0
     verify_baseline_schema_version: int = 0
     persistence_change: Dict[str, object] = field(
-        default_factory=lambda: {"strategy": "none"}
+        default_factory=lambda: {
+            "storage_transition": "none",
+            "compatibility_policy": "not_applicable",
+        }
     )
+    persistence_interface: Dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -188,9 +208,20 @@ class TaskSpec:
             persistence_change=(
                 dict(data.get("persistence_change", {}))
                 if isinstance(data.get("persistence_change", {}), dict)
-                else {"strategy": "none"}
+                else {
+                    "storage_transition": "none",
+                    "compatibility_policy": "not_applicable",
+                }
             )
-            or {"strategy": "none"},
+            or {
+                "storage_transition": "none",
+                "compatibility_policy": "not_applicable",
+            },
+            persistence_interface=(
+                dict(data.get("persistence_interface", {}))
+                if isinstance(data.get("persistence_interface", {}), dict)
+                else {}
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1042,10 +1073,15 @@ class PersistenceTargetConfig:
     kind: str
     locator: Dict[str, object] = field(default_factory=dict)
     associated_paths: List[str] = field(default_factory=list)
+    interface_version: int = 1
+    lifecycle: str = "ready"
+    status_argv: List[str] = field(default_factory=list)
+    migrate_argv: List[str] = field(default_factory=list)
     apply_argv: List[str] = field(default_factory=list)
     initialize_argv: List[str] = field(default_factory=list)
     reset_argv: List[str] = field(default_factory=list)
     verify_argv: List[str] = field(default_factory=list)
+    migration_roots: List[str] = field(default_factory=list)
     timeout_seconds: int = 300
 
     @classmethod
@@ -1060,10 +1096,15 @@ class PersistenceTargetConfig:
                 else {}
             ),
             associated_paths=[str(item) for item in data.get("associated_paths", [])],
+            interface_version=max(1, int(data.get("interface_version", 1) or 1)),
+            lifecycle=str(data.get("lifecycle", "ready") or "ready"),
+            status_argv=[str(item) for item in data.get("status_argv", [])],
+            migrate_argv=[str(item) for item in data.get("migrate_argv", [])],
             apply_argv=[str(item) for item in data.get("apply_argv", [])],
             initialize_argv=[str(item) for item in data.get("initialize_argv", [])],
             reset_argv=[str(item) for item in data.get("reset_argv", [])],
             verify_argv=[str(item) for item in data.get("verify_argv", [])],
+            migration_roots=[str(item) for item in data.get("migration_roots", [])],
             timeout_seconds=max(1, int(data.get("timeout_seconds", 300) or 300)),
         )
 
@@ -1074,10 +1115,15 @@ class PersistenceTargetConfig:
             "kind": self.kind,
             "locator": dict(self.locator),
             "associated_paths": list(self.associated_paths),
+            "interface_version": self.interface_version,
+            "lifecycle": self.lifecycle,
+            "status_argv": list(self.status_argv),
+            "migrate_argv": list(self.migrate_argv),
             "apply_argv": list(self.apply_argv),
             "initialize_argv": list(self.initialize_argv),
             "reset_argv": list(self.reset_argv),
             "verify_argv": list(self.verify_argv),
+            "migration_roots": list(self.migration_roots),
             "timeout_seconds": self.timeout_seconds,
         }
 
@@ -1465,7 +1511,10 @@ class SessionState:
     baseline_head_ref: str = ""
     baseline_commands: List[str] = field(default_factory=list)
     persistence_change: Dict[str, object] = field(
-        default_factory=lambda: {"strategy": "none"}
+        default_factory=lambda: {
+            "storage_transition": "none",
+            "compatibility_policy": "not_applicable",
+        }
     )
     persistence_actions: Dict[str, Dict[str, object]] = field(default_factory=dict)
     auto_approve: bool = False
@@ -1503,9 +1552,15 @@ class SessionState:
             persistence_change=(
                 dict(data.get("persistence_change", {}))
                 if isinstance(data.get("persistence_change", {}), dict)
-                else {"strategy": "none"}
+                else {
+                    "storage_transition": "none",
+                    "compatibility_policy": "not_applicable",
+                }
             )
-            or {"strategy": "none"},
+            or {
+                "storage_transition": "none",
+                "compatibility_policy": "not_applicable",
+            },
             persistence_actions={
                 str(key): dict(value)
                 for key, value in dict(data.get("persistence_actions", {})).items()

@@ -42,6 +42,7 @@ from .notifications import (
 from .orchestrator import Orchestrator
 from .models import PersistenceTargetConfig
 from .persistence_rebind import rebind_legacy_persistence_decision
+from .persistence_upgrade import parse_decision_policies, upgrade_persistence_contract
 from .prototype_variants import (
     LIVE_VARIANT_STATUSES,
     PrototypeGalleryHandler,
@@ -243,16 +244,25 @@ def _configure_persistence_target(args: argparse.Namespace) -> dict:
     target_id = str(args.target_id).strip() or prompt(
         "Persistence target id (for example local-sqlite): "
     ).strip()
-    environment = str(args.environment).strip() or prompt(
+    config = load_project_config(project_root)
+    existing = config.persistence.target(target_id)
+    environment = str(args.environment).strip() or (
+        existing.environment if existing is not None and not args.replace else ""
+    ) or prompt(
         "Environment (development/test/production): "
     ).strip()
-    kind = str(args.kind).strip() or prompt(
+    kind = str(args.kind).strip() or (
+        existing.kind if existing is not None and not args.replace else ""
+    ) or prompt(
         "Target kind (local_file/compose_service): "
     ).strip()
 
     if kind == "local_file":
         path = str(args.path).strip()
         path_env = str(args.path_env).strip()
+        if not path and not path_env and existing is not None and not args.replace:
+            path = str(existing.locator.get("path", ""))
+            path_env = str(existing.locator.get("path_env", ""))
         if not path and not path_env:
             value = prompt(
                 "Project-relative database path, or prefix an env name with '$' (for example .data/app.db): "
@@ -281,19 +291,43 @@ def _configure_persistence_target(args: argparse.Namespace) -> dict:
             value = prompt(f"{label} command (blank when not applicable): ").strip()
         return shlex.split(value) if value else []
 
+    def prior_or(value: list[str], field_name: str) -> list[str]:
+        if value or bool(getattr(args, "replace", False)) or existing is None:
+            return value
+        return list(getattr(existing, field_name))
+
     target = PersistenceTargetConfig(
         target_id=target_id,
         environment=environment,
         kind=kind,
         locator=locator,
-        associated_paths=[str(item) for item in args.associated_path],
-        apply_argv=command_argv(args.apply_command, "Migration/apply"),
-        initialize_argv=command_argv(args.initialize_command, "Initialize"),
-        reset_argv=command_argv(args.reset_command, "Reset"),
-        verify_argv=command_argv(args.verify_command, "Verify"),
+        associated_paths=(
+            [str(item) for item in args.associated_path]
+            if args.associated_path or bool(getattr(args, "replace", False)) or existing is None
+            else list(existing.associated_paths)
+        ),
+        interface_version=(
+            int(args.interface_version)
+            if int(args.interface_version) > 0
+            else (existing.interface_version if existing is not None else 1)
+        ),
+        lifecycle=(
+            str(args.lifecycle)
+            or (existing.lifecycle if existing is not None else "ready")
+        ),
+        status_argv=prior_or(command_argv(args.status_command, "Status"), "status_argv"),
+        migrate_argv=prior_or(command_argv(args.migrate_command, "Migrate"), "migrate_argv"),
+        apply_argv=prior_or(command_argv(args.apply_command, "Legacy migration/apply"), "apply_argv"),
+        initialize_argv=prior_or(command_argv(args.initialize_command, "Initialize"), "initialize_argv"),
+        reset_argv=prior_or(command_argv(args.reset_command, "Reset"), "reset_argv"),
+        verify_argv=prior_or(command_argv(args.verify_command, "Verify"), "verify_argv"),
+        migration_roots=(
+            [str(item) for item in args.migration_root]
+            if args.migration_root or bool(getattr(args, "replace", False)) or existing is None
+            else list(existing.migration_roots)
+        ),
         timeout_seconds=int(args.timeout_seconds),
     )
-    config = load_project_config(project_root)
     remaining = [item for item in config.persistence.targets if item.target_id != target_id]
     candidate_targets = [*remaining, target]
     errors = validate_persistence_config_payload(
@@ -1211,10 +1245,18 @@ def build_parser() -> argparse.ArgumentParser:
     persistence_parser.add_argument("--compose-file", default="")
     persistence_parser.add_argument("--service", action="append", default=[])
     persistence_parser.add_argument("--associated-path", action="append", default=[])
+    persistence_parser.add_argument("--interface-version", type=int, choices=(1, 2), default=0)
+    persistence_parser.add_argument(
+        "--lifecycle", choices=("pending_bootstrap", "ready"), default=""
+    )
+    persistence_parser.add_argument("--status-command", default="")
+    persistence_parser.add_argument("--migrate-command", default="")
     persistence_parser.add_argument("--apply-command", default="")
     persistence_parser.add_argument("--initialize-command", default="")
     persistence_parser.add_argument("--reset-command", default="")
     persistence_parser.add_argument("--verify-command", default="")
+    persistence_parser.add_argument("--migration-root", action="append", default=[])
+    persistence_parser.add_argument("--replace", action="store_true")
     persistence_parser.add_argument("--timeout-seconds", type=int, default=300)
     persistence_parser.add_argument("--auto-approve", action="store_true")
 
@@ -1233,6 +1275,19 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Registered persistence target id; repeat for multiple targets.",
     )
+
+    persistence_upgrade_parser = subparsers.add_parser(
+        "persistence-upgrade-contract",
+        help="Atomically upgrade active project persistence metadata to contract v2.",
+    )
+    persistence_upgrade_parser.add_argument("--project", required=True)
+    persistence_upgrade_parser.add_argument(
+        "--decision-policy",
+        action="append",
+        default=[],
+        metavar="PERSIST-NNN:TRANSITION:POLICY",
+    )
+    persistence_upgrade_parser.add_argument("--resume-interrupted", action="store_true")
 
     provider_resolve_parser = subparsers.add_parser(
         "provider-resolve",
@@ -1376,6 +1431,20 @@ def main(argv: list[str] | None = None) -> int:
             ValueError,
             RunAlreadyActiveError,
         ) as error:
+            payload = {"ok": False, "error": str(error)}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if bool(payload.get("ok")) else 1
+
+    if args.command == "persistence-upgrade-contract":
+        try:
+            project_root = Path(args.project).expanduser().resolve()
+            with ProjectRunLock(project_root):
+                payload = upgrade_persistence_contract(
+                    project_root,
+                    decision_policies=parse_decision_policies(args.decision_policy),
+                    resume_interrupted=bool(args.resume_interrupted),
+                )
+        except (OSError, RuntimeError, ValueError, RunAlreadyActiveError) as error:
             payload = {"ok": False, "error": str(error)}
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if bool(payload.get("ok")) else 1

@@ -35,6 +35,7 @@ from auto_agents.persistence import (
     build_persistence_action_manifest,
     detect_persistence_schema_changes,
     execute_persistence_action,
+    migration_artifact_immutability_errors,
     persistence_candidate_fingerprint,
 )
 from auto_agents.persistence_rebind import (
@@ -42,6 +43,7 @@ from auto_agents.persistence_rebind import (
     _replace_json_batch,
     rebind_legacy_persistence_decision,
 )
+from auto_agents.persistence_upgrade import upgrade_persistence_contract
 from auto_agents.requirements import validate_requirements_trace_payload
 from auto_agents.session import Session
 from auto_agents.validation import (
@@ -1206,6 +1208,168 @@ class PersistenceCLITests(unittest.TestCase):
                 state, "PERSISTENCE_CHANGE: " + json.dumps(payload)
             )
             self.assertIn("persistence-configure", error)
+
+
+class PersistenceContractV2Tests(unittest.TestCase):
+    def test_human_approved_target_proposal_registers_pending_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            proposal = {
+                "persistence_target_proposals": [{
+                    "id": "primary-db",
+                    "environment": "development",
+                    "kind": "local_file",
+                    "locator": {"path": ".data/app.db"},
+                    "associated_paths": [],
+                }]
+            }
+            with patch.object(orchestrator, "_prompt_user", return_value="y"):
+                self.assertTrue(orchestrator._approve_persistence_target_proposals(proposal))
+            target = load_project_config(root).persistence.target("primary-db")
+            assert target is not None
+            self.assertEqual(target.lifecycle, "pending_bootstrap")
+            self.assertEqual(target.interface_version, 2)
+
+    def test_existing_migration_artifact_is_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _git_init(root)
+            migration = root / "migrations/versions/0001.py"
+            migration.parent.mkdir(parents=True)
+            migration.write_text("VERSION = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "baseline"], cwd=root, check=True)
+            migration.write_text("VERSION = 99\n", encoding="utf-8")
+
+            errors = migration_artifact_immutability_errors(
+                root,
+                {
+                    "migration_artifacts": [{
+                        "id": "0001", "path": "migrations/versions/0001.py", "kind": "baseline"
+                    }]
+                },
+            )
+            self.assertTrue(any("immutable migration artifact" in item for item in errors))
+
+    def test_v2_rebuild_executes_json_protocol_and_deletes_sqlite_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _git_init(root)
+            (root / ".gitignore").write_text(".data/\n", encoding="utf-8")
+            data = root / ".data"
+            data.mkdir()
+            database = data / "app.db"
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                Path(f"{database}{suffix}").write_text("old", encoding="utf-8")
+            script = root / "runner.py"
+            script.write_text(
+                "import json,sys\n"
+                "from pathlib import Path\n"
+                "op=sys.argv[1]\n"
+                "p=Path('.data/app.db')\n"
+                "p.write_text('new') if op=='initialize' else None\n"
+                "print(json.dumps({'protocol_version':1,'operation':op,'ok':True,"
+                "'state':'ready','current_version':'0001','latest_version':'0001',"
+                "'pending_versions':[],'applied_migrations':[],"
+                "'schema_fingerprint':'sha256:test'}))\n",
+                encoding="utf-8",
+            )
+            command = [sys.executable, "runner.py"]
+            target = PersistenceTargetConfig(
+                target_id="local-db",
+                environment="test",
+                kind="local_file",
+                locator={"path": ".data/app.db"},
+                interface_version=2,
+                lifecycle="ready",
+                status_argv=[*command, "status"],
+                initialize_argv=[*command, "initialize"],
+                migrate_argv=[*command, "migrate"],
+                verify_argv=[*command, "verify"],
+                migration_roots=["migrations/versions"],
+            )
+            result = execute_persistence_action(
+                root,
+                {
+                    "storage_transition": "rebuild",
+                    "compatibility_policy": "reject_legacy",
+                    "decision_id": "PERSIST-001",
+                    "target_ids": ["local-db"],
+                    "to_version": "0001",
+                    "migration_artifacts": [],
+                    "contract_artifacts": ["src/contracts.py"],
+                    "legacy_fixture_refs": ["tests/test_db.py::test_reset"],
+                },
+                PersistenceConfig([target]),
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(database.read_text(encoding="utf-8"), "new")
+            for suffix in ("-wal", "-shm", "-journal"):
+                self.assertFalse(Path(f"{database}{suffix}").exists())
+
+    def test_pending_v2_target_requires_bootstrap_interface(self) -> None:
+        trace = {
+            "persistence_decisions": [{
+                "id": "PERSIST-001",
+                "storage_transition": "initialize",
+                "compatibility_policy": "not_applicable",
+                "target_ids": ["db"],
+                "source": "test",
+                "status": "active",
+            }]
+        }
+        plan = {
+            "persistence_contract_version": 2,
+            "tasks": [{
+                "task_id": "task-1",
+                "status": "pending",
+                "persistence_change": {
+                    "storage_transition": "initialize",
+                    "compatibility_policy": "not_applicable",
+                    "decision_id": "PERSIST-001",
+                    "target_ids": ["db"],
+                    "to_version": "0001",
+                    "migration_artifacts": [{
+                        "id": "0001", "path": "migrations/versions/0001.py", "kind": "baseline"
+                    }],
+                    "contract_artifacts": [],
+                    "legacy_fixture_refs": [],
+                },
+            }],
+        }
+        errors = validate_persistence_plan_contract(
+            plan,
+            trace,
+            configured_targets=[{
+                "id": "db", "environment": "test", "kind": "local_file",
+                "locator": {"path": ".data/app.db"}, "interface_version": 2,
+                "lifecycle": "pending_bootstrap",
+            }],
+        )
+        self.assertTrue(any("persistence_interface" in error for error in errors))
+
+    def test_upgrade_command_preserves_run_status_and_converts_active_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            _legacy_persistence_project(root)
+            before = read_json(run_state_path(root), default={})
+            result = upgrade_persistence_contract(
+                root,
+                decision_policies={"PERSIST-001": ("initialize", "not_applicable")},
+            )
+            self.assertTrue(result["ok"])
+            trace = read_json(requirements_trace_path(root), default={})
+            plan = read_json(task_plan_path(root), default={})
+            state = read_json(run_state_path(root), default={})
+            self.assertEqual(trace["persistence_contract_version"], 2)
+            self.assertEqual(plan["persistence_contract_version"], 2)
+            self.assertEqual(
+                trace["persistence_decisions"][0]["storage_transition"], "initialize"
+            )
+            self.assertNotIn("strategy", trace["persistence_decisions"][0])
+            self.assertEqual(state.get("run_id"), before.get("run_id"))
 
 
 if __name__ == "__main__":

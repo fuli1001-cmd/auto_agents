@@ -1261,7 +1261,7 @@ class Session:
                 "exists. This should target the specific bug described, not the whole test suite. "
                 "Examples: a pytest invocation with -k filter, a curl command, a grep check, etc.",
                 "- Match the repository's existing verification conventions when choosing FIX_VERIFY.",
-                "- Before GOAL_CLEAR, determine whether the fix will create or change persistent schema. Output one single-line PERSISTENCE_CHANGE JSON object. Use {'strategy':'none'} when it will not. A non-none strategy must reflect an explicit user decision and include decision_id, target_ids, to_version, migration_artifacts, and legacy_fixture_refs.",
+                "- Before GOAL_CLEAR, determine whether the fix affects persistent schema, data, required seed data, or a serialized contract. Output one single-line PERSISTENCE_CHANGE v2 JSON object. Use {'storage_transition':'none','compatibility_policy':'not_applicable'} when it will not. Otherwise copy an explicit user-approved decision and include decision_id, target_ids, to_version, migration_artifacts, contract_artifacts, and legacy_fixture_refs.",
                 "- If the project uses a local conda env at ./.conda, every Python-oriented "
                 "FIX_VERIFY command must run inside it via 'conda run -p ./.conda ...'.",
             ])
@@ -1532,7 +1532,7 @@ class Session:
             "4. If you discover a bug, output 'BUG_FOUND: <description>' and fix it",
             "5. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",
             "6. Provide a brief status update of what you did",
-            "7. Before any persistent schema change, output a single-line PERSISTENCE_CHANGE JSON contract based on an explicit user strategy. Use {'strategy':'none'} when no persistent schema changes are in scope.",
+            "7. Before any persistent change, output a single-line PERSISTENCE_CHANGE v2 JSON contract based on explicit user-approved storage_transition and compatibility_policy values. Use {'storage_transition':'none','compatibility_policy':'not_applicable'} when persistence is unaffected.",
             "",
             "EXECUTION SAFETY RULES (critical — follow strictly):",
             "- Set a timeout for EVERY HTTP request or polling loop (max 60s per request, 5 min total for repeated polling).",

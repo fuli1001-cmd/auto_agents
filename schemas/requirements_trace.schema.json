@@ -9,6 +9,10 @@
       "type": "integer",
       "minimum": 1
     },
+    "persistence_contract_version": {
+      "type": "integer",
+      "enum": [1, 2]
+    },
     "contract_identity_schema_version": {
       "type": "integer",
       "minimum": 1
@@ -94,7 +98,11 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "target_ids", "strategy", "source", "status"],
+        "required": ["id", "target_ids", "source", "status"],
+        "anyOf": [
+          {"required": ["strategy"]},
+          {"required": ["storage_transition", "compatibility_policy"]}
+        ],
         "properties": {
           "id": {"type": "string", "pattern": "^PERSIST-[0-9]{3,}$"},
           "target_ids": {
@@ -112,10 +120,33 @@
               "external_operator"
             ]
           },
+          "storage_transition": {
+            "type": "string",
+            "enum": ["initialize", "migrate_in_place", "rebuild", "external_operator", "none"]
+          },
+          "compatibility_policy": {
+            "type": "string",
+            "enum": ["not_applicable", "backward_compatible", "migrate_all", "dual_read", "reject_legacy", "operator_defined"]
+          },
           "source": {"type": "string", "minLength": 1},
           "status": {"type": "string", "enum": ["active", "superseded"]},
           "superseded_by": {"type": "string"},
           "notes": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "persistence_target_proposals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "environment", "kind", "locator"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{1,63}$"},
+          "environment": {"type": "string", "enum": ["development", "test", "production"]},
+          "kind": {"type": "string", "enum": ["local_file", "compose_service"]},
+          "locator": {"type": "object"},
+          "associated_paths": {"type": "array", "items": {"type": "string", "minLength": 1}}
         },
         "additionalProperties": false
       }
