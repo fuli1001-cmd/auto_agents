@@ -173,8 +173,8 @@ def trace_frontend_scope(trace_payload: object) -> Mapping[str, object]:
 
 def frontend_scope_requested(trace_payload: object) -> bool:
     scope = trace_frontend_scope(trace_payload)
-    if scope.get("requested") is True:
-        return True
+    if isinstance(trace_payload, Mapping) and FRONTEND_SCOPE_FIELD in trace_payload:
+        return scope.get("requested") is True
     if isinstance(trace_payload, Mapping):
         surfaces = trace_payload.get("frontend_surfaces")
         return isinstance(surfaces, list) and bool(surfaces)

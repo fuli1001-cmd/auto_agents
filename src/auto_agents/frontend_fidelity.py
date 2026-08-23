@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Iterable, List, Mapping, Sequence
 
 
@@ -76,6 +77,69 @@ _VISUAL_EVIDENCE_TERMS = (
     "样式",
     "布局",
 )
+_PRESERVATION_MARKERS = (
+    "preserve",
+    "remain unchanged",
+    "must not change",
+    "do not change",
+    "without changing",
+    "no redesign",
+    "保持",
+    "保留",
+    "不得改变",
+    "不改变",
+    "不得修改或重设计",
+    "不修改或重设计",
+    "不得修改",
+    "不修改",
+    "不得引入",
+    "不引入",
+    "不新增",
+    "不得新增",
+    "不重设计",
+    "不得重设计",
+    "不回退",
+)
+_NEGATED_CHANGE_MARKERS = (
+    "must not change",
+    "do not change",
+    "without changing",
+    "no redesign",
+    "不得改变",
+    "不改变",
+    "不得修改或重设计",
+    "不修改或重设计",
+    "不得修改",
+    "不修改",
+    "不得引入",
+    "不引入",
+    "不新增",
+    "不得新增",
+    "不重设计",
+    "不得重设计",
+)
+_POSITIVE_CHANGE_MARKERS = (
+    "add ",
+    "introduce ",
+    "new interaction",
+    "new ui",
+    "redesign",
+    "modify the ui",
+    "modify the design",
+    "modify the layout",
+    "change the ui",
+    "change the design",
+    "change the layout",
+    "replace ",
+    "新增",
+    "添加",
+    "引入",
+    "重设计",
+    "改版",
+    "修改",
+    "改变",
+    "替换",
+)
 
 
 def frontend_prototype_signals_from_text(text: str) -> List[str]:
@@ -147,6 +211,66 @@ def requirement_is_frontend_fidelity(requirement: object) -> bool:
     return has_prototype and (has_frontend or has_visual)
 
 
+def requirement_is_frontend_preservation_only(requirement: object) -> bool:
+    if not isinstance(requirement, Mapping):
+        return False
+    fields = [
+        str(requirement.get("text", "")),
+        str(requirement.get("notes", "")),
+    ]
+    fields.extend(str(item) for item in requirement.get("acceptance_oracles") or [])
+    combined = " ".join(fields).lower()
+    if not any(marker in combined for marker in _PRESERVATION_MARKERS):
+        return False
+    change_scan = combined
+    for marker in _NEGATED_CHANGE_MARKERS:
+        change_scan = change_scan.replace(marker, "")
+    for marker in (
+        "新增",
+        "添加",
+        "引入",
+        "重设计",
+        "改版",
+        "修改",
+        "改变",
+        "替换",
+    ):
+        change_scan = re.sub(
+            rf"(?:不|不得)[^，。；.!?]{{0,12}}{re.escape(marker)}",
+            "",
+            change_scan,
+        )
+    return not any(marker in change_scan for marker in _POSITIVE_CHANGE_MARKERS)
+
+
+def frontend_requirement_ids_are_preservation_only(
+    trace_payload: object,
+    requirement_ids: Iterable[object],
+) -> bool:
+    if not isinstance(trace_payload, Mapping):
+        return False
+    required = {
+        str(item).strip()
+        for item in requirement_ids
+        if str(item).strip()
+    }
+    if not required:
+        return False
+    raw_requirements = trace_payload.get("requirements")
+    requirements = {
+        str(item.get("id", "")).strip(): item
+        for item in raw_requirements
+        if isinstance(item, Mapping) and str(item.get("id", "")).strip()
+    } if isinstance(raw_requirements, list) else {}
+    return all(
+        requirement_id in requirements
+        and requirement_is_frontend_preservation_only(
+            requirements[requirement_id]
+        )
+        for requirement_id in required
+    )
+
+
 def frontend_fidelity_requirement_ids(trace_payload: object) -> List[str]:
     if not isinstance(trace_payload, Mapping):
         return []
@@ -211,6 +335,10 @@ def validate_frontend_fidelity_trace(trace_payload: object, *, spec_text: str = 
     ]
 
     frontend_scope = trace_payload.get("frontend_scope")
+    explicit_no_frontend_work = (
+        isinstance(frontend_scope, Mapping)
+        and frontend_scope.get("requested") is False
+    )
     pending_generated_prototype = (
         isinstance(frontend_scope, Mapping)
         and frontend_scope.get("requested") is True
@@ -218,7 +346,12 @@ def validate_frontend_fidelity_trace(trace_payload: object, *, spec_text: str = 
         and bool(frontend_scope.get("surfaces"))
     )
 
-    if signals and not surfaces and not pending_generated_prototype:
+    if (
+        signals
+        and not surfaces
+        and not pending_generated_prototype
+        and not explicit_no_frontend_work
+    ):
         preview = ", ".join(signals[:5])
         errors.append(
             "input spec appears to require frontend prototype fidelity "

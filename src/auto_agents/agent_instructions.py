@@ -9,7 +9,11 @@ from typing import Dict, List, Optional, Sequence
 
 from .config import agent_instructions_lock_path, normalized_project_rules_path, project_rules_path
 from .io_utils import read_json, read_text, write_json, write_text
-from .frontend_design import load_frontend_design_lock
+from .frontend_design import (
+    frontend_design_contract_sha256,
+    load_frontend_design_lock,
+    validate_frontend_design_artifacts,
+)
 
 
 MAX_ROOT_AGENTS_CHARS = 2800
@@ -235,9 +239,11 @@ def sync_agent_instructions(
         normalized_rules = _extract_project_rules(project_rules if meaningful else "")
     rendered_rules = {key: list(normalized_rules.get(key, [])) for key in NORMALIZED_RULE_KEYS}
     frontend_lock = load_frontend_design_lock(root)
-    frontend_contract_sha = ""
-    if frontend_lock.get("status") == "approved":
-        frontend_contract_sha = str(frontend_lock.get("contract_sha256", "")).strip()
+    frontend_contract_sha = _frontend_contract_sha_for_instructions(
+        root,
+        frontend_lock,
+    )
+    if frontend_contract_sha:
         rendered_rules["workflow_contracts"].extend(
             [
                 "Frontend appearance and interactions must follow the approved DESIGN.md and .auto-agents/docs/frontend_prototype/manifest.json artifacts.",
@@ -270,6 +276,29 @@ def sync_agent_instructions(
         generated_sha256=generated_sha256,
         project_rules_meaningful=meaningful,
     )
+
+
+def _frontend_contract_sha_for_instructions(
+    project_root: Path,
+    frontend_lock: object,
+) -> str:
+    if not isinstance(frontend_lock, dict):
+        return ""
+    status = str(frontend_lock.get("status", "")).strip()
+    pending_reapproval = bool(
+        status == "pending_approval"
+        and str(frontend_lock.get("redesign_requested_at", "")).strip()
+    )
+    if status != "approved" and not pending_reapproval:
+        return ""
+    if validate_frontend_design_artifacts(
+        project_root,
+        frontend_lock,
+        require_approved=False,
+    ):
+        return ""
+    expected = str(frontend_lock.get("contract_sha256", "")).strip()
+    return expected or frontend_design_contract_sha256(frontend_lock)
 
 
 def _loads_json_object(text: str) -> object:
@@ -341,10 +370,9 @@ def _agent_instructions_current(project_root: Path) -> bool:
     if str(lock.get("source_sha256", "")) != source_sha:
         return False
     frontend_lock = load_frontend_design_lock(root)
-    frontend_contract_sha = (
-        str(frontend_lock.get("contract_sha256", "")).strip()
-        if frontend_lock.get("status") == "approved"
-        else ""
+    frontend_contract_sha = _frontend_contract_sha_for_instructions(
+        root,
+        frontend_lock,
     )
     if str(lock.get("frontend_design_contract_sha256", "")) != frontend_contract_sha:
         return False

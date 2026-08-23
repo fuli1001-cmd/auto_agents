@@ -127,6 +127,7 @@ from .execution_recovery import (
 )
 from .frontend_fidelity import (
     frontend_fidelity_requirement_ids,
+    frontend_requirement_ids_are_preservation_only,
     validate_frontend_fidelity_trace,
 )
 from .frontend_design import (
@@ -1345,6 +1346,185 @@ class Orchestrator:
             required_ids,
         )
 
+    def _preservation_only_frontend_contract_update(
+        self,
+        trace_payload: object,
+        lock_payload: object,
+    ) -> Optional[Dict[str, object]]:
+        if not isinstance(trace_payload, dict) or not isinstance(lock_payload, dict):
+            return None
+        status = str(lock_payload.get("status", "")).strip()
+        if status not in {"approved", "pending_approval"}:
+            return None
+        if status == "pending_approval" and not str(
+            lock_payload.get("redesign_requested_at", "")
+        ).strip():
+            return None
+        if validate_frontend_design_artifacts(
+            self.project_root,
+            lock_payload,
+            require_approved=False,
+        ):
+            return None
+
+        surfaces = selected_surface_specs(
+            trace_payload,
+            max_pages=self.config.frontend_design.max_pages,
+        )
+        prototype = lock_payload.get("prototype")
+        pages = prototype.get("pages") if isinstance(prototype, dict) else None
+        if not surfaces or not isinstance(pages, list):
+            return None
+        pages_by_id = {
+            str(page.get("id", "")).strip(): page
+            for page in pages
+            if isinstance(page, dict) and str(page.get("id", "")).strip()
+        }
+        required_ids: List[str] = []
+        for surface in surfaces:
+            surface_id = str(surface.get("id", "")).strip()
+            page = pages_by_id.get(surface_id)
+            if page is None:
+                return None
+            surface_route = str(surface.get("route", "")).strip()
+            page_route = str(page.get("route", "")).strip()
+            if surface_route and page_route and surface_route != page_route:
+                return None
+            for requirement_id in surface.get("requirement_ids", []) or []:
+                normalized = str(requirement_id).strip()
+                if normalized and normalized not in required_ids:
+                    required_ids.append(normalized)
+        missing_ids = missing_frontend_design_contract_requirement_ids(
+            lock_payload,
+            required_ids,
+        )
+        if not missing_ids or not frontend_requirement_ids_are_preservation_only(
+            trace_payload,
+            missing_ids,
+        ):
+            return None
+
+        updated = copy.deepcopy(lock_payload)
+        updated_prototype = updated.get("prototype")
+        updated_pages = (
+            updated_prototype.get("pages")
+            if isinstance(updated_prototype, dict)
+            else None
+        )
+        if not isinstance(updated_pages, list):
+            return None
+        updated_pages_by_id = {
+            str(page.get("id", "")).strip(): page
+            for page in updated_pages
+            if isinstance(page, dict) and str(page.get("id", "")).strip()
+        }
+        for surface in surfaces:
+            page = updated_pages_by_id[str(surface.get("id", "")).strip()]
+            page_requirement_ids = [
+                str(item).strip()
+                for item in page.get("requirement_ids", []) or []
+                if str(item).strip()
+            ]
+            for requirement_id in surface.get("requirement_ids", []) or []:
+                normalized = str(requirement_id).strip()
+                if normalized and normalized not in page_requirement_ids:
+                    page_requirement_ids.append(normalized)
+            page["requirement_ids"] = page_requirement_ids
+
+        updated["status"] = "approved"
+        updated.setdefault("approved_at", utc_now_iso())
+        updated.setdefault(
+            "approval",
+            {
+                "method": "automatic_preservation_reuse",
+                "gate": "prototype",
+            },
+        )
+        updated.pop("redesign_requested_at", None)
+        updated.pop("redesign_requirement_ids", None)
+        updated["contract_sha256"] = frontend_design_contract_sha256(updated)
+        return updated
+
+    def _reuse_preservation_only_frontend_contract(
+        self,
+        state: RunState,
+        trace_payload: object,
+        lock_payload: object,
+    ) -> bool:
+        updated = self._preservation_only_frontend_contract_update(
+            trace_payload,
+            lock_payload,
+        )
+        if updated is None or not isinstance(trace_payload, dict):
+            return False
+
+        registry = None
+        matching_variant_id = ""
+        if str(lock_payload.get("status", "")).strip() == "pending_approval":
+            registry = load_registry(
+                self.project_root,
+                include_virtual_legacy=False,
+            )
+            candidates = candidate_variants(registry)
+            if len(candidates) != 1:
+                return False
+            decision = candidates[0].get("design_decision")
+            if (
+                not isinstance(decision, dict)
+                or str(decision.get("design_action", "")).strip() != "legacy"
+            ):
+                return False
+            matching_variant_id = str(candidates[0].get("id", "")).strip()
+            if not matching_variant_id:
+                return False
+
+        write_json(frontend_design_lock_path(self.project_root), updated)
+        scope = trace_payload.get("frontend_scope")
+        if isinstance(scope, dict):
+            scope["requested"] = False
+            scope["surfaces"] = []
+        trace_payload["frontend_surfaces"] = derived_frontend_surfaces(updated)
+        write_json(requirements_trace_path(self.project_root), trace_payload)
+        if registry is not None and matching_variant_id:
+            approve_variant_in_registry(
+                self.project_root,
+                registry,
+                matching_variant_id,
+            )
+
+        if "prototype" not in state.approved_gates:
+            state.approved_gates.append("prototype")
+        state.pending_approval = ""
+        if state.status == "paused":
+            state.status = "pending"
+        state.current_stage = "prototype"
+        state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
+        state.stage_summaries["prototype"] = (
+            "Reused the approved, byte-stable frontend design contract for "
+            "preservation-only requirements; no redesign was requested."
+        )
+        state.last_error = ""
+        sync_agent_instructions(self.project_root)
+        return True
+
+    def _normalize_preservation_only_prototype_pause(
+        self,
+        state: RunState,
+    ) -> bool:
+        if (
+            state.status != "paused"
+            or state.pending_approval != "prototype"
+            or state.current_stage != "prototype"
+        ):
+            return False
+        trace = load_requirements_trace(self.project_root, normalize=False)
+        lock = load_frontend_design_lock(self.project_root)
+        return self._reuse_preservation_only_frontend_contract(
+            state,
+            trace,
+            lock,
+        )
+
     @staticmethod
     def _is_missing_frontend_contract_preflight_feedback(
         feedback: str,
@@ -2033,6 +2213,8 @@ class Orchestrator:
             if self._normalize_blocked_requirements_audit_recovery_resume(state):
                 save_run_state(self.project_root, state)
             if self._normalize_stale_frontend_contract_clarify_resume(state):
+                save_run_state(self.project_root, state)
+            if self._normalize_preservation_only_prototype_pause(state):
                 save_run_state(self.project_root, state)
             pattern_recovery = self._route_forbidden_pattern_definition_recovery(state)
             if pattern_recovery:
@@ -2899,6 +3081,16 @@ class Orchestrator:
         stale_approved_contract = bool(
             approved_frontend_design(self.project_root) and missing_ids
         )
+        if (
+            stale_approved_contract
+            and not rejection_feedback
+            and self._reuse_preservation_only_frontend_contract(
+                state,
+                trace,
+                prior_lock,
+            )
+        ):
+            return state
         contract_recovery = recovery_requested or stale_approved_contract
         if contract_recovery and prior_lock.get("status") == "approved":
             state.resume_context[self.FRONTEND_CONTRACT_RECOVERY_CONTEXT] = True
@@ -16085,9 +16277,9 @@ class Orchestrator:
                 "If persistence is required and no suitable configured target exists, add a top-level persistence_target_proposals entry with id, environment, kind, locator, and associated_paths. The orchestrator will require explicit human confirmation and register it as pending_bootstrap; do not treat a proposal as deletion approval or a ready runner.",
                 "Every active requirement must have id, text, source, status, priority, acceptance_oracles, oracle_type, oracle_strength, evidence_boundary, forbidden_proxy_oracles, forbidden_patterns, external_docs_required, provider_reference, and notes fields. If a requirement needs multiple provider documents, also set provider_references to a list of local provider reference paths; do not join multiple paths into provider_reference with punctuation.",
                 "Use stable IDs like REQ-001. Mark hard requirements as priority='mandatory'. Use status='active', 'deferred', or 'superseded'.",
-                "If the requested scope includes frontend pages or screens, add top-level frontend_scope={requested:true,surfaces:[...]}. Each surface must include a stable id, name, route when known, priority (core/primary/secondary/optional), purpose, key_states, and non-empty requirement_ids. Set requested=false with surfaces=[] when no frontend work is requested.",
-                "When the spec already supplies prototypes, screenshots, Figma files, mockups, or prototype HTML, also add a top-level frontend_surfaces array. Each entry must name the surface, route/screen when known, prototype_refs, viewports when known, and the intended fidelity level. User-supplied design/prototype artifacts take precedence over external catalog selection.",
-                "For every frontend_surfaces entry, create active mandatory requirements that preserve the page-level visual contract from the prototype, including layout, copy, component hierarchy, and explicit forbidden old UI/style patterns. Use oracle_type='mixed' unless a stronger single oracle is clearly appropriate, and require deterministic DOM/CSS evidence plus screenshot/runtime visual evidence; optional judge_model evidence may supplement but must not be the only proof.",
+                "If the requested scope includes visible frontend additions or changes, add top-level frontend_scope={requested:true,surfaces:[...]}. Each surface must include a stable id, name, route when known, priority (core/primary/secondary/optional), purpose, key_states, and non-empty requirement_ids. A spec that only says to preserve, keep unchanged, or not modify already-approved frontend/design/prototype artifacts does not request frontend work: set requested=false with surfaces=[] and do not invent new frontend fidelity requirements.",
+                "When frontend_scope.requested=true and the spec supplies prototypes, screenshots, Figma files, mockups, or prototype HTML for that requested work, also add a top-level frontend_surfaces array. Each entry must name the surface, route/screen when known, prototype_refs, viewports when known, and the intended fidelity level. User-supplied design/prototype artifacts take precedence over external catalog selection.",
+                "For every frontend_surfaces entry associated with frontend_scope.requested=true, create active mandatory requirements that preserve the page-level visual contract from the prototype, including layout, copy, component hierarchy, and explicit forbidden old UI/style patterns. Use oracle_type='mixed' unless a stronger single oracle is clearly appropriate, and require deterministic DOM/CSS evidence plus screenshot/runtime visual evidence; optional judge_model evidence may supplement but must not be the only proof.",
                 "If frontend_scope.requested=true but no prototype/design artifact exists yet, omit frontend_surfaces or set it empty; the next workflow stage will create it. Still create active mandatory visual requirements for the requested surfaces, using acceptance language that requires conformance to the subsequently approved DESIGN.md and static prototype.",
                 "If the project has no frontend scope, set frontend_scope.requested=false and do not invent visual fidelity requirements.",
                 "If a requirement needs one external provider protocol or official API doc, set external_docs_required=true and provider_reference to a local path under .auto-agents/docs/provider_references/. If it needs several provider docs, set provider_references to local paths under that directory and keep provider_reference empty or set to the primary path.",
@@ -16182,7 +16374,7 @@ class Orchestrator:
                 "All active mandatory requirement acceptance_oracles must also be covered by either archived verified done-task proof or at least one current task requirement_proofs entry; requirement_ids alone are not sufficient coverage.",
                 "If an acceptance_oracle covers docs or architecture semantics, its evidence_refs must include an executable test that reads/asserts those docs and a supporting ref to the affected document, such as .auto-agents/docs/architecture.md.",
                 "Task acceptance criteria must preserve the bound requirement's concrete acceptance_oracles; do not weaken direct/API/protocol requirements into naming or configuration-only checks.",
-                "If requirements_trace.json contains frontend_surfaces or frontend/prototype fidelity requirements, create or preserve at least one page-level task per affected surface. The task must implement the whole visible surface against the prototype, not only isolated components or payload behavior.",
+                "If frontend_scope.requested=true and requirements_trace.json contains frontend_surfaces or frontend/prototype fidelity requirements, create or preserve at least one page-level task per affected surface. The task must implement the whole visible surface against the prototype, not only isolated components or payload behavior. When frontend_scope.requested=false, preservation-only visual requirements are regression constraints and must not create redesign or page implementation tasks.",
                 "Frontend prototype fidelity task acceptance must require deterministic DOM/CSS/static checks and screenshot/runtime visual evidence such as Playwright screenshots. A vision judge may be added when available, but it supplements deterministic and screenshot evidence rather than replacing them. Payload-only tests, route-existence checks, or component count checks are forbidden as the sole proof for visual fidelity.",
                 "For negative contract requirements such as 'must not contain', '不得', '不包含', or '不返回', preserve every concrete field/path/API token from the requirement in the task acceptance. For example, a requirement that forbids `tasks[].result` is NOT covered by only omitting `retry_trace`.",
                 "Preserve each bound requirement's oracle_type, oracle_strength, evidence_boundary, and forbidden_proxy_oracles when slicing tasks. Requirements that demand semantic or human-strength proof are NOT satisfied by proxy checks, internal-state-only checks, config-only checks, or metadata/log snapshots. Requirements that demand system_boundary or external_side_effect evidence are NOT covered unless the task acceptance requires proof at that boundary.",

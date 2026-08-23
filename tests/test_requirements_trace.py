@@ -1177,6 +1177,26 @@ class RequirementsTraceTests(unittest.TestCase):
         self.assertTrue(any("frontend prototype fidelity" in item for item in errors))
         self.assertTrue(any("frontend_surfaces" in item for item in errors))
 
+    def test_preservation_only_spec_can_explicitly_decline_frontend_work(self) -> None:
+        trace = {
+            "version": 1,
+            "frontend_scope": {
+                "requested": False,
+                "surfaces": [],
+            },
+            "requirements": [_requirement()],
+        }
+        spec = (
+            "Do not modify the approved frontend prototype; "
+            "this iteration changes backend contracts only."
+        )
+
+        errors = validate_frontend_fidelity_trace(trace, spec_text=spec)
+
+        self.assertFalse(
+            any("frontend prototype fidelity" in item for item in errors)
+        )
+
     def test_frontend_surface_requires_active_visual_requirement(self) -> None:
         trace = {
             "version": 1,

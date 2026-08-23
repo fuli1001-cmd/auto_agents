@@ -32,6 +32,7 @@ from auto_agents.frontend_design import (
     FrontendDesignUnavailable,
     discover_existing_frontend,
     frontend_design_artifact_hashes,
+    frontend_scope_requested,
     load_frontend_design_lock,
     parse_catalog_entries,
     selected_surface_specs,
@@ -44,6 +45,7 @@ from auto_agents.models import AgentRequest, AgentResult, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.prototype_variants import (
     candidate_variants,
+    ensure_registry,
     gallery_html,
     load_registry,
     registry_variants,
@@ -683,6 +685,160 @@ class FrontendDesignTests(unittest.TestCase):
             variant = candidate_variants(load_registry(root))[0]
             self.assertIn("REQ-002", variant["prototype"]["pages"][0]["requirement_ids"])
             self.assertIn("specs/prototype/home.html", variant["source"]["refs"])
+
+    def test_preservation_only_requirement_reuses_approved_contract_without_redesign(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_text(root / "spec.md", "# Preserve the existing frontend")
+            write_text(root / "src/pages/Home.tsx", "export const Home = () => <main />")
+            write_text(root / "specs/prototype/home.html", HTML)
+            write_text(design_md_path(root), "# User design")
+            write_frontend_fidelity_trace(root)
+
+            orchestrator = Orchestrator(root)
+            adapter = PrototypeAdapter(root)
+            orchestrator.adapter = adapter
+            state = load_run_state(root)
+            state.resume_context[
+                Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT
+            ] = True
+            orchestrator._run_prototype_stage(state, root / "spec.md")
+            approved = orchestrator.approve("prototype")
+
+            trace = json.loads(
+                requirements_trace_path(root).read_text(encoding="utf-8")
+            )
+            trace["frontend_scope"]["surfaces"][0]["requirement_ids"].append(
+                "REQ-002"
+            )
+            trace["requirements"].append(
+                {
+                    "id": "REQ-002",
+                    "status": "active",
+                    "priority": "mandatory",
+                    "text": (
+                        "Preserve the approved home layout and copy; "
+                        "the backend change must not change the UI."
+                    ),
+                    "acceptance_oracles": [
+                        "The existing rendered home page remains unchanged."
+                    ],
+                    "oracle_type": "mixed",
+                    "oracle_strength": "human",
+                    "evidence_boundary": "system_boundary",
+                    "forbidden_proxy_oracles": [],
+                    "notes": "preservation-only frontend contract",
+                }
+            )
+            write_json(requirements_trace_path(root), trace)
+            adapter.calls.clear()
+
+            result = orchestrator._run_prototype_stage(
+                approved,
+                root / "spec.md",
+            )
+
+            self.assertIs(result, approved)
+            self.assertEqual(result.pending_approval, "")
+            self.assertIn("prototype", result.approved_gates)
+            self.assertIn(
+                "preservation-only",
+                result.stage_summaries["prototype"],
+            )
+            self.assertFalse(
+                any(call.startswith("prototype-generate") for call in adapter.calls)
+            )
+            lock = load_frontend_design_lock(root)
+            self.assertEqual(lock["status"], "approved")
+            self.assertIn(
+                "REQ-002",
+                lock["prototype"]["pages"][0]["requirement_ids"],
+            )
+            updated_trace = json.loads(
+                requirements_trace_path(root).read_text(encoding="utf-8")
+            )
+            self.assertFalse(updated_trace["frontend_scope"]["requested"])
+            self.assertEqual(updated_trace["frontend_scope"]["surfaces"], [])
+            self.assertFalse(frontend_scope_requested(updated_trace))
+
+    def test_paused_legacy_preservation_reapproval_is_normalized_without_prompt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_text(root / "spec.md", "# Preserve the existing frontend")
+            write_text(root / "src/pages/Home.tsx", "export const Home = () => <main />")
+            write_text(root / "specs/prototype/home.html", HTML)
+            write_text(design_md_path(root), "# User design")
+            write_frontend_fidelity_trace(root)
+
+            orchestrator = Orchestrator(root)
+            orchestrator.adapter = PrototypeAdapter(root)
+            state = load_run_state(root)
+            state.resume_context[
+                Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT
+            ] = True
+            orchestrator._run_prototype_stage(state, root / "spec.md")
+            approved = orchestrator.approve("prototype")
+
+            trace = json.loads(
+                requirements_trace_path(root).read_text(encoding="utf-8")
+            )
+            trace["frontend_scope"]["surfaces"][0]["requirement_ids"].append(
+                "REQ-002"
+            )
+            trace["requirements"].append(
+                {
+                    "id": "REQ-002",
+                    "status": "active",
+                    "priority": "mandatory",
+                    "text": "保持批准的首页视觉合同，不得修改或重设计 UI。",
+                    "acceptance_oracles": ["现有页面布局和文案保持不变。"],
+                    "oracle_type": "mixed",
+                    "oracle_strength": "human",
+                    "evidence_boundary": "system_boundary",
+                    "forbidden_proxy_oracles": [],
+                    "notes": "",
+                }
+            )
+            write_json(requirements_trace_path(root), trace)
+            lock = load_frontend_design_lock(root)
+            lock["status"] = "pending_approval"
+            lock["redesign_requested_at"] = "2026-08-23T00:00:00+00:00"
+            lock["redesign_requirement_ids"] = ["REQ-002"]
+            lock.pop("approved_at", None)
+            lock.pop("approval", None)
+            lock.pop("contract_sha256", None)
+            write_json(frontend_design_lock_path(root), lock)
+            frontend_prototype_variants_registry_path(root).unlink()
+            ensure_registry(root, max_pages=3)
+            approved.status = "paused"
+            approved.current_stage = "prototype"
+            approved.pending_approval = "prototype"
+
+            normalized = orchestrator._normalize_preservation_only_prototype_pause(
+                approved
+            )
+
+            self.assertTrue(normalized)
+            self.assertEqual(approved.status, "pending")
+            self.assertEqual(approved.pending_approval, "")
+            self.assertIn("prototype", approved.approved_gates)
+            restored = load_frontend_design_lock(root)
+            self.assertEqual(restored["status"], "approved")
+            self.assertNotIn("redesign_requested_at", restored)
+            self.assertIn(
+                "REQ-002",
+                restored["prototype"]["pages"][0]["requirement_ids"],
+            )
+            self.assertIn(
+                "approved DESIGN.md",
+                (root / "AGENTS.md").read_text(encoding="utf-8"),
+            )
 
     def test_parallel_scheduler_checks_contract_before_evidence_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

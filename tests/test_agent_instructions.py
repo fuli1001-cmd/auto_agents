@@ -19,12 +19,16 @@ from auto_agents.agent_instructions import (
 )
 from auto_agents.config import (
     agent_instructions_lock_path,
+    design_md_path,
+    frontend_design_lock_path,
+    frontend_prototype_dir,
     load_project_config,
     normalized_project_rules_path,
     project_rules_path,
     save_project_config,
 )
-from auto_agents.io_utils import write_text
+from auto_agents.frontend_design import frontend_design_artifact_hashes
+from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 
@@ -134,6 +138,80 @@ class AgentInstructionSyncTests(unittest.TestCase):
             self.assertIn("Prefer small, directly verifiable changes", agents)
             self.assertIn("Default compose success path is output_review pass -> export", agents)
             self.assertIn("Do not reintroduce a default output confirmation gate", copilot)
+
+    def test_pending_reapproval_preserves_approved_frontend_guardrails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            prototype = frontend_prototype_dir(project_root)
+            write_text(design_md_path(project_root), "# Approved design")
+            write_text(
+                prototype / "index.html",
+                (
+                    "<!doctype html><html><head>"
+                    "<meta name='viewport' content='width=device-width'>"
+                    "</head><body>Index</body></html>"
+                ),
+            )
+            write_text(
+                prototype / "home.html",
+                (
+                    "<!doctype html><html><head>"
+                    "<meta name='viewport' content='width=device-width'>"
+                    "</head><body>Home</body></html>"
+                ),
+            )
+            pages = [
+                {
+                    "id": "home",
+                    "title": "Home",
+                    "route": "/",
+                    "html_ref": ".auto-agents/docs/frontend_prototype/home.html",
+                    "requirement_ids": ["REQ-001"],
+                }
+            ]
+            write_json(
+                prototype / "manifest.json",
+                {
+                    "version": 1,
+                    "index_ref": ".auto-agents/docs/frontend_prototype/index.html",
+                    "viewports": ["1440x900"],
+                    "pages": pages,
+                },
+            )
+            lock = {
+                "version": 1,
+                "status": "pending_approval",
+                "redesign_requested_at": "2026-08-23T00:00:00+00:00",
+                "source": {"kind": "user", "refs": ["DESIGN.md"]},
+                "design_path": "DESIGN.md",
+                "prototype": {
+                    "manifest_ref": (
+                        ".auto-agents/docs/frontend_prototype/manifest.json"
+                    ),
+                    "index_ref": ".auto-agents/docs/frontend_prototype/index.html",
+                    "viewports": ["1440x900"],
+                    "pages": pages,
+                },
+            }
+            lock["artifact_sha256"] = frontend_design_artifact_hashes(
+                project_root
+            )
+            write_json(frontend_design_lock_path(project_root), lock)
+
+            sync_agent_instructions(project_root)
+
+            agents = (project_root / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("approved DESIGN.md", agents)
+            self.assertIn("Do not modify DESIGN.md", agents)
+            instruction_lock = json.loads(
+                agent_instructions_lock_path(project_root).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(
+                instruction_lock["frontend_design_contract_sha256"]
+            )
 
     def test_sync_uses_current_normalized_rules_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
