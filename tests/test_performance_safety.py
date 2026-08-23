@@ -16,6 +16,7 @@ from auto_agents.models import (
     CommandResult,
     GateParallelGroup,
     GateResult,
+    PersistenceTargetConfig,
     RunState,
     TaskSpec,
     VerificationStep,
@@ -996,6 +997,144 @@ class EvidencePreflightTests(unittest.TestCase):
                     ".auto-agents/state/provider_references.lock.json",
                 ],
             )
+
+    def test_project_config_mutation_is_owned_by_target_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            task = TaskSpec(
+                task_id="task-schema",
+                title="Schema",
+                description="Rebuild the configured test database.",
+                acceptance=["The configured target can be rebuilt explicitly."],
+            )
+
+            owner, paths = orchestrator._actionable_preflight_upstream_mutations(
+                task,
+                [
+                    {
+                        "path": ".auto-agents/config.json",
+                        "reason": "bind the explicit reset command",
+                    },
+                    {
+                        "path": "src/app.py",
+                        "reason": "implement the reset boundary",
+                    },
+                ],
+            )
+
+            self.assertEqual(owner, "target_project")
+            self.assertEqual(paths, [".auto-agents/config.json"])
+
+    def test_project_config_preflight_block_persists_human_owned_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            from auto_agents.config import load_run_state
+
+            state = load_run_state(root)
+            task = TaskSpec(
+                task_id="task-schema",
+                title="Schema",
+                description="Rebuild the configured test database.",
+                acceptance=["The configured target can be rebuilt explicitly."],
+                persistence_change={
+                    "strategy": "clean_break",
+                    "decision_id": "PERSIST-001",
+                    "target_ids": ["local-sqlite-test"],
+                    "to_version": "2",
+                },
+            )
+            state.tasks = [task]
+            result = {
+                "decision": "BLOCK",
+                "target_stage": "",
+                "reason": (
+                    "The registered local-sqlite-test target needs an explicit "
+                    "reset command."
+                ),
+                "checklist": [],
+                "required_mutations": [
+                    {
+                        "path": ".auto-agents/config.json",
+                        "reason": "bind the explicit reset command",
+                    }
+                ],
+            }
+
+            routed = orchestrator._route_evidence_preflight(
+                state, [task], task, result
+            )
+
+            self.assertEqual(routed.status, "blocked")
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(routed.active_blocker["owner"], "target_project")
+            self.assertEqual(
+                routed.active_blocker["category"],
+                "persistence_target_configuration_required",
+            )
+            self.assertIn(".auto-agents/config.json", routed.active_blocker["reason"])
+
+    def test_ready_preflight_is_normalized_to_project_config_block(self) -> None:
+        class ConfigMutationAdapter:
+            def run(self, request):
+                summary = (
+                    'EVIDENCE_PREFLIGHT: {"decision":"READY","reason":"one config '
+                    'binding is missing","checklist":["run the reset boundary"],'
+                    '"required_mutations":[{"path":".auto-agents/config.json",'
+                    '"reason":"bind the explicit reset command"}]}'
+                )
+                write_text(request.output_path, summary)
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=summary,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            orchestrator.adapter = ConfigMutationAdapter()
+            from auto_agents.config import load_run_state
+
+            state = load_run_state(root)
+            task = orchestrator._load_tasks_from_plan()[0]
+            state.tasks = [task]
+            orchestrator._commit_planning_baseline_if_needed([task])
+            with patch.object(
+                orchestrator, "_task_needs_evidence_preflight", return_value=True
+            ):
+                result = orchestrator._ensure_evidence_preflight(state, task)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["decision"], "BLOCK")
+            self.assertEqual(task.evidence_preflight["decision"], "BLOCK")
+            self.assertIn("target project", result["reason"])
+
+    def test_project_config_change_invalidates_preflight_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            task = orchestrator._load_tasks_from_plan()[0]
+            before = orchestrator._evidence_preflight_fingerprint(task)
+
+            orchestrator.config.persistence.targets = [
+                PersistenceTargetConfig(
+                    target_id="local-sqlite-test",
+                    environment="test",
+                    kind="local_file",
+                    locator={"path": ".tmp-tests/app.sqlite3"},
+                    reset_argv=["tool", "reset"],
+                )
+            ]
+            after = orchestrator._evidence_preflight_fingerprint(task)
+
+            self.assertNotEqual(before, after)
 
     def test_routing_happens_before_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

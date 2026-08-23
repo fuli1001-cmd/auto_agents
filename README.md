@@ -1191,6 +1191,12 @@ DSN name. Register one interactively with:
 python3 -m auto_agents persistence-configure --project /tmp/demo
 ```
 
+Implementation agents cannot edit this target-project-owned configuration. If evidence preflight
+finds that a task requires a `.auto-agents/config.json` change, the run blocks before implementation
+and reports the required path. Update or register the target, then rerun the same command; project
+configuration participates in the preflight cache key, so the corrected configuration is evaluated
+immediately without requiring a source commit.
+
 Runs created by older auto_agents versions may have incorrectly stored
 `REQ-NNN` requirement IDs in `persistence_decisions[].target_ids`. After a
 human has registered the intended target, rebind that legacy decision

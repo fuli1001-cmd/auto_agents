@@ -14020,10 +14020,15 @@ class Orchestrator:
         ]
         effort = self.config.efforts.get("evidence_preflight", "balanced")
         payload = {
-            "version": 1,
+            "version": 2,
             "task": task_payload,
             "requirements": requirements,
             "head": head_ref(self.project_root),
+            # Evidence feasibility may depend on human-owned target registration
+            # and command bindings. Include project configuration so an operator
+            # update invalidates a cached READY/BLOCK result without requiring a
+            # source commit.
+            "project_config": self.config.to_dict(),
             "provider": self.config.active_provider,
             "model": self._model_label_for_agent_stage("evidence_preflight", effort),
             "effort": effort,
@@ -14087,12 +14092,22 @@ class Orchestrator:
                     )
                 )
                 if owner_stage:
-                    parsed["decision"] = "ROUTE"
-                    parsed["target_stage"] = owner_stage
-                    parsed["reason"] = (
-                        f"{parsed['reason']} Required mutation(s) are owned by "
-                        f"{owner_stage}: {', '.join(mutation_paths)}"
-                    )
+                    if owner_stage == "target_project":
+                        parsed["decision"] = "BLOCK"
+                        parsed["target_stage"] = ""
+                        parsed["reason"] = (
+                            f"{parsed['reason']} Required mutation(s) are owned by the "
+                            f"target project: {', '.join(mutation_paths)}. Update the "
+                            "project configuration outside implementation, then rerun "
+                            "the same auto-agents command."
+                        )
+                    else:
+                        parsed["decision"] = "ROUTE"
+                        parsed["target_stage"] = owner_stage
+                        parsed["reason"] = (
+                            f"{parsed['reason']} Required mutation(s) are owned by "
+                            f"{owner_stage}: {', '.join(mutation_paths)}"
+                        )
                 elif parsed.get("decision") == "ROUTE" and required_mutations:
                     parsed["decision"] = "READY"
                     parsed["target_stage"] = ""
@@ -14155,7 +14170,7 @@ class Orchestrator:
         task: TaskSpec,
         required_mutations: Iterable[object],
     ) -> Tuple[str, List[str]]:
-        """Return only unresolved mutations owned by a pre-implement stage."""
+        """Return unresolved mutations not owned by implementation."""
         trace = load_requirements_trace(self.project_root)
         task_requirement_ids = {
             str(requirement_id).strip()
@@ -14193,6 +14208,10 @@ class Orchestrator:
             path = self._normalize_audit_blocker_path(item.get("path", ""))
             if not path:
                 continue
+            if path == ".auto-agents/config.json":
+                owners.add("target_project")
+                actionable.append(path)
+                continue
             owner = self._forbidden_pattern_owner_stage({"path": path})
             if owner == "provider_research":
                 known_satisfied_reference = (
@@ -14215,6 +14234,14 @@ class Orchestrator:
 
         if not actionable:
             return "", []
+        if "target_project" in owners:
+            return "target_project", list(
+                dict.fromkeys(
+                    path
+                    for path in actionable
+                    if path == ".auto-agents/config.json"
+                )
+            )
         if len(owners) == 1:
             return next(iter(owners)), list(dict.fromkeys(actionable))
         return "plan", list(dict.fromkeys(actionable))
@@ -14233,6 +14260,7 @@ class Orchestrator:
                 "Choose SPLIT when independently verifiable proof surfaces require separate task slices.",
                 "Choose CLARIFY only when a product decision or external contract is genuinely missing.",
                 "Choose ROUTE when implementation requires changing an artifact owned by an earlier stage; set target_stage to clarify, prototype, design, plan, or provider_research.",
+                "Project configuration at .auto-agents/config.json is target-project-owned. If it must change, list it in required_mutations; do not claim the implementation task can edit it.",
                 "Always list required_mutations as objects with exact project-relative path and reason. Provider references under .auto-agents are read-only implementation inputs owned by provider_research.",
                 "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
                 "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\"}]}",
@@ -14294,11 +14322,6 @@ class Orchestrator:
         result: Dict[str, object],
     ) -> RunState:
         decision = str(result.get("decision", "")).strip().upper()
-        target_stage = (
-            str(result.get("target_stage", "")).strip()
-            if decision == "ROUTE"
-            else "plan" if decision == "SPLIT" else "clarify"
-        )
         route_paths = sorted(
             {
                 self._normalize_audit_blocker_path(item.get("path", ""))
@@ -14306,6 +14329,44 @@ class Orchestrator:
                 if isinstance(item, dict)
                 and self._normalize_audit_blocker_path(item.get("path", ""))
             }
+        )
+        if decision == "BLOCK":
+            task.status = "pending"
+            self._persist_tasks(tasks)
+            reason = (
+                f"Evidence preflight blocked {task.task_id}: "
+                f"{str(result.get('reason', '')).strip()} "
+                "Target-project configuration path(s): "
+                f"{', '.join(route_paths) or '(none)'}."
+            )
+            fingerprint = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    {
+                        "task_id": task.task_id,
+                        "paths": route_paths,
+                        "reason": reason,
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            self._block_run(
+                state,
+                owner="target_project",
+                category=(
+                    "persistence_target_configuration_required"
+                    if persistence_change_strategy(task.persistence_change) != "none"
+                    else "project_configuration_required"
+                ),
+                reason=reason,
+                fingerprint=fingerprint,
+            )
+            save_run_state(self.project_root, state)
+            self.logger.error(reason)
+            return state
+        target_stage = (
+            str(result.get("target_stage", "")).strip()
+            if decision == "ROUTE"
+            else "plan" if decision == "SPLIT" else "clarify"
         )
         route_identity = hashlib.sha256(
             json.dumps(
