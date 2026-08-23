@@ -5115,7 +5115,7 @@ class RetryFlowTests(unittest.TestCase):
                 {"task-legacy": ["task-child-a", "task-child-b"]},
             )
 
-    def test_stale_plan_coupled_tests_retry_implement_until_migrated(self) -> None:
+    def test_stale_plan_audit_retries_text_and_skips_binary_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -5154,10 +5154,19 @@ class RetryFlowTests(unittest.TestCase):
             tests_dir = project_root / "tests"
             tests_dir.mkdir(exist_ok=True)
             write_text(tests_dir / "test_plan_contract.py", "EXPECTED_TASK = 'task-legacy'\n")
+            fixtures_dir = tests_dir / "fixtures"
+            fixtures_dir.mkdir()
+            binary_fixture = fixtures_dir / "plan_snapshot.bin"
+            binary_fixture.write_bytes(b"\x00PNG\xc6 task-legacy")
 
             state = load_run_state(project_root)
             state.tasks = orchestrator._load_tasks_from_plan()
             state.plan_task_replacements = {"task-legacy": ["task-child-a", "task-child-b"]}
+
+            self.assertIn(
+                "tests/fixtures/plan_snapshot.bin",
+                orchestrator._repository_test_paths(),
+            )
 
             state = orchestrator._run_implementation_loop(state, max_tasks=1)
 

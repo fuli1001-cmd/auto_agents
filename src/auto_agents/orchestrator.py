@@ -15754,6 +15754,13 @@ class Orchestrator:
                 paths.append(path)
         return sorted(set(paths))
 
+    def _read_repository_test_text(self, relative_path: str) -> Optional[str]:
+        """Read an audit candidate only when it contains valid UTF-8 text."""
+        try:
+            return read_text(self.project_root / relative_path)
+        except UnicodeDecodeError:
+            return None
+
     def _task_plan_replacements_for_retired_id(self, state: RunState, retired_id: str) -> List[str]:
         replacements = [
             task.task_id
@@ -15912,8 +15919,12 @@ class Orchestrator:
 
         findings: List[str] = []
         for relative_path in self._repository_test_paths():
-            content = read_text(self.project_root / relative_path)
-            if not content.strip() or not self._text_references_task_id(content, task.task_id):
+            content = self._read_repository_test_text(relative_path)
+            if (
+                content is None
+                or not content.strip()
+                or not self._text_references_task_id(content, task.task_id)
+            ):
                 continue
             statuses = self._test_file_task_status_literals(relative_path, content, task.task_id)
             stale_statuses = [status for status in statuses if status != expected_status]
@@ -15945,8 +15956,8 @@ class Orchestrator:
 
         findings: List[Dict[str, object]] = []
         for relative_path in self._repository_test_paths():
-            content = read_text(self.project_root / relative_path)
-            if not content.strip():
+            content = self._read_repository_test_text(relative_path)
+            if content is None or not content.strip():
                 continue
             for retired_id in retired_ids:
                 if not self._text_references_task_id(content, retired_id):
@@ -16001,8 +16012,12 @@ class Orchestrator:
 
         findings: List[Dict[str, object]] = []
         for relative_path in self._repository_test_paths():
-            content = read_text(self.project_root / relative_path)
-            if not content.strip() or not self._text_references_task_id(content, task.task_id):
+            content = self._read_repository_test_text(relative_path)
+            if (
+                content is None
+                or not content.strip()
+                or not self._text_references_task_id(content, task.task_id)
+            ):
                 continue
             statuses = self._test_file_task_status_literals(relative_path, content, task.task_id)
             stale_statuses = [status for status in statuses if status != expected_status]
