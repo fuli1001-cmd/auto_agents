@@ -1583,12 +1583,17 @@ def task_plan_warnings(payload: object) -> List[str]:
     return warnings
 
 
-def _allow_empty_task_plan_for_iteration(project_root: Path) -> bool:
+def _allow_empty_task_plan_before_plan(project_root: Path) -> bool:
     state_payload = read_json(run_state_path(project_root), default=None)
     if not isinstance(state_payload, dict):
         return False
     context = state_payload.get("resume_context", {})
-    if not isinstance(context, dict) or not str(context.get("previous_run_id", "")).strip():
+    # Both completed-run iterations and blocked-run restarts intentionally
+    # materialize their new task plan at the plan stage.
+    if not isinstance(context, dict) or not any(
+        str(context.get(key, "")).strip()
+        for key in ("previous_run_id", "restarted_blocked_run_id")
+    ):
         return False
     summaries = state_payload.get("stage_summaries", {})
     if isinstance(summaries, dict) and "plan" in summaries:
@@ -2556,7 +2561,7 @@ def validate_project_root(
         errors.extend(
             validate_task_plan_payload(
                 plan_payload,
-                allow_empty_tasks=_allow_empty_task_plan_for_iteration(root),
+                allow_empty_tasks=_allow_empty_task_plan_before_plan(root),
                 enforce_active_task_granularity=True,
             )
         )

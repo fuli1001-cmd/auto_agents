@@ -362,6 +362,13 @@ def expand_pytest_directory_steps(
         if kind != "test" or runner != "pytest":
             expanded.append(step)
             continue
+        if step.artifact_globs:
+            # One verification step owns each published artifact glob. Splitting
+            # it would copy that ownership onto every shard and make the
+            # generated verification graph invalid (and potentially race
+            # multiple writers against the same evidence path).
+            expanded.append(step)
+            continue
         if step.max_batches == 1 and not stable_for_step:
             # Preserve the directory target so the runner's own discovery,
             # ignore configuration, and session fixtures remain authoritative.
@@ -812,6 +819,10 @@ def expand_vitest_directory_steps(
         runner = step.runner.strip().lower()
         kind = step.kind.strip().lower() or "test"
         if kind != "test" or runner != "vitest":
+            expanded.append(step)
+            continue
+        if step.artifact_globs:
+            # Keep ignored evidence production under one durable proof owner.
             expanded.append(step)
             continue
         if step.max_batches == 1 and not stable_for_step:

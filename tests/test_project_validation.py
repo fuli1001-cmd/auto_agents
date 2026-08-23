@@ -1046,25 +1046,86 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertTrue(report["ok"])
             self.assertFalse(any("at least one task" in item for item in report["errors"]))
 
-    def test_validation_report_rejects_empty_plan_after_plan_stage(self) -> None:
+    def test_validation_report_allows_empty_plan_during_restarted_blocked_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
             write_json(task_plan_path(project_root), {"tasks": []})
             state = load_run_state(project_root)
-            state.status = "pending"
-            state.current_stage = "implement"
-            state.stage_summaries["plan"] = "planned"
+            state.status = "paused"
+            state.current_stage = "prototype"
             state.resume_context = {
-                "previous_run_id": "oldrun123",
-                "previous_task_plan_archive": str(project_root / ".auto-agents" / "history" / "task_plans" / "oldrun123.json"),
+                "restarted_blocked_run_id": "blockedrun123",
             }
             save_run_state(project_root, state)
 
             report = validation_report(project_root)
 
-            self.assertFalse(report["ok"])
-            self.assertTrue(any("at least one task" in item for item in report["errors"]))
+            self.assertTrue(report["ok"])
+            self.assertFalse(any("at least one task" in item for item in report["errors"]))
+
+    def test_run_resumes_restarted_blocked_prototype_with_empty_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(task_plan_path(project_root), {"tasks": []})
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.current_stage = "prototype"
+            state.pending_approval = "prototype"
+            state.stage_summaries["prototype"] = "Generated candidate."
+            state.resume_context = {
+                "restarted_blocked_run_id": "blockedrun123",
+            }
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "orchestrator_transition",
+                "status": "blocked",
+            }
+            save_run_state(project_root, state)
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator.mark_self_repair_applied("repairabc123")
+
+            class FailingIfCalledAdapter:
+                def run(self, request):
+                    raise AssertionError(
+                        f"adapter should not run while prototype approval is pending: {request.stage}"
+                    )
+
+            orchestrator.adapter = FailingIfCalledAdapter()
+
+            resumed = orchestrator.run(spec_file=spec_file)
+
+            self.assertEqual(resumed.status, "paused")
+            self.assertEqual(resumed.pending_approval, "prototype")
+            self.assertEqual(resumed.last_error, "")
+            self.assertEqual(
+                resumed.active_blocker["prepared_self_repair_commit"],
+                "repairabc123",
+            )
+
+    def test_validation_report_rejects_empty_plan_after_plan_stage(self) -> None:
+        for lineage_key in ("previous_run_id", "restarted_blocked_run_id"):
+            with self.subTest(lineage_key=lineage_key), tempfile.TemporaryDirectory() as tmp:
+                project_root = Path(tmp) / "demo"
+                Orchestrator.init_project(project_root, "demo", "mock")
+                write_json(task_plan_path(project_root), {"tasks": []})
+                state = load_run_state(project_root)
+                state.status = "pending"
+                state.current_stage = "implement"
+                state.stage_summaries["plan"] = "planned"
+                state.resume_context = {lineage_key: "oldrun123"}
+                save_run_state(project_root, state)
+
+                report = validation_report(project_root)
+
+                self.assertFalse(report["ok"])
+                self.assertTrue(
+                    any("at least one task" in item for item in report["errors"])
+                )
 
     def test_validation_report_passes_for_bootstrapped_project(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3845,6 +3906,58 @@ class ProjectValidationTests(unittest.TestCase):
                     "unknown proof_id" in error or "fallback_proof_ids" in error
                     for error in errors
                 ),
+                errors,
+            )
+
+    def test_generated_artifact_step_keeps_one_proof_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            tests = project_root / "tests" / "schema"
+            tests.mkdir(parents=True)
+            for index in range(4):
+                (tests / f"test_{index}.py").write_text(
+                    "def test_contract(): pass\n", encoding="utf-8"
+                )
+
+            config = load_project_config(project_root)
+            config.gates.verification_policy_version = 4
+            save_project_config(project_root, config)
+            source = VerificationStep(
+                proof_id="affected.schema.evidence",
+                runner="pytest",
+                targets=["tests/schema"],
+                levels=["affected"],
+                impact_paths=["src/schema/**"],
+                artifact_globs=[".tmp-tests/evidence/schema-*.json"],
+                result_cache_scope="auto",
+            )
+            save_task_plan(
+                project_root,
+                {
+                    "tasks": [],
+                    "verification_policy_version": 4,
+                    "verification_steps": [source.to_dict()],
+                },
+            )
+
+            Orchestrator(project_root)._apply_generated_verification_config()
+
+            persisted = load_project_config(project_root)
+            self.assertEqual(len(persisted.gates.steps), 1)
+            self.assertEqual(
+                persisted.gates.steps[0].proof_id,
+                "affected.schema.evidence",
+            )
+            self.assertEqual(
+                persisted.gates.steps[0].artifact_globs,
+                [".tmp-tests/evidence/schema-*.json"],
+            )
+            errors = validate_project_config_payload(
+                json.loads(config_path(project_root).read_text(encoding="utf-8"))
+            )
+            self.assertFalse(
+                any("duplicates artifact ownership" in error for error in errors),
                 errors,
             )
 

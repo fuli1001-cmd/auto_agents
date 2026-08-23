@@ -807,6 +807,43 @@ class GateTests(unittest.TestCase):
                 [f"tests/test_{index}.py" for index in range(8)],
             )
 
+    def test_artifact_producing_steps_remain_single_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tests = root / "tests"
+            tests.mkdir()
+            for index in range(4):
+                (tests / f"test_{index}.py").write_text("", encoding="utf-8")
+            pytest_step = VerificationStep(
+                proof_id="evidence.pytest",
+                kind="test",
+                runner="pytest",
+                targets=["tests"],
+                artifact_globs=[".tmp-tests/evidence/pytest-*.json"],
+                result_cache_scope="auto",
+            )
+            vitest_step = VerificationStep(
+                proof_id="evidence.vitest",
+                kind="test",
+                runner="vitest",
+                targets=["tests/test_0.py", "tests/test_1.py"],
+                artifact_globs=[".tmp-tests/evidence/vitest-*.json"],
+                result_cache_scope="auto",
+            )
+
+            self.assertEqual(
+                expand_pytest_directory_steps(
+                    [pytest_step], root, max_batches_per_step=4, stable_shards=True
+                ),
+                [pytest_step],
+            )
+            self.assertEqual(
+                expand_vitest_directory_steps(
+                    [vitest_step], root, max_batches_per_step=4, stable_shards=True
+                ),
+                [vitest_step],
+            )
+
     def test_expanded_proof_references_follow_every_stable_shard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
