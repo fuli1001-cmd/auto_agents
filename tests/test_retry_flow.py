@@ -8942,6 +8942,99 @@ class IterationFlowTests(unittest.TestCase):
             self.assertNotIn("task-001", state.task_review_cache,
                              "Old task_review_cache should have been cleared")
 
+    def test_restart_blocked_archives_nonempty_plan_and_legacy_pending_run(self):
+        for run_status in ("blocked", "pending"):
+            with self.subTest(run_status=run_status), tempfile.TemporaryDirectory() as tmp:
+                project_root = Path(tmp) / "demo"
+                Orchestrator.init_project(project_root, "demo", "mock")
+                commit_all(project_root, "chore: bootstrap test project")
+                orchestrator = Orchestrator(project_root)
+                state = load_run_state(project_root)
+                old_run_id = state.run_id
+                blocked_task = TaskSpec(
+                    task_id="repair-task-001",
+                    title="Blocked proof repair",
+                    description="External proof is unavailable.",
+                    acceptance=["The proof is available."],
+                    status="blocked",
+                    task_origin="evidence_repair",
+                )
+                state.status = run_status
+                state.current_stage = "implement"
+                state.tasks = [blocked_task]
+                state.last_error = "review rejected the task"
+                save_run_state(project_root, state)
+                write_json(
+                    task_plan_path(project_root),
+                    {"tasks": [blocked_task.to_dict()]},
+                )
+
+                with (
+                    patch.object(orchestrator, "_pending_stages", return_value=[]),
+                    patch.object(orchestrator, "_commit_if_dirty"),
+                ):
+                    restarted = orchestrator.run(
+                        spec_file=project_root / "spec.md",
+                        restart_blocked=True,
+                        skip_validate=True,
+                    )
+
+                self.assertNotEqual(restarted.run_id, old_run_id)
+                self.assertEqual(restarted.status, "completed")
+                self.assertEqual(
+                    restarted.resume_context["restarted_blocked_run_id"],
+                    old_run_id,
+                )
+                self.assertEqual(load_task_plan(project_root)["tasks"], [])
+                archived_plan = json.loads(
+                    archived_task_plan_path(
+                        project_root,
+                        old_run_id,
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    archived_plan["tasks"][0]["task_id"],
+                    "repair-task-001",
+                )
+                self.assertEqual(
+                    archived_plan["tasks"][0]["status"],
+                    "blocked",
+                )
+
+    def test_restart_blocked_rejects_active_run_without_blocked_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            commit_all(project_root, "chore: bootstrap test project")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            pending_task = TaskSpec(
+                task_id="task-001",
+                title="Pending work",
+                description="Work has not started.",
+                acceptance=["The work completes."],
+                status="pending",
+            )
+            state.status = "pending"
+            state.tasks = [pending_task]
+            save_run_state(project_root, state)
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [pending_task.to_dict()]},
+            )
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "--restart-blocked requires the active run to be blocked",
+            ):
+                orchestrator.restart_blocked_run()
+
+            self.assertEqual(load_run_state(project_root).status, "pending")
+            self.assertEqual(
+                load_task_plan(project_root)["tasks"][0]["status"],
+                "pending",
+            )
+
     def test_resume_prunes_historically_covered_pending_tasks_and_repairs(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

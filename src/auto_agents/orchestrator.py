@@ -1979,13 +1979,16 @@ class Orchestrator:
             self._max_tasks_remaining = max_tasks
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
+            restarted_before_preconditions = False
+            if restart_blocked:
+                state = self.restart_blocked_run()
+                restarted_before_preconditions = True
             if self._normalize_legacy_verify_baselines(state):
                 save_run_state(self.project_root, state)
             if self._normalize_missing_workspace_dependency_recovery(state):
                 save_run_state(self.project_root, state)
             if self._normalize_stage_recovery_verification_refs(state):
                 save_run_state(self.project_root, state)
-            restarted_before_preconditions = False
             if state.workflow_version < 2:
                 legacy_progress = any(
                     stage in state.stage_summaries
@@ -1999,14 +2002,6 @@ class Orchestrator:
                 state.workflow_version = 2
                 save_run_state(self.project_root, state)
             self._attach_run_logger(state.run_id)
-            if (
-                restart_blocked
-                and state.status == "blocked"
-                and not load_task_plan(self.project_root).get("tasks", [])
-            ):
-                state = self.restart_blocked_run()
-                restarted_before_preconditions = True
-                self._attach_run_logger(state.run_id)
             if not restart_blocked:
                 if self._resume_blocked_run(state):
                     save_run_state(self.project_root, state)
@@ -2057,11 +2052,6 @@ class Orchestrator:
                     skip_validate=skip_validate,
                     allow_unsafe_forbidden_pattern_definitions=pattern_recovery,
                 )
-
-            if restart_blocked and not restarted_before_preconditions:
-                state = self.restart_blocked_run()
-                self._attach_run_logger(state.run_id)
-                save_run_state(self.project_root, state)
 
             if state.status == "completed":
                 self.logger.info("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]")
@@ -2236,7 +2226,24 @@ class Orchestrator:
 
     def restart_blocked_run(self) -> RunState:
         state = load_run_state(self.project_root)
-        if state.status != "blocked":
+        blocked_task_ids = {
+            task.task_id
+            for task in state.tasks
+            if task.status == "blocked"
+        }
+        try:
+            raw_tasks = load_task_plan(self.project_root).get("tasks", [])
+        except (OSError, TypeError, ValueError):
+            raw_tasks = []
+        if isinstance(raw_tasks, list):
+            blocked_task_ids.update(
+                str(task.get("task_id", "")).strip()
+                for task in raw_tasks
+                if isinstance(task, dict)
+                and str(task.get("status", "")).strip() == "blocked"
+                and str(task.get("task_id", "")).strip()
+            )
+        if state.status != "blocked" and not blocked_task_ids:
             raise RuntimeError("--restart-blocked requires the active run to be blocked")
         dirty_code = [
             path
@@ -13900,6 +13907,7 @@ class Orchestrator:
                 "parallel_sequential_retry_tasks",
                 "parallel_integration_metrics",
                 "parallel_task_path_history",
+                "restarted_blocked_run_id",
                 self.FRONTEND_CONTRACT_RECOVERY_CONTEXT,
             )
             if key in state.resume_context
