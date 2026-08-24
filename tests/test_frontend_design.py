@@ -763,6 +763,22 @@ class FrontendDesignTests(unittest.TestCase):
             self.assertFalse(updated_trace["frontend_scope"]["requested"])
             self.assertEqual(updated_trace["frontend_scope"]["surfaces"], [])
             self.assertFalse(frontend_scope_requested(updated_trace))
+            self.assertEqual(orchestrator._frontend_design_prompt_lines(), [])
+            task_prompt = orchestrator._build_task_prompt(
+                TaskSpec(
+                    task_id="task-preservation",
+                    title="Verify preserved home",
+                    description="Run preservation regression.",
+                    acceptance=["The approved home remains unchanged."],
+                    requirement_ids=["REQ-002"],
+                ),
+                "implement",
+            )
+            self.assertIn("APPROVED FRONTEND DESIGN CONTRACT", task_prompt)
+            self.assertIn(
+                ".auto-agents/state/frontend_design.lock.json",
+                task_prompt,
+            )
 
     def test_paused_legacy_preservation_reapproval_is_normalized_without_prompt(
         self,

@@ -1446,6 +1446,9 @@ audit evidence, staged and unstaged diffs, worker capabilities, and durable owne
 The investigator and reviewer run in read-only mode; they may execute bounded non-mutating focused
 diagnostics. A high-confidence evidence consensus starts self-repair in an isolated auto_agents Git
 worktree. The candidate fix is tested before its commit is integrated into the clean main checkout.
+The configured `max_dynamic_commands` is a soft investigation budget; a completed valid report is
+accepted within a small hard-ceiling grace of 25% (minimum two tools) so post-hoc accounting does not
+discard a useful diagnosis for a one-command overage.
 The repaired process then reconciles only protected paths named by a durable attempt checkpoint and
 restarts the original `run` command. A repeated root cause is bounded by
 `execution.self_repair_diagnosis.max_repair_cycles`. If evidence is insufficient, the CLI blocks

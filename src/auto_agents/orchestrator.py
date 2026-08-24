@@ -16421,13 +16421,27 @@ class Orchestrator:
         _, output_path = run_artifact_paths(self.project_root, run_id, stage)
         return output_path
 
-    def _frontend_design_prompt_lines(self) -> List[str]:
-        if (
-            not approved_frontend_design(self.project_root)
-            or not frontend_scope_requested(load_requirements_trace(self.project_root))
-        ):
+    def _frontend_design_prompt_lines(
+        self,
+        required_requirement_ids: Iterable[str] = (),
+    ) -> List[str]:
+        trace = load_requirements_trace(self.project_root)
+        required_ids = [
+            str(requirement_id).strip()
+            for requirement_id in required_requirement_ids
+            if str(requirement_id).strip()
+        ]
+        if not approved_frontend_design(self.project_root):
             return []
         lock = load_frontend_design_lock(self.project_root)
+        if required_ids:
+            if missing_frontend_design_contract_requirement_ids(
+                lock,
+                required_ids,
+            ):
+                return []
+        elif not frontend_scope_requested(trace):
+            return []
         prototype = lock.get("prototype", {})
         manifest_ref = (
             str(prototype.get("manifest_ref", ""))
@@ -16922,7 +16936,9 @@ class Orchestrator:
         if requirement_context:
             common.extend(["", requirement_context])
         if self._task_requires_frontend_design_contract(task):
-            frontend_contract = self._frontend_design_prompt_lines()
+            frontend_contract = self._frontend_design_prompt_lines(
+                self._task_frontend_design_requirement_ids(task)
+            )
             if not frontend_contract:
                 raise RuntimeError(
                     f"frontend task {task.task_id} requires an approved frontend design contract"

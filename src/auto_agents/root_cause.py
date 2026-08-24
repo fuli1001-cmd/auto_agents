@@ -738,10 +738,15 @@ class RootCauseCoordinator:
                 result.stderr or result.summary or f"root-cause {role} agent failed"
             )
         tool_count = self._diagnostic_tool_count(artifacts, request.attempt_id)
-        if tool_count > self.config.max_dynamic_commands:
+        hard_tool_limit = self.config.max_dynamic_commands + max(
+            2,
+            self.config.max_dynamic_commands // 4,
+        )
+        if tool_count > hard_tool_limit:
             raise RuntimeError(
                 f"root-cause {role} exceeded the diagnostic command/tool limit: "
-                f"{tool_count}>{self.config.max_dynamic_commands}"
+                f"{tool_count}>{hard_tool_limit} "
+                f"(soft_budget={self.config.max_dynamic_commands})"
             )
         raw = (result.summary or result.stdout or read_text(output_path)).strip()
         report = RootCauseReport.from_dict(_extract_json(raw), role=role)

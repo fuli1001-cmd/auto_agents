@@ -94,10 +94,12 @@ class _FakeOrchestrator:
         responses,
         *,
         mutate_target: Optional[Path] = None,
+        investigator_tool_count: int = 0,
     ) -> None:
         self.responses = list(responses)
         self.requests = []
         self.mutate_target = mutate_target
+        self.investigator_tool_count = investigator_tool_count
         self.config = type(
             "Config",
             (),
@@ -108,6 +110,21 @@ class _FakeOrchestrator:
         self.requests.append(request)
         if self.mutate_target is not None and len(self.requests) == 1:
             write_text(self.mutate_target / "README.md", "mutated\n")
+        if (
+            request.stage == "self_repair_investigator"
+            and self.investigator_tool_count
+        ):
+            write_json(
+                request.output_path.parent
+                / "provider-attempts"
+                / "root-cause-investigator-fake-resume-0.json",
+                {
+                    "events": [
+                        {"kind": "tool_completed"}
+                        for _ in range(self.investigator_tool_count)
+                    ]
+                },
+            )
         payload = self.responses.pop(0)
         return AgentResult(
             ok=True,
@@ -118,7 +135,14 @@ class _FakeOrchestrator:
 
 
 class RootCauseCoordinatorTests(unittest.TestCase):
-    def _coordinator(self, root: Path, responses, *, mutate=False):
+    def _coordinator(
+        self,
+        root: Path,
+        responses,
+        *,
+        mutate=False,
+        investigator_tool_count=0,
+    ):
         auto_root = root / "auto"
         target_root = root / "target"
         _init_repo(auto_root)
@@ -131,6 +155,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
         fake = _FakeOrchestrator(
             responses,
             mutate_target=(target_root if mutate else None),
+            investigator_tool_count=investigator_tool_count,
         )
         coordinator = RootCauseCoordinator(
             fake,
@@ -276,6 +301,21 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             evidence = Path(diagnosis.evidence_path).read_text(encoding="utf-8")
             self.assertNotIn("super-secret-token", evidence)
             self.assertIn("[REDACTED]", evidence)
+
+    def test_one_command_over_soft_budget_keeps_valid_diagnosis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, _fake, _target = self._coordinator(
+                Path(tmp),
+                [
+                    _report(role="investigator", verdict="ROOT_CAUSE"),
+                    _report(role="reviewer", verdict="AGREE"),
+                ],
+                investigator_tool_count=13,
+            )
+
+            diagnosis = coordinator.run()
+
+            self.assertTrue(diagnosis.repair_approved)
 
     def test_self_repair_runs_in_isolated_worktree_and_integrates_commit(self):
         with tempfile.TemporaryDirectory() as tmp:
