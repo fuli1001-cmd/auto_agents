@@ -1415,6 +1415,18 @@ class ProjectValidationTests(unittest.TestCase):
         )
         self.assertFalse(implement_config_decision.eligible)
 
+        restore_invariant = classify_auto_agents_error(
+            "auto_agents implementation ownership restore invariant failed. "
+            "The protected path state did not return to its pre-attempt "
+            "worktree and Git index snapshot: spec.md",
+            env={},
+        )
+        self.assertTrue(restore_invariant.eligible)
+        self.assertEqual(
+            restore_invariant.category,
+            "implementation_ownership_restore_invariant",
+        )
+
         review_decision = classify_auto_agents_error(
             "Task task-001 failed gates: review rejected the task",
             env={},

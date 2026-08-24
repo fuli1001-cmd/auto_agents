@@ -384,6 +384,21 @@ def classify_auto_agents_error(
             values,
         )
 
+    if "auto_agents implementation ownership restore invariant failed" in lowered:
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="implementation_ownership_restore_invariant",
+                reason=(
+                    "the orchestrator failed to restore a protected path to its "
+                    "pre-attempt worktree and Git index state"
+                ),
+            ),
+            text,
+            values,
+            max_attempts=1,
+        )
+
     if (
         "requirements audit failed:" in lowered
         and "automatic recovery is unsafe" in lowered

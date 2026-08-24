@@ -4504,8 +4504,100 @@ class Orchestrator:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target, follow_symlinks=False)
 
-    def _restore_paths_from_restore_point(self, paths: Iterable[str], restore_root: Path) -> None:
-        for relative in sorted({str(path).strip() for path in paths if str(path).strip()}):
+        index_result = subprocess.run(
+            ["git", "rev-parse", "--git-path", "index"],
+            cwd=str(self.project_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if index_result.returncode == 0:
+            index_path = Path(index_result.stdout.strip())
+            if not index_path.is_absolute():
+                index_path = self.project_root / index_path
+            if index_path.is_file():
+                shutil.copy2(index_path, restore_root / ".git-index.snapshot")
+
+    def _restore_index_paths_from_restore_point(
+        self,
+        paths: Iterable[str],
+        restore_root: Path,
+    ) -> None:
+        saved_index = restore_root / ".git-index.snapshot"
+        if not saved_index.is_file():
+            return
+        saved_env = dict(os.environ)
+        saved_env["GIT_INDEX_FILE"] = str(saved_index)
+        for relative in sorted(
+            {str(path).strip() for path in paths if str(path).strip()}
+        ):
+            saved_entry = subprocess.run(
+                ["git", "ls-files", "--stage", "--", relative],
+                cwd=str(self.project_root),
+                env=saved_env,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if saved_entry.returncode != 0:
+                raise RuntimeError(
+                    saved_entry.stderr.strip()
+                    or f"could not inspect saved Git index entry for {relative}"
+                )
+            stage_zero = None
+            for line in saved_entry.stdout.splitlines():
+                metadata, separator, entry_path = line.partition("\t")
+                fields = metadata.split()
+                if (
+                    separator
+                    and entry_path == relative
+                    and len(fields) == 3
+                    and fields[2] == "0"
+                ):
+                    stage_zero = (fields[0], fields[1])
+                    break
+            if stage_zero is None:
+                update = subprocess.run(
+                    ["git", "update-index", "--force-remove", "--", relative],
+                    cwd=str(self.project_root),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                )
+            else:
+                mode, object_id = stage_zero
+                update = subprocess.run(
+                    [
+                        "git",
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        mode,
+                        object_id,
+                        relative,
+                    ],
+                    cwd=str(self.project_root),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                )
+            if update.returncode != 0:
+                raise RuntimeError(
+                    update.stderr.strip()
+                    or f"could not restore Git index entry for {relative}"
+                )
+
+    def _restore_paths_from_restore_point(
+        self,
+        paths: Iterable[str],
+        restore_root: Path,
+        *,
+        before_snapshot: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
+        normalized_paths = sorted(
+            {str(path).strip() for path in paths if str(path).strip()}
+        )
+        for relative in normalized_paths:
             target = self.project_root / relative
             source = restore_root / relative
             if target.is_dir() and not source.is_dir():
@@ -4520,6 +4612,18 @@ class Orchestrator:
             elif source.exists() or source.is_symlink():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target, follow_symlinks=False)
+        self._restore_index_paths_from_restore_point(
+            normalized_paths,
+            restore_root,
+        )
+        if before_snapshot is None:
+            return []
+        restored_snapshot = self._worktree_change_snapshot()
+        return sorted(
+            relative
+            for relative in normalized_paths
+            if before_snapshot.get(relative) != restored_snapshot.get(relative)
+        )
 
     def _is_implement_restorable_scope_violation_path(self, path: str) -> bool:
         normalized = str(path).replace("\\", "/").strip()
@@ -18276,7 +18380,17 @@ class Orchestrator:
                         and restore_root is not None
                         and all(self._is_implement_restorable_scope_violation_path(path) for path in offending)
                     ):
-                        self._restore_paths_from_restore_point(offending, restore_root)
+                        unrestored = self._restore_paths_from_restore_point(
+                            offending,
+                            restore_root,
+                            before_snapshot=snapshot_before,
+                        )
+                        if unrestored:
+                            raise RuntimeError(
+                                "auto_agents implementation ownership restore invariant failed. "
+                                "The protected path state did not return to its pre-attempt "
+                                f"worktree and Git index snapshot: {self._changed_path_preview(unrestored)}"
+                            )
                         last_error = (
                             f"stage {stage} modified files outside its ownership during {stage_key}. "
                             f"Changed paths: {self._changed_path_preview(offending)}. "
@@ -18305,7 +18419,17 @@ class Orchestrator:
                             for path in offending
                         )
                     ):
-                        self._restore_paths_from_restore_point(offending, restore_root)
+                        unrestored = self._restore_paths_from_restore_point(
+                            offending,
+                            restore_root,
+                            before_snapshot=snapshot_before,
+                        )
+                        if unrestored:
+                            raise RuntimeError(
+                                "auto_agents clarify ownership restore invariant failed. "
+                                "The protected path state did not return to its pre-attempt "
+                                f"worktree and Git index snapshot: {self._changed_path_preview(unrestored)}"
+                            )
                         last_error = (
                             f"stage {stage} modified files outside its ownership during {stage_key}. "
                             f"Changed paths: {self._changed_path_preview(offending)}. "

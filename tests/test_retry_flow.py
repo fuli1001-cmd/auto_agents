@@ -1061,6 +1061,51 @@ class RecoveringProtectedInputMutationImplementAdapter:
         )
 
 
+class RecoveringStagedPublicSpecMutationImplementAdapter:
+    def __init__(self, project_root: Path) -> None:
+        self.project_root = project_root
+        self.implement_calls = 0
+        self.second_attempt_spec_status = ""
+
+    def run(self, request):
+        if request.stage == "implement":
+            self.implement_calls += 1
+            write_text(self.project_root / "artifact.txt", "good\n")
+            if self.implement_calls == 1:
+                write_text(
+                    self.project_root / "spec.md",
+                    "# Unauthorized staged public spec change\n",
+                )
+                subprocess.run(
+                    ["git", "add", "--", "spec.md"],
+                    cwd=str(self.project_root),
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                summary = "implemented with a staged protected spec mutation\n"
+            else:
+                self.second_attempt_spec_status = subprocess.run(
+                    ["git", "status", "--short", "--", "spec.md"],
+                    cwd=str(self.project_root),
+                    check=True,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                ).stdout
+                summary = "implemented clean retry\n"
+        else:
+            summary = f"{request.stage}\n"
+        write_text(request.output_path, summary)
+        return AgentResult(
+            ok=True,
+            command=["fake"],
+            output_path=request.output_path,
+            summary=summary.strip(),
+            returncode=0,
+        )
+
+
 class PublicSpecImplementAdapter:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
@@ -3043,6 +3088,52 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(
                 (project_root / "specs" / "2026-05-07-iter-01.md").read_text(encoding="utf-8"),
                 "original spec\n",
+            )
+
+    def test_implement_retry_restores_staged_public_spec_index_and_worktree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(project_root / "spec.md", "# Public product spec\n")
+            iteration_spec = project_root / "specs" / "iteration.md"
+            write_text(iteration_spec, "# Immutable iteration input\n")
+            commit_all(project_root, "chore: seed staged restore test")
+
+            orchestrator = Orchestrator(project_root)
+            orchestrator._active_spec_file = iteration_spec.resolve()
+            adapter = RecoveringStagedPublicSpecMutationImplementAdapter(
+                project_root
+            )
+            orchestrator.adapter = adapter
+            state = load_run_state(project_root)
+
+            result = orchestrator._run_agent_with_retries(
+                state,
+                "implement",
+                "implement-task-001",
+                "Update repository code and tests only.",
+                run_id=state.run_id,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(adapter.implement_calls, 2)
+            self.assertEqual(adapter.second_attempt_spec_status, "")
+            self.assertEqual(
+                (project_root / "spec.md").read_text(encoding="utf-8"),
+                "# Public product spec\n",
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "status", "--short", "--", "spec.md"],
+                    cwd=str(project_root),
+                    check=True,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                ).stdout,
+                "",
             )
 
     def test_implement_stage_restores_archived_task_plan_mutation(self) -> None:
