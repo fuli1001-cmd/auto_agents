@@ -854,6 +854,10 @@ class RootCauseCoordinator:
                 "Do not infer auto_agents ownership from prose alone. Cite inspectable source "
                 "or a reproduced runtime invariant/counterfactual. Cite repository-relative "
                 "source paths so the evidence remains valid after the snapshots are deleted.",
+                "Set generic=true when the proposed fix changes reusable auto_agents engine "
+                "behavior without hard-coding the current project/task, even if this is the "
+                "first observed occurrence. generic does not mean the symptom must already "
+                "have appeared in multiple projects.",
                 "Return exactly one JSON object matching this schema:",
                 json.dumps(schema, ensure_ascii=False, indent=2),
                 "PRIOR_REPORTS:",
@@ -888,6 +892,8 @@ class RootCauseCoordinator:
             reviewer.verdict == "AGREE"
             and reviewer.owner == investigator.owner
             and reviewer.category == investigator.category
+            and reviewer.generic == investigator.generic
+            and reviewer.safe_to_repair == investigator.safe_to_repair
         )
 
     @staticmethod

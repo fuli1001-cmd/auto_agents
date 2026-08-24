@@ -233,6 +233,32 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertIsNotNone(diagnosis.arbiter)
             self.assertEqual(len(fake.requests), 3)
 
+    def test_generic_or_safety_disagreement_requires_arbiter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            investigator = _report(
+                role="investigator",
+                verdict="ROOT_CAUSE",
+            )
+            investigator["generic"] = False
+            reviewer = _report(
+                role="reviewer",
+                verdict="AGREE",
+            )
+            arbiter = _report(
+                role="arbiter",
+                verdict="FINAL",
+                confidence=0.94,
+            )
+            coordinator, fake, _target = self._coordinator(
+                Path(tmp),
+                [investigator, reviewer, arbiter],
+            )
+
+            diagnosis = coordinator.run()
+
+            self.assertTrue(diagnosis.repair_approved)
+            self.assertEqual(len(fake.requests), 3)
+
     def test_target_project_consensus_does_not_start_repair(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, _fake, _target = self._coordinator(
