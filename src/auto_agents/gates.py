@@ -36,7 +36,8 @@ from .process_supervision import run_supervised_shell_command
 
 _PYTEST_FAILED = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
 _VITEST_FAILED = re.compile(
-    r"^\s*FAIL\s+(\S+\.(?:test|spec)\.[jt]sx?(?:\s+>\s+.+)?)$",
+    r"^\s*FAIL\s+(?P<failure>(?P<file>\S+\.(?:test|spec)\.[cm]?[jt]sx?)"
+    r"(?:\s+>\s+.+?)?)(?:\s+\[\s*(?P=file)\s*\])?$",
     re.MULTILINE,
 )
 _UNITTEST_FAILED = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
@@ -167,6 +168,10 @@ class GateCommandTimeoutError(GateCommandExecutionError):
 
 class GateCommandInfrastructureError(GateCommandExecutionError):
     """A test reported that verification infrastructure could not run."""
+
+
+class GateCommandBaselineIdentityError(GateCommandExecutionError):
+    """A baseline failed without yielding a stable semantic failure identity."""
 
 
 def first_terminated_command(gate_result: GateResult) -> Optional[CommandResult]:
@@ -2024,7 +2029,11 @@ def extract_failure_info(gate_result: GateResult) -> FailureExtraction:
         if pytest_ids:
             failures.extend(pytest_ids)
             continue
-        vitest_ids = [item.strip() for item in _VITEST_FAILED.findall(combined) if item.strip()]
+        vitest_ids = [
+            match.group("failure").strip()
+            for match in _VITEST_FAILED.finditer(combined)
+            if match.group("failure").strip()
+        ]
         if vitest_ids:
             failures.extend(vitest_ids)
             continue

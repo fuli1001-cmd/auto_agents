@@ -72,6 +72,7 @@ from .config import (
     write_run_prompt,
 )
 from .gates import (
+    GateCommandBaselineIdentityError,
     GateCommandExecutionError,
     GateCommandInfrastructureError,
     GateCommandTimeoutError,
@@ -115,6 +116,8 @@ from .release_attestation import (
     enqueue_release_verification,
 )
 from .execution_recovery import (
+    BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+    BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY,
     ExecutionIncident,
     ExecutionIncidentStore,
     IncidentDiagnosis,
@@ -7286,6 +7289,9 @@ class Orchestrator:
             reported_infrastructure = (
                 incident.kind == "gate_reported_infrastructure_error"
             )
+            unresolved_failure_identity = (
+                incident.kind == BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
+            )
             attempts = incident.process_snapshot.get(
                 "infrastructure_attempts", []
             )
@@ -7314,16 +7320,27 @@ class Orchestrator:
                 title=(
                     "Repair verification infrastructure"
                     if reported_infrastructure
-                    else "Repair stalled verification command"
+                    else (
+                        "Repair baseline verification identity"
+                        if unresolved_failure_identity
+                        else "Repair stalled verification command"
+                    )
                 ),
                 description=(
                     "Diagnose and repair the target-project verification infrastructure defect. "
                     "The test explicitly reported that its infrastructure could not run and all "
                     "currently eligible workers were already tried. Do not merely rerun the test. "
                     if reported_infrastructure
-                    else
-                    "Diagnose and repair the target-project cause of this supervised verification "
-                    "incident. "
+                    else (
+                        "Diagnose and repair the target-project verification contract. The "
+                        "baseline command failed without emitting a stable test or suite "
+                        "identity after its bounded diagnostic rerun. Do not merely rerun the "
+                        "test. "
+                        if unresolved_failure_identity
+                        else
+                        "Diagnose and repair the target-project cause of this supervised "
+                        "verification incident. "
+                    )
                 )
                 + (
                     "Do not weaken, skip, xfail, or remove verification. Do not increase "
@@ -13317,9 +13334,14 @@ class Orchestrator:
         incident_result = (
             replace(
                 failed_result,
-                infrastructure_error=True,
-                infrastructure_failure_id="baseline_failure_identity_unresolved",
-                infrastructure_contract="stable_test_failure_ids",
+                process_snapshot={
+                    **dict(failed_result.process_snapshot),
+                    BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY: {
+                        "status": "unresolved",
+                        "contract": "stable_test_failure_ids",
+                        "repair_scope": "verification_contract",
+                    },
+                },
             )
             if failed_result is not None
             else None
@@ -13352,7 +13374,7 @@ class Orchestrator:
                 conda_hint = ""
         else:
             conda_hint = ""
-        raise GateCommandInfrastructureError(
+        raise GateCommandBaselineIdentityError(
             f"{context} failed before producing stable test-case failure ids; "
             "the result was not cached as a semantic baseline"
             + conda_hint

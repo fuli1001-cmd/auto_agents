@@ -36,6 +36,8 @@ INCIDENT_OWNERS = {
     "user_input",
     "unknown",
 }
+BASELINE_FAILURE_IDENTITY_INCIDENT_KIND = "gate_baseline_failure_identity_unresolved"
+BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY = "baseline_failure_identity"
 _WATCH_PATTERN = re.compile(
     r"(?:^|\s)(?:--watch(?:All)?\b|watch\b|pytest-watch\b|vitest(?!\s+run\b)(?:\s+watch)?\b)",
     re.IGNORECASE,
@@ -272,14 +274,27 @@ def command_incident(
         ),
         "",
     )
-    if result.infrastructure_failure_id:
+    baseline_identity = result.process_snapshot.get(
+        BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY,
+        {},
+    )
+    baseline_identity_unresolved = bool(
+        baseline
+        and isinstance(baseline_identity, dict)
+        and str(baseline_identity.get("status", "")).strip().lower()
+        == "unresolved"
+    )
+    if baseline_identity_unresolved:
+        kind = BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
+    elif result.infrastructure_failure_id:
         kind = "gate_reported_infrastructure_error"
     elif result.infrastructure_error:
         kind = "gate_infrastructure_error"
     else:
         kind = "gate_stall" if result.termination_reason == "stalled" else "gate_timeout"
     if (
-        not result.infrastructure_error
+        not baseline_identity_unresolved
+        and not result.infrastructure_error
         and result.termination_reason not in {"timeout", "stalled"}
     ):
         kind = f"gate_{result.termination_reason or 'abnormal_exit'}"
@@ -412,6 +427,27 @@ def deterministic_diagnosis(incident: ExecutionIncident) -> Optional[IncidentDia
             confidence=0.95,
             reason="provider supervision termination uses the existing resume/failover route",
             evidence=[f"termination_reason={incident.termination_reason}"],
+        )
+    baseline_identity = incident.process_snapshot.get(
+        BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY,
+        {},
+    )
+    if incident.kind == BASELINE_FAILURE_IDENTITY_INCIDENT_KIND:
+        contract = (
+            str(baseline_identity.get("contract", "")).strip()
+            if isinstance(baseline_identity, dict)
+            else ""
+        )
+        return IncidentDiagnosis(
+            owner="verification_contract",
+            action="RECOVER_TARGET",
+            confidence=1.0,
+            reason=(
+                "the verification baseline failed without a stable semantic "
+                "failure identity"
+            ),
+            evidence=[f"contract={contract or 'unspecified'}"],
+            cause_status="confirmed",
         )
     marker = incident.process_snapshot.get("reported_infrastructure_marker", {})
     repair_scope = (

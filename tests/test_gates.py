@@ -1575,6 +1575,31 @@ class GateTests(unittest.TestCase):
             ],
         )
 
+    def test_extract_vitest_bracketed_suite_failure_id(self) -> None:
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="npm exec -- vitest run src/e2e/setup.test.ts",
+                    ok=False,
+                    returncode=1,
+                    stdout=(
+                        " FAIL  src/e2e/setup.test.ts "
+                        "[ src/e2e/setup.test.ts ]\n"
+                        "Error: Hook timed out in 90000ms.\n"
+                        " Test Files  1 failed (1)\n"
+                        "      Tests  17 skipped (17)\n"
+                    ),
+                    stderr="",
+                )
+            ],
+        )
+
+        info = extract_failure_info(gate)
+
+        self.assertTrue(info.comparable)
+        self.assertEqual(info.failure_ids, ["src/e2e/setup.test.ts"])
+
 
 if __name__ == "__main__":
     unittest.main()

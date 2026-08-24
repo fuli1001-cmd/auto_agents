@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.gates import GateCommandInfrastructureError
+from auto_agents.gates import GateCommandBaselineIdentityError
 from auto_agents.git_ops import (
     add_worktree,
     changed_files,
@@ -68,13 +68,55 @@ class RecoveryResilienceTests(unittest.TestCase):
             )
             orchestrator._gate_baseline_cache.put = Mock()
 
-            with self.assertRaises(GateCommandInfrastructureError):
+            with self.assertRaises(GateCommandBaselineIdentityError) as raised:
                 orchestrator._ensure_task_verify_baseline(task)
 
+            self.assertIsNotNone(raised.exception.result)
+            self.assertFalse(raised.exception.result.infrastructure_error)
+            self.assertFalse(raised.exception.result.infrastructure_failure_id)
+            identity = raised.exception.result.process_snapshot[
+                "baseline_failure_identity"
+            ]
+            self.assertEqual(identity["repair_scope"], "verification_contract")
             self.assertEqual(task.verify_baseline_ref, "")
             self.assertEqual(task.verify_baseline_failures, [])
             self.assertEqual(task.verify_baseline_schema_version, 0)
             orchestrator._gate_baseline_cache.put.assert_not_called()
+
+    def test_bracketed_vitest_suite_baseline_has_stable_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            test_file = "src/e2e/setup.test.ts"
+            gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=f"npm exec -- vitest run {test_file}",
+                        ok=False,
+                        returncode=1,
+                        stdout=(
+                            f" FAIL  {test_file} [ {test_file} ]\n"
+                            "Error: Hook timed out in 90000ms.\n"
+                            " Test Files  1 failed (1)\n"
+                            "      Tests  17 skipped (17)\n"
+                        ),
+                    )
+                ],
+                summary="one failed suite",
+            )
+            orchestrator._run_verify_failure_identity_diagnostic = Mock(
+                side_effect=AssertionError(
+                    "a stable suite identity must not require a diagnostic rerun"
+                )
+            )
+
+            failures = orchestrator._validated_baseline_failures(
+                gate,
+                context="task baseline verification commands",
+            )
+
+            self.assertEqual(failures, [test_file])
 
     def test_stable_test_baseline_is_versioned_after_capture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

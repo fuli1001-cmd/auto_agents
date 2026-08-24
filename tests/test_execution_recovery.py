@@ -8,6 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.execution_recovery import (
+    BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
     ExecutionIncident,
     ExecutionIncidentStore,
     IncidentDiagnosis,
@@ -27,6 +28,7 @@ from auto_agents.models import (
     VerificationStep,
 )
 from auto_agents.gates import (
+    GateCommandBaselineIdentityError,
     GateCommandInfrastructureError,
     GateCommandTimeoutError,
     classify_reported_infrastructure_failure,
@@ -330,6 +332,85 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertEqual(
                 state.execution_incidents[-1]["diagnosis"]["owner"],
                 "target_project",
+            )
+
+    def test_unresolved_baseline_identity_routes_to_verification_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            command = "npm exec -- vitest run src/e2e/setup.test.ts"
+            gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout=(
+                            "Error: suite setup failed before test collection\n"
+                            " Test Files  1 failed (1)\n"
+                            "      Tests  17 skipped (17)\n"
+                        ),
+                    )
+                ],
+                summary="suite setup failed",
+            )
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_run_verify_failure_identity_diagnostic",
+                    return_value=gate,
+                ),
+                self.assertRaises(GateCommandBaselineIdentityError) as raised,
+            ):
+                orchestrator._validated_baseline_failures(
+                    gate,
+                    context="lazy task baseline verification",
+                    task_id="task-setup",
+                )
+
+            result = raised.exception.result
+            self.assertIsNotNone(result)
+            self.assertFalse(result.termination_reason)
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse(result.infrastructure_error)
+            self.assertFalse(result.infrastructure_failure_id)
+            with patch.object(
+                orchestrator,
+                "_agent_diagnose_execution_incident",
+                side_effect=AssertionError("repair scope must route deterministically"),
+            ):
+                recovered = orchestrator._handle_gate_execution_incident(
+                    state,
+                    "implement",
+                    raised.exception,
+                )
+
+            self.assertTrue(recovered)
+            incident = state.execution_incidents[-1]
+            self.assertEqual(
+                incident["kind"],
+                BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+            )
+            self.assertEqual(
+                incident["diagnosis"]["owner"],
+                "verification_contract",
+            )
+            self.assertEqual(
+                incident["diagnosis"]["action"],
+                "RECOVER_TARGET",
+            )
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(
+                load_task_plan(root)["tasks"][0]["title"],
+                "Repair baseline verification identity",
+            )
+            self.assertEqual(
+                load_task_plan(root)["tasks"][0]["verification_refs"],
+                [f"cmd:{command}"],
             )
 
     def test_workspace_conda_repair_resumes_before_repeat_route_guard(self) -> None:
