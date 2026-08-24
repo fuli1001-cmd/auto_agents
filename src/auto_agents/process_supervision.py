@@ -349,6 +349,7 @@ def run_supervised_shell_command(
         next_activity_probe = started
         termination_reason = ""
         cleanup_incomplete = False
+        post_exit_cleanup: Dict[str, object] = {}
         try:
             while process.poll() is None:
                 now = time.monotonic()
@@ -395,6 +396,21 @@ def run_supervised_shell_command(
             returncode = process.poll()
             if returncode is None:
                 returncode = 124 if termination_reason in {"timeout", "stalled"} else 130
+            elif not termination_reason and process_group_exists(record.pgid):
+                residual_snapshot = _process_group_snapshot(record.pgid)
+                terminated = terminate_process_group(process, pgid=record.pgid)
+                cleanup_incomplete = terminated.cleanup_incomplete
+                post_exit_cleanup = {
+                    "required": True,
+                    "term_sent": terminated.term_sent,
+                    "kill_sent": terminated.kill_sent,
+                    "cleanup_incomplete": cleanup_incomplete,
+                    "residual_members": residual_snapshot.get("members", []),
+                }
+                process_snapshot = {
+                    **residual_snapshot,
+                    "post_exit_cleanup": post_exit_cleanup,
+                }
         except BaseException:
             terminated = terminate_process_group(process, pgid=record.pgid)
             cleanup_incomplete = terminated.cleanup_incomplete
@@ -422,6 +438,10 @@ def run_supervised_shell_command(
             if cleanup_incomplete:
                 diagnostic += "; process group cleanup is incomplete"
             stderr = f"{stderr}\n{diagnostic}".strip()
+        elif post_exit_cleanup and cleanup_incomplete:
+            stderr = (
+                f"{stderr}\ncommand exited but residual process group cleanup is incomplete"
+            ).strip()
         return SupervisedCommandResult(
             stdout=stdout,
             stderr=stderr,

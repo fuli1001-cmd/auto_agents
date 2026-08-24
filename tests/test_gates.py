@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -35,6 +37,7 @@ from auto_agents.models import (
     InfrastructureFailureMarker,
     VerificationStep,
 )
+from auto_agents.process_supervision import process_group_exists
 
 
 class _RecordingGateExecutor:
@@ -217,6 +220,48 @@ class GateTests(unittest.TestCase):
             self.assertEqual(result.commands[1].returncode, 3)
             self.assertIn("command failed:", result.summary)
             self.assertIn("python3 -c \"import sys; sys.exit(3)\"", result.summary)
+
+    def test_run_commands_reaps_residual_process_group_after_command_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for exit_code in (0, 1):
+                with self.subTest(exit_code=exit_code):
+                    marker = Path(tmp) / f"residual-{exit_code}.txt"
+                    child_code = "import time; time.sleep(60)"
+                    script = (
+                        "import os, subprocess, sys; from pathlib import Path; "
+                        f"child=subprocess.Popen([{sys.executable!r}, '-c', {child_code!r}]); "
+                        f"Path({str(marker)!r}).write_text("
+                        "str(child.pid) + ' ' + str(os.getpgrp()), encoding='utf-8'); "
+                        f"sys.exit({exit_code})"
+                    )
+                    pgid = 0
+                    try:
+                        result = run_commands(
+                            [f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"],
+                            Path(tmp),
+                        )
+                        _child_pid, raw_pgid = marker.read_text(encoding="utf-8").split()
+                        pgid = int(raw_pgid)
+
+                        self.assertEqual(result.ok, exit_code == 0)
+                        command = result.commands[0]
+                        self.assertEqual(command.returncode, exit_code)
+                        self.assertFalse(command.cleanup_incomplete)
+                        self.assertFalse(process_group_exists(pgid))
+                        self.assertEqual(
+                            command.process_snapshot["post_exit_cleanup"],
+                            {
+                                "required": True,
+                                "term_sent": True,
+                                "kill_sent": False,
+                                "cleanup_incomplete": False,
+                                "residual_members": command.process_snapshot["members"],
+                            },
+                        )
+                        self.assertTrue(command.process_snapshot["members"])
+                    finally:
+                        if pgid > 0 and process_group_exists(pgid):
+                            os.killpg(pgid, signal.SIGKILL)
 
     def test_run_commands_enforces_hard_timeout_and_preserves_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
