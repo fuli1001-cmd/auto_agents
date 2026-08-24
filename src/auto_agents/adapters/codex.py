@@ -139,7 +139,7 @@ class CodexAdapter(AgentAdapter):
                 "--json",
                 "--skip-git-repo-check",
                 "--sandbox",
-                "workspace-write",
+                request.sandbox_mode or "workspace-write",
                 self.config.cwd_flag,
                 str(request.cwd),
                 self.config.output_flag,
@@ -160,7 +160,7 @@ class CodexAdapter(AgentAdapter):
         env = dict(os.environ)
         env["AUTO_AGENTS_STAGE"] = request.stage
         env["AUTO_AGENTS_EFFORT"] = request.effort
-        timeout = self.config.timeout_seconds or None
+        timeout = request.timeout_seconds or self.config.timeout_seconds or None
 
         # Wrap the stream callback to parse codex JSON lines in real-time,
         # forwarding only visible agent messages (not raw JSON).

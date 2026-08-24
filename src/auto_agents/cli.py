@@ -481,9 +481,37 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
             else {}
         )
         reason = str(blocker.get("reason") or state_payload.get("last_error", "")).strip()
+        triage = blocker.get("self_repair_triage")
+        root_cause_lines: list[str] = []
+        if isinstance(triage, dict):
+            diagnosis = triage.get("root_cause")
+            final = (
+                diagnosis.get("final")
+                if isinstance(diagnosis, dict)
+                else None
+            )
+            if isinstance(final, dict):
+                owner = str(final.get("owner", "")).strip()
+                category = str(final.get("category", "")).strip()
+                evidence_path = str(
+                    diagnosis.get("evidence_path", "")
+                ).strip()
+                root_cause_lines = [
+                    (
+                        "Root cause: "
+                        + (owner or "unknown")
+                        + (f" / {category}" if category else "")
+                    ),
+                    *(
+                        [f"Diagnosis evidence: {evidence_path}"]
+                        if evidence_path
+                        else []
+                    ),
+                ]
         lines = [
             f"Run blocked at stage: {current_stage}.",
             *([f"Reason: {reason}"] if reason else []),
+            *root_cause_lines,
             "",
             "Key files to review:",
             *[f"- {item}" for item in key_files],
@@ -770,6 +798,7 @@ def _auto_repair_auto_agents_and_resume(
     decision: SelfRepairDecision,
     args,
     run_lock: ProjectRunLock,
+    diagnosis=None,
 ) -> int:
     orchestrator.record_run_blocker(
         owner="auto_agents",
@@ -777,6 +806,16 @@ def _auto_repair_auto_agents_and_resume(
         reason=decision.reason or str(error),
         fingerprint=decision.fingerprint,
     )
+    if diagnosis is not None:
+        state = load_run_state(project_root)
+        blocker = dict(state.active_blocker)
+        blocker["root_cause_diagnosis"] = {
+            "diagnosis_id": diagnosis.diagnosis_id,
+            "evidence_path": diagnosis.evidence_path,
+            "final": diagnosis.final.to_dict(),
+        }
+        state.active_blocker = blocker
+        save_run_state(project_root, state)
     print(
         "Run hit an auto_agents-owned failure. Starting automatic auto_agents self-repair...",
         file=sys.stderr,
@@ -786,6 +825,7 @@ def _auto_repair_auto_agents_and_resume(
         target_project_root=project_root,
         error=error,
         decision=decision,
+        diagnosis=diagnosis,
         print_agent_output=bool(getattr(args, "print_agent_output", False)),
     )
     result = runner.run()
@@ -873,9 +913,21 @@ def _triage_terminal_run_error(
     if orchestrator is None:
         fallback = classify_auto_agents_error(error, state=state)
         return SelfRepairTriageResult(
-            decision=fallback,
-            source="heuristic_fallback",
-            reason="provider triage is unavailable before orchestrator initialization",
+            decision=SelfRepairDecision(
+                False,
+                category=(
+                    fallback.category
+                    or "root_cause_diagnosis_unavailable"
+                ),
+                reason=(
+                    "root-cause diagnosis is unavailable before orchestrator "
+                    "initialization; automatic repair fails closed"
+                ),
+                fingerprint=fallback.fingerprint,
+                repeat_count=fallback.repeat_count,
+            ),
+            source="root_cause_failed",
+            reason="orchestrator initialization did not complete",
             provider_error="orchestrator initialization did not complete",
         )
     traceback_text = traceback.format_exc()
@@ -1675,12 +1727,12 @@ def main(argv: list[str] | None = None) -> int:
                 if isinstance(state_payload.get("active_blocker", {}), dict)
                 else {}
             )
-            if state_status == "blocked":
+            if state_status in {"blocked", "failed"}:
                 blocked_error = RuntimeError(
                     str(
                         blocker.get("reason", "")
                         or state_payload.get("last_error", "")
-                        or "run blocked without a reason"
+                        or f"run {state_status} without a reason"
                     )
                 )
                 triage = _triage_terminal_run_error(
@@ -1696,6 +1748,7 @@ def main(argv: list[str] | None = None) -> int:
                         triage.decision,
                         args,
                         run_lock,
+                        diagnosis=triage.root_cause,
                     )
                 _record_blocked_self_repair_triage(project_root, triage)
                 print(_render_run_summary(project_root, state_payload))
@@ -1727,16 +1780,6 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"ok": False, "error": reason}, indent=2, ensure_ascii=False))
             return 130
         except Exception as error:
-            if (
-                orchestrator is not None
-                and hasattr(orchestrator, "is_provider_research_blocked_error")
-                and orchestrator.is_provider_research_blocked_error(str(error))
-            ):
-                return _auto_resolve_provider_blocker(
-                    project_root,
-                    orchestrator,
-                    print_agent_output=bool(args.print_agent_output),
-                )
             project_root = Path(args.project)
             triage = _triage_terminal_run_error(project_root, orchestrator, error)
             decision = triage.decision
@@ -1748,6 +1791,17 @@ def main(argv: list[str] | None = None) -> int:
                     decision,
                     args,
                     run_lock,
+                    diagnosis=triage.root_cause,
+                )
+            if (
+                orchestrator is not None
+                and hasattr(orchestrator, "is_provider_research_blocked_error")
+                and orchestrator.is_provider_research_blocked_error(str(error))
+            ):
+                return _auto_resolve_provider_blocker(
+                    project_root,
+                    orchestrator,
+                    print_agent_output=bool(args.print_agent_output),
                 )
             _block_terminal_run_error(project_root, orchestrator, error, triage)
             _notify_run_blocked(project_root, error)

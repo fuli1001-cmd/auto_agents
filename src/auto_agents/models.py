@@ -1026,6 +1026,46 @@ class ProviderFailoverConfig:
 
 
 @dataclass
+class SelfRepairDiagnosisConfig:
+    mode: str = "all_terminal"
+    investigator_timeout_seconds: int = 900
+    reviewer_timeout_seconds: int = 600
+    arbiter_timeout_seconds: int = 600
+    command_timeout_seconds: int = 300
+    max_dynamic_commands: int = 12
+    confidence_threshold: float = 0.85
+    arbiter_confidence_threshold: float = 0.90
+    max_repair_cycles: int = 2
+    network_enabled: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "SelfRepairDiagnosisConfig":
+        return cls(
+            mode=str(data.get("mode", "all_terminal")).strip() or "all_terminal",
+            investigator_timeout_seconds=int(
+                data.get("investigator_timeout_seconds", 900)
+            ),
+            reviewer_timeout_seconds=int(
+                data.get("reviewer_timeout_seconds", 600)
+            ),
+            arbiter_timeout_seconds=int(
+                data.get("arbiter_timeout_seconds", 600)
+            ),
+            command_timeout_seconds=int(data.get("command_timeout_seconds", 300)),
+            max_dynamic_commands=int(data.get("max_dynamic_commands", 12)),
+            confidence_threshold=float(data.get("confidence_threshold", 0.85)),
+            arbiter_confidence_threshold=float(
+                data.get("arbiter_confidence_threshold", 0.90)
+            ),
+            max_repair_cycles=int(data.get("max_repair_cycles", 2)),
+            network_enabled=bool(data.get("network_enabled", False)),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class ExecutionConfig:
     parallel_tasks: ParallelTasksConfig = field(default_factory=ParallelTasksConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
@@ -1034,6 +1074,9 @@ class ExecutionConfig:
     smart_timeout: SmartTimeoutConfig = field(default_factory=SmartTimeoutConfig)
     provider_failover: ProviderFailoverConfig = field(
         default_factory=ProviderFailoverConfig
+    )
+    self_repair_diagnosis: SelfRepairDiagnosisConfig = field(
+        default_factory=SelfRepairDiagnosisConfig
     )
 
     @classmethod
@@ -1053,6 +1096,9 @@ class ExecutionConfig:
             provider_failover=ProviderFailoverConfig.from_dict(
                 dict(data.get("provider_failover", {}))
             ),
+            self_repair_diagnosis=SelfRepairDiagnosisConfig.from_dict(
+                dict(data.get("self_repair_diagnosis", {}))
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1063,6 +1109,7 @@ class ExecutionConfig:
             "evidence_preflight": self.evidence_preflight.to_dict(),
             "smart_timeout": self.smart_timeout.to_dict(),
             "provider_failover": self.provider_failover.to_dict(),
+            "self_repair_diagnosis": self.self_repair_diagnosis.to_dict(),
         }
 
 
@@ -1612,6 +1659,8 @@ class AgentRequest:
     attempt_id: str = ""
     progress_report_path: Optional[Path] = None
     resume_session_id: str = ""
+    sandbox_mode: str = ""
+    timeout_seconds: int = 0
 
 
 @dataclass

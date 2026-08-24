@@ -2209,6 +2209,54 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 errors.append("execution.evidence_preflight must be an object")
             elif evidence_preflight.get("mode", "high_risk") not in {"off", "high_risk", "all"}:
                 errors.append("execution.evidence_preflight.mode must be one of: off, high_risk, all")
+            diagnosis = execution.get("self_repair_diagnosis", {})
+            if not isinstance(diagnosis, dict):
+                errors.append("execution.self_repair_diagnosis must be an object")
+            else:
+                if diagnosis.get("mode", "all_terminal") not in {
+                    "off",
+                    "all_terminal",
+                }:
+                    errors.append(
+                        "execution.self_repair_diagnosis.mode must be one of: "
+                        "off, all_terminal"
+                    )
+                for key, default in {
+                    "investigator_timeout_seconds": 900,
+                    "reviewer_timeout_seconds": 600,
+                    "arbiter_timeout_seconds": 600,
+                    "command_timeout_seconds": 300,
+                    "max_dynamic_commands": 12,
+                    "max_repair_cycles": 2,
+                }.items():
+                    value = diagnosis.get(key, default)
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 1
+                    ):
+                        errors.append(
+                            f"execution.self_repair_diagnosis.{key} "
+                            "must be an integer >= 1"
+                        )
+                for key, default in {
+                    "confidence_threshold": 0.85,
+                    "arbiter_confidence_threshold": 0.90,
+                }.items():
+                    value = diagnosis.get(key, default)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not 0.0 <= float(value) <= 1.0
+                    ):
+                        errors.append(
+                            f"execution.self_repair_diagnosis.{key} "
+                            "must be between 0 and 1"
+                        )
+                if not isinstance(diagnosis.get("network_enabled", False), bool):
+                    errors.append(
+                        "execution.self_repair_diagnosis.network_enabled must be a boolean"
+                    )
             smart_timeout = execution.get("smart_timeout", {})
             if not isinstance(smart_timeout, dict):
                 errors.append("execution.smart_timeout must be an object")

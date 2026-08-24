@@ -408,6 +408,18 @@ class ProjectValidationTests(unittest.TestCase):
             "quota_cooldown_seconds": 3600,
             "max_cooldown_seconds": 300,
         }
+        payload["execution"]["self_repair_diagnosis"] = {
+            "mode": "sometimes",
+            "investigator_timeout_seconds": 0,
+            "reviewer_timeout_seconds": 600,
+            "arbiter_timeout_seconds": 600,
+            "command_timeout_seconds": 300,
+            "max_dynamic_commands": 0,
+            "confidence_threshold": 1.5,
+            "arbiter_confidence_threshold": 0.9,
+            "max_repair_cycles": 0,
+            "network_enabled": "yes",
+        }
 
         errors = validate_project_config_payload(payload)
 
@@ -418,6 +430,25 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(any("provider_failover.probe_enabled" in item for item in errors))
         self.assertTrue(any("provider_failover.probe_timeout_seconds" in item for item in errors))
         self.assertTrue(any("max_cooldown_seconds must be" in item for item in errors))
+        self.assertTrue(any("self_repair_diagnosis.mode" in item for item in errors))
+        self.assertTrue(
+            any(
+                "self_repair_diagnosis.investigator_timeout_seconds" in item
+                for item in errors
+            )
+        )
+        self.assertTrue(
+            any(
+                "self_repair_diagnosis.confidence_threshold" in item
+                for item in errors
+            )
+        )
+        self.assertTrue(
+            any(
+                "self_repair_diagnosis.network_enabled" in item
+                for item in errors
+            )
+        )
 
     def test_task_plan_validation_rejects_invalid_recovery_lineage(self) -> None:
         task = {
@@ -1586,11 +1617,56 @@ class ProjectValidationTests(unittest.TestCase):
 
             def _call_with_failover(self, request):
                 self.request = request
+                role = request.stage.removeprefix("self_repair_")
+                structured = {
+                    "schema_version": 1,
+                    "role": role,
+                    "verdict": (
+                        "ROOT_CAUSE"
+                        if role == "investigator"
+                        else "AGREE"
+                    ),
+                    "owner": "auto_agents",
+                    "confidence": 0.96,
+                    "category": payload["category"],
+                    "generic": True,
+                    "safe_to_repair": True,
+                    "causal_chain": [
+                        "orchestrator rewrote verified evidence",
+                        "review observed stale generated evidence",
+                    ],
+                    "evidence": [
+                        {
+                            "kind": "source",
+                            "ref": "src/auto_agents/orchestrator.py:1",
+                            "claim": (
+                                "verified evidence is rewritten before review"
+                            ),
+                        },
+                        {
+                            "kind": "test",
+                            "ref": "tests/test_retry_flow.py",
+                            "claim": "four verification passes precede rejection",
+                        },
+                    ],
+                    "rejected_hypotheses": [],
+                    "reproduction_commands": [
+                        "pytest -q tests/test_retry_flow.py"
+                    ],
+                    "reproduction_outcome": "lifecycle defect reproduced",
+                    "proposed_fix_scope": [
+                        "src/auto_agents/orchestrator.py"
+                    ],
+                    "verification_commands": [
+                        "python -m pytest -q tests/test_retry_flow.py"
+                    ],
+                    "resume_strategy": "repair_and_resume",
+                }
                 return AgentResult(
                     ok=True,
                     command=[],
                     output_path=request.output_path,
-                    summary=json.dumps(payload),
+                    summary=json.dumps(structured),
                 )
 
         orchestrator = FakeOrchestrator()
@@ -1619,9 +1695,9 @@ class ProjectValidationTests(unittest.TestCase):
         )
 
         self.assertTrue(result.decision.eligible)
-        self.assertEqual(result.source, "provider")
+        self.assertEqual(result.source, "root_cause_consensus")
         self.assertEqual(result.decision.category, "generated_artifact_lifecycle")
-        self.assertEqual(orchestrator.request.stage, "self_repair_triage")
+        self.assertEqual(orchestrator.request.stage, "self_repair_reviewer")
         self.assertIn("review rejected the task", orchestrator.request.prompt)
         self.assertIn("REQ-102 audit paragraph is still stale", orchestrator.request.prompt)
         self.assertIn("all commands passed", orchestrator.request.prompt)
@@ -1822,10 +1898,10 @@ class ProjectValidationTests(unittest.TestCase):
         )
 
         self.assertFalse(result.decision.eligible)
-        self.assertEqual(result.source, "provider")
+        self.assertEqual(result.source, "root_cause_consensus")
         self.assertEqual(result.judgment.owner, "target_project")
 
-    def test_provider_triage_failure_uses_conservative_heuristic_fallback(self) -> None:
+    def test_root_cause_diagnosis_failure_blocks_without_consensus(self) -> None:
         scope_error = (
             "Task task-224 failed gates: verification scope mismatch: new failures are outside "
             "this task's owned test/proof surface"
@@ -1849,8 +1925,8 @@ class ProjectValidationTests(unittest.TestCase):
             env={},
         )
 
-        self.assertTrue(result.decision.eligible)
-        self.assertEqual(result.source, "heuristic_fallback")
+        self.assertFalse(result.decision.eligible)
+        self.assertEqual(result.source, "root_cause_failed")
         self.assertIn("JSON object", result.provider_error)
 
         rejected = adjudicate_auto_agents_error(
@@ -1860,7 +1936,7 @@ class ProjectValidationTests(unittest.TestCase):
             env={},
         )
         self.assertFalse(rejected.decision.eligible)
-        self.assertEqual(rejected.source, "heuristic_fallback")
+        self.assertEqual(rejected.source, "root_cause_failed")
 
     def test_self_repair_disabled_skips_provider_triage(self) -> None:
         class ProviderMustNotRun:
@@ -2326,6 +2402,57 @@ class ProjectValidationTests(unittest.TestCase):
             triage_run.assert_called_once()
             self.assertIn("baseline gate command timeout", stdout.getvalue())
             self.assertEqual(load_run_state(project_root).status, "blocked")
+
+    def test_cli_failed_result_enters_terminal_root_cause_diagnosis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            def mock_run(_self, *args, **kwargs):
+                del args, kwargs
+                state = load_run_state(project_root)
+                state.status = "failed"
+                state.current_stage = "implement"
+                state.last_error = "terminal failed result"
+                save_run_state(project_root, state)
+                return state
+
+            triage = SelfRepairTriageResult(
+                decision=SelfRepairDecision(
+                    False,
+                    category="target_failure",
+                    reason="target project owns the failure",
+                ),
+                source="root_cause_consensus",
+                reason="no auto_agents repair",
+            )
+            with (
+                patch.object(Orchestrator, "run", mock_run),
+                patch(
+                    "auto_agents.cli._triage_terminal_run_error",
+                    return_value=triage,
+                ) as diagnose,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main(
+                    [
+                        "run",
+                        "--project",
+                        str(project_root),
+                        "--spec-file",
+                        str(spec_file),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 3)
+            diagnose.assert_called_once()
+            self.assertIn(
+                "terminal failed result",
+                str(diagnose.call_args.args[2]),
+            )
 
     def test_cli_run_sends_unexpected_exception_to_provider_triage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3523,6 +3650,35 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(usage.cached_input_tokens if usage else None, 50)
             self.assertEqual(usage.output_tokens if usage else None, 25)
             self.assertEqual(usage.total_tokens if usage else None, 225)
+
+    def test_codex_adapter_honors_diagnostic_sandbox_and_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            output_path = project_root / "diagnosis.json"
+            write_text(output_path, "{}\n")
+            adapter = CodexAdapter(
+                ProviderConfig(timeout_seconds=1800)
+            )
+            request = AgentRequest(
+                stage="self_repair_investigator",
+                effort="max",
+                prompt="inspect only",
+                cwd=project_root,
+                output_path=output_path,
+                sandbox_mode="read-only",
+                timeout_seconds=123,
+            )
+
+            with patch(
+                "auto_agents.adapters.codex.run_subprocess_with_optional_streaming"
+            ) as run_mock:
+                run_mock.return_value = ("", "", 0, False, False)
+                adapter.run(request)
+
+            command = run_mock.call_args.args[0]
+            sandbox_index = command.index("--sandbox")
+            self.assertEqual(command[sandbox_index + 1], "read-only")
+            self.assertEqual(run_mock.call_args.kwargs["timeout"], 123)
 
     def test_run_can_persist_document_language_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

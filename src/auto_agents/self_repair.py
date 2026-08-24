@@ -12,10 +12,26 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .git_ops import changed_paths, commit_all
+from .git_ops import (
+    add_worktree,
+    changed_paths,
+    commit_all,
+    head_ref,
+    remove_worktree,
+)
 from .gates import run_commands
 from .io_utils import read_json, read_text, write_text
-from .models import AgentRequest, AgentResult, RunState
+from .models import (
+    AgentRequest,
+    AgentResult,
+    RunState,
+    SelfRepairDiagnosisConfig,
+)
+from .root_cause import (
+    RootCauseCoordinator,
+    RootCauseDiagnosis,
+    repository_guard_fingerprint,
+)
 from .requirements import forbidden_pattern_definition_reason
 
 
@@ -102,6 +118,7 @@ class SelfRepairTriageResult:
     reason: str
     judgment: Optional[SelfRepairJudgment] = None
     provider_error: str = ""
+    root_cause: Optional[RootCauseDiagnosis] = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -110,6 +127,11 @@ class SelfRepairTriageResult:
             "reason": self.reason,
             "judgment": self.judgment.to_dict() if self.judgment is not None else None,
             "provider_error": self.provider_error,
+            "root_cause": (
+                self.root_cause.to_dict()
+                if self.root_cause is not None
+                else None
+            ),
         }
 
 
@@ -581,11 +603,10 @@ def adjudicate_auto_agents_error(
     traceback_text: str = "",
     env: Optional[dict[str, str]] = None,
 ) -> SelfRepairTriageResult:
-    """Ask the configured provider to classify a terminal run error.
+    """Run evidence-based investigator/reviewer diagnosis for a terminal error.
 
-    The deterministic classifier remains a conservative fallback when the provider
-    cannot produce a valid judgment. A valid provider judgment is authoritative,
-    including a DO_NOT_REPAIR result that overrides an eligible heuristic.
+    Heuristics are hints only. Automatic repair fails closed unless the complete
+    root-cause consensus pipeline proves a generic, safe auto_agents defect.
     """
 
     values = os.environ if env is None else env
@@ -597,44 +618,68 @@ def adjudicate_auto_agents_error(
             reason="self repair is disabled by environment",
         )
 
-    judge = AutoAgentsSelfRepairJudge(
-        orchestrator,
-        target_project_root=target_project_root,
-        error=error,
-        state=state,
-        traceback_text=traceback_text,
-        heuristic=heuristic,
+    config = getattr(
+        getattr(getattr(orchestrator, "config", None), "execution", None),
+        "self_repair_diagnosis",
+        SelfRepairDiagnosisConfig(),
     )
-    try:
-        judgment = judge.run()
-    except Exception as exc:
-        provider_error = _compact_text(str(exc), limit=1200)
-        if heuristic.category == "recovery_route_invariant":
-            return SelfRepairTriageResult(
-                decision=SelfRepairDecision(
-                    False,
-                    category=heuristic.category,
-                    reason=(
-                        "recovery-loop self-repair requires provider confirmation; "
-                        "triage was unavailable"
-                    ),
-                    fingerprint=heuristic.fingerprint,
-                    repeat_count=heuristic.repeat_count,
-                ),
-                source="provider_required",
-                reason="sensitive recovery-loop triage fails closed",
-                provider_error=provider_error,
-            )
+    if config.mode == "off":
         return SelfRepairTriageResult(
             decision=heuristic,
-            source="heuristic_fallback",
+            source="diagnosis_disabled",
+            reason="terminal root-cause diagnosis is disabled by project configuration",
+        )
+    try:
+        diagnosis = RootCauseCoordinator(
+            orchestrator,
+            auto_agents_root=auto_agents_repo_root(),
+            target_root=target_project_root,
+            error=error,
+            state=state,
+            traceback_text=traceback_text,
+            heuristic=heuristic.to_dict(),
+            runtime_evidence=self_repair_runtime_evidence(),
+            config=config,
+        ).run()
+    except Exception as exc:
+        provider_error = _compact_text(str(exc), limit=1200)
+        return SelfRepairTriageResult(
+            decision=SelfRepairDecision(
+                False,
+                category=(
+                    heuristic.category
+                    or "root_cause_diagnosis_unavailable"
+                ),
+                reason=(
+                    "automatic repair requires completed investigator/reviewer "
+                    "evidence consensus; root-cause diagnosis was unavailable"
+                ),
+                fingerprint=heuristic.fingerprint,
+                repeat_count=heuristic.repeat_count,
+            ),
+            source="root_cause_failed",
             reason=(
-                "provider self-repair triage failed; using conservative heuristic fallback"
+                "terminal root-cause diagnosis failed closed"
             ),
             provider_error=provider_error,
         )
 
-    if not judgment.approved:
+    final = diagnosis.final
+    judgment = SelfRepairJudgment(
+        decision=(
+            "SELF_REPAIR"
+            if diagnosis.repair_approved
+            else "DO_NOT_REPAIR"
+        ),
+        owner=final.owner,
+        generic=final.generic,
+        safe_to_self_repair=final.safe_to_repair,
+        confidence=final.confidence,
+        category=final.category,
+        reason=" -> ".join(final.causal_chain),
+        evidence=[item.claim for item in final.evidence],
+    )
+    if not diagnosis.repair_approved:
         return SelfRepairTriageResult(
             decision=SelfRepairDecision(
                 False,
@@ -645,9 +690,10 @@ def adjudicate_auto_agents_error(
                     f"{judgment.reason}"
                 ),
             ),
-            source="provider",
-            reason="provider judgment did not satisfy the high-confidence composite gate",
+            source="root_cause_consensus",
+            reason=diagnosis.reason,
             judgment=judgment,
+            root_cause=diagnosis,
         )
 
     decision = _with_repetition_guard(
@@ -659,17 +705,22 @@ def adjudicate_auto_agents_error(
         str(error or ""),
         values,
         fingerprint_category="provider_judged_auto_agents",
-        max_attempts=(1 if heuristic.category == "recovery_route_invariant" else SELF_REPAIR_MAX_CONSECUTIVE_SAME_ERROR - 1),
+        max_attempts=(
+            1
+            if heuristic.category == "recovery_route_invariant"
+            else config.max_repair_cycles
+        ),
     )
     return SelfRepairTriageResult(
         decision=decision,
-        source="provider",
+        source="root_cause_consensus",
         reason=(
             "provider approved self-repair under the high-confidence composite gate"
             if decision.eligible
             else decision.reason
         ),
         judgment=judgment,
+        root_cause=diagnosis,
     )
 
 
@@ -976,6 +1027,7 @@ def self_repair_verify_commands(env: Optional[dict[str, str]] = None) -> list[st
     if configured:
         return [configured]
     return [
+        "python -m pytest -q tests/test_root_cause.py",
         "python -m pytest -q tests/test_project_validation.py -k "
         "'self_repair or provider_judgment or provider_triage or legacy_efforts or provider_resolve'",
         "python -m pytest -q tests/test_retry_flow.py -k 'scope or verification_scope or recovery'",
@@ -990,12 +1042,14 @@ class AutoAgentsSelfRepairRunner:
         target_project_root: Path,
         error: object,
         decision: SelfRepairDecision,
+        diagnosis: Optional[RootCauseDiagnosis] = None,
         print_agent_output: bool = False,
     ) -> None:
         self.target_orchestrator = target_orchestrator
         self.target_project_root = target_project_root
         self.error = error
         self.decision = decision
+        self.diagnosis = diagnosis
         self.print_agent_output = print_agent_output
         self.repo_root = auto_agents_repo_root()
 
@@ -1012,69 +1066,170 @@ class AutoAgentsSelfRepairRunner:
                     f"changed paths: {preview}"
                 ),
             )
+        base_head = head_ref(self.repo_root)
 
-        prompt = self._build_prompt()
-        prompt_path, output_path = self._artifact_paths()
-        write_text(prompt_path, prompt)
-        effort = self._effort()
-        request = AgentRequest(
-            stage="self_repair",
-            effort=effort,
-            prompt=prompt,
-            cwd=self.repo_root,
-            output_path=output_path,
-            stream_output=(
-                self.target_orchestrator._stream_agent_output_callback("self-repair")
-                if self.print_agent_output
-                and hasattr(self.target_orchestrator, "_stream_agent_output_callback")
-                else None
-            ),
+        target_before = repository_guard_fingerprint(
+            self.target_project_root,
+            ignore_run_artifacts=True,
         )
-        result: AgentResult = self.target_orchestrator._call_with_failover(request)
-        if hasattr(self.target_orchestrator, "_emit_agent_output"):
-            self.target_orchestrator._emit_agent_output("self-repair", result)
-        if not result.ok:
-            return SelfRepairResult(
-                ok=False,
-                status="failed",
-                category=self.decision.category,
-                reason=self._agent_failure_detail(result),
-                summary=result.summary or result.stdout,
-            )
+        with tempfile.TemporaryDirectory(
+            prefix="auto-agents-self-repair-worktree-"
+        ) as tmp:
+            repair_root = Path(tmp) / "repair"
+            created = False
+            try:
+                add_worktree(
+                    self.repo_root,
+                    repair_root,
+                    ref=head_ref(self.repo_root) or "HEAD",
+                )
+                created = True
+                target_snapshot = Path(tmp) / "target-evidence"
+                RootCauseCoordinator._copy_diagnostic_tree(
+                    self.target_project_root,
+                    target_snapshot,
+                )
+                prompt = self._build_prompt(
+                    repair_root,
+                    target_snapshot,
+                )
+                prompt_path, output_path = self._artifact_paths()
+                write_text(prompt_path, prompt)
+                request = AgentRequest(
+                    stage="self_repair",
+                    effort=self._effort(),
+                    prompt=prompt,
+                    cwd=repair_root,
+                    output_path=output_path,
+                    stream_output=(
+                        self.target_orchestrator._stream_agent_output_callback(
+                            "self-repair"
+                        )
+                        if self.print_agent_output
+                        and hasattr(
+                            self.target_orchestrator,
+                            "_stream_agent_output_callback",
+                        )
+                        else None
+                    ),
+                )
+                result: AgentResult = (
+                    self.target_orchestrator._call_with_failover(request)
+                )
+                if hasattr(self.target_orchestrator, "_emit_agent_output"):
+                    self.target_orchestrator._emit_agent_output(
+                        "self-repair",
+                        result,
+                    )
+                if not result.ok:
+                    return SelfRepairResult(
+                        ok=False,
+                        status="failed",
+                        category=self.decision.category,
+                        reason=self._agent_failure_detail(result),
+                        summary=result.summary or result.stdout,
+                    )
 
-        summary = (result.summary or result.stdout).strip()
-        dirty_after = changed_paths(self.repo_root)
-        if not dirty_after:
-            return SelfRepairResult(
-                ok=False,
-                status="failed",
-                category=self.decision.category,
-                reason="self-repair agent completed without changing auto_agents",
-                summary=summary,
-            )
+                summary = (result.summary or result.stdout).strip()
+                if not changed_paths(repair_root):
+                    return SelfRepairResult(
+                        ok=False,
+                        status="failed",
+                        category=self.decision.category,
+                        reason=(
+                            "self-repair agent completed without changing "
+                            "auto_agents"
+                        ),
+                        summary=summary,
+                    )
+                if repository_guard_fingerprint(
+                    self.target_project_root,
+                    ignore_run_artifacts=True,
+                ) != target_before:
+                    return SelfRepairResult(
+                        ok=False,
+                        status="failed",
+                        category=self.decision.category,
+                        reason=(
+                            "self-repair agent modified the target project "
+                            "outside diagnostic artifacts"
+                        ),
+                        summary=summary,
+                    )
 
-        verification = self._run_verification()
-        if not verification.ok:
-            return SelfRepairResult(
-                ok=False,
-                status="failed",
-                category=self.decision.category,
-                reason="self-repair verification failed",
-                summary=summary,
-                verification=verification.summary,
-            )
-
-        commit_message = self._commit_message(summary)
-        commit_sha = commit_all(self.repo_root, commit_message)
-        return SelfRepairResult(
-            ok=True,
-            status="completed",
-            category=self.decision.category,
-            reason=self.decision.reason,
-            commit_sha=commit_sha,
-            summary=summary,
-            verification=verification.summary,
-        )
+                verification = self._run_verification(repair_root)
+                if not verification.ok:
+                    return SelfRepairResult(
+                        ok=False,
+                        status="failed",
+                        category=self.decision.category,
+                        reason="self-repair verification failed",
+                        summary=summary,
+                        verification=verification.summary,
+                    )
+                candidate_commit = commit_all(
+                    repair_root,
+                    self._commit_message(summary),
+                )
+                if (
+                    changed_paths(self.repo_root)
+                    or head_ref(self.repo_root) != base_head
+                ):
+                    return SelfRepairResult(
+                        ok=False,
+                        status="failed",
+                        category=self.decision.category,
+                        reason=(
+                            "auto_agents main checkout changed while isolated "
+                            "self-repair was running"
+                        ),
+                        summary=summary,
+                        verification=verification.summary,
+                    )
+                integrated = subprocess.run(
+                    ["git", "cherry-pick", candidate_commit],
+                    cwd=str(self.repo_root),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    check=False,
+                )
+                if integrated.returncode != 0:
+                    subprocess.run(
+                        ["git", "cherry-pick", "--abort"],
+                        cwd=str(self.repo_root),
+                        text=True,
+                        encoding="utf-8",
+                        capture_output=True,
+                        check=False,
+                    )
+                    return SelfRepairResult(
+                        ok=False,
+                        status="failed",
+                        category=self.decision.category,
+                        reason=(
+                            integrated.stderr.strip()
+                            or "could not integrate isolated self-repair commit"
+                        ),
+                        summary=summary,
+                        verification=verification.summary,
+                    )
+                commit_sha = head_ref(self.repo_root)
+                return SelfRepairResult(
+                    ok=True,
+                    status="completed",
+                    category=self.decision.category,
+                    reason=self.decision.reason,
+                    commit_sha=commit_sha,
+                    summary=summary,
+                    verification=verification.summary,
+                )
+            finally:
+                if created:
+                    try:
+                        remove_worktree(self.repo_root, repair_root, force=True)
+                    except RuntimeError:
+                        pass
 
     def _effort(self) -> str:
         config = getattr(self.target_orchestrator, "config", None)
@@ -1088,7 +1243,11 @@ class AutoAgentsSelfRepairRunner:
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         return prompt_path, output_path
 
-    def _build_prompt(self) -> str:
+    def _build_prompt(
+        self,
+        repair_root: Optional[Path] = None,
+        target_evidence_root: Optional[Path] = None,
+    ) -> str:
         state_payload = {}
         try:
             from .config import load_run_state
@@ -1096,15 +1255,71 @@ class AutoAgentsSelfRepairRunner:
             state_payload = load_run_state(self.target_project_root).to_dict()
         except Exception:
             state_payload = {}
+        if target_evidence_root is not None:
+            state_payload = json.loads(
+                json.dumps(state_payload, ensure_ascii=False)
+                .replace(
+                    str(self.target_project_root),
+                    str(target_evidence_root),
+                )
+                .replace(
+                    str(self.repo_root),
+                    str(repair_root or self.repo_root),
+                )
+            )
+        error_text = str(self.error).strip()
+        classifier_reason = self.decision.reason
+        if target_evidence_root is not None:
+            error_text = error_text.replace(
+                str(self.target_project_root),
+                str(target_evidence_root),
+            )
+            classifier_reason = classifier_reason.replace(
+                str(self.target_project_root),
+                str(target_evidence_root),
+            )
+        if repair_root is not None:
+            error_text = error_text.replace(
+                str(self.repo_root),
+                str(repair_root),
+            )
+            classifier_reason = classifier_reason.replace(
+                str(self.repo_root),
+                str(repair_root),
+            )
 
+        diagnosis_payload = (
+            self.diagnosis.to_dict() if self.diagnosis is not None else {}
+        )
+        if target_evidence_root is not None:
+            serialized = json.dumps(diagnosis_payload, ensure_ascii=False)
+            diagnosis_payload = json.loads(
+                serialized.replace(
+                    str(self.target_project_root),
+                    str(target_evidence_root),
+                ).replace(
+                    str(self.repo_root),
+                    str(repair_root or self.repo_root),
+                )
+            )
         lines = [
-            f"auto_agents repository root: {self.repo_root}",
-            f"Target project root (read-only evidence): {self.target_project_root}",
+            f"auto_agents repository root: {repair_root or self.repo_root}",
+            (
+                "Target project snapshot (read-only evidence): "
+                f"{target_evidence_root or self.target_project_root}"
+            ),
             f"Self-repair category: {self.decision.category}",
-            f"Classifier reason: {self.decision.reason}",
+            f"Classifier reason: {classifier_reason}",
             "",
             "Original run error:",
-            str(self.error).strip(),
+            error_text,
+            "",
+            "Root-cause diagnosis:",
+            json.dumps(
+                diagnosis_payload,
+                indent=2,
+                ensure_ascii=False,
+            ),
             "",
             "Target run state excerpt:",
             json.dumps(_compact_run_state(state_payload), indent=2, ensure_ascii=False),
@@ -1140,12 +1355,25 @@ class AutoAgentsSelfRepairRunner:
             parts.append(f"summary={result.summary[:500]}")
         return "; ".join(parts) if parts else "self-repair agent failed without output"
 
-    def _run_verification(self) -> "_VerificationResult":
+    def _run_verification(
+        self,
+        verification_root: Optional[Path] = None,
+    ) -> "_VerificationResult":
         summaries = []
-        for command in self_repair_verify_commands():
+        commands = self_repair_verify_commands()
+        if self.diagnosis is not None:
+            for command in self.diagnosis.final.verification_commands:
+                normalized = " ".join(str(command).split())
+                if (
+                    normalized.startswith("python -m pytest ")
+                    or normalized.startswith("python3 -m pytest ")
+                    or normalized.startswith("pytest ")
+                ) and normalized not in commands:
+                    commands.append(normalized)
+        for command in commands:
             gate = run_commands(
                 [command],
-                self.repo_root,
+                verification_root or self.repo_root,
                 command_timeout_seconds=900,
             )
             process = gate.commands[0]

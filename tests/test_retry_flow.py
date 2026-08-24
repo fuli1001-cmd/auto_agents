@@ -3135,6 +3135,64 @@ class RetryFlowTests(unittest.TestCase):
                 ).stdout,
                 "",
             )
+            self.assertFalse(
+                orchestrator._attempt_recovery_checkpoint_root(
+                    state.run_id,
+                    "implement-task-001",
+                ).exists()
+            )
+
+    def test_self_repair_reconciles_durable_attempt_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_text(project_root / "spec.md", "# Public product spec\n")
+            commit_all(project_root, "chore: seed checkpoint reconciliation")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            before = orchestrator._worktree_change_snapshot()
+            checkpoint = orchestrator._attempt_recovery_checkpoint_root(
+                state.run_id,
+                "implement-task-001",
+            )
+            checkpoint.mkdir(parents=True, exist_ok=True)
+            orchestrator._capture_auto_agents_restore_point(checkpoint)
+            orchestrator._write_attempt_recovery_manifest(
+                checkpoint,
+                run_id=state.run_id,
+                stage="implement",
+                stage_key="implement-task-001",
+                before_snapshot=before,
+                offending_paths=["spec.md"],
+            )
+            write_text(project_root / "spec.md", "# Poisoned spec\n")
+            subprocess.run(
+                ["git", "add", "--", "spec.md"],
+                cwd=str(project_root),
+                check=True,
+            )
+
+            reconciled = (
+                orchestrator._reconcile_self_repair_attempt_checkpoints(state)
+            )
+
+            self.assertEqual(reconciled, [str(checkpoint)])
+            self.assertFalse(checkpoint.exists())
+            self.assertEqual(
+                (project_root / "spec.md").read_text(encoding="utf-8"),
+                "# Public product spec\n",
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "status", "--short", "--", "spec.md"],
+                    cwd=str(project_root),
+                    check=True,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                ).stdout,
+                "",
+            )
 
     def test_implement_stage_restores_archived_task_plan_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

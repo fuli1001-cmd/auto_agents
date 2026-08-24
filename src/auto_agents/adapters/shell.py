@@ -135,7 +135,7 @@ class ShellAdapter(AgentAdapter):
             command,
             request,
             env,
-            timeout=self.config.timeout_seconds or None,
+            timeout=request.timeout_seconds or self.config.timeout_seconds or None,
             idle_timeout=self.config.idle_timeout_seconds or None,
             smart_timeout=self.smart_timeout,
             progress_decoder=ShellProgressDecoder(progress_path),

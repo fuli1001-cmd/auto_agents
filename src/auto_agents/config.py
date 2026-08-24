@@ -326,6 +326,18 @@ DEFAULT_CONFIG = {
             "quota_cooldown_seconds": 3600,
             "max_cooldown_seconds": 14400,
         },
+        "self_repair_diagnosis": {
+            "mode": "all_terminal",
+            "investigator_timeout_seconds": 900,
+            "reviewer_timeout_seconds": 600,
+            "arbiter_timeout_seconds": 600,
+            "command_timeout_seconds": 300,
+            "max_dynamic_commands": 12,
+            "confidence_threshold": 0.85,
+            "arbiter_confidence_threshold": 0.90,
+            "max_repair_cycles": 2,
+            "network_enabled": False,
+        },
         "recovery": {
             "enabled": True,
             "max_rounds": 2,

@@ -4625,6 +4625,47 @@ class Orchestrator:
             if before_snapshot.get(relative) != restored_snapshot.get(relative)
         )
 
+    def _attempt_recovery_checkpoint_root(
+        self,
+        run_id: str,
+        stage_key: str,
+    ) -> Path:
+        safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "-", stage_key).strip("-")
+        return (
+            run_path(self.project_root, run_id)
+            / "attempt-checkpoints"
+            / (safe_stage or "attempt")
+        )
+
+    def _write_attempt_recovery_manifest(
+        self,
+        checkpoint_root: Path,
+        *,
+        run_id: str,
+        stage: str,
+        stage_key: str,
+        before_snapshot: Dict[str, str],
+        offending_paths: Iterable[str] = (),
+    ) -> None:
+        write_json(
+            checkpoint_root / "manifest.json",
+            {
+                "version": 1,
+                "run_id": run_id,
+                "stage": stage,
+                "stage_key": stage_key,
+                "head": head_ref(self.project_root),
+                "before_snapshot": dict(before_snapshot),
+                "offending_paths": sorted(
+                    {
+                        str(path).strip()
+                        for path in offending_paths
+                        if str(path).strip()
+                    }
+                ),
+            },
+        )
+
     def _is_implement_restorable_scope_violation_path(self, path: str) -> bool:
         normalized = str(path).replace("\\", "/").strip()
         if not normalized:
@@ -6128,6 +6169,12 @@ class Orchestrator:
         ):
             return []
 
+        reconciled_checkpoints = self._reconcile_self_repair_attempt_checkpoints(
+            state
+        )
+        if reconciled_checkpoints:
+            blocker["reconciled_attempt_checkpoints"] = reconciled_checkpoints
+
         repaired_dependency_links = (
             self._repair_self_referential_dependency_links()
         )
@@ -6205,6 +6252,47 @@ class Orchestrator:
         blocker["prepared_self_repair_commit"] = commit_sha
         blocker["requeued_task_ids"] = requeued_task_ids
         return requeued_task_ids
+
+    def _reconcile_self_repair_attempt_checkpoints(
+        self,
+        state: RunState,
+    ) -> List[str]:
+        checkpoints_root = (
+            run_path(self.project_root, state.run_id)
+            / "attempt-checkpoints"
+        )
+        if not checkpoints_root.is_dir():
+            return []
+        reconciled: List[str] = []
+        for manifest_path in sorted(checkpoints_root.glob("*/manifest.json")):
+            payload = read_json(manifest_path, default={})
+            if not isinstance(payload, dict):
+                continue
+            offending = [
+                str(path).strip()
+                for path in payload.get("offending_paths", []) or []
+                if str(path).strip()
+            ]
+            before_snapshot = payload.get("before_snapshot")
+            if not offending or not isinstance(before_snapshot, dict):
+                continue
+            unrestored = self._restore_paths_from_restore_point(
+                offending,
+                manifest_path.parent,
+                before_snapshot={
+                    str(path): str(fingerprint)
+                    for path, fingerprint in before_snapshot.items()
+                },
+            )
+            if unrestored:
+                raise RuntimeError(
+                    "auto_agents self-repair checkpoint reconciliation failed. "
+                    "Protected target paths did not return to their durable "
+                    f"pre-attempt state: {self._changed_path_preview(unrestored)}"
+                )
+            reconciled.append(str(manifest_path.parent))
+            shutil.rmtree(manifest_path.parent, ignore_errors=True)
+        return reconciled
 
     @staticmethod
     def _requeued_task_id(state: RunState) -> str:
@@ -18329,10 +18417,29 @@ class Orchestrator:
         usage_available = False
         restore_workspace = None
         restore_root: Optional[Path] = None
+        durable_restore_root: Optional[Path] = None
+        completed = False
         restorable_clarify_conversation = (
             stage == "clarify" and stage_key.startswith("clarify-conv-")
         )
-        if stage == "implement" or restorable_clarify_conversation:
+        if stage == "implement":
+            durable_restore_root = self._attempt_recovery_checkpoint_root(
+                active_run_id,
+                stage_key,
+            )
+            if durable_restore_root.exists():
+                shutil.rmtree(durable_restore_root)
+            durable_restore_root.mkdir(parents=True, exist_ok=True)
+            restore_root = durable_restore_root
+            self._capture_auto_agents_restore_point(restore_root)
+            self._write_attempt_recovery_manifest(
+                restore_root,
+                run_id=active_run_id,
+                stage=stage,
+                stage_key=stage_key,
+                before_snapshot=snapshot_before,
+            )
+        elif restorable_clarify_conversation:
             restore_workspace = tempfile.TemporaryDirectory(prefix="auto-agents-restore-")
             restore_root = Path(restore_workspace.name)
             self._capture_auto_agents_restore_point(restore_root)
@@ -18380,6 +18487,15 @@ class Orchestrator:
                         and restore_root is not None
                         and all(self._is_implement_restorable_scope_violation_path(path) for path in offending)
                     ):
+                        if durable_restore_root is not None:
+                            self._write_attempt_recovery_manifest(
+                                durable_restore_root,
+                                run_id=active_run_id,
+                                stage=stage,
+                                stage_key=stage_key,
+                                before_snapshot=snapshot_before,
+                                offending_paths=offending,
+                            )
                         unrestored = self._restore_paths_from_restore_point(
                             offending,
                             restore_root,
@@ -18465,10 +18581,13 @@ class Orchestrator:
                     usage=(cumulative_usage if usage_available else None),
                     model=result.model or self._model_label_for_agent_stage(stage, resolved_effort),
                 )
+                completed = True
                 return result
         finally:
             if restore_workspace is not None:
                 restore_workspace.cleanup()
+            if completed and durable_restore_root is not None:
+                shutil.rmtree(durable_restore_root, ignore_errors=True)
 
         self._emit_agent_metrics(
             stage_key,

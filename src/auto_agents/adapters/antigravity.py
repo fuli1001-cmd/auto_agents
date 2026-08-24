@@ -205,7 +205,7 @@ class AntigravityAdapter(AgentAdapter):
                 command,
                 request,
                 env,
-                timeout=self.config.timeout_seconds or None,
+                timeout=request.timeout_seconds or self.config.timeout_seconds or None,
                 # agy 1.1+ takes the print prompt as the flag value. Sending
                 # it on stdin can make the next CLI option become the prompt.
                 stdin_input="",

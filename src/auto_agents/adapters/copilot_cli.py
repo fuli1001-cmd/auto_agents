@@ -152,7 +152,7 @@ class CopilotCliAdapter(AgentAdapter):
         else:
             stdin_input = request.prompt
 
-        timeout = self.config.timeout_seconds or None
+        timeout = request.timeout_seconds or self.config.timeout_seconds or None
 
         filtered_request = request
         if request.stream_output is not None:
