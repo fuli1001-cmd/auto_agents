@@ -848,7 +848,10 @@ def _auto_repair_auto_agents_and_resume(
             fingerprint=decision.fingerprint,
         )
         _notify_run_blocked(project_root, message)
-        print(json.dumps({"ok": False, "error": message}, indent=2, ensure_ascii=False))
+        payload = {"ok": False, "error": message}
+        if result.verification.strip():
+            payload["verification"] = result.verification
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 3
 
     orchestrator.mark_self_repair_applied(result.commit_sha)

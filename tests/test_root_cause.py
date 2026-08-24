@@ -21,6 +21,7 @@ from auto_agents.root_cause import RootCauseCoordinator
 from auto_agents.self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
+    self_repair_verification_command,
 )
 
 
@@ -135,6 +136,39 @@ class _FakeOrchestrator:
 
 
 class RootCauseCoordinatorTests(unittest.TestCase):
+    def test_self_repair_pytest_command_avoids_root_module_shadowing(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        command = self_repair_verification_command(
+            "python -m pytest -q -p no:cacheprovider "
+            "tests/test_provider_contract_policy.py "
+            "-k composite_recovery_provenance_header",
+            repo_root,
+        )
+
+        result = subprocess.run(
+            command,
+            cwd=repo_root,
+            shell=True,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("1 passed", result.stdout)
+        self.assertIn("pytest.main", command)
+        self.assertNotIn(" -m pytest ", command)
+
+    def test_self_repair_verification_preserves_non_pytest_commands(self):
+        self.assertEqual(
+            self_repair_verification_command(
+                "python -m unittest -q",
+                Path("/tmp/repo"),
+            ),
+            "python -m unittest -q",
+        )
+
     def _coordinator(
         self,
         root: Path,

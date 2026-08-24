@@ -30,6 +30,11 @@ _MALFORMED_PROVENANCE_LABEL_PATTERN = re.compile(
 )
 _NUMBERED_RULE_PATTERN = re.compile(r"^\d+[.)]\s+")
 _TABLE_SEPARATOR_PATTERN = re.compile(r"^:?-{3,}:?$")
+_RECOVERY_PROVENANCE_HEADERS = {
+    "source",
+    "provenance",
+    "source or provenance",
+}
 
 _PROVENANCE_SECTIONS = (
     "Prompt / Content Construction",
@@ -199,7 +204,7 @@ def _validate_recovery_provenance(section: str) -> list[str]:
     provenance_indexes = [
         index
         for index, cell in enumerate(header_cells)
-        if cell.lower() in {"source", "provenance"}
+        if _normalize_heading(cell) in _RECOVERY_PROVENANCE_HEADERS
     ]
     if not provenance_indexes:
         errors.append("Retry / Recovery Matrix must include a Source or Provenance column")

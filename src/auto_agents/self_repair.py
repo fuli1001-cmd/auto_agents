@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass
@@ -1034,6 +1036,34 @@ def self_repair_verify_commands(env: Optional[dict[str, str]] = None) -> list[st
     ]
 
 
+def self_repair_verification_command(command: str, repo_root: Path) -> str:
+    """Run pytest without letting the root auto_agents.py shadow src/auto_agents."""
+    normalized = str(command).strip()
+    try:
+        parts = shlex.split(normalized)
+    except ValueError:
+        return normalized
+    if (
+        len(parts) >= 3
+        and parts[0] in {"python", "python3"}
+        and parts[1:3] == ["-m", "pytest"]
+    ):
+        pytest_args = parts[3:]
+    elif parts and parts[0] == "pytest":
+        pytest_args = parts[1:]
+    else:
+        return normalized
+
+    source_root = str((repo_root / "src").resolve())
+    runner = (
+        "import sys; "
+        f"sys.path.insert(0, {source_root!r}); "
+        "import pytest; "
+        "raise SystemExit(pytest.main(sys.argv[1:]))"
+    )
+    return shlex.join([sys.executable, "-c", runner, *pytest_args])
+
+
 class AutoAgentsSelfRepairRunner:
     def __init__(
         self,
@@ -1371,15 +1401,22 @@ class AutoAgentsSelfRepairRunner:
                 ) and normalized not in commands:
                     commands.append(normalized)
         for command in commands:
+            verification_command = self_repair_verification_command(
+                command,
+                verification_root or self.repo_root,
+            )
             gate = run_commands(
-                [command],
+                [verification_command],
                 verification_root or self.repo_root,
                 command_timeout_seconds=900,
             )
             process = gate.commands[0]
             detail = (process.stderr or process.stdout or "").strip()
             summaries.append(
-                f"$ {command}\nexit={process.returncode}\n{detail[:1200]}".strip()
+                (
+                    f"$ {verification_command}\n"
+                    f"exit={process.returncode}\n{detail[:1200]}"
+                ).strip()
             )
             if process.returncode != 0:
                 return _VerificationResult(False, "\n\n".join(summaries))

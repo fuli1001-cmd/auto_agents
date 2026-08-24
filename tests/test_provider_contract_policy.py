@@ -157,6 +157,23 @@ class ProviderContractPolicyTests(unittest.TestCase):
                 errors,
             )
 
+    def test_v2_reference_accepts_composite_recovery_provenance_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reference = Path(tmp) / "provider.md"
+            lock_entry = {
+                "path": "provider.md",
+                "status": "verified",
+                "contract_version": PROVIDER_REFERENCE_CONTRACT_VERSION,
+            }
+            composite_matrix_header = _sourced_reference_markdown().replace(
+                "| Outcome | Retry | Provenance |",
+                "| Outcome | Retry | Source or Provenance |",
+            )
+
+            write_text(reference, composite_matrix_header)
+
+            self.assertEqual(validate_provider_reference_v2(reference, lock_entry), [])
+
     def test_provider_research_validation_deduplicates_shared_reference_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

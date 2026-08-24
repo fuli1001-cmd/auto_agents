@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.cli import (
     SELF_REPAIR_STRICT_ENV,
+    _auto_repair_auto_agents_and_resume,
     _preflight_automatic_self_repair,
     build_parser,
     main,
@@ -2189,6 +2190,61 @@ class ProjectValidationTests(unittest.TestCase):
                 resume_run.call_args.kwargs["pass_fd"],
                 int(resume_env[RUN_LOCK_FD_ENV]),
             )
+
+    def test_cli_failed_self_repair_reports_verification_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            decision = SelfRepairDecision(
+                True,
+                category="self_repair_verification",
+                reason="repair candidate requires verification",
+                fingerprint="verification-fingerprint",
+            )
+
+            class FakeSelfRepairRunner:
+                repo_root = Path("/tmp/auto_agents_repo")
+
+                def __init__(self, target_orchestrator, **kwargs):
+                    del target_orchestrator, kwargs
+
+                def run(self):
+                    return SelfRepairResult(
+                        ok=False,
+                        status="failed",
+                        reason="self-repair verification failed",
+                        category="self_repair_verification",
+                        verification=(
+                            "$ pytest -q tests/test_root_cause.py\n"
+                            "exit=2\nModuleNotFoundError: auto_agents.cli"
+                        ),
+                    )
+
+            stdout = io.StringIO()
+            args = type("Args", (), {"print_agent_output": False})()
+            with (
+                ProjectRunLock(project_root) as run_lock,
+                patch("auto_agents.cli.AutoAgentsSelfRepairRunner", FakeSelfRepairRunner),
+                patch("auto_agents.cli.notify_self_repair_finished"),
+                patch("auto_agents.cli._notify_run_blocked"),
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = _auto_repair_auto_agents_and_resume(
+                    project_root,
+                    orchestrator,
+                    RuntimeError("terminal"),
+                    decision,
+                    args,
+                    run_lock,
+                )
+
+            self.assertEqual(exit_code, 3)
+            payload = json.loads(stdout.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertIn("self-repair verification failed", payload["error"])
+            self.assertIn("ModuleNotFoundError", payload["verification"])
 
     def test_cli_meta_triages_non_auto_agents_blocker_and_resumes_after_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
