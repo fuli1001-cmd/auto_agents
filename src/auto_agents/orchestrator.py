@@ -297,6 +297,7 @@ _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
 _ARTIFACT_PUBLICATION_METADATA_REPAIR_CONTEXT = (
     "artifact_publication_metadata_repair"
 )
+_RECOVERY_SIGNATURE_EPOCHS_CONTEXT = "recovery_signature_epochs"
 _DANGLING_DEPENDENCIES_AFTER_TASK_PRUNING = (
     "dangling_dependencies_after_task_pruning"
 )
@@ -385,6 +386,7 @@ class Orchestrator:
     SPLIT_TASK_MARKER = "SPLIT_TASK:"
     ARBITER_MIN_REVIEW_FAILS = 2
     MAX_RECOVERY_LOOP_EVENTS = 20
+    MAX_CHANGED_FAILURE_RECOVERY_EPOCHS = 1
     RECOVERY_LOOP_REPEAT_THRESHOLD = 2
     FRONTEND_CONTRACT_RECOVERY_CONTEXT = "frontend_design_contract_recovery"
 
@@ -10665,7 +10667,207 @@ class Orchestrator:
                 return True
         return False
 
-    def _candidate_repair_refs(self, task: TaskSpec, result: Dict[str, object]) -> List[str]:
+    @staticmethod
+    def _split_vitest_failure_identity(ref: str) -> Tuple[str, str]:
+        normalized = str(ref).strip()
+        if "::" in normalized:
+            return "", ""
+        match = re.fullmatch(
+            r"(?P<path>\S+\.(?:test|spec)\.[cm]?[jt]sx?)"
+            r"\s+>\s+(?P<selector>.+)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return "", ""
+        return match.group("path").strip(), match.group("selector").strip()
+
+    @staticmethod
+    def _vitest_failure_path_matches(observed: str, owned: str) -> bool:
+        observed_path = observed.replace("\\", "/").strip().removeprefix("./")
+        owned_path = owned.replace("\\", "/").strip().removeprefix("./")
+        return bool(
+            observed_path
+            and owned_path
+            and (
+                observed_path == owned_path
+                or owned_path.endswith("/" + observed_path)
+            )
+        )
+
+    @staticmethod
+    def _vitest_failure_selector_matches(observed: str, owned: str) -> bool:
+        observed_selector = " > ".join(
+            part.strip() for part in observed.split(" > ") if part.strip()
+        )
+        owned_selector = " > ".join(
+            part.strip() for part in owned.split(" > ") if part.strip()
+        )
+        if not observed_selector or not owned_selector:
+            return False
+        return bool(
+            observed_selector == owned_selector
+            or observed_selector.endswith(" > " + owned_selector)
+        )
+
+    def _recovery_lineage_tasks(
+        self,
+        tasks: Iterable[TaskSpec],
+        task: TaskSpec,
+    ) -> List[TaskSpec]:
+        candidates = list(tasks)
+        if not any(item.task_id == task.task_id for item in candidates):
+            candidates.append(task)
+        owner = self._recovery_lineage_owner(candidates, task)
+        return [
+            item
+            for item in candidates
+            if item.task_id == owner.task_id
+            or (
+                item.task_origin == "evidence_repair"
+                and self._recovery_lineage_owner(candidates, item).task_id
+                == owner.task_id
+            )
+        ]
+
+    def _owned_vitest_evidence_refs(
+        self,
+        task: TaskSpec,
+        tasks: Iterable[TaskSpec],
+    ) -> List[str]:
+        refs: List[str] = []
+        for lineage_task in self._recovery_lineage_tasks(tasks, task):
+            planned_refs = self._task_planned_evidence_refs(lineage_task)
+            for raw_ref in planned_refs:
+                ref = self._canonical_project_evidence_ref(raw_ref)
+                if self._looks_like_vitest_evidence_ref(ref) and ref not in refs:
+                    refs.append(ref)
+
+            # A task may own a generated Vitest step through an explicit command
+            # ref instead of repeating the step target in verification_refs.
+            for raw_ref in planned_refs:
+                if not self._command_evidence_ref_command(raw_ref):
+                    continue
+                matched_steps = self._verification_steps_for_evidence_ref(
+                    self.config.gates.steps,
+                    raw_ref,
+                )
+                for candidate in self._vitest_step_evidence_refs(matched_steps):
+                    if candidate not in refs:
+                        refs.append(candidate)
+        return refs
+
+    def _vitest_step_evidence_refs(
+        self,
+        steps: Iterable[VerificationStep],
+    ) -> List[str]:
+        refs: List[str] = []
+        for step in steps:
+            if step.runner.strip().lower() != "vitest":
+                continue
+            selector = ""
+            for index, arg in enumerate(step.args[:-1]):
+                if arg in {"-t", "--test-name-pattern", "--testNamePattern"}:
+                    selector = step.args[index + 1].strip()
+                    break
+            for target in step.targets:
+                candidate = self._canonical_project_evidence_ref(target)
+                if selector:
+                    candidate = f"{candidate}::{selector}"
+                if (
+                    self._looks_like_vitest_evidence_ref(candidate)
+                    and candidate not in refs
+                ):
+                    refs.append(candidate)
+        return refs
+
+    def _vitest_owned_ref_aliases(self, owned_ref: str) -> List[str]:
+        owned_path, owned_selector = self._split_evidence_ref(owned_ref)
+        aliases = [owned_ref]
+        for configured_ref in self._vitest_step_evidence_refs(
+            self.config.gates.steps
+        ):
+            configured_path, configured_selector = self._split_evidence_ref(
+                configured_ref
+            )
+            if not (
+                self._vitest_failure_path_matches(owned_path, configured_path)
+                or self._vitest_failure_path_matches(configured_path, owned_path)
+            ):
+                continue
+            selector = owned_selector or configured_selector
+            alias = (
+                f"{configured_path}::{selector}"
+                if selector
+                else configured_path
+            )
+            if alias not in aliases:
+                aliases.append(alias)
+        return aliases
+
+    def _resolve_owned_vitest_failure_ref(
+        self,
+        task: TaskSpec,
+        failure_id: str,
+        tasks: Iterable[TaskSpec],
+    ) -> str:
+        observed_path, observed_selector = self._split_vitest_failure_identity(
+            failure_id
+        )
+        if not observed_path or not observed_selector:
+            return ""
+
+        matches: List[str] = []
+        for owned_ref in self._owned_vitest_evidence_refs(task, tasks):
+            for alias in self._vitest_owned_ref_aliases(owned_ref):
+                owned_path, owned_selector = self._split_evidence_ref(alias)
+                if not self._vitest_failure_path_matches(
+                    observed_path,
+                    owned_path,
+                ):
+                    continue
+                if owned_selector and not self._vitest_failure_selector_matches(
+                    observed_selector,
+                    owned_selector,
+                ):
+                    continue
+                selector = owned_selector or observed_selector.rsplit(
+                    " > ",
+                    1,
+                )[-1].strip()
+                canonical = (
+                    f"{owned_path}::{selector}" if selector else owned_path
+                )
+                if (
+                    canonical not in matches
+                    and self._build_task_proof_evidence_command_for_ref(canonical)
+                ):
+                    matches.append(canonical)
+
+        if len(matches) != 1:
+            return ""
+        return matches[0]
+
+    def _candidate_executable_repair_refs(
+        self,
+        task: TaskSpec,
+        ref: str,
+        tasks: Iterable[TaskSpec],
+    ) -> List[str]:
+        if self._split_vitest_failure_identity(ref) != ("", ""):
+            resolved = self._resolve_owned_vitest_failure_ref(task, ref, tasks)
+            return [resolved] if resolved else []
+        if self._build_task_proof_evidence_command_for_ref(ref):
+            return [ref]
+        return []
+
+    def _candidate_repair_refs(
+        self,
+        task: TaskSpec,
+        result: Dict[str, object],
+        *,
+        tasks: Optional[Iterable[TaskSpec]] = None,
+    ) -> List[str]:
         comparable = bool(result.get("comparable_failures", True))
         raw_ids = result.get("failure_ids", [])
         failure_ids = [str(item).strip() for item in raw_ids if str(item).strip()] if isinstance(raw_ids, list) else []
@@ -10675,17 +10877,20 @@ class Orchestrator:
         )
         if not comparable and not repeated_non_comparable:
             return []
+        lineage_tasks = list(tasks) if tasks is not None else [task]
         refs: List[str] = []
         for failure_id in failure_ids:
             if failure_id.startswith("reason:"):
                 continue
             if failure_id.startswith("cmd:") and not repeated_non_comparable:
                 continue
-            if (
-                self._build_task_proof_evidence_command_for_ref(failure_id)
-                and failure_id not in refs
+            for ref in self._candidate_executable_repair_refs(
+                task,
+                failure_id,
+                lineage_tasks,
             ):
-                refs.append(failure_id)
+                if ref not in refs:
+                    refs.append(ref)
         if refs:
             return refs
         refs.extend(
@@ -10697,12 +10902,13 @@ class Orchestrator:
         if isinstance(proof_evidence, dict):
             for raw_ref in proof_evidence.get("failed_refs", []) or []:
                 ref = str(raw_ref).strip()
-                if (
-                    ref
-                    and ref not in refs
-                    and self._build_task_proof_evidence_command_for_ref(ref)
+                for candidate in self._candidate_executable_repair_refs(
+                    task,
+                    ref,
+                    lineage_tasks,
                 ):
-                    refs.append(ref)
+                    if candidate and candidate not in refs:
+                        refs.append(candidate)
         return refs
 
     @staticmethod
@@ -11090,6 +11296,104 @@ class Orchestrator:
         )
         return True
 
+    def _changed_failure_recovery_epoch_count(
+        self,
+        state: RunState,
+        owner: TaskSpec,
+    ) -> int:
+        raw_counts = state.resume_context.get(
+            _RECOVERY_SIGNATURE_EPOCHS_CONTEXT,
+            {},
+        )
+        persisted_count = 0
+        if isinstance(raw_counts, dict):
+            try:
+                persisted_count = max(
+                    0,
+                    int(raw_counts.get(owner.task_id, 0) or 0),
+                )
+            except (TypeError, ValueError):
+                persisted_count = 0
+        history_count = sum(
+            1
+            for entry in owner.recovery_history
+            if isinstance(entry, dict)
+            and str(entry.get("result", "")) == "epoch_reopened"
+        )
+        return max(persisted_count, history_count)
+
+    def _reopen_recovery_epoch_for_changed_failure(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        signature: str,
+    ) -> bool:
+        max_rounds = max(1, int(self.config.execution.recovery.max_rounds))
+        if int(task.recovery_round) < max_rounds:
+            return False
+
+        owner = self._recovery_lineage_owner(tasks, task)
+        route = state.last_recovery_route
+        route_outcome = str(route.get("outcome", ""))
+        previous_signature = str(route.get("failure_signature", "")).strip()
+        if (
+            str(route.get("lineage_id", "")) != owner.task_id
+            or int(route.get("epoch", 0) or 0) != int(owner.recovery_epoch)
+        ):
+            return False
+        changed_after_metadata_repair = bool(
+            route_outcome == "plan_metadata_repaired"
+            and previous_signature
+            and previous_signature != signature
+        )
+        newly_resolved_terminal_failure = bool(
+            route_outcome == "not_recoverable"
+            and not previous_signature
+        )
+        if not (
+            changed_after_metadata_repair
+            or newly_resolved_terminal_failure
+        ):
+            return False
+
+        reopen_count = self._changed_failure_recovery_epoch_count(state, owner)
+        if reopen_count >= self.MAX_CHANGED_FAILURE_RECOVERY_EPOCHS:
+            return False
+
+        previous_epoch = int(owner.recovery_epoch)
+        owner.recovery_epoch = previous_epoch + 1
+        owner.recovery_round = 0
+        task.recovery_epoch = owner.recovery_epoch
+        task.recovery_round = 0
+        counts = state.resume_context.get(
+            _RECOVERY_SIGNATURE_EPOCHS_CONTEXT,
+            {},
+        )
+        counts = dict(counts) if isinstance(counts, dict) else {}
+        counts[owner.task_id] = reopen_count + 1
+        state.resume_context[_RECOVERY_SIGNATURE_EPOCHS_CONTEXT] = counts
+        self._append_recovery_history_once(
+            owner,
+            {
+                "signature": signature,
+                "failure_signature": signature,
+                "round": 0,
+                "epoch": int(owner.recovery_epoch),
+                "result": "epoch_reopened",
+                "trigger": route_outcome,
+                "previous_epoch": previous_epoch,
+                "previous_signature": previous_signature,
+            },
+        )
+        self.logger.info(
+            "[recovery] reopened lineage=%s epoch=%s after newly actionable "
+            "failure signature",
+            owner.task_id,
+            owner.recovery_epoch,
+        )
+        return True
+
     def _schedule_repair_tasks_for_failure(
         self,
         state: RunState,
@@ -11190,7 +11494,7 @@ class Orchestrator:
             save_run_state(self.project_root, state)
             return True
 
-        refs = self._candidate_repair_refs(task, result)
+        refs = self._candidate_repair_refs(task, result, tasks=tasks)
         if not refs:
             self._record_recovery_route(
                 state,
@@ -11201,6 +11505,12 @@ class Orchestrator:
             )
             return False
         signature = self._recovery_signature(refs, reason)
+        self._reopen_recovery_epoch_for_changed_failure(
+            state,
+            tasks,
+            task,
+            signature,
+        )
         round_number = int(task.recovery_round) + 1
         if round_number > recovery_config.max_rounds:
             self.logger.info(
@@ -12917,16 +13227,10 @@ class Orchestrator:
     def _looks_like_vitest_evidence_ref(ref: str) -> bool:
         path, _ = Orchestrator._split_evidence_ref(ref)
         lowered = path.lower()
-        return lowered.endswith(
-            (
-                ".test.js",
-                ".test.jsx",
-                ".test.ts",
-                ".test.tsx",
-                ".spec.js",
-                ".spec.jsx",
-                ".spec.ts",
-                ".spec.tsx",
+        return bool(
+            re.search(
+                r"\.(?:test|spec)\.[cm]?[jt]sx?$",
+                lowered,
             )
         )
 

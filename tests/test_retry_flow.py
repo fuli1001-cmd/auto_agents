@@ -232,6 +232,141 @@ class VerifyFailureClassificationTests(unittest.TestCase):
 
             self.assertEqual(refs, [])
 
+    def test_vitest_display_failure_recovery_resolves_lineage_owned_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.steps.extend(
+                [
+                    VerificationStep(
+                        kind="test",
+                        runner="vitest",
+                        targets=["workbench/src/e2e/video-home.test.ts"],
+                    ),
+                    VerificationStep(
+                        kind="test",
+                        runner="vitest",
+                        targets=["workbench/src/e2e/consumer.test.ts"],
+                    ),
+                ]
+            )
+            desktop_ref = (
+                "workbench/src/e2e/video-home.test.ts::"
+                "dialog_desktop_matches_prototype"
+            )
+            unprefixed_desktop_ref = desktop_ref.removeprefix("workbench/")
+            duration_ref = (
+                "workbench/src/e2e/video-home.test.ts::"
+                "dialog_duration_semantics_matches_prototype"
+            )
+            parent = TaskSpec(
+                task_id="task-video-home",
+                title="Match the video home prototype",
+                description="Keep the video dialog faithful to the prototype.",
+                acceptance=["The dialog matches at both viewports."],
+                verification_refs=[unprefixed_desktop_ref],
+            )
+            completed_repair = TaskSpec(
+                task_id="repair-video-home",
+                title="Publish duration evidence",
+                description="Publish the duration proof.",
+                acceptance=["Duration evidence passes."],
+                status="done",
+                task_origin="evidence_repair",
+                parent_task_id=parent.task_id,
+                verification_refs=[duration_ref],
+            )
+            transitive_consumer = TaskSpec(
+                task_id="task-consumer",
+                title="Consume prototype evidence",
+                description="Check the nested producer result.",
+                acceptance=["The producer exits successfully."],
+                verification_refs=[
+                    "workbench/src/e2e/consumer.test.ts::producer_exits_cleanly"
+                ],
+            )
+
+            result = {
+                "reason": "3 new verification failures vs task baseline",
+                "failure_ids": [
+                    "src/e2e/video-home.test.ts > video home > "
+                    "dialog_desktop_matches_prototype",
+                    "src/e2e/video-home.test.ts > video home > "
+                    "dialog_duration_semantics_matches_prototype",
+                    "src/e2e/consumer.test.ts > evidence consumer > "
+                    "producer_exits_cleanly",
+                ],
+                "comparable_failures": True,
+            }
+            tasks = [completed_repair, parent, transitive_consumer]
+            refs = orchestrator._candidate_repair_refs(
+                parent,
+                result,
+                tasks=[completed_repair, parent, transitive_consumer],
+            )
+
+            self.assertEqual(refs, [desktop_ref, duration_ref])
+            state = load_run_state(project_root)
+            state.tasks = tasks
+
+            self.assertTrue(
+                orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    tasks,
+                    parent,
+                    result,
+                )
+            )
+            scheduled_repairs = [
+                item
+                for item in tasks
+                if item.task_origin == "evidence_repair" and item.status == "pending"
+            ]
+            self.assertEqual(len(scheduled_repairs), 1)
+            self.assertEqual(scheduled_repairs[0].verification_refs, refs)
+            self.assertEqual(
+                state.last_recovery_route["outcome"],
+                "repair_tasks_scheduled",
+            )
+
+    def test_ambiguous_vitest_display_recovery_is_not_repair_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            for package in ("admin", "workbench"):
+                orchestrator.config.gates.steps.append(
+                    VerificationStep(
+                        kind="test",
+                        runner="vitest",
+                        targets=[f"{package}/src/e2e/home.test.ts"],
+                    )
+                )
+            parent = TaskSpec(
+                task_id="task-home",
+                title="Verify home",
+                description="Verify both independently packaged home surfaces.",
+                acceptance=["Both home surfaces pass."],
+                verification_refs=[
+                    "admin/src/e2e/home.test.ts::renders_home",
+                    "workbench/src/e2e/home.test.ts::renders_home",
+                ],
+            )
+
+            refs = orchestrator._candidate_repair_refs(
+                parent,
+                {
+                    "failure_ids": [
+                        "src/e2e/home.test.ts > home > renders_home",
+                    ],
+                    "comparable_failures": True,
+                },
+                tasks=[parent],
+            )
+
+            self.assertEqual(refs, [])
+
     def test_repeated_non_comparable_commands_schedule_evidence_repairs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -614,6 +749,188 @@ class VerifyFailureClassificationTests(unittest.TestCase):
                 refs + ["tests/test_other.py::B::test_c"], "same wording"
             )
             self.assertNotEqual(sig_first, sig_other)
+
+    def test_changed_failure_after_metadata_repair_opens_bounded_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.execution.recovery.max_rounds = 2
+            failure_ref = "tests/test_dialog.py::test_matches_prototype"
+            parent = TaskSpec(
+                task_id="task-dialog",
+                title="Match the dialog prototype",
+                description="Keep dialog geometry aligned with its prototype.",
+                acceptance=["The dialog proof passes."],
+                status="blocked",
+                task_origin="planned",
+                recovery_round=2,
+                verification_refs=[failure_ref],
+            )
+            completed_repair = TaskSpec(
+                task_id="repair-task-dialog-r1-1",
+                title="Publish dialog evidence",
+                description="Publish the prior evidence set.",
+                acceptance=["Prior evidence is published."],
+                status="done",
+                task_origin="evidence_repair",
+                parent_task_id=parent.task_id,
+                recovery_round=2,
+            )
+            state = load_run_state(project_root)
+            state.tasks = [completed_repair, parent]
+            state.last_recovery_route = {
+                "task_id": parent.task_id,
+                "task_origin": "planned",
+                "lineage_id": parent.task_id,
+                "epoch": 0,
+                "round": 2,
+                "outcome": "plan_metadata_repaired",
+                "failure_signature": "prior-publication-signature",
+            }
+
+            scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                state,
+                state.tasks,
+                parent,
+                {
+                    "reason": "1 new verification failure vs task baseline",
+                    "failure_ids": [failure_ref],
+                    "comparable_failures": True,
+                },
+            )
+
+            self.assertTrue(scheduled)
+            self.assertEqual(parent.recovery_epoch, 1)
+            self.assertEqual(parent.recovery_round, 1)
+            self.assertEqual(completed_repair.status, "done")
+            self.assertEqual(completed_repair.recovery_round, 2)
+            self.assertEqual(
+                [
+                    entry["result"]
+                    for entry in parent.recovery_history
+                    if entry.get("result") == "epoch_reopened"
+                ],
+                ["epoch_reopened"],
+            )
+            self.assertEqual(
+                state.last_recovery_route["outcome"],
+                "repair_tasks_scheduled",
+            )
+            self.assertEqual(state.last_recovery_route["epoch"], 1)
+
+    def test_newly_resolved_terminal_vitest_failure_opens_bounded_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.execution.recovery.max_rounds = 2
+            owned_ref = "workbench/src/e2e/dialog.test.ts::matches_prototype"
+            orchestrator.config.gates.steps.append(
+                VerificationStep(
+                    kind="test",
+                    runner="vitest",
+                    targets=["workbench/src/e2e/dialog.test.ts"],
+                )
+            )
+            task = TaskSpec(
+                task_id="task-dialog",
+                title="Match the dialog prototype",
+                description="Keep dialog geometry aligned with its prototype.",
+                acceptance=["The dialog proof passes."],
+                status="blocked",
+                recovery_round=2,
+                verification_refs=[owned_ref],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "lineage_id": task.task_id,
+                "epoch": 0,
+                "round": 2,
+                "outcome": "not_recoverable",
+                "failure_signature": "",
+            }
+
+            scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                state,
+                state.tasks,
+                task,
+                {
+                    "reason": "1 new verification failure vs task baseline",
+                    "failure_ids": [
+                        "src/e2e/dialog.test.ts > dialog > matches_prototype"
+                    ],
+                    "comparable_failures": True,
+                },
+            )
+
+            self.assertTrue(scheduled)
+            self.assertEqual(task.recovery_epoch, 1)
+            self.assertEqual(task.recovery_round, 1)
+            self.assertEqual(task.recovery_history[0]["trigger"], "not_recoverable")
+            repair = next(
+                item for item in state.tasks if item.task_origin == "evidence_repair"
+            )
+            self.assertEqual(repair.verification_refs, [owned_ref])
+
+    def test_metadata_repair_signature_epoch_has_global_churn_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.execution.recovery.max_rounds = 2
+            failure_ref = "tests/test_dialog.py::test_mobile_matches_prototype"
+            parent = TaskSpec(
+                task_id="task-dialog",
+                title="Match the dialog prototype",
+                description="Keep dialog geometry aligned with its prototype.",
+                acceptance=["The dialog proof passes."],
+                status="blocked",
+                task_origin="planned",
+                recovery_epoch=1,
+                recovery_round=2,
+                verification_refs=[failure_ref],
+                recovery_history=[
+                    {
+                        "epoch": 1,
+                        "round": 0,
+                        "result": "epoch_reopened",
+                        "signature": "second-signature",
+                        "previous_signature": "first-signature",
+                        "trigger": "plan_metadata_repaired",
+                    }
+                ],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [parent]
+            state.last_recovery_route = {
+                "task_id": parent.task_id,
+                "task_origin": "planned",
+                "lineage_id": parent.task_id,
+                "epoch": 1,
+                "round": 2,
+                "outcome": "plan_metadata_repaired",
+                "failure_signature": "second-signature",
+            }
+
+            scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                state,
+                state.tasks,
+                parent,
+                {
+                    "reason": "1 new verification failure vs task baseline",
+                    "failure_ids": [failure_ref],
+                    "comparable_failures": True,
+                },
+            )
+
+            self.assertFalse(scheduled)
+            self.assertEqual(parent.recovery_epoch, 1)
+            self.assertEqual(parent.recovery_round, 2)
+            self.assertEqual(parent.recovery_history[-1]["result"], "exhausted")
+            self.assertEqual(state.last_recovery_route["outcome"], "exhausted")
 
     def test_task_verify_commands_follow_owned_proof_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
