@@ -325,6 +325,11 @@ class VerifyFailureClassificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
+            (project_root / "tests").mkdir(exist_ok=True)
+            write_text(
+                project_root / "tests" / "test_storage_smoke.py",
+                "def test_publishes_receipt():\n    pass\n",
+            )
             orchestrator = Orchestrator(project_root)
             producer_ref = "tests/test_storage_smoke.py::test_publishes_receipt"
             unrelated_ref = "tests/test_public_api.py::test_lists_assets"
@@ -336,6 +341,14 @@ class VerifyFailureClassificationTests(unittest.TestCase):
             write_json(
                 task_plan_path(project_root),
                 {
+                    "verification_steps": [
+                        {
+                            "kind": "test",
+                            "runner": "pytest",
+                            "targets": ["tests/test_storage_smoke.py"],
+                            "artifact_globs": [artifact_ref],
+                        }
+                    ],
                     "tasks": [
                         {
                             "task_id": "task-storage",
@@ -383,6 +396,161 @@ class VerifyFailureClassificationTests(unittest.TestCase):
                 result.last_recovery_route["outcome"],
                 "repair_tasks_scheduled",
             )
+
+    def test_artifact_contract_missing_generated_glob_routes_plan_and_syncs_config(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            (project_root / "tests").mkdir(exist_ok=True)
+            write_text(
+                project_root / "tests" / "test_storage_smoke.py",
+                "def test_publishes_receipt():\n    pass\n",
+            )
+            orchestrator = Orchestrator(project_root)
+            producer_ref = "tests/test_storage_smoke.py::test_publishes_receipt"
+            artifact_ref = ".tmp-tests/storage/runs/*/receipt.json"
+            covered_artifact_ref = ".tmp-tests/storage/runs/*/summary.json"
+            failure_id = (
+                "verification_contract:nonportable_ignored_evidence:"
+                f"{artifact_ref}"
+            )
+            covered_failure_id = (
+                "verification_contract:nonportable_ignored_evidence:"
+                f"{covered_artifact_ref}"
+            )
+            task = TaskSpec(
+                task_id="task-storage",
+                title="Verify durable storage",
+                description="Publish current-run storage evidence.",
+                acceptance=["The storage receipt is portable."],
+                status="blocked",
+                verification_refs=[producer_ref],
+                requirement_proofs=[
+                    {
+                        "evidence_refs": [
+                            producer_ref,
+                            artifact_ref,
+                            covered_artifact_ref,
+                        ],
+                    }
+                ],
+            )
+            completed_repair = TaskSpec(
+                task_id="repair-task-storage-r1-1",
+                title="Repair receipt producer",
+                description="Repair the producer implementation.",
+                acceptance=["The producer proof passes."],
+                status="done",
+                task_origin="evidence_repair",
+                parent_task_id=task.task_id,
+            )
+            pending_repair = TaskSpec(
+                task_id="repair-task-storage-r1-2",
+                title="Repair receipt assertion",
+                description="Finish the producer assertion repair.",
+                acceptance=["The producer assertion passes."],
+                status="pending",
+                task_origin="evidence_repair",
+                parent_task_id=task.task_id,
+            )
+            plan_payload = {
+                "verification_steps": [
+                    {
+                        "kind": "test",
+                        "runner": "pytest",
+                        "targets": ["tests/test_storage_smoke.py"],
+                        "artifact_globs": [covered_artifact_ref],
+                    }
+                ],
+                "tasks": [
+                    completed_repair.to_dict(),
+                    pending_repair.to_dict(),
+                    task.to_dict(),
+                ],
+            }
+            write_json(task_plan_path(project_root), plan_payload)
+            state = load_run_state(project_root)
+            state.tasks = [completed_repair, pending_repair, task]
+
+            recovered = orchestrator._schedule_repair_tasks_for_failure(
+                state,
+                state.tasks,
+                task,
+                {
+                    "ok": False,
+                    "reason": "ignored evidence was not published",
+                    "failure_ids": [failure_id, covered_failure_id],
+                    "comparable_failures": True,
+                },
+            )
+
+            self.assertTrue(recovered)
+            self.assertEqual(state.current_stage, "plan")
+            self.assertEqual(state.rejected_stage, "plan")
+            self.assertEqual(state.last_recovery_route["outcome"], "plan_metadata_repair")
+            self.assertEqual(len(state.tasks), 3)
+            self.assertEqual(completed_repair.status, "done")
+            self.assertEqual(pending_repair.status, "pending")
+            repair = state.resume_context["artifact_publication_metadata_repair"]
+            self.assertEqual(
+                [item["artifact_ref"] for item in repair["artifacts"]],
+                [artifact_ref],
+            )
+            feedback = orchestrator._plan_validation_feedback(
+                AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=project_root / "plan-output.txt",
+                    summary="updated plan",
+                )
+            )
+            self.assertIn(
+                "artifact publication metadata repair requires artifact_globs",
+                feedback,
+            )
+            self.assertTrue(
+                orchestrator._artifact_publication_metadata_repair_errors(
+                    plan_payload,
+                    repair=repair,
+                )
+            )
+
+            plan_payload["verification_steps"][0]["artifact_globs"].append(
+                artifact_ref
+            )
+            write_json(task_plan_path(project_root), plan_payload)
+            self.assertEqual(
+                orchestrator._artifact_publication_metadata_repair_errors(
+                    plan_payload,
+                    repair=repair,
+                ),
+                [],
+            )
+
+            orchestrator._apply_generated_verification_config()
+            state.tasks = orchestrator._load_tasks_from_plan()
+            orchestrator._complete_artifact_publication_metadata_repair(state)
+
+            self.assertIn(
+                artifact_ref,
+                orchestrator.config.gates.steps[0].artifact_globs,
+            )
+            self.assertNotIn(
+                "artifact_publication_metadata_repair",
+                state.resume_context,
+            )
+            self.assertEqual(
+                state.last_recovery_route["outcome"],
+                "plan_metadata_repaired",
+            )
+            self.assertEqual(state.tasks[0].status, "done")
+            self.assertEqual(state.tasks[1].status, "pending")
+            parent = next(
+                item for item in state.tasks if item.task_id == task.task_id
+            )
+            self.assertEqual(parent.evidence_preflight, {})
 
     def test_artifact_contract_without_sibling_uses_task_owned_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

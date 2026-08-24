@@ -290,10 +290,13 @@ class StageOwnershipRouteError(RuntimeError):
 
 
 VERIFY_BASELINE_SCHEMA_VERSION = 1
-IMPLEMENTATION_SCOPE_POLICY_VERSION = 4
+IMPLEMENTATION_SCOPE_POLICY_VERSION = 5
 EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT = 2
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
+_ARTIFACT_PUBLICATION_METADATA_REPAIR_CONTEXT = (
+    "artifact_publication_metadata_repair"
+)
 _DANGLING_DEPENDENCIES_AFTER_TASK_PRUNING = (
     "dangling_dependencies_after_task_pruning"
 )
@@ -3249,6 +3252,7 @@ class Orchestrator:
             )
             if origins_changed or ownership_changed:
                 self._persist_tasks(state.tasks)
+            self._complete_artifact_publication_metadata_repair(state)
             self._emit_plan_task_count(state.tasks)
         return state
 
@@ -9136,6 +9140,8 @@ class Orchestrator:
                             result,
                         )
                 if scheduled_recovery:
+                    if state.current_stage != "implement":
+                        return state
                     continue
                 self._persist_tasks(tasks)
                 for failed_task, result in failed_results:
@@ -10713,22 +10719,27 @@ class Orchestrator:
             return "", ""
         return parts[1], parts[2]
 
-    def _artifact_publication_repair_refs(
+    def _ignored_evidence_publication_failure_refs(
         self,
-        task: TaskSpec,
         failure_ids: Iterable[str],
     ) -> List[str]:
-        failed_artifact_refs = {
-            artifact_ref
-            for failure_id in failure_ids
-            for failure_kind, artifact_ref in [
+        refs: List[str] = []
+        for failure_id in failure_ids:
+            failure_kind, artifact_ref = (
                 self._structured_verification_contract_failure(failure_id)
-            ]
-            if failure_kind == _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND
-        }
-        if not failed_artifact_refs:
-            return []
+            )
+            if (
+                failure_kind == _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND
+                and artifact_ref not in refs
+            ):
+                refs.append(artifact_ref)
+        return refs
 
+    def _artifact_publication_producer_refs(
+        self,
+        task: TaskSpec,
+        artifact_ref: str,
+    ) -> List[str]:
         producer_refs: List[str] = []
         for proof in task.requirement_proofs:
             if not isinstance(proof, dict):
@@ -10738,11 +10749,11 @@ class Orchestrator:
                 for raw_ref in proof.get("evidence_refs", []) or []
                 if str(raw_ref).strip()
             ]
-            if not failed_artifact_refs.intersection(proof_refs):
+            if artifact_ref not in proof_refs:
                 continue
             for ref in proof_refs:
                 if (
-                    ref not in failed_artifact_refs
+                    ref != artifact_ref
                     and ref not in producer_refs
                     and self._build_task_proof_evidence_command_for_ref(ref)
                 ):
@@ -10750,17 +10761,233 @@ class Orchestrator:
         if producer_refs:
             return producer_refs
 
-        # A proof may cite only its generated artifact while the executable producer is
-        # owned at task level. In that case all executable task refs are safe recovery
-        # candidates; the repair remains bounded by the parent's verification contract.
+        # Some plans bind generated evidence at task level rather than placing
+        # the executable producer beside every artifact ref in a requirement
+        # proof. Preserve that legacy fallback while keeping the candidate set
+        # bounded by the task's owned proof surface.
         for ref in self._task_planned_evidence_refs(task):
             if (
-                ref not in failed_artifact_refs
+                ref != artifact_ref
                 and ref not in producer_refs
                 and self._build_task_proof_evidence_command_for_ref(ref)
             ):
                 producer_refs.append(ref)
         return producer_refs
+
+    def _verification_steps_for_evidence_ref(
+        self,
+        steps: Iterable[VerificationStep],
+        evidence_ref: str,
+    ) -> List[VerificationStep]:
+        command_ref = self._command_evidence_ref_command(evidence_ref)
+        if command_ref:
+            matches: List[VerificationStep] = []
+            for step in steps:
+                try:
+                    command = command_from_verification_step(
+                        step,
+                        project_root=self.project_root,
+                    )
+                except ValueError:
+                    continue
+                if command == command_ref:
+                    matches.append(step)
+            return matches
+
+        path, selector = self._split_evidence_ref(evidence_ref)
+        normalized_path = path.replace("\\", "/").strip().removeprefix("./")
+        if not normalized_path:
+            return []
+
+        matches: List[VerificationStep] = []
+        for step in steps:
+            step_selector = ""
+            for index, arg in enumerate(step.args[:-1]):
+                if arg in {"-t", "--test-name-pattern", "--testNamePattern"}:
+                    step_selector = step.args[index + 1].strip()
+                    break
+            if selector and step_selector and step_selector != selector:
+                continue
+            for raw_target in step.targets:
+                target = raw_target.replace("\\", "/").strip().removeprefix("./")
+                target_path, target_selector = self._split_evidence_ref(target)
+                target_path = target_path.removeprefix("./")
+                if selector and target_selector and target_selector != selector:
+                    continue
+                if not selector and (target_selector or step_selector):
+                    continue
+                if not (
+                    target_path == normalized_path
+                    or (
+                        target_path
+                        and not Path(target_path).suffix
+                        and normalized_path.startswith(target_path.rstrip("/") + "/")
+                    )
+                ):
+                    continue
+                matches.append(step)
+                break
+        return matches
+
+    @classmethod
+    def _artifact_ref_is_covered_by_glob(
+        cls,
+        artifact_ref: str,
+        artifact_glob: str,
+    ) -> bool:
+        pattern = artifact_ref.replace("\\", "/").strip().removeprefix("./")
+        publication_glob = (
+            artifact_glob.replace("\\", "/").strip().removeprefix("./")
+        )
+        if not pattern or not publication_glob:
+            return False
+        if pattern == publication_glob:
+            return True
+        probe = cls._glob_probe_path(pattern)
+        return fnmatch.fnmatchcase(probe, publication_glob)
+
+    @classmethod
+    def _verification_step_covers_artifact_ref(
+        cls,
+        step: VerificationStep,
+        artifact_ref: str,
+    ) -> bool:
+        return any(
+            cls._artifact_ref_is_covered_by_glob(artifact_ref, artifact_glob)
+            for artifact_glob in step.artifact_globs
+        )
+
+    @staticmethod
+    def _verification_steps_from_payload(
+        payload: object,
+    ) -> List[VerificationStep]:
+        if not isinstance(payload, dict):
+            return []
+        raw_steps = payload.get("verification_steps", [])
+        if not isinstance(raw_steps, list):
+            return []
+        try:
+            return [
+                VerificationStep.from_dict(dict(raw_step))
+                for raw_step in raw_steps
+                if isinstance(raw_step, dict)
+            ]
+        except (TypeError, ValueError):
+            return []
+
+    def _producer_verification_steps(
+        self,
+        steps: Iterable[VerificationStep],
+        producer_refs: Iterable[str],
+    ) -> List[VerificationStep]:
+        matches: List[VerificationStep] = []
+        for producer_ref in producer_refs:
+            for step in self._verification_steps_for_evidence_ref(
+                steps,
+                producer_ref,
+            ):
+                if step not in matches:
+                    matches.append(step)
+        return matches
+
+    def _artifact_publication_metadata_repair(
+        self,
+        task: TaskSpec,
+        failure_ids: Iterable[str],
+    ) -> Dict[str, object]:
+        """Describe missing plan-owned producer publication metadata."""
+        if not self.config.gates.allow_agent_updates:
+            return {}
+        failed_artifact_refs = self._ignored_evidence_publication_failure_refs(
+            failure_ids
+        )
+        if not failed_artifact_refs:
+            return {}
+        try:
+            plan_payload = load_task_plan(self.project_root)
+        except (OSError, TypeError, ValueError):
+            return {}
+        raw_steps = (
+            plan_payload.get("verification_steps", [])
+            if isinstance(plan_payload, dict)
+            else []
+        )
+        # Free-form or operator-managed gate configuration has no generated
+        # plan source to repair. Keep its existing target-project ownership.
+        if not isinstance(raw_steps, list) or not raw_steps:
+            return {}
+        steps = self._verification_steps_from_payload(plan_payload)
+
+        missing: List[Dict[str, object]] = []
+        for artifact_ref in failed_artifact_refs:
+            producer_refs = self._artifact_publication_producer_refs(
+                task,
+                artifact_ref,
+            )
+            if not producer_refs:
+                continue
+            producer_steps = self._producer_verification_steps(
+                steps,
+                producer_refs,
+            )
+            if any(
+                self._verification_step_covers_artifact_ref(step, artifact_ref)
+                for step in producer_steps
+            ):
+                continue
+            missing.append(
+                {
+                    "artifact_ref": artifact_ref,
+                    "producer_refs": producer_refs,
+                }
+            )
+        if not missing:
+            return {}
+        return {
+            "schema_version": 1,
+            "task_id": task.task_id,
+            "artifacts": missing,
+        }
+
+    def _latest_artifact_publication_failure_ids(
+        self,
+        task: TaskSpec,
+    ) -> List[str]:
+        for entry in reversed(task.verify_history):
+            if not isinstance(entry, dict):
+                continue
+            raw_ids = entry.get("failure_ids", [])
+            if not isinstance(raw_ids, list):
+                continue
+            failure_ids = [
+                str(item).strip() for item in raw_ids if str(item).strip()
+            ]
+            if self._ignored_evidence_publication_failure_refs(failure_ids):
+                return failure_ids
+        return []
+
+    def _artifact_publication_repair_refs(
+        self,
+        task: TaskSpec,
+        failure_ids: Iterable[str],
+    ) -> List[str]:
+        failed_artifact_refs = self._ignored_evidence_publication_failure_refs(
+            failure_ids
+        )
+        if not failed_artifact_refs:
+            return []
+
+        producer_refs: List[str] = []
+        for artifact_ref in failed_artifact_refs:
+            for ref in self._artifact_publication_producer_refs(
+                task,
+                artifact_ref,
+            ):
+                if ref not in producer_refs:
+                    producer_refs.append(ref)
+        if producer_refs:
+            return producer_refs
+        return []
 
     @staticmethod
     def _group_repair_refs(refs: List[str], max_refs_per_group: int, max_groups: int) -> List[List[str]]:
@@ -10787,6 +11014,81 @@ class Orchestrator:
     def _repair_task_id(parent_task_id: str, round_number: int, index: int) -> str:
         safe_parent = re.sub(r"[^a-zA-Z0-9_-]+", "-", parent_task_id).strip("-").lower() or "task"
         return f"repair-{safe_parent}-r{round_number}-{index}"
+
+    def _route_artifact_publication_metadata_repair(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        result: Dict[str, object],
+        repair: Dict[str, object],
+    ) -> bool:
+        artifacts = [
+            item
+            for item in repair.get("artifacts", []) or []
+            if isinstance(item, dict)
+            and str(item.get("artifact_ref", "")).strip()
+        ]
+        if not artifacts:
+            return False
+
+        failure_ids = [
+            str(item).strip()
+            for item in result.get("failure_ids", []) or []
+            if str(item).strip()
+        ]
+        repair = {
+            **repair,
+            "failure_ids": failure_ids,
+        }
+        state.resume_context[
+            _ARTIFACT_PUBLICATION_METADATA_REPAIR_CONTEXT
+        ] = repair
+
+        task.status = "pending"
+        task.evidence_preflight = {}
+        self._rewind_state_from_stage(state, "plan")
+        state.rejected_stage = "plan"
+        detail_lines = [
+            f"- {item['artifact_ref']} <- "
+            + ", ".join(str(ref) for ref in item.get("producer_refs", []) or [])
+            for item in artifacts
+        ]
+        state.rejection_reason = "\n".join(
+            [
+                "Generated verification publication metadata is incomplete.",
+                "Update .auto-agents/state/task_plan.json verification_steps so each "
+                "artifact below is covered by an artifact_globs entry on one of its "
+                "listed producer steps. Preserve existing repair tasks and their statuses, "
+                "especially completed repairs. "
+                "Do not create an implementation repair task solely for this metadata gap; "
+                "the orchestrator will synchronize the repaired verification_steps into "
+                ".auto-agents/config.json.",
+                "",
+                *detail_lines,
+            ]
+        )
+        state.last_error = (
+            f"artifact publication metadata for {task.task_id} requires plan repair"
+        )
+        signature = self._recovery_signature(failure_ids)
+        self._persist_tasks(tasks)
+        state.tasks = tasks
+        self._record_recovery_route(
+            state,
+            task,
+            outcome="plan_metadata_repair",
+            failure_kind=_IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND,
+            reason=state.rejection_reason,
+            signature=signature,
+        )
+        save_run_state(self.project_root, state)
+        self.logger.info(
+            "[recovery] parent=%s route=plan publication_metadata_gaps=%s",
+            task.task_id,
+            len(artifacts),
+        )
+        return True
 
     def _schedule_repair_tasks_for_failure(
         self,
@@ -10837,6 +11139,27 @@ class Orchestrator:
                 tasks,
                 task,
                 result,
+            )
+        raw_failure_ids = result.get("failure_ids", [])
+        failure_ids = (
+            [
+                str(item).strip()
+                for item in raw_failure_ids
+                if str(item).strip()
+            ]
+            if isinstance(raw_failure_ids, list)
+            else []
+        )
+        publication_metadata_repair = (
+            self._artifact_publication_metadata_repair(task, failure_ids)
+        )
+        if publication_metadata_repair:
+            return self._route_artifact_publication_metadata_repair(
+                state,
+                tasks,
+                task,
+                result,
+                publication_metadata_repair,
             )
         existing_open_repairs = [
             item for item in tasks
@@ -14426,7 +14749,7 @@ class Orchestrator:
         ]
         effort = self.config.efforts.get("evidence_preflight", "balanced")
         payload = {
-            "version": 2,
+            "version": 3,
             "task": task_payload,
             "requirements": requirements,
             "head": head_ref(self.project_root),
@@ -14577,6 +14900,7 @@ class Orchestrator:
         required_mutations: Iterable[object],
     ) -> Tuple[str, List[str]]:
         """Return unresolved mutations not owned by implementation."""
+        required_mutations = list(required_mutations)
         trace = load_requirements_trace(self.project_root)
         task_requirement_ids = {
             str(requirement_id).strip()
@@ -14605,6 +14929,29 @@ class Orchestrator:
         provider_lock = self._normalize_audit_blocker_path(
             self._relative_repo_path(provider_references_lock_path(self.project_root))
         )
+        has_config_mutation = any(
+            isinstance(item, dict)
+            and self._normalize_audit_blocker_path(item.get("path", ""))
+            == ".auto-agents/config.json"
+            for item in required_mutations
+        )
+        try:
+            plan_payload = load_task_plan(self.project_root)
+        except (OSError, TypeError, ValueError):
+            plan_payload = {}
+        generated_verification_source = bool(
+            isinstance(plan_payload, dict)
+            and isinstance(plan_payload.get("verification_steps"), list)
+            and plan_payload.get("verification_steps")
+        )
+        publication_metadata_repair = (
+            self._artifact_publication_metadata_repair(
+                task,
+                self._latest_artifact_publication_failure_ids(task),
+            )
+            if has_config_mutation
+            else {}
+        )
 
         actionable: List[str] = []
         owners: Set[str] = set()
@@ -14615,7 +14962,31 @@ class Orchestrator:
             if not path:
                 continue
             if path == ".auto-agents/config.json":
-                owners.add("target_project")
+                config_scope = str(
+                    item.get("config_scope", item.get("scope", ""))
+                ).strip().lower()
+                explicitly_generated = config_scope in {
+                    "generated_verification",
+                    "generated_verification_steps",
+                    "gates.steps",
+                    "verification_steps",
+                }
+                explicitly_operator_owned = bool(config_scope) and not (
+                    explicitly_generated
+                )
+                generated_verification_metadata = bool(
+                    self.config.gates.allow_agent_updates
+                    and generated_verification_source
+                    and not explicitly_operator_owned
+                    and (explicitly_generated or publication_metadata_repair)
+                    and persistence_change_strategy(task.persistence_change)
+                    == "none"
+                )
+                owners.add(
+                    "plan"
+                    if generated_verification_metadata
+                    else "target_project"
+                )
                 actionable.append(path)
                 continue
             owner = self._forbidden_pattern_owner_stage({"path": path})
@@ -14666,10 +15037,10 @@ class Orchestrator:
                 "Choose SPLIT when independently verifiable proof surfaces require separate task slices.",
                 "Choose CLARIFY only when a product decision or external contract is genuinely missing.",
                 "Choose ROUTE when implementation requires changing an artifact owned by an earlier stage; set target_stage to clarify, prototype, design, plan, or provider_research.",
-                "Project configuration at .auto-agents/config.json is target-project-owned. If it must change, list it in required_mutations; do not claim the implementation task can edit it.",
+                "Project configuration at .auto-agents/config.json is normally target-project-owned. The gates.steps graph generated from task_plan.json is plan-owned when gates.allow_agent_updates is enabled; route missing generated verification or artifact publication metadata to plan. If config.json must change, list it in required_mutations and set config_scope to generated_verification or operator.",
                 "Always list required_mutations as objects with exact project-relative path and reason. Provider references under .auto-agents are read-only implementation inputs owned by provider_research.",
                 "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
-                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\"}]}",
+                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\",\"config_scope\":\"generated_verification|operator\"}]}",
                 f"Task JSON:\n{json.dumps(task.to_dict(), indent=2, ensure_ascii=False)}",
                 requirement_context,
             ]
@@ -14736,6 +15107,48 @@ class Orchestrator:
                 and self._normalize_audit_blocker_path(item.get("path", ""))
             }
         )
+        if (
+            decision in {"BLOCK", "ROUTE"}
+            and ".auto-agents/config.json" in route_paths
+        ):
+            required_mutations = result.get("required_mutations", []) or []
+            owner_stage, _mutation_paths = (
+                self._actionable_preflight_upstream_mutations(
+                    task,
+                    required_mutations,
+                )
+            )
+            failure_ids = self._latest_artifact_publication_failure_ids(task)
+            publication_metadata_repair = (
+                self._artifact_publication_metadata_repair(
+                    task,
+                    failure_ids,
+                )
+            )
+            if owner_stage == "plan" and publication_metadata_repair:
+                if self._route_artifact_publication_metadata_repair(
+                    state,
+                    tasks,
+                    task,
+                    {
+                        "reason": str(result.get("reason", "")).strip(),
+                        "failure_ids": failure_ids,
+                    },
+                    publication_metadata_repair,
+                ):
+                    return state
+            if decision == "BLOCK" and owner_stage == "plan":
+                decision = "ROUTE"
+                result = {
+                    **result,
+                    "decision": "ROUTE",
+                    "target_stage": "plan",
+                    "reason": (
+                        "Generated verification configuration is plan-owned. "
+                        + str(result.get("reason", "")).strip()
+                    ).strip(),
+                }
+                task.evidence_preflight = {}
         if decision == "BLOCK":
             task.status = "pending"
             self._persist_tasks(tasks)
@@ -19795,6 +20208,122 @@ class Orchestrator:
         )
         return any(marker in normalized for marker in no_uncovered_markers)
 
+    def _active_artifact_publication_metadata_repair(
+        self,
+    ) -> Dict[str, object]:
+        try:
+            state = load_run_state(self.project_root)
+        except (FileNotFoundError, KeyError, TypeError, ValueError):
+            return {}
+        repair = state.resume_context.get(
+            _ARTIFACT_PUBLICATION_METADATA_REPAIR_CONTEXT,
+            {},
+        )
+        return dict(repair) if isinstance(repair, dict) else {}
+
+    def _artifact_publication_metadata_repair_errors(
+        self,
+        plan_payload: object,
+        *,
+        repair: Optional[Dict[str, object]] = None,
+    ) -> List[str]:
+        repair = (
+            dict(repair)
+            if isinstance(repair, dict)
+            else self._active_artifact_publication_metadata_repair()
+        )
+        artifacts = repair.get("artifacts", []) if repair else []
+        if not isinstance(artifacts, list) or not artifacts:
+            return []
+        steps = self._verification_steps_from_payload(plan_payload)
+        errors: List[str] = []
+        for item in artifacts:
+            if not isinstance(item, dict):
+                continue
+            artifact_ref = str(item.get("artifact_ref", "")).strip()
+            producer_refs = [
+                str(ref).strip()
+                for ref in item.get("producer_refs", []) or []
+                if str(ref).strip()
+            ]
+            if not artifact_ref or not producer_refs:
+                continue
+            producer_steps = self._producer_verification_steps(
+                steps,
+                producer_refs,
+            )
+            if not producer_steps:
+                errors.append(
+                    "artifact publication metadata repair requires a verification "
+                    f"step for {artifact_ref}; producer refs: "
+                    + ", ".join(producer_refs)
+                )
+                continue
+            if not any(
+                self._verification_step_covers_artifact_ref(step, artifact_ref)
+                for step in producer_steps
+            ):
+                errors.append(
+                    "artifact publication metadata repair requires artifact_globs "
+                    f"coverage for {artifact_ref} on its producer verification step"
+                )
+        return errors
+
+    def _complete_artifact_publication_metadata_repair(
+        self,
+        state: RunState,
+    ) -> None:
+        repair = state.resume_context.get(
+            _ARTIFACT_PUBLICATION_METADATA_REPAIR_CONTEXT,
+            {},
+        )
+        if not isinstance(repair, dict) or not repair:
+            return
+        errors = self._artifact_publication_metadata_repair_errors(
+            {
+                "verification_steps": [
+                    step.to_dict() for step in self.config.gates.steps
+                ]
+            },
+            repair=repair,
+        )
+        if errors:
+            raise RuntimeError(
+                "generated artifact publication metadata remained incomplete "
+                "after plan validation: "
+                + "; ".join(errors)
+            )
+        task_id = str(repair.get("task_id", "")).strip()
+        for task in state.tasks:
+            if task.task_id == task_id:
+                # The prior preflight fingerprint described the stale generated
+                # gate graph. It must never survive the plan-to-config sync.
+                task.evidence_preflight = {}
+        route_history = state.resume_context.get(
+            "evidence_preflight_routes",
+            {},
+        )
+        if isinstance(route_history, dict) and task_id:
+            route_history.pop(task_id, None)
+            if route_history:
+                state.resume_context["evidence_preflight_routes"] = route_history
+            else:
+                state.resume_context.pop("evidence_preflight_routes", None)
+        state.resume_context.pop(
+            _ARTIFACT_PUBLICATION_METADATA_REPAIR_CONTEXT,
+            None,
+        )
+        if str(state.last_recovery_route.get("outcome", "")) == (
+            "plan_metadata_repair"
+        ):
+            state.last_recovery_route["outcome"] = "plan_metadata_repaired"
+            state.last_recovery_route["reason"] = (
+                "generated verification artifact publication metadata was "
+                "repaired and synchronized into project configuration"
+            )
+        self._persist_tasks(state.tasks)
+        save_run_state(self.project_root, state)
+
     def _plan_validation_feedback(self, result: AgentResult) -> Optional[str]:
         payload = load_task_plan(self.project_root)
         trace = load_requirements_trace(self.project_root)
@@ -19860,6 +20389,9 @@ class Orchestrator:
                     "task plan verification_commands",
                 )
             )
+        errors.extend(
+            self._artifact_publication_metadata_repair_errors(payload)
+        )
         if not errors:
             # Soft warning: if this is an iteration with no new pending tasks, nudge the agent.
             is_iteration = any(

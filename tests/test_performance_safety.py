@@ -850,6 +850,54 @@ class GateOptimizationTests(unittest.TestCase):
 
 
 class EvidencePreflightTests(unittest.TestCase):
+    def _artifact_publication_gap_task(
+        self,
+        root: Path,
+    ) -> tuple[Orchestrator, TaskSpec, str]:
+        Orchestrator.init_project(root, "demo", "mock")
+        producer_ref = "tests/test_receipt.py::test_publishes_receipt"
+        artifact_ref = ".tmp-tests/receipts/runs/*/receipt.json"
+        failure_id = (
+            "verification_contract:nonportable_ignored_evidence:"
+            f"{artifact_ref}"
+        )
+        task = TaskSpec(
+            task_id="task-receipt",
+            title="Publish receipt",
+            description="Publish an isolated verification receipt.",
+            acceptance=["The receipt is portable."],
+            verification_refs=[producer_ref],
+            requirement_proofs=[
+                {"evidence_refs": [producer_ref, artifact_ref]}
+            ],
+            verify_history=[
+                {
+                    "attempt": 1,
+                    "decision": "fail",
+                    "summary": "ignored evidence was not published",
+                    "failure_ids": [failure_id],
+                    "comparable_failures": True,
+                }
+            ],
+        )
+        write_json(
+            root / ".auto-agents" / "state" / "task_plan.json",
+            {
+                "verification_steps": [
+                    {
+                        "kind": "test",
+                        "runner": "pytest",
+                        "targets": ["tests/test_receipt.py"],
+                        "artifact_globs": [
+                            ".tmp-tests/receipts/runs/*/summary.json"
+                        ],
+                    }
+                ],
+                "tasks": [task.to_dict()],
+            },
+        )
+        return Orchestrator(root), task, artifact_ref
+
     def _provider_contract_task(
         self,
         root: Path,
@@ -1026,6 +1074,127 @@ class EvidencePreflightTests(unittest.TestCase):
 
             self.assertEqual(owner, "target_project")
             self.assertEqual(paths, [".auto-agents/config.json"])
+
+    def test_generated_verification_config_mutation_routes_to_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator, task, _artifact_ref = (
+                self._artifact_publication_gap_task(root)
+            )
+
+            owner, paths = orchestrator._actionable_preflight_upstream_mutations(
+                task,
+                [
+                    {
+                        "path": ".auto-agents/config.json",
+                        "reason": "repair generated producer publication metadata",
+                        "config_scope": "generated_verification",
+                    }
+                ],
+            )
+
+            self.assertEqual(owner, "plan")
+            self.assertEqual(paths, [".auto-agents/config.json"])
+
+            task.verify_history = []
+            task.requirement_proofs = []
+            owner, paths = orchestrator._actionable_preflight_upstream_mutations(
+                task,
+                [
+                    {
+                        "path": ".auto-agents/config.json",
+                        "reason": "repair generated verification dependencies",
+                        "config_scope": "generated_verification",
+                    }
+                ],
+            )
+            self.assertEqual(owner, "plan")
+            self.assertEqual(paths, [".auto-agents/config.json"])
+
+    def test_operator_config_scope_stays_target_owned_despite_artifact_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator, task, _artifact_ref = (
+                self._artifact_publication_gap_task(root)
+            )
+
+            owner, paths = orchestrator._actionable_preflight_upstream_mutations(
+                task,
+                [
+                    {
+                        "path": ".auto-agents/config.json",
+                        "reason": "configure an operator-owned credential binding",
+                        "config_scope": "operator",
+                    }
+                ],
+            )
+
+            self.assertEqual(owner, "target_project")
+            self.assertEqual(paths, [".auto-agents/config.json"])
+
+            orchestrator.config.gates.allow_agent_updates = False
+            owner, paths = orchestrator._actionable_preflight_upstream_mutations(
+                task,
+                [
+                    {
+                        "path": ".auto-agents/config.json",
+                        "reason": "repair generated producer publication metadata",
+                        "config_scope": "generated_verification",
+                    }
+                ],
+            )
+            self.assertEqual(owner, "target_project")
+            self.assertEqual(paths, [".auto-agents/config.json"])
+
+    def test_cached_config_block_is_recovered_as_plan_metadata_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator, task, artifact_ref = (
+                self._artifact_publication_gap_task(root)
+            )
+            from auto_agents.config import load_run_state
+
+            state = load_run_state(root)
+            task.evidence_preflight = {
+                "decision": "BLOCK",
+                "fingerprint": "legacy-fingerprint",
+            }
+            state.tasks = [task]
+            result = {
+                "decision": "BLOCK",
+                "target_stage": "",
+                "reason": "generated producer publication metadata is incomplete",
+                "checklist": [],
+                "required_mutations": [
+                    {
+                        "path": ".auto-agents/config.json",
+                        "reason": "repair generated producer publication metadata",
+                    }
+                ],
+            }
+
+            routed = orchestrator._route_evidence_preflight(
+                state,
+                [task],
+                task,
+                result,
+            )
+
+            self.assertEqual(routed.status, "pending")
+            self.assertEqual(routed.current_stage, "plan")
+            self.assertEqual(routed.rejected_stage, "plan")
+            self.assertEqual(routed.active_blocker, {})
+            self.assertEqual(task.evidence_preflight, {})
+            self.assertEqual(
+                routed.last_recovery_route["outcome"],
+                "plan_metadata_repair",
+            )
+            repair = routed.resume_context[
+                "artifact_publication_metadata_repair"
+            ]
+            self.assertEqual(repair["artifacts"][0]["artifact_ref"], artifact_ref)
 
     def test_project_config_preflight_block_persists_human_owned_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
