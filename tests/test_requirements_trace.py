@@ -2246,6 +2246,57 @@ class RequirementsTraceTests(unittest.TestCase):
         self.assertTrue(any("task-001" in item for item in updates), updates)
         self.assertEqual(validate_task_plan_with_requirements(repaired, trace), [])
 
+    def test_plan_status_normalization_restores_only_trusted_done_identities(self) -> None:
+        trusted_task = {
+            "task_id": "repair-task-001",
+            "title": "Canonical evidence repair",
+            "description": "The authoritative run-state task already completed.",
+            "acceptance": ["The regression remains verified."],
+            "requirement_ids": ["REQ-001"],
+            "requirement_proofs": [],
+            "status": "done",
+            "commit_message": "",
+            "task_origin": "evidence_repair",
+            "verify_history": [{"attempt": 1, "decision": "pass"}],
+        }
+        candidate_copy = dict(trusted_task)
+        candidate_copy["title"] = "Planner-modified historical copy"
+        candidate_copy["verify_history"] = []
+        candidate_copy["status"] = "pending"
+        untrusted_task = {
+            "task_id": "repair-task-002",
+            "title": "Untrusted generated completion",
+            "description": "The planner invented this completed state.",
+            "acceptance": ["The regression remains verified."],
+            "requirement_ids": ["REQ-001"],
+            "requirement_proofs": [],
+            "status": "done",
+            "commit_message": "",
+            "task_origin": "evidence_repair",
+        }
+        plan = {
+            "oracle_proof_schema_version": 1,
+            "tasks": [candidate_copy, untrusted_task],
+        }
+
+        repaired, updates = normalize_generated_task_plan_statuses(
+            plan,
+            trusted_done_tasks=[trusted_task],
+        )
+
+        self.assertEqual(repaired["tasks"][0], trusted_task)
+        self.assertEqual(repaired["tasks"][1]["status"], "pending")
+        self.assertEqual(plan["tasks"][0]["title"], "Planner-modified historical copy")
+        self.assertEqual(plan["tasks"][0]["status"], "pending")
+        self.assertTrue(
+            any("repair-task-001" in item and "authoritative done payload" in item for item in updates),
+            updates,
+        )
+        self.assertTrue(
+            any("repair-task-002" in item and "to 'pending'" in item for item in updates),
+            updates,
+        )
+
     def test_plan_validation_rejects_done_task_with_unverified_oracle_proof(self) -> None:
         trace = {"version": 1, "requirements": [_requirement()]}
         plan = {

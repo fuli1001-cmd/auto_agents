@@ -21767,7 +21767,18 @@ class Orchestrator:
     def _plan_validation_feedback(self, result: AgentResult) -> Optional[str]:
         payload = load_task_plan(self.project_root)
         trace = load_requirements_trace(self.project_root)
-        payload, status_normalization_updates = normalize_generated_task_plan_statuses(payload)
+        prior_done_tasks = [
+            item
+            for item in getattr(self, "_plan_prior_done_task_payloads", [])
+            if isinstance(item, dict)
+        ]
+        trusted_done_tasks = (
+            load_archived_done_task_payloads(self.project_root) + prior_done_tasks
+        )
+        payload, status_normalization_updates = normalize_generated_task_plan_statuses(
+            payload,
+            trusted_done_tasks=trusted_done_tasks,
+        )
         payload, oracle_preservation_updates = preserve_task_plan_negative_oracle_clauses(
             payload,
             trace,
@@ -21782,16 +21793,11 @@ class Orchestrator:
             save_task_plan(self.project_root, payload)
             for update in plan_normalization_updates:
                 self.logger.info(f"[plan] {update}")
-        prior_done_tasks = [
-            item
-            for item in getattr(self, "_plan_prior_done_task_payloads", [])
-            if isinstance(item, dict)
-        ]
         errors = validate_task_plan_with_requirements(
             payload,
             trace,
             enforce_active_task_granularity=True,
-            historical_tasks=load_archived_done_task_payloads(self.project_root) + prior_done_tasks,
+            historical_tasks=trusted_done_tasks,
         )
         errors.extend(
             validate_persistence_plan_contract(

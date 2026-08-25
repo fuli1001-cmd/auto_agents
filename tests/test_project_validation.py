@@ -3630,6 +3630,162 @@ class ProjectValidationTests(unittest.TestCase):
             repaired = json.loads(task_plan_path(project_root).read_text(encoding="utf-8"))
             self.assertEqual(repaired["tasks"][0]["status"], "pending")
 
+    def test_plan_validation_restores_trusted_done_evidence_repair_before_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_scope": {"requested": False, "surfaces": []},
+                    "requirements": [
+                        {
+                            "id": "REQ-020",
+                            "text": "Preserve the approved Workbench prototype fidelity.",
+                            "source": "iteration non-goals",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": [
+                                "Desktop and mobile screenshots remain visually unchanged."
+                            ],
+                            "oracle_type": "mixed",
+                            "oracle_strength": "semantic",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "frontend_surface: home; preservation-only contract",
+                            "frontend_surface": True,
+                        }
+                    ],
+                },
+            )
+            canonical_task = {
+                "task_id": "repair-task-001",
+                "title": "Repair historical evidence",
+                "description": "The evidence-only repair already completed.",
+                "acceptance": [
+                    "Desktop and mobile screenshots remain visually unchanged."
+                ],
+                "requirement_ids": ["REQ-020"],
+                "requirement_proofs": [],
+                "status": "done",
+                "commit_message": "",
+                "task_origin": "evidence_repair",
+                "review_summary": "Historical repair was accepted.",
+                "verify_history": [{"attempt": 1, "decision": "pass"}],
+                "verification_refs": ["tests/test_frontend.py::test_preserved"],
+            }
+            candidate_task = dict(canonical_task)
+            candidate_task["title"] = "Planner copy of historical repair"
+            candidate_task["review_summary"] = ""
+            candidate_task["verify_history"] = []
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [
+                        {"kind": "test", "runner": "pytest", "targets": ["tests"]}
+                    ],
+                    "tasks": [candidate_task],
+                },
+            )
+            (project_root / "tests").mkdir()
+            orchestrator = Orchestrator(project_root)
+            orchestrator._plan_prior_done_task_payloads = [canonical_task]
+            result = AgentResult(
+                ok=True,
+                command=[],
+                output_path=Path("."),
+                summary=(
+                    "COVERAGE ANALYSIS: REQ-020 is covered by repair-task-001. "
+                    "UNCOVERED: none."
+                ),
+                stdout="",
+            )
+
+            feedback = orchestrator._plan_validation_feedback(result)
+
+            self.assertIsNone(feedback)
+            repaired = json.loads(task_plan_path(project_root).read_text(encoding="utf-8"))
+            self.assertEqual(repaired["tasks"], [canonical_task])
+
+    def test_plan_validation_still_rejects_new_preservation_only_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_scope": {"requested": False, "surfaces": []},
+                    "requirements": [
+                        {
+                            "id": "REQ-020",
+                            "text": "Preserve the approved Workbench prototype fidelity.",
+                            "source": "iteration non-goals",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": [
+                                "Desktop and mobile screenshots remain visually unchanged."
+                            ],
+                            "oracle_type": "mixed",
+                            "oracle_strength": "semantic",
+                            "evidence_boundary": "system_boundary",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "frontend_surface: home; preservation-only contract",
+                            "frontend_surface": True,
+                        }
+                    ],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 1,
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [
+                        {"kind": "test", "runner": "pytest", "targets": ["tests"]}
+                    ],
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Rebind preserved frontend evidence",
+                            "description": "Create new preservation-only work.",
+                            "acceptance": [
+                                "Desktop and mobile screenshots remain visually unchanged."
+                            ],
+                            "requirement_ids": ["REQ-020"],
+                            "requirement_proofs": [],
+                            "status": "pending",
+                            "commit_message": "",
+                        }
+                    ],
+                },
+            )
+            (project_root / "tests").mkdir()
+            result = AgentResult(
+                ok=True,
+                command=[],
+                output_path=Path("."),
+                summary="valid plan",
+                stdout="",
+            )
+
+            feedback = Orchestrator(project_root)._plan_validation_feedback(result)
+
+            self.assertIsNotNone(feedback)
+            self.assertIn(
+                "task task-001 binds preservation-only frontend requirements",
+                feedback,
+            )
+
     def test_plan_validation_rejects_oversized_active_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

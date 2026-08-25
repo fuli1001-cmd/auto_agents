@@ -391,15 +391,20 @@ def preserve_task_plan_negative_oracle_clauses(
     return repaired, updates
 
 
-def normalize_generated_task_plan_statuses(plan_payload: object) -> Tuple[object, List[str]]:
+def normalize_generated_task_plan_statuses(
+    plan_payload: object,
+    *,
+    trusted_done_tasks: Iterable[dict] = (),
+) -> Tuple[object, List[str]]:
     """Normalize planner-generated task statuses before strict plan validation.
 
     The plan stage writes the next executable plan, not a live run snapshot. LLMs
     can accidentally copy archived or run-state task statuses such as done or
     in_progress back into task_plan.json. In oracle proof schema mode that makes
     validation fail before implementation can begin, because done tasks require
-    verified proofs. Keep truly verified done tasks intact, but turn stale copied
-    runtime statuses back into pending work.
+    verified proofs. Restore task IDs supplied by the orchestrator as canonical
+    done payloads, keep independently verified done tasks intact, and turn stale
+    untrusted runtime statuses back into pending work.
     """
     if not isinstance(plan_payload, dict):
         return plan_payload, []
@@ -419,9 +424,31 @@ def normalize_generated_task_plan_statuses(plan_payload: object) -> Tuple[object
     if not isinstance(repaired_tasks, list):
         return plan_payload, []
 
-    updates: List[str] = []
-    for task in repaired_tasks:
+    trusted_done_by_id: Dict[str, dict] = {}
+    for task in trusted_done_tasks:
         if not isinstance(task, dict):
+            continue
+        if str(task.get("status", "")).strip() != "done":
+            continue
+        task_id = str(task.get("task_id", "")).strip()
+        if task_id:
+            # Later authoritative inputs take precedence; the orchestrator
+            # appends current-run records after archived records.
+            trusted_done_by_id[task_id] = task
+
+    updates: List[str] = []
+    for index, task in enumerate(repaired_tasks):
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id", "")).strip()
+        trusted_task = trusted_done_by_id.get(task_id)
+        if trusted_task is not None:
+            if task != trusted_task:
+                repaired_tasks[index] = copy.deepcopy(trusted_task)
+                updates.append(
+                    f"task {task_id}: restored authoritative done payload before "
+                    "generated-status normalization"
+                )
             continue
         status = str(task.get("status", "pending")).strip()
         if status == "pending":
@@ -435,8 +462,10 @@ def normalize_generated_task_plan_statuses(plan_payload: object) -> Tuple[object
         if status == "done" and has_only_verified_proofs:
             continue
         task["status"] = "pending"
-        task_id = str(task.get("task_id", "")).strip() or "<unknown>"
-        updates.append(f"task {task_id}: normalized generated status {status!r} to 'pending'")
+        display_task_id = task_id or "<unknown>"
+        updates.append(
+            f"task {display_task_id}: normalized generated status {status!r} to 'pending'"
+        )
 
     if not updates:
         return plan_payload, []
