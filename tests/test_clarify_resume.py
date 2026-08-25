@@ -1,5 +1,6 @@
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -200,7 +201,7 @@ class ClarifyResumeTests(unittest.TestCase):
             "sha256:stale",
         )
 
-    def test_clarify_generate_retry_restores_owned_artifacts(self):
+    def test_clarify_generate_validation_retry_preserves_candidate_artifacts(self):
         project_root, _spec_file = self._setup_project()
         orchestrator = Orchestrator(project_root)
         state = load_run_state(project_root)
@@ -252,8 +253,176 @@ class ClarifyResumeTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(calls, 2)
-        self.assertEqual(second_attempt_brief, "# Original Brief\n")
-        self.assertEqual(second_attempt_trace, {"version": 1, "requirements": []})
+        self.assertEqual(second_attempt_brief, "# Generated Attempt 1\n")
+        self.assertEqual(
+            second_attempt_trace,
+            {"version": 1, "requirements": [{"id": "REQ-001"}]},
+        )
+        self.assertFalse(
+            orchestrator._attempt_recovery_checkpoint_root(
+                state.run_id,
+                "clarify-generate",
+            ).exists()
+        )
+
+    def test_clarify_generate_retry_amends_reciprocal_replacement_candidate(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        trace_path = requirements_trace_path(project_root)
+
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [self._requirement()]}
+        )
+        predecessor = json.loads(json.dumps(previous["requirements"][0]))
+        predecessor["status"] = "superseded"
+        predecessor["superseded_by"] = ["REQ-002"]
+        replacement = self._requirement()
+        replacement.update(
+            {
+                "id": "REQ-002",
+                "text": "Provide deterministic replacement output.",
+                "supersedes": ["REQ-001"],
+            }
+        )
+        candidate, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [predecessor, replacement]}
+        )
+        write_json(trace_path, previous)
+        self._write_valid_brief(project_root)
+        orchestrator._active_spec_file = spec_file
+        orchestrator._clarify_pre_trace_payload = previous
+        orchestrator._clarify_historical_tasks = [
+            {
+                "task_id": "completed-task",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+            }
+        ]
+
+        calls = 0
+        trace_seen_on_retry = None
+
+        def run_generate(request):
+            nonlocal calls, trace_seen_on_retry
+            calls += 1
+            if calls == 1:
+                write_text(
+                    docs_dir(project_root) / "project_brief.md",
+                    "# Project Brief\n\n## Problem\n\nMissing required sections.\n",
+                )
+                write_json(trace_path, candidate)
+            else:
+                trace_seen_on_retry = json.loads(trace_path.read_text(encoding="utf-8"))
+                self._write_valid_brief(project_root)
+            write_text(request.output_path, f"attempt {calls}\n")
+            return AgentResult(
+                ok=True,
+                command=["fake"],
+                output_path=request.output_path,
+                summary=f"attempt {calls}",
+                returncode=0,
+            )
+
+        orchestrator.adapter.run = run_generate
+
+        result = orchestrator._run_agent_with_retries(
+            state=state,
+            stage="clarify",
+            stage_key="clarify-generate",
+            prompt="Generate clarify artifacts.",
+            validation_feedback=orchestrator._clarify_validation_feedback,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, 2)
+        self.assertEqual(trace_seen_on_retry, candidate)
+        final_trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        self.assertEqual(final_trace, candidate)
+        self.assertEqual(validate_requirements_trace_payload(final_trace), [])
+        self.assertEqual(
+            final_trace["requirements"][0]["superseded_by"],
+            ["REQ-002"],
+        )
+        self.assertEqual(
+            final_trace["requirements"][1]["supersedes"],
+            ["REQ-001"],
+        )
+
+    def test_clarify_generate_exhaustion_restores_worktree_and_index(self):
+        project_root, _spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        brief_path = docs_dir(project_root) / "project_brief.md"
+        trace_path = requirements_trace_path(project_root)
+        write_text(brief_path, "# Original Brief\n")
+        write_json(trace_path, {"version": 1, "requirements": []})
+        transaction_paths = orchestrator._clarify_generate_transaction_paths()
+        subprocess.run(
+            ["git", "add", "--", *transaction_paths],
+            cwd=str(project_root),
+            check=True,
+        )
+        cached_before = subprocess.run(
+            ["git", "diff", "--cached", "--", *transaction_paths],
+            cwd=str(project_root),
+            check=True,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        ).stdout
+        calls = 0
+
+        def run_generate(request):
+            nonlocal calls
+            calls += 1
+            write_text(brief_path, f"# Invalid Candidate {calls}\n")
+            write_json(
+                trace_path,
+                {"version": 1, "requirements": [{"id": f"REQ-{calls:03d}"}]},
+            )
+            subprocess.run(
+                ["git", "add", "--", *transaction_paths],
+                cwd=str(project_root),
+                check=True,
+            )
+            write_text(request.output_path, f"attempt {calls}\n")
+            return AgentResult(
+                ok=True,
+                command=["fake"],
+                output_path=request.output_path,
+                summary=f"attempt {calls}",
+                returncode=0,
+            )
+
+        orchestrator.adapter.run = run_generate
+
+        with self.assertRaisesRegex(RuntimeError, "clarify-generate exhausted retries"):
+            orchestrator._run_agent_with_retries(
+                state=state,
+                stage="clarify",
+                stage_key="clarify-generate",
+                prompt="Generate clarify artifacts.",
+                validation_feedback=lambda _result: "candidate is incomplete",
+            )
+
+        self.assertEqual(calls, 2)
+        self.assertEqual(brief_path.read_text(encoding="utf-8"), "# Original Brief\n")
+        self.assertEqual(
+            json.loads(trace_path.read_text(encoding="utf-8")),
+            {"version": 1, "requirements": []},
+        )
+        self.assertEqual(
+            subprocess.run(
+                ["git", "diff", "--cached", "--", *transaction_paths],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            ).stdout,
+            cached_before,
+        )
         self.assertFalse(
             orchestrator._attempt_recovery_checkpoint_root(
                 state.run_id,
@@ -269,6 +438,20 @@ class ClarifyResumeTests(unittest.TestCase):
         trace_path = requirements_trace_path(project_root)
         write_text(brief_path, "# Original Brief\n")
         write_json(trace_path, {"version": 1, "requirements": []})
+        transaction_paths = orchestrator._clarify_generate_transaction_paths()
+        subprocess.run(
+            ["git", "add", "--", *transaction_paths],
+            cwd=str(project_root),
+            check=True,
+        )
+        cached_before = subprocess.run(
+            ["git", "diff", "--cached", "--", *transaction_paths],
+            cwd=str(project_root),
+            check=True,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        ).stdout
         before = orchestrator._worktree_change_snapshot()
         checkpoint = orchestrator._attempt_recovery_checkpoint_root(
             state.run_id,
@@ -286,6 +469,11 @@ class ClarifyResumeTests(unittest.TestCase):
         )
         write_text(brief_path, "# Interrupted Brief\n")
         write_json(trace_path, {"version": 1, "requirements": [{"id": "BROKEN"}]})
+        subprocess.run(
+            ["git", "add", "--", *transaction_paths],
+            cwd=str(project_root),
+            check=True,
+        )
         state.status = "blocked"
         state.active_blocker = {
             "owner": "auto_agents",
@@ -302,6 +490,17 @@ class ClarifyResumeTests(unittest.TestCase):
         self.assertEqual(
             json.loads(trace_path.read_text(encoding="utf-8")),
             {"version": 1, "requirements": []},
+        )
+        self.assertEqual(
+            subprocess.run(
+                ["git", "diff", "--cached", "--", *transaction_paths],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            ).stdout,
+            cached_before,
         )
         self.assertEqual(state.status, "pending")
         self.assertEqual(state.active_blocker, {})

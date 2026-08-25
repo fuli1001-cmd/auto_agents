@@ -20433,18 +20433,13 @@ class Orchestrator:
                 if validation_feedback is not None:
                     issue = validation_feedback(result)
                     if issue:
-                        if restorable_clarify_generate and restore_root is not None:
-                            unrestored = self._restore_paths_from_restore_point(
-                                clarify_transaction_paths,
-                                restore_root,
-                                before_snapshot=snapshot_before,
-                            )
-                            if unrestored:
-                                raise RuntimeError(
-                                    "auto_agents clarify generation restore invariant failed. "
-                                    "Clarify-owned paths did not return to their pre-attempt "
-                                    f"state: {self._changed_path_preview(unrestored)}"
-                                )
+                        # Validation feedback describes amendable output, not a
+                        # failed transaction. In particular, keep a successful,
+                        # in-scope clarify candidate in the worktree so the next
+                        # retry can fix only the reported defects. Its durable
+                        # pre-loop checkpoint remains the rollback source for
+                        # command failures, interruptions, exceptions, and final
+                        # retry exhaustion.
                         last_error = issue
                         feedback = issue
                         continue
