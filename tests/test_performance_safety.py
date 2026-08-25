@@ -1011,6 +1011,70 @@ class EvidencePreflightTests(unittest.TestCase):
             self.assertEqual(owner, "")
             self.assertEqual(paths, [])
 
+    def test_operator_owned_provider_inputs_block_even_with_valid_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator, task = self._provider_contract_task(
+                root,
+                valid_reference=True,
+            )
+
+            owner, paths = orchestrator._actionable_preflight_upstream_mutations(
+                task,
+                [
+                    {
+                        "path": ".auto-agents/docs/provider_references/image.md",
+                        "reason": "provide an authorized fixture and pinned tool",
+                        "config_scope": "operator",
+                    }
+                ],
+            )
+
+            self.assertEqual(owner, "target_project")
+            self.assertEqual(
+                paths,
+                [".auto-agents/docs/provider_references/image.md"],
+            )
+
+    def test_operator_owned_provider_route_is_not_downgraded_to_ready(self) -> None:
+        class OperatorInputAdapter:
+            def run(self, request):
+                summary = (
+                    'EVIDENCE_PREFLIGHT: {"decision":"ROUTE",'
+                    '"target_stage":"provider_research",'
+                    '"reason":"authorized fixture is unavailable",'
+                    '"checklist":[],"required_mutations":[{'
+                    '"path":".auto-agents/docs/provider_references/image.md",'
+                    '"reason":"provide an authorized fixture and pinned tool",'
+                    '"owner":"target_project"}]}'
+                )
+                write_text(request.output_path, summary)
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=summary,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator, task = self._provider_contract_task(
+                root,
+                valid_reference=True,
+            )
+            orchestrator.adapter = OperatorInputAdapter()
+            from auto_agents.config import load_run_state
+
+            state = load_run_state(root)
+            state.tasks = [task]
+            orchestrator._commit_planning_baseline_if_needed([task])
+            result = orchestrator._ensure_evidence_preflight(state, task)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["decision"], "BLOCK")
+            self.assertEqual(task.evidence_preflight["decision"], "BLOCK")
+            self.assertIn("target project", str(result["reason"]))
+
     def test_invalid_provider_mutations_route_to_provider_research(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"

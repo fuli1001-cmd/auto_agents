@@ -6384,14 +6384,16 @@ class RetryFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
-            (project_root / ".conda").symlink_to(
-                Path(sys.prefix),
-                target_is_directory=True,
-            )
+            runtime = project_root / ".conda"
+            (runtime / "bin").mkdir(parents=True)
+            (runtime / "conda-meta").mkdir()
+            (runtime / "bin" / "python").symlink_to(Path(sys.executable))
             orchestrator = Orchestrator(project_root)
 
             config = orchestrator.config
-            config.gates.commands = ["conda run -p ./.conda python -m pytest -q tests/test_missing.py"]
+            config.gates.commands = [
+                "./.conda/bin/python -m pytest -q tests/test_missing.py"
+            ]
             config.gates.require_clean_git_before_task = False
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root)
@@ -6421,7 +6423,7 @@ class RetryFlowTests(unittest.TestCase):
                 orchestrator._run_implementation_loop(state, max_tasks=1)
 
             self.assertIn("missing pytest target", str(raised.exception))
-            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(orchestrator.adapter.implement_calls, 0)
             self.assertEqual(orchestrator.adapter.review_calls, 0)
 
     def test_review_rejection_is_included_in_final_error_summary(self) -> None:
@@ -6656,10 +6658,39 @@ class RetryFlowTests(unittest.TestCase):
             repair, parent = result.tasks
             self.assertEqual(repair.parent_task_id, "task-001")
             self.assertEqual(repair.verification_refs, ["tests/test_public_api.py::test_contract"])
+            self.assertEqual(repair.requirement_ids, ["REQ-001"])
             self.assertEqual(parent.status, "pending")
             self.assertIn("repair-task-001-r1-1", parent.depends_on)
             self.assertEqual(parent.recovery_history[-1]["result"], "scheduled")
             self.assertIn("[recovery] scheduled parent=task-001", stream.getvalue())
+
+    def test_legacy_evidence_repair_inherits_parent_requirement_lineage(self) -> None:
+        parent = TaskSpec(
+            task_id="task-boundary",
+            title="Prove the external boundary",
+            description="Exercise the authorized external boundary.",
+            acceptance=["The real boundary passes."],
+            requirement_ids=["REQ-BOUNDARY"],
+        )
+        repair = TaskSpec(
+            task_id="legacy-repair",
+            title="Repair boundary evidence",
+            description="Repair the failed boundary proof.",
+            acceptance=["The proof passes."],
+            parent_task_id=parent.task_id,
+            task_origin="planned",
+            evidence_preflight={
+                "decision": "READY",
+                "fingerprint": "legacy-context-free-result",
+            },
+        )
+
+        changed = Orchestrator._normalize_task_origins([repair, parent])
+
+        self.assertTrue(changed)
+        self.assertEqual(repair.task_origin, "evidence_repair")
+        self.assertEqual(repair.requirement_ids, ["REQ-BOUNDARY"])
+        self.assertEqual(repair.evidence_preflight, {})
 
     def test_review_rejected_repair_is_requeued_with_feedback_before_parent_resumes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7151,11 +7182,27 @@ class RetryFlowTests(unittest.TestCase):
                     },
                 )
 
-            self.assertFalse(scheduled)
-            self.assertEqual(task.status, "in_progress")
+            self.assertTrue(scheduled)
+            self.assertEqual(task.status, "pending")
             self.assertEqual(task.recovery_history[-1]["result"], "judge_stopped")
             self.assertEqual(state.last_recovery_route["outcome"], "judge_stopped")
             self.assertEqual(state.last_recovery_route["judge_source"], "provider")
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(state.active_blocker["owner"], "target_project")
+            self.assertEqual(
+                state.active_blocker["category"],
+                "recovery_external_action_required",
+            )
+            self.assertIn("external clarification", state.active_blocker["reason"])
+
+            resumed = orchestrator._resume_blocked_run(state)
+
+            self.assertTrue(resumed)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(task.recovery_epoch, 1)
+            self.assertEqual(task.recovery_round, 0)
+            self.assertEqual(state.last_recovery_route, {})
+            self.assertEqual(state.active_blocker["status"], "retrying")
 
     def test_recovery_judge_replan_routes_scope_split_task_to_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

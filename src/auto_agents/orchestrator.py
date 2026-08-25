@@ -289,7 +289,7 @@ class StageOwnershipRouteError(RuntimeError):
         self.paths = [str(path) for path in paths]
 
 
-VERIFY_BASELINE_SCHEMA_VERSION = 1
+VERIFY_BASELINE_SCHEMA_VERSION = 2
 IMPLEMENTATION_SCOPE_POLICY_VERSION = 5
 EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT = 2
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
@@ -6721,6 +6721,36 @@ class Orchestrator:
                     "[self-repair] requeued tasks=%s with fresh verification retry lifecycle",
                     ",".join(requeued_task_ids),
                 )
+        if str(blocker.get("category", "")) in {
+            "recovery_external_action_required",
+            "recovery_evidence_change_required",
+        }:
+            lineage_id = str(
+                state.last_recovery_route.get("lineage_id", "")
+            ).strip()
+            owner = next(
+                (task for task in state.tasks if task.task_id == lineage_id),
+                None,
+            )
+            if owner is not None:
+                owner.recovery_epoch += 1
+                owner.recovery_round = 0
+                for task in state.tasks:
+                    if (
+                        task is owner
+                        or self._recovery_lineage_owner(state.tasks, task).task_id
+                        == owner.task_id
+                    ):
+                        task.recovery_epoch = owner.recovery_epoch
+                        task.recovery_round = 0
+                state.last_recovery_route = {}
+                self._persist_tasks(state.tasks)
+                self.logger.info(
+                    "[recovery] reopened lineage=%s epoch=%s after explicit "
+                    "operator resume",
+                    owner.task_id,
+                    owner.recovery_epoch,
+                )
         blocker["status"] = "retrying"
         blocker["resume_attempts"] = int(blocker.get("resume_attempts", 0) or 0) + 1
         blocker["updated_at"] = utc_now_iso()
@@ -11609,7 +11639,7 @@ class Orchestrator:
                         f"The fix remains scoped to failed evidence for parent task {task.task_id}.",
                         "No parent requirement_proofs, acceptance criteria, or forbidden proxy oracle constraints are weakened.",
                     ],
-                    requirement_ids=[],
+                    requirement_ids=list(task.requirement_ids),
                     depends_on=[],
                     status="pending",
                     commit_message=f"fix({task.task_id}): repair proof evidence",
@@ -11926,6 +11956,49 @@ class Orchestrator:
                 }
         return {}
 
+    def _block_for_recovery_stop(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        *,
+        reason: str,
+        signature: str,
+        category: str = "recovery_external_action_required",
+    ) -> bool:
+        """Persist provider STOP as a resumable evidence blocker."""
+        task.status = "pending"
+        if owner.status != "done":
+            owner.status = "pending"
+        blocker_reason = (
+            f"Recovery stopped for {owner.task_id}; changed evidence, "
+            "clarification, or external action is required before resume. "
+            f"{reason}"
+        ).strip()
+        fingerprint = "sha256:" + hashlib.sha256(
+            json.dumps(
+                {
+                    "lineage_id": owner.task_id,
+                    "epoch": int(owner.recovery_epoch),
+                    "evidence": self._recovery_evidence_fingerprint(owner),
+                    "signature": signature,
+                    "reason": reason,
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self._block_run(
+            state,
+            owner="target_project",
+            category=category,
+            reason=blocker_reason,
+            fingerprint=fingerprint,
+        )
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        return True
+
     def _recover_review_rejected_task(
         self,
         state: RunState,
@@ -12025,6 +12098,19 @@ class Orchestrator:
                 lineage_owner=owner,
             )
             save_run_state(self.project_root, state)
+            if outcome == "judge_stopped":
+                return self._block_for_recovery_stop(
+                    state,
+                    tasks,
+                    task,
+                    owner,
+                    reason=str(terminal_route.get("reason", "")).strip()
+                    or "terminal recovery evidence is unchanged",
+                    signature=str(
+                        terminal_route.get("failure_signature", "")
+                    ),
+                    category="recovery_evidence_change_required",
+                )
             return False
 
         next_round = int(task.recovery_round) + 1
@@ -12117,7 +12203,18 @@ class Orchestrator:
             )
             self._persist_tasks(tasks)
             save_run_state(self.project_root, state)
-            return False
+            return self._block_for_recovery_stop(
+                state,
+                tasks,
+                task,
+                owner,
+                reason=(
+                    "deterministic no-progress: failure and owner artifacts "
+                    "are unchanged"
+                ),
+                signature=signature,
+                category="recovery_evidence_change_required",
+            )
 
         judgment = self._run_recovery_judge(state, task, owner, feedback, next_round)
         decision = str(judgment.get("decision", "CONTINUE"))
@@ -12142,7 +12239,14 @@ class Orchestrator:
             )
             self._persist_tasks(tasks)
             save_run_state(self.project_root, state)
-            return False
+            return self._block_for_recovery_stop(
+                state,
+                tasks,
+                task,
+                owner,
+                reason=judge_reason,
+                signature=signature,
+            )
         if decision == "REPLAN":
             if int(owner.split_depth) >= self.MAX_SPLIT_DEPTH:
                 decision = "STOP"
@@ -13946,6 +14050,12 @@ class Orchestrator:
                 continue
             if failure_id.startswith(_NON_COMPARABLE_BASELINE_PREFIXES):
                 return False
+            if re.match(
+                r"^(?:ERROR:\s*)?(?:file or directory )?not found\s*:",
+                failure_id,
+                flags=re.IGNORECASE,
+            ):
+                return False
             if failure_id.startswith("cmd:") and cls._is_test_verification_command(
                 failure_id[len("cmd:") :]
             ):
@@ -15088,7 +15198,7 @@ class Orchestrator:
         ]
         effort = self.config.efforts.get("evidence_preflight", "balanced")
         payload = {
-            "version": 3,
+            "version": 4,
             "task": task_payload,
             "requirements": requirements,
             "head": head_ref(self.project_root),
@@ -15300,6 +15410,23 @@ class Orchestrator:
             path = self._normalize_audit_blocker_path(item.get("path", ""))
             if not path:
                 continue
+            declared_owner = str(
+                item.get(
+                    "owner",
+                    item.get("config_scope", item.get("scope", "")),
+                )
+            ).strip().lower()
+            if declared_owner in {
+                "operator",
+                "user",
+                "user_input",
+                "target",
+                "target_project",
+                "external",
+            }:
+                owners.add("target_project")
+                actionable.append(path)
+                continue
             if path == ".auto-agents/config.json":
                 config_scope = str(
                     item.get("config_scope", item.get("scope", ""))
@@ -15351,13 +15478,7 @@ class Orchestrator:
         if not actionable:
             return "", []
         if "target_project" in owners:
-            return "target_project", list(
-                dict.fromkeys(
-                    path
-                    for path in actionable
-                    if path == ".auto-agents/config.json"
-                )
-            )
+            return "target_project", list(dict.fromkeys(actionable))
         if len(owners) == 1:
             return next(iter(owners)), list(dict.fromkeys(actionable))
         return "plan", list(dict.fromkeys(actionable))
@@ -15379,7 +15500,8 @@ class Orchestrator:
                 "Project configuration at .auto-agents/config.json is normally target-project-owned. The gates.steps graph generated from task_plan.json is plan-owned when gates.allow_agent_updates is enabled; route missing generated verification or artifact publication metadata to plan. If config.json must change, list it in required_mutations and set config_scope to generated_verification or operator.",
                 "Always list required_mutations as objects with exact project-relative path and reason. Provider references under .auto-agents are read-only implementation inputs owned by provider_research.",
                 "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
-                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\",\"config_scope\":\"generated_verification|operator\"}]}",
+                "For every required mutation, set owner to implementation, plan, provider_research, or target_project. Credentials, authorized fixtures, pinned operator artifacts, and network policy are target_project-owned and must never be reported READY while absent.",
+                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\",\"owner\":\"implementation|plan|provider_research|target_project\",\"config_scope\":\"generated_verification|operator\"}]}",
                 f"Task JSON:\n{json.dumps(task.to_dict(), indent=2, ensure_ascii=False)}",
                 requirement_context,
             ]
@@ -16611,6 +16733,29 @@ class Orchestrator:
             migrated_epoch = historical_epochs.get(task.task_id, 0)
             if migrated_epoch > task.recovery_epoch:
                 task.recovery_epoch = migrated_epoch
+                changed = True
+        by_id = {task.task_id: task for task in tasks}
+        for task in tasks:
+            if task.task_origin != "evidence_repair" or not task.parent_task_id:
+                continue
+            owner = task
+            seen: Set[str] = set()
+            while owner.task_origin == "evidence_repair" and owner.parent_task_id:
+                if owner.task_id in seen:
+                    break
+                seen.add(owner.task_id)
+                parent = by_id.get(owner.parent_task_id)
+                if parent is None:
+                    break
+                owner = parent
+            inherited_ids = list(
+                dict.fromkeys([*owner.requirement_ids, *task.requirement_ids])
+            )
+            if inherited_ids != task.requirement_ids:
+                task.requirement_ids = inherited_ids
+                # Requirement ownership changes the risk classification and
+                # invalidates any legacy context-free preflight decision.
+                task.evidence_preflight = {}
                 changed = True
         return changed
 
