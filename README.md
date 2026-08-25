@@ -1445,7 +1445,16 @@ changing blocker ownership. It includes full relevant attempt timelines, run sta
 audit evidence, staged and unstaged diffs, worker capabilities, and durable ownership checkpoints.
 The investigator and reviewer run in read-only mode; they may execute bounded non-mutating focused
 diagnostics. A high-confidence evidence consensus starts self-repair in an isolated auto_agents Git
-worktree. The candidate fix is tested before its commit is integrated into the clean main checkout.
+worktree. When the auto_agents checkout has a configured remote, its current branch is first merged
+from the tracked remote branch (falling back to `origin`, or the first configured remote, and the
+same branch name). Merge conflicts are routed to a focused conflict-resolution agent and the
+resolved merge is verified. After pulling new commits, diagnosis-specific verification commands run
+against the synchronized checkout; when they pass, auto_agents resumes with that code without
+creating a redundant repair. Otherwise the candidate fix is tested before its commit is integrated
+into the clean main checkout, then pushed back to the remote branch. If the remote advances during
+the repair, auto_agents merges and verifies it before retrying the push. Unresolved conflicts or
+failed verification stop synchronization explicitly, while a final push failure leaves the verified
+local commit intact for recovery.
 The configured `max_dynamic_commands` is a soft investigation budget; a completed valid report is
 accepted within a small hard-ceiling grace of 25% (minimum two tools) so post-hoc accounting does not
 discard a useful diagnosis for a one-command overage.

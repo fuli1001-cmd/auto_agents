@@ -833,7 +833,11 @@ def _auto_repair_auto_agents_and_resume(
         notify_self_repair_finished,
         project_root,
         auto_agents_root=runner.repo_root,
-        status=result.status,
+        status=(
+            "completed"
+            if result.status == "already_repaired"
+            else result.status
+        ),
         reason=str(error),
         commit_sha=result.commit_sha,
         summary=result.summary or result.reason,
@@ -855,10 +859,18 @@ def _auto_repair_auto_agents_and_resume(
         return 3
 
     orchestrator.mark_self_repair_applied(result.commit_sha)
-    print(
-        f"auto_agents self-repair committed {result.commit_sha[:12]}. Resuming run with repaired code...",
-        file=sys.stderr,
-    )
+    if result.status == "already_repaired":
+        print(
+            "Latest remote auto_agents code already resolves this issue at "
+            f"{result.commit_sha[:12]}. Resuming run without a new repair...",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"auto_agents self-repair committed {result.commit_sha[:12]}. "
+            "Resuming run with repaired code...",
+            file=sys.stderr,
+        )
     return _run_self_repair_resume_process(
         _run_command_for_self_repair_resume(args),
         cwd=auto_agents_repo_root(),

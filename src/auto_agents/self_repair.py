@@ -45,6 +45,7 @@ SELF_REPAIR_MAX_CONSECUTIVE_SAME_ERROR = 3
 SELF_REPAIR_PROVIDER_CONFIDENCE_THRESHOLD = 0.85
 SELF_REPAIR_TRIAGE_CONTEXT_LIMIT = 20_000
 SELF_REPAIR_TRIAGE_LOG_LIMIT = 24_000
+SELF_REPAIR_GIT_SYNC_TIMEOUT_SECONDS = 120
 SELF_REPAIR_TRIAGE_OWNERS = {
     "auto_agents",
     "execution_environment",
@@ -135,6 +136,173 @@ class SelfRepairTriageResult:
                 else None
             ),
         }
+
+
+@dataclass(frozen=True)
+class _SelfRepairRemote:
+    name: str
+    branch: str
+
+
+class _SelfRepairGitConflict(RuntimeError):
+    def __init__(self, message: str, paths: list[str]) -> None:
+        super().__init__(message)
+        self.paths = paths
+
+
+def _self_repair_git(
+    repo_root: Path,
+    *args: str,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(repo_root),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+        timeout=SELF_REPAIR_GIT_SYNC_TIMEOUT_SECONDS,
+        env=env,
+    )
+
+
+def _nul_git_paths(result: subprocess.CompletedProcess[str]) -> set[str]:
+    return {path for path in result.stdout.split("\0") if path}
+
+
+def _self_repair_remote(repo_root: Path) -> Optional[_SelfRepairRemote]:
+    remotes_result = _self_repair_git(repo_root, "remote")
+    if remotes_result.returncode != 0:
+        raise RuntimeError(
+            remotes_result.stderr.strip()
+            or remotes_result.stdout.strip()
+            or "could not list auto_agents Git remotes"
+        )
+    remotes = sorted(
+        line.strip() for line in remotes_result.stdout.splitlines() if line.strip()
+    )
+    if not remotes:
+        return None
+
+    branch_result = _self_repair_git(
+        repo_root,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "HEAD",
+    )
+    branch = branch_result.stdout.strip()
+    if branch_result.returncode != 0 or not branch:
+        raise RuntimeError(
+            "auto_agents has a Git remote but its main checkout is detached; "
+            "cannot select a branch to synchronize"
+        )
+
+    remote_result = _self_repair_git(
+        repo_root,
+        "config",
+        "--get",
+        f"branch.{branch}.remote",
+    )
+    merge_result = _self_repair_git(
+        repo_root,
+        "config",
+        "--get",
+        f"branch.{branch}.merge",
+    )
+    configured_remote = remote_result.stdout.strip()
+    configured_merge = merge_result.stdout.strip()
+    if (
+        remote_result.returncode == 0
+        and merge_result.returncode == 0
+        and configured_remote in remotes
+        and configured_merge.startswith("refs/heads/")
+    ):
+        return _SelfRepairRemote(
+            name=configured_remote,
+            branch=configured_merge.removeprefix("refs/heads/"),
+        )
+
+    fallback_remote = "origin" if "origin" in remotes else remotes[0]
+    return _SelfRepairRemote(name=fallback_remote, branch=branch)
+
+
+def _sync_self_repair_from_remote(
+    repo_root: Path,
+    remote: _SelfRepairRemote,
+) -> bool:
+    head_before = head_ref(repo_root)
+    remote_ref = f"refs/heads/{remote.branch}"
+    probe = _self_repair_git(
+        repo_root,
+        "ls-remote",
+        "--exit-code",
+        "--heads",
+        remote.name,
+        remote_ref,
+    )
+    if probe.returncode == 2:
+        # An empty remote (or one without this branch yet) has nothing to pull.
+        return False
+    if probe.returncode != 0:
+        raise RuntimeError(
+            probe.stderr.strip()
+            or probe.stdout.strip()
+            or f"could not inspect Git remote {remote.name}"
+        )
+    pulled = _self_repair_git(
+        repo_root,
+        "pull",
+        "--no-rebase",
+        "--no-edit",
+        remote.name,
+        remote.branch,
+    )
+    if pulled.returncode != 0:
+        conflicts = _self_repair_git(
+            repo_root,
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+            "-z",
+        )
+        conflict_paths = [
+            path
+            for path in conflicts.stdout.split("\0")
+            if path
+        ]
+        detail = (
+            pulled.stderr.strip()
+            or pulled.stdout.strip()
+            or f"could not merge from {remote.name}/{remote.branch}"
+        )
+        if conflict_paths:
+            raise _SelfRepairGitConflict(detail, conflict_paths)
+        raise RuntimeError(
+            detail
+        )
+    return head_ref(repo_root) != head_before
+
+
+def _push_self_repair_to_remote(
+    repo_root: Path,
+    remote: _SelfRepairRemote,
+) -> None:
+    pushed = _self_repair_git(
+        repo_root,
+        "push",
+        "--set-upstream",
+        remote.name,
+        f"HEAD:refs/heads/{remote.branch}",
+    )
+    if pushed.returncode != 0:
+        raise RuntimeError(
+            pushed.stderr.strip()
+            or pushed.stdout.strip()
+            or f"could not push self-repair to {remote.name}/{remote.branch}"
+        )
 
 
 def auto_agents_repo_root() -> Path:
@@ -1082,6 +1250,7 @@ class AutoAgentsSelfRepairRunner:
         self.diagnosis = diagnosis
         self.print_agent_output = print_agent_output
         self.repo_root = auto_agents_repo_root()
+        self._remote_conflict_resolved = False
 
     def run(self) -> SelfRepairResult:
         dirty_before = changed_paths(self.repo_root)
@@ -1096,7 +1265,46 @@ class AutoAgentsSelfRepairRunner:
                     f"changed paths: {preview}"
                 ),
             )
+        head_before_sync = head_ref(self.repo_root)
+        try:
+            remote = _self_repair_remote(self.repo_root)
+            if remote is not None:
+                self._synchronize_from_remote(remote)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            self._abort_remote_merge()
+            return SelfRepairResult(
+                ok=False,
+                status="failed",
+                category=self.decision.category,
+                reason=f"could not synchronize auto_agents before self-repair: {error}",
+            )
         base_head = head_ref(self.repo_root)
+        if self._remote_conflict_resolved:
+            conflict_verification = self._run_verification(self.repo_root)
+            if not conflict_verification.ok:
+                return SelfRepairResult(
+                    ok=False,
+                    status="failed",
+                    category=self.decision.category,
+                    reason="resolved remote merge conflicts failed verification",
+                    commit_sha=base_head,
+                    verification=conflict_verification.summary,
+                )
+        if remote is not None and base_head != head_before_sync:
+            resolved = self._verify_remote_already_repaired(head_before_sync)
+            if resolved is not None and resolved.ok:
+                return SelfRepairResult(
+                    ok=True,
+                    status="already_repaired",
+                    category=self.decision.category,
+                    reason=(
+                        "the synchronized remote code already passes the "
+                        "diagnosis-specific self-repair checks"
+                    ),
+                    commit_sha=base_head,
+                    summary="latest remote code already contains the required repair",
+                    verification=resolved.summary,
+                )
 
         target_before = repository_guard_fingerprint(
             self.target_project_root,
@@ -1245,6 +1453,68 @@ class AutoAgentsSelfRepairRunner:
                         verification=verification.summary,
                     )
                 commit_sha = head_ref(self.repo_root)
+                if remote is not None:
+                    push_error = ""
+                    for attempt in range(2):
+                        try:
+                            _push_self_repair_to_remote(self.repo_root, remote)
+                            push_error = ""
+                            break
+                        except (
+                            OSError,
+                            RuntimeError,
+                            subprocess.SubprocessError,
+                        ) as error:
+                            push_error = str(error)
+                            if attempt > 0:
+                                break
+                            try:
+                                changed = self._synchronize_from_remote(remote)
+                                if not changed:
+                                    break
+                                merged_verification = self._run_verification(
+                                    self.repo_root
+                                )
+                                if not merged_verification.ok:
+                                    return SelfRepairResult(
+                                        ok=False,
+                                        status="failed",
+                                        category=self.decision.category,
+                                        reason=(
+                                            "remote changed while publishing self-repair, "
+                                            "and the integrated result failed verification"
+                                        ),
+                                        commit_sha=head_ref(self.repo_root),
+                                        summary=summary,
+                                        verification=merged_verification.summary,
+                                    )
+                                verification = merged_verification
+                                commit_sha = head_ref(self.repo_root)
+                            except (
+                                OSError,
+                                RuntimeError,
+                                subprocess.SubprocessError,
+                            ) as sync_error:
+                                self._abort_remote_merge()
+                                push_error = (
+                                    f"{push_error}; conflict synchronization failed: "
+                                    f"{sync_error}"
+                                )
+                                break
+                    if push_error:
+                        return SelfRepairResult(
+                            ok=False,
+                            status="failed",
+                            category=self.decision.category,
+                            reason=(
+                                "self-repair was committed locally but could not "
+                                f"synchronize to {remote.name}/{remote.branch}: "
+                                f"{push_error}"
+                            ),
+                            commit_sha=commit_sha,
+                            summary=summary,
+                            verification=verification.summary,
+                        )
                 return SelfRepairResult(
                     ok=True,
                     status="completed",
@@ -1258,6 +1528,224 @@ class AutoAgentsSelfRepairRunner:
                 if created:
                     try:
                         remove_worktree(self.repo_root, repair_root, force=True)
+                    except RuntimeError:
+                        pass
+
+    def _synchronize_from_remote(self, remote: _SelfRepairRemote) -> bool:
+        head_before = head_ref(self.repo_root)
+        try:
+            return _sync_self_repair_from_remote(self.repo_root, remote)
+        except _SelfRepairGitConflict as conflict:
+            self._resolve_remote_conflicts(remote, conflict)
+            self._remote_conflict_resolved = True
+            return head_ref(self.repo_root) != head_before
+
+    def _resolve_remote_conflicts(
+        self,
+        remote: _SelfRepairRemote,
+        conflict: _SelfRepairGitConflict,
+    ) -> None:
+        staged_before = _nul_git_paths(
+            _self_repair_git(
+                self.repo_root,
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+            )
+        )
+        conflict_list = "\n".join(f"- {path}" for path in conflict.paths)
+        prompt = "\n".join(
+            [
+                "Resolve the active Git merge conflicts in the auto_agents repository.",
+                f"Remote source: {remote.name}/{remote.branch}",
+                "Preserve the compatible intent of both the latest remote code and local commits.",
+                "Resolve only the listed conflicted files; do not commit, push, weaken tests, or edit the target project.",
+                "Remove every conflict marker and leave the resolved files ready to stage.",
+                "",
+                "Conflicted paths:",
+                conflict_list,
+            ]
+        )
+        _prompt_path, output_path = self._artifact_paths()
+        request = AgentRequest(
+            stage="self_repair_git_conflict",
+            effort=self._effort(),
+            prompt=prompt,
+            cwd=self.repo_root,
+            output_path=output_path,
+            stream_output=(
+                self.target_orchestrator._stream_agent_output_callback(
+                    "self-repair-git-conflict"
+                )
+                if self.print_agent_output
+                and hasattr(
+                    self.target_orchestrator,
+                    "_stream_agent_output_callback",
+                )
+                else None
+            ),
+        )
+        result: AgentResult = self.target_orchestrator._call_with_failover(request)
+        if hasattr(self.target_orchestrator, "_emit_agent_output"):
+            self.target_orchestrator._emit_agent_output(
+                "self-repair-git-conflict",
+                result,
+            )
+        if not result.ok:
+            raise RuntimeError(
+                "automatic Git conflict resolution failed: "
+                + self._agent_failure_detail(result)
+            )
+
+        unstaged_after = _nul_git_paths(
+            _self_repair_git(
+                self.repo_root,
+                "diff",
+                "--name-only",
+                "-z",
+            )
+        )
+        staged_after = _nul_git_paths(
+            _self_repair_git(
+                self.repo_root,
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+            )
+        )
+        untracked_after = _nul_git_paths(
+            _self_repair_git(
+                self.repo_root,
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            )
+        )
+        allowed_paths = staged_before | set(conflict.paths)
+        unexpected_paths = sorted(
+            (unstaged_after | staged_after | untracked_after) - allowed_paths
+        )
+        if unexpected_paths:
+            raise RuntimeError(
+                "Git conflict resolver changed paths outside the conflict scope: "
+                + ", ".join(unexpected_paths)
+            )
+
+        staged = _self_repair_git(
+            self.repo_root,
+            "add",
+            "-A",
+            "--",
+            *conflict.paths,
+        )
+        if staged.returncode != 0:
+            raise RuntimeError(
+                staged.stderr.strip()
+                or staged.stdout.strip()
+                or "could not stage resolved Git conflicts"
+            )
+        unresolved = _self_repair_git(
+            self.repo_root,
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+            "-z",
+        )
+        if unresolved.stdout.strip():
+            raise RuntimeError(
+                "automatic Git conflict resolution left unresolved paths: "
+                + ", ".join(
+                    path for path in unresolved.stdout.split("\0") if path
+                )
+            )
+        checked = _self_repair_git(self.repo_root, "diff", "--cached", "--check")
+        if checked.returncode != 0:
+            raise RuntimeError(
+                checked.stdout.strip()
+                or checked.stderr.strip()
+                or "resolved Git merge still contains invalid conflict markers"
+            )
+        committed = _self_repair_git(self.repo_root, "commit", "--no-edit")
+        if committed.returncode != 0:
+            raise RuntimeError(
+                committed.stderr.strip()
+                or committed.stdout.strip()
+                or "could not commit resolved remote merge"
+            )
+        remaining = changed_paths(self.repo_root)
+        if remaining:
+            raise RuntimeError(
+                "resolved remote merge left the auto_agents checkout dirty: "
+                + ", ".join(remaining[:8])
+            )
+
+    def _abort_remote_merge(self) -> None:
+        try:
+            merge_head = _self_repair_git(
+                self.repo_root,
+                "rev-parse",
+                "--verify",
+                "MERGE_HEAD",
+            )
+            if merge_head.returncode == 0:
+                _self_repair_git(self.repo_root, "merge", "--abort")
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def _verify_remote_already_repaired(
+        self,
+        previous_head: str,
+    ) -> Optional["_VerificationResult"]:
+        if self.diagnosis is None:
+            return None
+        commands = [
+            " ".join(str(command).split())
+            for command in self.diagnosis.final.verification_commands
+            if str(command).strip()
+        ]
+        if not commands:
+            return None
+        previous = self._run_verification_at_ref(commands, previous_head)
+        if previous.ok:
+            return None
+        current = self._run_verification_at_ref(
+            commands,
+            head_ref(self.repo_root) or "HEAD",
+        )
+        return current if current.ok else None
+
+    def _run_verification_at_ref(
+        self,
+        commands: list[str],
+        ref: str,
+    ) -> "_VerificationResult":
+        with tempfile.TemporaryDirectory(
+            prefix="auto-agents-remote-repair-check-"
+        ) as tmp:
+            verification_root = Path(tmp) / "verification"
+            created = False
+            try:
+                add_worktree(
+                    self.repo_root,
+                    verification_root,
+                    ref=ref,
+                )
+                created = True
+                return self._run_verification_commands(
+                    commands,
+                    verification_root,
+                )
+            finally:
+                if created:
+                    try:
+                        remove_worktree(
+                            self.repo_root,
+                            verification_root,
+                            force=True,
+                        )
                     except RuntimeError:
                         pass
 
@@ -1389,25 +1877,31 @@ class AutoAgentsSelfRepairRunner:
         self,
         verification_root: Optional[Path] = None,
     ) -> "_VerificationResult":
-        summaries = []
         commands = self_repair_verify_commands()
         if self.diagnosis is not None:
             for command in self.diagnosis.final.verification_commands:
                 normalized = " ".join(str(command).split())
-                if (
-                    normalized.startswith("python -m pytest ")
-                    or normalized.startswith("python3 -m pytest ")
-                    or normalized.startswith("pytest ")
-                ) and normalized not in commands:
+                if normalized and normalized not in commands:
                     commands.append(normalized)
+        return self._run_verification_commands(
+            commands,
+            verification_root or self.repo_root,
+        )
+
+    def _run_verification_commands(
+        self,
+        commands: list[str],
+        verification_root: Path,
+    ) -> "_VerificationResult":
+        summaries = []
         for command in commands:
             verification_command = self_repair_verification_command(
                 command,
-                verification_root or self.repo_root,
+                verification_root,
             )
             gate = run_commands(
                 [verification_command],
-                verification_root or self.repo_root,
+                verification_root,
                 command_timeout_seconds=900,
             )
             process = gate.commands[0]

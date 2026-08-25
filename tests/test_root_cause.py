@@ -450,6 +450,348 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 "",
             )
 
+    def test_self_repair_pulls_before_repair_and_pushes_completed_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote_root = root / "remote.git"
+            seed_root = root / "seed"
+            auto_root = root / "auto"
+            upstream_root = root / "upstream"
+            published_root = root / "published"
+            target_root = root / "target"
+
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote_root)],
+                check=True,
+            )
+            _init_repo(seed_root)
+            branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=seed_root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "remote", "add", "origin", str(remote_root)],
+                cwd=seed_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "push", "-qu", "origin", branch],
+                cwd=seed_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "clone", "-q", str(remote_root), str(auto_root)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "test"],
+                cwd=auto_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=auto_root,
+                check=True,
+            )
+            write_text(auto_root / "README.md", "local branch change\n")
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "local change"],
+                cwd=auto_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "clone", "-q", str(remote_root), str(upstream_root)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "test"],
+                cwd=upstream_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=upstream_root,
+                check=True,
+            )
+            write_text(upstream_root / "README.md", "remote branch change\n")
+            write_text(upstream_root / "upstream.py", "LATEST = True\n")
+            subprocess.run(["git", "add", "-A"], cwd=upstream_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "upstream change"],
+                cwd=upstream_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "push", "-q"],
+                cwd=upstream_root,
+                check=True,
+            )
+
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents" / "state" / "run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+
+            class RepairOrchestrator:
+                config = type(
+                    "Config",
+                    (),
+                    {"efforts": {"self_repair": "max"}},
+                )()
+
+                def _call_with_failover(self, request):
+                    if request.stage == "self_repair_git_conflict":
+                        if "README.md" in request.prompt:
+                            write_text(
+                                request.cwd / "README.md",
+                                "local branch change\nremote branch change\n",
+                            )
+                        if "fixed.py" in request.prompt:
+                            write_text(
+                                request.cwd / "fixed.py",
+                                "FIXED = True\nREMOTE_ADVANCED = True\n",
+                            )
+                        return AgentResult(
+                            ok=True,
+                            command=[],
+                            output_path=request.output_path,
+                            summary="merged compatible local and remote changes",
+                        )
+                    self.assert_upstream_was_pulled(request.cwd)
+                    write_text(
+                        upstream_root / "concurrent.py",
+                        "REMOTE_ADVANCED = True\n",
+                    )
+                    write_text(
+                        upstream_root / "fixed.py",
+                        "REMOTE_ADVANCED = True\n",
+                    )
+                    subprocess.run(
+                        ["git", "add", "-A"],
+                        cwd=upstream_root,
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["git", "commit", "-qm", "concurrent remote change"],
+                        cwd=upstream_root,
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["git", "push", "-q"],
+                        cwd=upstream_root,
+                        check=True,
+                    )
+                    write_text(request.cwd / "fixed.py", "FIXED = True\n")
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=(
+                            "generic fix complete\n"
+                            "COMMIT_MESSAGE: synchronize repaired repository"
+                        ),
+                    )
+
+                @staticmethod
+                def assert_upstream_was_pulled(repair_root):
+                    if not (repair_root / "upstream.py").is_file():
+                        raise AssertionError(
+                            "self-repair did not start from remote HEAD"
+                        )
+
+            with (
+                patch(
+                    "auto_agents.self_repair.auto_agents_repo_root",
+                    return_value=auto_root,
+                ),
+                patch(
+                    "auto_agents.self_repair.self_repair_verify_commands",
+                    return_value=["true"],
+                ),
+            ):
+                result = AutoAgentsSelfRepairRunner(
+                    RepairOrchestrator(),
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(
+                        True,
+                        category="retry_restore_invariant",
+                        reason="restore defect",
+                    ),
+                ).run()
+
+            self.assertTrue(result.ok, result.reason)
+            subprocess.run(
+                ["git", "clone", "-q", str(remote_root), str(published_root)],
+                check=True,
+            )
+            self.assertTrue((published_root / "upstream.py").is_file())
+            self.assertTrue((published_root / "fixed.py").is_file())
+            self.assertTrue((published_root / "concurrent.py").is_file())
+            self.assertEqual(
+                (published_root / "fixed.py").read_text(encoding="utf-8"),
+                "FIXED = True\nREMOTE_ADVANCED = True\n",
+            )
+            self.assertEqual(
+                (published_root / "README.md").read_text(encoding="utf-8"),
+                "local branch change\nremote branch change\n",
+            )
+
+    def test_self_repair_stops_when_remote_cannot_be_synchronized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            subprocess.run(
+                [
+                    "git",
+                    "remote",
+                    "add",
+                    "origin",
+                    str(root / "missing-remote.git"),
+                ],
+                cwd=auto_root,
+                check=True,
+            )
+
+            class RepairOrchestrator:
+                calls = 0
+
+                def _call_with_failover(self, request):
+                    self.calls += 1
+                    raise AssertionError("repair must not run with an unsynchronized remote")
+
+            orchestrator = RepairOrchestrator()
+            with patch(
+                "auto_agents.self_repair.auto_agents_repo_root",
+                return_value=auto_root,
+            ):
+                result = AutoAgentsSelfRepairRunner(
+                    orchestrator,
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(
+                        True,
+                        category="retry_restore_invariant",
+                        reason="restore defect",
+                    ),
+                ).run()
+
+            self.assertFalse(result.ok)
+            self.assertEqual(orchestrator.calls, 0)
+            self.assertIn("before self-repair", result.reason)
+
+    def test_self_repair_skips_repair_when_remote_update_resolves_diagnosis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote_root = root / "remote.git"
+            seed_root = root / "seed"
+            auto_root = root / "auto"
+            upstream_root = root / "upstream"
+            target_root = root / "target"
+
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote_root)],
+                check=True,
+            )
+            _init_repo(seed_root)
+            branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                cwd=seed_root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "remote", "add", "origin", str(remote_root)],
+                cwd=seed_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "push", "-qu", "origin", branch],
+                cwd=seed_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "clone", "-q", str(remote_root), str(auto_root)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "clone", "-q", str(remote_root), str(upstream_root)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "test"],
+                cwd=upstream_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=upstream_root,
+                check=True,
+            )
+            write_text(upstream_root / "remote_fix.py", "FIXED = True\n")
+            subprocess.run(["git", "add", "-A"], cwd=upstream_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "fix diagnosed issue upstream"],
+                cwd=upstream_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "push", "-q"],
+                cwd=upstream_root,
+                check=True,
+            )
+            _init_repo(target_root)
+
+            class RepairOrchestrator:
+                calls = 0
+
+                def _call_with_failover(self, request):
+                    self.calls += 1
+                    raise AssertionError("upstream fix must make repair unnecessary")
+
+            diagnosis = type(
+                "Diagnosis",
+                (),
+                {
+                    "final": type(
+                        "FinalReport",
+                        (),
+                        {"verification_commands": ["test -f remote_fix.py"]},
+                    )()
+                },
+            )()
+            orchestrator = RepairOrchestrator()
+            with patch(
+                "auto_agents.self_repair.auto_agents_repo_root",
+                return_value=auto_root,
+            ):
+                result = AutoAgentsSelfRepairRunner(
+                    orchestrator,
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(
+                        True,
+                        category="retry_restore_invariant",
+                        reason="restore defect",
+                    ),
+                    diagnosis=diagnosis,
+                ).run()
+
+            self.assertTrue(result.ok, result.reason)
+            self.assertEqual(result.status, "already_repaired")
+            self.assertEqual(orchestrator.calls, 0)
+            self.assertTrue((auto_root / "remote_fix.py").is_file())
+            self.assertIn("test -f remote_fix.py", result.verification)
+
 
 if __name__ == "__main__":
     unittest.main()

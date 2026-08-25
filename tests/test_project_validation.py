@@ -2094,7 +2094,7 @@ class ProjectValidationTests(unittest.TestCase):
             notify.assert_called_once()
             self.assertEqual(notify.call_args.args[1]["status"], "completed")
 
-    def test_cli_run_auto_repairs_auto_agents_and_resumes_current_run(self) -> None:
+    def test_cli_run_resumes_when_remote_already_repaired_auto_agents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -2123,8 +2123,8 @@ class ProjectValidationTests(unittest.TestCase):
                 def run(self):
                     return SelfRepairResult(
                         ok=True,
-                        status="completed",
-                        reason="repaired",
+                        status="already_repaired",
+                        reason="latest remote code already resolves the issue",
                         category="generated_artifact_lifecycle",
                         commit_sha="abc123456789",
                         summary="generic fix\nCOMMIT_MESSAGE: repair gate scope handling",
@@ -2175,8 +2175,12 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertEqual(runner_calls["count"], 1)
             self.assertIn("Starting automatic auto_agents self-repair", stderr.getvalue())
-            self.assertIn("Resuming run with repaired code", stderr.getvalue())
+            self.assertIn("Resuming run without a new repair", stderr.getvalue())
             notify_self_repair.assert_called_once()
+            self.assertEqual(
+                notify_self_repair.call_args.kwargs["status"],
+                "completed",
+            )
             resume_run.assert_called_once()
             resumed_command = resume_run.call_args.args[0]
             self.assertIn("run", resumed_command)
