@@ -8720,15 +8720,48 @@ class Orchestrator:
             *retry_tasks,
             *(task for task in tasks if task.task_id not in retry_task_ids),
         ]
-        for task in ordered_tasks:
-            if task.status == "done":
-                continue
+        while True:
+            if not any(task.status != "done" for task in ordered_tasks):
+                break
             if not self._has_task_budget(max_tasks, processed):
                 self._task_budget_exhausted = True
+                break
+            completed = {
+                task.task_id for task in tasks if task.status == "done"
+            }
+            task = next(
+                (
+                    candidate
+                    for candidate in ordered_tasks
+                    if candidate.status != "done"
+                    and all(
+                        dependency in completed
+                        for dependency in candidate.depends_on
+                    )
+                ),
+                None,
+            )
+            if task is None:
+                unfinished = [
+                    candidate
+                    for candidate in ordered_tasks
+                    if candidate.status != "done"
+                ]
+                if unfinished:
+                    deferred = self._deferred_parallel_task_reasons(tasks)
+                    raise RuntimeError(
+                        "sequential task dependency scheduler has no runnable task; "
+                        + "; ".join(deferred[:6])
+                    )
                 break
             rewind_state = self._execute_task_in_main_worktree(state, tasks, task)
             if rewind_state is not None:
                 return rewind_state
+            if task.status != "done":
+                raise RuntimeError(
+                    "sequential task execution returned without completing or "
+                    f"rerouting {task.task_id}; status={task.status}"
+                )
             processed += 1
             self._consume_task_budget()
 
@@ -15403,10 +15436,11 @@ class Orchestrator:
         result: Dict[str, object],
     ) -> RunState:
         decision = str(result.get("decision", "")).strip().upper()
+        required_mutations = result.get("required_mutations", []) or []
         route_paths = sorted(
             {
                 self._normalize_audit_blocker_path(item.get("path", ""))
-                for item in result.get("required_mutations", []) or []
+                for item in required_mutations
                 if isinstance(item, dict)
                 and self._normalize_audit_blocker_path(item.get("path", ""))
             }
@@ -15415,7 +15449,6 @@ class Orchestrator:
             decision in {"BLOCK", "ROUTE"}
             and ".auto-agents/config.json" in route_paths
         ):
-            required_mutations = result.get("required_mutations", []) or []
             owner_stage, _mutation_paths = (
                 self._actionable_preflight_upstream_mutations(
                     task,
@@ -15453,6 +15486,43 @@ class Orchestrator:
                     ).strip(),
                 }
                 task.evidence_preflight = {}
+        if decision == "ROUTE" and required_mutations:
+            owner_stage, mutation_paths = (
+                self._actionable_preflight_upstream_mutations(
+                    task,
+                    required_mutations,
+                )
+            )
+            if owner_stage == "target_project":
+                decision = "BLOCK"
+                route_paths = sorted(mutation_paths)
+                result = {
+                    **result,
+                    "decision": "BLOCK",
+                    "target_stage": "",
+                    "reason": (
+                        f"{str(result.get('reason', '')).strip()} Required "
+                        "mutation(s) are target-project-owned: "
+                        f"{', '.join(route_paths)}"
+                    ).strip(),
+                }
+            elif owner_stage:
+                route_paths = sorted(mutation_paths)
+                result = {
+                    **result,
+                    "target_stage": owner_stage,
+                }
+            else:
+                task.evidence_preflight = {}
+                route_history = state.resume_context.get(
+                    "evidence_preflight_routes",
+                    {},
+                )
+                if isinstance(route_history, dict):
+                    route_history.pop(task.task_id, None)
+                self._persist_tasks(tasks)
+                save_run_state(self.project_root, state)
+                return state
         if decision == "BLOCK":
             task.status = "pending"
             self._persist_tasks(tasks)
@@ -15501,6 +15571,11 @@ class Orchestrator:
                 sort_keys=True,
             ).encode("utf-8")
         ).hexdigest()[:16]
+        progress_fingerprint = self._evidence_preflight_route_progress_fingerprint(
+            task,
+            target_stage,
+            route_paths,
+        )
         route_history = state.resume_context.get("evidence_preflight_routes", {})
         if not isinstance(route_history, dict):
             route_history = {}
@@ -15509,23 +15584,49 @@ class Orchestrator:
             int(prior.get("repeat", 0) or 0) + 1
             if isinstance(prior, dict)
             and str(prior.get("identity", "")) == route_identity
+            and str(prior.get("progress_fingerprint", ""))
+            == progress_fingerprint
             else 1
         )
         route_history[task.task_id] = {
             "identity": route_identity,
+            "progress_fingerprint": progress_fingerprint,
             "repeat": repeat,
             "target_stage": target_stage,
             "paths": route_paths,
         }
         state.resume_context["evidence_preflight_routes"] = route_history
         if repeat >= EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT:
-            state.last_error = (
-                "evidence preflight made no progress: the same owner-stage route "
-                f"repeated for {task.task_id}; target_stage={target_stage}; "
-                f"paths={', '.join(route_paths) or '(none)'}"
+            task.status = "pending"
+            self._persist_tasks(tasks)
+            reason = (
+                "Evidence preflight could not satisfy its verification contract "
+                "after the owning stage completed without changing the actionable "
+                f"inputs for {task.task_id}; target_stage={target_stage}; "
+                f"actionable_paths={', '.join(route_paths) or '(none)'}. "
+                f"Preflight reason: {str(result.get('reason', '')).strip()}"
+            )
+            fingerprint = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    {
+                        "task_id": task.task_id,
+                        "target_stage": target_stage,
+                        "paths": route_paths,
+                        "progress_fingerprint": progress_fingerprint,
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            self._block_run(
+                state,
+                owner="verification_contract",
+                category="evidence_preflight_route_stalled",
+                reason=reason,
+                fingerprint=fingerprint,
             )
             save_run_state(self.project_root, state)
-            raise RuntimeError(state.last_error)
+            self.logger.error(reason)
+            return state
         task.status = "pending"
         self._persist_tasks(tasks)
         self._rewind_state_from_stage(state, target_stage)
@@ -15537,6 +15638,51 @@ class Orchestrator:
         state.last_error = state.rejection_reason
         save_run_state(self.project_root, state)
         return state
+
+    def _evidence_preflight_route_progress_fingerprint(
+        self,
+        task: TaskSpec,
+        target_stage: str,
+        route_paths: Iterable[str],
+    ) -> str:
+        """Fingerprint owner-controlled semantics, excluding preflight bookkeeping."""
+        task_payload = task.to_dict()
+        for key in (
+            "status",
+            "commit_sha",
+            "evidence_preflight",
+            "review_summary",
+            "review_history",
+            "verify_history",
+            "verify_baseline_failures",
+            "verify_baseline_ref",
+            "scratchpad",
+            "arbitration_history",
+            "recovery_history",
+        ):
+            task_payload.pop(key, None)
+        normalized_paths = sorted(
+            {
+                self._normalize_audit_blocker_path(path)
+                for path in route_paths
+                if self._normalize_audit_blocker_path(path)
+            }
+        )
+        task_plan = self._normalize_audit_blocker_path(
+            self._relative_repo_path(task_plan_path(self.project_root))
+        )
+        artifact_paths = [
+            path for path in normalized_paths if path != task_plan
+        ]
+        payload = {
+            "task": task_payload,
+            "target_stage": target_stage,
+            "paths": normalized_paths,
+            "artifacts": self._artifact_fingerprints(artifact_paths),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
 
     def _review_effort_for_task(self, task: TaskSpec) -> str:
         default_effort = self.config.efforts.get("review", "balanced")

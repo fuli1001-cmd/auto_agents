@@ -8853,6 +8853,50 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual([task.status for task in state.tasks], ["done", "done"])
             self.assertIn("fallback to sequential", stream.getvalue())
 
+    def test_sequential_tasks_wait_for_dependencies_even_when_planned_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            dependent = TaskSpec(
+                task_id="dependent",
+                title="Dependent",
+                description="Consume the prerequisite.",
+                acceptance=["dependency is consumed"],
+                status="pending",
+                depends_on=["prerequisite"],
+            )
+            prerequisite = TaskSpec(
+                task_id="prerequisite",
+                title="Prerequisite",
+                description="Produce the prerequisite.",
+                acceptance=["dependency exists"],
+                status="pending",
+            )
+            tasks = [dependent, prerequisite]
+            state.tasks = tasks
+            execution_order = []
+
+            def complete_task(_state, _tasks, task):
+                execution_order.append(task.task_id)
+                task.status = "done"
+                return None
+
+            with patch.object(
+                orchestrator,
+                "_execute_task_in_main_worktree",
+                side_effect=complete_task,
+            ):
+                result = orchestrator._run_sequential_implementation_loop(
+                    state,
+                    tasks,
+                    max_tasks=None,
+                )
+
+            self.assertEqual(execution_order, ["prerequisite", "dependent"])
+            self.assertTrue(all(task.status == "done" for task in result.tasks))
+
     def test_parallel_tasks_strict_mode_requires_depends_on(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

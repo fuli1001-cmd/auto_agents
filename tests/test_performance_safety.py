@@ -1350,8 +1350,109 @@ class EvidencePreflightTests(unittest.TestCase):
             }
 
             orchestrator._route_evidence_preflight(state, tasks, task, result)
-            with self.assertRaisesRegex(RuntimeError, "made no progress"):
-                orchestrator._route_evidence_preflight(state, tasks, task, result)
+            task.evidence_preflight = {
+                "decision": "ROUTE",
+                "fingerprint": "bookkeeping-only-change",
+            }
+            routed = orchestrator._route_evidence_preflight(
+                state,
+                tasks,
+                task,
+                result,
+            )
+
+            self.assertEqual(routed.status, "blocked")
+            self.assertEqual(
+                routed.active_blocker["category"],
+                "evidence_preflight_route_stalled",
+            )
+            self.assertEqual(
+                routed.active_blocker["owner"],
+                "verification_contract",
+            )
+            self.assertIn(
+                ".auto-agents/docs/provider_references/image.md",
+                routed.active_blocker["reason"],
+            )
+
+    def test_preflight_route_progress_resets_repeat_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            from auto_agents.config import load_run_state
+
+            state = load_run_state(root)
+            task = orchestrator._load_tasks_from_plan()[0]
+            tasks = [task]
+            result = {
+                "decision": "ROUTE",
+                "target_stage": "plan",
+                "reason": "the plan must bind the real proof",
+                "required_mutations": [
+                    {
+                        "path": ".auto-agents/state/task_plan.json",
+                        "reason": "bind the real proof",
+                    }
+                ],
+            }
+
+            orchestrator._route_evidence_preflight(state, tasks, task, result)
+            task.acceptance.append("The real proof is explicitly bound.")
+            routed = orchestrator._route_evidence_preflight(
+                state,
+                tasks,
+                task,
+                result,
+            )
+
+            self.assertEqual(routed.status, "pending")
+            history = routed.resume_context["evidence_preflight_routes"][task.task_id]
+            self.assertEqual(history["repeat"], 1)
+
+    def test_preflight_route_reports_only_actionable_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator, task = self._provider_contract_task(
+                root,
+                valid_reference=True,
+            )
+            from auto_agents.config import load_run_state
+
+            state = load_run_state(root)
+            tasks = [task]
+            result = {
+                "decision": "ROUTE",
+                "target_stage": "plan",
+                "reason": "bind the real proof in the plan",
+                "required_mutations": [
+                    {
+                        "path": ".auto-agents/docs/provider_references/image.md",
+                        "reason": "record the provider contract",
+                    },
+                    {
+                        "path": ".auto-agents/state/provider_references.lock.json",
+                        "reason": "record the provider lock",
+                    },
+                    {
+                        "path": ".auto-agents/state/task_plan.json",
+                        "reason": "bind the real proof",
+                    },
+                ],
+            }
+
+            routed = orchestrator._route_evidence_preflight(
+                state,
+                tasks,
+                task,
+                result,
+            )
+
+            history = routed.resume_context["evidence_preflight_routes"][task.task_id]
+            self.assertEqual(
+                history["paths"],
+                [".auto-agents/state/task_plan.json"],
+            )
 
     def test_cached_ready_result_skips_provider_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
