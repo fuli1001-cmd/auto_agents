@@ -413,6 +413,137 @@ class OperatorInputStoreTests(unittest.TestCase):
                 state.pending_input_requests[0]["key"], "youtube.source_url"
             )
 
+    def test_cached_operator_mutation_is_invalidated_and_recollected(self):
+        class Adapter:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, request):
+                self.calls += 1
+                payload = {
+                    "decision": "WAIT_USER",
+                    "target_stage": "",
+                    "reason": "operator approval is required",
+                    "checklist": ["collect the approval"],
+                    "required_inputs": [
+                        _request(
+                            key="boundary.approval",
+                            question="Do you approve use of the authorized fixture?",
+                            purpose="Authorize the real boundary proof.",
+                            why_required="The proof performs an external operation.",
+                            how_to_obtain=["Answer yes only when approved."],
+                            recommended_answer="Answer no when uncertain.",
+                            subject_fingerprint="fixture-approval",
+                            validation={"claims": ["external_operation"]},
+                            bindings=[],
+                        ).to_dict()
+                    ],
+                    "required_mutations": [],
+                }
+                summary = "EVIDENCE_PREFLIGHT: " + json.dumps(payload)
+                write_text(request.output_path, summary)
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=summary,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            adapter = Adapter()
+            orchestrator.adapter = adapter
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="External boundary",
+                description="Exercise an authorized external boundary.",
+                acceptance=["The real boundary proof passes."],
+            )
+            state.tasks = [task]
+            with mock.patch.object(
+                orchestrator, "_task_needs_evidence_preflight", return_value=True
+            ):
+                task.evidence_preflight = {
+                    "fingerprint": orchestrator._evidence_preflight_fingerprint(task),
+                    "decision": "BLOCK",
+                    "target_stage": "",
+                    "reason": "operator prerequisites are absent",
+                    "checklist": ["collect operator prerequisites"],
+                    "required_inputs": [],
+                    "required_mutations": [
+                        {
+                            "path": ".auto-agents/config.json",
+                            "reason": "bind the approved external fixture",
+                            "owner": "target_project",
+                            "config_scope": "operator",
+                        }
+                    ],
+                }
+                result = orchestrator._ensure_evidence_preflight(state, task)
+
+            self.assertEqual(adapter.calls, 1)
+            self.assertEqual(result["decision"], "WAIT_USER")
+            self.assertEqual(task.status, "waiting_user")
+            self.assertEqual(task.evidence_preflight["decision"], "WAIT_USER")
+            self.assertEqual(len(state.pending_input_requests), 1)
+            self.assertEqual(state.active_blocker, {})
+
+    def test_restored_operator_mutation_cannot_route_to_terminal_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="External boundary",
+                description="Exercise an authorized external boundary.",
+                acceptance=["The real boundary proof passes."],
+            )
+            result = {
+                "fingerprint": "legacy-fingerprint",
+                "decision": "BLOCK",
+                "target_stage": "",
+                "reason": "operator prerequisites are absent",
+                "checklist": ["collect operator prerequisites"],
+                "required_inputs": [],
+                "required_mutations": [
+                    {
+                        "path": ".auto-agents/config.json",
+                        "reason": "bind the approved external fixture",
+                        "owner": "target_project",
+                        "config_scope": "operator",
+                    }
+                ],
+            }
+            task.evidence_preflight = dict(result)
+            state.tasks = [task]
+            state.resume_context["evidence_preflight_routes"] = {
+                task.task_id: {"repeat": 1}
+            }
+
+            with mock.patch.object(
+                orchestrator,
+                "_block_run",
+                side_effect=AssertionError("malformed result must not block"),
+            ):
+                routed = orchestrator._route_evidence_preflight(
+                    state, [task], task, result
+                )
+
+            self.assertEqual(routed.status, "pending")
+            self.assertEqual(routed.active_blocker, {})
+            self.assertEqual(task.evidence_preflight, {})
+            self.assertNotIn(
+                task.task_id,
+                routed.resume_context.get("evidence_preflight_routes", {}),
+            )
+            persisted = load_run_state(project)
+            self.assertEqual(persisted.tasks[0].evidence_preflight, {})
+
     def test_pause_mode_persists_waiting_without_blocking(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "demo"

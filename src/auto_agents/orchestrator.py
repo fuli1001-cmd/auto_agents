@@ -16118,7 +16118,7 @@ class Orchestrator:
         ]
         effort = self.config.efforts.get("evidence_preflight", "balanced")
         payload = {
-            "version": 6,
+            "version": 7,
             "task": task_payload,
             "requirements": requirements,
             "head": head_ref(self.project_root),
@@ -16150,6 +16150,18 @@ class Orchestrator:
             return None
         fingerprint = self._evidence_preflight_fingerprint(task)
         cached = task.evidence_preflight
+        cache_issue = (
+            self._evidence_preflight_protocol_issue(cached) if cached else ""
+        )
+        if cache_issue:
+            self._invalidate_evidence_preflight_result(
+                state,
+                state.tasks if state.tasks else [task],
+                task,
+                issue=cache_issue,
+                source="cache",
+            )
+            cached = {}
         if str(cached.get("fingerprint", "")) == fingerprint:
             self.logger.info(
                 "[evidence-preflight] task=%s cache=hit decision=%s",
@@ -16400,6 +16412,39 @@ class Orchestrator:
             "upstream provider-research work as a separate required mutation. "
             "Affected paths: "
             + ", ".join(operator_paths)
+        )
+
+    def _invalidate_evidence_preflight_result(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        *,
+        issue: str,
+        source: str,
+    ) -> None:
+        """Discard a malformed result before it can become a terminal route."""
+
+        task.evidence_preflight = {}
+        for candidate in tasks:
+            if candidate.task_id == task.task_id:
+                candidate.evidence_preflight = {}
+        route_history = state.resume_context.get("evidence_preflight_routes", {})
+        if isinstance(route_history, dict):
+            route_history.pop(task.task_id, None)
+            if route_history:
+                state.resume_context["evidence_preflight_routes"] = route_history
+            else:
+                state.resume_context.pop("evidence_preflight_routes", None)
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        self.logger.warning(
+            "[evidence-preflight] task=%s decision=INVALIDATE_PROTOCOL "
+            "source=%s reason=%s",
+            task.task_id,
+            source,
+            issue,
         )
 
     def _actionable_preflight_upstream_mutations(
@@ -16670,6 +16715,16 @@ class Orchestrator:
         task: TaskSpec,
         result: Dict[str, object],
     ) -> RunState:
+        protocol_issue = self._evidence_preflight_protocol_issue(result)
+        if protocol_issue:
+            self._invalidate_evidence_preflight_result(
+                state,
+                tasks,
+                task,
+                issue=protocol_issue,
+                source="route",
+            )
+            return state
         decision = str(result.get("decision", "")).strip().upper()
         if decision == "WAIT_USER":
             task.status = "waiting_user"
