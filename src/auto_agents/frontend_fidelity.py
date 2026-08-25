@@ -271,6 +271,71 @@ def frontend_requirement_ids_are_preservation_only(
     )
 
 
+def preservation_only_frontend_requirement_ids(trace_payload: object) -> List[str]:
+    """Return visual contracts that must not create preservation-only iteration work."""
+
+    if not isinstance(trace_payload, Mapping):
+        return []
+    frontend_scope = trace_payload.get("frontend_scope")
+    if not (
+        isinstance(frontend_scope, Mapping)
+        and frontend_scope.get("requested") is False
+    ):
+        return []
+    requirements = trace_payload.get("requirements")
+    if not isinstance(requirements, list):
+        return []
+    return [
+        str(requirement.get("id", "")).strip()
+        for requirement in requirements
+        if isinstance(requirement, Mapping)
+        and requirement.get("status") == "active"
+        and requirement.get("priority") == "mandatory"
+        and str(requirement.get("id", "")).strip()
+        and requirement_is_frontend_fidelity(requirement)
+        and requirement_is_frontend_preservation_only(requirement)
+    ]
+
+
+def _requirements_by_id(trace_payload: object) -> Mapping[str, Mapping[str, object]]:
+    if not isinstance(trace_payload, Mapping):
+        return {}
+    requirements = trace_payload.get("requirements")
+    if not isinstance(requirements, list):
+        return {}
+    return {
+        str(requirement.get("id", "")).strip(): requirement
+        for requirement in requirements
+        if isinstance(requirement, Mapping)
+        and str(requirement.get("id", "")).strip()
+    }
+
+
+def _frontend_requirement_contract_changed(
+    previous: Mapping[str, object],
+    current: Mapping[str, object],
+) -> bool:
+    previous_hash = str(previous.get("contract_sha256", "")).strip()
+    current_hash = str(current.get("contract_sha256", "")).strip()
+    if previous_hash and current_hash:
+        return previous_hash != current_hash
+    contract_fields = (
+        "text",
+        "source",
+        "priority",
+        "acceptance_oracles",
+        "oracle_type",
+        "oracle_strength",
+        "evidence_boundary",
+        "forbidden_proxy_oracles",
+        "forbidden_patterns",
+        "external_docs_required",
+        "provider_reference",
+        "provider_references",
+    )
+    return any(previous.get(field) != current.get(field) for field in contract_fields)
+
+
 def frontend_fidelity_requirement_ids(trace_payload: object) -> List[str]:
     if not isinstance(trace_payload, Mapping):
         return []
@@ -315,7 +380,12 @@ def frontend_fidelity_requirement_ids(trace_payload: object) -> List[str]:
     ]
 
 
-def validate_frontend_fidelity_trace(trace_payload: object, *, spec_text: str = "") -> List[str]:
+def validate_frontend_fidelity_trace(
+    trace_payload: object,
+    *,
+    spec_text: str = "",
+    previous_trace: object = None,
+) -> List[str]:
     errors: List[str] = []
     if not isinstance(trace_payload, Mapping):
         return errors
@@ -345,6 +415,32 @@ def validate_frontend_fidelity_trace(trace_payload: object, *, spec_text: str = 
         and isinstance(frontend_scope.get("surfaces"), list)
         and bool(frontend_scope.get("surfaces"))
     )
+
+    if explicit_no_frontend_work and previous_trace is not None:
+        previous_requirements = _requirements_by_id(previous_trace)
+        for requirement in requirements:
+            if not isinstance(requirement, Mapping):
+                continue
+            if requirement.get("status") != "active":
+                continue
+            if not requirement_is_frontend_fidelity(requirement):
+                continue
+            requirement_id = str(requirement.get("id", "")).strip()
+            previous_requirement = previous_requirements.get(requirement_id)
+            if previous_requirement is None:
+                errors.append(
+                    f"frontend_scope.requested=false forbids introducing active frontend "
+                    f"fidelity requirement {requirement_id or '<unknown>'}; preserve historical "
+                    "contracts unchanged and keep regression checks in affected or release verification."
+                )
+            elif _frontend_requirement_contract_changed(
+                previous_requirement,
+                requirement,
+            ):
+                errors.append(
+                    f"frontend_scope.requested=false forbids changing frontend fidelity "
+                    f"requirement {requirement_id}; restore its previous contract."
+                )
 
     if (
         signals
@@ -394,8 +490,36 @@ def validate_frontend_fidelity_task_plan(
 ) -> List[str]:
     if not isinstance(plan_payload, Mapping) or not isinstance(trace_payload, Mapping):
         return []
+
+    errors: List[str] = []
+    preservation_only_ids = set(
+        preservation_only_frontend_requirement_ids(trace_payload)
+    )
+    current_tasks = plan_payload.get("tasks")
+    if preservation_only_ids and isinstance(current_tasks, list):
+        for index, task in enumerate(current_tasks, start=1):
+            if not isinstance(task, Mapping):
+                continue
+            if str(task.get("status", "pending")).strip() == "done":
+                continue
+            task_id = str(task.get("task_id", f"#{index}")).strip()
+            requirement_ids = {
+                str(item).strip()
+                for item in task.get("requirement_ids", []) or []
+                if isinstance(item, str) and item.strip()
+            }
+            invalid_ids = sorted(requirement_ids & preservation_only_ids)
+            if invalid_ids:
+                errors.append(
+                    f"task {task_id} binds preservation-only frontend requirements while "
+                    "frontend_scope.requested=false: "
+                    + ", ".join(invalid_ids)
+                    + ". Do not create standalone implementation or proof-rebinding work; "
+                    "run relevant regressions only as affected or release verification."
+                )
+
     if not trace_frontend_surfaces(trace_payload):
-        return []
+        return errors
 
     requirements = trace_payload.get("requirements") if isinstance(trace_payload.get("requirements"), list) else []
     scoped_fidelity_ids = set(frontend_fidelity_requirement_ids(trace_payload))
@@ -417,7 +541,6 @@ def validate_frontend_fidelity_task_plan(
         tasks.extend(item for item in current_tasks if isinstance(item, Mapping))
     tasks.extend(item for item in historical_tasks if isinstance(item, Mapping))
 
-    errors: List[str] = []
     for req_id in required_ids:
         proofs = _task_proofs_for_requirement(tasks, req_id)
         if not proofs:

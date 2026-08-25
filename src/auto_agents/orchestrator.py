@@ -17480,7 +17480,7 @@ class Orchestrator:
                 "All active mandatory requirement acceptance_oracles must also be covered by either archived verified done-task proof or at least one current task requirement_proofs entry; requirement_ids alone are not sufficient coverage.",
                 "If an acceptance_oracle covers docs or architecture semantics, its evidence_refs must include an executable test that reads/asserts those docs and a supporting ref to the affected document, such as .auto-agents/docs/architecture.md.",
                 "Task acceptance criteria must preserve the bound requirement's concrete acceptance_oracles; do not weaken direct/API/protocol requirements into naming or configuration-only checks.",
-                "If frontend_scope.requested=true and requirements_trace.json contains frontend_surfaces or frontend/prototype fidelity requirements, create or preserve at least one page-level task per affected surface. The task must implement the whole visible surface against the prototype, not only isolated components or payload behavior. When frontend_scope.requested=false, preservation-only visual requirements are regression constraints and must not create redesign or page implementation tasks.",
+                "If frontend_scope.requested=true and requirements_trace.json contains frontend_surfaces or frontend/prototype fidelity requirements, create or preserve at least one page-level task per affected surface. The task must implement the whole visible surface against the prototype, not only isolated components or payload behavior. When frontend_scope.requested=false, preservation-only visual requirements must not create any standalone task, implementation task, proof-rebinding task, or current-iteration requirement binding. Existing frontend regressions may run only as verification steps of genuinely affected non-frontend work or as final release verification.",
                 "Frontend prototype fidelity task acceptance must require deterministic DOM/CSS/static checks and screenshot/runtime visual evidence such as Playwright screenshots. A vision judge may be added when available, but it supplements deterministic and screenshot evidence rather than replacing them. Payload-only tests, route-existence checks, or component count checks are forbidden as the sole proof for visual fidelity.",
                 "For negative contract requirements such as 'must not contain', '不得', '不包含', or '不返回', preserve every concrete field/path/API token from the requirement in the task acceptance. For example, a requirement that forbids `tasks[].result` is NOT covered by only omitting `retry_trace`.",
                 "Preserve each bound requirement's oracle_type, oracle_strength, evidence_boundary, and forbidden_proxy_oracles when slicing tasks. Requirements that demand semantic or human-strength proof are NOT satisfied by proxy checks, internal-state-only checks, config-only checks, or metadata/log snapshots. Requirements that demand system_boundary or external_side_effect evidence are NOT covered unless the task acceptance requires proof at that boundary.",
@@ -20972,8 +20972,14 @@ class Orchestrator:
         active_spec_file = getattr(self, "_active_spec_file", None)
         if isinstance(active_spec_file, Path) and active_spec_file.exists():
             spec_text = read_text(active_spec_file)
-        errors.extend(validate_frontend_fidelity_trace(trace, spec_text=spec_text))
         previous_trace = getattr(self, "_clarify_pre_trace_payload", {}) or {}
+        errors.extend(
+            validate_frontend_fidelity_trace(
+                trace,
+                spec_text=spec_text,
+                previous_trace=previous_trace,
+            )
+        )
         if previous_trace:
             errors.extend(
                 validate_requirement_contract_transitions(

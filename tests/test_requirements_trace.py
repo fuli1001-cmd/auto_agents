@@ -16,7 +16,11 @@ from auto_agents.config import (
 )
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, ProviderConfig, TaskSpec
-from auto_agents.frontend_fidelity import validate_frontend_fidelity_trace
+from auto_agents.frontend_fidelity import (
+    validate_frontend_fidelity_task_plan,
+    validate_frontend_fidelity_trace,
+)
+from auto_agents.frontend_design import validate_frontend_scope
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.provider_contract import (
     PROVIDER_REFERENCE_CONTRACT_VERSION,
@@ -38,6 +42,7 @@ from auto_agents.requirements import (
     validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
     validate_requirement_contract_transitions,
+    validate_task_requirement_coverage,
     validate_provider_resolve_trace_transition,
 )
 from auto_agents.validation import validate_task_plan_with_requirements, validation_report
@@ -1195,6 +1200,181 @@ class RequirementsTraceTests(unittest.TestCase):
 
         self.assertFalse(
             any("frontend prototype fidelity" in item for item in errors)
+        )
+
+    def test_frontend_scope_rejects_surfaces_when_work_is_not_requested(self) -> None:
+        trace = {
+            "version": 1,
+            "frontend_scope": {
+                "requested": False,
+                "surfaces": [
+                    {
+                        "id": "home",
+                        "name": "Home",
+                        "priority": "primary",
+                        "requirement_ids": ["REQ-001"],
+                    }
+                ],
+            },
+            "requirements": [_requirement()],
+        }
+
+        errors = validate_frontend_scope(trace)
+
+        self.assertTrue(
+            any("surfaces must be empty when requested=false" in error for error in errors)
+        )
+
+    def test_preservation_only_iteration_rejects_new_frontend_requirement(self) -> None:
+        previous_requirement = _requirement(
+            id="REQ-009",
+            text="Preserve the approved Workbench home prototype.",
+            source="specs/previous-iteration.md",
+            acceptance_oracles=["The rendered home remains visually unchanged."],
+            oracle_type="mixed",
+            oracle_strength="semantic",
+            notes="frontend_surface: home",
+            frontend_surface=True,
+        )
+        previous = {
+            "version": 1,
+            "frontend_scope": {"requested": False, "surfaces": []},
+            "requirements": [previous_requirement],
+        }
+        current = json.loads(json.dumps(previous))
+        current["requirements"][0]["status"] = "superseded"
+        current["requirements"][0]["superseded_by"] = ["REQ-020"]
+        current["requirements"].append(
+            _requirement(
+                id="REQ-020",
+                text="The Workbench home must preserve the approved prototype fidelity.",
+                source="specs/storyboard-contract.md non-goals",
+                acceptance_oracles=[
+                    "Desktop and mobile screenshots remain visually unchanged."
+                ],
+                oracle_type="mixed",
+                oracle_strength="semantic",
+                notes="frontend_surface: home",
+                frontend_surface=True,
+                supersedes=["REQ-009"],
+            )
+        )
+
+        errors = validate_frontend_fidelity_trace(
+            current,
+            spec_text="Do not modify the approved Workbench visual design.",
+            previous_trace=previous,
+        )
+
+        self.assertTrue(
+            any(
+                "requested=false forbids introducing" in error
+                and "REQ-020" in error
+                for error in errors
+            )
+        )
+
+    def test_preservation_only_iteration_allows_unchanged_historical_requirement(self) -> None:
+        requirement = _requirement(
+            id="REQ-009",
+            text="Preserve the approved Workbench home prototype.",
+            source="specs/previous-iteration.md",
+            acceptance_oracles=["The rendered home remains visually unchanged."],
+            oracle_type="mixed",
+            oracle_strength="semantic",
+            notes="frontend_surface: home",
+            frontend_surface=True,
+        )
+        previous = {
+            "version": 1,
+            "frontend_scope": {"requested": False, "surfaces": []},
+            "requirements": [requirement],
+        }
+        current = json.loads(json.dumps(previous))
+
+        errors = validate_frontend_fidelity_trace(
+            current,
+            previous_trace=previous,
+        )
+
+        self.assertFalse(
+            any("requested=false forbids" in error for error in errors)
+        )
+
+    def test_preservation_only_iteration_rejects_changed_historical_requirement(self) -> None:
+        requirement = _requirement(
+            id="REQ-009",
+            text="Preserve the approved Workbench home prototype.",
+            source="specs/previous-iteration.md",
+            acceptance_oracles=["The rendered home remains visually unchanged."],
+            oracle_type="mixed",
+            oracle_strength="semantic",
+            notes="frontend_surface: home",
+            frontend_surface=True,
+        )
+        previous = {
+            "version": 1,
+            "frontend_scope": {"requested": False, "surfaces": []},
+            "requirements": [requirement],
+        }
+        current = json.loads(json.dumps(previous))
+        current["requirements"][0]["acceptance_oracles"] = [
+            "Regenerate desktop and mobile fidelity evidence."
+        ]
+
+        errors = validate_frontend_fidelity_trace(
+            current,
+            previous_trace=previous,
+        )
+
+        self.assertTrue(
+            any(
+                "requested=false forbids changing" in error
+                and "REQ-009" in error
+                for error in errors
+            )
+        )
+
+    def test_preservation_only_frontend_requirement_cannot_create_rebinding_task(self) -> None:
+        requirement = _requirement(
+            id="REQ-020",
+            text="The Workbench home must preserve the approved prototype fidelity.",
+            source="specs/storyboard-contract.md non-goals",
+            acceptance_oracles=[
+                "Desktop and mobile screenshots remain visually unchanged."
+            ],
+            oracle_type="mixed",
+            oracle_strength="semantic",
+            notes="frontend_surface: home",
+            frontend_surface=True,
+        )
+        trace = {
+            "version": 1,
+            "frontend_scope": {"requested": False, "surfaces": []},
+            "requirements": [requirement],
+        }
+        task_plan = {
+            "tasks": [
+                {
+                    "task_id": "task-377",
+                    "title": "Rebind Workbench home prototype fidelity regression",
+                    "status": "pending",
+                    "requirement_ids": ["REQ-020"],
+                }
+            ]
+        }
+
+        coverage_errors = validate_task_requirement_coverage({"tasks": []}, trace)
+        plan_errors = validate_frontend_fidelity_task_plan(task_plan, trace)
+
+        self.assertFalse(
+            any("mandatory active requirements" in error for error in coverage_errors)
+        )
+        self.assertTrue(
+            any(
+                "task task-377 binds preservation-only frontend requirements" in error
+                for error in plan_errors
+            )
         )
 
     def test_frontend_surface_requires_active_visual_requirement(self) -> None:

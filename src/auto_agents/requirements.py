@@ -22,6 +22,7 @@ from .config import (
     run_state_path,
     task_plan_path,
 )
+from .frontend_fidelity import preservation_only_frontend_requirement_ids
 from .io_utils import read_json, read_text, write_json, write_text
 from .models import (
     PERSISTENCE_COMPATIBILITY_POLICIES,
@@ -1085,7 +1086,10 @@ def validate_task_requirement_coverage(
         return errors
 
     known_ids = requirement_ids(trace_payload)
-    mandatory_ids = mandatory_active_requirement_ids(trace_payload)
+    preservation_only_ids = set(
+        preservation_only_frontend_requirement_ids(trace_payload)
+    )
+    mandatory_ids = mandatory_active_requirement_ids(trace_payload) - preservation_only_ids
     if not known_ids:
         return errors
 
@@ -1278,6 +1282,9 @@ def validate_task_requirement_proofs(
     historical_requirement_ids = _historical_task_requirement_ids(historical_task_list, known_ids)
     current_requirement_ids = _current_task_requirement_ids(tasks, known_ids)
     current_done_requirement_ids = _historical_task_requirement_ids(current_done_tasks, known_ids)
+    preservation_only_ids = set(
+        preservation_only_frontend_requirement_ids(trace_payload)
+    )
     proofs_by_requirement: Dict[str, List[dict]] = _historical_verified_proofs_by_requirement(
         historical_task_list,
         trace_payload,
@@ -1361,6 +1368,8 @@ def validate_task_requirement_proofs(
             proofs_by_requirement.setdefault(req_id, []).append(proof)
 
     for req_id, requirement in by_req.items():
+        if req_id in preservation_only_ids:
+            continue
         if str(requirement.get("status", "active")).strip() != "active":
             continue
         if str(requirement.get("priority", "mandatory")).strip() != "mandatory":

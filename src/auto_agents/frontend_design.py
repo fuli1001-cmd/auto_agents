@@ -211,6 +211,8 @@ def validate_frontend_scope(trace_payload: object) -> List[str]:
         return errors
     if raw.get("requested") is True and not surfaces:
         errors.append(f"{FRONTEND_SCOPE_FIELD}.surfaces must not be empty when requested=true")
+    if raw.get("requested") is False and surfaces:
+        errors.append(f"{FRONTEND_SCOPE_FIELD}.surfaces must be empty when requested=false")
     seen = set()
     for index, item in enumerate(surfaces, start=1):
         prefix = f"{FRONTEND_SCOPE_FIELD}.surfaces[{index}]"

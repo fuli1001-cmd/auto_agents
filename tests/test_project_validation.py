@@ -4586,6 +4586,10 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("preserve those done tasks", prompt)
             self.assertIn("archived done tasks with verified requirement_proofs already count as historical coverage", prompt)
             self.assertIn("Do NOT create regression-lock or baseline-preservation tasks", prompt)
+            self.assertIn(
+                "must not create any standalone task, implementation task, proof-rebinding task",
+                prompt,
+            )
             self.assertNotIn("APPEND new tasks to the end of the JSON array", prompt)
 
     def test_plan_merge_preserves_current_run_done_tasks_and_prunes_duplicates(self) -> None:
