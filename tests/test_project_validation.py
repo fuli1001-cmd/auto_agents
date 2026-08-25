@@ -1370,6 +1370,38 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertTrue(ownership_decision.eligible)
         self.assertEqual(ownership_decision.category, "clarify_conversation_mutation_scope")
 
+        clarify_swap_decision = classify_auto_agents_error(
+            "stage clarify modified files outside its ownership during clarify-generate. "
+            "Changed paths: specs/.storyboard-contract.md.swp. "
+            "Allowed scope: .auto-agents/runs/demo/**; "
+            ".auto-agents/state/run_state.json.",
+            env={},
+        )
+        self.assertTrue(clarify_swap_decision.eligible)
+        self.assertEqual(
+            clarify_swap_decision.category,
+            "clarify_generate_transient_editor_artifact",
+        )
+
+        clarify_spec_decision = classify_auto_agents_error(
+            "stage clarify modified files outside its ownership during clarify-generate. "
+            "Changed paths: specs/storyboard-contract.md. "
+            "Allowed scope: .auto-agents/runs/demo/**; "
+            ".auto-agents/state/run_state.json.",
+            env={},
+        )
+        self.assertFalse(clarify_spec_decision.eligible)
+
+        clarify_mixed_decision = classify_auto_agents_error(
+            "stage clarify modified files outside its ownership during clarify-generate. "
+            "Changed paths: specs/.storyboard-contract.md.swp, "
+            "specs/storyboard-contract.md. "
+            "Allowed scope: .auto-agents/runs/demo/**; "
+            ".auto-agents/state/run_state.json.",
+            env={},
+        )
+        self.assertFalse(clarify_mixed_decision.eligible)
+
         readme_proposal_decision = classify_auto_agents_error(
             "stage readme modified files outside its ownership during readme-propose. "
             "Changed paths: README.md. Allowed scope: .auto-agents/runs/demo/**; "

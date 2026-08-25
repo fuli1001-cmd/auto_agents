@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional
 
 from .config import run_path
+from .git_ops import is_untracked_vim_swap
 from .io_utils import read_json, read_text, write_json
 from .models import AgentRequest, AgentResult, RunState, SelfRepairDiagnosisConfig
 
@@ -294,13 +295,18 @@ def repository_guard_fingerprint(
     ignore_run_artifacts: bool = False,
 ) -> str:
     state = repository_diagnostic_state(root)
-    if ignore_run_artifacts:
-        status_lines = [
-            line
-            for line in str(state["status"]).splitlines()
-            if ".auto-agents/runs/" not in line
-        ]
-        state["status"] = "\n".join(status_lines)
+    status_lines = []
+    for line in str(state["status"]).splitlines():
+        status = line[:2]
+        path = line[3:].strip()
+        if " -> " in path:
+            _, path = path.split(" -> ", 1)
+        if is_untracked_vim_swap(status, path):
+            continue
+        if ignore_run_artifacts and ".auto-agents/runs/" in line:
+            continue
+        status_lines.append(line)
+    state["status"] = "\n".join(status_lines)
     return hashlib.sha256(
         json.dumps(state, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()

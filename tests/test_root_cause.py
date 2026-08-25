@@ -335,6 +335,30 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             ):
                 coordinator.run()
 
+    def test_vim_swap_disappearing_during_diagnosis_does_not_trip_invariant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            coordinator, fake, target = self._coordinator(
+                Path(tmp),
+                [
+                    _report(role="investigator", verdict="ROOT_CAUSE"),
+                    _report(role="reviewer", verdict="AGREE"),
+                ],
+            )
+            swap_path = target / ".README.md.swp"
+            swap_path.write_bytes(b"vim recovery data")
+            original_call = fake._call_with_failover
+
+            def remove_swap_then_call(request):
+                swap_path.unlink(missing_ok=True)
+                return original_call(request)
+
+            fake._call_with_failover = remove_swap_then_call
+
+            diagnosis = coordinator.run()
+
+            self.assertTrue(diagnosis.repair_approved)
+            self.assertFalse(swap_path.exists())
+
     def test_terminal_evidence_redacts_credentials(self):
         with tempfile.TemporaryDirectory() as tmp:
             coordinator, _fake, target = self._coordinator(

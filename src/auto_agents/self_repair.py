@@ -19,6 +19,7 @@ from .git_ops import (
     changed_paths,
     commit_all,
     head_ref,
+    is_untracked_vim_swap,
     remove_worktree,
 )
 from .gates import run_commands
@@ -421,6 +422,25 @@ def self_repair_repeat_count(env: Optional[dict[str, str]] = None) -> int:
         return 0
 
 
+def _clarify_generate_vim_swap_scope_error(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if (
+        "stage clarify modified files outside its ownership during clarify-generate"
+        not in lowered
+        or "allowed scope:" not in lowered
+    ):
+        return False
+    match = re.search(
+        r"changed paths:\s*(.*?)\.\s*allowed scope:",
+        str(text),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return False
+    paths = [item.strip() for item in match.group(1).split(",") if item.strip()]
+    return bool(paths) and all(is_untracked_vim_swap("??", path) for path in paths)
+
+
 def classify_auto_agents_error(
     error: object,
     *,
@@ -644,6 +664,20 @@ def classify_auto_agents_error(
                 reason=(
                     "clarify conversation mutated requirements-owned artifacts before the "
                     "clarify generation step; this is eligible for generic orchestrator repair"
+                ),
+            ),
+            text,
+            values,
+        )
+
+    if _clarify_generate_vim_swap_scope_error(text):
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category="clarify_generate_transient_editor_artifact",
+                reason=(
+                    "clarify generation observed only untracked Vim swap artifacts; "
+                    "this is eligible for generic transient ownership repair"
                 ),
             ),
             text,

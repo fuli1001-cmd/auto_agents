@@ -153,7 +153,7 @@ from .frontend_design import (
     validate_frontend_scope,
     validate_prototype_manifest,
 )
-from .git_ops import abort_cherry_pick, add_worktree, apply_commit_no_commit_excluding, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, commit_only_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, list_worktrees, ref_exists, remove_worktree, tracked_files, update_ref, worktree_fingerprint
+from .git_ops import abort_cherry_pick, add_worktree, apply_commit_no_commit_excluding, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, commit_only_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, is_untracked_vim_swap, list_worktrees, ref_exists, remove_worktree, tracked_files, update_ref, worktree_fingerprint
 from .infrastructure_repair import repair_workspace_local_conda
 from .io_utils import read_json, read_text, write_json, write_text
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
@@ -4405,6 +4405,8 @@ class Orchestrator:
         snapshot: Dict[str, str] = {}
         for status, path in changed_entries(self.project_root, ignored_prefixes=()):
             if path.startswith(".antigravitycli/"):
+                continue
+            if is_untracked_vim_swap(status, path):
                 continue
             hasher = hashlib.sha256()
             hasher.update(status.encode("utf-8"))

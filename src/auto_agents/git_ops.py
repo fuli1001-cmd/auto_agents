@@ -208,6 +208,21 @@ def changed_entries(
     return entries
 
 
+def is_untracked_vim_swap(status: str, path: str) -> bool:
+    """Return true only for an untracked Vim swap/recovery artifact."""
+
+    if str(status).strip() != "??":
+        return False
+    normalized = str(path).replace("\\", "/").strip().lower()
+    name = normalized.rsplit("/", 1)[-1]
+    return (
+        name.startswith(".")
+        and len(name) > 4
+        and name[-4:-1] == ".sw"
+        and name[-1] in "abcdefghijklmnop"
+    )
+
+
 def changed_paths(project_root: Path, ignored_prefixes: tuple[str, ...] = (".auto-agents/", ".antigravitycli/")) -> list[str]:
     return [path for _, path in changed_entries(project_root, ignored_prefixes=ignored_prefixes)]
 

@@ -92,6 +92,51 @@ class ClarifyResumeTests(unittest.TestCase):
         spec_file.write_text("# Idea\nBuild something.", encoding="utf-8")
         return project_root, spec_file
 
+    def test_worktree_snapshot_ignores_untracked_vim_swap_but_not_spec_changes(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+
+        before = orchestrator._worktree_change_snapshot()
+        swap_path = spec_file.with_name(f".{spec_file.name}.swp")
+        swap_path.write_bytes(b"vim recovery data")
+
+        with_swap = orchestrator._worktree_change_snapshot()
+        spec_file.write_text("# Changed specification\n", encoding="utf-8")
+        with_spec_change = orchestrator._worktree_change_snapshot()
+
+        self.assertEqual(with_swap, before)
+        self.assertTrue(swap_path.exists())
+        self.assertIn("spec.md", with_spec_change)
+
+    def test_clarify_generate_preserves_and_ignores_untracked_vim_swap(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        swap_path = spec_file.with_name(f".{spec_file.name}.swp")
+
+        def run_with_swap(request):
+            swap_path.write_bytes(b"vim recovery data")
+            write_text(request.output_path, "Generated brief.\n")
+            return AgentResult(
+                ok=True,
+                command=["fake"],
+                output_path=request.output_path,
+                summary="Generated brief.",
+                returncode=0,
+            )
+
+        orchestrator.adapter.run = run_with_swap
+
+        result = orchestrator._run_agent_with_retries(
+            state=state,
+            stage="clarify",
+            stage_key="clarify-generate",
+            prompt="Generate the brief.",
+        )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(swap_path.exists())
+
     def test_crash_resume_with_ready_to_generate_confirms_generation(self):
         """When history ends with READY_TO_GENERATE, the next run should
         resume to confirmation (not start fresh) and generate the brief."""
