@@ -1487,6 +1487,67 @@ class RequirementsTraceTests(unittest.TestCase):
 
         self.assertTrue(any("page-level visual evidence" in item for item in errors))
 
+    def test_frontend_visual_evidence_ignores_historical_id_collision(self) -> None:
+        requirement = _requirement(
+            id="REQ-027",
+            text="Preserve the approved home page visual contract.",
+            acceptance_oracles=["Desktop and mobile screenshots remain unchanged."],
+            oracle_type="mixed",
+            oracle_strength="semantic",
+            notes="frontend_surface: Home",
+            frontend_surface=True,
+        )
+        trace, _ = stamp_requirement_contract_hashes(
+            {
+                "version": 1,
+                "frontend_surfaces": [
+                    {
+                        "name": "Home",
+                        "route": "/",
+                        "prototype_refs": ["specs/frontend_prototype/home.html"],
+                        "viewports": ["desktop", "mobile"],
+                        "requirement_ids": ["REQ-027"],
+                    }
+                ],
+                "requirements": [requirement],
+            }
+        )
+        historical_task = {
+            "task_id": "task-old",
+            "status": "done",
+            "requirement_ids": ["REQ-027"],
+            "requirement_proofs": [
+                {
+                    "requirement_id": "REQ-027",
+                    "proof_type": "integration_test",
+                    "evidence_refs": ["tests/test_provider_payload.py"],
+                    "status": "verified",
+                }
+            ],
+        }
+
+        errors = validate_frontend_fidelity_task_plan(
+            {"tasks": []},
+            trace,
+            historical_tasks=[historical_task],
+        )
+
+        self.assertFalse(
+            any("page-level visual evidence" in error for error in errors)
+        )
+
+        historical_task["requirement_proofs"][0][
+            "requirement_contract_sha256"
+        ] = trace["requirements"][0]["contract_sha256"]
+        matching_errors = validate_frontend_fidelity_task_plan(
+            {"tasks": []},
+            trace,
+            historical_tasks=[historical_task],
+        )
+        self.assertTrue(
+            any("page-level visual evidence" in error for error in matching_errors)
+        )
+
     def test_frontend_fidelity_validation_uses_explicit_surface_requirement_scope(self) -> None:
         trace = {
             "version": 1,

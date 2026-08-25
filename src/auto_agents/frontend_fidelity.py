@@ -562,7 +562,22 @@ def validate_frontend_fidelity_task_plan(
     tasks.extend(item for item in historical_tasks if isinstance(item, Mapping))
 
     for req_id in required_ids:
-        proofs = _task_proofs_for_requirement(tasks, req_id)
+        requirement = next(
+            (
+                item
+                for item in requirements
+                if isinstance(item, Mapping)
+                and str(item.get("id", "")).strip() == req_id
+            ),
+            {},
+        )
+        proofs = _task_proofs_for_requirement(
+            tasks,
+            req_id,
+            expected_contract_hash=str(
+                requirement.get("contract_sha256", "")
+            ).strip(),
+        )
         if not proofs:
             continue
         if not any(_proof_has_visual_evidence(proof) for _task, proof in proofs):
@@ -575,7 +590,10 @@ def validate_frontend_fidelity_task_plan(
 
 
 def _task_proofs_for_requirement(
-    tasks: Sequence[Mapping[str, object]], req_id: str
+    tasks: Sequence[Mapping[str, object]],
+    req_id: str,
+    *,
+    expected_contract_hash: str = "",
 ) -> List[tuple[Mapping[str, object], Mapping[str, object]]]:
     matches: List[tuple[Mapping[str, object], Mapping[str, object]]] = []
     for task in tasks:
@@ -585,8 +603,17 @@ def _task_proofs_for_requirement(
         for proof in proofs:
             if not isinstance(proof, Mapping):
                 continue
-            if str(proof.get("requirement_id", "")).strip() == req_id:
-                matches.append((task, proof))
+            if str(proof.get("requirement_id", "")).strip() != req_id:
+                continue
+            if (
+                expected_contract_hash
+                and str(
+                    proof.get("requirement_contract_sha256", "")
+                ).strip()
+                != expected_contract_hash
+            ):
+                continue
+            matches.append((task, proof))
     return matches
 
 

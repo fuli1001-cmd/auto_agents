@@ -1723,6 +1723,67 @@ class Orchestrator:
         )
         return True
 
+    def _normalize_valid_plan_retry_outcome(self, state: RunState) -> bool:
+        if (
+            state.status != "blocked"
+            or "plan" in state.stage_summaries
+            or not state.last_error.startswith("plan exhausted retries:")
+        ):
+            return False
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        if str(blocker.get("category", "")).strip() != (
+            "retry_outcome_artifact_mismatch"
+        ):
+            return False
+
+        prior_tasks = list(state.tasks)
+        self._plan_prior_done_task_payloads = self._done_task_payloads(prior_tasks)
+        try:
+            feedback = self._plan_validation_feedback(
+                AgentResult(
+                    ok=True,
+                    command=[],
+                    output_path=Path("."),
+                    summary=(
+                        "Recovered the persisted plan artifact after correcting "
+                        "orchestrator validation."
+                    ),
+                )
+            )
+        finally:
+            self._plan_prior_done_task_payloads = []
+        if feedback is not None:
+            return False
+
+        state.current_stage = "plan"
+        state.stage_summaries["plan"] = (
+            "Recovered the persisted plan artifact after correcting an "
+            "orchestrator-owned validation mismatch."
+        )
+        state.status = "pending"
+        state.last_error = ""
+        state.rejected_stage = ""
+        state.rejection_reason = ""
+        state.active_blocker = {}
+        self._complete_plan_stage(state, prior_tasks)
+        state.last_recovery_route = {
+            "outcome": "plan_retry_artifact_reconciled",
+            "from_stage": "plan",
+            "to_stage": "provider_research",
+            "reason": (
+                "the provider's final task_plan.json passed the corrected "
+                "contract-aware validator"
+            ),
+        }
+        self.logger.info(
+            "[plan] reconciled valid artifact after exhausted retries"
+        )
+        return True
+
     @staticmethod
     def _normalize_audit_blocker_path(path: object) -> str:
         normalized = str(path or "").strip().replace("\\", "/")
@@ -2287,6 +2348,8 @@ class Orchestrator:
                 state,
                 resolved_spec_file,
             ):
+                save_run_state(self.project_root, state)
+            if self._normalize_valid_plan_retry_outcome(state):
                 save_run_state(self.project_root, state)
             if not restart_blocked:
                 if self._resume_blocked_run(state):
@@ -3331,28 +3394,38 @@ class Orchestrator:
         state.stage_summaries[stage] = result.summary.strip()
         state.last_error = ""
         if stage == "plan":
-            self._merge_prior_done_tasks_into_generated_plan(prior_tasks)
-            self._apply_generated_verification_config()
-            state.tasks = self._load_tasks_from_plan()
-            self._clear_stale_implementation_resume_markers(
-                state,
-                task_ids={
-                    task.task_id
-                    for task in state.tasks
-                    if task.status == "pending"
-                },
-            )
-            state.plan_task_replacements = self._derive_plan_task_replacements(prior_tasks, state.tasks)
-            origins_changed = self._normalize_task_origins(state.tasks, state)
-            ownership_changed = self._inherit_plan_replacement_mutable_artifacts(
-                prior_tasks,
-                state.tasks,
-            )
-            if origins_changed or ownership_changed:
-                self._persist_tasks(state.tasks)
-            self._complete_artifact_publication_metadata_repair(state)
-            self._emit_plan_task_count(state.tasks)
+            self._complete_plan_stage(state, prior_tasks)
         return state
+
+    def _complete_plan_stage(
+        self,
+        state: RunState,
+        prior_tasks: List[TaskSpec],
+    ) -> None:
+        self._merge_prior_done_tasks_into_generated_plan(prior_tasks)
+        self._apply_generated_verification_config()
+        state.tasks = self._load_tasks_from_plan()
+        self._clear_stale_implementation_resume_markers(
+            state,
+            task_ids={
+                task.task_id
+                for task in state.tasks
+                if task.status == "pending"
+            },
+        )
+        state.plan_task_replacements = self._derive_plan_task_replacements(
+            prior_tasks,
+            state.tasks,
+        )
+        origins_changed = self._normalize_task_origins(state.tasks, state)
+        ownership_changed = self._inherit_plan_replacement_mutable_artifacts(
+            prior_tasks,
+            state.tasks,
+        )
+        if origins_changed or ownership_changed:
+            self._persist_tasks(state.tasks)
+        self._complete_artifact_publication_metadata_repair(state)
+        self._emit_plan_task_count(state.tasks)
 
     def _block_for_persistence_configuration(self, state: RunState) -> bool:
         trace = load_requirements_trace(self.project_root)

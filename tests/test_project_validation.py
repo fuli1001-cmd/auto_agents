@@ -3376,6 +3376,51 @@ class ProjectValidationTests(unittest.TestCase):
             rendered = stream.getvalue()
             self.assertIn("[stage:plan] tasks=1", rendered)
 
+    def test_valid_plan_artifact_is_reconciled_after_retry_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.current_stage = "design"
+            state.stage_summaries["design"] = "designed"
+            state.last_error = (
+                "plan exhausted retries: provider output was rejected"
+            )
+            state.active_blocker = {
+                "owner": "unknown",
+                "category": "retry_outcome_artifact_mismatch",
+                "reason": state.last_error,
+            }
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_plan_validation_feedback",
+                    return_value=None,
+                ) as validate,
+                patch.object(
+                    orchestrator,
+                    "_complete_plan_stage",
+                ) as complete,
+            ):
+                reconciled = orchestrator._normalize_valid_plan_retry_outcome(
+                    state
+                )
+
+            self.assertTrue(reconciled)
+            validate.assert_called_once()
+            complete.assert_called_once()
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.current_stage, "plan")
+            self.assertIn("plan", state.stage_summaries)
+            self.assertEqual(state.active_blocker, {})
+            self.assertEqual(
+                state.last_recovery_route["outcome"],
+                "plan_retry_artifact_reconciled",
+            )
+
     def test_plan_validation_accepts_no_new_iteration_tasks_with_coverage_justification(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
