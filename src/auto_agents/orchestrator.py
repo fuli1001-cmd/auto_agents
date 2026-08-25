@@ -156,7 +156,10 @@ from .frontend_design import (
     validate_prototype_manifest,
 )
 from .git_ops import abort_cherry_pick, add_worktree, apply_commit_no_commit_excluding, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, commit_only_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, is_untracked_vim_swap, list_worktrees, ref_exists, remove_worktree, tracked_files, update_ref, worktree_fingerprint
-from .infrastructure_repair import repair_workspace_local_conda
+from .infrastructure_repair import (
+    repair_declared_workspace_local_conda,
+    repair_workspace_local_conda,
+)
 from .io_utils import read_json, read_text, write_json, write_text
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
 from .models import (
@@ -3989,18 +3992,60 @@ class Orchestrator:
             request = UserInputRequest.from_dict(enriched)
             if request.kind == "install_approval":
                 raw_manifest = request.validation.get("runtime_manifest", [])
-                plan = self._project_runtime.plan(
-                    raw_manifest if isinstance(raw_manifest, list) else []
+                manifest_items: object = raw_manifest
+                if isinstance(raw_manifest, dict):
+                    manifest_items = raw_manifest.get(
+                        "requirements",
+                        raw_manifest.get("tools", []),
+                    )
+                raw_items = (
+                    manifest_items
+                    if isinstance(manifest_items, list)
+                    else []
                 )
-                missing_plan = self._project_runtime.missing(plan)
-                if not missing_plan.requirements:
+                exact_runtime_manifest = bool(raw_items) and all(
+                    isinstance(item, dict)
+                    and str(item.get("source_url", "")).strip()
+                    for item in raw_items
+                )
+                if not exact_runtime_manifest:
+                    tool_ids = {
+                        str(item.get("tool_id", "")).strip().lower()
+                        for item in raw_items
+                        if isinstance(item, dict)
+                    }
+                    request_text = " ".join(
+                        (
+                            request.question,
+                            request.purpose,
+                            request.why_required,
+                        )
+                    ).lower()
+                    workspace_conda_request = bool(
+                        tool_ids & {"python", "pytest", "pip"}
+                        or ".conda" in request_text
+                    )
+                    if not workspace_conda_request:
+                        raise ValueError(
+                            "install_approval runtime_manifest must provide "
+                            "pinned source_url entries"
+                        )
+                    request = self._workspace_conda_install_approval_request(request)
+                    raw_items = []
+                plan = self._project_runtime.plan(raw_items)
+                if not raw_items:
+                    missing_plan = None
+                else:
+                    missing_plan = self._project_runtime.missing(plan)
+                if missing_plan is not None and not missing_plan.requirements:
                     continue
-                canonical = missing_plan.approval_request()
-                canonical.task_id = request.task_id
-                canonical.stage = request.stage
-                canonical.requirement_ids = list(request.requirement_ids)
-                canonical.bindings = [dict(item) for item in request.bindings]
-                request = canonical
+                if missing_plan is not None:
+                    canonical = missing_plan.approval_request()
+                    canonical.task_id = request.task_id
+                    canonical.stage = request.stage
+                    canonical.requirement_ids = list(request.requirement_ids)
+                    canonical.bindings = [dict(item) for item in request.bindings]
+                    request = canonical
             for binding in request.bindings:
                 binding.setdefault("input_key", request.key)
                 if binding not in task.operator_input_bindings:
@@ -4036,6 +4081,69 @@ class Orchestrator:
             if not state.active_input_request_id:
                 state.active_input_request_id = requests[0].request_id
         return requests
+
+    def _workspace_conda_install_approval_request(
+        self,
+        request: UserInputRequest,
+    ) -> UserInputRequest:
+        declared_sources = [
+            name
+            for name in (
+                "environment.yml",
+                "environment.yaml",
+                "conda-environment.yml",
+                "conda-environment.yaml",
+                "pyproject.toml",
+            )
+            if (self.project_root / name).is_file()
+        ]
+        if not declared_sources:
+            raise ValueError(
+                "workspace Conda installation requires environment.yml or pyproject.toml"
+            )
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "project": str(self.project_root),
+                    "sources": declared_sources,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        return UserInputRequest.from_dict(
+            {
+                "key": f"runtime.install.workspace_conda.{fingerprint[:16]}",
+                "kind": "install_approval",
+                "question": (
+                    "是否允许根据项目声明重建缺失的 ./.conda 环境并安装测试依赖？"
+                ),
+                "purpose": (
+                    "恢复项目固定验证命令使用的 ./.conda/bin/python。"
+                ),
+                "why_required": request.why_required,
+                "how_to_obtain": [
+                    "程序仅在目标项目的 ./.conda 和既有本地依赖目录内安装。",
+                    "环境来源：" + (", ".join(declared_sources) or "未找到声明文件"),
+                ],
+                "recommended_answer": (
+                    "确认允许下载项目声明的依赖后选择 y；否则选择 n。"
+                ),
+                "default": False,
+                "persistence": "project",
+                "sensitivity": "private",
+                "task_id": request.task_id,
+                "stage": request.stage,
+                "requirement_ids": list(request.requirement_ids),
+                "subject_fingerprint": fingerprint,
+                "question_version": 1,
+                "validation": {
+                    "workspace_conda": True,
+                    "declared_sources": declared_sources,
+                },
+                "bindings": [],
+            }
+        )
 
     def _pending_input_requests(self, state: RunState) -> List[UserInputRequest]:
         requests: List[UserInputRequest] = []
@@ -4081,6 +4189,71 @@ class Orchestrator:
             state.status = "pending"
             state.last_error = ""
             changed = True
+        return changed
+
+    def _reconcile_orphaned_waiting_user_tasks(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> bool:
+        pending_task_ids = {
+            request.task_id
+            for request in self._pending_input_requests(state)
+            if request.task_id
+        }
+        invalid: List[str] = []
+        changed = False
+        for task in tasks:
+            if (
+                task.status != "waiting_user"
+                or task.task_id in pending_task_ids
+            ):
+                continue
+            payloads = task.required_inputs
+            if not payloads and isinstance(task.evidence_preflight, dict):
+                raw_payloads = task.evidence_preflight.get(
+                    "required_inputs",
+                    [],
+                )
+                if isinstance(raw_payloads, list):
+                    payloads = [
+                        dict(item)
+                        for item in raw_payloads
+                        if isinstance(item, dict)
+                    ]
+            if not payloads:
+                invalid.append(f"{task.task_id}: no persisted input request")
+                continue
+            try:
+                requests = self._normalize_input_requests(
+                    state,
+                    task,
+                    payloads,
+                )
+            except (TypeError, ValueError) as error:
+                invalid.append(f"{task.task_id}: {error}")
+                continue
+            if requests:
+                pending_task_ids.add(task.task_id)
+                changed = True
+                continue
+            task.status = "pending"
+            task.required_inputs = []
+            task.evidence_preflight = {}
+            changed = True
+
+        if invalid:
+            reason = (
+                "waiting_user task has no actionable persisted input request: "
+                + "; ".join(invalid[:6])
+            )
+            self._block_run(
+                state,
+                owner="auto_agents",
+                category="waiting_user_request_missing",
+                reason=reason,
+            )
+            return changed
         return changed
 
     def _interactive_input_available(self) -> bool:
@@ -4141,18 +4314,33 @@ class Orchestrator:
                 raise RuntimeError(
                     "project-local runtime installation is disabled by configuration"
                 )
-            raw_manifest = request.validation.get("runtime_manifest", [])
             try:
-                plan = self._project_runtime.plan(
-                    raw_manifest if isinstance(raw_manifest, list) else []
-                )
-                if not plan.requirements:
-                    raise ValueError("runtime install approval has an empty manifest")
-                installed = self._project_runtime.install(plan)
-                self._operator_inputs.save_runtime_records(
-                    installed,
-                    manifest_fingerprint=plan.fingerprint,
-                )
+                if request.validation.get("workspace_conda") is True:
+                    repair = repair_declared_workspace_local_conda(
+                        self.project_root,
+                        allow_downloads=(
+                            self.config.execution.project_runtime.allow_downloads
+                        ),
+                    )
+                    if not repair.repaired:
+                        raise RuntimeError(repair.reason)
+                else:
+                    raw_manifest = request.validation.get(
+                        "runtime_manifest",
+                        [],
+                    )
+                    plan = self._project_runtime.plan(
+                        raw_manifest if isinstance(raw_manifest, list) else []
+                    )
+                    if not plan.requirements:
+                        raise ValueError(
+                            "runtime install approval has an empty manifest"
+                        )
+                    installed = self._project_runtime.install(plan)
+                    self._operator_inputs.save_runtime_records(
+                        installed,
+                        manifest_fingerprint=plan.fingerprint,
+                    )
             except Exception:
                 self._operator_inputs.remove(request.key)
                 raise
@@ -9253,6 +9441,26 @@ class Orchestrator:
         state.current_stage = "implement"
         state.tasks = tasks
         save_run_state(self.project_root, state)
+
+        if any(task.status == "waiting_user" for task in tasks):
+            reconciled_inputs = self._reconcile_orphaned_waiting_user_tasks(
+                state,
+                tasks,
+            )
+            if reconciled_inputs:
+                self._persist_tasks(tasks)
+                state.tasks = tasks
+                save_run_state(self.project_root, state)
+            if state.status == "blocked":
+                return state
+            if any(task.status == "waiting_user" for task in tasks):
+                resumed = self._process_pending_user_input(state, tasks)
+                if not resumed:
+                    state.tasks = tasks
+                    return state
+                tasks = self._load_implementation_tasks(state)
+                state.tasks = tasks
+                save_run_state(self.project_root, state)
 
         if state.rejected_stage == "implement" and state.rejection_reason:
             is_full_verify_recovery = "Failure type: full_verification" in state.rejection_reason

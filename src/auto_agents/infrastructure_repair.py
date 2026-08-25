@@ -237,6 +237,19 @@ def repair_workspace_local_conda(
             action="not_workspace_conda",
             reason="incident does not require the workspace-local Conda prefix",
         )
+    return repair_declared_workspace_local_conda(
+        project_root,
+        allow_downloads=allow_downloads,
+    )
+
+
+def repair_declared_workspace_local_conda(
+    project_root: Path,
+    *,
+    allow_downloads: bool = True,
+) -> InfrastructureRepairResult:
+    """Recreate a project-local Conda prefix from declared project metadata."""
+
     project_root = project_root.resolve()
     prefix = project_root / ".conda"
     if (
