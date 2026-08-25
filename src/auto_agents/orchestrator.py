@@ -16148,6 +16148,7 @@ class Orchestrator:
         created = False
         snapshot_manager: Optional[GateSnapshotManager] = None
         result: Optional[AgentResult] = None
+        protocol_attempt = 1
         try:
             snapshot_manager = GateSnapshotManager(
                 self.project_root,
@@ -16156,27 +16157,82 @@ class Orchestrator:
             snapshot = snapshot_manager.create()
             add_worktree(self.project_root, worktree_path, ref=snapshot.ref_name)
             created = True
-            request = AgentRequest(
-                stage="evidence_preflight",
-                effort=self.config.efforts.get("evidence_preflight", "balanced"),
-                prompt=prompt.replace(str(self.project_root), str(worktree_path)),
-                cwd=worktree_path,
-                output_path=output_path,
-                stream_output=(
-                    self._stream_agent_output_callback(stage_key)
-                    if self._print_agent_output
-                    else None
-                ),
-                attempt_id=stage_key,
-            )
-            with log_timing(self.logger, f"agent:{stage_key} attempt=1"):
-                result = self._call_with_failover(request)
-            self._emit_agent_output(stage_key, result)
-            if not result.ok:
-                raise RuntimeError(result.stderr or result.summary or "provider failed")
-            parsed = self._parse_evidence_preflight(result.summary or result.stdout)
-            if parsed is None:
-                raise ValueError("invalid EVIDENCE_PREFLIGHT response")
+            parsed: Optional[Dict[str, object]] = None
+            feedback = ""
+            cumulative_usage: Optional[AgentUsage] = None
+            usage_available = False
+            protocol_attempts = max(2, self._max_attempts("evidence_preflight"))
+            for protocol_attempt in range(1, protocol_attempts + 1):
+                attempt_stage_key = (
+                    stage_key
+                    if protocol_attempt == 1
+                    else f"{stage_key}-attempt-{protocol_attempt}"
+                )
+                attempt_prompt = prompt
+                if feedback:
+                    attempt_prompt = (
+                        f"{prompt}\n\nPrevious response protocol issue:\n{feedback}\n"
+                    )
+                    write_run_prompt(
+                        self.project_root,
+                        state.run_id,
+                        attempt_stage_key,
+                        attempt_prompt,
+                    )
+                request = AgentRequest(
+                    stage="evidence_preflight",
+                    effort=self.config.efforts.get("evidence_preflight", "balanced"),
+                    prompt=attempt_prompt.replace(
+                        str(self.project_root), str(worktree_path)
+                    ),
+                    cwd=worktree_path,
+                    output_path=(
+                        output_path
+                        if protocol_attempt == 1
+                        else self._stage_output_path(state.run_id, attempt_stage_key)
+                    ),
+                    stream_output=(
+                        self._stream_agent_output_callback(attempt_stage_key)
+                        if self._print_agent_output
+                        else None
+                    ),
+                    attempt_id=attempt_stage_key,
+                )
+                with log_timing(
+                    self.logger,
+                    f"agent:{attempt_stage_key} attempt={protocol_attempt}",
+                ):
+                    result = self._call_with_failover(request)
+                if result.usage is not None:
+                    cumulative_usage = (cumulative_usage or AgentUsage()).plus(
+                        result.usage
+                    )
+                    usage_available = True
+                self._emit_agent_output(attempt_stage_key, result)
+                if not result.ok:
+                    raise RuntimeError(
+                        result.stderr or result.summary or "provider failed"
+                    )
+                parsed = self._parse_evidence_preflight(
+                    result.summary or result.stdout
+                )
+                if parsed is None:
+                    raise ValueError("invalid EVIDENCE_PREFLIGHT response")
+                feedback = self._evidence_preflight_protocol_issue(parsed)
+                if not feedback:
+                    break
+                self.logger.warning(
+                    "[evidence-preflight] task=%s decision=RETRY_PROTOCOL "
+                    "attempt=%s reason=%s",
+                    task.task_id,
+                    protocol_attempt,
+                    feedback,
+                )
+            if parsed is None or feedback:
+                raise ValueError(
+                    "invalid EVIDENCE_PREFLIGHT prerequisite disposition: "
+                    + (feedback or "missing parsed response")
+                )
             raw_inputs = parsed.get("required_inputs", [])
             if isinstance(raw_inputs, list) and raw_inputs:
                 pending_inputs = self._normalize_input_requests(
@@ -16233,8 +16289,8 @@ class Orchestrator:
             self._emit_agent_metrics(
                 stage_key,
                 result,
-                attempts=1,
-                usage=result.usage,
+                attempts=protocol_attempt,
+                usage=(cumulative_usage if usage_available else None),
                 model=(
                     result.model
                     or self._model_label_for_agent_stage(
@@ -16280,6 +16336,51 @@ class Orchestrator:
             len(parsed.get("checklist", [])),
         )
         return parsed if parsed["decision"] != "READY" else None
+
+    @staticmethod
+    def _evidence_preflight_protocol_issue(
+        parsed: Dict[str, object],
+    ) -> str:
+        """Reject operator prerequisites encoded only as terminal mutations."""
+
+        required_inputs = parsed.get("required_inputs", [])
+        if isinstance(required_inputs, list) and required_inputs:
+            return ""
+        required_mutations = parsed.get("required_mutations", [])
+        if not isinstance(required_mutations, list):
+            return ""
+        operator_paths: List[str] = []
+        for item in required_mutations:
+            if not isinstance(item, dict):
+                continue
+            owner = str(item.get("owner", "")).strip().lower()
+            config_scope = str(
+                item.get("config_scope", item.get("scope", ""))
+            ).strip().lower()
+            operator_owned = owner in {
+                "operator",
+                "user",
+                "user_input",
+            } or (
+                config_scope == "operator"
+                and owner in {"", "target", "target_project", "external"}
+            )
+            if not operator_owned:
+                continue
+            path = str(item.get("path", "")).strip()
+            if path and path not in operator_paths:
+                operator_paths.append(path)
+        if not operator_paths:
+            return ""
+        return (
+            "Operator-owned prerequisites cannot be represented only as required "
+            "mutations. Return the facts, consent, authorized fixtures, secrets, "
+            "network approval, or project-local install approval as structured "
+            "required_inputs so auto_agents can enter WAIT_USER. Keep genuinely "
+            "upstream provider-research work as a separate required mutation. "
+            "Affected paths: "
+            + ", ".join(operator_paths)
+        )
 
     def _actionable_preflight_upstream_mutations(
         self,
@@ -16478,6 +16579,7 @@ class Orchestrator:
                 "For an authorized video fixture, ask one attestation question only: '你是否确认：你或项目团队拥有该视频，或已获得权利人的明确授权，可以下载、处理、生成衍生内容，并长期用于自动化测试？' Bind it to the source URL input through validation.subject.source_url_input_key; do not separately ask for the authorization basis or evidence file.",
                 "The operator-input summary below is authoritative for presence and validation. Do not ask again for a valid key already listed. A later attestation may bind to an earlier answer with validation.subject fields such as source_url_input_key.",
                 "Project configuration at .auto-agents/config.json is normally target-project-owned. The gates.steps graph generated from task_plan.json is plan-owned when gates.allow_agent_updates is enabled; route missing generated verification or artifact publication metadata to plan. If config.json must change, list it in required_mutations and set config_scope to generated_verification or operator.",
+                "Never use an operator-scoped required_mutation as a substitute for required_inputs. If an operator must supply or approve anything, required_inputs must describe it even when provider-research mutations are also needed.",
                 "Always list required_mutations as objects with exact project-relative path and reason. Provider references under .auto-agents are read-only implementation inputs owned by provider_research.",
                 "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
                 "For every required mutation, set owner to implementation, plan, provider_research, or target_project. Credentials, authorized fixtures, pinned operator artifacts, and network policy are target_project-owned and must never be reported READY while absent.",

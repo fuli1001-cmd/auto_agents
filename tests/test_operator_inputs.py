@@ -301,6 +301,118 @@ class OperatorInputStoreTests(unittest.TestCase):
             self.assertEqual(task.status, "waiting_user")
             self.assertEqual(len(state.pending_input_requests), 1)
 
+    def test_preflight_retries_operator_mutation_and_queues_input(self):
+        source_request = _request(
+            key="youtube.source_url",
+            kind="url",
+            question="请输入获得授权的公开视频 URL",
+            purpose="为真实 YouTube 导入测试提供授权视频。",
+            why_required="真实系统边界测试需要操作者选择视频。",
+            how_to_obtain=["提供项目拥有或已明确获授权的视频 URL。"],
+            recommended_answer="使用专门用于自动化测试的视频。",
+            default="",
+            sensitivity="private",
+            validation={"https_only": True},
+            bindings=[
+                {
+                    "env": "SDGLOBAL_TEST_YOUTUBE_PUBLIC_VIDEO_URL",
+                    "projection": "value",
+                }
+            ],
+            subject_fingerprint="",
+        )
+
+        class Adapter:
+            def __init__(self):
+                self.prompts = []
+
+            def run(self, request):
+                self.prompts.append(request.prompt)
+                if len(self.prompts) == 1:
+                    payload = {
+                        "decision": "ROUTE",
+                        "target_stage": "provider_research",
+                        "reason": (
+                            "authorized fixture and pinned tool bindings are absent"
+                        ),
+                        "checklist": ["collect prerequisites"],
+                        "required_inputs": [],
+                        "required_mutations": [
+                            {
+                                "path": (
+                                    ".auto-agents/docs/provider_references/yt-dlp.md"
+                                ),
+                                "reason": "resolve audited tool pins",
+                                "owner": "provider_research",
+                                "config_scope": "operator",
+                            },
+                            {
+                                "path": ".auto-agents/config.json",
+                                "reason": "bind the authorized fixture and runtime",
+                                "owner": "target_project",
+                                "config_scope": "operator",
+                            },
+                        ],
+                    }
+                else:
+                    payload = {
+                        "decision": "ROUTE",
+                        "target_stage": "provider_research",
+                        "reason": "collect operator input before verification",
+                        "checklist": ["collect the authorized source URL"],
+                        "required_inputs": [source_request.to_dict()],
+                        "required_mutations": [
+                            {
+                                "path": (
+                                    ".auto-agents/docs/provider_references/yt-dlp.md"
+                                ),
+                                "reason": "resolve audited tool pins",
+                                "owner": "provider_research",
+                            }
+                        ],
+                    }
+                summary = "EVIDENCE_PREFLIGHT: " + json.dumps(
+                    payload, ensure_ascii=False
+                )
+                write_text(request.output_path, summary)
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=summary,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            adapter = Adapter()
+            orchestrator.adapter = adapter
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need an authorized fixture and pinned tools",
+                acceptance=["Real boundary proof passes"],
+            )
+            state.tasks = [task]
+            with mock.patch.object(
+                orchestrator, "_task_needs_evidence_preflight", return_value=True
+            ):
+                result = orchestrator._ensure_evidence_preflight(state, task)
+
+            self.assertEqual(len(adapter.prompts), 2)
+            self.assertIn(
+                "Operator-owned prerequisites cannot be represented only",
+                adapter.prompts[1],
+            )
+            self.assertEqual(result["decision"], "WAIT_USER")
+            self.assertEqual(task.status, "waiting_user")
+            self.assertEqual(len(state.pending_input_requests), 1)
+            self.assertEqual(
+                state.pending_input_requests[0]["key"], "youtube.source_url"
+            )
+
     def test_pause_mode_persists_waiting_without_blocking(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "demo"
