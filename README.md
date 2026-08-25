@@ -1560,6 +1560,37 @@ python3 -m auto_agents collab --project /tmp/demo --full-verify
 Each verification entry in the saved session log records its `progress` or `final` scope, logical
 command count, physically executed command count, certificate hits, and wall-clock duration.
 
+### Recoverable operator input
+
+The main `run` workflow treats missing user-owned facts, consent, authorized
+fixtures, secrets, and project-local install approval as recoverable input rather
+than a terminal blocker. With the default `--interaction-mode auto`, an attached
+TTY asks one plain-language question at a time. Without a TTY, the run persists
+`waiting_user` and can be resumed with:
+
+```bash
+python3 -m auto_agents answer --project /tmp/demo
+```
+
+The answer command resumes the saved run automatically after the last pending
+input validates; pass `--no-resume` to save only. `inputs list`, `inputs set`, and
+`inputs remove` manage reusable project-scoped answers. Ordinary/private inputs
+are stored in the Git-ignored `.auto-agents/operator/inputs.json`; secrets are
+stored in `.auto-agents/operator/secrets.env`. Both files are mode `0600` on
+POSIX. Secrets are never written to prompts, run state, task plans, or logs.
+
+Secret echo is configurable with `--secret-echo auto|visible|hidden`. `auto`
+hides secret input and shows ordinary input. Passing a secret directly through
+`--value` is rejected to avoid shell history; use interactive input,
+`--from-env`, or `--from-file`.
+
+Missing standalone tools may be installed under the target project's
+`.auto-agents/runtime/` after one y/n approval for the complete pinned manifest.
+Downloads are digest-checked and published atomically. auto_agents never uses
+`sudo`, a system package manager, or a global language-package install for this
+repair path. System drivers, daemons, kernel modules, and certificates remain
+explicit operator actions.
+
 ### Provider research recovery (`provider-resolve`)
 
 Interactive recovery loop for runs blocked in `provider_research` because provider references still

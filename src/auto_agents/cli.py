@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import getpass
 import http.server
 import json
 import os
@@ -35,12 +36,14 @@ from .io_utils import write_json
 from .notifications import (
     notify_run_finished,
     notify_run_started,
+    notify_run_waiting,
     notify_self_repair_finished,
     notify_session_finished,
     notify_session_started,
 )
 from .orchestrator import Orchestrator
 from .models import PersistenceTargetConfig
+from .operator_inputs import OperatorInputStore, UserInputRequest, prompt_for_request
 from .persistence_rebind import rebind_legacy_persistence_decision
 from .persistence_upgrade import parse_decision_policies, upgrade_persistence_contract
 from .prototype_variants import (
@@ -474,6 +477,40 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
         ]
         return "\n".join(lines)
 
+    if status == "waiting_user":
+        pending = state_payload.get("pending_input_requests", [])
+        requests = [item for item in pending if isinstance(item, dict)]
+        active_id = str(state_payload.get("active_input_request_id", ""))
+        active = next(
+            (
+                item
+                for item in requests
+                if str(item.get("request_id", "")) == active_id
+            ),
+            requests[0] if requests else {},
+        )
+        question = str(active.get("question", "Operator input is required."))
+        request_id = str(active.get("request_id", ""))
+        answer_cmd = _format_command(
+            "python3",
+            "-m",
+            "auto_agents",
+            "answer",
+            "--project",
+            str(project_root),
+            *(["--request-id", request_id] if request_id else []),
+        )
+        return "\n".join(
+            [
+                f"Run is waiting for operator input at stage: {current_stage}.",
+                f"Question: {question}",
+                f"Pending inputs: {len(requests)}",
+                "",
+                f"Answer and resume: {answer_cmd}",
+                f"Inspect persisted status: {status_cmd}",
+            ]
+        )
+
     if status == "blocked":
         blocker = (
             dict(state_payload.get("active_blocker", {}))
@@ -611,7 +648,7 @@ def _saved_run_context(project_root: Path) -> dict[str, object]:
         state = load_run_state(project_root)
     except Exception:
         return {}
-    if state.status not in {"blocked", "paused"} and not state.active_execution_incident_id:
+    if state.status not in {"blocked", "paused", "waiting_user"} and not state.active_execution_incident_id:
         return {}
     return dict(state.resume_context)
 
@@ -633,6 +670,12 @@ def _apply_saved_run_context(args, project_root: Path) -> Path:
     args.provider = args.provider or (str(context.get("provider_kind") or "") or None)
     args.doc_language = args.doc_language or (
         str(context.get("doc_language") or "") or None
+    )
+    args.interaction_mode = args.interaction_mode or (
+        str(context.get("interaction_mode") or "") or None
+    )
+    args.secret_echo = args.secret_echo or (
+        str(context.get("secret_echo") or "") or None
     )
     return Path(spec_text) if spec_text else _default_spec_file(project_root)
 
@@ -662,6 +705,91 @@ def _try_load_run_state(project_root: Path):
         return load_run_state(project_root)
     except Exception:
         return None
+
+
+def _active_input_request(
+    project_root: Path, request_id: str = ""
+) -> UserInputRequest:
+    state = load_run_state(project_root)
+    requests = [
+        UserInputRequest.from_dict(item)
+        for item in state.pending_input_requests
+        if isinstance(item, dict)
+    ]
+    request = next(
+        (
+            item
+            for item in requests
+            if not request_id or item.request_id == request_id
+        ),
+        None,
+    )
+    if request is None:
+        raise RuntimeError("no matching pending user input request")
+    return request
+
+
+def _input_value_from_args(
+    args: argparse.Namespace,
+    request: UserInputRequest,
+    orchestrator: Orchestrator,
+) -> object:
+    if bool(getattr(args, "yes", False)):
+        return True
+    if bool(getattr(args, "no", False)):
+        return False
+    from_env = str(getattr(args, "from_env", "") or "").strip()
+    if from_env:
+        if from_env not in os.environ:
+            raise ValueError(f"environment variable is unset: {from_env}")
+        return os.environ[from_env]
+    from_file = str(getattr(args, "from_file", "") or "").strip()
+    if from_file:
+        return Path(from_file).expanduser().read_text(encoding="utf-8")
+    explicit = getattr(args, "value", None)
+    if explicit is not None:
+        if request.kind == "secret" or request.sensitivity == "secret":
+            raise ValueError(
+                "secret values cannot be passed with --value; use interactive input, "
+                "--from-env, or --from-file"
+            )
+        return explicit
+    return prompt_for_request(
+        request,
+        echo_mode=str(getattr(args, "echo", "auto")),
+        input_fn=lambda prompt: orchestrator._prompt_user(prompt, default="n"),
+        secret_input_fn=(
+            (lambda prompt: orchestrator._user_input_fn(prompt))
+            if orchestrator._user_input_fn is not None
+            else getpass.getpass
+        ),
+    )
+
+
+def _resume_run_after_answer(
+    project_root: Path,
+    orchestrator: Orchestrator,
+) -> object:
+    state = load_run_state(project_root)
+    context = dict(state.resume_context)
+    spec_text = str(context.get("spec_file", "")).strip()
+    spec_file = Path(spec_text) if spec_text else _default_spec_file(project_root)
+    return orchestrator.run(
+        spec_file=spec_file,
+        auto_approve=bool(context.get("auto_approve", False)),
+        allow_dirty_tree=bool(context.get("allow_dirty_tree", False)),
+        max_tasks=(
+            int(context["max_tasks"])
+            if isinstance(context.get("max_tasks"), int)
+            else None
+        ),
+        skip_validate=bool(context.get("skip_validate", False)),
+        print_agent_output=bool(context.get("print_agent_output", False)),
+        provider_kind=(str(context.get("provider_kind", "")) or None),
+        doc_language=(str(context.get("doc_language", "")) or None),
+        interaction_mode=(str(context.get("interaction_mode", "")) or None),
+        secret_echo=(str(context.get("secret_echo", "")) or None),
+    )
 
 
 def _session_mode_for_command(command: str) -> str:
@@ -1094,6 +1222,52 @@ def build_parser() -> argparse.ArgumentParser:
             "Fail before starting when automatic self-repair is enabled but the "
             "auto_agents repository is not clean."
         ),
+    )
+    run_parser.add_argument(
+        "--interaction-mode",
+        choices=("auto", "tty", "pause", "fail"),
+        help="How the run handles required operator input.",
+    )
+    run_parser.add_argument(
+        "--secret-echo",
+        choices=("auto", "visible", "hidden"),
+        help="Whether interactive secret input is echoed.",
+    )
+
+    answer_parser = subparsers.add_parser(
+        "answer", help="Answer the active structured operator-input request."
+    )
+    answer_parser.add_argument("--project", required=True)
+    answer_parser.add_argument("--request-id", default="")
+    answer_values = answer_parser.add_mutually_exclusive_group()
+    answer_values.add_argument("--yes", action="store_true")
+    answer_values.add_argument("--no", action="store_true")
+    answer_values.add_argument("--value")
+    answer_values.add_argument("--from-env")
+    answer_values.add_argument("--from-file")
+    answer_parser.add_argument(
+        "--echo", choices=("auto", "visible", "hidden"), default="auto"
+    )
+    answer_parser.add_argument("--no-resume", action="store_true")
+
+    inputs_parser = subparsers.add_parser(
+        "inputs", help="Inspect or manage persisted project operator inputs."
+    )
+    inputs_subparsers = inputs_parser.add_subparsers(
+        dest="inputs_command", required=True
+    )
+    inputs_list = inputs_subparsers.add_parser("list")
+    inputs_list.add_argument("--project", required=True)
+    inputs_remove = inputs_subparsers.add_parser("remove")
+    inputs_remove.add_argument("--project", required=True)
+    inputs_remove.add_argument("--key", required=True)
+    inputs_set = inputs_subparsers.add_parser("set")
+    inputs_set.add_argument("--project", required=True)
+    inputs_set.add_argument("--key", required=True)
+    inputs_set.add_argument("--value")
+    inputs_set.add_argument("--secret", action="store_true")
+    inputs_set.add_argument(
+        "--echo", choices=("auto", "visible", "hidden"), default="auto"
     )
 
     stop_parser = subparsers.add_parser(
@@ -1627,6 +1801,79 @@ def main(argv: list[str] | None = None) -> int:
         print(root)
         return 0
 
+    if args.command == "inputs":
+        project_root = Path(args.project).expanduser().resolve()
+        store = OperatorInputStore(project_root)
+        try:
+            if args.inputs_command == "list":
+                payload = {
+                    "ok": True,
+                    "records": list(store.records().values()),
+                }
+            elif args.inputs_command == "remove":
+                payload = {
+                    "ok": store.remove(str(args.key)),
+                    "key": str(args.key),
+                }
+            else:
+                request = UserInputRequest.from_dict(
+                    {
+                        "key": str(args.key),
+                        "kind": "secret" if args.secret else "text",
+                        "question": f"请输入 {args.key}",
+                        "purpose": "保存目标项目可复用的操作者输入。",
+                        "why_required": "用户明确要求保存此项，避免重复输入。",
+                        "how_to_obtain": ["输入该项目应使用的值。"],
+                        "recommended_answer": "确认值属于当前目标项目后再保存。",
+                        "persistence": "project",
+                        "sensitivity": "secret" if args.secret else "private",
+                        "subject_fingerprint": "manual",
+                    }
+                )
+                if args.secret and args.value is not None:
+                    raise ValueError(
+                        "secret values cannot be passed with --value; omit it for interactive input"
+                    )
+                orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+                value = (
+                    args.value
+                    if args.value is not None
+                    else prompt_for_request(
+                        request,
+                        echo_mode=args.echo,
+                        input_fn=lambda prompt: orchestrator._prompt_user(prompt),
+                        secret_input_fn=getpass.getpass,
+                    )
+                )
+                record = store.save_answer(request, value, source="inputs-set")
+                payload = {"ok": True, "record": record}
+        except (OSError, RuntimeError, ValueError) as error:
+            payload = {"ok": False, "error": str(error)}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if bool(payload.get("ok")) else 1
+
+    if args.command == "answer":
+        project_root = Path(args.project).expanduser().resolve()
+        try:
+            with ProjectRunLock(project_root):
+                orchestrator = Orchestrator(
+                    project_root, agent_output_stream=sys.stderr
+                )
+                request = _active_input_request(project_root, args.request_id)
+                value = _input_value_from_args(args, request, orchestrator)
+                payload = orchestrator.answer_input_request(
+                    request_id=request.request_id,
+                    value=value,
+                    source="answer-cli",
+                )
+                if bool(payload.get("resume")) and not bool(args.no_resume):
+                    resumed = _resume_run_after_answer(project_root, orchestrator)
+                    payload["resumed_run"] = resumed.to_dict()
+        except (OSError, RuntimeError, ValueError, RunAlreadyActiveError) as error:
+            payload = {"ok": False, "error": str(error)}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if bool(payload.get("ok")) else 1
+
     if args.command == "approve":
         orchestrator = Orchestrator(Path(args.project))
         gate = args.gate or load_run_state(Path(args.project)).pending_approval
@@ -1749,9 +1996,15 @@ def main(argv: list[str] | None = None) -> int:
                 provider_kind=args.provider,
                 restart_blocked=bool(getattr(args, "restart_blocked", False)),
                 full_verify=bool(getattr(args, "full_verify", False)),
+                interaction_mode=getattr(args, "interaction_mode", None),
+                secret_echo=getattr(args, "secret_echo", None),
             )
             state_payload = state.to_dict()
             state_status = str(state_payload.get("status", ""))
+            if state_status == "waiting_user":
+                _safe_notify(notify_run_waiting, project_root, state_payload)
+                print(_render_run_summary(project_root, state_payload))
+                return 3
             blocker = (
                 dict(state_payload.get("active_blocker", {}))
                 if isinstance(state_payload.get("active_blocker", {}), dict)

@@ -1,0 +1,477 @@
+from __future__ import annotations
+
+import json
+import io
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from unittest import mock
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from auto_agents.config import load_run_state, save_run_state
+from auto_agents.cli import build_parser, main
+from auto_agents.io_utils import write_text
+from auto_agents.gate_execution import LocalGatePlanExecutor
+from auto_agents.models import AgentResult, GateConfig, TaskSpec
+from auto_agents.operator_inputs import (
+    OperatorInputStore,
+    UserInputRequest,
+    prompt_for_request,
+)
+from auto_agents.orchestrator import Orchestrator
+
+
+def _request(**updates):
+    payload = {
+        "key": "youtube.authorization",
+        "kind": "attestation",
+        "question": (
+            "你是否确认：你或项目团队拥有该视频，或已获得权利人的明确授权，"
+            "可以下载、处理、生成衍生内容，并长期用于自动化测试？"
+        ),
+        "purpose": "证明真实视频测试已获得操作者授权。",
+        "why_required": "真实系统边界不能使用未经确认的第三方素材。",
+        "how_to_obtain": ["只有确实拥有权利或明确许可时选择 y。"],
+        "recommended_answer": "不确定时选择 n。",
+        "default": False,
+        "persistence": "project",
+        "sensitivity": "private",
+        "subject_fingerprint": "video-abc",
+        "question_version": 1,
+        "validation": {
+            "claims": ["download", "processing", "derivative_creation", "automated_testing"],
+            "subject": {"source_url_input_key": "youtube.source_url"},
+            "stable_test_use": True,
+        },
+        "bindings": [
+            {
+                "env": "SDGLOBAL_TEST_YOUTUBE_AUTHORIZATION_EVIDENCE",
+                "projection": "artifact_path",
+            }
+        ],
+    }
+    payload.update(updates)
+    return UserInputRequest.from_dict(payload)
+
+
+class OperatorInputStoreTests(unittest.TestCase):
+    def test_attestation_is_one_safe_default_no_question(self):
+        request = _request()
+        self.assertEqual(request.kind, "attestation")
+        self.assertFalse(request.default)
+        self.assertIn("不确定时选择 n", request.render())
+
+    def test_project_values_and_secrets_are_persisted_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            store = OperatorInputStore(project)
+            url_request = _request(
+                key="youtube.source_url",
+                kind="url",
+                question="请输入公开视频 URL",
+                validation={"https_only": True},
+            )
+            secret_request = _request(
+                key="provider.api_token",
+                kind="secret",
+                question="请输入 Provider token",
+                sensitivity="secret",
+                validation={},
+            )
+
+            store.save_answer(url_request, "https://www.youtube.com/watch?v=abcdefghijk")
+            store.save_answer(secret_request, "top-secret-value")
+
+            inputs_text = store.inputs_path.read_text(encoding="utf-8")
+            secrets_text = store.secrets_path.read_text(encoding="utf-8")
+            self.assertNotIn("top-secret-value", inputs_text)
+            self.assertIn("top-secret-value", secrets_text)
+            self.assertEqual(stat.S_IMODE(store.inputs_path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(store.secrets_path.stat().st_mode), 0o600)
+            environment, missing = store.environment(
+                [
+                    {
+                        "input_key": "provider.api_token",
+                        "env": "PROVIDER_API_TOKEN",
+                        "projection": "value",
+                    }
+                ]
+            )
+            self.assertEqual(missing, [])
+            self.assertEqual(environment["PROVIDER_API_TOKEN"], "top-secret-value")
+
+    def test_attestation_resolves_subject_from_prior_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            store = OperatorInputStore(project)
+            source = _request(
+                key="youtube.source_url",
+                kind="url",
+                question="请输入公开视频 URL",
+                validation={"https_only": True},
+            )
+            url = "https://www.youtube.com/watch?v=abcdefghijk"
+            store.save_answer(source, url)
+            record = store.save_answer(_request(), "y")
+            artifact = json.loads(
+                Path(str(record["artifact_path"])).read_text(encoding="utf-8")
+            )
+            self.assertEqual(artifact["subject"]["source_url"], url)
+            self.assertEqual(artifact["source_url"], url)
+            self.assertEqual(
+                artifact["rights_basis"],
+                "ownership_or_explicit_permission_attested",
+            )
+
+    def test_question_or_subject_change_invalidates_saved_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            store = OperatorInputStore(project)
+            request = _request()
+            store.save_answer(request, True)
+            self.assertTrue(store.is_valid(request)[0])
+            self.assertFalse(store.is_valid(_request(question_version=2))[0])
+            self.assertFalse(
+                store.is_valid(_request(subject_fingerprint="video-other"))[0]
+            )
+
+    def test_operator_answer_invalidates_preflight_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            task = orchestrator._load_tasks_from_plan()[0]
+            task.required_inputs = [_request().to_dict()]
+            before = orchestrator._evidence_preflight_fingerprint(task)
+            orchestrator._operator_inputs.save_answer(_request(), True)
+            after = orchestrator._evidence_preflight_fingerprint(task)
+            self.assertNotEqual(before, after)
+
+    def test_echo_mode_is_selectable(self):
+        request = _request(
+            key="provider.api_token",
+            kind="secret",
+            question="请输入 token",
+            sensitivity="secret",
+            validation={},
+        )
+        calls = []
+        visible = prompt_for_request(
+            request,
+            echo_mode="visible",
+            input_fn=lambda prompt: calls.append("visible") or "a",
+            secret_input_fn=lambda prompt: calls.append("hidden") or "b",
+        )
+        hidden = prompt_for_request(
+            request,
+            echo_mode="hidden",
+            input_fn=lambda prompt: calls.append("visible") or "a",
+            secret_input_fn=lambda prompt: calls.append("hidden") or "b",
+        )
+        self.assertEqual((visible, hidden), ("a", "b"))
+        self.assertEqual(calls, ["visible", "hidden"])
+
+    def test_waiting_request_is_answered_and_task_requeued(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need input",
+                acceptance=["Input exists"],
+                status="pending",
+            )
+            state.tasks = [task]
+            requests = orchestrator._normalize_input_requests(
+                state, task, [_request().to_dict()]
+            )
+            self.assertEqual(task.status, "waiting_user")
+            state.status = "waiting_user"
+            save_run_state(project, state)
+            orchestrator._persist_tasks(state.tasks)
+
+            result = orchestrator.answer_input_request(
+                request_id=requests[0].request_id,
+                value=True,
+            )
+            resumed = load_run_state(project)
+            self.assertTrue(result["resume"])
+            self.assertEqual(resumed.status, "pending")
+            self.assertEqual(resumed.tasks[0].status, "pending")
+            self.assertEqual(resumed.pending_input_requests, [])
+
+    def test_declined_attestation_routes_to_clarify_without_silent_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need authorization",
+                acceptance=["Authorized input exists"],
+            )
+            state.tasks = [task]
+            request = orchestrator._normalize_input_requests(
+                state, task, [_request().to_dict()]
+            )[0]
+            state.status = "waiting_user"
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(project, state)
+            orchestrator.answer_input_request(
+                request_id=request.request_id,
+                value=False,
+            )
+            routed = load_run_state(project)
+            self.assertEqual(routed.rejected_stage, "clarify")
+            self.assertIn("Do not weaken", routed.rejection_reason)
+            self.assertEqual(routed.active_blocker, {})
+
+    def test_preflight_parser_accepts_wait_user(self):
+        payload = {
+            "decision": "WAIT_USER",
+            "target_stage": "",
+            "reason": "authorized fixture required",
+            "checklist": ["collect one answer"],
+            "required_inputs": [_request().to_dict()],
+            "required_mutations": [],
+        }
+        parsed = Orchestrator._parse_evidence_preflight(
+            "EVIDENCE_PREFLIGHT: " + json.dumps(payload, ensure_ascii=False)
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["decision"], "WAIT_USER")
+
+    def test_preflight_snapshot_sees_untracked_candidate_and_queues_input(self):
+        class Adapter:
+            def run(self, request):
+                if not (request.cwd / "candidate-untracked.txt").is_file():
+                    raise AssertionError("candidate snapshot omitted untracked file")
+                payload = {
+                    "decision": "WAIT_USER",
+                    "target_stage": "",
+                    "reason": "authorization is required",
+                    "checklist": ["collect authorization"],
+                    "required_inputs": [_request().to_dict()],
+                    "required_mutations": [],
+                }
+                summary = "EVIDENCE_PREFLIGHT: " + json.dumps(
+                    payload, ensure_ascii=False
+                )
+                write_text(request.output_path, summary)
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=summary,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            (project / "candidate-untracked.txt").write_text(
+                "candidate\n", encoding="utf-8"
+            )
+            orchestrator = Orchestrator(project)
+            orchestrator.adapter = Adapter()
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need input",
+                acceptance=["Input exists"],
+            )
+            state.tasks = [task]
+            with mock.patch.object(
+                orchestrator, "_task_needs_evidence_preflight", return_value=True
+            ):
+                result = orchestrator._ensure_evidence_preflight(state, task)
+            self.assertEqual(result["decision"], "WAIT_USER")
+            self.assertEqual(task.status, "waiting_user")
+            self.assertEqual(len(state.pending_input_requests), 1)
+
+    def test_pause_mode_persists_waiting_without_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            orchestrator._interaction_mode = "pause"
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need input",
+                acceptance=["Input exists"],
+            )
+            state.tasks = [task]
+            orchestrator._normalize_input_requests(
+                state, task, [_request().to_dict()]
+            )
+            self.assertFalse(orchestrator._process_pending_user_input(state, [task]))
+            persisted = load_run_state(project)
+            self.assertEqual(persisted.status, "waiting_user")
+            self.assertEqual(persisted.active_blocker, {})
+
+    def test_cli_parser_exposes_interaction_and_answer_commands(self):
+        parser = build_parser()
+        run = parser.parse_args(
+            [
+                "run",
+                "--project",
+                "/tmp/demo",
+                "--interaction-mode",
+                "pause",
+                "--secret-echo",
+                "visible",
+            ]
+        )
+        answer = parser.parse_args(
+            ["answer", "--project", "/tmp/demo", "--yes"]
+        )
+        self.assertEqual(run.interaction_mode, "pause")
+        self.assertEqual(run.secret_echo, "visible")
+        self.assertTrue(answer.yes)
+
+    def test_answer_cli_saves_without_resume_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need input",
+                acceptance=["Input exists"],
+            )
+            state.tasks = [task]
+            orchestrator._normalize_input_requests(
+                state, task, [_request().to_dict()]
+            )
+            state.status = "waiting_user"
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(project, state)
+            output = io.StringIO()
+            with mock.patch("sys.stdout", output):
+                exit_code = main(
+                    [
+                        "answer",
+                        "--project",
+                        str(project),
+                        "--yes",
+                        "--no-resume",
+                    ]
+                )
+            self.assertEqual(exit_code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertEqual(load_run_state(project).status, "pending")
+
+    def test_sequential_scheduler_finishes_independent_task_before_waiting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            orchestrator._interaction_mode = "pause"
+            state = load_run_state(project)
+            waiting = TaskSpec(
+                task_id="task-waiting",
+                title="Waiting",
+                description="Need input",
+                acceptance=["Input exists"],
+            )
+            independent = TaskSpec(
+                task_id="task-independent",
+                title="Independent",
+                description="Can finish",
+                acceptance=["Done"],
+            )
+            tasks = [waiting, independent]
+            state.tasks = tasks
+            orchestrator._normalize_input_requests(
+                state, waiting, [_request(task_id=waiting.task_id).to_dict()]
+            )
+
+            def execute(_state, _tasks, task):
+                task.status = "done"
+                return None
+
+            with mock.patch.object(
+                orchestrator,
+                "_execute_task_in_main_worktree",
+                side_effect=execute,
+            ):
+                result = orchestrator._run_sequential_implementation_loop(
+                    state, tasks, None
+                )
+            self.assertEqual(independent.status, "done")
+            self.assertEqual(waiting.status, "waiting_user")
+            self.assertEqual(result.status, "waiting_user")
+
+    def test_declared_binding_is_injected_without_storing_value_in_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            store = OperatorInputStore(project)
+            request = _request(
+                key="provider.api_token",
+                kind="secret",
+                question="请输入 token",
+                sensitivity="secret",
+                validation={},
+            )
+            store.save_answer(request, "secret-for-gate")
+            orchestrator = Orchestrator(project)
+            task = orchestrator._load_tasks_from_plan()[0]
+            task.operator_input_bindings = [
+                {
+                    "input_key": "provider.api_token",
+                    "env": "PROVIDER_API_TOKEN",
+                    "projection": "value",
+                }
+            ]
+            orchestrator._persist_tasks([task])
+            environment = orchestrator._operator_gate_environment()
+            self.assertEqual(environment["PROVIDER_API_TOKEN"], "secret-for-gate")
+            self.assertNotIn(
+                "secret-for-gate",
+                (project / ".auto-agents" / "state" / "task_plan.json").read_text(
+                    encoding="utf-8"
+                ),
+            )
+
+    def test_gate_output_redacts_operator_bound_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            command = "printf '%s' \"$PROVIDER_API_TOKEN\""
+            with LocalGatePlanExecutor(
+                project,
+                GateConfig(),
+                {command: {}},
+                environment_overrides={"PROVIDER_API_TOKEN": "secret-for-gate"},
+            ) as executor:
+                result = executor.run(
+                    command,
+                    timeout_seconds=30,
+                    adaptive_timeout_enabled=False,
+                    idle_timeout_seconds=30,
+                )
+            self.assertTrue(result.ok)
+            self.assertEqual(result.stdout, "[REDACTED]")
+            self.assertNotIn("secret-for-gate", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -4,6 +4,7 @@ import ast
 import copy
 import contextlib
 import fnmatch
+import getpass
 import json
 import hashlib
 import os
@@ -98,6 +99,7 @@ from .gates import (
 from .gate_baseline_cache import GateBaselineCache
 from .gate_timing import GateTimingStore
 from .gate_execution import (
+    GateSnapshotManager,
     LocalGatePlanExecutor,
     dependency_link_paths,
     discover_dependency_links,
@@ -177,6 +179,12 @@ from .models import (
     TaskSpec,
     VerificationStep,
 )
+from .operator_inputs import (
+    OperatorInputStore,
+    UserInputRequest,
+    prompt_for_request,
+)
+from .project_runtime import ProjectRuntimeManager
 from .provider_limits import ParallelTuningStore, provider_limit
 from .provider_contract import (
     format_provider_reference_v2_errors,
@@ -433,6 +441,10 @@ class Orchestrator:
         self._performance_commands: Dict[str, Dict[str, object]] = {}
         self._shared_gate_cache_path = gate_cache_path
         self._gate_preempt_requested = gate_preempt_requested
+        self._operator_inputs = OperatorInputStore(self.project_root)
+        self._project_runtime = ProjectRuntimeManager(self.project_root)
+        self._interaction_mode = self.config.execution.user_input.mode
+        self._secret_echo = self.config.execution.user_input.secret_echo
         gate_environment = gate_environment_fingerprint(
             isolation_mode=(
                 self.config.gates.isolation.mode
@@ -493,7 +505,16 @@ class Orchestrator:
         return self.project_root / ".auto-agents" / "failed-verification-logs"
 
     def _cleanup_failed_verification_logs(self) -> None:
-        shutil.rmtree(self._failed_verification_log_dir(), ignore_errors=True)
+        log_dir = self._failed_verification_log_dir()
+        if not log_dir.is_dir():
+            return
+        cutoff = time.time() - 7 * 24 * 60 * 60
+        for path in log_dir.glob("*.log"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
 
     def _persist_failed_verification_log(self, raw_output: str, *, label: str) -> str:
         if not raw_output.strip():
@@ -2302,12 +2323,20 @@ class Orchestrator:
         provider_kind: Optional[str] = None,
         restart_blocked: bool = False,
         full_verify: bool = False,
+        interaction_mode: Optional[str] = None,
+        secret_echo: Optional[str] = None,
     ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
         self._ensure_agent_instructions_synced()
         self._print_agent_output = print_agent_output
         self._allow_dirty_tree = allow_dirty_tree
         self._force_full_verify = bool(full_verify)
+        self._interaction_mode = str(
+            interaction_mode or self.config.execution.user_input.mode
+        )
+        self._secret_echo = str(
+            secret_echo or self.config.execution.user_input.secret_echo
+        )
         try:
             self._cleanup_failed_verification_logs()
             if provider_kind is not None:
@@ -2369,6 +2398,8 @@ class Orchestrator:
                 print_agent_output=print_agent_output,
                 provider_kind=provider_kind,
                 doc_language=doc_language,
+                interaction_mode=self._interaction_mode,
+                secret_echo=self._secret_echo,
             )
             if self._normalize_misrouted_provider_research_resume(state):
                 save_run_state(self.project_root, state)
@@ -2497,6 +2528,8 @@ class Orchestrator:
                         reason=f"stage {stage} completed",
                     )
                 save_run_state(self.project_root, state)
+                if state.status == "waiting_user":
+                    return state
                 if state.status == "blocked" or (
                     state.status == "paused" and stage not in state.stage_summaries
                 ):
@@ -3929,6 +3962,291 @@ class Orchestrator:
         if spec_kind == "design":
             return "balanced"
         return "deep"
+
+    def _normalize_input_requests(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        payloads: Iterable[object],
+    ) -> List[UserInputRequest]:
+        requests: List[UserInputRequest] = []
+        existing_ids = {
+            str(item.get("request_id", ""))
+            for item in state.pending_input_requests
+            if isinstance(item, dict)
+        }
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            enriched = {
+                **payload,
+                "task_id": str(payload.get("task_id", task.task_id)),
+                "stage": str(payload.get("stage", "implement")),
+                "requirement_ids": list(
+                    payload.get("requirement_ids", task.requirement_ids) or []
+                ),
+            }
+            request = UserInputRequest.from_dict(enriched)
+            if request.kind == "install_approval":
+                raw_manifest = request.validation.get("runtime_manifest", [])
+                plan = self._project_runtime.plan(
+                    raw_manifest if isinstance(raw_manifest, list) else []
+                )
+                missing_plan = self._project_runtime.missing(plan)
+                if not missing_plan.requirements:
+                    continue
+                canonical = missing_plan.approval_request()
+                canonical.task_id = request.task_id
+                canonical.stage = request.stage
+                canonical.requirement_ids = list(request.requirement_ids)
+                canonical.bindings = [dict(item) for item in request.bindings]
+                request = canonical
+            for binding in request.bindings:
+                binding.setdefault("input_key", request.key)
+                if binding not in task.operator_input_bindings:
+                    task.operator_input_bindings.append(dict(binding))
+            valid, _reason = self._operator_inputs.is_valid(request)
+            if valid:
+                continue
+            requests.append(request)
+            if request.request_id not in existing_ids:
+                stale_ids = {
+                    str(item.get("request_id", ""))
+                    for item in state.pending_input_requests
+                    if isinstance(item, dict)
+                    and str(item.get("key", "")) == request.key
+                }
+                if stale_ids:
+                    state.pending_input_requests = [
+                        item
+                        for item in state.pending_input_requests
+                        if str(item.get("request_id", "")) not in stale_ids
+                    ]
+                    existing_ids.difference_update(stale_ids)
+                state.pending_input_requests = [
+                    item
+                    for item in state.pending_input_requests
+                    if str(item.get("key", "")) != request.key
+                ]
+                state.pending_input_requests.append(request.to_dict())
+                existing_ids.add(request.request_id)
+        if requests:
+            task.status = "waiting_user"
+            task.required_inputs = [request.to_dict() for request in requests]
+            if not state.active_input_request_id:
+                state.active_input_request_id = requests[0].request_id
+        return requests
+
+    def _pending_input_requests(self, state: RunState) -> List[UserInputRequest]:
+        requests: List[UserInputRequest] = []
+        retained: List[Dict[str, object]] = []
+        for payload in state.pending_input_requests:
+            try:
+                request = UserInputRequest.from_dict(payload)
+            except (TypeError, ValueError):
+                continue
+            valid, _reason = self._operator_inputs.is_valid(request)
+            if valid:
+                continue
+            retained.append(request.to_dict())
+            requests.append(request)
+        if retained != state.pending_input_requests:
+            state.pending_input_requests = retained
+        if requests:
+            ids = {request.request_id for request in requests}
+            if state.active_input_request_id not in ids:
+                state.active_input_request_id = requests[0].request_id
+        else:
+            state.active_input_request_id = ""
+        return requests
+
+    def _refresh_tasks_after_inputs(
+        self, state: RunState, tasks: Optional[List[TaskSpec]] = None
+    ) -> bool:
+        changed = False
+        task_list = tasks if tasks is not None else state.tasks
+        pending_by_task = {
+            request.task_id
+            for request in self._pending_input_requests(state)
+            if request.task_id
+        }
+        for task in task_list:
+            if task.status != "waiting_user" or task.task_id in pending_by_task:
+                continue
+            task.status = "pending"
+            task.required_inputs = []
+            task.evidence_preflight = {}
+            changed = True
+        if not state.pending_input_requests and state.status == "waiting_user":
+            state.status = "pending"
+            state.last_error = ""
+            changed = True
+        return changed
+
+    def _interactive_input_available(self) -> bool:
+        if self._user_input_fn is not None:
+            return True
+        if self._interaction_mode == "pause":
+            return False
+        if sys.stdin.isatty():
+            return True
+        return self._interaction_mode in {"auto", "tty"} and self._reopen_stdin_from_tty()
+
+    def _route_declined_input_to_clarify(
+        self, state: RunState, request: UserInputRequest
+    ) -> None:
+        self._rewind_state_from_stage(state, "clarify")
+        state.rejected_stage = "clarify"
+        state.rejection_reason = (
+            f"The operator answered no to required input {request.key}. "
+            "Do not weaken the active requirement silently. Ask whether to provide "
+            "an alternative authorized input or explicitly revise/supersede the requirement.\n\n"
+            f"Question: {request.question}"
+        )
+        state.status = "pending"
+        state.last_error = ""
+        state.pending_input_requests = [
+            item
+            for item in state.pending_input_requests
+            if str(item.get("request_id", "")) != request.request_id
+        ]
+        state.active_input_request_id = ""
+
+    def answer_input_request(
+        self,
+        *,
+        request_id: str = "",
+        value: object,
+        source: str = "cli",
+    ) -> Dict[str, object]:
+        state = load_run_state(self.project_root)
+        pending = self._pending_input_requests(state)
+        request = next(
+            (
+                item
+                for item in pending
+                if not request_id or item.request_id == request_id
+            ),
+            None,
+        )
+        if request is None:
+            raise RuntimeError("no matching pending user input request")
+        record = self._operator_inputs.save_answer(request, value, source=source)
+        if request.kind == "install_approval" and record.get("value") is True:
+            if (
+                not self.config.execution.project_runtime.enabled
+                or not self.config.execution.project_runtime.allow_downloads
+            ):
+                self._operator_inputs.remove(request.key)
+                raise RuntimeError(
+                    "project-local runtime installation is disabled by configuration"
+                )
+            raw_manifest = request.validation.get("runtime_manifest", [])
+            try:
+                plan = self._project_runtime.plan(
+                    raw_manifest if isinstance(raw_manifest, list) else []
+                )
+                if not plan.requirements:
+                    raise ValueError("runtime install approval has an empty manifest")
+                installed = self._project_runtime.install(plan)
+                self._operator_inputs.save_runtime_records(
+                    installed,
+                    manifest_fingerprint=plan.fingerprint,
+                )
+            except Exception:
+                self._operator_inputs.remove(request.key)
+                raise
+        if request.kind in {"attestation", "install_approval"} and record.get("value") is False:
+            self._route_declined_input_to_clarify(state, request)
+        else:
+            state.pending_input_requests = [
+                item
+                for item in state.pending_input_requests
+                if str(item.get("request_id", "")) != request.request_id
+            ]
+            self._refresh_tasks_after_inputs(state)
+            incident_id = str(request.validation.get("incident_id", "")).strip()
+            if incident_id:
+                incident = self._incident_store(state).active(state)
+                if incident is not None and incident.incident_id == incident_id:
+                    incident.status = "recovering"
+                    incident.history.append(
+                        {
+                            "event": "operator_input_answered",
+                            "request_id": request.request_id,
+                            "input_key": request.key,
+                            "answer_revision": int(record.get("revision", 0) or 0),
+                        }
+                    )
+                    self._incident_store(state).save(incident, state)
+                    state.active_blocker = {}
+                    state.status = "pending"
+                    state.last_error = ""
+        self._persist_tasks(state.tasks)
+        save_run_state(self.project_root, state)
+        return {
+            "ok": True,
+            "request_id": request.request_id,
+            "key": request.key,
+            "remaining": len(state.pending_input_requests),
+            "run_status": state.status,
+            "resume": not state.pending_input_requests,
+        }
+
+    def _process_pending_user_input(
+        self, state: RunState, tasks: Optional[List[TaskSpec]] = None
+    ) -> bool:
+        pending = self._pending_input_requests(state)
+        if not pending:
+            return False
+        request = pending[0]
+        state.active_input_request_id = request.request_id
+        if not self.config.execution.user_input.enabled or self._interaction_mode == "fail":
+            self._block_run(
+                state,
+                owner="user_input",
+                category="user_input_required",
+                reason=request.render(),
+                fingerprint=request.request_id,
+            )
+            save_run_state(self.project_root, state)
+            return False
+        if not self._interactive_input_available():
+            state.status = "waiting_user"
+            state.last_error = ""
+            save_run_state(self.project_root, state)
+            self.logger.warning(
+                "[user-input] waiting request_id=%s key=%s\n%s",
+                request.request_id,
+                request.key,
+                request.render(),
+            )
+            return False
+        while True:
+            answer = prompt_for_request(
+                request,
+                echo_mode=self._secret_echo,
+                input_fn=lambda prompt: self._prompt_user(prompt, default="n"),
+                secret_input_fn=(
+                    (lambda prompt: self._user_input_fn(prompt))
+                    if self._user_input_fn is not None
+                    else getpass.getpass
+                ),
+            )
+            try:
+                result = self.answer_input_request(
+                    request_id=request.request_id,
+                    value=answer,
+                    source="interactive",
+                )
+            except ValueError as error:
+                self.logger.warning("Invalid answer: %s", error)
+                continue
+            refreshed = load_run_state(self.project_root)
+            state.__dict__.update(refreshed.__dict__)
+            if tasks is not None:
+                tasks[:] = state.tasks
+            return bool(result.get("resume"))
 
     def _prompt_user(self, prompt: str, default: str = "", multiline: bool = False) -> str:
         if self._user_input_fn:
@@ -7045,7 +7363,15 @@ class Orchestrator:
         incident = self._merge_or_save_execution_incident(state, incident)
         diagnosis = deterministic_diagnosis(incident)
         if diagnosis is None:
-            diagnosis = self._agent_diagnose_execution_incident(incident)
+            diagnosis = self._agent_diagnose_execution_incident(
+                incident,
+                user_context=(
+                    self._operator_inputs.value_for(
+                        f"incident.{incident.incident_id}.operator_response"
+                    )
+                    or ""
+                ),
+            )
         if diagnosis is None:
             return self._block_for_execution_incident(state, incident, "automatic diagnosis was inconclusive")
         return self._apply_execution_incident_diagnosis(state, incident, diagnosis)
@@ -7267,6 +7593,51 @@ class Orchestrator:
                 "the previous recovery route produced no new execution evidence",
             )
         if diagnosis.confidence < 0.8 or diagnosis.action in {"ASK_USER", "STOP"}:
+            if (
+                diagnosis.action == "ASK_USER"
+                and self.config.execution.user_input.enabled
+            ):
+                request = UserInputRequest.from_dict(
+                    {
+                        "key": f"incident.{incident.incident_id}.operator_response",
+                        "kind": "text",
+                        "question": diagnosis.reason,
+                        "purpose": "提供自动诊断无法从仓库或运行证据中确定的操作者信息。",
+                        "why_required": "没有这项信息就无法安全选择恢复动作。",
+                        "how_to_obtain": [
+                            "按问题描述执行只读检查或提供已知事实。",
+                            "不要粘贴密码、Token 或其他秘密；秘密应使用单独的 secret 输入。",
+                        ],
+                        "recommended_answer": "只提供观察到的事实；不确定时明确回答不确定。",
+                        "persistence": "run",
+                        "sensitivity": "private",
+                        "task_id": incident.task_id,
+                        "stage": incident.stage,
+                        "subject_fingerprint": incident.evidence_fingerprint,
+                        "question_version": 1,
+                        "validation": {"incident_id": incident.incident_id},
+                    }
+                )
+                state.pending_input_requests = [
+                    item
+                    for item in state.pending_input_requests
+                    if str(item.get("key", "")) != request.key
+                ]
+                state.pending_input_requests.append(request.to_dict())
+                state.active_input_request_id = request.request_id
+                state.status = "waiting_user"
+                state.last_error = ""
+                incident.status = "needs_human"
+                incident.history.append(
+                    {
+                        "event": "waiting_user",
+                        "request_id": request.request_id,
+                        "input_key": request.key,
+                    }
+                )
+                self._incident_store(state).save(incident, state)
+                save_run_state(self.project_root, state)
+                return False
             return self._block_for_execution_incident(state, incident, diagnosis.reason)
         if diagnosis.action == "SELF_REPAIR":
             incident.status = "self_repair"
@@ -7461,7 +7832,15 @@ class Orchestrator:
                 evidence_fingerprint=fingerprint,
                 occurrence_count=occurrence,
             )
-            diagnosis = self._agent_diagnose_execution_incident(incident)
+            diagnosis = self._agent_diagnose_execution_incident(
+                incident,
+                user_context=(
+                    self._operator_inputs.value_for(
+                        f"incident.{incident.incident_id}.operator_response"
+                    )
+                    or ""
+                ),
+            )
             event["diagnosis"] = diagnosis.to_dict() if diagnosis is not None else {}
             if diagnosis is None or diagnosis.confidence < 0.8 or diagnosis.action in {"ASK_USER", "STOP"}:
                 event["action"] = "block_inconclusive_diagnosis"
@@ -8461,6 +8840,7 @@ class Orchestrator:
     ):
         use_result_cache = bool(use_result_cache and not self._force_full_verify)
         result_context_fingerprint = self._gate_result_context_fingerprint()
+        operator_environment = self._operator_gate_environment()
         if not self.config.gates.isolation.enabled:
             return contextlib.nullcontext(None)
         if self.config.gates.distributed.enabled and not source_ref:
@@ -8472,6 +8852,7 @@ class Orchestrator:
                     self._gate_baseline_cache.environment_fingerprint
                 ),
                 result_context_fingerprint=result_context_fingerprint,
+                environment_overrides=operator_environment,
             )
         return LocalGatePlanExecutor(
             self.project_root,
@@ -8485,7 +8866,21 @@ class Orchestrator:
             use_result_cache=use_result_cache,
             cache_path=self._shared_gate_cache_path,
             preempt_requested=self._gate_preempt_requested,
+            environment_overrides=operator_environment,
         )
+
+    def _operator_gate_environment(self) -> Dict[str, str]:
+        bindings: List[Mapping[str, object]] = []
+        for step in self.config.gates.steps:
+            bindings.extend(step.operator_input_bindings)
+        try:
+            tasks = self._load_tasks_from_plan()
+        except (OSError, TypeError, ValueError):
+            tasks = []
+        for task in tasks:
+            bindings.extend(task.operator_input_bindings)
+        environment, _missing = self._operator_inputs.environment(bindings)
+        return environment
 
     def _gate_result_context_fingerprint(self) -> str:
         run_payload = read_json(run_state_path(self.project_root), default={})
@@ -8504,6 +8899,7 @@ class Orchestrator:
             "verification_policy_version": (
                 self.config.gates.verification_policy_version
             ),
+            "operator_inputs": self._operator_inputs.fingerprint(),
         }
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -9004,7 +9400,7 @@ class Orchestrator:
                 (
                     candidate
                     for candidate in ordered_tasks
-                    if candidate.status != "done"
+                    if candidate.status not in {"done", "waiting_user"}
                     and all(
                         dependency in completed
                         for dependency in candidate.depends_on
@@ -9013,6 +9409,33 @@ class Orchestrator:
                 None,
             )
             if task is None:
+                if any(
+                    candidate.status == "waiting_user"
+                    for candidate in ordered_tasks
+                ):
+                    resumed = self._process_pending_user_input(state, tasks)
+                    if not resumed:
+                        state.tasks = tasks
+                        return state
+                    refreshed_tasks = self._load_implementation_tasks(state)
+                    tasks[:] = refreshed_tasks
+                    tasks_by_id = {item.task_id: item for item in tasks}
+                    retry_tasks = [
+                        tasks_by_id[task_id]
+                        for task_id in retry_ids
+                        if task_id in tasks_by_id
+                        and tasks_by_id[task_id].status != "done"
+                    ]
+                    retry_task_ids = {item.task_id for item in retry_tasks}
+                    ordered_tasks = [
+                        *retry_tasks,
+                        *(
+                            item
+                            for item in tasks
+                            if item.task_id not in retry_task_ids
+                        ),
+                    ]
+                    continue
                 unfinished = [
                     candidate
                     for candidate in ordered_tasks
@@ -9027,7 +9450,11 @@ class Orchestrator:
                 break
             rewind_state = self._execute_task_in_main_worktree(state, tasks, task)
             if rewind_state is not None:
+                if task.status == "waiting_user":
+                    continue
                 return rewind_state
+            if task.status == "waiting_user":
+                continue
             if task.status != "done":
                 raise RuntimeError(
                     "sequential task execution returned without completing or "
@@ -9162,7 +9589,9 @@ class Orchestrator:
                 raise RuntimeError(fallback_reason)
 
             recovery_tasks = [
-                task for task in tasks if task.status not in {"pending", "done"}
+                task
+                for task in tasks
+                if task.status not in {"pending", "waiting_user", "done"}
             ]
             if (
                 recovery_tasks
@@ -9256,6 +9685,12 @@ class Orchestrator:
                 if task.task_id not in excluded_ids
             ]
             if not ready:
+                if any(task.status == "waiting_user" for task in tasks):
+                    resumed = self._process_pending_user_input(state, tasks)
+                    if resumed:
+                        tasks[:] = self._load_implementation_tasks(state)
+                        continue
+                    return state
                 break
             remaining = self._remaining_task_budget(max_tasks, processed, len(ready))
             if remaining <= 0:
@@ -9263,6 +9698,7 @@ class Orchestrator:
                 break
             batch_size = min(current_workers, remaining)
             batch = self._select_parallel_batch(state, ready, batch_size)
+            runnable_batch: List[TaskSpec] = []
             for candidate in batch:
                 route = self._route_frontend_design_contract_prerequisite(
                     state, tasks, candidate
@@ -9271,7 +9707,16 @@ class Orchestrator:
                     return route
                 route = self._ensure_evidence_preflight(state, candidate)
                 if route:
-                    return self._route_evidence_preflight(state, tasks, candidate, route)
+                    routed = self._route_evidence_preflight(
+                        state, tasks, candidate, route
+                    )
+                    if candidate.status == "waiting_user":
+                        continue
+                    return routed
+                runnable_batch.append(candidate)
+            batch = runnable_batch
+            if not batch:
+                continue
             if len(batch) < 2:
                 self.logger.info(
                     "[parallel-tasks] ready=%s batch=%s; executing sequentially task=%s",
@@ -11889,6 +12334,10 @@ class Orchestrator:
                     recovery_round=round_number,
                     verification_refs=list(group),
                     mutable_artifacts=self._effective_task_mutable_artifacts(task),
+                    required_inputs=[dict(item) for item in task.required_inputs],
+                    operator_input_bindings=[
+                        dict(item) for item in task.operator_input_bindings
+                    ],
                 )
             )
 
@@ -15311,6 +15760,8 @@ class Orchestrator:
         print_agent_output: bool,
         provider_kind: Optional[str],
         doc_language: Optional[str],
+        interaction_mode: str = "auto",
+        secret_echo: str = "auto",
     ) -> None:
         previous_run_id = str(state.resume_context.get("previous_run_id", "")).strip()
         previous_task_plan_archive = str(
@@ -15338,6 +15789,8 @@ class Orchestrator:
             "print_agent_output": bool(print_agent_output),
             "provider_kind": str(provider_kind).strip() if provider_kind else "",
             "doc_language": str(doc_language).strip() if doc_language else "",
+            "interaction_mode": str(interaction_mode),
+            "secret_echo": str(secret_echo),
         }
         if previous_run_id:
             state.resume_context["previous_run_id"] = previous_run_id
@@ -15362,6 +15815,8 @@ class Orchestrator:
             print_agent_output=bool(context.get("print_agent_output", False)),
             provider_kind=provider_kind,
             doc_language=doc_language,
+            interaction_mode=(str(context.get("interaction_mode", "")) or None),
+            secret_echo=(str(context.get("secret_echo", "")) or None),
         )
 
     def _run_task_review(
@@ -15437,10 +15892,18 @@ class Orchestrator:
         ]
         effort = self.config.efforts.get("evidence_preflight", "balanced")
         payload = {
-            "version": 4,
+            "version": 5,
             "task": task_payload,
             "requirements": requirements,
             "head": head_ref(self.project_root),
+            "candidate_worktree": worktree_fingerprint(self.project_root),
+            "operator_inputs": self._operator_inputs.fingerprint(
+                [
+                    str(item.get("key", ""))
+                    for item in task.required_inputs
+                    if isinstance(item, dict)
+                ]
+            ),
             # Evidence feasibility may depend on human-owned target registration
             # and command bindings. Include project configuration so an operator
             # update invalidates a cached READY/BLOCK result without requiring a
@@ -15475,9 +15938,15 @@ class Orchestrator:
         write_run_prompt(self.project_root, state.run_id, stage_key, prompt)
         worktree_path = self._parallel_worktree_root() / state.run_id / f"preflight-{task.task_id}"
         created = False
+        snapshot_manager: Optional[GateSnapshotManager] = None
         result: Optional[AgentResult] = None
         try:
-            add_worktree(self.project_root, worktree_path, ref=head_ref(self.project_root) or "HEAD")
+            snapshot_manager = GateSnapshotManager(
+                self.project_root,
+                f"preflight-{state.run_id}-{task.task_id}-{uuid.uuid4().hex[:8]}",
+            )
+            snapshot = snapshot_manager.create()
+            add_worktree(self.project_root, worktree_path, ref=snapshot.ref_name)
             created = True
             request = AgentRequest(
                 stage="evidence_preflight",
@@ -15500,8 +15969,28 @@ class Orchestrator:
             parsed = self._parse_evidence_preflight(result.summary or result.stdout)
             if parsed is None:
                 raise ValueError("invalid EVIDENCE_PREFLIGHT response")
+            raw_inputs = parsed.get("required_inputs", [])
+            if isinstance(raw_inputs, list) and raw_inputs:
+                pending_inputs = self._normalize_input_requests(
+                    state,
+                    task,
+                    raw_inputs,
+                )
+                if pending_inputs:
+                    parsed["decision"] = "WAIT_USER"
+                    parsed["target_stage"] = ""
+                    parsed["required_inputs"] = [
+                        request.to_dict() for request in pending_inputs
+                    ]
+                    parsed["reason"] = (
+                        f"{str(parsed.get('reason', '')).strip()} Required operator "
+                        "input will be collected interactively one item at a time."
+                    ).strip()
             required_mutations = parsed.get("required_mutations", [])
-            if isinstance(required_mutations, list):
+            if (
+                parsed.get("decision") != "WAIT_USER"
+                and isinstance(required_mutations, list)
+            ):
                 owner_stage, mutation_paths = (
                     self._actionable_preflight_upstream_mutations(
                         task,
@@ -15564,6 +16053,8 @@ class Orchestrator:
                         cleanup_error,
                     )
                 shutil.rmtree(worktree_path, ignore_errors=True)
+            if snapshot_manager is not None:
+                snapshot_manager.close()
 
         parsed["fingerprint"] = fingerprint
         task.evidence_preflight = parsed
@@ -15726,6 +16217,41 @@ class Orchestrator:
         requirement_context = format_requirement_context(
             requirements_for_task(self.project_root, task)
         )
+        failure_logs: List[str] = []
+        operator_records = [
+            {
+                "key": key,
+                "kind": str(record.get("kind", "")),
+                "revision": int(record.get("revision", 0) or 0),
+                "subject_fingerprint": str(record.get("subject_fingerprint", "")),
+                "present": bool(
+                    record.get("present", record.get("value") is not None)
+                ),
+                "projections": sorted(
+                    projection
+                    for projection in (
+                        "value",
+                        "artifact_path",
+                        "runtime_path",
+                        "version",
+                        "sha256",
+                    )
+                    if record.get(projection) not in (None, "")
+                    or (projection == "value" and record.get("secret_env"))
+                ),
+            }
+            for key, record in sorted(self._operator_inputs.records().items())
+        ]
+        task_text = json.dumps(task.to_dict(), ensure_ascii=False)
+        for relative in re.findall(
+            r"\.auto-agents/failed-verification-logs/[A-Za-z0-9_.-]+\.log",
+            task_text,
+        ):
+            content = read_text(self.project_root / relative)
+            if content:
+                failure_logs.append(
+                    f"Failure log {relative}:\n{content[-12000:]}"
+                )
         return "\n".join(
             [
                 f"Project root: {self.project_root}",
@@ -15736,12 +16262,22 @@ class Orchestrator:
                 "Choose SPLIT when independently verifiable proof surfaces require separate task slices.",
                 "Choose CLARIFY only when a product decision or external contract is genuinely missing.",
                 "Choose ROUTE when implementation requires changing an artifact owned by an earlier stage; set target_stage to clarify, prototype, design, plan, or provider_research.",
+                "Choose WAIT_USER when progress requires a fact, choice, consent, authorized fixture, secret, or project-local install approval that only the operator can provide.",
+                "For WAIT_USER, return required_inputs. Ask for semantic user-owned facts, never derived paths, versions, or hashes that auto_agents can discover. Each item must contain key, kind, question, purpose, why_required, how_to_obtain, recommended_answer, default, persistence, sensitivity, validation, bindings, subject_fingerprint, and question_version.",
+                "Ask one plain-language question per required_inputs item. Attestation and install approval questions must be y/n with default=false. Never recommend answering yes unless the stated condition is actually true.",
+                "Group all project-local missing software into one install_approval item whose validation.runtime_manifest contains the full pinned tool list. Do not ask the user for executable paths, versions, or hashes that the runtime manager can derive.",
+                "Install bindings must set input_key to runtime.<tool_id> and select runtime_path, version, or sha256. Other bindings may omit input_key to use the request's own key.",
+                "For an authorized video fixture, ask one attestation question only: '你是否确认：你或项目团队拥有该视频，或已获得权利人的明确授权，可以下载、处理、生成衍生内容，并长期用于自动化测试？' Bind it to the source URL input through validation.subject.source_url_input_key; do not separately ask for the authorization basis or evidence file.",
+                "The operator-input summary below is authoritative for presence and validation. Do not ask again for a valid key already listed. A later attestation may bind to an earlier answer with validation.subject fields such as source_url_input_key.",
                 "Project configuration at .auto-agents/config.json is normally target-project-owned. The gates.steps graph generated from task_plan.json is plan-owned when gates.allow_agent_updates is enabled; route missing generated verification or artifact publication metadata to plan. If config.json must change, list it in required_mutations and set config_scope to generated_verification or operator.",
                 "Always list required_mutations as objects with exact project-relative path and reason. Provider references under .auto-agents are read-only implementation inputs owned by provider_research.",
                 "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
                 "For every required mutation, set owner to implementation, plan, provider_research, or target_project. Credentials, authorized fixtures, pinned operator artifacts, and network policy are target_project-owned and must never be reported READY while absent.",
-                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\",\"owner\":\"implementation|plan|provider_research|target_project\",\"config_scope\":\"generated_verification|operator\"}]}",
+                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE|WAIT_USER\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_inputs\":[{\"key\":\"...\",\"kind\":\"boolean|choice|text|url|path|secret|attestation|install_approval\",\"question\":\"...\",\"purpose\":\"...\",\"why_required\":\"...\",\"how_to_obtain\":[\"...\"],\"recommended_answer\":\"...\",\"default\":false,\"persistence\":\"one_time|run|project\",\"sensitivity\":\"public|private|secret\",\"validation\":{},\"bindings\":[{\"input_key\":\"optional or runtime.<tool_id>\",\"env\":\"NAME\",\"projection\":\"value|artifact_path|runtime_path|version|sha256\"}],\"subject_fingerprint\":\"...\",\"question_version\":1}],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\",\"owner\":\"implementation|plan|provider_research|target_project\",\"config_scope\":\"generated_verification|operator\"}]}",
                 f"Task JSON:\n{json.dumps(task.to_dict(), indent=2, ensure_ascii=False)}",
+                "Operator input summary (values redacted):\n"
+                + json.dumps(operator_records, indent=2, ensure_ascii=False),
+                *(failure_logs or ["Failure logs: (none retained)"]),
                 requirement_context,
             ]
         )
@@ -15763,12 +16299,14 @@ class Orchestrator:
             checklist = payload.get("checklist", [])
             target_stage = str(payload.get("target_stage", "")).strip()
             required_mutations = payload.get("required_mutations", [])
+            required_inputs = payload.get("required_inputs", [])
             if (
-                decision not in {"READY", "SPLIT", "CLARIFY", "ROUTE"}
+                decision not in {"READY", "SPLIT", "CLARIFY", "ROUTE", "WAIT_USER"}
                 or not reason
                 or not isinstance(checklist, list)
                 or any(not isinstance(item, str) or not item.strip() for item in checklist)
                 or not isinstance(required_mutations, list)
+                or not isinstance(required_inputs, list)
                 or any(
                     not isinstance(item, dict)
                     or not str(item.get("path", "")).strip()
@@ -15780,6 +16318,7 @@ class Orchestrator:
                     and target_stage
                     not in {"clarify", "prototype", "design", "plan", "provider_research"}
                 )
+                or (decision == "WAIT_USER" and not required_inputs)
             ):
                 return None
             return {
@@ -15788,6 +16327,9 @@ class Orchestrator:
                 "reason": reason,
                 "checklist": [str(item).strip() for item in checklist],
                 "required_mutations": [dict(item) for item in required_mutations],
+                "required_inputs": [
+                    dict(item) for item in required_inputs if isinstance(item, dict)
+                ],
             }
         return None
 
@@ -15799,6 +16341,19 @@ class Orchestrator:
         result: Dict[str, object],
     ) -> RunState:
         decision = str(result.get("decision", "")).strip().upper()
+        if decision == "WAIT_USER":
+            task.status = "waiting_user"
+            state.tasks = tasks
+            state.status = "pending"
+            state.last_error = ""
+            self._persist_tasks(tasks)
+            save_run_state(self.project_root, state)
+            self.logger.warning(
+                "[evidence-preflight] task=%s waiting_user requests=%s",
+                task.task_id,
+                len(result.get("required_inputs", []) or []),
+            )
+            return state
         required_mutations = result.get("required_mutations", []) or []
         route_paths = sorted(
             {

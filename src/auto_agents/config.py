@@ -38,6 +38,8 @@ node_modules/
 .antigravitycli/
 """
 AUTO_GITIGNORE_ENTRIES = (
+    "operator/",
+    "runtime/",
     "failed-verification-logs/",
     "runs/",
     "state/gate_baseline_cache.json",
@@ -298,6 +300,20 @@ DEFAULT_CONFIG = {
         "evidence_preflight": {
             "mode": "high_risk",
         },
+        "user_input": {
+            "enabled": True,
+            "mode": "auto",
+            "secret_echo": "auto",
+            "continue_independent_tasks": True,
+            "auto_resume_on_answer": True,
+            "operator_dir": ".auto-agents/operator",
+        },
+        "project_runtime": {
+            "enabled": True,
+            "root": ".auto-agents/runtime",
+            "require_first_approval": True,
+            "allow_downloads": True,
+        },
         "smart_timeout": {
             "enabled": True,
             "provider_idle_seconds": 1800,
@@ -413,6 +429,26 @@ def state_dir(project_root: Path) -> Path:
 
 def runs_dir(project_root: Path) -> Path:
     return auto_dir(project_root) / "runs"
+
+
+def operator_dir(project_root: Path) -> Path:
+    return auto_dir(project_root) / "operator"
+
+
+def operator_inputs_path(project_root: Path) -> Path:
+    return operator_dir(project_root) / "inputs.json"
+
+
+def operator_secrets_path(project_root: Path) -> Path:
+    return operator_dir(project_root) / "secrets.env"
+
+
+def project_runtime_dir(project_root: Path) -> Path:
+    return auto_dir(project_root) / "runtime"
+
+
+def runtime_requirements_lock_path(project_root: Path) -> Path:
+    return state_dir(project_root) / "runtime_requirements.lock.json"
 
 
 def history_dir(project_root: Path) -> Path:

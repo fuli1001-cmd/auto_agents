@@ -88,6 +88,32 @@ def notify_run_started(project_root: Path) -> bool:
     return notify_flow_started(project_root, workflow="run")
 
 
+def notify_run_waiting(
+    project_root: Path,
+    state_payload: Mapping[str, object],
+) -> bool:
+    requests = [
+        item
+        for item in (state_payload.get("pending_input_requests", []) or [])
+        if isinstance(item, dict)
+    ]
+    active_id = str(state_payload.get("active_input_request_id", ""))
+    active = next(
+        (item for item in requests if str(item.get("request_id", "")) == active_id),
+        requests[0] if requests else {},
+    )
+    question = str(active.get("question", "Operator input is required."))
+    content = _format_flow_message(
+        project_root,
+        workflow="run",
+        status="waiting_user",
+        identifier=str(state_payload.get("run_id", "")),
+        stage=str(state_payload.get("current_stage", "")),
+        detail=question,
+    )
+    return send_wechat_markdown(content)
+
+
 def notify_session_finished(
     project_root: Path,
     state_payload: Mapping[str, object],
@@ -224,8 +250,14 @@ def _format_flow_message(
 ) -> str:
     project_root = project_root.expanduser()
     project_name = _project_name(project_root)
-    color = "warning" if status in {"failed", "blocked"} else "info"
-    time_label = "Started" if status == "started" else "Finished"
+    color = "warning" if status in {"failed", "blocked", "waiting_user"} else "info"
+    time_label = (
+        "Started"
+        if status == "started"
+        else "Waiting since"
+        if status == "waiting_user"
+        else "Finished"
+    )
     lines = [
         f"<font color=\"{color}\">**auto-agents {workflow} {status}**</font>",
         "",

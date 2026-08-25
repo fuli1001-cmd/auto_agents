@@ -47,7 +47,7 @@ from .requirements import (
 
 
 TASK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-ALLOWED_TASK_STATUS = {"pending", "in_progress", "blocked", "done"}
+ALLOWED_TASK_STATUS = {"pending", "in_progress", "waiting_user", "blocked", "done"}
 ALLOWED_EFFORTS = {"balanced", "deep", "max"}
 REQUIRED_EFFORT_STAGES = tuple(DEFAULT_EFFORTS)
 DEFAULTED_EFFORT_STAGES = {
@@ -655,6 +655,26 @@ def validate_verification_steps(
                         )
                     else:
                         artifact_owners[normalized] = prefix
+        input_bindings = raw_step.get("operator_input_bindings", [])
+        if not isinstance(input_bindings, list):
+            errors.append(f"{prefix}.operator_input_bindings must be a list")
+        else:
+            for binding_index, binding in enumerate(input_bindings, start=1):
+                binding_prefix = f"{prefix}.operator_input_bindings[{binding_index}]"
+                if not isinstance(binding, dict):
+                    errors.append(f"{binding_prefix} must be an object")
+                    continue
+                input_key = str(binding.get("input_key", "")).strip()
+                env_name = str(binding.get("env", "")).strip()
+                projection = str(binding.get("projection", "value")).strip()
+                if not re.fullmatch(r"[a-z][a-z0-9_.-]{2,127}", input_key):
+                    errors.append(f"{binding_prefix}.input_key is invalid")
+                if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", env_name):
+                    errors.append(f"{binding_prefix}.env is invalid")
+                if projection not in {
+                    "value", "artifact_path", "runtime_path", "version", "sha256"
+                }:
+                    errors.append(f"{binding_prefix}.projection is invalid")
         if policy_version >= 2:
             targets_list = targets if isinstance(targets, list) else []
             if (
@@ -1078,6 +1098,13 @@ def validate_task_plan_payload(
                     errors.append(
                         f"{prefix} mutable_artifacts entry '{raw_path}' cannot grant access to orchestrator-owned paths"
                     )
+        for field in ("required_inputs", "operator_input_bindings"):
+            value = task.get(field, [])
+            if value is not None and (
+                not isinstance(value, list)
+                or any(not isinstance(item, dict) for item in value)
+            ):
+                errors.append(f"{prefix} {field} must be a list of objects")
         verification_refs = task.get("verification_refs", [])
         if verification_refs is not None and (
             not isinstance(verification_refs, list)
@@ -2209,6 +2236,30 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 errors.append("execution.evidence_preflight must be an object")
             elif evidence_preflight.get("mode", "high_risk") not in {"off", "high_risk", "all"}:
                 errors.append("execution.evidence_preflight.mode must be one of: off, high_risk, all")
+            user_input = execution.get("user_input", {})
+            if not isinstance(user_input, dict):
+                errors.append("execution.user_input must be an object")
+            else:
+                if not isinstance(user_input.get("enabled", True), bool):
+                    errors.append("execution.user_input.enabled must be a boolean")
+                if user_input.get("mode", "auto") not in {"auto", "tty", "pause", "fail"}:
+                    errors.append("execution.user_input.mode must be one of: auto, tty, pause, fail")
+                if user_input.get("secret_echo", "auto") not in {"auto", "visible", "hidden"}:
+                    errors.append("execution.user_input.secret_echo must be one of: auto, visible, hidden")
+                for key in ("continue_independent_tasks", "auto_resume_on_answer"):
+                    if not isinstance(user_input.get(key, True), bool):
+                        errors.append(f"execution.user_input.{key} must be a boolean")
+                if user_input.get("operator_dir", ".auto-agents/operator") != ".auto-agents/operator":
+                    errors.append("execution.user_input.operator_dir must be .auto-agents/operator")
+            project_runtime = execution.get("project_runtime", {})
+            if not isinstance(project_runtime, dict):
+                errors.append("execution.project_runtime must be an object")
+            else:
+                for key in ("enabled", "require_first_approval", "allow_downloads"):
+                    if not isinstance(project_runtime.get(key, True), bool):
+                        errors.append(f"execution.project_runtime.{key} must be a boolean")
+                if project_runtime.get("root", ".auto-agents/runtime") != ".auto-agents/runtime":
+                    errors.append("execution.project_runtime.root must be .auto-agents/runtime")
             diagnosis = execution.get("self_repair_diagnosis", {})
             if not isinstance(diagnosis, dict):
                 errors.append("execution.self_repair_diagnosis must be an object")

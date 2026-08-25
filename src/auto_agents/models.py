@@ -11,6 +11,8 @@ STAGE_ORDER = ["clarify", "prototype", "design", "plan", "provider_research", "i
 APPROVAL_ORDER = ["requirements", "prototype", "architecture", "persistence-reset", "release"]
 SESSION_MODES = ("fix", "collab", "provider_resolve")
 SESSION_STATUSES = ("conversing", "executing", "verifying", "waiting_user", "completed", "failed")
+USER_INPUT_MODES = ("auto", "tty", "pause", "fail")
+SECRET_ECHO_MODES = ("auto", "visible", "hidden")
 DEFAULT_SESSION_MAX_ATTEMPTS = {"fix": 4, "collab": 10, "provider_resolve": 8}
 SESSION_STALL_THRESHOLD = 3
 SESSION_AGENT_ERROR_THRESHOLD = 5
@@ -141,6 +143,8 @@ class TaskSpec:
         }
     )
     persistence_interface: Dict[str, object] = field(default_factory=dict)
+    required_inputs: List[Dict[str, object]] = field(default_factory=list)
+    operator_input_bindings: List[Dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "TaskSpec":
@@ -222,6 +226,16 @@ class TaskSpec:
                 if isinstance(data.get("persistence_interface", {}), dict)
                 else {}
             ),
+            required_inputs=[
+                dict(item)
+                for item in (data.get("required_inputs", []) or [])
+                if isinstance(item, dict)
+            ],
+            operator_input_bindings=[
+                dict(item)
+                for item in (data.get("operator_input_bindings", []) or [])
+                if isinstance(item, dict)
+            ],
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -346,6 +360,7 @@ class VerificationStep:
     exclusive_resources: List[str] = field(default_factory=list)
     dynamic_ports: List[str] = field(default_factory=list)
     artifact_globs: List[str] = field(default_factory=list)
+    operator_input_bindings: List[Dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "VerificationStep":
@@ -382,6 +397,11 @@ class VerificationStep:
                 str(item) for item in data.get("dynamic_ports", [])
             ],
             artifact_globs=[str(item) for item in data.get("artifact_globs", [])],
+            operator_input_bindings=[
+                dict(item)
+                for item in (data.get("operator_input_bindings", []) or [])
+                if isinstance(item, dict)
+            ],
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -411,6 +431,9 @@ class VerificationStep:
             "exclusive_resources": list(self.exclusive_resources),
             "dynamic_ports": list(self.dynamic_ports),
             "artifact_globs": list(self.artifact_globs),
+            "operator_input_bindings": [
+                dict(item) for item in self.operator_input_bindings
+            ],
         }
 
 
@@ -947,6 +970,56 @@ class EvidencePreflightConfig:
 
 
 @dataclass
+class UserInputConfig:
+    enabled: bool = True
+    mode: str = "auto"
+    secret_echo: str = "auto"
+    continue_independent_tasks: bool = True
+    auto_resume_on_answer: bool = True
+    operator_dir: str = ".auto-agents/operator"
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "UserInputConfig":
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            mode=str(data.get("mode", "auto")),
+            secret_echo=str(data.get("secret_echo", "auto")),
+            continue_independent_tasks=bool(
+                data.get("continue_independent_tasks", True)
+            ),
+            auto_resume_on_answer=bool(data.get("auto_resume_on_answer", True)),
+            operator_dir=str(
+                data.get("operator_dir", ".auto-agents/operator")
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class ProjectRuntimeConfig:
+    enabled: bool = True
+    root: str = ".auto-agents/runtime"
+    require_first_approval: bool = True
+    allow_downloads: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "ProjectRuntimeConfig":
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            root=str(data.get("root", ".auto-agents/runtime")),
+            require_first_approval=bool(
+                data.get("require_first_approval", True)
+            ),
+            allow_downloads=bool(data.get("allow_downloads", True)),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class SmartTimeoutConfig:
     enabled: bool = True
     provider_idle_seconds: int = 1800
@@ -1078,6 +1151,8 @@ class ExecutionConfig:
     self_repair_diagnosis: SelfRepairDiagnosisConfig = field(
         default_factory=SelfRepairDiagnosisConfig
     )
+    user_input: UserInputConfig = field(default_factory=UserInputConfig)
+    project_runtime: ProjectRuntimeConfig = field(default_factory=ProjectRuntimeConfig)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ExecutionConfig":
@@ -1099,6 +1174,12 @@ class ExecutionConfig:
             self_repair_diagnosis=SelfRepairDiagnosisConfig.from_dict(
                 dict(data.get("self_repair_diagnosis", {}))
             ),
+            user_input=UserInputConfig.from_dict(
+                dict(data.get("user_input", {}))
+            ),
+            project_runtime=ProjectRuntimeConfig.from_dict(
+                dict(data.get("project_runtime", {}))
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1110,6 +1191,8 @@ class ExecutionConfig:
             "smart_timeout": self.smart_timeout.to_dict(),
             "provider_failover": self.provider_failover.to_dict(),
             "self_repair_diagnosis": self.self_repair_diagnosis.to_dict(),
+            "user_input": self.user_input.to_dict(),
+            "project_runtime": self.project_runtime.to_dict(),
         }
 
 
@@ -1408,6 +1491,8 @@ class RunState:
         default_factory=dict
     )
     persistence_actions: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    pending_input_requests: List[Dict[str, object]] = field(default_factory=list)
+    active_input_request_id: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -1488,6 +1573,14 @@ class RunState:
                 for key, value in dict(data.get("persistence_actions", {})).items()
                 if isinstance(value, dict)
             },
+            pending_input_requests=[
+                dict(item)
+                for item in (data.get("pending_input_requests", []) or [])
+                if isinstance(item, dict)
+            ],
+            active_input_request_id=str(
+                data.get("active_input_request_id", "")
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1531,6 +1624,10 @@ class RunState:
             "persistence_actions": {
                 key: dict(value) for key, value in self.persistence_actions.items()
             },
+            "pending_input_requests": [
+                dict(item) for item in self.pending_input_requests
+            ],
+            "active_input_request_id": self.active_input_request_id,
         }
 
 

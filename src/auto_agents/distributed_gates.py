@@ -59,11 +59,13 @@ class DistributedGatePlanExecutor:
         run_id: str = "",
         environment_fingerprint: str = "",
         result_context_fingerprint: str = "",
+        environment_overrides: Optional[Mapping[str, str]] = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.run_id = str(run_id)
         self.gate_config = gate_config
         self.metadata = dict(metadata)
+        self.environment_overrides = dict(environment_overrides or {})
         self.local = LocalGatePlanExecutor(
             self.project_root,
             gate_config,
@@ -72,6 +74,7 @@ class DistributedGatePlanExecutor:
             worker_id="local",
             environment_fingerprint=environment_fingerprint,
             result_context_fingerprint=result_context_fingerprint,
+            environment_overrides=self.environment_overrides,
         )
         self.key = project_key(self.project_root)
         self.environment_manifest = build_environment_manifest(self.project_root)
@@ -876,6 +879,20 @@ class DistributedGatePlanExecutor:
         cancel_event: Optional[threading.Event] = None,
         progress=None,
     ) -> CommandResult:
+        # Operator-bound inputs and secrets are controller-local by default.
+        # Do not forward them to LAN workers unless a future worker protocol
+        # explicitly advertises matching named bindings and runtime digests.
+        if self.environment_overrides:
+            return self.local.run(
+                command,
+                lane=lane,
+                timeout_seconds=timeout_seconds,
+                adaptive_timeout_enabled=adaptive_timeout_enabled,
+                idle_timeout_seconds=idle_timeout_seconds,
+                cancel_event=cancel_event,
+                progress=progress,
+                environment_overrides=self.environment_overrides,
+            )
         cached = self.local.cached_result(command)
         if cached is not None:
             if progress is not None:

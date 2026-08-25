@@ -584,6 +584,7 @@ def dependency_link_paths(project_root: Path) -> tuple[str, ...]:
         Path(".conda"),
         Path(".venv"),
         Path("node_modules"),
+        Path(".auto-agents/runtime"),
     }
     for lock_name in (
         "package-lock.json",
@@ -670,6 +671,7 @@ class LocalGatePlanExecutor:
         use_result_cache: bool = True,
         cache_path: Optional[Path] = None,
         preempt_requested: Optional[Callable[[], bool]] = None,
+        environment_overrides: Optional[Mapping[str, str]] = None,
     ) -> None:
         self.project_root = project_root.resolve()
         self.gate_config = gate_config
@@ -695,6 +697,7 @@ class LocalGatePlanExecutor:
         self.source_ref = str(source_ref).strip()
         self.use_result_cache = bool(use_result_cache)
         self.preempt_requested = preempt_requested
+        self.environment_overrides = dict(environment_overrides or {})
         self.timing_store = GateTimingStore(
             self.project_root,
             cache_path=cache_path,
@@ -986,10 +989,14 @@ class LocalGatePlanExecutor:
                 with dynamic_port_lease(
                     _metadata_list(metadata, "dynamic_ports")
                 ) as dynamic_ports:
+                    merged_overrides = {
+                        **self.environment_overrides,
+                        **dict(environment_overrides or {}),
+                    }
                     env = gate_environment(
                         sandbox,
                         job_id=job_id,
-                        base={**os.environ, **dict(environment_overrides or {})},
+                        base={**os.environ, **merged_overrides},
                         runtime_root=runtime_root,
                         runtime_profile=requested_profile,
                         dynamic_ports=dynamic_ports,
@@ -1038,6 +1045,14 @@ class LocalGatePlanExecutor:
             mutations = self._mutation_paths(sandbox)
             self._publish_diagnostics(sandbox, job_id)
             stderr = process.stderr
+            stdout = process.stdout
+            for sensitive_value in sorted(
+                {value for value in merged_overrides.values() if value},
+                key=len,
+                reverse=True,
+            ):
+                stdout = stdout.replace(sensitive_value, "[REDACTED]")
+                stderr = stderr.replace(sensitive_value, "[REDACTED]")
             termination_reason = (
                 "foreground_preempted"
                 if foreground_preempted.is_set()
@@ -1059,7 +1074,7 @@ class LocalGatePlanExecutor:
                 command=command,
                 ok=ok,
                 returncode=returncode,
-                stdout=process.stdout,
+                stdout=stdout,
                 stderr=stderr,
                 duration_seconds=process.duration_seconds,
                 termination_reason=termination_reason,
