@@ -205,6 +205,75 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
             self.assertEqual(command, "cd auto_agents && test -d .")
 
+    def test_supplemental_pytest_with_no_selected_tests_is_nonfatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repair_root = Path(tmp)
+            write_text(
+                repair_root / "test_sample.py",
+                "def test_present():\n    assert True\n",
+            )
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=repair_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+
+            result = runner._run_verification_commands(
+                ["python -m pytest -q test_sample.py -k missing_selector"],
+                repair_root,
+                allow_pytest_no_tests=True,
+            )
+
+            self.assertTrue(result.ok, result.summary)
+            self.assertIn("exit=5", result.summary)
+            self.assertIn("nonfatal=supplemental pytest selector", result.summary)
+
+    def test_required_pytest_with_no_selected_tests_remains_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repair_root = Path(tmp)
+            write_text(
+                repair_root / "test_sample.py",
+                "def test_present():\n    assert True\n",
+            )
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=repair_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+
+            result = runner._run_verification_commands(
+                ["python -m pytest -q test_sample.py -k missing_selector"],
+                repair_root,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("exit=5", result.summary)
+
+    def test_supplemental_pytest_failure_remains_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repair_root = Path(tmp)
+            write_text(
+                repair_root / "test_sample.py",
+                "def test_failure():\n    assert False\n",
+            )
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=repair_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+
+            result = runner._run_verification_commands(
+                ["python -m pytest -q test_sample.py"],
+                repair_root,
+                allow_pytest_no_tests=True,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("exit=1", result.summary)
+
     def _coordinator(
         self,
         root: Path,

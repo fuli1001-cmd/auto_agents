@@ -1942,21 +1942,39 @@ class AutoAgentsSelfRepairRunner:
         self,
         verification_root: Optional[Path] = None,
     ) -> "_VerificationResult":
+        root = verification_root or self.repo_root
         commands = self_repair_verify_commands()
-        if self.diagnosis is not None:
-            for command in self.diagnosis.final.verification_commands:
-                normalized = " ".join(str(command).split())
-                if normalized and normalized not in commands:
-                    commands.append(normalized)
-        return self._run_verification_commands(
-            commands,
-            verification_root or self.repo_root,
+        required = self._run_verification_commands(commands, root)
+        if not required.ok or self.diagnosis is None:
+            return required
+
+        supplemental = []
+        for command in self.diagnosis.final.verification_commands:
+            normalized = " ".join(str(command).split())
+            if (
+                normalized
+                and normalized not in commands
+                and normalized not in supplemental
+            ):
+                supplemental.append(normalized)
+        if not supplemental:
+            return required
+        additional = self._run_verification_commands(
+            supplemental,
+            root,
+            allow_pytest_no_tests=True,
         )
+        summary = "\n\n".join(
+            part for part in (required.summary, additional.summary) if part
+        )
+        return _VerificationResult(additional.ok, summary)
 
     def _run_verification_commands(
         self,
         commands: list[str],
         verification_root: Path,
+        *,
+        allow_pytest_no_tests: bool = False,
     ) -> "_VerificationResult":
         summaries = []
         for command in commands:
@@ -1978,6 +1996,15 @@ class AutoAgentsSelfRepairRunner:
                     f"exit={process.returncode}\n{detail[:1200]}"
                 ).strip()
             )
+            if (
+                allow_pytest_no_tests
+                and process.returncode == 5
+                and _is_pytest_verification_command(command)
+            ):
+                summaries[-1] += (
+                    "\nnonfatal=supplemental pytest selector collected no tests"
+                )
+                continue
             if process.returncode != 0:
                 return _VerificationResult(False, "\n\n".join(summaries))
         return _VerificationResult(True, "\n\n".join(summaries))
@@ -1994,6 +2021,18 @@ class AutoAgentsSelfRepairRunner:
 class _VerificationResult:
     ok: bool
     summary: str
+
+
+def _is_pytest_verification_command(command: str) -> bool:
+    try:
+        parts = shlex.split(str(command))
+    except ValueError:
+        return False
+    return any(
+        Path(part).name == "pytest"
+        or (part == "-m" and index + 1 < len(parts) and parts[index + 1] == "pytest")
+        for index, part in enumerate(parts)
+    )
 
 
 def _compact_run_state(payload: dict[str, object]) -> dict[str, object]:
