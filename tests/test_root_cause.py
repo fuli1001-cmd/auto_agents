@@ -169,6 +169,42 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             "python -m unittest -q",
         )
 
+    def test_self_repair_verification_strips_redundant_repository_cd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repair_root = Path(tmp) / "repair"
+            repair_root.mkdir()
+
+            command = self_repair_verification_command(
+                "cd auto_agents && test -d .",
+                repair_root,
+                repository_aliases={"auto_agents"},
+            )
+
+            self.assertEqual(command, "test -d .")
+            result = subprocess.run(
+                command,
+                cwd=repair_root,
+                shell=True,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_self_repair_verification_keeps_real_nested_repository_cd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repair_root = Path(tmp) / "repair"
+            (repair_root / "auto_agents").mkdir(parents=True)
+
+            command = self_repair_verification_command(
+                "cd auto_agents && test -d .",
+                repair_root,
+                repository_aliases={"auto_agents"},
+            )
+
+            self.assertEqual(command, "cd auto_agents && test -d .")
+
     def _coordinator(
         self,
         root: Path,

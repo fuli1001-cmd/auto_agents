@@ -1238,9 +1238,40 @@ def self_repair_verify_commands(env: Optional[dict[str, str]] = None) -> list[st
     ]
 
 
-def self_repair_verification_command(command: str, repo_root: Path) -> str:
+def self_repair_verification_command(
+    command: str,
+    repo_root: Path,
+    *,
+    repository_aliases: Optional[set[str]] = None,
+) -> str:
     """Run pytest without letting the root auto_agents.py shadow src/auto_agents."""
     normalized = str(command).strip()
+    aliases = {repo_root.name}
+    aliases.update(
+        str(alias).strip()
+        for alias in (repository_aliases or set())
+        if str(alias).strip()
+    )
+    leading_cd = re.fullmatch(
+        r"cd\s+((?:'[^']*'|\"[^\"]*\"|[^\s;&|]+))\s*&&\s*(.+)",
+        normalized,
+        flags=re.DOTALL,
+    )
+    if leading_cd is not None:
+        try:
+            cd_parts = shlex.split(leading_cd.group(1))
+        except ValueError:
+            cd_parts = []
+        if len(cd_parts) == 1:
+            cd_path = Path(cd_parts[0])
+            normalized_alias = cd_path.as_posix().removeprefix("./").rstrip("/")
+            if (
+                not cd_path.is_absolute()
+                and "/" not in normalized_alias
+                and normalized_alias in aliases
+                and not (repo_root / cd_path).is_dir()
+            ):
+                normalized = leading_cd.group(2).strip()
     try:
         parts = shlex.split(normalized)
     except ValueError:
@@ -1932,6 +1963,7 @@ class AutoAgentsSelfRepairRunner:
             verification_command = self_repair_verification_command(
                 command,
                 verification_root,
+                repository_aliases={self.repo_root.name},
             )
             gate = run_commands(
                 [verification_command],
