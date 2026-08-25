@@ -2408,6 +2408,7 @@ class ProjectValidationTests(unittest.TestCase):
                     evidence=["no production credential was supplied"],
                 ),
             )
+            stdout = io.StringIO()
 
             with (
                 patch.object(Orchestrator, "run", mock_run),
@@ -2415,7 +2416,7 @@ class ProjectValidationTests(unittest.TestCase):
                     "auto_agents.cli._triage_terminal_run_error",
                     return_value=triage,
                 ),
-                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stdout(stdout),
                 contextlib.redirect_stderr(io.StringIO()),
             ):
                 exit_code = main(
@@ -2428,6 +2429,10 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(
                 blocked_state.active_blocker["self_repair_triage"]["judgment"]["decision"],
                 "DO_NOT_REPAIR",
+            )
+            self.assertIn(
+                "Self-repair decision: provider rejected self-repair",
+                stdout.getvalue(),
             )
 
     def test_self_repair_runtime_evidence_detects_worker_capability_mismatch(self) -> None:

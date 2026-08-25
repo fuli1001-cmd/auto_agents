@@ -428,6 +428,26 @@ def validate_frontend_fidelity_trace(
             requirement_id = str(requirement.get("id", "")).strip()
             previous_requirement = previous_requirements.get(requirement_id)
             if previous_requirement is None:
+                supersedes = {
+                    str(item).strip()
+                    for item in requirement.get("supersedes", []) or []
+                    if str(item).strip()
+                }
+                preserves_previous_lineage = bool(
+                    supersedes
+                    and requirement_is_frontend_preservation_only(requirement)
+                    and any(
+                        superseded_id in previous_requirements
+                        and previous_requirements[superseded_id].get("status")
+                        == "active"
+                        and requirement_is_frontend_fidelity(
+                            previous_requirements[superseded_id]
+                        )
+                        for superseded_id in supersedes
+                    )
+                )
+                if preserves_previous_lineage:
+                    continue
                 errors.append(
                     f"frontend_scope.requested=false forbids introducing active frontend "
                     f"fidelity requirement {requirement_id or '<unknown>'}; preserve historical "

@@ -483,7 +483,17 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
         reason = str(blocker.get("reason") or state_payload.get("last_error", "")).strip()
         triage = blocker.get("self_repair_triage")
         root_cause_lines: list[str] = []
+        self_repair_decision = ""
         if isinstance(triage, dict):
+            decision = triage.get("decision")
+            if (
+                isinstance(decision, dict)
+                and not bool(decision.get("eligible", False))
+            ):
+                self_repair_decision = str(
+                    triage.get("reason")
+                    or decision.get("reason", "")
+                ).strip()
             diagnosis = triage.get("root_cause")
             final = (
                 diagnosis.get("final")
@@ -511,6 +521,11 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
         lines = [
             f"Run blocked at stage: {current_stage}.",
             *([f"Reason: {reason}"] if reason else []),
+            *(
+                [f"Self-repair decision: {self_repair_decision}"]
+                if self_repair_decision
+                else []
+            ),
             *root_cause_lines,
             "",
             "Key files to review:",
@@ -1766,7 +1781,17 @@ def main(argv: list[str] | None = None) -> int:
                         diagnosis=triage.root_cause,
                     )
                 _record_blocked_self_repair_triage(project_root, triage)
-                print(_render_run_summary(project_root, state_payload))
+                updated_state = _try_load_run_state(project_root)
+                print(
+                    _render_run_summary(
+                        project_root,
+                        (
+                            updated_state.to_dict()
+                            if updated_state is not None
+                            else state_payload
+                        ),
+                    )
+                )
                 return 3
             if (
                 state_status == "completed"

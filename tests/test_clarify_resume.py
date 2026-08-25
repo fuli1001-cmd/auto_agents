@@ -13,10 +13,16 @@ from auto_agents.config import (
     docs_dir,
     load_run_state,
     requirements_trace_path,
+    run_path,
+    save_run_state,
 )
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.requirements import (
+    stamp_requirement_contract_hashes,
+    validate_requirements_trace_payload,
+)
 
 
 class RecoveringClarifyConversationMutationAdapter:
@@ -91,6 +97,215 @@ class ClarifyResumeTests(unittest.TestCase):
         spec_file = project_root / "spec.md"
         spec_file.write_text("# Idea\nBuild something.", encoding="utf-8")
         return project_root, spec_file
+
+    @staticmethod
+    def _requirement() -> dict[str, object]:
+        return {
+            "id": "REQ-001",
+            "text": "Provide deterministic output.",
+            "source": "iteration specification",
+            "status": "active",
+            "priority": "mandatory",
+            "acceptance_oracles": ["The public API returns deterministic output."],
+            "oracle_type": "integration_test",
+            "oracle_strength": "behavioral",
+            "evidence_boundary": "system_boundary",
+            "forbidden_proxy_oracles": [],
+            "forbidden_patterns": [],
+            "external_docs_required": False,
+            "provider_reference": "",
+            "notes": "",
+        }
+
+    def _write_valid_brief(self, project_root: Path) -> None:
+        write_text(
+            docs_dir(project_root) / "project_brief.md",
+            (
+                "# Project Brief\n\n"
+                "## Problem\n\nNeed deterministic output.\n\n"
+                "## MVP Scope\n\nExpose the public API.\n\n"
+                "## Non-Goals\n\nNo unrelated features.\n\n"
+                "## Constraints\n\nPreserve compatibility.\n"
+            ),
+        )
+
+    def test_resume_completes_valid_interrupted_clarify_hash_postcondition(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        self._write_valid_brief(project_root)
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [self._requirement()]}
+        )
+        current = json.loads(json.dumps(previous))
+        current["requirements"][0]["contract_sha256"] = "sha256:stale"
+        write_json(requirements_trace_path(project_root), current)
+        write_json(
+            run_path(project_root, state.run_id)
+            / "requirements_trace.pre-clarify.json",
+            previous,
+        )
+        state.status = "blocked"
+        state.current_stage = "clarify"
+        state.active_blocker = {
+            "owner": "auto_agents",
+            "category": "clarify_generate_hash_postcondition_resume_deadlock",
+            "reason": "interrupted clarify postcondition",
+        }
+        state.last_error = "interrupted clarify postcondition"
+        save_run_state(project_root, state)
+
+        recovered = orchestrator._normalize_incomplete_clarify_generate_postcondition(
+            state,
+            spec_file,
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(state.status, "pending")
+        self.assertEqual(state.active_blocker, {})
+        self.assertIn("clarify", state.stage_summaries)
+        normalized = json.loads(
+            requirements_trace_path(project_root).read_text(encoding="utf-8")
+        )
+        self.assertEqual(validate_requirements_trace_payload(normalized), [])
+        self.assertNotEqual(
+            normalized["requirements"][0]["contract_sha256"],
+            "sha256:stale",
+        )
+
+    def test_clarify_validation_does_not_persist_hashes_before_all_checks_pass(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        orchestrator._active_spec_file = spec_file
+        trace, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [self._requirement()]}
+        )
+        trace["requirements"][0]["contract_sha256"] = "sha256:stale"
+        write_json(requirements_trace_path(project_root), trace)
+        write_text(
+            docs_dir(project_root) / "project_brief.md",
+            "# Incomplete Brief\n",
+        )
+
+        feedback = orchestrator._clarify_validation_feedback(
+            AgentResult(ok=True, command=[], output_path=Path("."))
+        )
+
+        self.assertIsNotNone(feedback)
+        persisted = json.loads(
+            requirements_trace_path(project_root).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            persisted["requirements"][0]["contract_sha256"],
+            "sha256:stale",
+        )
+
+    def test_clarify_generate_retry_restores_owned_artifacts(self):
+        project_root, _spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        brief_path = docs_dir(project_root) / "project_brief.md"
+        trace_path = requirements_trace_path(project_root)
+        write_text(brief_path, "# Original Brief\n")
+        write_json(trace_path, {"version": 1, "requirements": []})
+        calls = 0
+        second_attempt_brief = ""
+        second_attempt_trace = None
+
+        def run_generate(request):
+            nonlocal calls, second_attempt_brief, second_attempt_trace
+            calls += 1
+            if calls == 2:
+                second_attempt_brief = brief_path.read_text(encoding="utf-8")
+                second_attempt_trace = json.loads(
+                    trace_path.read_text(encoding="utf-8")
+                )
+            write_text(brief_path, f"# Generated Attempt {calls}\n")
+            write_json(
+                trace_path,
+                {"version": 1, "requirements": [{"id": f"REQ-{calls:03d}"}]},
+            )
+            write_text(request.output_path, f"attempt {calls}\n")
+            return AgentResult(
+                ok=True,
+                command=["fake"],
+                output_path=request.output_path,
+                summary=f"attempt {calls}",
+                returncode=0,
+            )
+
+        orchestrator.adapter.run = run_generate
+        validation_calls = 0
+
+        def validate(_result):
+            nonlocal validation_calls
+            validation_calls += 1
+            return "retry clarify generation" if validation_calls == 1 else None
+
+        result = orchestrator._run_agent_with_retries(
+            state=state,
+            stage="clarify",
+            stage_key="clarify-generate",
+            prompt="Generate clarify artifacts.",
+            validation_feedback=validate,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, 2)
+        self.assertEqual(second_attempt_brief, "# Original Brief\n")
+        self.assertEqual(second_attempt_trace, {"version": 1, "requirements": []})
+        self.assertFalse(
+            orchestrator._attempt_recovery_checkpoint_root(
+                state.run_id,
+                "clarify-generate",
+            ).exists()
+        )
+
+    def test_resume_rolls_back_interrupted_clarify_generate_checkpoint(self):
+        project_root, _spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        brief_path = docs_dir(project_root) / "project_brief.md"
+        trace_path = requirements_trace_path(project_root)
+        write_text(brief_path, "# Original Brief\n")
+        write_json(trace_path, {"version": 1, "requirements": []})
+        before = orchestrator._worktree_change_snapshot()
+        checkpoint = orchestrator._attempt_recovery_checkpoint_root(
+            state.run_id,
+            "clarify-generate",
+        )
+        checkpoint.mkdir(parents=True, exist_ok=True)
+        orchestrator._capture_auto_agents_restore_point(checkpoint)
+        orchestrator._write_attempt_recovery_manifest(
+            checkpoint,
+            run_id=state.run_id,
+            stage="clarify",
+            stage_key="clarify-generate",
+            before_snapshot=before,
+            offending_paths=orchestrator._clarify_generate_transaction_paths(),
+        )
+        write_text(brief_path, "# Interrupted Brief\n")
+        write_json(trace_path, {"version": 1, "requirements": [{"id": "BROKEN"}]})
+        state.status = "blocked"
+        state.active_blocker = {
+            "owner": "auto_agents",
+            "category": "clarify_generate_interrupted",
+            "reason": "interrupted",
+        }
+
+        reconciled = orchestrator._reconcile_interrupted_clarify_generate_checkpoint(
+            state
+        )
+
+        self.assertTrue(reconciled)
+        self.assertEqual(brief_path.read_text(encoding="utf-8"), "# Original Brief\n")
+        self.assertEqual(
+            json.loads(trace_path.read_text(encoding="utf-8")),
+            {"version": 1, "requirements": []},
+        )
+        self.assertEqual(state.status, "pending")
+        self.assertEqual(state.active_blocker, {})
+        self.assertFalse(checkpoint.exists())
 
     def test_worktree_snapshot_ignores_untracked_vim_swap_but_not_spec_changes(self):
         project_root, spec_file = self._setup_project()

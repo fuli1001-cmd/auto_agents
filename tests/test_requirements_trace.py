@@ -1225,7 +1225,7 @@ class RequirementsTraceTests(unittest.TestCase):
             any("surfaces must be empty when requested=false" in error for error in errors)
         )
 
-    def test_preservation_only_iteration_rejects_new_frontend_requirement(self) -> None:
+    def test_preservation_only_iteration_allows_superseding_frontend_lineage(self) -> None:
         previous_requirement = _requirement(
             id="REQ-009",
             text="Preserve the approved Workbench home prototype.",
@@ -1257,6 +1257,38 @@ class RequirementsTraceTests(unittest.TestCase):
                 notes="frontend_surface: home",
                 frontend_surface=True,
                 supersedes=["REQ-009"],
+            )
+        )
+
+        errors = validate_frontend_fidelity_trace(
+            current,
+            spec_text="Do not modify the approved Workbench visual design.",
+            previous_trace=previous,
+        )
+
+        self.assertFalse(
+            any("requested=false forbids introducing" in error for error in errors)
+        )
+
+    def test_preservation_only_iteration_rejects_new_frontend_without_lineage(self) -> None:
+        previous = {
+            "version": 1,
+            "frontend_scope": {"requested": False, "surfaces": []},
+            "requirements": [],
+        }
+        current = json.loads(json.dumps(previous))
+        current["requirements"].append(
+            _requirement(
+                id="REQ-020",
+                text="The Workbench home must preserve the approved prototype fidelity.",
+                source="specs/storyboard-contract.md non-goals",
+                acceptance_oracles=[
+                    "Desktop and mobile screenshots remain visually unchanged."
+                ],
+                oracle_type="mixed",
+                oracle_strength="semantic",
+                notes="frontend_surface: home",
+                frontend_surface=True,
             )
         )
 

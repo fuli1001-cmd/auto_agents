@@ -1634,6 +1634,95 @@ class Orchestrator:
         )
         return True
 
+    def _normalize_incomplete_clarify_generate_postcondition(
+        self,
+        state: RunState,
+        spec_file: Path,
+    ) -> bool:
+        """Finish an interrupted, otherwise-valid clarify generation commit."""
+        if (
+            state.current_stage != "clarify"
+            or "clarify" in state.stage_summaries
+            or state.pending_approval
+        ):
+            return False
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        category = str(blocker.get("category", "")).strip()
+        if (
+            state.status == "blocked"
+            and str(blocker.get("owner", "")).strip() != "auto_agents"
+        ):
+            return False
+        if state.status == "blocked" and not category.startswith("clarify_generate_"):
+            return False
+
+        pre_trace_path = (
+            run_path(self.project_root, state.run_id)
+            / "requirements_trace.pre-clarify.json"
+        )
+        previous_trace = read_json(pre_trace_path, default={})
+        raw_trace = load_requirements_trace(self.project_root, normalize=False)
+        if not isinstance(previous_trace, dict) or not previous_trace:
+            return False
+        if not isinstance(raw_trace, dict):
+            return False
+
+        raw_errors = validate_requirements_trace_payload(raw_trace)
+        if not raw_errors or any(
+            "contract_sha256 is missing or stale" not in error
+            for error in raw_errors
+        ):
+            return False
+        trace, stamp_updates = stamp_requirement_contract_hashes(raw_trace)
+        if not stamp_updates or not isinstance(trace, dict):
+            return False
+        historical_tasks = (
+            load_archived_done_task_payloads(self.project_root)
+            + self._done_task_payloads(state.tasks)
+        )
+        errors = self._clarify_artifact_validation_errors(
+            trace,
+            previous_trace=previous_trace,
+            historical_tasks=historical_tasks,
+            spec_file=spec_file,
+        )
+        if errors:
+            return False
+
+        self._persist_clarify_contract_postconditions(
+            previous_trace,
+            trace,
+            stamp_updates,
+        )
+        state.stage_summaries["clarify"] = (
+            "Recovered an interrupted clarify generation after completing and "
+            "validating engine-owned requirement contract hashes."
+        )
+        state.status = "pending"
+        state.rejected_stage = ""
+        state.rejection_reason = ""
+        state.last_error = ""
+        state.active_blocker = {}
+        state.last_recovery_route = {
+            "outcome": "clarify_postcondition_completed",
+            "from_stage": "clarify",
+            "to_stage": "prototype",
+            "reason": (
+                "the interrupted clarify artifacts passed contract transition "
+                "validation after engine-owned hash stamping"
+            ),
+            "stamped_requirements": len(stamp_updates),
+        }
+        self.logger.info(
+            "[clarify] completed interrupted generation postcondition; stamped=%s",
+            len(stamp_updates),
+        )
+        return True
+
     @staticmethod
     def _normalize_audit_blocker_path(path: object) -> str:
         normalized = str(path or "").strip().replace("\\", "/")
@@ -2190,6 +2279,15 @@ class Orchestrator:
                 state.workflow_version = 2
                 save_run_state(self.project_root, state)
             self._attach_run_logger(state.run_id)
+            resolved_spec_file = spec_file.expanduser().resolve()
+            self._active_spec_file = resolved_spec_file
+            if self._reconcile_interrupted_clarify_generate_checkpoint(state):
+                save_run_state(self.project_root, state)
+            if self._normalize_incomplete_clarify_generate_postcondition(
+                state,
+                resolved_spec_file,
+            ):
+                save_run_state(self.project_root, state)
             if not restart_blocked:
                 if self._resume_blocked_run(state):
                     save_run_state(self.project_root, state)
@@ -2198,8 +2296,6 @@ class Orchestrator:
                     return state
             if self._normalize_legacy_requirements_audit_resume(state):
                 save_run_state(self.project_root, state)
-            resolved_spec_file = spec_file.expanduser().resolve()
-            self._active_spec_file = resolved_spec_file
             self._capture_resume_context(
                 state,
                 spec_file=resolved_spec_file,
@@ -4647,6 +4743,76 @@ class Orchestrator:
             / "attempt-checkpoints"
             / (safe_stage or "attempt")
         )
+
+    def _clarify_generate_transaction_paths(self) -> List[str]:
+        return [
+            self._relative_repo_path(
+                docs_dir(self.project_root) / "project_brief.md"
+            ),
+            self._relative_repo_path(
+                requirements_trace_path(self.project_root)
+            ),
+        ]
+
+    def _reconcile_interrupted_clarify_generate_checkpoint(
+        self,
+        state: RunState,
+    ) -> bool:
+        checkpoint = self._attempt_recovery_checkpoint_root(
+            state.run_id,
+            "clarify-generate",
+        )
+        manifest_path = checkpoint / "manifest.json"
+        payload = read_json(manifest_path, default={})
+        if not isinstance(payload, dict):
+            return False
+        if (
+            str(payload.get("stage", "")) != "clarify"
+            or str(payload.get("stage_key", "")) != "clarify-generate"
+        ):
+            return False
+        before_snapshot = payload.get("before_snapshot")
+        paths = [
+            str(path).strip()
+            for path in payload.get("offending_paths", []) or []
+            if str(path).strip()
+        ]
+        if not paths or not isinstance(before_snapshot, dict):
+            return False
+        unrestored = self._restore_paths_from_restore_point(
+            paths,
+            checkpoint,
+            before_snapshot={
+                str(path): str(fingerprint)
+                for path, fingerprint in before_snapshot.items()
+            },
+        )
+        if unrestored:
+            raise RuntimeError(
+                "auto_agents clarify checkpoint reconciliation failed. "
+                "Clarify-owned paths did not return to their pre-attempt "
+                f"state: {self._changed_path_preview(unrestored)}"
+            )
+        shutil.rmtree(checkpoint, ignore_errors=True)
+        state.status = "pending"
+        state.last_error = ""
+        state.rejected_stage = ""
+        state.rejection_reason = ""
+        state.active_blocker = {}
+        state.last_recovery_route = {
+            "outcome": "clarify_attempt_rolled_back",
+            "from_stage": "clarify",
+            "to_stage": "clarify",
+            "reason": (
+                "an interrupted clarify generation was restored from its "
+                "durable pre-attempt checkpoint"
+            ),
+        }
+        self.logger.info(
+            "[clarify] restored interrupted generation checkpoint: %s",
+            checkpoint,
+        )
+        return True
 
     def _write_attempt_recovery_manifest(
         self,
@@ -19470,7 +19636,15 @@ class Orchestrator:
         restorable_clarify_conversation = (
             stage == "clarify" and stage_key.startswith("clarify-conv-")
         )
-        if stage == "implement":
+        restorable_clarify_generate = (
+            stage == "clarify" and stage_key == "clarify-generate"
+        )
+        clarify_transaction_paths = (
+            self._clarify_generate_transaction_paths()
+            if restorable_clarify_generate
+            else []
+        )
+        if stage == "implement" or restorable_clarify_generate:
             durable_restore_root = self._attempt_recovery_checkpoint_root(
                 active_run_id,
                 stage_key,
@@ -19486,6 +19660,7 @@ class Orchestrator:
                 stage=stage,
                 stage_key=stage_key,
                 before_snapshot=snapshot_before,
+                offending_paths=clarify_transaction_paths,
             )
         elif restorable_clarify_conversation:
             restore_workspace = tempfile.TemporaryDirectory(prefix="auto-agents-restore-")
@@ -19611,6 +19786,18 @@ class Orchestrator:
                     )
 
                 if not result.ok:
+                    if restorable_clarify_generate and restore_root is not None:
+                        unrestored = self._restore_paths_from_restore_point(
+                            clarify_transaction_paths,
+                            restore_root,
+                            before_snapshot=snapshot_before,
+                        )
+                        if unrestored:
+                            raise RuntimeError(
+                                "auto_agents clarify generation restore invariant failed. "
+                                "Clarify-owned paths did not return to their pre-attempt "
+                                f"state: {self._changed_path_preview(unrestored)}"
+                            )
                     last_error = result.stderr or result.summary or f"{stage_key} failed"
                     feedback = f"- The command failed.\n- Details: {last_error}"
                     continue
@@ -19618,6 +19805,18 @@ class Orchestrator:
                 if validation_feedback is not None:
                     issue = validation_feedback(result)
                     if issue:
+                        if restorable_clarify_generate and restore_root is not None:
+                            unrestored = self._restore_paths_from_restore_point(
+                                clarify_transaction_paths,
+                                restore_root,
+                                before_snapshot=snapshot_before,
+                            )
+                            if unrestored:
+                                raise RuntimeError(
+                                    "auto_agents clarify generation restore invariant failed. "
+                                    "Clarify-owned paths did not return to their pre-attempt "
+                                    f"state: {self._changed_path_preview(unrestored)}"
+                                )
                         last_error = issue
                         feedback = issue
                         continue
@@ -19634,7 +19833,28 @@ class Orchestrator:
         finally:
             if restore_workspace is not None:
                 restore_workspace.cleanup()
-            if completed and durable_restore_root is not None:
+            clarify_restore_completed = False
+            if (
+                restorable_clarify_generate
+                and not completed
+                and restore_root is not None
+            ):
+                unrestored = self._restore_paths_from_restore_point(
+                    clarify_transaction_paths,
+                    restore_root,
+                    before_snapshot=snapshot_before,
+                )
+                if unrestored:
+                    raise RuntimeError(
+                        "auto_agents clarify generation restore invariant failed. "
+                        "Clarify-owned paths did not return to their pre-attempt "
+                        f"state: {self._changed_path_preview(unrestored)}"
+                    )
+                clarify_restore_completed = True
+            if (
+                durable_restore_root is not None
+                and (completed or clarify_restore_completed)
+            ):
                 shutil.rmtree(durable_restore_root, ignore_errors=True)
 
         self._emit_agent_metrics(
@@ -21105,21 +21325,48 @@ class Orchestrator:
         return any(token in text for token in ("in_progress", "`in_progress`", "status", "`done`", "done"))
 
     def _clarify_validation_feedback(self, _: AgentResult) -> Optional[str]:
-        path = docs_dir(self.project_root) / "project_brief.md"
-        errors = validate_required_document(path, "project_brief.md")
         raw_trace = load_requirements_trace(self.project_root, normalize=False)
         trace, stamp_updates = stamp_requirement_contract_hashes(raw_trace)
-        if isinstance(trace, dict) and trace != raw_trace:
-            # Contract identity is engine-owned. Normalize hashes before strict
-            # schema validation so an agent never needs to calculate SHA-256.
-            write_json(requirements_trace_path(self.project_root), trace)
+        if not isinstance(trace, dict):
+            trace = raw_trace
+        previous_trace = getattr(self, "_clarify_pre_trace_payload", {}) or {}
+        errors = self._clarify_artifact_validation_errors(
+            trace,
+            previous_trace=previous_trace,
+            historical_tasks=(
+                getattr(self, "_clarify_historical_tasks", []) or []
+            ),
+            spec_file=getattr(self, "_active_spec_file", None),
+        )
+        if not errors and isinstance(trace, dict):
+            self._persist_clarify_contract_postconditions(
+                previous_trace,
+                trace,
+                stamp_updates,
+            )
+            return None
+        bullets = "\n".join(f"- {item}" for item in errors)
+        return (
+            "The clarify output is incomplete. Rewrite the project brief and requirements trace in place, "
+            "preserving required brief headings and valid requirements_trace.json shape.\n"
+            f"{bullets}"
+        )
+
+    def _clarify_artifact_validation_errors(
+        self,
+        trace: object,
+        *,
+        previous_trace: object,
+        historical_tasks: Iterable[object],
+        spec_file: Optional[Path],
+    ) -> List[str]:
+        path = docs_dir(self.project_root) / "project_brief.md"
+        errors = validate_required_document(path, "project_brief.md")
         errors.extend(validate_requirements_trace_payload(trace))
         errors.extend(validate_frontend_scope(trace))
         spec_text = ""
-        active_spec_file = getattr(self, "_active_spec_file", None)
-        if isinstance(active_spec_file, Path) and active_spec_file.exists():
-            spec_text = read_text(active_spec_file)
-        previous_trace = getattr(self, "_clarify_pre_trace_payload", {}) or {}
+        if isinstance(spec_file, Path) and spec_file.exists():
+            spec_text = read_text(spec_file)
         errors.extend(
             validate_frontend_fidelity_trace(
                 trace,
@@ -21132,18 +21379,23 @@ class Orchestrator:
                 validate_requirement_contract_transitions(
                     previous_trace,
                     trace,
-                    historical_tasks=getattr(self, "_clarify_historical_tasks", []) or [],
+                    historical_tasks=historical_tasks,
                 )
             )
 
-        # Iteration safety: detect silent deletion of pre-existing REQ IDs.
-        # The pre-snapshot is captured in _run_interactive_clarify before
-        # generation; on first run it is empty so this check is a no-op.
-        pre_ids = getattr(self, "_clarify_pre_trace_ids", set()) or set()
+        pre_ids = (
+            self._active_or_deferred_req_ids(previous_trace)
+            if isinstance(previous_trace, dict)
+            else set()
+        )
         if pre_ids:
             current_ids = {
                 str(item.get("id", "")).strip()
-                for item in (trace.get("requirements") or [])
+                for item in (
+                    trace.get("requirements", [])
+                    if isinstance(trace, dict)
+                    else []
+                )
                 if isinstance(item, dict) and str(item.get("id", "")).strip()
             }
             missing = sorted(pre_ids - current_ids)
@@ -21155,35 +21407,35 @@ class Orchestrator:
                     f"{preview}{more}. Restore these entries; if they are no longer in scope, "
                     "keep id/text/source/acceptance_oracles and set status='superseded' instead of removing them."
                 )
+        return errors
 
-        if not errors:
-            for update in stamp_updates:
-                self.logger.info(f"[clarify] {update}")
-            if previous_trace:
-                lock = load_provider_references_lock(self.project_root)
-                migrated_lock, migrated_refs = (
-                    migrate_legacy_provider_reference_consumer_hashes(
-                        lock,
-                        previous_trace,
-                        trace,
-                    )
+    def _persist_clarify_contract_postconditions(
+        self,
+        previous_trace: object,
+        trace: dict,
+        stamp_updates: Iterable[str],
+    ) -> None:
+        write_json(requirements_trace_path(self.project_root), trace)
+        for update in stamp_updates:
+            self.logger.info(f"[clarify] {update}")
+        if isinstance(previous_trace, dict) and previous_trace:
+            lock = load_provider_references_lock(self.project_root)
+            migrated_lock, migrated_refs = (
+                migrate_legacy_provider_reference_consumer_hashes(
+                    lock,
+                    previous_trace,
+                    trace,
                 )
-                if migrated_refs and isinstance(migrated_lock, dict):
-                    write_json(
-                        provider_references_lock_path(self.project_root),
-                        migrated_lock,
-                    )
-                    self.logger.info(
-                        "[clarify] migrated unchanged provider contract lock(s): %s",
-                        ", ".join(migrated_refs),
-                    )
-            return None
-        bullets = "\n".join(f"- {item}" for item in errors)
-        return (
-            "The clarify output is incomplete. Rewrite the project brief and requirements trace in place, "
-            "preserving required brief headings and valid requirements_trace.json shape.\n"
-            f"{bullets}"
-        )
+            )
+            if migrated_refs and isinstance(migrated_lock, dict):
+                write_json(
+                    provider_references_lock_path(self.project_root),
+                    migrated_lock,
+                )
+                self.logger.info(
+                    "[clarify] migrated unchanged provider contract lock(s): %s",
+                    ", ".join(migrated_refs),
+                )
 
     @staticmethod
     def _active_or_deferred_req_ids(trace: dict) -> Set[str]:
