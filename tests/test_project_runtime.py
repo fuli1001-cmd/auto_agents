@@ -260,6 +260,64 @@ class ProjectRuntimeManagerTests(unittest.TestCase):
             )
             self.assertEqual(load_run_state(project).tasks[0].status, "pending")
 
+    def test_healthy_workspace_conda_retires_stale_install_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            (project / "pyproject.toml").write_text(
+                "[project]\nname='demo'\nversion='0.1.0'\nrequires-python='>=3.9'\n",
+                encoding="utf-8",
+            )
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-runtime",
+                title="Runtime",
+                description="Install runtime",
+                acceptance=["Runtime exists"],
+            )
+            request_payload = {
+                "key": "install_approval",
+                "kind": "install_approval",
+                "question": "install?",
+                "purpose": "run proof",
+                "why_required": "./.conda/bin/python is missing",
+                "default": False,
+                "persistence": "project",
+                "sensitivity": "public",
+                "validation": {
+                    "runtime_manifest": {
+                        "tools": [{"tool_id": "python"}]
+                    }
+                },
+                "subject_fingerprint": "requested",
+            }
+            requests = orchestrator._normalize_input_requests(
+                state,
+                task,
+                [request_payload],
+            )
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(task.status, "waiting_user")
+
+            (project / ".conda" / "conda-meta").mkdir(parents=True)
+            python = project / ".conda" / "bin" / "python"
+            python.parent.mkdir(parents=True)
+            python.write_text("#!/bin/sh\n", encoding="utf-8")
+            python.chmod(0o755)
+
+            changed = orchestrator._reconcile_orphaned_waiting_user_tasks(
+                state,
+                [task],
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(task.required_inputs, [])
+            self.assertEqual(task.evidence_preflight, {})
+            self.assertEqual(state.pending_input_requests, [])
+            self.assertEqual(state.active_input_request_id, "")
+
     def test_orphaned_waiting_task_restores_request_and_pauses_before_baseline(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "demo"

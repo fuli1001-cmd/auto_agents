@@ -4032,6 +4032,11 @@ class Orchestrator:
                         )
                     request = self._workspace_conda_install_approval_request(request)
                     raw_items = []
+                if (
+                    request.validation.get("workspace_conda") is True
+                    and self._workspace_conda_is_healthy()
+                ):
+                    continue
                 plan = self._project_runtime.plan(raw_items)
                 if not raw_items:
                     missing_plan = None
@@ -4145,6 +4150,13 @@ class Orchestrator:
             }
         )
 
+    def _workspace_conda_is_healthy(self) -> bool:
+        prefix = self.project_root / ".conda"
+        return (
+            (prefix / "conda-meta").is_dir()
+            and (prefix / "bin" / "python").is_file()
+        )
+
     def _pending_input_requests(self, state: RunState) -> List[UserInputRequest]:
         requests: List[UserInputRequest] = []
         retained: List[Dict[str, object]] = []
@@ -4152,6 +4164,12 @@ class Orchestrator:
             try:
                 request = UserInputRequest.from_dict(payload)
             except (TypeError, ValueError):
+                continue
+            if (
+                request.kind == "install_approval"
+                and request.validation.get("workspace_conda") is True
+                and self._workspace_conda_is_healthy()
+            ):
                 continue
             valid, _reason = self._operator_inputs.is_valid(request)
             if valid:
@@ -16100,7 +16118,7 @@ class Orchestrator:
         ]
         effort = self.config.efforts.get("evidence_preflight", "balanced")
         payload = {
-            "version": 5,
+            "version": 6,
             "task": task_payload,
             "requirements": requirements,
             "head": head_ref(self.project_root),
@@ -16157,6 +16175,8 @@ class Orchestrator:
             snapshot = snapshot_manager.create()
             add_worktree(self.project_root, worktree_path, ref=snapshot.ref_name)
             created = True
+            dependency_links = discover_dependency_links(self.project_root)
+            install_dependency_links(worktree_path, dependency_links)
             parsed: Optional[Dict[str, object]] = None
             feedback = ""
             cumulative_usage: Optional[AgentUsage] = None

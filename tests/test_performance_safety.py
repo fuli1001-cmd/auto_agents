@@ -1563,6 +1563,10 @@ class EvidencePreflightTests(unittest.TestCase):
         class ReadyAdapter:
             def run(self, request):
                 self.cwd = request.cwd
+                self.conda_is_link = (request.cwd / ".conda").is_symlink()
+                self.conda_python_exists = (
+                    request.cwd / ".conda" / "bin" / "python"
+                ).is_file()
                 summary = (
                     'EVIDENCE_PREFLIGHT: {"decision":"READY","reason":"feasible",'
                     '"checklist":["exercise the public boundary"]}'
@@ -1578,6 +1582,10 @@ class EvidencePreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"
             Orchestrator.init_project(root, "demo", "mock")
+            (root / ".conda" / "conda-meta").mkdir(parents=True)
+            python = root / ".conda" / "bin" / "python"
+            write_text(python, "#!/bin/sh\n")
+            python.chmod(0o755)
             orchestrator = Orchestrator(root)
             adapter = ReadyAdapter()
             orchestrator.adapter = adapter
@@ -1594,6 +1602,8 @@ class EvidencePreflightTests(unittest.TestCase):
             self.assertEqual(task.evidence_preflight["decision"], "READY")
             self.assertIn("public boundary", task.evidence_preflight["checklist"][0])
             self.assertNotEqual(adapter.cwd, root)
+            self.assertTrue(adapter.conda_is_link)
+            self.assertTrue(adapter.conda_python_exists)
             self.assertFalse(Path(adapter.cwd).exists())
 
 
