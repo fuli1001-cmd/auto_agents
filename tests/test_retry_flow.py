@@ -7223,11 +7223,62 @@ class RetryFlowTests(unittest.TestCase):
         self.assertEqual(stop["owner"], "verification_contract")
         self.assertEqual(invalid["decision"], "")
 
-    def test_recovery_judge_stop_is_a_persisted_terminal_route(self) -> None:
+    def test_recovery_stop_owner_is_derived_from_typed_incident(self) -> None:
+        for diagnosed_owner, expected_owner in (
+            ("target_project", "target_project"),
+            ("verification_contract", "verification_contract"),
+            ("verification_infrastructure", "verification_infrastructure"),
+            ("execution_environment", "verification_infrastructure"),
+            ("requirements", "verification_contract"),
+        ):
+            with self.subTest(owner=diagnosed_owner):
+                self.assertEqual(
+                    Orchestrator._recovery_stop_owner_from_incident(
+                        {
+                            "source": "gate",
+                            "status": "needs_human",
+                            "diagnosis": {
+                                "source": "deterministic",
+                                "owner": diagnosed_owner,
+                            },
+                        }
+                    ),
+                    expected_owner,
+                )
+
+        self.assertEqual(
+            Orchestrator._recovery_stop_owner_from_incident(
+                {
+                    "source": "provider",
+                    "status": "needs_human",
+                    "diagnosis": {
+                        "source": "provider",
+                        "owner": "target_project",
+                    },
+                }
+            ),
+            "external_provider",
+        )
+        self.assertEqual(
+            Orchestrator._recovery_stop_owner_from_incident(
+                {
+                    "source": "gate",
+                    "status": "needs_human",
+                    "diagnosis": {
+                        "source": "provider",
+                        "owner": "external_provider",
+                    },
+                }
+            ),
+            "",
+        )
+
+    def test_unbound_recovery_judge_stop_is_rejected_at_last_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
             orchestrator = Orchestrator(project_root)
+            orchestrator.config.execution.recovery.max_rounds = 2
             task = TaskSpec(
                 task_id="ordinary-child",
                 title="Ordinary child",
@@ -7235,6 +7286,7 @@ class RetryFlowTests(unittest.TestCase):
                 acceptance=["Observable proof passes."],
                 status="in_progress",
                 task_origin="scope_split",
+                recovery_round=1,
             )
             state = load_run_state(project_root)
             state.tasks = [task]
@@ -7265,28 +7317,197 @@ class RetryFlowTests(unittest.TestCase):
 
             self.assertTrue(scheduled)
             self.assertEqual(task.status, "pending")
+            self.assertEqual(task.recovery_round, 2)
+            self.assertEqual(task.recovery_history[-1]["result"], "requeued")
+            self.assertEqual(
+                task.recovery_history[-1]["rejected_stop"]["prerequisite_keys"],
+                ["acceptance.contract"],
+            )
+            self.assertIn(
+                "not bound to exactly one current typed recovery record",
+                task.recovery_history[-1]["rejected_stop"]["reason"],
+            )
+            self.assertEqual(state.last_recovery_route["outcome"], "requeued")
+            self.assertEqual(
+                state.last_recovery_route["judge_source"],
+                "reconciled_fallback",
+            )
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.active_blocker, {})
+
+    def test_typed_current_external_prerequisite_allows_provider_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="provider-boundary",
+                title="Exercise the provider boundary",
+                description="Run the bounded external proof.",
+                acceptance=["The external proof completes."],
+                status="in_progress",
+                task_origin="scope_split",
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            state.execution_incident_budget_epoch = 3
+            state.active_execution_incident_id = "provider-incident"
+            state.execution_incidents = [
+                {
+                    "incident_id": "provider-incident",
+                    "source": "provider",
+                    "kind": "provider_protocol_error",
+                    "task_id": task.task_id,
+                    "status": "needs_human",
+                    "budget_epoch": 3,
+                    "incident_fingerprint": "provider-identity",
+                    "evidence_fingerprint": "provider-evidence",
+                }
+            ]
+            review = "The external execution lane remains unavailable."
+            evidence = orchestrator._recovery_judge_evidence(
+                state,
+                task,
+                task,
+                review,
+                1,
+            )
+            prerequisite = evidence["recovery_prerequisites"][0]
+            prerequisite_refs = [
+                prerequisite["evidence_ref"],
+                *prerequisite["evidence_refs"],
+            ]
+
+            self.assertEqual(prerequisite["status"], "unsatisfied")
+            self.assertEqual(prerequisite["owner"], "external_provider")
+            self.assertEqual(
+                prerequisite["current_fingerprint"],
+                evidence["current_fingerprint"],
+            )
+
+            with patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                return_value={
+                    "decision": "STOP",
+                    "reason": "The typed provider incident requires external action.",
+                    "actionable_items": [],
+                    "split_axis": [],
+                    "owner": "external_provider",
+                    "prerequisite_keys": [prerequisite["key"]],
+                    "evidence_refs": prerequisite_refs,
+                    "source": "provider",
+                },
+            ):
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    {
+                        "reason": "review rejected the task",
+                        "review": review,
+                    },
+                )
+
+            self.assertTrue(scheduled)
             self.assertEqual(task.recovery_history[-1]["result"], "judge_stopped")
             self.assertEqual(state.last_recovery_route["outcome"], "judge_stopped")
-            self.assertEqual(state.last_recovery_route["judge_source"], "provider")
             self.assertEqual(state.status, "blocked")
-            self.assertEqual(
-                state.active_blocker["owner"],
-                "verification_contract",
-            )
+            self.assertEqual(state.active_blocker["owner"], "external_provider")
             self.assertEqual(
                 state.active_blocker["category"],
-                "recovery_contract_action_required",
+                "recovery_provider_action_required",
             )
-            self.assertIn("external clarification", state.active_blocker["reason"])
 
-            resumed = orchestrator._resume_blocked_run(state)
+    def test_typed_prerequisite_rejects_owner_mismatch_and_stale_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="provider-boundary",
+                title="Exercise the provider boundary",
+                description="Run the bounded external proof.",
+                acceptance=["The external proof completes."],
+                status="in_progress",
+                task_origin="scope_split",
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            state.active_execution_incident_id = "provider-incident"
+            state.execution_incidents = [
+                {
+                    "incident_id": "provider-incident",
+                    "source": "provider",
+                    "kind": "provider_protocol_error",
+                    "task_id": task.task_id,
+                    "status": "needs_human",
+                    "budget_epoch": 0,
+                    "incident_fingerprint": "provider-identity",
+                    "evidence_fingerprint": "provider-evidence",
+                }
+            ]
+            review = "The external execution lane remains unavailable."
+            evidence = orchestrator._recovery_judge_evidence(
+                state,
+                task,
+                task,
+                review,
+                1,
+            )
+            prerequisite = evidence["recovery_prerequisites"][0]
+            validation = orchestrator._validate_recovery_stop(
+                state,
+                task,
+                task,
+                review,
+                1,
+                {
+                    "owner": "target_project",
+                    "prerequisite_keys": [prerequisite["key"]],
+                    "evidence_refs": [
+                        prerequisite["evidence_ref"],
+                        *prerequisite["evidence_refs"],
+                    ],
+                },
+            )
 
-            self.assertTrue(resumed)
-            self.assertEqual(state.status, "pending")
-            self.assertEqual(task.recovery_epoch, 1)
-            self.assertEqual(task.recovery_round, 0)
-            self.assertEqual(state.last_recovery_route, {})
-            self.assertEqual(state.active_blocker["status"], "retrying")
+            self.assertFalse(validation["valid"])
+            self.assertIn(
+                "owner does not match the typed prerequisite owner",
+                validation["reason"],
+            )
+
+            stale_evidence = json.loads(json.dumps(evidence))
+            stale_evidence["evidence_catalog"][
+                prerequisite["evidence_ref"]
+            ]["entry"]["current_fingerprint"] = "stale-fingerprint"
+            with patch.object(
+                orchestrator,
+                "_recovery_judge_evidence",
+                return_value=stale_evidence,
+            ):
+                stale_validation = orchestrator._validate_recovery_stop(
+                    state,
+                    task,
+                    task,
+                    review,
+                    1,
+                    {
+                        "owner": "external_provider",
+                        "prerequisite_keys": [prerequisite["key"]],
+                        "evidence_refs": [
+                            prerequisite["evidence_ref"],
+                            *prerequisite["evidence_refs"],
+                        ],
+                    },
+                )
+
+            self.assertFalse(stale_validation["valid"])
+            self.assertIn(
+                "not a current unsatisfied engine-generated recovery record",
+                stale_validation["reason"],
+            )
 
     def test_recovery_judge_replan_routes_scope_split_task_to_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

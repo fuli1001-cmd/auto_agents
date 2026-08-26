@@ -421,6 +421,7 @@ class Orchestrator:
         "verification_contract": "recovery_contract_action_required",
         "verification_infrastructure": "recovery_infrastructure_action_required",
     }
+    RECOVERY_PREREQUISITE_SCHEMA_VERSION = 1
 
     def __init__(
         self,
@@ -13194,6 +13195,108 @@ class Orchestrator:
             "pending_requests": pending_requests,
         }
 
+    @classmethod
+    def _recovery_stop_owner_from_incident(
+        cls,
+        incident: Mapping[str, object],
+    ) -> str:
+        """Derive terminal ownership only from engine-owned incident fields."""
+
+        if str(incident.get("status", "")).strip() != "needs_human":
+            return ""
+        if str(incident.get("source", "")).strip() == "provider":
+            return "external_provider"
+
+        raw_diagnosis = incident.get("diagnosis", {})
+        diagnosis = (
+            dict(raw_diagnosis) if isinstance(raw_diagnosis, dict) else {}
+        )
+        if str(diagnosis.get("source", "")).strip() != "deterministic":
+            return ""
+        diagnosed_owner = str(diagnosis.get("owner", "")).strip()
+        diagnosed_owner = {
+            "execution_environment": "verification_infrastructure",
+            "requirements": "verification_contract",
+        }.get(diagnosed_owner, diagnosed_owner)
+        if diagnosed_owner == "user_input":
+            # User-owned blockers require an outstanding typed input request.
+            return ""
+        return (
+            diagnosed_owner
+            if diagnosed_owner in cls.RECOVERY_STOP_OWNERS
+            else ""
+        )
+
+    def _recovery_prerequisite_evidence(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        *,
+        current_fingerprint: str,
+    ) -> List[Dict[str, object]]:
+        """Build typed, current non-input prerequisites from trusted state."""
+
+        active_incident_id = str(
+            state.active_execution_incident_id
+        ).strip()
+        if not active_incident_id:
+            return []
+        incident = next(
+            (
+                dict(entry)
+                for entry in reversed(state.execution_incidents)
+                if isinstance(entry, dict)
+                and str(entry.get("incident_id", "")).strip()
+                == active_incident_id
+            ),
+            {},
+        )
+        if not incident:
+            return []
+        if int(incident.get("budget_epoch", 0) or 0) != int(
+            state.execution_incident_budget_epoch
+        ):
+            return []
+
+        lineage_ids = {
+            candidate.task_id
+            for candidate in self._recovery_lineage_tasks(tasks, task)
+        }
+        lineage_ids.add(owner.task_id)
+        incident_task_id = str(incident.get("task_id", "")).strip()
+        if incident_task_id and incident_task_id not in lineage_ids:
+            return []
+
+        stop_owner = self._recovery_stop_owner_from_incident(incident)
+        source_fingerprint = str(
+            incident.get("evidence_fingerprint")
+            or incident.get("incident_fingerprint", "")
+        ).strip()
+        if not stop_owner or not source_fingerprint or not current_fingerprint:
+            return []
+
+        prerequisite_key = f"execution_incident:{active_incident_id}"
+        source_ref = f"execution-incident:{active_incident_id}"
+        evidence_ref = f"recovery-prerequisite:{active_incident_id}"
+        return [
+            {
+                "schema_version": self.RECOVERY_PREREQUISITE_SCHEMA_VERSION,
+                "evidence_ref": evidence_ref,
+                "key": prerequisite_key,
+                "status": "unsatisfied",
+                "owner": stop_owner,
+                "category": self.RECOVERY_STOP_CATEGORIES[stop_owner],
+                "source": "execution_incident",
+                "source_id": active_incident_id,
+                "source_fingerprint": source_fingerprint,
+                "current_fingerprint": current_fingerprint,
+                "evidence_refs": [source_ref],
+                "generated_by": "auto_agents",
+            }
+        ]
+
     def _recovery_judge_evidence(
         self,
         state: RunState,
@@ -13267,6 +13370,45 @@ class Orchestrator:
                         "kind": group.rstrip("s"),
                         "entry": dict(entry),
                     }
+        current_fingerprint = self._recovery_evidence_fingerprint(
+            owner,
+            state=state,
+            tasks=tasks,
+        )
+        recovery_prerequisites = self._recovery_prerequisite_evidence(
+            state,
+            tasks,
+            task,
+            owner,
+            current_fingerprint=current_fingerprint,
+        )
+        incidents_by_id = {
+            str(entry.get("incident_id", "")).strip(): dict(entry)
+            for entry in state.execution_incidents
+            if isinstance(entry, dict)
+            and str(entry.get("incident_id", "")).strip()
+        }
+        for prerequisite in recovery_prerequisites:
+            source_id = str(prerequisite.get("source_id", "")).strip()
+            source_refs = prerequisite.get("evidence_refs", [])
+            source_ref = (
+                str(source_refs[0]).strip()
+                if isinstance(source_refs, list) and source_refs
+                else ""
+            )
+            if source_ref and source_id in incidents_by_id:
+                evidence_catalog[source_ref] = {
+                    "kind": "execution_incident",
+                    "entry": incidents_by_id[source_id],
+                }
+            evidence_ref = str(
+                prerequisite.get("evidence_ref", "")
+            ).strip()
+            if evidence_ref:
+                evidence_catalog[evidence_ref] = {
+                    "kind": "recovery_prerequisite",
+                    "entry": dict(prerequisite),
+                }
         return {
             "task": task.to_dict(),
             "lineage_owner": owner.to_dict(),
@@ -13278,6 +13420,8 @@ class Orchestrator:
             "latest_review": review,
             "changed_paths": changed,
             "operator_inputs": operator_inputs,
+            "current_fingerprint": current_fingerprint,
+            "recovery_prerequisites": recovery_prerequisites,
             "evidence_catalog": evidence_catalog,
         }
 
@@ -13565,6 +13709,9 @@ class Orchestrator:
             "The operator_inputs section is authoritative and contains status only; all values are redacted.",
             "Never claim that an operator input is missing when its record or active binding is available.",
             "For a user_input STOP, every prerequisite_keys item must name an outstanding pending input key and evidence_refs must cite its pending-input ref.",
+            "The recovery_prerequisites section is the authoritative list of non-user prerequisites generated by auto_agents.",
+            "For a non-user STOP, every prerequisite_keys item must exactly match an unsatisfied recovery_prerequisites key, owner must match that record, and evidence_refs must cite both its evidence_ref and supporting evidence_refs.",
+            "If no matching typed recovery prerequisite exists, do not return STOP.",
             "Every STOP must name one owner, one or more prerequisite_keys, and one or more exact refs from evidence_catalog.",
             "Do not modify files or propose changes to auto_agents itself.",
             "Return exactly one line: RECOVERY_DECISION: followed by a JSON object.",
@@ -13676,7 +13823,14 @@ class Orchestrator:
             if isinstance(catalog.get(ref), dict)
         }
         if not cited_kinds.intersection(
-            {"changed_path", "latest_review", "pending_request", "verification"}
+            {
+                "changed_path",
+                "execution_incident",
+                "latest_review",
+                "pending_request",
+                "recovery_prerequisite",
+                "verification",
+            }
         ):
             return {
                 "valid": False,
@@ -13816,6 +13970,169 @@ class Orchestrator:
                     + ", ".join(unrouted_inputs)
                 ),
             }
+
+        non_input_claims = sorted(claimed - known_input_aliases)
+        if non_input_claims:
+            typed_records: Dict[
+                str,
+                List[Tuple[str, Dict[str, object]]],
+            ] = {}
+            for catalog_ref, raw_record in catalog.items():
+                if not isinstance(raw_record, dict):
+                    continue
+                if str(raw_record.get("kind", "")) != "recovery_prerequisite":
+                    continue
+                raw_entry = raw_record.get("entry", {})
+                if not isinstance(raw_entry, dict):
+                    continue
+                entry = dict(raw_entry)
+                key = str(entry.get("key", "")).strip()
+                if not key:
+                    continue
+                typed_records.setdefault(key, []).append((catalog_ref, entry))
+
+            current_fingerprint = str(
+                evidence.get("current_fingerprint", "")
+            ).strip()
+            typed_owners: Set[str] = set()
+            for key in non_input_claims:
+                matching = typed_records.get(key, [])
+                if len(matching) != 1:
+                    return {
+                        "valid": False,
+                        "reason": (
+                            "STOP prerequisite is not bound to exactly one current "
+                            "typed recovery record: " + key
+                        ),
+                    }
+                prerequisite_ref, record = matching[0]
+                record_owner = str(record.get("owner", "")).strip()
+                record_category = str(record.get("category", "")).strip()
+                record_source = str(record.get("source", "")).strip()
+                record_fingerprint = str(
+                    record.get("current_fingerprint", "")
+                ).strip()
+                if (
+                    int(record.get("schema_version", 0) or 0)
+                    != self.RECOVERY_PREREQUISITE_SCHEMA_VERSION
+                    or str(record.get("status", "")).strip()
+                    != "unsatisfied"
+                    or str(record.get("generated_by", "")).strip()
+                    != "auto_agents"
+                    or record_owner not in self.RECOVERY_STOP_OWNERS
+                    or record_owner == "user_input"
+                    or record_category
+                    != self.RECOVERY_STOP_CATEGORIES.get(record_owner, "")
+                    or not record_source
+                    or not current_fingerprint
+                    or record_fingerprint != current_fingerprint
+                    or str(record.get("evidence_ref", "")).strip()
+                    != prerequisite_ref
+                ):
+                    return {
+                        "valid": False,
+                        "reason": (
+                            "STOP prerequisite is not a current unsatisfied "
+                            "engine-generated recovery record: " + key
+                        ),
+                    }
+                raw_supporting_refs = record.get("evidence_refs", [])
+                if (
+                    not isinstance(raw_supporting_refs, list)
+                    or not raw_supporting_refs
+                    or any(
+                        not isinstance(item, str) or not item.strip()
+                        for item in raw_supporting_refs
+                    )
+                ):
+                    return {
+                        "valid": False,
+                        "reason": (
+                            "typed STOP prerequisite has no supporting evidence: "
+                            + key
+                        ),
+                    }
+                supporting_refs = {
+                    str(item).strip() for item in raw_supporting_refs
+                }
+                required_refs = {prerequisite_ref, *supporting_refs}
+                if not required_refs.issubset(set(evidence_refs)):
+                    return {
+                        "valid": False,
+                        "reason": (
+                            "STOP does not cite the typed prerequisite and its "
+                            "supporting evidence: " + key
+                        ),
+                    }
+                if not supporting_refs.issubset(set(catalog)):
+                    return {
+                        "valid": False,
+                        "reason": (
+                            "typed STOP prerequisite cites evidence absent from "
+                            "the current catalog: " + key
+                        ),
+                    }
+                if record_source != "execution_incident":
+                    return {
+                        "valid": False,
+                        "reason": (
+                            "typed STOP prerequisite has an unsupported local "
+                            "source: " + key
+                        ),
+                    }
+                source_id = str(record.get("source_id", "")).strip()
+                incident_records = [
+                    dict(catalog[ref].get("entry", {}))
+                    for ref in supporting_refs
+                    if isinstance(catalog.get(ref), dict)
+                    and str(catalog[ref].get("kind", ""))
+                    == "execution_incident"
+                    and isinstance(catalog[ref].get("entry", {}), dict)
+                    and str(
+                        catalog[ref].get("entry", {}).get("incident_id", "")
+                    ).strip()
+                    == source_id
+                ]
+                if len(incident_records) != 1:
+                    return {
+                        "valid": False,
+                        "reason": (
+                            "typed STOP prerequisite is not bound to exactly one "
+                            "execution incident: " + key
+                        ),
+                    }
+                source_incident = incident_records[0]
+                source_fingerprint = str(
+                    source_incident.get("evidence_fingerprint")
+                    or source_incident.get("incident_fingerprint", "")
+                ).strip()
+                if (
+                    source_id != str(state.active_execution_incident_id).strip()
+                    or int(source_incident.get("budget_epoch", 0) or 0)
+                    != int(state.execution_incident_budget_epoch)
+                    or self._recovery_stop_owner_from_incident(source_incident)
+                    != record_owner
+                    or source_fingerprint
+                    != str(record.get("source_fingerprint", "")).strip()
+                ):
+                    return {
+                        "valid": False,
+                        "reason": (
+                            "typed STOP prerequisite conflicts with its current "
+                            "execution incident: " + key
+                        ),
+                    }
+                typed_owners.add(record_owner)
+
+            if typed_owners != {stop_owner}:
+                return {
+                    "valid": False,
+                    "reason": (
+                        "STOP owner does not match the typed prerequisite owner: "
+                        + ", ".join(sorted(typed_owners))
+                    ),
+                }
+            stop_owner = next(iter(typed_owners))
 
         return {
             "valid": True,
