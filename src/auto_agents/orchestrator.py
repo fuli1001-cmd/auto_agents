@@ -402,6 +402,7 @@ class Orchestrator:
     MAX_CHANGED_FAILURE_RECOVERY_EPOCHS = 1
     RECOVERY_LOOP_REPEAT_THRESHOLD = 2
     FRONTEND_CONTRACT_RECOVERY_CONTEXT = "frontend_design_contract_recovery"
+    INSTALLED_ENGINE_RECOVERY_CONTEXT = "installed_engine_recovery_revisions"
 
     def __init__(
         self,
@@ -816,6 +817,110 @@ class Orchestrator:
             state.implement_verify_baseline_ref = ""
         if target_index < STAGE_ORDER.index("implement"):
             self._clear_stale_implementation_resume_markers(state)
+
+    @staticmethod
+    def _installed_engine_revision() -> str:
+        """Identify the installed engine even when it is not running from Git."""
+        engine_root = Path(__file__).resolve().parents[2]
+        revision = head_ref(engine_root)
+        hasher = hashlib.sha256()
+        for name in ("orchestrator.py", "requirements.py"):
+            path = Path(__file__).resolve().parent / name
+            try:
+                hasher.update(path.read_bytes())
+            except OSError:
+                hasher.update(f"missing:{name}".encode("utf-8"))
+            hasher.update(b"\0")
+        source_fingerprint = hasher.hexdigest()
+        return f"{revision or 'source'}:{source_fingerprint}"
+
+    def _normalize_installed_requirement_namespace_repair(
+        self,
+        state: RunState,
+    ) -> bool:
+        """Resume a namespace repair supplied by an externally upgraded engine.
+
+        Automatic self-repair marks its commit before resuming.  A user may instead
+        update auto_agents out of band and rerun the original command.  In that
+        case the persisted blocker has no self_repair_commit, so the normal resume
+        path used to keep the repaired run blocked forever.
+        """
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        if (
+            state.status != "blocked"
+            or str(blocker.get("owner", "")).strip() != "auto_agents"
+            or str(blocker.get("category", "")).strip()
+            != "requirements_recovery_namespace_collision"
+        ):
+            return False
+
+        revision = self._installed_engine_revision()
+        recovery_revisions = state.resume_context.get(
+            self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
+            {},
+        )
+        if not isinstance(recovery_revisions, dict):
+            recovery_revisions = {}
+        if (
+            str(recovery_revisions.get("requirements_recovery_namespace_collision", ""))
+            == revision
+        ):
+            return False
+
+        trace = load_requirements_trace(self.project_root, normalize=False)
+        historical_tasks = (
+            load_archived_done_task_payloads(self.project_root)
+            + self._done_task_payloads(state.tasks)
+        )
+        collisions = historical_requirement_contract_collision_ids(
+            trace,
+            historical_tasks,
+        )
+        if not collisions:
+            return False
+
+        next_requirement_id = next_unused_requirement_id(
+            trace,
+            historical_tasks=historical_tasks,
+        )
+        recovery_revisions["requirements_recovery_namespace_collision"] = revision
+        state.resume_context[self.INSTALLED_ENGINE_RECOVERY_CONTEXT] = (
+            recovery_revisions
+        )
+        state.agent_attempts.pop("requirements_audit_recovery", None)
+        self._rewind_state_from_stage(state, "clarify")
+        state.rejected_stage = "clarify"
+        state.rejection_reason = (
+            "The installed auto_agents engine now has archive-aware requirement "
+            "namespace recovery. Recover forward from clarify: preserve collided "
+            f"delivered IDs {', '.join(collisions)} as superseded with reciprocal "
+            "links, allocate replacements starting at the archive-aware next unused "
+            f"ID {next_requirement_id}, and do not edit or delete archived tasks or "
+            "proofs."
+        )
+        blocker.update(
+            {
+                "status": "retrying",
+                "installed_engine_recovery_revision": revision,
+                "installed_engine_recovery_collisions": collisions,
+                "installed_engine_recovery_next_requirement_id": next_requirement_id,
+                "updated_at": utc_now_iso(),
+            }
+        )
+        state.active_blocker = blocker
+        state.last_error = ""
+        self.logger.info(
+            "[self-repair] resumed externally upgraded requirement namespace "
+            "repair revision=%s collisions=%s next=%s",
+            revision.split(":", 1)[0],
+            ",".join(collisions),
+            next_requirement_id,
+        )
+        return True
 
     def _normalize_legacy_requirements_audit_resume(self, state: RunState) -> bool:
         last_error = state.last_error.strip()
@@ -2386,6 +2491,8 @@ class Orchestrator:
             if self._normalize_valid_plan_retry_outcome(state):
                 save_run_state(self.project_root, state)
             if not restart_blocked:
+                if self._normalize_installed_requirement_namespace_repair(state):
+                    save_run_state(self.project_root, state)
                 if self._resume_blocked_run(state):
                     save_run_state(self.project_root, state)
                 if state.status == "blocked":
@@ -16125,6 +16232,7 @@ class Orchestrator:
                 "parallel_task_path_history",
                 "restarted_blocked_run_id",
                 self.FRONTEND_CONTRACT_RECOVERY_CONTEXT,
+                self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
             )
             if key in state.resume_context
         }

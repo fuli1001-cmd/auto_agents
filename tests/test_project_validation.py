@@ -1171,6 +1171,125 @@ class ProjectValidationTests(unittest.TestCase):
                 "repair-namespace",
             )
 
+    def test_installed_engine_upgrade_reopens_namespace_recovery_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-032",
+                            "text": "Current replacement contract.",
+                            "source": "spec.md",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["Current behavior passes."],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            write_json(
+                project_root
+                / ".auto-agents"
+                / "history"
+                / "task_plans"
+                / "old-run.json",
+                {
+                    "tasks": [
+                        {
+                            "task_id": "task-old",
+                            "title": "Delivered historical contract",
+                            "description": "Already delivered.",
+                            "acceptance": ["done"],
+                            "requirement_ids": ["REQ-223"],
+                            "requirement_proofs": [
+                                {
+                                    "requirement_id": "REQ-032",
+                                    "requirement_contract_sha256": "sha256:historical",
+                                    "status": "verified",
+                                }
+                            ],
+                            "status": "done",
+                            "commit_message": "",
+                        }
+                    ]
+                },
+            )
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.current_stage = "verify"
+            state.agent_attempts["requirements_audit_recovery"] = 4
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "requirements_recovery_namespace_collision",
+                "reason": "automatic auto_agents self-repair failed",
+                "status": "blocked",
+            }
+
+            orchestrator = Orchestrator(project_root)
+            with patch.object(
+                orchestrator,
+                "_installed_engine_revision",
+                return_value="engine-revision-2",
+            ):
+                changed = orchestrator._normalize_installed_requirement_namespace_repair(
+                    state
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.current_stage, "clarify")
+            self.assertEqual(state.rejected_stage, "clarify")
+            self.assertNotIn("requirements_audit_recovery", state.agent_attempts)
+            self.assertIn("REQ-032", state.rejection_reason)
+            self.assertIn("REQ-224", state.rejection_reason)
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Iteration\n")
+            orchestrator._capture_resume_context(
+                state,
+                spec_file=spec_file,
+                auto_approve=True,
+                allow_dirty_tree=False,
+                max_tasks=None,
+                skip_validate=False,
+                print_agent_output=False,
+                provider_kind="mock",
+                doc_language=None,
+            )
+            self.assertEqual(
+                state.resume_context[
+                    Orchestrator.INSTALLED_ENGINE_RECOVERY_CONTEXT
+                ]["requirements_recovery_namespace_collision"],
+                "engine-revision-2",
+            )
+
+            state.status = "blocked"
+            state.active_blocker["status"] = "blocked"
+            with patch.object(
+                orchestrator,
+                "_installed_engine_revision",
+                return_value="engine-revision-2",
+            ):
+                changed_again = (
+                    orchestrator._normalize_installed_requirement_namespace_repair(
+                        state
+                    )
+                )
+
+            self.assertFalse(changed_again)
+            self.assertEqual(state.status, "blocked")
+
     def test_validation_report_rejects_empty_plan_after_plan_stage(self) -> None:
         for lineage_key in ("previous_run_id", "restarted_blocked_run_id"):
             with self.subTest(lineage_key=lineage_key), tempfile.TemporaryDirectory() as tmp:
