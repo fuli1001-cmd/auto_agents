@@ -477,6 +477,9 @@ class OperatorInputStoreTests(unittest.TestCase):
                 owner,
                 reason="authorized source is required",
                 signature="same-failure",
+                blocker_owner="user_input",
+                prerequisite_keys=[request.key],
+                evidence_refs=[f"pending-input:{request.request_id}"],
             )
 
             self.assertTrue(stopped)
@@ -485,6 +488,189 @@ class OperatorInputStoreTests(unittest.TestCase):
             self.assertEqual(repair.status, "waiting_user")
             self.assertEqual(repair.required_inputs[0]["key"], request.key)
             self.assertEqual(state.active_input_request_id, request.request_id)
+
+    def test_answered_bound_input_rejects_provider_stop_and_requeues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            request = _request(
+                key="fixture.source",
+                kind="url",
+                question="Provide the authorized fixture URL",
+                validation={"https_only": True},
+                bindings=[
+                    {
+                        "env": "TEST_FIXTURE_URL",
+                        "projection": "value",
+                    }
+                ],
+                task_id="bounded-repair",
+            )
+            task = TaskSpec(
+                task_id="bounded-repair",
+                title="Repair the bounded failure",
+                description="Address the latest implementation failure.",
+                acceptance=["The boundary proof passes."],
+                status="in_progress",
+                task_origin="scope_split",
+                operator_input_bindings=[
+                    {
+                        "input_key": request.key,
+                        "env": "TEST_FIXTURE_URL",
+                        "projection": "value",
+                    }
+                ],
+                verify_history=[
+                    {
+                        "attempt": 1,
+                        "decision": "fail",
+                        "summary": "The worker reached a later bounded failure.",
+                        "failure_ids": ["tests/test_boundary.py::test_import"],
+                    }
+                ],
+            )
+            state = load_run_state(project)
+            state.tasks = [task]
+            before = orchestrator._recovery_evidence_fingerprint(
+                task,
+                state=state,
+                tasks=state.tasks,
+            )
+            answer = "https://example.test/authorized-fixture"
+            orchestrator._operator_inputs.save_answer(request, answer)
+            secret_request = _request(
+                key="provider.test_token",
+                kind="secret",
+                question="Provide the test provider token",
+                sensitivity="secret",
+                validation={},
+                bindings=[],
+            )
+            secret_answer = "never-render-this-token"
+            orchestrator._operator_inputs.save_answer(
+                secret_request,
+                secret_answer,
+            )
+            after = orchestrator._recovery_evidence_fingerprint(
+                task,
+                state=state,
+                tasks=state.tasks,
+            )
+            review = "The latest verification reached an implementation failure."
+            evidence = orchestrator._recovery_judge_evidence(
+                state,
+                task,
+                task,
+                review,
+                1,
+            )
+
+            self.assertNotEqual(before, after)
+            serialized_evidence = json.dumps(evidence, ensure_ascii=False)
+            self.assertNotIn(answer, serialized_evidence)
+            self.assertNotIn(secret_answer, serialized_evidence)
+            record = next(
+                item
+                for item in evidence["operator_inputs"]["records"]
+                if item["key"] == request.key
+            )
+            binding = evidence["operator_inputs"]["bindings"][0]
+            self.assertTrue(record["present"])
+            self.assertTrue(binding["available"])
+
+            with mock.patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                return_value={
+                    "decision": "STOP",
+                    "reason": "The fixture input is still missing.",
+                    "actionable_items": [],
+                    "split_axis": [],
+                    "owner": "user_input",
+                    "prerequisite_keys": [request.key],
+                    "evidence_refs": [
+                        "latest-review",
+                        f"operator-input:{request.key}",
+                    ],
+                    "source": "provider",
+                },
+            ):
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    {
+                        "reason": "review rejected the task",
+                        "review": review,
+                        "failure_ids": ["tests/test_boundary.py::test_import"],
+                    },
+                )
+
+            self.assertTrue(scheduled)
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(task.recovery_history[-1]["result"], "requeued")
+            self.assertIn("rejected_stop", task.recovery_history[-1])
+            self.assertEqual(state.last_recovery_route["outcome"], "requeued")
+            self.assertEqual(
+                state.last_recovery_route["judge_source"],
+                "reconciled_fallback",
+            )
+            self.assertEqual(state.active_blocker, {})
+
+    def test_provider_stop_for_outstanding_input_routes_wait_user(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            task = TaskSpec(
+                task_id="bounded-repair",
+                title="Repair the bounded failure",
+                description="Run the authorized boundary proof.",
+                acceptance=["The boundary proof passes."],
+                status="in_progress",
+                task_origin="scope_split",
+            )
+            request = _request(task_id=task.task_id)
+            state = load_run_state(project)
+            state.tasks = [task]
+            state.pending_input_requests = [request.to_dict()]
+
+            with mock.patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                return_value={
+                    "decision": "STOP",
+                    "reason": "The authorization is genuinely outstanding.",
+                    "actionable_items": [],
+                    "split_axis": [],
+                    "owner": "user_input",
+                    "prerequisite_keys": [request.key],
+                    "evidence_refs": [
+                        f"pending-input:{request.request_id}",
+                    ],
+                    "source": "provider",
+                },
+            ):
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    {
+                        "reason": "review rejected the task",
+                        "review": "Authorization must exist before the proof runs.",
+                    },
+                )
+
+            self.assertTrue(scheduled)
+            self.assertEqual(state.status, "waiting_user")
+            self.assertEqual(task.status, "waiting_user")
+            self.assertEqual(state.active_blocker, {})
+            self.assertEqual(state.active_input_request_id, request.request_id)
+            self.assertEqual(
+                state.last_recovery_route["stop_owner"],
+                "user_input",
+            )
 
     def test_pending_task_with_persisted_input_is_reconciled_on_resume(self):
         with tempfile.TemporaryDirectory() as tmp:

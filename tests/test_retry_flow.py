@@ -7132,9 +7132,16 @@ class RetryFlowTests(unittest.TestCase):
             '{"decision":"REPLAN","reason":"too broad","actionable_items":[],'
             '"split_axis":["selection", "proof"]}'
         )
-        stop = Orchestrator._parse_recovery_judge_decision(
+        legacy_stop = Orchestrator._parse_recovery_judge_decision(
             '{"decision":"STOP","reason":"external input required",'
             '"actionable_items":[],"split_axis":[]}'
+        )
+        stop = Orchestrator._parse_recovery_judge_decision(
+            '{"decision":"STOP","reason":"external contract required",'
+            '"actionable_items":[],"split_axis":[],'
+            '"owner":"verification_contract",'
+            '"prerequisite_keys":["acceptance.contract"],'
+            '"evidence_refs":["latest-review"]}'
         )
         invalid = Orchestrator._parse_recovery_judge_decision(
             '{"decision":"CONTINUE","reason":"fixable","actionable_items":[]}'
@@ -7142,7 +7149,9 @@ class RetryFlowTests(unittest.TestCase):
 
         self.assertEqual(cont["decision"], "CONTINUE")
         self.assertEqual(replan["decision"], "REPLAN")
+        self.assertEqual(legacy_stop["decision"], "")
         self.assertEqual(stop["decision"], "STOP")
+        self.assertEqual(stop["owner"], "verification_contract")
         self.assertEqual(invalid["decision"], "")
 
     def test_recovery_judge_stop_is_a_persisted_terminal_route(self) -> None:
@@ -7169,6 +7178,9 @@ class RetryFlowTests(unittest.TestCase):
                     "reason": "The review requires external clarification.",
                     "actionable_items": [],
                     "split_axis": [],
+                    "owner": "verification_contract",
+                    "prerequisite_keys": ["acceptance.contract"],
+                    "evidence_refs": ["latest-review"],
                     "source": "provider",
                 },
             ):
@@ -7188,10 +7200,13 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.last_recovery_route["outcome"], "judge_stopped")
             self.assertEqual(state.last_recovery_route["judge_source"], "provider")
             self.assertEqual(state.status, "blocked")
-            self.assertEqual(state.active_blocker["owner"], "target_project")
+            self.assertEqual(
+                state.active_blocker["owner"],
+                "verification_contract",
+            )
             self.assertEqual(
                 state.active_blocker["category"],
-                "recovery_external_action_required",
+                "recovery_contract_action_required",
             )
             self.assertIn("external clarification", state.active_blocker["reason"])
 

@@ -403,6 +403,22 @@ class Orchestrator:
     RECOVERY_LOOP_REPEAT_THRESHOLD = 2
     FRONTEND_CONTRACT_RECOVERY_CONTEXT = "frontend_design_contract_recovery"
     INSTALLED_ENGINE_RECOVERY_CONTEXT = "installed_engine_recovery_revisions"
+    RECOVERY_STOP_OWNERS = frozenset(
+        {
+            "external_provider",
+            "target_project",
+            "user_input",
+            "verification_contract",
+            "verification_infrastructure",
+        }
+    )
+    RECOVERY_STOP_CATEGORIES = {
+        "external_provider": "recovery_provider_action_required",
+        "target_project": "recovery_external_action_required",
+        "user_input": "user_input_required",
+        "verification_contract": "recovery_contract_action_required",
+        "verification_infrastructure": "recovery_infrastructure_action_required",
+    }
 
     def __init__(
         self,
@@ -7691,8 +7707,12 @@ class Orchestrator:
                     ",".join(requeued_task_ids),
                 )
         if str(blocker.get("category", "")) in {
+            "recovery_action_required",
+            "recovery_contract_action_required",
             "recovery_external_action_required",
             "recovery_evidence_change_required",
+            "recovery_infrastructure_action_required",
+            "recovery_provider_action_required",
         }:
             lineage_id = str(
                 state.last_recovery_route.get("lineage_id", "")
@@ -12884,7 +12904,275 @@ class Orchestrator:
             owner = parent
         return owner
 
-    def _recovery_evidence_fingerprint(self, task: TaskSpec) -> str:
+    def _recovery_operator_input_evidence(
+        self,
+        state: Optional[RunState],
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+    ) -> Dict[str, object]:
+        """Return value-free operator-input evidence for recovery decisions."""
+
+        lineage_source = list(tasks)
+        if not any(
+            candidate.task_id == owner.task_id
+            for candidate in lineage_source
+        ):
+            lineage_source.append(owner)
+        lineage = self._recovery_lineage_tasks(lineage_source, task)
+        lineage_ids = {candidate.task_id for candidate in lineage}
+        bindings: List[Dict[str, object]] = []
+        seen_bindings: Set[Tuple[str, str, str, str]] = set()
+        for candidate in lineage:
+            candidate_bindings = [
+                dict(item)
+                for item in candidate.operator_input_bindings
+                if isinstance(item, dict)
+            ]
+            for required in candidate.required_inputs:
+                if not isinstance(required, dict):
+                    continue
+                required_key = str(required.get("key", "")).strip()
+                for raw_binding in required.get("bindings", []) or []:
+                    if not isinstance(raw_binding, dict):
+                        continue
+                    normalized = dict(raw_binding)
+                    normalized.setdefault("input_key", required_key)
+                    candidate_bindings.append(normalized)
+            for raw_binding in candidate_bindings:
+                input_key = str(raw_binding.get("input_key", "")).strip()
+                environment = str(raw_binding.get("env", "")).strip()
+                projection = str(raw_binding.get("projection", "value")).strip()
+                if not input_key:
+                    continue
+                identity = (
+                    candidate.task_id,
+                    input_key,
+                    environment,
+                    projection,
+                )
+                if identity in seen_bindings:
+                    continue
+                seen_bindings.add(identity)
+                available = False
+                try:
+                    projected_value = self._operator_inputs.value_for(
+                        input_key,
+                        projection,
+                    )
+                    available = projected_value is not None
+                    if available and projection in {
+                        "artifact_path",
+                        "runtime_path",
+                    }:
+                        available = Path(str(projected_value)).is_file()
+                except (OSError, TypeError, ValueError):
+                    available = False
+                bindings.append(
+                    {
+                        "evidence_ref": (
+                            f"operator-binding:{candidate.task_id}:"
+                            f"{len(bindings)}"
+                        ),
+                        "task_id": candidate.task_id,
+                        "input_key": input_key,
+                        "env": environment,
+                        "projection": projection,
+                        "required": bool(raw_binding.get("required", True)),
+                        "available": available,
+                    }
+                )
+
+        bound_keys = {
+            str(binding.get("input_key", ""))
+            for binding in bindings
+            if str(binding.get("input_key", ""))
+        }
+        records: List[Dict[str, object]] = []
+        for key, record in sorted(self._operator_inputs.records().items()):
+            stored_projections: List[str] = []
+            if record.get("value") is not None or record.get("secret_env"):
+                stored_projections.append("value")
+            stored_projections.extend(
+                projection
+                for projection in (
+                    "artifact_path",
+                    "runtime_path",
+                    "version",
+                    "sha256",
+                )
+                if record.get(projection) not in (None, "")
+            )
+            available_projections: List[str] = []
+            for projection in stored_projections:
+                try:
+                    projected_value = self._operator_inputs.value_for(
+                        key,
+                        projection,
+                    )
+                    if projected_value is None:
+                        continue
+                    if projection in {"artifact_path", "runtime_path"} and not Path(
+                        str(projected_value)
+                    ).is_file():
+                        continue
+                    available_projections.append(projection)
+                except (OSError, TypeError, ValueError):
+                    continue
+            records.append(
+                {
+                    "evidence_ref": f"operator-input:{key}",
+                    "key": key,
+                    "kind": str(record.get("kind", "")),
+                    "sensitivity": str(record.get("sensitivity", "")),
+                    "revision": int(record.get("revision", 0) or 0),
+                    "question_version": int(
+                        record.get("question_version", 0) or 0
+                    ),
+                    "present": bool(available_projections),
+                    "available_projections": available_projections,
+                    "bound_to_lineage": key in bound_keys,
+                }
+            )
+
+        pending_requests: List[Dict[str, object]] = []
+        raw_pending = state.pending_input_requests if state is not None else []
+        for payload in raw_pending:
+            try:
+                request = UserInputRequest.from_dict(payload)
+            except (TypeError, ValueError):
+                continue
+            try:
+                valid, _ = self._operator_inputs.is_valid(request)
+            except (OSError, TypeError, ValueError):
+                valid = False
+            pending_bindings = [
+                {
+                    "input_key": str(
+                        binding.get("input_key", request.key)
+                    ).strip(),
+                    "env": str(binding.get("env", "")).strip(),
+                    "projection": str(
+                        binding.get("projection", "value")
+                    ).strip(),
+                }
+                for binding in request.bindings
+            ]
+            pending_requests.append(
+                {
+                    "evidence_ref": f"pending-input:{request.request_id}",
+                    "request_id": request.request_id,
+                    "key": request.key,
+                    "kind": request.kind,
+                    "task_id": request.task_id,
+                    "state": "resolved" if valid else "outstanding",
+                    "validation_status": "valid" if valid else "invalid",
+                    "bindings": pending_bindings,
+                    "in_recovery_lineage": request.task_id in lineage_ids,
+                }
+            )
+
+        return {
+            "values_redacted": True,
+            "records": records,
+            "bindings": bindings,
+            "pending_requests": pending_requests,
+        }
+
+    def _recovery_judge_evidence(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        owner: TaskSpec,
+        review: str,
+        next_round: int,
+    ) -> Dict[str, object]:
+        tasks = list(state.tasks) or [task]
+        operator_inputs = self._recovery_operator_input_evidence(
+            state,
+            tasks,
+            task,
+            owner,
+        )
+        evidence_catalog: Dict[str, Dict[str, object]] = {
+            "latest-review": {
+                "kind": "latest_review",
+                "text": review,
+            },
+            f"task-contract:{task.task_id}": {
+                "kind": "task_contract",
+                "task_id": task.task_id,
+            },
+            f"lineage-contract:{owner.task_id}": {
+                "kind": "lineage_contract",
+                "task_id": owner.task_id,
+            },
+        }
+        verify_start = max(0, len(task.verify_history) - 4)
+        verify_history: List[Dict[str, object]] = []
+        for index, raw_entry in enumerate(
+            task.verify_history[-4:],
+            start=verify_start,
+        ):
+            entry = dict(raw_entry)
+            evidence_ref = f"verification:{task.task_id}:{index}"
+            entry["evidence_ref"] = evidence_ref
+            verify_history.append(entry)
+            evidence_catalog[evidence_ref] = {
+                "kind": "verification",
+                "entry": dict(raw_entry),
+            }
+        recovery_start = max(0, len(task.recovery_history) - 4)
+        recovery_history: List[Dict[str, object]] = []
+        for index, raw_entry in enumerate(
+            task.recovery_history[-4:],
+            start=recovery_start,
+        ):
+            entry = dict(raw_entry)
+            evidence_ref = f"recovery-history:{task.task_id}:{index}"
+            entry["evidence_ref"] = evidence_ref
+            recovery_history.append(entry)
+            evidence_catalog[evidence_ref] = {
+                "kind": "recovery_history",
+                "entry": dict(raw_entry),
+            }
+        changed = changed_paths(self.project_root)[:40]
+        for index, path in enumerate(changed):
+            evidence_catalog[f"changed-path:{index}"] = {
+                "kind": "changed_path",
+                "path": path,
+            }
+        for group in ("records", "bindings", "pending_requests"):
+            for entry in operator_inputs.get(group, []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                evidence_ref = str(entry.get("evidence_ref", "")).strip()
+                if evidence_ref:
+                    evidence_catalog[evidence_ref] = {
+                        "kind": group.rstrip("s"),
+                        "entry": dict(entry),
+                    }
+        return {
+            "task": task.to_dict(),
+            "lineage_owner": owner.to_dict(),
+            "next_round": next_round,
+            "max_rounds": int(self.config.execution.recovery.max_rounds),
+            "review_history": task.review_history[-6:],
+            "verify_history": verify_history,
+            "recovery_history": recovery_history,
+            "latest_review": review,
+            "changed_paths": changed,
+            "operator_inputs": operator_inputs,
+            "evidence_catalog": evidence_catalog,
+        }
+
+    def _recovery_evidence_fingerprint(
+        self,
+        task: TaskSpec,
+        *,
+        state: Optional[RunState] = None,
+        tasks: Optional[List[TaskSpec]] = None,
+    ) -> str:
         contract = {
             "task_id": task.task_id,
             "title": task.title,
@@ -12898,6 +13186,63 @@ class Orchestrator:
             "scope_boundaries": task.scope_boundaries,
             "persistence_change": task.persistence_change,
         }
+        task_list = list(tasks or (state.tasks if state is not None else [task]))
+        fingerprint_owner = self._recovery_lineage_owner(task_list, task)
+        input_evidence = self._recovery_operator_input_evidence(
+            state,
+            task_list,
+            task,
+            fingerprint_owner,
+        )
+        input_keys = {
+            str(binding.get("input_key", ""))
+            for binding in input_evidence.get("bindings", []) or []
+            if isinstance(binding, dict)
+            and str(binding.get("input_key", ""))
+        }
+        input_keys.update(
+            str(request.get("key", ""))
+            for request in input_evidence.get("pending_requests", []) or []
+            if isinstance(request, dict)
+            and bool(request.get("in_recovery_lineage"))
+            and str(request.get("key", ""))
+        )
+        input_status = {
+            "records": [
+                {
+                    "key": record.get("key"),
+                    "revision": record.get("revision"),
+                    "present": record.get("present"),
+                    "available_projections": record.get(
+                        "available_projections", []
+                    ),
+                }
+                for record in input_evidence.get("records", []) or []
+                if isinstance(record, dict)
+                and str(record.get("key", "")) in input_keys
+            ],
+            "bindings": [
+                {
+                    "task_id": binding.get("task_id"),
+                    "input_key": binding.get("input_key"),
+                    "env": binding.get("env"),
+                    "projection": binding.get("projection"),
+                    "available": binding.get("available"),
+                }
+                for binding in input_evidence.get("bindings", []) or []
+                if isinstance(binding, dict)
+            ],
+            "pending_requests": [
+                {
+                    "request_id": request.get("request_id"),
+                    "key": request.get("key"),
+                    "state": request.get("state"),
+                }
+                for request in input_evidence.get("pending_requests", []) or []
+                if isinstance(request, dict)
+                and bool(request.get("in_recovery_lineage"))
+            ],
+        }
         payload = {
             "head": head_ref(self.project_root),
             "worktree": worktree_fingerprint(self.project_root),
@@ -12908,6 +13253,8 @@ class Orchestrator:
                 "implementation_scope_policy_version": IMPLEMENTATION_SCOPE_POLICY_VERSION,
             },
         }
+        if input_keys or input_status["bindings"] or input_status["pending_requests"]:
+            payload["operator_inputs"] = input_status
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
         ).hexdigest()[:24]
@@ -12947,9 +13294,13 @@ class Orchestrator:
         judge_source: str = "",
         engine_invariant: str = "",
         lineage_owner: Optional[TaskSpec] = None,
+        stop_owner: str = "",
+        stop_category: str = "",
+        prerequisite_keys: Optional[List[str]] = None,
+        evidence_refs: Optional[List[str]] = None,
     ) -> None:
         owner = lineage_owner or task
-        state.last_recovery_route = {
+        route = {
             "task_id": task.task_id,
             "task_origin": task.task_origin,
             "lineage_id": owner.task_id,
@@ -12958,7 +13309,11 @@ class Orchestrator:
             "max_rounds": int(self.config.execution.recovery.max_rounds),
             "failure_kind": failure_kind,
             "failure_signature": signature,
-            "evidence_fingerprint": self._recovery_evidence_fingerprint(owner),
+            "evidence_fingerprint": self._recovery_evidence_fingerprint(
+                owner,
+                state=state,
+                tasks=state.tasks,
+            ),
             "judge_decision": judge_decision,
             "judge_source": judge_source,
             "outcome": outcome,
@@ -12966,34 +13321,105 @@ class Orchestrator:
             "repair_task_ids": list(repair_task_ids or []),
             "engine_invariant": engine_invariant,
         }
+        if stop_owner or stop_category or prerequisite_keys or evidence_refs:
+            route.update(
+                {
+                    "stop_owner": stop_owner,
+                    "stop_category": stop_category,
+                    "prerequisite_keys": list(prerequisite_keys or []),
+                    "evidence_refs": list(evidence_refs or []),
+                }
+            )
+        state.last_recovery_route = route
 
     @staticmethod
     def _parse_recovery_judge_decision(raw: str) -> Dict[str, object]:
+        empty = {
+            "decision": "",
+            "reason": "invalid recovery judge decision",
+            "actionable_items": [],
+            "split_axis": [],
+            "owner": "",
+            "prerequisite_keys": [],
+            "evidence_refs": [],
+        }
         text = str(raw or "").strip()
         if text.startswith("RECOVERY_DECISION:"):
             text = text.split(":", 1)[1].strip()
         try:
             payload = json.loads(text)
         except (json.JSONDecodeError, TypeError):
-            return {"decision": "", "reason": "invalid recovery judge JSON", "actionable_items": [], "split_axis": []}
+            return dict(empty, reason="invalid recovery judge JSON")
         if not isinstance(payload, dict):
-            return {"decision": "", "reason": "recovery judge output is not an object", "actionable_items": [], "split_axis": []}
+            return dict(
+                empty,
+                reason="recovery judge output is not an object",
+            )
         decision = str(payload.get("decision", "")).strip().upper()
         reason = str(payload.get("reason", "")).strip()
         actionable = payload.get("actionable_items", [])
         split_axis = payload.get("split_axis", [])
-        actionable_items = [str(item).strip() for item in actionable if str(item).strip()] if isinstance(actionable, list) else []
-        split_items = [str(item).strip() for item in split_axis if str(item).strip()] if isinstance(split_axis, list) else []
+        owner = str(payload.get("owner", "")).strip()
+        raw_prerequisites = payload.get("prerequisite_keys", [])
+        raw_evidence_refs = payload.get("evidence_refs", [])
+        actionable_items = (
+            [str(item).strip() for item in actionable if str(item).strip()]
+            if isinstance(actionable, list)
+            else []
+        )
+        split_items = (
+            [str(item).strip() for item in split_axis if str(item).strip()]
+            if isinstance(split_axis, list)
+            else []
+        )
+        prerequisite_keys = (
+            [
+                str(item).strip()
+                for item in raw_prerequisites
+                if str(item).strip()
+            ]
+            if isinstance(raw_prerequisites, list)
+            else []
+        )
+        evidence_refs = (
+            [
+                str(item).strip()
+                for item in raw_evidence_refs
+                if str(item).strip()
+            ]
+            if isinstance(raw_evidence_refs, list)
+            else []
+        )
         valid = decision in {"CONTINUE", "REPLAN", "STOP"} and bool(reason)
         if decision == "CONTINUE":
             valid = valid and bool(actionable_items)
         if decision == "REPLAN":
             valid = valid and 2 <= len(split_items) <= 4
+        if decision == "STOP":
+            valid = (
+                valid
+                and isinstance(raw_prerequisites, list)
+                and all(
+                    isinstance(item, str) and bool(item.strip())
+                    for item in raw_prerequisites
+                )
+                and isinstance(raw_evidence_refs, list)
+                and all(
+                    isinstance(item, str) and bool(item.strip())
+                    for item in raw_evidence_refs
+                )
+                and owner in Orchestrator.RECOVERY_STOP_OWNERS
+                and bool(prerequisite_keys)
+                and bool(evidence_refs)
+            )
         return {
             "decision": decision if valid else "",
             "reason": reason or "invalid recovery judge decision",
             "actionable_items": actionable_items,
             "split_axis": split_items,
+            "owner": owner,
+            "prerequisite_keys": prerequisite_keys,
+            "evidence_refs": evidence_refs,
         }
 
     def _run_recovery_judge(
@@ -13004,17 +13430,13 @@ class Orchestrator:
         review: str,
         next_round: int,
     ) -> Dict[str, object]:
-        evidence = {
-            "task": task.to_dict(),
-            "lineage_owner": owner.to_dict(),
-            "next_round": next_round,
-            "max_rounds": int(self.config.execution.recovery.max_rounds),
-            "review_history": task.review_history[-6:],
-            "verify_history": task.verify_history[-4:],
-            "recovery_history": task.recovery_history[-4:],
-            "latest_review": review,
-            "changed_paths": changed_paths(self.project_root)[:40],
-        }
+        evidence = self._recovery_judge_evidence(
+            state,
+            task,
+            owner,
+            review,
+            next_round,
+        )
         prompt = "\n".join([
             "You are the read-only adaptive recovery judge for auto_agents.",
             f"Target project (read-only): {self.project_root}",
@@ -13023,9 +13445,13 @@ class Orchestrator:
             "CONTINUE requires concrete actionable fixes and credible remaining progress.",
             "REPLAN requires 2-4 independently testable split axes.",
             "STOP means further target-project attempts are not useful without changed evidence, clarification, or external action.",
+            "The operator_inputs section is authoritative and contains status only; all values are redacted.",
+            "Never claim that an operator input is missing when its record or active binding is available.",
+            "For a user_input STOP, every prerequisite_keys item must name an outstanding pending input key and evidence_refs must cite its pending-input ref.",
+            "Every STOP must name one owner, one or more prerequisite_keys, and one or more exact refs from evidence_catalog.",
             "Do not modify files or propose changes to auto_agents itself.",
             "Return exactly one line: RECOVERY_DECISION: followed by a JSON object.",
-            'Schema: {"decision":"CONTINUE|REPLAN|STOP","reason":"...","actionable_items":["..."],"split_axis":["..."]}',
+            'Schema: {"decision":"CONTINUE|REPLAN|STOP","reason":"...","actionable_items":["..."],"split_axis":["..."],"owner":"external_provider|target_project|user_input|verification_contract|verification_infrastructure","prerequisite_keys":["..."],"evidence_refs":["exact evidence_catalog key"]}',
             "RECOVERY_EVIDENCE_BEGIN",
             json.dumps(evidence, ensure_ascii=False, indent=2),
             "RECOVERY_EVIDENCE_END",
@@ -13046,6 +13472,9 @@ class Orchestrator:
                 "reason": f"recovery judge invocation failed: {exc}",
                 "actionable_items": [],
                 "split_axis": [],
+                "owner": "",
+                "prerequisite_keys": [],
+                "evidence_refs": [],
             }
         if not parsed.get("decision"):
             parsed["decision"] = "CONTINUE"
@@ -13054,6 +13483,231 @@ class Orchestrator:
         else:
             parsed["source"] = "provider"
         return parsed
+
+    def _validate_recovery_stop(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        owner: TaskSpec,
+        review: str,
+        next_round: int,
+        judgment: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Validate a provider STOP against inspectable, local recovery state."""
+
+        stop_owner = str(judgment.get("owner", "")).strip()
+        raw_prerequisite_keys = judgment.get("prerequisite_keys", [])
+        raw_evidence_refs = judgment.get("evidence_refs", [])
+        if not isinstance(raw_prerequisite_keys, list) or not isinstance(
+            raw_evidence_refs,
+            list,
+        ) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in [*raw_prerequisite_keys, *raw_evidence_refs]
+        ):
+            return {
+                "valid": False,
+                "reason": (
+                    "STOP prerequisite_keys and evidence_refs must be non-empty "
+                    "lists of strings"
+                ),
+            }
+        prerequisite_keys = [
+            str(item).strip()
+            for item in raw_prerequisite_keys
+            if str(item).strip()
+        ]
+        evidence_refs = [
+            str(item).strip()
+            for item in raw_evidence_refs
+            if str(item).strip()
+        ]
+        if (
+            stop_owner not in self.RECOVERY_STOP_OWNERS
+            or not prerequisite_keys
+            or not evidence_refs
+        ):
+            return {
+                "valid": False,
+                "reason": (
+                    "STOP is missing structured owner, prerequisite_keys, "
+                    "or evidence_refs"
+                ),
+            }
+
+        evidence = self._recovery_judge_evidence(
+            state,
+            task,
+            owner,
+            review,
+            next_round,
+        )
+        catalog = evidence.get("evidence_catalog", {})
+        catalog = dict(catalog) if isinstance(catalog, dict) else {}
+        unknown_refs = sorted(set(evidence_refs) - set(catalog))
+        if unknown_refs:
+            return {
+                "valid": False,
+                "reason": (
+                    "STOP cites evidence refs that are absent from the current "
+                    "recovery catalog: " + ", ".join(unknown_refs)
+                ),
+            }
+        cited_kinds = {
+            str(dict(catalog[ref]).get("kind", ""))
+            for ref in evidence_refs
+            if isinstance(catalog.get(ref), dict)
+        }
+        if not cited_kinds.intersection(
+            {"changed_path", "latest_review", "pending_request", "verification"}
+        ):
+            return {
+                "valid": False,
+                "reason": "STOP does not cite current failure or pending-input evidence",
+            }
+
+        raw_inputs = evidence.get("operator_inputs", {})
+        input_evidence = dict(raw_inputs) if isinstance(raw_inputs, dict) else {}
+        persisted_keys = {
+            str(record.get("key", ""))
+            for record in input_evidence.get("records", []) or []
+            if isinstance(record, dict)
+            and bool(record.get("present"))
+            and str(record.get("key", ""))
+        }
+        known_input_aliases = {
+            str(record.get("key", ""))
+            for record in input_evidence.get("records", []) or []
+            if isinstance(record, dict) and str(record.get("key", ""))
+        }
+        available_binding_aliases: Set[str] = set()
+        bindings_by_key: Dict[str, List[Dict[str, object]]] = {}
+        for binding in input_evidence.get("bindings", []) or []:
+            if not isinstance(binding, dict):
+                continue
+            input_key = str(binding.get("input_key", "")).strip()
+            environment = str(binding.get("env", "")).strip()
+            aliases = {input_key, environment}
+            aliases.discard("")
+            known_input_aliases.update(aliases)
+            if input_key:
+                bindings_by_key.setdefault(input_key, []).append(binding)
+            if bool(binding.get("available")):
+                if environment:
+                    available_binding_aliases.add(environment)
+        for input_key, key_bindings in bindings_by_key.items():
+            required_bindings = [
+                binding
+                for binding in key_bindings
+                if bool(binding.get("required", True))
+            ]
+            if (
+                required_bindings
+                and all(
+                    bool(binding.get("available"))
+                    for binding in required_bindings
+                )
+            ) or (
+                not required_bindings
+                and any(
+                    bool(binding.get("available"))
+                    for binding in key_bindings
+                )
+            ):
+                available_binding_aliases.add(input_key)
+        persisted_keys -= set(bindings_by_key)
+
+        pending_aliases: Set[str] = set()
+        pending_refs_by_alias: Dict[str, Set[str]] = {}
+        for request in input_evidence.get("pending_requests", []) or []:
+            if (
+                not isinstance(request, dict)
+                or str(request.get("state", "")) != "outstanding"
+                or not bool(request.get("in_recovery_lineage"))
+            ):
+                continue
+            aliases = {str(request.get("key", "")).strip()}
+            for binding in request.get("bindings", []) or []:
+                if not isinstance(binding, dict):
+                    continue
+                aliases.update(
+                    {
+                        str(binding.get("input_key", "")).strip(),
+                        str(binding.get("env", "")).strip(),
+                    }
+                )
+            aliases.discard("")
+            pending_aliases.update(aliases)
+            known_input_aliases.update(aliases)
+            pending_ref = str(request.get("evidence_ref", "")).strip()
+            for alias in aliases:
+                pending_refs_by_alias.setdefault(alias, set()).add(pending_ref)
+
+        claimed = set(prerequisite_keys)
+        satisfied = (
+            persisted_keys | available_binding_aliases
+        ) - pending_aliases
+        contradicted = sorted(claimed & satisfied)
+        if contradicted:
+            return {
+                "valid": False,
+                "reason": (
+                    "STOP prerequisites are already answered or available through "
+                    "active bindings: " + ", ".join(contradicted)
+                ),
+            }
+
+        claimed_pending = claimed & pending_aliases
+        if claimed_pending:
+            if claimed - pending_aliases:
+                return {
+                    "valid": False,
+                    "reason": (
+                        "STOP mixes outstanding inputs with prerequisites that are "
+                        "not represented by pending requests"
+                    ),
+                }
+            required_pending_refs = {
+                evidence_ref
+                for key in claimed_pending
+                for evidence_ref in pending_refs_by_alias.get(key, set())
+            }
+            if not required_pending_refs.issubset(set(evidence_refs)):
+                return {
+                    "valid": False,
+                    "reason": "STOP does not cite the matching pending-input evidence",
+                }
+            stop_owner = "user_input"
+        elif stop_owner == "user_input":
+            return {
+                "valid": False,
+                "reason": (
+                    "user_input STOP has no matching outstanding request in the "
+                    "recovery lineage"
+                ),
+            }
+
+        unrouted_inputs = sorted(
+            (claimed & known_input_aliases) - satisfied - pending_aliases
+        )
+        if unrouted_inputs:
+            return {
+                "valid": False,
+                "reason": (
+                    "input prerequisites have no outstanding request and must be "
+                    "re-established by a fresh lifecycle: "
+                    + ", ".join(unrouted_inputs)
+                ),
+            }
+
+        return {
+            "valid": True,
+            "reason": "STOP is consistent with current recovery evidence",
+            "owner": stop_owner,
+            "category": self.RECOVERY_STOP_CATEGORIES[stop_owner],
+            "prerequisite_keys": prerequisite_keys,
+            "evidence_refs": evidence_refs,
+        }
 
     def _reopen_recovery_epoch_if_evidence_changed(
         self,
@@ -13064,7 +13718,11 @@ class Orchestrator:
         route = self._terminal_recovery_route_for_owner(state, tasks, owner)
         if not route:
             return False
-        current_fingerprint = self._recovery_evidence_fingerprint(owner)
+        current_fingerprint = self._recovery_evidence_fingerprint(
+            owner,
+            state=state,
+            tasks=tasks,
+        )
         previous_fingerprint = str(route.get("evidence_fingerprint", ""))
         if not previous_fingerprint or previous_fingerprint == current_fingerprint:
             return False
@@ -13117,6 +13775,18 @@ class Orchestrator:
                     "epoch": int(owner.recovery_epoch),
                     "outcome": outcome,
                     "evidence_fingerprint": str(entry.get("evidence_fingerprint", "")),
+                    "failure_signature": str(
+                        entry.get("failure_signature", entry.get("signature", ""))
+                    ),
+                    "reason": str(
+                        entry.get("judge_reason", entry.get("reason", ""))
+                    ),
+                    "stop_owner": str(entry.get("stop_owner", "")),
+                    "stop_category": str(entry.get("stop_category", "")),
+                    "prerequisite_keys": list(
+                        entry.get("prerequisite_keys", []) or []
+                    ),
+                    "evidence_refs": list(entry.get("evidence_refs", []) or []),
                 }
         return {}
 
@@ -13129,7 +13799,10 @@ class Orchestrator:
         *,
         reason: str,
         signature: str,
-        category: str = "recovery_external_action_required",
+        blocker_owner: str = "unknown",
+        category: str = "",
+        prerequisite_keys: Optional[List[str]] = None,
+        evidence_refs: Optional[List[str]] = None,
     ) -> bool:
         """Persist provider STOP as a resumable evidence blocker."""
         if self._route_recovery_stop_to_pending_input(
@@ -13138,8 +13811,18 @@ class Orchestrator:
             task,
             owner,
             reason=reason,
+            prerequisite_keys=prerequisite_keys,
         ):
             return True
+        normalized_owner = (
+            blocker_owner
+            if blocker_owner in self.RECOVERY_STOP_OWNERS
+            else "unknown"
+        )
+        normalized_category = category or self.RECOVERY_STOP_CATEGORIES.get(
+            normalized_owner,
+            "recovery_action_required",
+        )
         task.status = "pending"
         if owner.status != "done":
             owner.status = "pending"
@@ -13153,17 +13836,25 @@ class Orchestrator:
                 {
                     "lineage_id": owner.task_id,
                     "epoch": int(owner.recovery_epoch),
-                    "evidence": self._recovery_evidence_fingerprint(owner),
+                    "evidence": self._recovery_evidence_fingerprint(
+                        owner,
+                        state=state,
+                        tasks=tasks,
+                    ),
                     "signature": signature,
                     "reason": reason,
+                    "owner": normalized_owner,
+                    "category": normalized_category,
+                    "prerequisite_keys": list(prerequisite_keys or []),
+                    "evidence_refs": list(evidence_refs or []),
                 },
                 sort_keys=True,
             ).encode("utf-8")
         ).hexdigest()
         self._block_run(
             state,
-            owner="target_project",
-            category=category,
+            owner=normalized_owner,
+            category=normalized_category,
             reason=blocker_reason,
             fingerprint=fingerprint,
         )
@@ -13179,6 +13870,7 @@ class Orchestrator:
         owner: TaskSpec,
         *,
         reason: str,
+        prerequisite_keys: Optional[List[str]] = None,
     ) -> bool:
         """Prefer a durable WAIT_USER route when the recovery lineage has input."""
 
@@ -13197,9 +13889,27 @@ class Orchestrator:
             )
         ]
         lineage_ids = {item.task_id for item in lineage_tasks}
-        matching = [
-            request for request in pending if request.task_id in lineage_ids
-        ]
+        requested = {
+            str(item).strip()
+            for item in prerequisite_keys or []
+            if str(item).strip()
+        }
+        matching: List[UserInputRequest] = []
+        for request in pending:
+            if request.task_id not in lineage_ids:
+                continue
+            aliases = {request.key}
+            for binding in request.bindings:
+                aliases.update(
+                    {
+                        str(binding.get("input_key", request.key)).strip(),
+                        str(binding.get("env", "")).strip(),
+                    }
+                )
+            aliases.discard("")
+            if requested and not (requested & aliases):
+                continue
+            matching.append(request)
         if not matching:
             return False
 
@@ -13323,9 +14033,28 @@ class Orchestrator:
         terminal_route = self._terminal_recovery_route_for_owner(state, tasks, owner)
         if (
             not reopened
-            and str(terminal_route.get("evidence_fingerprint", "")) == self._recovery_evidence_fingerprint(owner)
+            and str(terminal_route.get("evidence_fingerprint", ""))
+            == self._recovery_evidence_fingerprint(
+                owner,
+                state=state,
+                tasks=tasks,
+            )
         ):
             outcome = str(terminal_route.get("outcome", ""))
+            terminal_owner = str(terminal_route.get("stop_owner", "")).strip()
+            terminal_category = str(
+                terminal_route.get("stop_category", "")
+            ).strip()
+            terminal_prerequisites = [
+                str(item).strip()
+                for item in terminal_route.get("prerequisite_keys", []) or []
+                if str(item).strip()
+            ]
+            terminal_refs = [
+                str(item).strip()
+                for item in terminal_route.get("evidence_refs", []) or []
+                if str(item).strip()
+            ]
             self._record_recovery_route(
                 state,
                 task,
@@ -13334,6 +14063,10 @@ class Orchestrator:
                 reason="terminal recovery evidence is unchanged",
                 round_number=task.recovery_round,
                 lineage_owner=owner,
+                stop_owner=terminal_owner,
+                stop_category=terminal_category,
+                prerequisite_keys=terminal_prerequisites,
+                evidence_refs=terminal_refs,
             )
             save_run_state(self.project_root, state)
             if outcome == "judge_stopped":
@@ -13347,7 +14080,10 @@ class Orchestrator:
                     signature=str(
                         terminal_route.get("failure_signature", "")
                     ),
+                    blocker_owner=terminal_owner,
                     category="recovery_evidence_change_required",
+                    prerequisite_keys=terminal_prerequisites,
+                    evidence_refs=terminal_refs,
                 )
             return False
 
@@ -13367,15 +14103,25 @@ class Orchestrator:
             ]
         if not failure_ids:
             failure_ids = list(task.verification_refs)
+        verification_failure_signature = str(
+            result.get("failure_signature", "")
+        ).strip()
         signature_payload = {
             "kind": failure_kind,
-            "review": self._review_fingerprint(feedback),
+            "semantic_failure": (
+                verification_failure_signature
+                or self._review_fingerprint(feedback)
+            ),
             "failure_ids": sorted(failure_ids),
         }
         signature = hashlib.sha256(
             json.dumps(signature_payload, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
-        evidence_fingerprint = self._recovery_evidence_fingerprint(owner)
+        evidence_fingerprint = self._recovery_evidence_fingerprint(
+            owner,
+            state=state,
+            tasks=tasks,
+        )
 
         history_entry = {
             "signature": signature,
@@ -13386,6 +14132,7 @@ class Orchestrator:
             "failure_ids": failure_ids,
             "repair_task_ids": [task.task_id],
             "failure_signature": signature,
+            "verification_failure_signature": verification_failure_signature,
             "evidence_fingerprint": evidence_fingerprint,
         }
         if next_round > max_rounds:
@@ -13423,7 +14170,13 @@ class Orchestrator:
             and str(entry.get("result", "")) in {"requeued", "judge_stopped"}
         ]
         if prior_same:
-            stopped_entry = dict(history_entry, result="judge_stopped", judge_decision="STOP")
+            stopped_entry = dict(
+                history_entry,
+                result="judge_stopped",
+                judge_decision="STOP",
+                stop_owner="target_project",
+                stop_category="recovery_evidence_change_required",
+            )
             self._append_recovery_history_once(task, stopped_entry)
             if owner is not task:
                 self._append_recovery_history_once(owner, dict(stopped_entry))
@@ -13438,6 +14191,8 @@ class Orchestrator:
                 judge_decision="STOP",
                 judge_source="deterministic",
                 lineage_owner=owner,
+                stop_owner="target_project",
+                stop_category="recovery_evidence_change_required",
             )
             self._persist_tasks(tasks)
             save_run_state(self.project_root, state)
@@ -13451,6 +14206,7 @@ class Orchestrator:
                     "are unchanged"
                 ),
                 signature=signature,
+                blocker_owner="target_project",
                 category="recovery_evidence_change_required",
             )
 
@@ -13458,8 +14214,46 @@ class Orchestrator:
         decision = str(judgment.get("decision", "CONTINUE"))
         judge_reason = str(judgment.get("reason", "")).strip() or feedback
         judge_source = str(judgment.get("source", "provider"))
+        stop_validation: Dict[str, object] = {}
         if decision == "STOP":
-            stopped_entry = dict(history_entry, result="judge_stopped", judge_decision=decision, judge_reason=judge_reason)
+            stop_validation = self._validate_recovery_stop(
+                state,
+                task,
+                owner,
+                feedback,
+                next_round,
+                judgment,
+            )
+            if not bool(stop_validation.get("valid")):
+                decision = "CONTINUE"
+                judge_source = "reconciled_fallback"
+                judge_reason = (
+                    "Provider STOP rejected by current recovery evidence: "
+                    + str(stop_validation.get("reason", "invalid STOP"))
+                )
+                judgment = dict(judgment)
+                judgment["actionable_items"] = [
+                    feedback.splitlines()[0][:300]
+                    if feedback
+                    else "address the latest recorded failure"
+                ]
+        if decision == "STOP":
+            stop_owner = str(stop_validation.get("owner", "unknown"))
+            stop_category = str(stop_validation.get("category", ""))
+            stop_prerequisites = list(
+                stop_validation.get("prerequisite_keys", []) or []
+            )
+            stop_refs = list(stop_validation.get("evidence_refs", []) or [])
+            stopped_entry = dict(
+                history_entry,
+                result="judge_stopped",
+                judge_decision=decision,
+                judge_reason=judge_reason,
+                stop_owner=stop_owner,
+                stop_category=stop_category,
+                prerequisite_keys=stop_prerequisites,
+                evidence_refs=stop_refs,
+            )
             self._append_recovery_history_once(task, stopped_entry)
             if owner is not task:
                 self._append_recovery_history_once(owner, dict(stopped_entry))
@@ -13474,6 +14268,10 @@ class Orchestrator:
                 judge_decision=decision,
                 judge_source=judge_source,
                 lineage_owner=owner,
+                stop_owner=stop_owner,
+                stop_category=stop_category,
+                prerequisite_keys=stop_prerequisites,
+                evidence_refs=stop_refs,
             )
             self._persist_tasks(tasks)
             save_run_state(self.project_root, state)
@@ -13484,6 +14282,10 @@ class Orchestrator:
                 owner,
                 reason=judge_reason,
                 signature=signature,
+                blocker_owner=stop_owner,
+                category=stop_category,
+                prerequisite_keys=stop_prerequisites,
+                evidence_refs=stop_refs,
             )
         if decision == "REPLAN":
             if int(owner.split_depth) >= self.MAX_SPLIT_DEPTH:
@@ -13551,6 +14353,15 @@ class Orchestrator:
             judge_reason=judge_reason,
             judge_source=judge_source,
         )
+        if stop_validation and not bool(stop_validation.get("valid")):
+            requeued_entry["rejected_stop"] = {
+                "reason": str(stop_validation.get("reason", "")),
+                "owner": str(judgment.get("owner", "")),
+                "prerequisite_keys": list(
+                    judgment.get("prerequisite_keys", []) or []
+                ),
+                "evidence_refs": list(judgment.get("evidence_refs", []) or []),
+            }
         self._append_recovery_history_once(task, requeued_entry)
         if owner is not task:
             self._append_recovery_history_once(owner, dict(requeued_entry))
