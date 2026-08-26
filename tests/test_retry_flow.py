@@ -8225,6 +8225,127 @@ class RetryFlowTests(unittest.TestCase):
                 task.recovery_history[-1],
             )
 
+    def test_self_repair_requeued_contiguous_exhaustion_stays_requeued(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            repair = TaskSpec(
+                task_id="bounded-recovery-repair",
+                title="Repair bounded recovery proof",
+                description="Repair the bounded proof.",
+                acceptance=["The bounded proof passes."],
+                status="blocked",
+                task_origin="evidence_repair",
+                parent_task_id="bounded-recovery",
+                recovery_round=2,
+                recovery_history=[
+                    {
+                        "epoch": 0,
+                        "round": 1,
+                        "result": "requeued",
+                        "repair_task_ids": ["bounded-recovery-repair"],
+                    },
+                    {
+                        "epoch": 0,
+                        "round": 2,
+                        "result": "requeued",
+                        "repair_task_ids": ["bounded-recovery-repair"],
+                    },
+                    {
+                        "epoch": 0,
+                        "round": 3,
+                        "result": "exhausted",
+                        "repair_task_ids": ["bounded-recovery-repair"],
+                    },
+                ],
+            )
+            parent = TaskSpec(
+                task_id="bounded-recovery",
+                title="Bounded recovery",
+                description="Use the configured recovery budget.",
+                acceptance=["The bounded proof passes."],
+                status="pending",
+                recovery_round=2,
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [repair, parent]
+            terminal_fingerprint = orchestrator._recovery_evidence_fingerprint(
+                parent,
+                state=state,
+                tasks=state.tasks,
+            )
+            repair.recovery_history[-1][
+                "evidence_fingerprint"
+            ] = terminal_fingerprint
+            state.last_recovery_route = {
+                "task_id": repair.task_id,
+                "lineage_id": parent.task_id,
+                "epoch": 0,
+                "round": 3,
+                "outcome": "exhausted",
+                "evidence_fingerprint": terminal_fingerprint,
+            }
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "orchestrator_transition",
+                "status": "blocked",
+            }
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(project_root, state)
+
+            marked = orchestrator.mark_self_repair_applied("repair123")
+            resumed = Orchestrator(project_root)
+
+            self.assertTrue(resumed._resume_blocked_run(marked))
+            repaired_task = next(
+                task
+                for task in marked.tasks
+                if task.task_id == repair.task_id
+            )
+            parent_task = next(
+                task
+                for task in marked.tasks
+                if task.task_id == parent.task_id
+            )
+            self.assertEqual(marked.status, "pending")
+            self.assertEqual(repaired_task.status, "pending")
+            self.assertEqual(
+                marked.last_recovery_route["outcome"],
+                "self_repair_requeued",
+            )
+            self.assertEqual(marked.active_blocker["status"], "retrying")
+            self.assertEqual(
+                marked.resume_context["parallel_sequential_retry_tasks"],
+                [repair.task_id],
+            )
+            terminal_route, terminal_task, owner = (
+                resumed._active_terminal_recovery_route(marked, marked.tasks)
+            )
+            self.assertEqual(terminal_route, {})
+            self.assertIsNone(terminal_task)
+            self.assertIs(owner, parent_task)
+            self.assertEqual(
+                marked.last_recovery_route["outcome"],
+                "self_repair_requeued",
+            )
+            self.assertEqual(
+                repaired_task.recovery_history[-1]["result"],
+                "exhausted",
+            )
+
+            repaired_task.status = "blocked"
+            terminal_route, terminal_task, owner = (
+                resumed._active_terminal_recovery_route(marked, marked.tasks)
+            )
+            self.assertEqual(terminal_route["outcome"], "exhausted")
+            self.assertIs(terminal_task, repaired_task)
+            self.assertIs(owner, parent_task)
+
     def test_review_recovery_hard_cap_applies_to_ordinary_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

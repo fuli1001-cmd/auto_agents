@@ -14381,14 +14381,27 @@ class Orchestrator:
             if isinstance(state.last_recovery_route, dict)
             else {}
         )
+        route_outcome = str(route.get("outcome", ""))
         route_matches = bool(
             str(route.get("lineage_id", "")) == owner.task_id
             and int(route.get("epoch", 0) or 0) == epoch
-            and str(route.get("outcome", ""))
-            in {"exhausted", "judge_stopped"}
+            and route_outcome in {"exhausted", "judge_stopped"}
         )
         lineage_tasks = self._recovery_lineage_tasks(tasks, owner)
         by_id = {item.task_id: item for item in lineage_tasks}
+        routed_task = by_id.get(str(route.get("task_id", "")).strip())
+        if (
+            route_outcome == "self_repair_requeued"
+            and str(route.get("lineage_id", "")) == owner.task_id
+            and int(route.get("epoch", 0) or 0) == epoch
+            and routed_task is not None
+            and self._requeued_route_owns_task(state, routed_task)
+        ):
+            # A verified self-repair handoff deliberately supersedes the prior
+            # terminal lifecycle while its explicitly routed retry is active.
+            # Keep the exhausted history as audit evidence, but do not promote
+            # it back to the active route before the retry is consumed.
+            return {}
         history_candidates: List[
             Tuple[Tuple[int, int, int, int, int, int], Dict[str, object]]
         ] = []
