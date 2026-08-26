@@ -988,11 +988,11 @@ def _auto_repair_auto_agents_and_resume(
     )
     if not result.ok:
         message = f"automatic auto_agents self-repair failed: {result.reason}"
-        orchestrator.record_run_blocker(
-            owner="auto_agents",
+        orchestrator.record_self_repair_failure(
             category=result.category or decision.category or "self_repair_failed",
             reason=message,
-            fingerprint=decision.fingerprint,
+            summary=result.summary,
+            verification=result.verification,
         )
         _notify_run_blocked(project_root, message)
         payload = {"ok": False, "error": message}

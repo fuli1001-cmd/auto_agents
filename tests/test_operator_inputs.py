@@ -461,6 +461,58 @@ class OperatorInputStoreTests(unittest.TestCase):
             self.assertEqual(task.required_inputs[0]["key"], request.key)
             self.assertEqual(state.active_input_request_id, request.request_id)
 
+    def test_stale_auto_agents_blocker_resumes_through_persisted_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="repair-owner-r1-1",
+                title="Repair proof",
+                description="Repair the proof.",
+                acceptance=["The proof passes."],
+                status="pending",
+                task_origin="evidence_repair",
+            )
+            request = _request(task_id=task.task_id)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.last_error = "automatic auto_agents self-repair failed"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "evidence_preflight_runtime_source_divergence",
+                "reason": state.last_error,
+                "status": "blocked",
+            }
+            state.tasks = [task]
+            state.pending_input_requests = [request.to_dict()]
+
+            changed = orchestrator._resume_blocked_run(state)
+
+            self.assertTrue(changed)
+            self.assertEqual(state.status, "waiting_user")
+            self.assertEqual(state.active_blocker, {})
+            self.assertEqual(state.last_error, "")
+            self.assertEqual(task.status, "waiting_user")
+            self.assertEqual(state.active_input_request_id, request.request_id)
+
+    def test_runtime_identity_records_loaded_source_and_repository_revision(self):
+        identity = Orchestrator._auto_agents_runtime_identity()
+
+        self.assertTrue(
+            identity["orchestrator_module"].endswith(
+                "/src/auto_agents/orchestrator.py"
+            )
+        )
+        self.assertEqual(len(identity["orchestrator_sha256"]), 64)
+        self.assertEqual(
+            Path(identity["repository_root"]),
+            Path(__file__).resolve().parents[1],
+        )
+        self.assertTrue(identity["repository_head"])
+        self.assertTrue(identity["python_executable"])
+
     def test_declined_attestation_routes_to_clarify_without_silent_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "demo"

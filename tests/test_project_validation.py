@@ -2313,6 +2313,14 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertFalse(payload["ok"])
             self.assertIn("self-repair verification failed", payload["error"])
             self.assertIn("ModuleNotFoundError", payload["verification"])
+            state = load_run_state(project_root)
+            self.assertEqual(
+                state.active_blocker["reason"],
+                "repair candidate requires verification",
+            )
+            failure = state.active_blocker["self_repair_failure"]
+            self.assertIn("self-repair verification failed", failure["reason"])
+            self.assertIn("ModuleNotFoundError", failure["verification"])
 
     def test_cli_meta_triages_non_auto_agents_blocker_and_resumes_after_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4559,7 +4567,7 @@ class ProjectValidationTests(unittest.TestCase):
             )
             self.assertEqual(
                 gitignore_show.stdout,
-                "runs/\nfailed-verification-logs/\n"
+                "runs/\noperator/\nruntime/\nfailed-verification-logs/\n"
                 "state/gate_baseline_cache.json\nstate/gate_baseline_cache.sqlite3\n"
                 "state/gate_baseline_cache.sqlite3-*\nstate/requirements_audit_cache.sqlite3\n"
                 "state/requirements_audit_cache.sqlite3-*\nstate/repomap_cache.json\n"

@@ -2351,6 +2351,10 @@ class Orchestrator:
             self._max_tasks_remaining = max_tasks
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
+            runtime_identity = self._auto_agents_runtime_identity()
+            if state.resume_context.get("auto_agents_runtime") != runtime_identity:
+                state.resume_context["auto_agents_runtime"] = runtime_identity
+                save_run_state(self.project_root, state)
             restarted_before_preconditions = False
             if restart_blocked:
                 state = self.restart_blocked_run()
@@ -6887,6 +6891,45 @@ class Orchestrator:
         save_run_state(self.project_root, state)
         return state
 
+    def record_self_repair_failure(
+        self,
+        *,
+        category: str,
+        reason: str,
+        summary: str = "",
+        verification: str = "",
+    ) -> RunState:
+        """Attach repair failure evidence without replacing the causal blocker."""
+
+        state = load_run_state(self.project_root)
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        if not blocker:
+            self._block_run(
+                state,
+                owner="auto_agents",
+                category=category or "self_repair_failed",
+                reason=reason,
+            )
+            blocker = dict(state.active_blocker)
+        blocker["self_repair_failure"] = {
+            "category": category or "self_repair_failed",
+            "reason": reason,
+            "summary": summary,
+            "verification": verification,
+            "updated_at": utc_now_iso(),
+        }
+        blocker["status"] = "blocked"
+        blocker["updated_at"] = utc_now_iso()
+        state.active_blocker = blocker
+        state.status = "blocked"
+        state.last_error = reason
+        save_run_state(self.project_root, state)
+        return state
+
     @staticmethod
     def _remove_pruned_task_dependency_references(
         tasks: Iterable[object],
@@ -7496,6 +7539,8 @@ class Orchestrator:
                 "occurrence_count": 1,
                 "resume_attempts": 0,
             }
+        if self._resume_blocked_pending_user_input(state):
+            return True
         legacy_self_repair_incident = bool(
             not had_persisted_blocker
             and active_incident is not None
@@ -7577,6 +7622,48 @@ class Orchestrator:
                 }
             )
             self._incident_store(state).save(active_incident, state)
+        return True
+
+    def _resume_blocked_pending_user_input(self, state: RunState) -> bool:
+        """Let durable implementation inputs supersede a stale terminal blocker."""
+
+        if state.current_stage != "implement" or not state.pending_input_requests:
+            return False
+        tasks = list(state.tasks)
+        if not tasks:
+            raw_tasks = load_task_plan(self.project_root).get("tasks", [])
+            if isinstance(raw_tasks, list):
+                tasks = [
+                    TaskSpec.from_dict(item)
+                    for item in raw_tasks
+                    if isinstance(item, dict)
+                ]
+        self._reconcile_orphaned_waiting_user_tasks(state, tasks)
+        if state.status == "blocked" and str(
+            state.active_blocker.get("category", "")
+        ) == "waiting_user_request_missing":
+            return False
+        pending_task_ids = {
+            request.task_id
+            for request in self._pending_input_requests(state)
+            if request.task_id
+        }
+        waiting = [
+            task
+            for task in tasks
+            if task.status == "waiting_user" and task.task_id in pending_task_ids
+        ]
+        if not waiting:
+            return False
+        state.tasks = tasks
+        state.active_blocker = {}
+        state.status = "waiting_user"
+        state.last_error = ""
+        self._persist_tasks(tasks)
+        self.logger.warning(
+            "[user-input] resumed stale blocker through WAIT_USER tasks=%s",
+            ",".join(task.task_id for task in waiting),
+        )
         return True
 
     @staticmethod
@@ -16096,6 +16183,33 @@ class Orchestrator:
         )
         return "\n".join(lines)
 
+    @staticmethod
+    def _auto_agents_runtime_identity() -> Dict[str, str]:
+        """Describe the exact engine source loaded by the running interpreter."""
+
+        module_path = Path(__file__).resolve()
+        try:
+            module_sha256 = hashlib.sha256(module_path.read_bytes()).hexdigest()
+        except OSError:
+            module_sha256 = ""
+        repository_root = module_path.parents[2]
+        try:
+            repository_head = head_ref(repository_root)
+        except Exception:
+            repository_head = ""
+        if not (repository_root / ".git").exists():
+            repository_root_text = ""
+            repository_head = ""
+        else:
+            repository_root_text = str(repository_root)
+        return {
+            "python_executable": str(Path(sys.executable).resolve()),
+            "orchestrator_module": str(module_path),
+            "orchestrator_sha256": module_sha256,
+            "repository_root": repository_root_text,
+            "repository_head": repository_head,
+        }
+
     def _capture_resume_context(
         self,
         state: RunState,
@@ -16124,6 +16238,7 @@ class Orchestrator:
                 "parallel_integration_metrics",
                 "parallel_task_path_history",
                 "restarted_blocked_run_id",
+                "auto_agents_runtime",
                 self.FRONTEND_CONTRACT_RECOVERY_CONTEXT,
             )
             if key in state.resume_context
