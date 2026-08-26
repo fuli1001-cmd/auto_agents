@@ -28,9 +28,11 @@ from auto_agents.provider_contract import (
 )
 from auto_agents.requirements import (
     audit_requirements,
+    historical_requirement_contract_collision_ids,
     load_requirements_trace,
     migrate_legacy_provider_reference_consumer_hashes,
     normalize_generated_task_plan_statuses,
+    next_unused_requirement_id,
     preserve_task_plan_negative_oracle_clauses,
     run_requirements_audit,
     requirement_contract_sha256,
@@ -272,6 +274,113 @@ class RequirementsTraceTests(unittest.TestCase):
         )
 
         self.assertTrue(any("contract drift" in error for error in errors))
+
+    def test_new_requirement_cannot_reuse_id_reserved_only_by_archived_proof(self) -> None:
+        previous = {"version": 1, "requirements": [_requirement()]}
+        current = json.loads(json.dumps(previous))
+        current["requirements"].append(_requirement(id="REQ-032"))
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": [],
+                "requirement_proofs": [
+                    _proof(requirement_id="REQ-032")
+                ],
+            }
+        ]
+
+        errors = validate_requirement_contract_transitions(
+            previous,
+            current,
+            historical_tasks=historical,
+        )
+
+        self.assertTrue(any("namespace collision for REQ-032" in error for error in errors))
+
+    def test_next_requirement_id_includes_archived_ids_and_proofs(self) -> None:
+        trace = {"version": 1, "requirements": [_requirement(id="REQ-004")]}
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": ["REQ-011"],
+                "requirement_proofs": [
+                    _proof(requirement_id="REQ-019")
+                ],
+            }
+        ]
+
+        self.assertEqual(
+            next_unused_requirement_id(trace, historical_tasks=historical),
+            "REQ-020",
+        )
+
+    def test_active_contract_collision_with_archived_proof_requires_supersession(self) -> None:
+        archived_requirement = _requirement(
+            id="REQ-032",
+            text="Delivered historical behavior.",
+        )
+        active_requirement = _requirement(
+            id="REQ-032",
+            text="Different current behavior.",
+        )
+        current = {"version": 1, "requirements": [active_requirement]}
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": ["REQ-032"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_id="REQ-032",
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            archived_requirement
+                        ),
+                    )
+                ],
+            }
+        ]
+
+        self.assertEqual(
+            historical_requirement_contract_collision_ids(current, historical),
+            ["REQ-032"],
+        )
+        errors = validate_requirement_contract_transitions(
+            current,
+            json.loads(json.dumps(current)),
+            historical_tasks=historical,
+        )
+        self.assertTrue(
+            any(
+                "active contract conflicts with an archived delivered proof" in error
+                for error in errors
+            )
+        )
+
+    def test_legacy_oracle_drift_also_marks_historical_id_collision(self) -> None:
+        current = {
+            "version": 1,
+            "requirements": [_requirement(id="REQ-035")],
+        }
+        historical = [
+            {
+                "task_id": "task-legacy",
+                "status": "done",
+                "requirement_ids": ["REQ-035"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_id="REQ-035",
+                        acceptance_oracle="A different historical oracle.",
+                    )
+                ],
+            }
+        ]
+
+        self.assertEqual(
+            historical_requirement_contract_collision_ids(current, historical),
+            ["REQ-035"],
+        )
 
     def test_proven_requirement_can_be_superseded_with_reciprocal_replacement(self) -> None:
         previous = {"version": 1, "requirements": [_requirement()]}
@@ -1408,6 +1517,49 @@ class RequirementsTraceTests(unittest.TestCase):
                 for error in plan_errors
             )
         )
+
+    def test_requirements_audit_matches_preservation_only_plan_exemption(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            requirement = _requirement(
+                id="REQ-020",
+                text="Preserve the approved Workbench home prototype.",
+                source="specs/backend-contract.md non-goals",
+                acceptance_oracles=[
+                    "Desktop and mobile screenshots remain visually unchanged."
+                ],
+                oracle_type="mixed",
+                oracle_strength="semantic",
+                notes="frontend_surface: home",
+                frontend_surface=True,
+            )
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "frontend_scope": {"requested": False, "surfaces": []},
+                    "requirements": [requirement],
+                },
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 2, "tasks": []},
+            )
+
+            result = run_requirements_audit(project_root, [])
+
+            issue = {item["requirement_id"]: item for item in result["issues"]}[
+                "REQ-020"
+            ]
+            self.assertTrue(result["ok"], result["report"])
+            self.assertEqual(issue["result"], "pass")
+            self.assertFalse(
+                any(
+                    blocker.get("kind") in {"task_coverage", "oracle_proof_missing"}
+                    for blocker in issue["blockers"]
+                )
+            )
 
     def test_frontend_surface_requires_active_visual_requirement(self) -> None:
         trace = {

@@ -864,6 +864,12 @@ class RootCauseCoordinator:
                 "behavior without hard-coding the current project/task, even if this is the "
                 "first observed occurrence. generic does not mean the symptom must already "
                 "have appeared in multiple projects.",
+                "verification_commands are optional pre-commit checks for the auto_agents "
+                "candidate snapshot. Use repository-relative pytest/unittest commands or "
+                "read-only git status/diff checks only. Do not include target-project "
+                "validation, absolute target paths, example paths such as /path/to/target, "
+                "or unresolved placeholders; put target recovery checks in "
+                "reproduction_commands instead.",
                 "Return exactly one JSON object matching this schema:",
                 json.dumps(schema, ensure_ascii=False, indent=2),
                 "PRIOR_REPORTS:",

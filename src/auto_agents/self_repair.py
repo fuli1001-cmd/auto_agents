@@ -1297,6 +1297,84 @@ def self_repair_verification_command(
     return shlex.join([sys.executable, "-c", runner, *pytest_args])
 
 
+def _supplemental_verification_skip_reason(
+    command: str,
+    *,
+    repository_aliases: Optional[set[str]] = None,
+) -> str:
+    """Return why a provider-suggested command is not a candidate-worktree gate.
+
+    Root-cause reports are model output.  Their verification commands are useful
+    as focused supplements, but they must not turn an unresolved example path or
+    a target-recovery check into a pre-commit failure for an otherwise valid
+    auto_agents repair candidate.
+    """
+    normalized = " ".join(str(command).split())
+    lowered = normalized.lower()
+    if re.search(r"/(?:path|example)/to/", lowered):
+        return "unresolved example path"
+    if re.search(
+        r"(?:<[^>]*(?:target|project)[^>]*>|\{[^}]*(?:target|project)[^}]*\})",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        return "unresolved target-project placeholder"
+    try:
+        parts = shlex.split(normalized)
+    except ValueError:
+        return "malformed shell command"
+    if not parts:
+        return "empty command"
+    if (
+        any(token in {"&&", "||", ";", "|", ">", ">>", "<"} for token in parts)
+        or "$(" in normalized
+        or "`" in normalized
+    ):
+        leading_cd = re.fullmatch(
+            r"cd\s+((?:'[^']*'|\"[^\"]*\"|[^\s;&|]+))\s*&&\s*(.+)",
+            normalized,
+            flags=re.DOTALL,
+        )
+        if leading_cd is not None:
+            try:
+                cd_parts = shlex.split(leading_cd.group(1))
+            except ValueError:
+                cd_parts = []
+            aliases = {
+                str(alias).strip()
+                for alias in (repository_aliases or set())
+                if str(alias).strip()
+            }
+            if (
+                len(cd_parts) == 1
+                and not Path(cd_parts[0]).is_absolute()
+                and "/" not in Path(cd_parts[0]).as_posix().removeprefix("./").rstrip("/")
+                and Path(cd_parts[0]).as_posix().removeprefix("./").rstrip("/") in aliases
+            ):
+                return _supplemental_verification_skip_reason(
+                    leading_cd.group(2),
+                    repository_aliases=aliases,
+                )
+        return "shell control operators are not allowed"
+
+    executable = Path(parts[0]).name
+    if executable in {"auto-agents", "auto_agents.py"} and "--project" in parts:
+        return "target-project validation belongs to post-resume verification"
+    if _is_pytest_verification_command(normalized):
+        return ""
+    if (
+        len(parts) >= 3
+        and executable in {"python", "python3"}
+        and parts[1:3] == ["-m", "unittest"]
+    ):
+        return ""
+    if parts[:2] == ["git", "status"]:
+        return ""
+    if parts[:3] == ["git", "diff", "--check"]:
+        return ""
+    return "unsupported candidate-worktree verification command"
+
+
 class AutoAgentsSelfRepairRunner:
     def __init__(
         self,
@@ -1949,6 +2027,7 @@ class AutoAgentsSelfRepairRunner:
             return required
 
         supplemental = []
+        skipped = []
         for command in self.diagnosis.final.verification_commands:
             normalized = " ".join(str(command).split())
             if (
@@ -1956,16 +2035,32 @@ class AutoAgentsSelfRepairRunner:
                 and normalized not in commands
                 and normalized not in supplemental
             ):
-                supplemental.append(normalized)
+                skip_reason = _supplemental_verification_skip_reason(
+                    normalized,
+                    repository_aliases={self.repo_root.name, root.name},
+                )
+                if skip_reason:
+                    skipped.append(
+                        f"$ {normalized}\nskipped=supplemental {skip_reason}"
+                    )
+                else:
+                    supplemental.append(normalized)
         if not supplemental:
-            return required
+            summary = "\n\n".join(
+                part
+                for part in (required.summary, *skipped)
+                if part
+            )
+            return _VerificationResult(required.ok, summary)
         additional = self._run_verification_commands(
             supplemental,
             root,
             allow_pytest_no_tests=True,
         )
         summary = "\n\n".join(
-            part for part in (required.summary, additional.summary) if part
+            part
+            for part in (required.summary, *skipped, additional.summary)
+            if part
         )
         return _VerificationResult(additional.ok, summary)
 

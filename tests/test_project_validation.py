@@ -1139,6 +1139,38 @@ class ProjectValidationTests(unittest.TestCase):
                 "repairabc123",
             )
 
+    def test_requirement_namespace_self_repair_reopens_clarify_recovery_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.current_stage = "verify"
+            state.agent_attempts["requirements_audit_recovery"] = 4
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "requirements_recovery_namespace_collision",
+                "status": "blocked",
+            }
+            save_run_state(project_root, state)
+
+            orchestrator = Orchestrator(project_root)
+            state = orchestrator.mark_self_repair_applied("repair-namespace")
+            resumed = Orchestrator(project_root)
+
+            self.assertTrue(resumed._resume_blocked_run(state))
+            self.assertEqual(state.current_stage, "clarify")
+            self.assertEqual(state.rejected_stage, "clarify")
+            self.assertNotIn(
+                "requirements_audit_recovery",
+                state.agent_attempts,
+            )
+            self.assertIn("Recover forward from clarify", state.rejection_reason)
+            self.assertEqual(
+                state.active_blocker["requirements_recovery_epoch_reset_commit"],
+                "repair-namespace",
+            )
+
     def test_validation_report_rejects_empty_plan_after_plan_stage(self) -> None:
         for lineage_key in ("previous_run_id", "restarted_blocked_run_id"):
             with self.subTest(lineage_key=lineage_key), tempfile.TemporaryDirectory() as tmp:
@@ -4547,6 +4579,63 @@ class ProjectValidationTests(unittest.TestCase):
             prompt = orchestrator._build_prompt("clarify", spec_file)
 
             self.assertIn("Simplified Chinese", prompt)
+
+    def test_iteration_clarify_prompt_uses_archived_requirement_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Iteration\n")
+            write_json(
+                requirements_trace_path(project_root),
+                {
+                    "version": 1,
+                    "requirements": [
+                        {
+                            "id": "REQ-004",
+                            "text": "Current contract.",
+                            "source": "spec.md",
+                            "status": "active",
+                            "priority": "mandatory",
+                            "acceptance_oracles": ["Current behavior passes."],
+                            "oracle_type": "deterministic_test",
+                            "oracle_strength": "behavioral",
+                            "evidence_boundary": "internal_state",
+                            "forbidden_proxy_oracles": [],
+                            "forbidden_patterns": [],
+                            "external_docs_required": False,
+                            "provider_reference": "",
+                            "notes": "",
+                        }
+                    ],
+                },
+            )
+            orchestrator = Orchestrator(project_root)
+            orchestrator._clarify_historical_tasks = [
+                {
+                    "task_id": "task-archived",
+                    "status": "done",
+                    "requirement_ids": ["REQ-019"],
+                    "requirement_proofs": [
+                        {
+                            "requirement_id": "REQ-004",
+                            "requirement_contract_sha256": "sha256:historical",
+                        }
+                    ],
+                }
+            ]
+
+            prompt = orchestrator._build_prompt(
+                "clarify",
+                spec_file,
+                is_iteration=True,
+            )
+
+            self.assertIn("archive-aware next unused requirement ID as REQ-020", prompt)
+            self.assertIn(
+                "active/deferred IDs already conflict with archived delivered proof contracts: REQ-004",
+                prompt,
+            )
 
     def test_readme_prompt_uses_selected_document_language(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

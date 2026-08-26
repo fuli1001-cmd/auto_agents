@@ -830,23 +830,19 @@ def validate_requirement_contract_transitions(
         str(item.get("id", "")).strip(): item
         for item in requirement_records(current_payload)
     }
-    proven_ids: set[str] = set()
-    for task in historical_tasks:
-        if not isinstance(task, dict) or str(task.get("status", "")).strip() != "done":
-            continue
-        proven_ids.update(
-            str(value).strip()
-            for value in task.get("requirement_ids", []) or []
-            if isinstance(value, str) and value.strip()
-        )
-        proven_ids.update(
-            str(proof.get("requirement_id", "")).strip()
-            for proof in task.get("requirement_proofs", []) or []
-            if isinstance(proof, dict)
-            and str(proof.get("requirement_id", "")).strip()
-        )
+    historical_task_list = [
+        task for task in historical_tasks if isinstance(task, dict)
+    ]
+    proven_ids = delivered_requirement_ids(historical_task_list)
 
     errors: List[str] = []
+    for req_id in sorted(set(current) - set(previous)):
+        if req_id in proven_ids:
+            errors.append(
+                f"requirement ID namespace collision for {req_id}: this newly added ID "
+                "is permanently reserved by archived delivered work; preserve history "
+                "and append the requirement under the archive-aware next unused REQ ID"
+            )
     for req_id, before in previous.items():
         after = current.get(req_id)
         if after is None:
@@ -870,6 +866,16 @@ def validate_requirement_contract_transitions(
             errors.append(
                 f"proven requirement {req_id} is superseded but has no superseded_by replacement"
             )
+    for req_id in historical_requirement_contract_collision_ids(
+        current_payload,
+        historical_task_list,
+    ):
+        errors.append(
+            f"requirement ID namespace collision for {req_id}: the active contract "
+            "conflicts with an archived delivered proof using the same ID; preserve "
+            "the current entry as superseded with reciprocal links and append its "
+            "replacement under the archive-aware next unused REQ ID"
+        )
     return errors
 
 
@@ -981,6 +987,118 @@ def requirement_ids(trace_payload: dict) -> set[str]:
         for item in requirement_records(trace_payload)
         if str(item.get("id", "")).strip()
     }
+
+
+def delivered_requirement_ids(tasks: Iterable[dict]) -> set[str]:
+    """Return requirement IDs permanently reserved by completed work."""
+    delivered: set[str] = set()
+    for task in tasks:
+        if not isinstance(task, dict) or str(task.get("status", "")).strip() != "done":
+            continue
+        raw_ids = task.get("requirement_ids", [])
+        if not isinstance(raw_ids, list):
+            raw_ids = []
+        delivered.update(
+            str(value).strip()
+            for value in raw_ids
+            if isinstance(value, str) and value.strip()
+        )
+        raw_proofs = task.get("requirement_proofs", [])
+        if not isinstance(raw_proofs, list):
+            raw_proofs = []
+        delivered.update(
+            str(proof.get("requirement_id", "")).strip()
+            for proof in raw_proofs
+            if isinstance(proof, dict)
+            and str(proof.get("requirement_id", "")).strip()
+        )
+    return delivered
+
+
+def reserved_requirement_ids(
+    trace_payload: object,
+    *,
+    historical_tasks: Iterable[dict] = (),
+) -> set[str]:
+    """Return the cumulative trace and delivered-history requirement namespace."""
+    trace_ids = requirement_ids(trace_payload) if isinstance(trace_payload, dict) else set()
+    return trace_ids | delivered_requirement_ids(historical_tasks)
+
+
+def next_unused_requirement_id(
+    trace_payload: object,
+    *,
+    historical_tasks: Iterable[dict] = (),
+) -> str:
+    """Allocate after the highest well-formed ID in the permanent namespace."""
+    numbers = []
+    widths = [3]
+    for req_id in reserved_requirement_ids(
+        trace_payload,
+        historical_tasks=historical_tasks,
+    ):
+        match = re.fullmatch(r"REQ-(\d+)", req_id)
+        if match is None:
+            continue
+        numbers.append(int(match.group(1)))
+        widths.append(len(match.group(1)))
+    next_number = max(numbers, default=0) + 1
+    return f"REQ-{next_number:0{max(widths)}d}"
+
+
+def historical_requirement_contract_collision_ids(
+    trace_payload: object,
+    historical_tasks: Iterable[dict],
+) -> List[str]:
+    """Find active IDs whose contract conflicts with an archived proof."""
+    if not isinstance(trace_payload, dict):
+        return []
+    proofs_by_requirement: Dict[str, List[dict]] = {}
+    for task in historical_tasks:
+        if not isinstance(task, dict) or str(task.get("status", "")).strip() != "done":
+            continue
+        raw_proofs = task.get("requirement_proofs", [])
+        if not isinstance(raw_proofs, list):
+            continue
+        for proof in raw_proofs:
+            if not isinstance(proof, dict):
+                continue
+            req_id = str(proof.get("requirement_id", "")).strip()
+            if req_id:
+                proofs_by_requirement.setdefault(req_id, []).append(proof)
+
+    collisions = []
+    for requirement in requirement_records(trace_payload):
+        if str(requirement.get("status", "active")).strip() == "superseded":
+            continue
+        req_id = str(requirement.get("id", "")).strip()
+        expected_hash = requirement_contract_sha256(requirement)
+        oracles = [
+            str(oracle).strip()
+            for oracle in requirement.get("acceptance_oracles", []) or []
+            if str(oracle).strip()
+        ]
+        conflict = False
+        for proof in proofs_by_requirement.get(req_id, []):
+            proof_hash = str(
+                proof.get("requirement_contract_sha256", "")
+            ).strip()
+            exact_oracle = str(proof.get("acceptance_oracle", "")).strip()
+            try:
+                proof_index = int(proof.get("oracle_index")) - 1
+            except (TypeError, ValueError):
+                proof_index = -1
+            legacy_oracle_drift = bool(
+                exact_oracle
+                and 0 <= proof_index < len(oracles)
+                and exact_oracle != oracles[proof_index]
+            )
+            if (proof_hash and proof_hash != expected_hash) or legacy_oracle_drift:
+                conflict = True
+                break
+        if conflict:
+            collisions.append(req_id)
+    return sorted(set(collisions))
 
 
 def mandatory_active_requirement_ids(trace_payload: dict) -> set[str]:
@@ -2157,6 +2275,9 @@ def run_requirements_audit(
     archived_tasks = load_archived_done_tasks(project_root)
     trace = load_requirements_trace(project_root)
     known_ids = requirement_ids(trace)
+    preservation_only_ids = set(
+        preservation_only_frontend_requirement_ids(trace)
+    )
     spec_tokens = _current_spec_scope_tokens(current_spec)
     current_requirement_ids = {
         req_id
@@ -2302,14 +2423,24 @@ def run_requirements_audit(
                     reason="repository corpus scan exceeded the total audit time limit",
                 )
             )
-        if status == "active" and priority == "mandatory" and req_id not in task_requirements:
+        if (
+            status == "active"
+            and priority == "mandatory"
+            and req_id not in preservation_only_ids
+            and req_id not in task_requirements
+        ):
             blockers.append(
                 {
                     "kind": "task_coverage",
                     "message": "not covered by any done task",
                 }
             )
-        if status == "active" and priority == "mandatory" and oracle_proof_audit:
+        if (
+            status == "active"
+            and priority == "mandatory"
+            and req_id not in preservation_only_ids
+            and oracle_proof_audit
+        ):
             blockers.extend(
                 _oracle_proof_findings(
                     item, _proofs_for_requirement(tasks, req_id, assumed_done)

@@ -231,11 +231,13 @@ from .requirements import (
     forbidden_pattern_definition_findings,
     forbidden_pattern_findings,
     historical_verified_proofs_by_requirement,
+    historical_requirement_contract_collision_ids,
     load_archived_done_task_payloads,
     load_provider_references_lock,
     load_requirements_trace,
     migrate_legacy_provider_reference_consumer_hashes,
     normalize_generated_task_plan_statuses,
+    next_unused_requirement_id,
     provider_reference_paths,
     provider_reference_effective_status,
     provider_reference_status,
@@ -6948,6 +6950,21 @@ class Orchestrator:
         )
         if reconciled_checkpoints:
             blocker["reconciled_attempt_checkpoints"] = reconciled_checkpoints
+
+        if str(blocker.get("category", "")).strip() == (
+            "requirements_recovery_namespace_collision"
+        ):
+            state.agent_attempts.pop("requirements_audit_recovery", None)
+            self._rewind_state_from_stage(state, "clarify")
+            state.rejected_stage = "clarify"
+            state.rejection_reason = (
+                "auto_agents repaired the permanent requirement-ID namespace. "
+                "Recover forward from clarify: preserve every collided delivered ID "
+                "as superseded with reciprocal links, allocate replacements from the "
+                "archive-aware next unused REQ ID shown in the clarify prompt, and do "
+                "not edit or delete archived tasks or proofs."
+            )
+            blocker["requirements_recovery_epoch_reset_commit"] = commit_sha
 
         repaired_dependency_links = (
             self._repair_self_referential_dependency_links()
@@ -18680,6 +18697,28 @@ class Orchestrator:
         plan = task_plan_path(self.project_root)
         requirements_trace = requirements_trace_path(self.project_root)
         archived_plan = self._previous_task_plan_archive_for_prompt()
+        archive_aware_next_requirement_id = ""
+        historical_requirement_collisions: List[str] = []
+        if stage == "clarify" and is_iteration:
+            existing_trace = load_requirements_trace(
+                self.project_root,
+                normalize=False,
+            )
+            historical_tasks = [
+                task
+                for task in getattr(self, "_clarify_historical_tasks", [])
+                if isinstance(task, dict)
+            ]
+            archive_aware_next_requirement_id = next_unused_requirement_id(
+                existing_trace,
+                historical_tasks=historical_tasks,
+            )
+            historical_requirement_collisions = (
+                historical_requirement_contract_collision_ids(
+                    existing_trace,
+                    historical_tasks,
+                )
+            )
         analysis = self._analyze_spec(spec_file)
         spec_kind = str(analysis["kind"])
         spec_context = self._spec_context_line(analysis)
@@ -18742,7 +18781,24 @@ class Orchestrator:
                     "Do NOT delete existing REQ entries and do NOT renumber or reuse REQ IDs from the existing trace.",
                     "A requirement referenced by completed work is immutable. If its contract changes, preserve every contract field, mark the old entry status='superseded', set reciprocal superseded_by/supersedes links, and append the replacement under a new ID.",
                     "Mark requirements that are no longer in scope as status='superseded' (preserve id/text/source/acceptance_oracles) instead of removing them.",
-                    "For new iteration scope, append entries with new IDs that continue the existing numbering (e.g., if the highest existing ID is REQ-029, the next new one is REQ-030).",
+                    (
+                        "The engine computed the archive-aware next unused requirement ID as "
+                        f"{archive_aware_next_requirement_id}. Start new or replacement requirements "
+                        "at that ID and continue upward; every lower ID present only in archived "
+                        "done-task bindings or proofs remains permanently reserved and must not be reused."
+                    ),
+                    *(
+                        [
+                            "The following active/deferred IDs already conflict with archived "
+                            "delivered proof contracts: "
+                            + ", ".join(historical_requirement_collisions)
+                            + ". Preserve each collided entry as status='superseded' with reciprocal "
+                            "links, and append its active replacement at or above the archive-aware "
+                            "next unused ID. Do not delete or rewrite archived tasks or proofs."
+                        ]
+                        if historical_requirement_collisions
+                        else []
+                    ),
                     "Only unproven active/deferred entries may be refined in place; never use notes as a normative override for a conflicting active contract.",
                 ])
             lines.append("Final response: 3 short bullets summarizing the clarified scope.")

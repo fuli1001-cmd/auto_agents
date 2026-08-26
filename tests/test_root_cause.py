@@ -274,6 +274,128 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertIn("exit=1", result.summary)
 
+    def test_target_placeholder_supplement_is_skipped_before_candidate_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repair_root = Path(tmp) / "repair"
+            _init_repo(repair_root)
+            diagnosis = type(
+                "Diagnosis",
+                (),
+                {
+                    "final": type(
+                        "Final",
+                        (),
+                        {
+                            "verification_commands": [
+                                "auto-agents validate --project /path/to/target",
+                                f"auto-agents validate --project {repair_root}",
+                                "git status --short",
+                                "cd auto_agents && python -m unittest -q",
+                            ]
+                        },
+                    )()
+                },
+            )()
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=repair_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+                diagnosis=diagnosis,
+            )
+
+            with patch(
+                "auto_agents.self_repair.self_repair_verify_commands",
+                return_value=["python -m unittest -q"],
+            ):
+                result = runner._run_verification(repair_root)
+
+            self.assertTrue(result.ok, result.summary)
+            self.assertIn("skipped=supplemental unresolved example path", result.summary)
+            self.assertIn(
+                "skipped=supplemental target-project validation belongs to post-resume verification",
+                result.summary,
+            )
+            self.assertIn("$ git status --short", result.summary)
+            self.assertIn("$ python -m unittest -q", result.summary)
+            self.assertNotIn("missing config file", result.summary)
+
+    def test_unsupported_supplemental_shell_command_is_not_executed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repair_root = Path(tmp) / "repair"
+            _init_repo(repair_root)
+            diagnosis = type(
+                "Diagnosis",
+                (),
+                {
+                    "final": type(
+                        "Final",
+                        (),
+                        {"verification_commands": ["touch should-not-exist"]},
+                    )()
+                },
+            )()
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=repair_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+                diagnosis=diagnosis,
+            )
+
+            with patch(
+                "auto_agents.self_repair.self_repair_verify_commands",
+                return_value=["python -m unittest -q"],
+            ):
+                result = runner._run_verification(repair_root)
+
+            self.assertTrue(result.ok, result.summary)
+            self.assertFalse((repair_root / "should-not-exist").exists())
+            self.assertIn(
+                "skipped=supplemental unsupported candidate-worktree verification command",
+                result.summary,
+            )
+
+    def test_supplemental_read_only_prefix_cannot_hide_shell_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repair_root = Path(tmp) / "repair"
+            _init_repo(repair_root)
+            diagnosis = type(
+                "Diagnosis",
+                (),
+                {
+                    "final": type(
+                        "Final",
+                        (),
+                        {
+                            "verification_commands": [
+                                "git status --short && touch should-not-exist"
+                            ]
+                        },
+                    )()
+                },
+            )()
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=repair_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+                diagnosis=diagnosis,
+            )
+
+            with patch(
+                "auto_agents.self_repair.self_repair_verify_commands",
+                return_value=["python -m unittest -q"],
+            ):
+                result = runner._run_verification(repair_root)
+
+            self.assertTrue(result.ok, result.summary)
+            self.assertFalse((repair_root / "should-not-exist").exists())
+            self.assertIn(
+                "skipped=supplemental shell control operators are not allowed",
+                result.summary,
+            )
+
     def _coordinator(
         self,
         root: Path,
