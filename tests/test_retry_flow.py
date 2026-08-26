@@ -6862,6 +6862,93 @@ class RetryFlowTests(unittest.TestCase):
                 ["pass"],
             )
 
+    def test_repair_task_plan_sync_preserves_runtime_identity_and_local_proof_ownership(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            repair = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair proof evidence",
+                description="Repair the failed executable proof.",
+                acceptance=["The executable proof passes."],
+                parent_task_id="task-001",
+                task_origin="evidence_repair",
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[],
+                verification_refs=["tests/test_public_api.py::test_contract"],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [repair]
+
+            stale_snapshot = repair.to_dict()
+            stale_snapshot["task_origin"] = "planned"
+            stale_snapshot["requirement_proofs"] = [
+                {
+                    "requirement_id": "REQ-001",
+                    "oracle_index": 1,
+                    "status": "planned",
+                }
+            ]
+            write_json(task_plan_path(project_root), {"tasks": [stale_snapshot]})
+
+            with patch(
+                "auto_agents.orchestrator.changed_paths",
+                return_value=[".auto-agents/state/task_plan.json"],
+            ):
+                orchestrator._sync_allowed_repair_task_plan_edits(state, repair)
+
+            self.assertEqual(repair.task_origin, "evidence_repair")
+            self.assertEqual(repair.requirement_proofs, [])
+            self.assertIs(state.tasks[0], repair)
+            self.assertEqual(
+                orchestrator._task_completion_proof_findings(repair),
+                [],
+            )
+
+    def test_evidence_repair_without_local_proofs_ignores_stray_proof_updates(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            repair = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair proof evidence",
+                description="Repair the failed executable proof.",
+                acceptance=["The executable proof passes."],
+                task_origin="evidence_repair",
+                verification_refs=["tests/test_public_api.py::test_contract"],
+            )
+            response = (
+                "implemented\n\nORACLE_PROOF_UPDATES:\n```json\n"
+                '[{"requirement_id":"REQ-001","oracle_index":1,'
+                '"status":"verified","evidence_refs":'
+                '["tests/test_public_api.py::test_contract"]}]\n```'
+            )
+
+            applied, error = orchestrator._apply_oracle_proof_updates_from_text(
+                repair,
+                response,
+            )
+            prompt = orchestrator._build_task_prompt(repair, "implement")
+
+            self.assertFalse(applied)
+            self.assertEqual(error, "")
+            self.assertIn(
+                "ignored ORACLE_PROOF_UPDATES because the evidence-repair task has no local",
+                stream.getvalue(),
+            )
+            self.assertIn(
+                "This task has no local requirement_proofs. Do not emit an ORACLE_PROOF_UPDATES block",
+                prompt,
+            )
+            self.assertNotIn("Example final response block", prompt)
+
     def test_evidence_repair_with_explicit_requirement_proof_remains_strict(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

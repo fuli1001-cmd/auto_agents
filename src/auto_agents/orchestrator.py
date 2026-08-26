@@ -9710,6 +9710,18 @@ class Orchestrator:
         if not updates:
             return False, ""
         if not task.requirement_proofs:
+            if self._is_repair_task(task):
+                # Evidence-repair children normally own executable
+                # verification_refs while the parent retains requirement proof
+                # ownership.  A stray proof-update block must not consume an
+                # implementation attempt after the child already changed the
+                # candidate; its managed verification refs remain authoritative.
+                self.logger.info(
+                    "[task:%s] ignored ORACLE_PROOF_UPDATES because the evidence-repair "
+                    "task has no local requirement_proofs",
+                    task.task_id,
+                )
+                return False, ""
             return False, (
                 "ORACLE_PROOF_UPDATES was provided, but the current task has no existing "
                 "requirement_proofs entries to update"
@@ -20183,10 +20195,20 @@ class Orchestrator:
             None,
         )
         if current_index is not None:
+            # The in-memory repair identity and proof ownership are
+            # orchestrator-owned.  task_plan.json can be stale or can be touched
+            # by an implementation agent, so copying these two fields from its
+            # snapshot can temporarily turn a proof child into a planned task or
+            # attach the parent's proofs.  Either mutation makes the completion
+            # gate continue after verification and review have passed.
+            repair_origin = task.task_origin
+            local_requirement_proofs = copy.deepcopy(task.requirement_proofs)
             self._copy_parallel_task_snapshot_fields(
                 task,
                 loaded_tasks[current_index].to_dict(),
             )
+            task.task_origin = repair_origin
+            task.requirement_proofs = local_requirement_proofs
             loaded_tasks[current_index] = task
         if state.tasks:
             state.tasks[:] = loaded_tasks
@@ -21432,17 +21454,25 @@ class Orchestrator:
                 )
 
         if stage == "implement":
+            if task.requirement_proofs:
+                proof_update_lines = [
+                    "When the task has requirement_proofs, do NOT edit .auto-agents/state/task_plan.json directly. Instead, include an ORACLE_PROOF_UPDATES JSON block in your final response.",
+                    "Each ORACLE_PROOF_UPDATES entry must update an existing current-task proof by requirement_id and oracle_index, set status='verified', and include concrete evidence_refs plus proof_type/oracle_strength/evidence_boundary/proxy_oracles when relevant.",
+                    "Example final response block:\nORACLE_PROOF_UPDATES:\n```json\n[{\"requirement_id\":\"REQ-001\",\"oracle_index\":1,\"status\":\"verified\",\"proof_type\":\"integration_test\",\"oracle_strength\":\"behavioral\",\"evidence_boundary\":\"system_boundary\",\"evidence_refs\":[\"tests/test_public_api.py::test_behavior\"],\"proxy_oracles\":[]}]\n```",
+                ]
+            else:
+                proof_update_lines = [
+                    "This task has no local requirement_proofs. Do not emit an ORACLE_PROOF_UPDATES block; verification_refs, when present, are the complete executable proof surface owned by this task.",
+                ]
             lines = common + [
                 "Implement only this feature slice.",
                 "If local verification exposes a tightly coupled regression in files you touched or in paths explicitly implicated by retry feedback, fix it in the same attempt even if it sits slightly outside the nominal task slice.",
                 "The current task's owned acceptance criteria and owned requirement proof entries are hard requirements, not optional background.",
                 "Honor each owned oracle contract exactly: the implementation and tests must meet or exceed each requirement's oracle_strength, collect proof at the required evidence_boundary, and avoid every forbidden proxy oracle listed in the requirement context.",
-                "When the task has requirement_proofs, do NOT edit .auto-agents/state/task_plan.json directly. Instead, include an ORACLE_PROOF_UPDATES JSON block in your final response.",
-                "Each ORACLE_PROOF_UPDATES entry must update an existing current-task proof by requirement_id and oracle_index, set status='verified', and include concrete evidence_refs plus proof_type/oracle_strength/evidence_boundary/proxy_oracles when relevant.",
+                *proof_update_lines,
                 "Do not submit proof updates for proxy evidence listed in forbidden_proxy_oracles, for final-status-only checks, or for config/metadata-only checks when the requirement demands behavioral/system-boundary proof.",
                 "For frontend/prototype visual fidelity proofs, evidence_refs must include page-level visual evidence such as Playwright screenshot tests, screenshot artifacts, visual snapshots, or equivalent browser-rendered checks, plus deterministic DOM/CSS assertions where practical. Do not mark these proofs verified using payload-only tests or internal-state checks.",
                 "When a frontend/prototype proof has concrete prototype-comparison screenshot artifacts, include visual_evidence on that proof with surface, viewport, distinct raster prototype_image_ref and actual_image_ref paths for the same UI state, prototype_source_ref, and purpose='prototype_fidelity' so auto_agents can run the optional visual_judge gate. Put HTML only in prototype_source_ref; ordinary evidence_refs are never inferred into visual pairs. If the screenshot only proves layout stability, state transitions, no overflow, no overlap, or runtime DOM/CSS behavior, either omit visual_evidence or set purpose='layout_stability'/'state_transition' and visual_judge=false; do not pair those screenshots with a static prototype for visual_judge.",
-                "Example final response block:\nORACLE_PROOF_UPDATES:\n```json\n[{\"requirement_id\":\"REQ-001\",\"oracle_index\":1,\"status\":\"verified\",\"proof_type\":\"integration_test\",\"oracle_strength\":\"behavioral\",\"evidence_boundary\":\"system_boundary\",\"evidence_refs\":[\"tests/test_public_api.py::test_behavior\"],\"proxy_oracles\":[]}]\n```",
                 "If Task JSON and bound requirements conflict, preserve the bound requirements and mention the conflict in the final summary.",
                 "You MUST also write or update tests that verify the acceptance criteria in the Task JSON.",
                 "Do not run verification_refs or broad suites inside the implementation agent. auto_agents executes each owned proof once after the candidate is ready and reuses that certificate in review and attestation.",
@@ -22212,6 +22242,15 @@ class Orchestrator:
             if gate_result["ok"]:
                 proof_findings = self._task_completion_proof_findings(task)
                 if proof_findings:
+                    self.logger.info(
+                        "[task:%s] completion-boundary decision=continue gate=oracle_proof "
+                        "candidate=%s task_origin=%s requirement_proofs=%d findings=%d",
+                        task.task_id,
+                        review_fingerprint,
+                        task.task_origin,
+                        len(task.requirement_proofs),
+                        len(proof_findings),
+                    )
                     last_reason = self._format_requirement_proof_findings(task, proof_findings)
                     feedback = self._format_retry_feedback(
                         "oracle_proof_gate",
@@ -22229,6 +22268,15 @@ class Orchestrator:
                     task_attempt=attempt,
                 )
                 if not visual_result["ok"]:
+                    self.logger.info(
+                        "[task:%s] completion-boundary decision=continue gate=visual_judge "
+                        "candidate=%s task_origin=%s requirement_proofs=%d status=%s",
+                        task.task_id,
+                        review_fingerprint,
+                        task.task_origin,
+                        len(task.requirement_proofs),
+                        str(visual_result.get("status", "failed")),
+                    )
                     last_reason = str(visual_result["reason"])
                     feedback = self._format_retry_feedback(
                         "visual_judge",
@@ -22246,6 +22294,15 @@ class Orchestrator:
                     self._persist_tasks(state.tasks if state.tasks else [task])
                 gate_result["verify_current_failure_ids"] = list(
                     verify_result.get("current_failure_ids", [])
+                )
+                self.logger.info(
+                    "[task:%s] completion-boundary decision=complete candidate=%s "
+                    "task_origin=%s requirement_proofs=%d visual_status=%s",
+                    task.task_id,
+                    review_fingerprint,
+                    task.task_origin,
+                    len(task.requirement_proofs),
+                    str(visual_result.get("status", "")),
                 )
                 return gate_result
 
