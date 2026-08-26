@@ -1866,9 +1866,26 @@ def main(argv: list[str] | None = None) -> int:
                     value=value,
                     source="answer-cli",
                 )
-                if bool(payload.get("resume")) and not bool(args.no_resume):
-                    resumed = _resume_run_after_answer(project_root, orchestrator)
-                    payload["resumed_run"] = resumed.to_dict()
+                if not bool(args.no_resume):
+                    if not bool(payload.get("resume")):
+                        state = load_run_state(project_root)
+                        if (
+                            state.status == "waiting_user"
+                            and orchestrator._process_pending_user_input(
+                                state, state.tasks
+                            )
+                        ):
+                            refreshed = load_run_state(project_root)
+                            payload["remaining"] = len(
+                                refreshed.pending_input_requests
+                            )
+                            payload["run_status"] = refreshed.status
+                            payload["resume"] = True
+                    if bool(payload.get("resume")):
+                        resumed = _resume_run_after_answer(
+                            project_root, orchestrator
+                        )
+                        payload["resumed_run"] = resumed.to_dict()
         except (OSError, RuntimeError, ValueError, RunAlreadyActiveError) as error:
             payload = {"ok": False, "error": str(error)}
         print(json.dumps(payload, indent=2, ensure_ascii=False))

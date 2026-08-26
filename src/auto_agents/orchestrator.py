@@ -4544,57 +4544,65 @@ class Orchestrator:
     def _process_pending_user_input(
         self, state: RunState, tasks: Optional[List[TaskSpec]] = None
     ) -> bool:
-        pending = self._pending_input_requests(state)
-        if not pending:
-            return False
-        request = pending[0]
-        state.active_input_request_id = request.request_id
-        if not self.config.execution.user_input.enabled or self._interaction_mode == "fail":
-            self._block_run(
-                state,
-                owner="user_input",
-                category="user_input_required",
-                reason=request.render(),
-                fingerprint=request.request_id,
-            )
-            save_run_state(self.project_root, state)
-            return False
-        if not self._interactive_input_available():
-            state.status = "waiting_user"
-            state.last_error = ""
-            save_run_state(self.project_root, state)
-            self.logger.warning(
-                "[user-input] waiting request_id=%s key=%s\n%s",
-                request.request_id,
-                request.key,
-                request.render(),
-            )
-            return False
         while True:
-            answer = prompt_for_request(
-                request,
-                echo_mode=self._secret_echo,
-                input_fn=lambda prompt: self._prompt_user(prompt, default="n"),
-                secret_input_fn=(
-                    (lambda prompt: self._user_input_fn(prompt))
-                    if self._user_input_fn is not None
-                    else getpass.getpass
-                ),
-            )
-            try:
-                result = self.answer_input_request(
-                    request_id=request.request_id,
-                    value=answer,
-                    source="interactive",
+            pending = self._pending_input_requests(state)
+            if not pending:
+                return True
+            request = pending[0]
+            state.active_input_request_id = request.request_id
+            if (
+                not self.config.execution.user_input.enabled
+                or self._interaction_mode == "fail"
+            ):
+                self._block_run(
+                    state,
+                    owner="user_input",
+                    category="user_input_required",
+                    reason=request.render(),
+                    fingerprint=request.request_id,
                 )
-            except ValueError as error:
-                self.logger.warning("Invalid answer: %s", error)
-                continue
+                save_run_state(self.project_root, state)
+                return False
+            if not self._interactive_input_available():
+                state.status = "waiting_user"
+                state.last_error = ""
+                save_run_state(self.project_root, state)
+                self.logger.warning(
+                    "[user-input] waiting request_id=%s key=%s\n%s",
+                    request.request_id,
+                    request.key,
+                    request.render(),
+                )
+                return False
+            while True:
+                answer = prompt_for_request(
+                    request,
+                    echo_mode=self._secret_echo,
+                    input_fn=lambda prompt: self._prompt_user(prompt, default="n"),
+                    secret_input_fn=(
+                        (lambda prompt: self._user_input_fn(prompt))
+                        if self._user_input_fn is not None
+                        else getpass.getpass
+                    ),
+                )
+                try:
+                    result = self.answer_input_request(
+                        request_id=request.request_id,
+                        value=answer,
+                        source="interactive",
+                    )
+                except ValueError as error:
+                    self.logger.warning("Invalid answer: %s", error)
+                    continue
+                break
             refreshed = load_run_state(self.project_root)
             state.__dict__.update(refreshed.__dict__)
             if tasks is not None:
                 tasks[:] = state.tasks
-            return bool(result.get("resume"))
+            if state.rejected_stage and state.current_stage != request.stage:
+                return False
+            if bool(result.get("resume")):
+                return True
 
     def _prompt_user(self, prompt: str, default: str = "", multiline: bool = False) -> str:
         if self._user_input_fn:

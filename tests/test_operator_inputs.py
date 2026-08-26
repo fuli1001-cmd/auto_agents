@@ -210,6 +210,58 @@ class OperatorInputStoreTests(unittest.TestCase):
             self.assertEqual(resumed.tasks[0].status, "pending")
             self.assertEqual(resumed.pending_input_requests, [])
 
+    def test_interactive_input_answers_entire_batch_before_resuming(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            answers = iter(
+                ["https://www.youtube.com/watch?v=abcdefghijk", "y"]
+            )
+            prompts = []
+
+            def answer(prompt):
+                prompts.append(prompt)
+                return next(answers)
+
+            orchestrator = Orchestrator(project, user_input_fn=answer)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need an authorized source",
+                acceptance=["Authorized input exists"],
+            )
+            state.tasks = [task]
+            source_request = _request(
+                key="youtube.source_url",
+                kind="url",
+                question="请输入公开视频 URL",
+                default="",
+                validation={"https_only": True},
+                bindings=[],
+                subject_fingerprint="video-url",
+            )
+            orchestrator._normalize_input_requests(
+                state,
+                task,
+                [source_request.to_dict(), _request().to_dict()],
+            )
+            state.status = "waiting_user"
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(project, state)
+
+            resumed = orchestrator._process_pending_user_input(
+                state, state.tasks
+            )
+
+            self.assertTrue(resumed)
+            self.assertEqual(len(prompts), 2)
+            self.assertIn("公开视频 URL", prompts[0])
+            self.assertIn("明确授权", prompts[1])
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.pending_input_requests, [])
+            self.assertEqual(state.tasks[0].status, "pending")
+
     def test_input_batch_validation_is_atomic(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "demo"
@@ -923,6 +975,76 @@ class OperatorInputStoreTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
             self.assertTrue(payload["ok"])
             self.assertEqual(load_run_state(project).status, "pending")
+
+    def test_answer_cli_collects_remaining_inputs_before_resuming(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need an authorized source",
+                acceptance=["Authorized input exists"],
+            )
+            state.tasks = [task]
+            source_request = _request(
+                key="youtube.source_url",
+                kind="url",
+                question="请输入公开视频 URL",
+                default="",
+                validation={"https_only": True},
+                bindings=[],
+                subject_fingerprint="video-url",
+            )
+            requests = orchestrator._normalize_input_requests(
+                state,
+                task,
+                [source_request.to_dict(), _request().to_dict()],
+            )
+            state.status = "waiting_user"
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(project, state)
+            output = io.StringIO()
+            resumed_state = mock.Mock()
+            resumed_state.to_dict.return_value = {"status": "completed"}
+
+            with mock.patch("sys.stdout", output):
+                with mock.patch.object(
+                    Orchestrator,
+                    "_interactive_input_available",
+                    return_value=True,
+                ):
+                    with mock.patch.object(
+                        Orchestrator, "_prompt_user", return_value="y"
+                    ) as prompt:
+                        with mock.patch(
+                            "auto_agents.cli._resume_run_after_answer",
+                            return_value=resumed_state,
+                        ) as resume:
+                            exit_code = main(
+                                [
+                                    "answer",
+                                    "--project",
+                                    str(project),
+                                    "--request-id",
+                                    requests[0].request_id,
+                                    "--value",
+                                    "https://www.youtube.com/watch?v=abcdefghijk",
+                                ]
+                            )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(payload["resume"])
+            self.assertEqual(payload["remaining"], 0)
+            self.assertEqual(payload["resumed_run"]["status"], "completed")
+            self.assertEqual(prompt.call_count, 1)
+            resume.assert_called_once()
+            self.assertEqual(
+                load_run_state(project).pending_input_requests, []
+            )
 
     def test_sequential_scheduler_finishes_independent_task_before_waiting(self):
         with tempfile.TemporaryDirectory() as tmp:

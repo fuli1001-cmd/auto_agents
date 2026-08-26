@@ -1573,11 +1573,14 @@ python3 -m auto_agents answer --project /tmp/demo
 ```
 
 The answer command resumes the saved run automatically after the last pending
-input validates; pass `--no-resume` to save only. `inputs list`, `inputs set`, and
-`inputs remove` manage reusable project-scoped answers. Ordinary/private inputs
-are stored in the Git-ignored `.auto-agents/operator/inputs.json`; secrets are
-stored in `.auto-agents/operator/secrets.env`. Both files are mode `0600` on
-POSIX. Secrets are never written to prompts, run state, task plans, or logs.
+input validates. When several inputs are pending and a TTY is attached, both
+`run` and `answer` keep asking one question at a time in the same process, then
+resume the workflow after the complete batch validates. Pass `--no-resume` to
+save only. `inputs list`, `inputs set`, and `inputs remove` manage reusable
+project-scoped answers. Ordinary/private inputs are stored in the Git-ignored
+`.auto-agents/operator/inputs.json`; secrets are stored in
+`.auto-agents/operator/secrets.env`. Both files are mode `0600` on POSIX.
+Secrets are never written to prompts, run state, task plans, or logs.
 
 Secret echo is configurable with `--secret-echo auto|visible|hidden`. `auto`
 hides secret input and shows ordinary input. Passing a secret directly through
