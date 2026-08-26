@@ -3425,6 +3425,75 @@ class RetryFlowTests(unittest.TestCase):
         self.assertEqual(stage_recovery.task_origin, "stage_recovery")
         self.assertEqual(repair.task_origin, "evidence_repair")
 
+    def test_legacy_recovery_cursor_migration_keeps_epoch_round_coherent(self) -> None:
+        task = TaskSpec.from_dict(
+            {
+                "task_id": "legacy-recovery",
+                "title": "Recover observable evidence",
+                "description": "Repair the current evidence lifecycle.",
+                "acceptance": ["The current proof passes."],
+                "status": "pending",
+                "commit_message": "",
+                "task_origin": "scope_split",
+                "recovery_history": [
+                    {
+                        "epoch": 0,
+                        "round": 2,
+                        "result": "requeued",
+                    },
+                    {
+                        "epoch": 3,
+                        "round": 1,
+                        "result": "requeued",
+                    },
+                    {
+                        "epoch": 3,
+                        "round": 3,
+                        "result": "exhausted",
+                    },
+                ],
+            }
+        )
+
+        changed = Orchestrator._normalize_task_origins([task])
+
+        self.assertTrue(changed)
+        self.assertEqual((task.recovery_epoch, task.recovery_round), (3, 1))
+        self.assertNotIn("_recovery_cursor_metadata_present", task.to_dict())
+        self.assertFalse(Orchestrator._normalize_task_origins([task]))
+
+    def test_explicit_recovery_cursor_is_not_rederived_from_history(self) -> None:
+        task = TaskSpec.from_dict(
+            {
+                "task_id": "current-recovery",
+                "title": "Recover observable evidence",
+                "description": "Repair the current evidence lifecycle.",
+                "acceptance": ["The current proof passes."],
+                "status": "pending",
+                "commit_message": "",
+                "task_origin": "scope_split",
+                "recovery_epoch": 3,
+                "recovery_round": 0,
+                "recovery_history": [
+                    {
+                        "epoch": 0,
+                        "round": 2,
+                        "result": "requeued",
+                    },
+                    {
+                        "epoch": 3,
+                        "round": 1,
+                        "result": "requeued",
+                    },
+                ],
+            }
+        )
+
+        changed = Orchestrator._normalize_task_origins([task])
+
+        self.assertFalse(changed)
+        self.assertEqual((task.recovery_epoch, task.recovery_round), (3, 0))
+
     def test_verify_implicated_paths_include_public_documents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -7268,6 +7337,188 @@ class RetryFlowTests(unittest.TestCase):
             rewind.assert_called_once()
             self.assertEqual(state.last_recovery_route["outcome"], "replanned")
             self.assertEqual(state.last_recovery_route["judge_decision"], "REPLAN")
+
+    def test_self_repair_restores_skipped_current_epoch_recovery_round(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.execution.recovery.max_rounds = 2
+            failure_id = "tests/test_contract.py::test_observable_contract"
+            repair_id = "current-proof-repair"
+            parent_id = "observable-contract"
+            history = [
+                {
+                    "epoch": 0,
+                    "round": 2,
+                    "result": "requeued",
+                    "signature": "older-epoch",
+                    "failure_signature": "older-epoch",
+                    "repair_task_ids": [repair_id],
+                },
+                {
+                    "epoch": 3,
+                    "round": 1,
+                    "result": "requeued",
+                    "signature": "current-round-one",
+                    "failure_signature": "current-round-one",
+                    "evidence_fingerprint": "current-round-one-evidence",
+                    "repair_task_ids": [repair_id],
+                },
+                {
+                    "epoch": 3,
+                    "round": 3,
+                    "result": "exhausted",
+                    "signature": "invalid-terminal",
+                    "failure_signature": "invalid-terminal",
+                    "evidence_fingerprint": "invalid-terminal-evidence",
+                    "repair_task_ids": [repair_id],
+                },
+            ]
+            repair = TaskSpec(
+                task_id=repair_id,
+                title="Repair current proof evidence",
+                description="Repair the observable proof.",
+                acceptance=["The observable proof passes."],
+                status="blocked",
+                task_origin="evidence_repair",
+                parent_task_id=parent_id,
+                recovery_epoch=3,
+                recovery_round=2,
+                recovery_history=[dict(entry) for entry in history],
+                verification_refs=[failure_id],
+            )
+            parent = TaskSpec(
+                task_id=parent_id,
+                title="Implement the observable contract",
+                description="Keep the public contract observable.",
+                acceptance=["The observable contract passes."],
+                status="pending",
+                recovery_epoch=3,
+                recovery_round=2,
+                recovery_history=[dict(entry) for entry in history],
+                verification_refs=[failure_id],
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [repair, parent]
+            state.last_recovery_route = {
+                "task_id": repair_id,
+                "lineage_id": parent_id,
+                "epoch": 3,
+                "round": 3,
+                "max_rounds": 2,
+                "outcome": "exhausted",
+            }
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "recovery_cursor_invariant",
+                "status": "blocked",
+            }
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(project_root, state)
+
+            marked = orchestrator.mark_self_repair_applied("repair123")
+            resumed = Orchestrator(project_root)
+
+            self.assertTrue(resumed._resume_blocked_run(marked))
+            repaired_task = next(
+                task for task in marked.tasks if task.task_id == repair_id
+            )
+            repaired_parent = next(
+                task for task in marked.tasks if task.task_id == parent_id
+            )
+            self.assertEqual(repaired_task.status, "pending")
+            self.assertEqual(repaired_task.recovery_round, 1)
+            self.assertEqual(repaired_parent.recovery_round, 1)
+            self.assertEqual(marked.last_recovery_route, {})
+            self.assertEqual(
+                marked.active_blocker["recovery_cursor_reconciliations"][0][
+                    "last_consumed_round"
+                ],
+                1,
+            )
+            terminal = next(
+                entry
+                for entry in repaired_task.recovery_history
+                if entry.get("result") == "exhausted"
+            )
+            self.assertEqual(
+                terminal["recovery_cursor_reconciliation"]["outcome"],
+                "ignored_noncontiguous_exhaustion",
+            )
+
+            with patch.object(
+                resumed,
+                "_run_recovery_judge",
+                return_value={
+                    "decision": "CONTINUE",
+                    "reason": "One bounded current-epoch correction remains.",
+                    "actionable_items": ["Correct the current proof."],
+                    "split_axis": [],
+                    "source": "provider",
+                },
+            ):
+                scheduled = resumed._schedule_repair_tasks_for_failure(
+                    marked,
+                    marked.tasks,
+                    repaired_task,
+                    {
+                        "reason": "verification failed after self-repair",
+                        "review": "The current proof still needs one correction.",
+                        "failure_ids": [failure_id],
+                    },
+                )
+
+            self.assertTrue(scheduled)
+            self.assertEqual(repaired_task.recovery_round, 2)
+            self.assertEqual(repaired_parent.recovery_round, 2)
+            self.assertEqual(marked.last_recovery_route["outcome"], "requeued")
+            self.assertEqual(marked.last_recovery_route["round"], 2)
+
+    def test_self_repair_keeps_contiguous_recovery_exhaustion_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="bounded-recovery",
+                title="Bounded recovery",
+                description="Use the configured recovery budget.",
+                acceptance=["The bounded proof passes."],
+                status="blocked",
+                task_origin="scope_split",
+                recovery_epoch=2,
+                recovery_round=2,
+                recovery_history=[
+                    {"epoch": 2, "round": 1, "result": "requeued"},
+                    {"epoch": 2, "round": 2, "result": "requeued"},
+                    {"epoch": 2, "round": 3, "result": "exhausted"},
+                ],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "lineage_id": task.task_id,
+                "epoch": 2,
+                "round": 3,
+                "outcome": "exhausted",
+            }
+
+            reconciled = orchestrator._reconcile_noncontiguous_recovery_exhaustion(
+                state,
+                state.tasks,
+            )
+
+            self.assertEqual(reconciled, [])
+            self.assertEqual(task.recovery_round, 2)
+            self.assertEqual(state.last_recovery_route["outcome"], "exhausted")
+            self.assertNotIn(
+                "recovery_cursor_reconciliation",
+                task.recovery_history[-1],
+            )
 
     def test_review_recovery_hard_cap_applies_to_ordinary_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

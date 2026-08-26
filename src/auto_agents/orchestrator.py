@@ -311,6 +311,8 @@ _ARTIFACT_PUBLICATION_METADATA_REPAIR_CONTEXT = (
     "artifact_publication_metadata_repair"
 )
 _RECOVERY_SIGNATURE_EPOCHS_CONTEXT = "recovery_signature_epochs"
+_RECOVERY_ROUND_LIFECYCLE_RESULTS = frozenset({"scheduled", "requeued"})
+_RECOVERY_CURSOR_RECONCILIATION_KEY = "recovery_cursor_reconciliation"
 _DANGLING_DEPENDENCIES_AFTER_TASK_PRUNING = (
     "dangling_dependencies_after_task_pruning"
 )
@@ -7135,6 +7137,110 @@ class Orchestrator:
         }
         return self._remove_pruned_task_dependency_references(tasks, missing_ids)
 
+    def _reconcile_noncontiguous_recovery_exhaustion(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> List[Dict[str, object]]:
+        """Return a recovery opportunity skipped by a corrupt terminal cursor.
+
+        Exhaustion records the round *after* the last consumed recovery lifecycle.
+        A terminal round that skips over the latest scheduled/requeued round cannot
+        have been produced by a coherent cursor. Keep the history as audit evidence,
+        mark that terminal sentinel as superseded, and restore only the active
+        lineage cursor and route.
+        """
+
+        route = state.last_recovery_route
+        if not isinstance(route, dict) or str(route.get("outcome", "")) != "exhausted":
+            return []
+        try:
+            route_epoch = max(0, int(route.get("epoch", 0) or 0))
+            terminal_round = max(0, int(route.get("round", 0) or 0))
+        except (TypeError, ValueError):
+            return []
+        if terminal_round <= 0:
+            return []
+
+        by_id = {task.task_id: task for task in tasks}
+        lineage_id = str(route.get("lineage_id", "")).strip()
+        routed_task_id = str(route.get("task_id", "")).strip()
+        owner = by_id.get(lineage_id)
+        routed_task = by_id.get(routed_task_id)
+        if owner is None and routed_task is not None:
+            owner = self._recovery_lineage_owner(tasks, routed_task)
+            lineage_id = owner.task_id
+        if owner is None or int(owner.recovery_epoch) != route_epoch:
+            return []
+
+        lineage = self._recovery_lineage_tasks(tasks, routed_task or owner)
+        if not any(task.task_id == owner.task_id for task in lineage):
+            return []
+
+        terminal_entries: List[Tuple[TaskSpec, Dict[str, object]]] = []
+        consumed_rounds: Set[int] = set()
+        for task in lineage:
+            for entry in task.recovery_history:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    entry_epoch = max(0, int(entry.get("epoch", 0) or 0))
+                    entry_round = max(0, int(entry.get("round", 0) or 0))
+                except (TypeError, ValueError):
+                    continue
+                if entry_epoch != route_epoch:
+                    continue
+                result = str(entry.get("result", ""))
+                if result in _RECOVERY_ROUND_LIFECYCLE_RESULTS and entry_round > 0:
+                    consumed_rounds.add(entry_round)
+                if (
+                    result == "exhausted"
+                    and entry_round == terminal_round
+                    and not entry.get(_RECOVERY_CURSOR_RECONCILIATION_KEY)
+                ):
+                    terminal_entries.append((task, entry))
+
+        if not terminal_entries or not consumed_rounds:
+            return []
+        last_consumed_round = max(consumed_rounds)
+        if terminal_round <= last_consumed_round + 1:
+            return []
+
+        restored_task_ids: List[str] = []
+        for task in lineage:
+            if (
+                int(task.recovery_epoch) == route_epoch
+                and int(task.recovery_round) > last_consumed_round
+            ):
+                task.recovery_round = last_consumed_round
+                restored_task_ids.append(task.task_id)
+
+        reconciliation = {
+            "outcome": "ignored_noncontiguous_exhaustion",
+            "epoch": route_epoch,
+            "terminal_round": terminal_round,
+            "last_consumed_round": last_consumed_round,
+        }
+        for _task, entry in terminal_entries:
+            entry[_RECOVERY_CURSOR_RECONCILIATION_KEY] = dict(reconciliation)
+
+        state.last_recovery_route = {}
+        self.logger.warning(
+            "[recovery] reconciled noncontiguous exhaustion lineage=%s "
+            "epoch=%s terminal_round=%s restored_round=%s",
+            lineage_id,
+            route_epoch,
+            terminal_round,
+            last_consumed_round,
+        )
+        return [
+            {
+                "lineage_id": lineage_id,
+                **reconciliation,
+                "restored_task_ids": restored_task_ids,
+            }
+        ]
+
     def _prepare_self_repair_task_retries(
         self,
         state: RunState,
@@ -7185,6 +7291,15 @@ class Orchestrator:
                     if isinstance(item, dict)
                 ]
 
+        cursor_reconciliations = (
+            self._reconcile_noncontiguous_recovery_exhaustion(
+                state,
+                tasks,
+            )
+        )
+        if cursor_reconciliations:
+            blocker["recovery_cursor_reconciliations"] = cursor_reconciliations
+
         dependency_repairs = self._repair_dangling_dependencies_after_task_pruning(
             tasks,
             blocker,
@@ -7218,7 +7333,7 @@ class Orchestrator:
                 state.task_review_cache.pop(task.task_id, None)
                 requeued_task_ids.append(task.task_id)
 
-        if requeued_task_ids or dependency_repairs:
+        if requeued_task_ids or dependency_repairs or cursor_reconciliations:
             state.tasks = tasks
             self._persist_tasks(tasks)
 
@@ -13270,6 +13385,8 @@ class Orchestrator:
         for existing in task.recovery_history:
             if not isinstance(existing, dict):
                 continue
+            if existing.get(_RECOVERY_CURSOR_RECONCILIATION_KEY):
+                continue
             if (
                 existing.get("epoch"),
                 existing.get("round"),
@@ -13764,6 +13881,8 @@ class Orchestrator:
         for item in lineage_tasks:
             for entry in reversed(item.recovery_history):
                 if not isinstance(entry, dict):
+                    continue
+                if entry.get(_RECOVERY_CURSOR_RECONCILIATION_KEY):
                     continue
                 if int(entry.get("epoch", 0) or 0) != int(owner.recovery_epoch):
                     continue
@@ -19018,8 +19137,7 @@ class Orchestrator:
         """Migrate legacy task lineage from persisted relationships, never ID spelling."""
         current_ids = {task.task_id for task in tasks if task.task_id.strip()}
         repair_ids: Set[str] = set()
-        historical_rounds: Dict[str, int] = {}
-        historical_epochs: Dict[str, int] = {}
+        historical_cursors: Dict[str, Dict[int, int]] = {}
         for owner in tasks:
             for entry in owner.recovery_history:
                 if not isinstance(entry, dict):
@@ -19039,23 +19157,17 @@ class Orchestrator:
                     epoch = max(0, int(entry.get("epoch", 0) or 0))
                 except (TypeError, ValueError):
                     epoch = 0
-                historical_rounds[owner.task_id] = max(
-                    historical_rounds.get(owner.task_id, 0),
-                    round_number,
+                consumes_round = str(entry.get("result", "")) in (
+                    _RECOVERY_ROUND_LIFECYCLE_RESULTS
                 )
-                historical_epochs[owner.task_id] = max(
-                    historical_epochs.get(owner.task_id, 0),
-                    epoch,
-                )
-                for task_id in ids:
-                    historical_rounds[task_id] = max(
-                        historical_rounds.get(task_id, 0),
-                        round_number,
-                    )
-                    historical_epochs[task_id] = max(
-                        historical_epochs.get(task_id, 0),
-                        epoch,
-                    )
+                for task_id in {owner.task_id, *ids}:
+                    rounds_by_epoch = historical_cursors.setdefault(task_id, {})
+                    rounds_by_epoch.setdefault(epoch, 0)
+                    if consumes_round:
+                        rounds_by_epoch[epoch] = max(
+                            rounds_by_epoch[epoch],
+                            round_number,
+                        )
 
         replacement_ids = {
             task_id
@@ -19109,14 +19221,29 @@ class Orchestrator:
             if desired != task.task_origin:
                 task.task_origin = desired
                 changed = True
-            migrated_round = historical_rounds.get(task.task_id, 0)
-            if migrated_round > task.recovery_round:
-                task.recovery_round = migrated_round
-                changed = True
-            migrated_epoch = historical_epochs.get(task.task_id, 0)
-            if migrated_epoch > task.recovery_epoch:
-                task.recovery_epoch = migrated_epoch
-                changed = True
+            cursor_metadata_present = bool(
+                getattr(
+                    task,
+                    "_recovery_cursor_metadata_present",
+                    task.recovery_epoch > 0 or task.recovery_round > 0,
+                )
+            )
+            rounds_by_epoch = historical_cursors.get(task.task_id, {})
+            if rounds_by_epoch and not cursor_metadata_present:
+                # Legacy recovery metadata is one coherent (epoch, round) cursor.
+                # Select an epoch first, then count only lifecycle-producing rounds
+                # in that epoch.  Terminal entries use the *next* round as a
+                # sentinel and therefore never advance the reusable cursor.
+                migrated_epoch = max(rounds_by_epoch)
+                migrated_round = rounds_by_epoch[migrated_epoch]
+                if (
+                    migrated_epoch != task.recovery_epoch
+                    or migrated_round > task.recovery_round
+                ):
+                    task.recovery_epoch = migrated_epoch
+                    task.recovery_round = migrated_round
+                    task._recovery_cursor_metadata_present = True
+                    changed = True
         by_id = {task.task_id: task for task in tasks}
         for task in tasks:
             if task.task_origin != "evidence_repair" or not task.parent_task_id:

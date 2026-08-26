@@ -166,7 +166,7 @@ class TaskSpec:
             for entry in raw_requirement_proofs:
                 if isinstance(entry, dict):
                     requirement_proofs.append(entry)
-        return cls(
+        task = cls(
             task_id=str(data["task_id"]),
             title=str(data["title"]),
             description=str(data.get("description", "")),
@@ -237,6 +237,14 @@ class TaskSpec:
                 if isinstance(item, dict)
             ],
         )
+        # This is load-time migration metadata, not part of the persisted task
+        # contract.  Recovery history may backfill a cursor for legacy plans that
+        # predate these fields, but must not overwrite an orchestrator-owned cursor
+        # that was explicitly serialized.
+        task._recovery_cursor_metadata_present = bool(
+            "recovery_epoch" in data and "recovery_round" in data
+        )
+        return task
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
