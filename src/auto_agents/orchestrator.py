@@ -9812,8 +9812,15 @@ class Orchestrator:
                 strict_plan = int(plan.get("oracle_proof_schema_version") or 0) >= 1
             except (TypeError, ValueError):
                 strict_plan = False
-        if not strict_plan and not task.requirement_proofs:
-            return []
+        if not task.requirement_proofs:
+            if not strict_plan:
+                return []
+            if self._is_repair_task(task):
+                # Evidence-repair children inherit requirement_ids for lineage,
+                # risk classification, and review context. With no explicit local
+                # proofs, their verification_refs are the repair-owned proof
+                # surface; the parent keeps ownership of its requirement_proofs.
+                return []
         trace = load_requirements_trace(self.project_root)
         return validate_done_task_requirement_proofs(task, trace)
 

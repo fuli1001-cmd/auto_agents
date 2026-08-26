@@ -397,6 +397,7 @@ class ImplementPipelineTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root)
             config = orchestrator.config
             config.gates.commands = []
+            config.execution.evidence_preflight.mode = "off"
             save_project_config(project_root, config)
             orchestrator = Orchestrator(project_root)
             adapter = ProofUpdateAdapter(project_root)

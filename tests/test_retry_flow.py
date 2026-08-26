@@ -40,7 +40,48 @@ from auto_agents.provider_contract import (
     PROVIDER_REFERENCE_CONTRACT_VERSION,
     PROVIDER_REFERENCE_V2_HEADINGS,
 )
+from auto_agents.requirements import requirement_contract_sha256
 from auto_agents.validation import validation_report
+
+
+def _strict_requirement() -> dict:
+    return {
+        "id": "REQ-001",
+        "text": "Keep the public contract verified.",
+        "source": "test scope",
+        "status": "active",
+        "priority": "mandatory",
+        "acceptance_oracles": ["The public contract passes."],
+        "oracle_type": "integration_test",
+        "oracle_strength": "behavioral",
+        "evidence_boundary": "system_boundary",
+        "forbidden_proxy_oracles": [],
+        "forbidden_patterns": [],
+        "external_docs_required": False,
+        "provider_reference": "",
+        "notes": "",
+    }
+
+
+def _strict_requirement_proof(
+    requirement: dict,
+    evidence_ref: str,
+    *,
+    status: str,
+) -> dict:
+    return {
+        "requirement_id": str(requirement["id"]),
+        "oracle_index": 1,
+        "acceptance_oracle": str(requirement["acceptance_oracles"][0]),
+        "requirement_contract_sha256": requirement_contract_sha256(requirement),
+        "proof_type": "integration_test",
+        "oracle_strength": "behavioral",
+        "evidence_boundary": "system_boundary",
+        "evidence_refs": [evidence_ref],
+        "forbidden_proxy_oracles": [],
+        "proxy_oracles": [],
+        "status": status,
+    }
 
 
 class RetryingPlanAdapter:
@@ -6732,6 +6773,146 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("repair-task-001-r1-1", parent.depends_on)
             self.assertEqual(parent.recovery_history[-1]["result"], "scheduled")
             self.assertIn("[recovery] scheduled parent=task-001", stream.getvalue())
+
+    def test_strict_evidence_repair_completes_after_verify_and_review_without_local_proofs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            config = orchestrator.config
+            config.gates.commands = []
+            config.execution.parallel_tasks.enabled = False
+            config.execution.evidence_preflight.mode = "off"
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            requirement = _strict_requirement()
+            write_json(
+                requirements_trace_path(project_root),
+                {"version": 1, "requirements": [requirement]},
+            )
+            tests_dir = project_root / "tests"
+            tests_dir.mkdir()
+            proof_ref = "tests/test_public_api.py::test_contract"
+            write_text(
+                tests_dir / "test_public_api.py",
+                "def test_contract():\n    assert True\n",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 2,
+                    "verification_policy_version": 2,
+                    "tasks": [
+                        {
+                            "task_id": "task-001",
+                            "title": "Parent proof task",
+                            "description": "Keep the public contract verified.",
+                            "acceptance": ["The public contract passes."],
+                            "status": "blocked",
+                            "commit_message": "",
+                            "review_summary": f"owned proof evidence failed: {proof_ref}",
+                            "verify_history": [
+                                {
+                                    "attempt": 1,
+                                    "decision": "fail",
+                                    "summary": f"owned proof evidence failed: {proof_ref}",
+                                    "failure_ids": [proof_ref],
+                                    "comparable_failures": True,
+                                }
+                            ],
+                            "requirement_ids": ["REQ-001"],
+                            "requirement_proofs": [
+                                _strict_requirement_proof(
+                                    requirement,
+                                    proof_ref,
+                                    status="verified",
+                                )
+                            ],
+                        }
+                    ],
+                },
+            )
+
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            scheduled = orchestrator._run_implementation_loop(state, max_tasks=1)
+            repair, parent = scheduled.tasks
+            self.assertEqual(repair.task_origin, "evidence_repair")
+            self.assertEqual(repair.requirement_ids, ["REQ-001"])
+            self.assertEqual(repair.requirement_proofs, [])
+            self.assertEqual(repair.verification_refs, [proof_ref])
+            self.assertEqual(parent.status, "pending")
+
+            adapter = BlockedRetryAdapter(project_root)
+            orchestrator.adapter = adapter
+            completed = orchestrator._run_implementation_loop(
+                scheduled,
+                max_tasks=1,
+            )
+
+            completed_repair = completed.tasks[0]
+            self.assertEqual(completed_repair.status, "done")
+            self.assertEqual(adapter.implement_calls, 1)
+            self.assertEqual(adapter.review_calls, 1)
+            self.assertEqual(
+                [entry["decision"] for entry in completed_repair.verify_history],
+                ["pass"],
+            )
+
+    def test_evidence_repair_with_explicit_requirement_proof_remains_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            requirement = _strict_requirement()
+            write_json(
+                requirements_trace_path(project_root),
+                {"version": 1, "requirements": [requirement]},
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"oracle_proof_schema_version": 2, "tasks": []},
+            )
+            repair = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair proof evidence",
+                description="Repair the public contract proof.",
+                acceptance=["The public contract passes."],
+                task_origin="evidence_repair",
+                requirement_ids=["REQ-001"],
+                requirement_proofs=[
+                    _strict_requirement_proof(
+                        requirement,
+                        "tests/test_public_api.py::test_contract",
+                        status="planned",
+                    )
+                ],
+            )
+
+            findings = orchestrator._task_completion_proof_findings(repair)
+
+            self.assertTrue(findings)
+            self.assertTrue(
+                any("proof is not verified" in item["message"] for item in findings),
+                findings,
+            )
+            planned = TaskSpec(
+                task_id="task-001",
+                title="Implement the public contract",
+                description="Keep the public contract verified.",
+                acceptance=["The public contract passes."],
+                requirement_ids=["REQ-001"],
+            )
+
+            planned_findings = orchestrator._task_completion_proof_findings(planned)
+
+            self.assertTrue(
+                any(item["kind"] == "oracle_proof_missing" for item in planned_findings),
+                planned_findings,
+            )
 
     def test_legacy_evidence_repair_inherits_parent_requirement_lineage(self) -> None:
         parent = TaskSpec(
