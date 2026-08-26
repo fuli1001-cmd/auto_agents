@@ -677,6 +677,17 @@ class RootCauseCoordinator:
             ignore=ignore,
             symlinks=True,
         )
+        # Archived done-task payloads are part of the permanent requirement
+        # namespace. Copy that bounded subset of history so diagnosis and
+        # self-repair reproduce the same collision checks as the final audit.
+        archived_plans = source / ".auto-agents" / "history" / "task_plans"
+        if archived_plans.is_dir():
+            shutil.copytree(
+                archived_plans,
+                destination / ".auto-agents" / "history" / "task_plans",
+                dirs_exist_ok=True,
+                symlinks=True,
+            )
 
     def _replace_repository_roots(
         self,

@@ -136,6 +136,41 @@ class _FakeOrchestrator:
 
 
 class RootCauseCoordinatorTests(unittest.TestCase):
+    def test_diagnostic_snapshot_keeps_archived_requirement_namespace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            destination = root / "snapshot"
+            write_json(
+                source
+                / ".auto-agents"
+                / "history"
+                / "task_plans"
+                / "old-run.json",
+                {"tasks": [{"task_id": "task-old", "status": "done"}]},
+            )
+            write_json(
+                source
+                / ".auto-agents"
+                / "runs"
+                / "run-123"
+                / "large-generated.json",
+                {"generated": True},
+            )
+
+            RootCauseCoordinator._copy_diagnostic_tree(source, destination)
+
+            self.assertTrue(
+                (
+                    destination
+                    / ".auto-agents"
+                    / "history"
+                    / "task_plans"
+                    / "old-run.json"
+                ).is_file()
+            )
+            self.assertFalse((destination / ".auto-agents" / "runs").exists())
+
     def test_self_repair_pytest_command_avoids_root_module_shadowing(self):
         repo_root = Path(__file__).resolve().parents[1]
         command = self_repair_verification_command(
