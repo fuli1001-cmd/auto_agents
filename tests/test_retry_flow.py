@@ -7412,11 +7412,170 @@ class RetryFlowTests(unittest.TestCase):
             self.assertTrue(scheduled)
             self.assertEqual(task.recovery_history[-1]["result"], "judge_stopped")
             self.assertEqual(state.last_recovery_route["outcome"], "judge_stopped")
+            self.assertEqual(task.recovery_round, 1)
+            self.assertEqual(state.last_recovery_route["round"], 1)
+            self.assertEqual(
+                state.last_recovery_route["failure_signature"],
+                task.recovery_history[-1]["failure_signature"],
+            )
+            self.assertEqual(state.last_recovery_route["judge_decision"], "STOP")
+            self.assertEqual(state.last_recovery_route["judge_source"], "provider")
+            self.assertTrue(
+                state.last_recovery_route["prerequisite_fingerprint"]
+            )
+            self.assertEqual(
+                state.last_recovery_route["prerequisite_fingerprint"],
+                task.recovery_history[-1]["prerequisite_fingerprint"],
+            )
             self.assertEqual(state.status, "blocked")
             self.assertEqual(state.active_blocker["owner"], "external_provider")
             self.assertEqual(
                 state.active_blocker["category"],
                 "recovery_provider_action_required",
+            )
+
+    def test_repeated_provider_recovery_stop_is_idempotent_and_resume_needs_change(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.execution.recovery.max_rounds = 2
+            repair = TaskSpec(
+                task_id="provider-proof-repair",
+                title="Repair provider proof evidence",
+                description="Run the bounded provider proof.",
+                acceptance=["The provider proof completes."],
+                status="in_progress",
+                task_origin="evidence_repair",
+                parent_task_id="provider-contract",
+                recovery_epoch=3,
+                recovery_round=1,
+            )
+            parent = TaskSpec(
+                task_id="provider-contract",
+                title="Exercise the provider contract",
+                description="Keep the external contract observable.",
+                acceptance=["The external contract is proven."],
+                status="pending",
+                recovery_epoch=3,
+                recovery_round=1,
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.tasks = [repair, parent]
+            state.execution_incident_budget_epoch = 4
+            state.active_execution_incident_id = "provider-incident"
+            state.execution_incidents = [
+                {
+                    "incident_id": "provider-incident",
+                    "source": "provider",
+                    "kind": "provider_protocol_error",
+                    "task_id": repair.task_id,
+                    "status": "needs_human",
+                    "budget_epoch": 4,
+                    "incident_fingerprint": "provider-identity",
+                    "evidence_fingerprint": "provider-evidence-v1",
+                }
+            ]
+            review = "The external execution lane remains unavailable."
+            evidence = orchestrator._recovery_judge_evidence(
+                state,
+                repair,
+                parent,
+                review,
+                2,
+            )
+            prerequisite = evidence["recovery_prerequisites"][0]
+            judgment = {
+                "decision": "STOP",
+                "reason": "The typed provider prerequisite needs external action.",
+                "actionable_items": [],
+                "split_axis": [],
+                "owner": "external_provider",
+                "prerequisite_keys": [prerequisite["key"]],
+                "evidence_refs": [
+                    prerequisite["evidence_ref"],
+                    *prerequisite["evidence_refs"],
+                ],
+                "source": "provider",
+            }
+            failure = {
+                "reason": "verification failed at the provider boundary",
+                "review": review,
+                "failure_ids": ["tests/test_provider.py::test_live_boundary"],
+            }
+
+            with patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                return_value=judgment,
+            ):
+                first = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    repair,
+                    failure,
+                )
+
+            self.assertTrue(first)
+            self.assertEqual(repair.recovery_round, 2)
+            self.assertEqual(parent.recovery_round, 2)
+            self.assertEqual(state.last_recovery_route["round"], 2)
+            self.assertEqual(state.last_recovery_route["judge_decision"], "STOP")
+            self.assertEqual(state.last_recovery_route["judge_source"], "provider")
+            first_route = json.loads(json.dumps(state.last_recovery_route))
+            repair_history_size = len(repair.recovery_history)
+            parent_history_size = len(parent.recovery_history)
+
+            with patch.object(
+                orchestrator,
+                "_run_recovery_judge",
+                side_effect=AssertionError(
+                    "unchanged terminal evidence must not invoke the judge again"
+                ),
+            ):
+                repeated = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    repair,
+                    failure,
+                )
+
+            self.assertTrue(repeated)
+            self.assertEqual(state.last_recovery_route, first_route)
+            self.assertEqual(len(repair.recovery_history), repair_history_size)
+            self.assertEqual(len(parent.recovery_history), parent_history_size)
+            self.assertEqual(
+                state.active_blocker["category"],
+                "recovery_provider_action_required",
+            )
+
+            unchanged_epoch = parent.recovery_epoch
+            self.assertFalse(orchestrator._resume_blocked_run(state))
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(parent.recovery_epoch, unchanged_epoch)
+            self.assertEqual(repair.recovery_round, 2)
+            self.assertEqual(parent.recovery_round, 2)
+            self.assertEqual(state.last_recovery_route, first_route)
+            self.assertIn("resume_rejection", state.active_blocker)
+
+            state.execution_incidents[0][
+                "evidence_fingerprint"
+            ] = "provider-evidence-v2"
+
+            self.assertTrue(orchestrator._resume_blocked_run(state))
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(parent.recovery_epoch, unchanged_epoch + 1)
+            self.assertEqual(repair.recovery_epoch, unchanged_epoch + 1)
+            self.assertEqual(repair.recovery_round, 0)
+            self.assertEqual(parent.recovery_round, 0)
+            self.assertEqual(state.last_recovery_route, {})
+            self.assertTrue(
+                state.active_blocker["recovery_resume_evidence"][
+                    "prerequisite_changed"
+                ]
             )
 
     def test_typed_prerequisite_rejects_owner_mismatch_and_stale_record(self) -> None:
@@ -7558,6 +7717,150 @@ class RetryFlowTests(unittest.TestCase):
             rewind.assert_called_once()
             self.assertEqual(state.last_recovery_route["outcome"], "replanned")
             self.assertEqual(state.last_recovery_route["judge_decision"], "REPLAN")
+
+    def test_self_repair_reconciles_newer_terminal_recovery_history_without_retry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            repair = TaskSpec(
+                task_id="external-proof-repair",
+                title="Repair external proof evidence",
+                description="Run the bounded external proof.",
+                acceptance=["The external proof completes."],
+                status="pending",
+                task_origin="evidence_repair",
+                parent_task_id="external-contract",
+                recovery_epoch=3,
+                recovery_round=1,
+                verify_retry_epoch=5,
+            )
+            parent = TaskSpec(
+                task_id="external-contract",
+                title="Exercise the external contract",
+                description="Keep the provider contract observable.",
+                acceptance=["The provider contract is proven."],
+                status="pending",
+                recovery_epoch=3,
+                recovery_round=1,
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [repair, parent]
+            prerequisite_keys = ["external.anonymous_availability"]
+            evidence_refs = [
+                f"verification:{repair.task_id}:0",
+                f"lineage-contract:{parent.task_id}",
+            ]
+            evidence_fingerprint = orchestrator._recovery_evidence_fingerprint(
+                parent,
+                state=state,
+                tasks=state.tasks,
+            )
+            prerequisite_fingerprint = (
+                orchestrator._recovery_prerequisite_fingerprint(
+                    state,
+                    state.tasks,
+                    repair,
+                    parent,
+                    prerequisite_keys=prerequisite_keys,
+                    evidence_refs=evidence_refs,
+                )
+            )
+            stopped_entry = {
+                "epoch": 3,
+                "round": 2,
+                "max_rounds": 2,
+                "result": "judge_stopped",
+                "failure_kind": "verification_failed",
+                "signature": "signed-terminal-failure",
+                "failure_signature": "signed-terminal-failure",
+                "evidence_fingerprint": evidence_fingerprint,
+                "judge_decision": "STOP",
+                "judge_reason": "The external prerequisite remains unavailable.",
+                "judge_source": "provider",
+                "stop_owner": "external_provider",
+                "stop_category": "recovery_provider_action_required",
+                "prerequisite_keys": prerequisite_keys,
+                "evidence_refs": evidence_refs,
+                "prerequisite_fingerprint": prerequisite_fingerprint,
+                "repair_task_ids": [repair.task_id],
+            }
+            repair.recovery_history = [dict(stopped_entry)]
+            parent.recovery_history = [dict(stopped_entry)]
+            state.last_recovery_route = {
+                "task_id": repair.task_id,
+                "task_origin": repair.task_origin,
+                "lineage_id": parent.task_id,
+                "epoch": 3,
+                "round": 1,
+                "max_rounds": 2,
+                "failure_kind": "verification_failed",
+                "failure_signature": "",
+                "evidence_fingerprint": evidence_fingerprint,
+                "judge_decision": "",
+                "judge_source": "",
+                "outcome": "judge_stopped",
+                "reason": "terminal recovery evidence is unchanged",
+                "repair_task_ids": [],
+                "engine_invariant": "",
+                "stop_owner": "external_provider",
+                "stop_category": "recovery_provider_action_required",
+                "prerequisite_keys": prerequisite_keys,
+                "evidence_refs": evidence_refs,
+            }
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "terminal_recovery_lifecycle_not_idempotent",
+                "reason": "terminal route provenance is inconsistent",
+                "status": "blocked",
+            }
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(project_root, state)
+
+            marked = orchestrator.mark_self_repair_applied("repair123")
+            resumed = Orchestrator(project_root)
+            with patch.object(
+                resumed,
+                "_begin_fresh_verify_retry_lifecycle",
+                side_effect=AssertionError(
+                    "terminal reconciliation must not open a verification retry"
+                ),
+            ):
+                changed = resumed._resume_blocked_run(marked)
+
+            repaired_task = next(
+                task for task in marked.tasks if task.task_id == repair.task_id
+            )
+            repaired_parent = next(
+                task for task in marked.tasks if task.task_id == parent.task_id
+            )
+            self.assertFalse(changed)
+            self.assertEqual(marked.status, "blocked")
+            self.assertEqual(repaired_task.recovery_round, 2)
+            self.assertEqual(repaired_parent.recovery_round, 2)
+            self.assertEqual(repaired_task.verify_retry_epoch, 5)
+            self.assertEqual(len(repaired_task.recovery_history), 1)
+            self.assertEqual(len(repaired_parent.recovery_history), 1)
+            self.assertEqual(marked.last_recovery_route["round"], 2)
+            self.assertEqual(
+                marked.last_recovery_route["failure_signature"],
+                "signed-terminal-failure",
+            )
+            self.assertEqual(marked.last_recovery_route["judge_decision"], "STOP")
+            self.assertEqual(marked.last_recovery_route["judge_source"], "provider")
+            self.assertEqual(
+                marked.last_recovery_route["reason"],
+                "The external prerequisite remains unavailable.",
+            )
+            self.assertEqual(marked.active_blocker["owner"], "external_provider")
+            self.assertEqual(
+                marked.active_blocker["category"],
+                "recovery_provider_action_required",
+            )
 
     def test_self_repair_restores_skipped_current_epoch_recovery_round(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

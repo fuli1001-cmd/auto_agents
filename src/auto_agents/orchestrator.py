@@ -311,7 +311,9 @@ _ARTIFACT_PUBLICATION_METADATA_REPAIR_CONTEXT = (
     "artifact_publication_metadata_repair"
 )
 _RECOVERY_SIGNATURE_EPOCHS_CONTEXT = "recovery_signature_epochs"
-_RECOVERY_ROUND_LIFECYCLE_RESULTS = frozenset({"scheduled", "requeued"})
+_RECOVERY_ROUND_LIFECYCLE_RESULTS = frozenset(
+    {"scheduled", "requeued", "judge_stopped"}
+)
 _RECOVERY_CURSOR_RECONCILIATION_KEY = "recovery_cursor_reconciliation"
 _DANGLING_DEPENDENCIES_AFTER_TASK_PRUNING = (
     "dangling_dependencies_after_task_pruning"
@@ -421,6 +423,16 @@ class Orchestrator:
         "verification_contract": "recovery_contract_action_required",
         "verification_infrastructure": "recovery_infrastructure_action_required",
     }
+    RECOVERY_ACTION_CATEGORIES = frozenset(
+        {
+            "recovery_action_required",
+            "recovery_contract_action_required",
+            "recovery_external_action_required",
+            "recovery_evidence_change_required",
+            "recovery_infrastructure_action_required",
+            "recovery_provider_action_required",
+        }
+    )
     RECOVERY_PREREQUISITE_SCHEMA_VERSION = 1
 
     def __init__(
@@ -7764,6 +7776,13 @@ class Orchestrator:
             and not self_repair_resume
         ):
             return False
+        terminal_route, terminal_task, terminal_owner = (
+            self._active_terminal_recovery_route(state, state.tasks)
+        )
+        if terminal_route:
+            # Persist any load-time repair from a newer signed terminal history
+            # before deciding whether the run may leave the blocker.
+            self._persist_tasks(state.tasks)
         policy_v5_resume = self._prepare_policy_v5_reported_infrastructure_resume(
             state,
             active_incident,
@@ -7812,6 +7831,15 @@ class Orchestrator:
             state.active_blocker = blocker
             state.status = "blocked"
             return False
+        if (
+            self_repair_resume
+            and str(terminal_route.get("outcome", "")) == "judge_stopped"
+            and self._restore_unchanged_terminal_recovery_blocker(
+                state,
+                state.tasks,
+            )
+        ):
+            return False
         if self_repair_resume:
             requeued_task_ids = self._prepare_self_repair_task_retries(
                 state,
@@ -7822,40 +7850,93 @@ class Orchestrator:
                     "[self-repair] requeued tasks=%s with fresh verification retry lifecycle",
                     ",".join(requeued_task_ids),
                 )
-        if str(blocker.get("category", "")) in {
-            "recovery_action_required",
-            "recovery_contract_action_required",
-            "recovery_external_action_required",
-            "recovery_evidence_change_required",
-            "recovery_infrastructure_action_required",
-            "recovery_provider_action_required",
-        }:
-            lineage_id = str(
-                state.last_recovery_route.get("lineage_id", "")
-            ).strip()
-            owner = next(
-                (task for task in state.tasks if task.task_id == lineage_id),
-                None,
+            if self._restore_unchanged_terminal_recovery_blocker(
+                state,
+                state.tasks,
+            ):
+                return False
+        if str(blocker.get("category", "")) in self.RECOVERY_ACTION_CATEGORIES:
+            terminal_route, terminal_task, terminal_owner = (
+                self._active_terminal_recovery_route(state, state.tasks)
             )
-            if owner is not None:
-                owner.recovery_epoch += 1
-                owner.recovery_round = 0
-                for task in state.tasks:
-                    if (
-                        task is owner
-                        or self._recovery_lineage_owner(state.tasks, task).task_id
-                        == owner.task_id
-                    ):
-                        task.recovery_epoch = owner.recovery_epoch
-                        task.recovery_round = 0
-                state.last_recovery_route = {}
+            if (
+                terminal_route
+                and terminal_task is not None
+                and terminal_owner is not None
+            ):
+                resume_evidence = self._terminal_recovery_resume_evidence(
+                    state,
+                    state.tasks,
+                    terminal_task,
+                    terminal_owner,
+                    terminal_route,
+                )
+                if not bool(resume_evidence["changed"]):
+                    blocker["status"] = "blocked"
+                    blocker["resume_attempts"] = int(
+                        blocker.get("resume_attempts", 0) or 0
+                    ) + 1
+                    blocker["resume_rejection"] = {
+                        "reason": (
+                            "terminal recovery evidence and declared "
+                            "prerequisites are unchanged"
+                        ),
+                        **resume_evidence,
+                        "updated_at": utc_now_iso(),
+                    }
+                    blocker["updated_at"] = utc_now_iso()
+                    state.active_blocker = blocker
+                    state.status = "blocked"
+                    state.last_error = str(blocker.get("reason", ""))
+                    self.logger.warning(
+                        "[recovery] kept terminal lineage=%s epoch=%s round=%s "
+                        "blocked because resume evidence is unchanged",
+                        terminal_owner.task_id,
+                        terminal_owner.recovery_epoch,
+                        terminal_owner.recovery_round,
+                    )
+                    return False
+                self._reopen_terminal_recovery_epoch(
+                    state,
+                    state.tasks,
+                    terminal_owner,
+                )
+                blocker["recovery_resume_evidence"] = resume_evidence
                 self._persist_tasks(state.tasks)
                 self.logger.info(
-                    "[recovery] reopened lineage=%s epoch=%s after explicit "
-                    "operator resume",
-                    owner.task_id,
-                    owner.recovery_epoch,
+                    "[recovery] reopened lineage=%s epoch=%s after changed "
+                    "recovery evidence",
+                    terminal_owner.task_id,
+                    terminal_owner.recovery_epoch,
                 )
+            else:
+                # Preserve legacy recovery-action resumes that predate durable
+                # terminal routes. They cannot participate in the new evidence
+                # comparison because no terminal fingerprint was recorded.
+                lineage_id = str(
+                    state.last_recovery_route.get("lineage_id", "")
+                ).strip()
+                legacy_owner = next(
+                    (
+                        task
+                        for task in state.tasks
+                        if task.task_id == lineage_id
+                    ),
+                    None,
+                )
+                if legacy_owner is not None:
+                    self._reopen_terminal_recovery_epoch(
+                        state,
+                        state.tasks,
+                        legacy_owner,
+                    )
+                    self._persist_tasks(state.tasks)
+                    self.logger.info(
+                        "[recovery] reopened legacy lineage=%s epoch=%s after "
+                        "explicit operator resume",
+                        legacy_owner.task_id,
+                        legacy_owner.recovery_epoch,
+                    )
         blocker["status"] = "retrying"
         blocker["resume_attempts"] = int(blocker.get("resume_attempts", 0) or 0) + 1
         blocker["updated_at"] = utc_now_iso()
@@ -13297,6 +13378,84 @@ class Orchestrator:
             }
         ]
 
+    def _recovery_prerequisite_fingerprint(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        *,
+        prerequisite_keys: Iterable[str],
+        evidence_refs: Iterable[str] = (),
+    ) -> str:
+        """Fingerprint value-free state for the prerequisites named by STOP."""
+
+        keys = sorted(
+            {
+                str(item).strip()
+                for item in prerequisite_keys
+                if str(item).strip()
+            }
+        )
+        if not keys:
+            return ""
+
+        current_fingerprint = self._recovery_evidence_fingerprint(
+            owner,
+            state=state,
+            tasks=tasks,
+        )
+        typed_records = []
+        for record in self._recovery_prerequisite_evidence(
+            state,
+            tasks,
+            task,
+            owner,
+            current_fingerprint=current_fingerprint,
+        ):
+            key = str(record.get("key", "")).strip()
+            if key not in keys:
+                continue
+            typed_records.append(
+                {
+                    "key": key,
+                    "schema_version": int(
+                        record.get("schema_version", 0) or 0
+                    ),
+                    "status": str(record.get("status", "")).strip(),
+                    "owner": str(record.get("owner", "")).strip(),
+                    "category": str(record.get("category", "")).strip(),
+                    "source": str(record.get("source", "")).strip(),
+                    "source_id": str(record.get("source_id", "")).strip(),
+                    "source_fingerprint": str(
+                        record.get("source_fingerprint", "")
+                    ).strip(),
+                    "evidence_refs": sorted(
+                        str(item).strip()
+                        for item in record.get("evidence_refs", []) or []
+                        if str(item).strip()
+                    ),
+                }
+            )
+        payload = {
+            "schema_version": self.RECOVERY_PREREQUISITE_SCHEMA_VERSION,
+            "prerequisite_keys": keys,
+            "typed_records": sorted(
+                typed_records,
+                key=lambda item: str(item["key"]),
+            ),
+            "evidence_refs": sorted(
+                {
+                    str(item).strip()
+                    for item in evidence_refs
+                    if str(item).strip()
+                }
+            ),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:24]
+
     def _recovery_judge_evidence(
         self,
         state: RunState,
@@ -13540,6 +13699,18 @@ class Orchestrator:
                 return
         task.recovery_history.append(entry)
 
+    @staticmethod
+    def _advance_recovery_stop_cursor(
+        task: TaskSpec,
+        owner: TaskSpec,
+        round_number: int,
+    ) -> None:
+        """Consume a judged STOP round on both the task and its lineage owner."""
+
+        task.recovery_epoch = owner.recovery_epoch
+        task.recovery_round = max(int(task.recovery_round), int(round_number))
+        owner.recovery_round = max(int(owner.recovery_round), int(round_number))
+
     def _record_recovery_route(
         self,
         state: RunState,
@@ -13559,8 +13730,20 @@ class Orchestrator:
         stop_category: str = "",
         prerequisite_keys: Optional[List[str]] = None,
         evidence_refs: Optional[List[str]] = None,
+        prerequisite_fingerprint: str = "",
     ) -> None:
         owner = lineage_owner or task
+        normalized_prerequisites = list(prerequisite_keys or [])
+        normalized_evidence_refs = list(evidence_refs or [])
+        if normalized_prerequisites and not prerequisite_fingerprint:
+            prerequisite_fingerprint = self._recovery_prerequisite_fingerprint(
+                state,
+                state.tasks,
+                task,
+                owner,
+                prerequisite_keys=normalized_prerequisites,
+                evidence_refs=normalized_evidence_refs,
+            )
         route = {
             "task_id": task.task_id,
             "task_origin": task.task_origin,
@@ -13582,13 +13765,20 @@ class Orchestrator:
             "repair_task_ids": list(repair_task_ids or []),
             "engine_invariant": engine_invariant,
         }
-        if stop_owner or stop_category or prerequisite_keys or evidence_refs:
+        if (
+            stop_owner
+            or stop_category
+            or normalized_prerequisites
+            or normalized_evidence_refs
+            or prerequisite_fingerprint
+        ):
             route.update(
                 {
                     "stop_owner": stop_owner,
                     "stop_category": stop_category,
-                    "prerequisite_keys": list(prerequisite_keys or []),
-                    "evidence_refs": list(evidence_refs or []),
+                    "prerequisite_keys": normalized_prerequisites,
+                    "evidence_refs": normalized_evidence_refs,
+                    "prerequisite_fingerprint": prerequisite_fingerprint,
                 }
             )
         state.last_recovery_route = route
@@ -14152,24 +14342,24 @@ class Orchestrator:
         route = self._terminal_recovery_route_for_owner(state, tasks, owner)
         if not route:
             return False
-        current_fingerprint = self._recovery_evidence_fingerprint(
+        routed_task = next(
+            (
+                task
+                for task in tasks
+                if task.task_id == str(route.get("task_id", "")).strip()
+            ),
             owner,
-            state=state,
-            tasks=tasks,
         )
-        previous_fingerprint = str(route.get("evidence_fingerprint", ""))
-        if not previous_fingerprint or previous_fingerprint == current_fingerprint:
+        resume_evidence = self._terminal_recovery_resume_evidence(
+            state,
+            tasks,
+            routed_task,
+            owner,
+            route,
+        )
+        if not bool(resume_evidence["changed"]):
             return False
-        owner.recovery_epoch += 1
-        owner.recovery_round = 0
-        for item in tasks:
-            if item is owner or (
-                item.task_origin == "evidence_repair"
-                and self._recovery_lineage_owner(tasks, item).task_id == owner.task_id
-            ):
-                item.recovery_epoch = owner.recovery_epoch
-                item.recovery_round = 0
-        state.last_recovery_route = {}
+        self._reopen_terminal_recovery_epoch(state, tasks, owner)
         return True
 
     def _terminal_recovery_route_for_owner(
@@ -14178,53 +14368,378 @@ class Orchestrator:
         tasks: List[TaskSpec],
         owner: TaskSpec,
     ) -> Dict[str, object]:
-        route = state.last_recovery_route
-        if (
+        epoch = int(owner.recovery_epoch)
+        route = (
+            dict(state.last_recovery_route)
+            if isinstance(state.last_recovery_route, dict)
+            else {}
+        )
+        route_matches = bool(
             str(route.get("lineage_id", "")) == owner.task_id
-            and int(route.get("epoch", 0) or 0) == int(owner.recovery_epoch)
-            and str(route.get("outcome", "")) in {"exhausted", "judge_stopped"}
-        ):
-            return dict(route)
-
-        lineage_tasks = [
-            item
-            for item in tasks
-            if item is owner
-            or (
-                item.task_origin == "evidence_repair"
-                and self._recovery_lineage_owner(tasks, item).task_id == owner.task_id
-            )
-        ]
-        for item in lineage_tasks:
-            for entry in reversed(item.recovery_history):
+            and int(route.get("epoch", 0) or 0) == epoch
+            and str(route.get("outcome", ""))
+            in {"exhausted", "judge_stopped"}
+        )
+        lineage_tasks = self._recovery_lineage_tasks(tasks, owner)
+        by_id = {item.task_id: item for item in lineage_tasks}
+        history_candidates: List[
+            Tuple[Tuple[int, int, int, int, int, int], Dict[str, object]]
+        ] = []
+        for task_index, item in enumerate(lineage_tasks):
+            for history_index, entry in enumerate(item.recovery_history):
                 if not isinstance(entry, dict):
                     continue
                 if entry.get(_RECOVERY_CURSOR_RECONCILIATION_KEY):
                     continue
-                if int(entry.get("epoch", 0) or 0) != int(owner.recovery_epoch):
+                if int(entry.get("epoch", 0) or 0) != epoch:
                     continue
                 outcome = str(entry.get("result", ""))
                 if outcome not in {"exhausted", "judge_stopped"}:
                     continue
-                return {
+                round_number = int(entry.get("round", 0) or 0)
+                signature = str(
+                    entry.get("failure_signature", entry.get("signature", ""))
+                )
+                repair_task_ids = [
+                    str(task_id).strip()
+                    for task_id in entry.get("repair_task_ids", []) or []
+                    if str(task_id).strip()
+                ]
+                routed_task = next(
+                    (
+                        by_id[task_id]
+                        for task_id in repair_task_ids
+                        if task_id in by_id
+                    ),
+                    item,
+                )
+                entry_reason = str(
+                    entry.get("judge_reason", entry.get("reason", ""))
+                )
+                failure_kind = str(entry.get("failure_kind", "")).strip()
+                if not failure_kind:
+                    failure_kind = str(route.get("failure_kind", "")).strip()
+                if not failure_kind:
+                    failure_kind = self._recovery_failure_kind(entry_reason)
+                candidate: Dict[str, object] = {
+                    "task_id": routed_task.task_id,
+                    "task_origin": routed_task.task_origin,
                     "lineage_id": owner.task_id,
-                    "epoch": int(owner.recovery_epoch),
+                    "epoch": epoch,
+                    "round": round_number,
+                    "max_rounds": int(
+                        entry.get(
+                            "max_rounds",
+                            route.get(
+                                "max_rounds",
+                                self.config.execution.recovery.max_rounds,
+                            ),
+                        )
+                        or self.config.execution.recovery.max_rounds
+                    ),
+                    "failure_kind": failure_kind,
+                    "failure_signature": signature,
+                    "evidence_fingerprint": str(
+                        entry.get("evidence_fingerprint", "")
+                    ),
+                    "judge_decision": str(entry.get("judge_decision", "")),
+                    "judge_source": str(entry.get("judge_source", "")),
                     "outcome": outcome,
-                    "evidence_fingerprint": str(entry.get("evidence_fingerprint", "")),
-                    "failure_signature": str(
-                        entry.get("failure_signature", entry.get("signature", ""))
-                    ),
-                    "reason": str(
-                        entry.get("judge_reason", entry.get("reason", ""))
-                    ),
-                    "stop_owner": str(entry.get("stop_owner", "")),
-                    "stop_category": str(entry.get("stop_category", "")),
-                    "prerequisite_keys": list(
-                        entry.get("prerequisite_keys", []) or []
-                    ),
-                    "evidence_refs": list(entry.get("evidence_refs", []) or []),
+                    "reason": entry_reason,
+                    "repair_task_ids": repair_task_ids,
+                    "engine_invariant": str(entry.get("engine_invariant", "")),
                 }
-        return {}
+                stop_owner = str(entry.get("stop_owner", ""))
+                stop_category = str(entry.get("stop_category", ""))
+                prerequisite_keys = list(
+                    entry.get("prerequisite_keys", []) or []
+                )
+                evidence_refs = list(entry.get("evidence_refs", []) or [])
+                prerequisite_fingerprint = str(
+                    entry.get("prerequisite_fingerprint", "")
+                )
+                if (
+                    stop_owner
+                    or stop_category
+                    or prerequisite_keys
+                    or evidence_refs
+                    or prerequisite_fingerprint
+                ):
+                    candidate.update(
+                        {
+                            "stop_owner": stop_owner,
+                            "stop_category": stop_category,
+                            "prerequisite_keys": prerequisite_keys,
+                            "evidence_refs": evidence_refs,
+                            "prerequisite_fingerprint": (
+                                prerequisite_fingerprint
+                            ),
+                        }
+                    )
+                score = (
+                    round_number,
+                    int(bool(signature)),
+                    int(bool(candidate["judge_decision"])),
+                    int(bool(candidate["judge_source"])),
+                    int(bool(stop_owner)),
+                    history_index + task_index,
+                )
+                history_candidates.append((score, candidate))
+
+        history_route = (
+            dict(max(history_candidates, key=lambda item: item[0])[1])
+            if history_candidates
+            else {}
+        )
+        if not route_matches:
+            canonical = history_route
+        elif not history_route:
+            canonical = route
+        else:
+            route_round = int(route.get("round", 0) or 0)
+            history_round = int(history_route.get("round", 0) or 0)
+            if history_round > route_round:
+                canonical = history_route
+            elif history_round < route_round:
+                canonical = route
+            else:
+                canonical = dict(route)
+                for key, value in history_route.items():
+                    if value not in (None, "", []):
+                        canonical[key] = value
+
+        if not canonical:
+            return {}
+        state.last_recovery_route = dict(canonical)
+        if str(canonical.get("outcome", "")) == "judge_stopped":
+            terminal_round = int(canonical.get("round", 0) or 0)
+            terminal_signature = str(
+                canonical.get("failure_signature", "")
+            )
+            routed_task_id = str(canonical.get("task_id", "")).strip()
+            for candidate in lineage_tasks:
+                carries_terminal = any(
+                    isinstance(entry, dict)
+                    and not entry.get(_RECOVERY_CURSOR_RECONCILIATION_KEY)
+                    and int(entry.get("epoch", 0) or 0) == epoch
+                    and int(entry.get("round", 0) or 0) == terminal_round
+                    and str(entry.get("result", "")) == "judge_stopped"
+                    and (
+                        not terminal_signature
+                        or str(
+                            entry.get(
+                                "failure_signature",
+                                entry.get("signature", ""),
+                            )
+                        )
+                        == terminal_signature
+                    )
+                    for entry in candidate.recovery_history
+                )
+                if (
+                    candidate.task_id in {owner.task_id, routed_task_id}
+                    or carries_terminal
+                ):
+                    candidate.recovery_epoch = epoch
+                    candidate.recovery_round = max(
+                        int(candidate.recovery_round),
+                        terminal_round,
+                    )
+        return dict(canonical)
+
+    def _active_terminal_recovery_route(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> Tuple[Dict[str, object], Optional[TaskSpec], Optional[TaskSpec]]:
+        """Return and reconcile the terminal record for the active lineage."""
+
+        if not tasks:
+            return {}, None, None
+        by_id = {task.task_id: task for task in tasks}
+        route = (
+            state.last_recovery_route
+            if isinstance(state.last_recovery_route, dict)
+            else {}
+        )
+        routed_task = by_id.get(str(route.get("task_id", "")).strip())
+        owner = by_id.get(str(route.get("lineage_id", "")).strip())
+        if owner is None and routed_task is not None:
+            owner = self._recovery_lineage_owner(tasks, routed_task)
+
+        if owner is None:
+            candidates: List[Tuple[int, int, TaskSpec]] = []
+            seen: Set[str] = set()
+            for candidate in tasks:
+                candidate_owner = self._recovery_lineage_owner(tasks, candidate)
+                if candidate_owner.task_id in seen:
+                    continue
+                seen.add(candidate_owner.task_id)
+                terminal_rounds = [
+                    int(entry.get("round", 0) or 0)
+                    for lineage_task in self._recovery_lineage_tasks(
+                        tasks,
+                        candidate_owner,
+                    )
+                    for entry in lineage_task.recovery_history
+                    if isinstance(entry, dict)
+                    and not entry.get(_RECOVERY_CURSOR_RECONCILIATION_KEY)
+                    and int(entry.get("epoch", 0) or 0)
+                    == int(candidate_owner.recovery_epoch)
+                    and str(entry.get("result", ""))
+                    in {"exhausted", "judge_stopped"}
+                ]
+                if terminal_rounds:
+                    candidates.append(
+                        (
+                            int(candidate_owner.recovery_epoch),
+                            max(terminal_rounds),
+                            candidate_owner,
+                        )
+                    )
+            if candidates:
+                owner = max(candidates, key=lambda item: item[:2])[2]
+        if owner is None:
+            return {}, None, None
+
+        canonical = self._terminal_recovery_route_for_owner(
+            state,
+            tasks,
+            owner,
+        )
+        if not canonical:
+            return {}, None, owner
+        routed_task = by_id.get(str(canonical.get("task_id", "")).strip())
+        return canonical, routed_task or owner, owner
+
+    def _terminal_recovery_resume_evidence(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        route: Mapping[str, object],
+    ) -> Dict[str, object]:
+        current_evidence = self._recovery_evidence_fingerprint(
+            owner,
+            state=state,
+            tasks=tasks,
+        )
+        previous_evidence = str(route.get("evidence_fingerprint", "")).strip()
+        prerequisite_keys = [
+            str(item).strip()
+            for item in route.get("prerequisite_keys", []) or []
+            if str(item).strip()
+        ]
+        evidence_refs = [
+            str(item).strip()
+            for item in route.get("evidence_refs", []) or []
+            if str(item).strip()
+        ]
+        previous_prerequisite = str(
+            route.get("prerequisite_fingerprint", "")
+        ).strip()
+        current_prerequisite = (
+            self._recovery_prerequisite_fingerprint(
+                state,
+                tasks,
+                task,
+                owner,
+                prerequisite_keys=prerequisite_keys,
+                evidence_refs=evidence_refs,
+            )
+            if prerequisite_keys
+            else ""
+        )
+        evidence_changed = bool(
+            previous_evidence
+            and current_evidence
+            and previous_evidence != current_evidence
+        )
+        prerequisite_changed = bool(
+            previous_prerequisite
+            and current_prerequisite
+            and previous_prerequisite != current_prerequisite
+        )
+        return {
+            "changed": evidence_changed or prerequisite_changed,
+            "evidence_changed": evidence_changed,
+            "prerequisite_changed": prerequisite_changed,
+            "previous_evidence_fingerprint": previous_evidence,
+            "current_evidence_fingerprint": current_evidence,
+            "previous_prerequisite_fingerprint": previous_prerequisite,
+            "current_prerequisite_fingerprint": current_prerequisite,
+        }
+
+    def _reopen_terminal_recovery_epoch(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        owner: TaskSpec,
+    ) -> None:
+        owner.recovery_epoch += 1
+        owner.recovery_round = 0
+        for task in self._recovery_lineage_tasks(tasks, owner):
+            task.recovery_epoch = owner.recovery_epoch
+            task.recovery_round = 0
+        state.last_recovery_route = {}
+
+    def _restore_unchanged_terminal_recovery_blocker(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> bool:
+        route, task, owner = self._active_terminal_recovery_route(state, tasks)
+        if not route or task is None or owner is None:
+            return False
+        resume_evidence = self._terminal_recovery_resume_evidence(
+            state,
+            tasks,
+            task,
+            owner,
+            route,
+        )
+        if bool(resume_evidence["changed"]):
+            return False
+
+        reason = str(route.get("reason", "")).strip() or (
+            "terminal recovery evidence is unchanged"
+        )
+        if str(route.get("outcome", "")) == "judge_stopped":
+            return self._block_for_recovery_stop(
+                state,
+                tasks,
+                task,
+                owner,
+                reason=reason,
+                signature=str(route.get("failure_signature", "")),
+                blocker_owner=str(route.get("stop_owner", "")).strip(),
+                category=str(route.get("stop_category", "")).strip(),
+                prerequisite_keys=list(
+                    route.get("prerequisite_keys", []) or []
+                ),
+                evidence_refs=list(route.get("evidence_refs", []) or []),
+            )
+
+        blocker_owner = str(route.get("stop_owner", "")).strip()
+        if blocker_owner not in self.RECOVERY_STOP_OWNERS:
+            blocker_owner = "target_project"
+        self._block_run(
+            state,
+            owner=blocker_owner,
+            category=(
+                str(route.get("stop_category", "")).strip()
+                or "recovery_evidence_change_required"
+            ),
+            reason=(
+                f"Recovery is terminal for {owner.task_id}; changed evidence "
+                f"is required before resume. {reason}"
+            ),
+            fingerprint=str(route.get("evidence_fingerprint", "")),
+        )
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        return True
 
     def _block_for_recovery_stop(
         self,
@@ -14267,6 +14782,18 @@ class Orchestrator:
             "clarification, or external action is required before resume. "
             f"{reason}"
         ).strip()
+        prerequisite_fingerprint = (
+            self._recovery_prerequisite_fingerprint(
+                state,
+                tasks,
+                task,
+                owner,
+                prerequisite_keys=prerequisite_keys or [],
+                evidence_refs=evidence_refs or [],
+            )
+            if prerequisite_keys
+            else ""
+        )
         fingerprint = "sha256:" + hashlib.sha256(
             json.dumps(
                 {
@@ -14283,6 +14810,7 @@ class Orchestrator:
                     "category": normalized_category,
                     "prerequisite_keys": list(prerequisite_keys or []),
                     "evidence_refs": list(evidence_refs or []),
+                    "prerequisite_fingerprint": prerequisite_fingerprint,
                 },
                 sort_keys=True,
             ).encode("utf-8")
@@ -14491,20 +15019,9 @@ class Orchestrator:
                 for item in terminal_route.get("evidence_refs", []) or []
                 if str(item).strip()
             ]
-            self._record_recovery_route(
-                state,
-                task,
-                outcome=outcome,
-                failure_kind=failure_kind,
-                reason="terminal recovery evidence is unchanged",
-                round_number=task.recovery_round,
-                lineage_owner=owner,
-                stop_owner=terminal_owner,
-                stop_category=terminal_category,
-                prerequisite_keys=terminal_prerequisites,
-                evidence_refs=terminal_refs,
-            )
-            save_run_state(self.project_root, state)
+            # The canonical terminal record is immutable while its evidence is
+            # unchanged. Rewriting it from a task cursor can only discard the
+            # round, signature, or judge provenance that made it terminal.
             if outcome == "judge_stopped":
                 return self._block_for_recovery_stop(
                     state,
@@ -14517,10 +15034,12 @@ class Orchestrator:
                         terminal_route.get("failure_signature", "")
                     ),
                     blocker_owner=terminal_owner,
-                    category="recovery_evidence_change_required",
+                    category=terminal_category,
                     prerequisite_keys=terminal_prerequisites,
                     evidence_refs=terminal_refs,
                 )
+            self._persist_tasks(tasks)
+            save_run_state(self.project_root, state)
             return False
 
         next_round = int(task.recovery_round) + 1
@@ -14563,6 +15082,8 @@ class Orchestrator:
             "signature": signature,
             "round": next_round,
             "epoch": int(owner.recovery_epoch),
+            "max_rounds": max_rounds,
+            "failure_kind": failure_kind,
             "reason": reason,
             "review": feedback,
             "failure_ids": failure_ids,
@@ -14584,6 +15105,7 @@ class Orchestrator:
                 reason=feedback,
                 signature=signature,
                 round_number=next_round,
+                repair_task_ids=[task.task_id],
                 lineage_owner=owner,
             )
             self.logger.info(
@@ -14606,13 +15128,20 @@ class Orchestrator:
             and str(entry.get("result", "")) in {"requeued", "judge_stopped"}
         ]
         if prior_same:
+            no_progress_reason = (
+                "deterministic no-progress: failure and owner artifacts are "
+                "unchanged"
+            )
             stopped_entry = dict(
                 history_entry,
                 result="judge_stopped",
                 judge_decision="STOP",
+                judge_reason=no_progress_reason,
+                judge_source="deterministic",
                 stop_owner="target_project",
                 stop_category="recovery_evidence_change_required",
             )
+            self._advance_recovery_stop_cursor(task, owner, next_round)
             self._append_recovery_history_once(task, stopped_entry)
             if owner is not task:
                 self._append_recovery_history_once(owner, dict(stopped_entry))
@@ -14621,26 +15150,22 @@ class Orchestrator:
                 task,
                 outcome="judge_stopped",
                 failure_kind=failure_kind,
-                reason="deterministic no-progress: failure and owner artifacts are unchanged",
+                reason=no_progress_reason,
                 signature=signature,
                 round_number=next_round,
                 judge_decision="STOP",
                 judge_source="deterministic",
+                repair_task_ids=[task.task_id],
                 lineage_owner=owner,
                 stop_owner="target_project",
                 stop_category="recovery_evidence_change_required",
             )
-            self._persist_tasks(tasks)
-            save_run_state(self.project_root, state)
             return self._block_for_recovery_stop(
                 state,
                 tasks,
                 task,
                 owner,
-                reason=(
-                    "deterministic no-progress: failure and owner artifacts "
-                    "are unchanged"
-                ),
+                reason=no_progress_reason,
                 signature=signature,
                 blocker_owner="target_project",
                 category="recovery_evidence_change_required",
@@ -14680,16 +15205,29 @@ class Orchestrator:
                 stop_validation.get("prerequisite_keys", []) or []
             )
             stop_refs = list(stop_validation.get("evidence_refs", []) or [])
+            stop_prerequisite_fingerprint = (
+                self._recovery_prerequisite_fingerprint(
+                    state,
+                    tasks,
+                    task,
+                    owner,
+                    prerequisite_keys=stop_prerequisites,
+                    evidence_refs=stop_refs,
+                )
+            )
             stopped_entry = dict(
                 history_entry,
                 result="judge_stopped",
                 judge_decision=decision,
                 judge_reason=judge_reason,
+                judge_source=judge_source,
                 stop_owner=stop_owner,
                 stop_category=stop_category,
                 prerequisite_keys=stop_prerequisites,
                 evidence_refs=stop_refs,
+                prerequisite_fingerprint=stop_prerequisite_fingerprint,
             )
+            self._advance_recovery_stop_cursor(task, owner, next_round)
             self._append_recovery_history_once(task, stopped_entry)
             if owner is not task:
                 self._append_recovery_history_once(owner, dict(stopped_entry))
@@ -14703,14 +15241,14 @@ class Orchestrator:
                 round_number=next_round,
                 judge_decision=decision,
                 judge_source=judge_source,
+                repair_task_ids=[task.task_id],
                 lineage_owner=owner,
                 stop_owner=stop_owner,
                 stop_category=stop_category,
                 prerequisite_keys=stop_prerequisites,
                 evidence_refs=stop_refs,
+                prerequisite_fingerprint=stop_prerequisite_fingerprint,
             )
-            self._persist_tasks(tasks)
-            save_run_state(self.project_root, state)
             return self._block_for_recovery_stop(
                 state,
                 tasks,
@@ -14727,8 +15265,20 @@ class Orchestrator:
             if int(owner.split_depth) >= self.MAX_SPLIT_DEPTH:
                 decision = "STOP"
                 judge_reason = f"replan requested at split depth limit: {judge_reason}"
-                stopped_entry = dict(history_entry, result="judge_stopped", judge_decision=decision, judge_reason=judge_reason)
+                stopped_entry = dict(
+                    history_entry,
+                    result="judge_stopped",
+                    judge_decision=decision,
+                    judge_reason=judge_reason,
+                    judge_source=judge_source,
+                )
+                self._advance_recovery_stop_cursor(task, owner, next_round)
                 self._append_recovery_history_once(task, stopped_entry)
+                if owner is not task:
+                    self._append_recovery_history_once(
+                        owner,
+                        dict(stopped_entry),
+                    )
                 self._record_recovery_route(
                     state,
                     task,
@@ -14739,6 +15289,7 @@ class Orchestrator:
                     round_number=next_round,
                     judge_decision=decision,
                     judge_source=judge_source,
+                    repair_task_ids=[task.task_id],
                     lineage_owner=owner,
                 )
                 self._persist_tasks(tasks)
@@ -19549,8 +20100,8 @@ class Orchestrator:
             if rounds_by_epoch and not cursor_metadata_present:
                 # Legacy recovery metadata is one coherent (epoch, round) cursor.
                 # Select an epoch first, then count only lifecycle-producing rounds
-                # in that epoch.  Terminal entries use the *next* round as a
-                # sentinel and therefore never advance the reusable cursor.
+                # in that epoch. Exhaustion uses the next round as a sentinel;
+                # a judged STOP consumes the round in which the judge ran.
                 migrated_epoch = max(rounds_by_epoch)
                 migrated_round = rounds_by_epoch[migrated_epoch]
                 if (
