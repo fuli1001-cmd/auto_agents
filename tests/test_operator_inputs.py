@@ -210,6 +210,257 @@ class OperatorInputStoreTests(unittest.TestCase):
             self.assertEqual(resumed.tasks[0].status, "pending")
             self.assertEqual(resumed.pending_input_requests, [])
 
+    def test_input_batch_validation_is_atomic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need an authorized source and runtime.",
+                acceptance=["The real proof passes."],
+            )
+            malformed_install = _request(
+                key="runtime.install",
+                kind="install_approval",
+                question="Install yt-dlp?",
+                purpose="Run the real proof.",
+                why_required="yt-dlp is required.",
+                validation={
+                    "runtime_manifest": [
+                        {"tool_id": "yt-dlp", "version": "2026.07.04"}
+                    ]
+                },
+                bindings=[],
+            )
+
+            with self.assertRaisesRegex(ValueError, "pinned source_url"):
+                orchestrator._normalize_input_requests(
+                    state,
+                    task,
+                    [_request().to_dict(), malformed_install.to_dict()],
+                )
+
+            self.assertEqual(state.pending_input_requests, [])
+            self.assertEqual(state.active_input_request_id, "")
+            self.assertEqual(task.operator_input_bindings, [])
+            self.assertEqual(task.required_inputs, [])
+            self.assertEqual(task.status, "pending")
+
+    def test_malformed_preflight_input_batch_retries_without_partial_state(self):
+        valid_source = _request(
+            key="youtube.source_url",
+            kind="url",
+            question="请输入获得授权的公开视频 URL",
+            validation={"https_only": True},
+        )
+        malformed_install = _request(
+            key="runtime.install",
+            kind="install_approval",
+            question="Install yt-dlp?",
+            purpose="Run the real proof.",
+            why_required="yt-dlp is required.",
+            validation={
+                "runtime_manifest": [
+                    {"tool_id": "yt-dlp", "version": "2026.07.04"}
+                ]
+            },
+            bindings=[],
+        )
+
+        class Adapter:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, request):
+                self.calls += 1
+                inputs = (
+                    [_request().to_dict(), malformed_install.to_dict()]
+                    if self.calls == 1
+                    else [valid_source.to_dict()]
+                )
+                payload = {
+                    "decision": "WAIT_USER",
+                    "target_stage": "",
+                    "reason": "operator prerequisites are required",
+                    "checklist": ["collect the authorized source"],
+                    "required_inputs": inputs,
+                    "required_mutations": [],
+                }
+                summary = "EVIDENCE_PREFLIGHT: " + json.dumps(
+                    payload, ensure_ascii=False
+                )
+                write_text(request.output_path, summary)
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=summary,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            adapter = Adapter()
+            orchestrator.adapter = adapter
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need an authorized source and runtime.",
+                acceptance=["The real proof passes."],
+            )
+            state.tasks = [task]
+
+            with mock.patch.object(
+                orchestrator, "_task_needs_evidence_preflight", return_value=True
+            ):
+                result = orchestrator._ensure_evidence_preflight(state, task)
+
+            self.assertEqual(adapter.calls, 2)
+            self.assertEqual(result["decision"], "WAIT_USER")
+            self.assertEqual(
+                [item["key"] for item in state.pending_input_requests],
+                ["youtube.source_url"],
+            )
+            self.assertEqual(task.status, "waiting_user")
+
+    def test_exhausted_malformed_preflight_blocks_as_auto_agents_owned(self):
+        malformed_install = _request(
+            key="runtime.install",
+            kind="install_approval",
+            question="Install yt-dlp?",
+            purpose="Run the real proof.",
+            why_required="yt-dlp is required.",
+            validation={
+                "runtime_manifest": [
+                    {"tool_id": "yt-dlp", "version": "2026.07.04"}
+                ]
+            },
+            bindings=[],
+        )
+
+        class Adapter:
+            def run(self, request):
+                payload = {
+                    "decision": "WAIT_USER",
+                    "target_stage": "",
+                    "reason": "operator prerequisites are required",
+                    "checklist": ["collect prerequisites"],
+                    "required_inputs": [malformed_install.to_dict()],
+                    "required_mutations": [],
+                }
+                summary = "EVIDENCE_PREFLIGHT: " + json.dumps(payload)
+                write_text(request.output_path, summary)
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=summary,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            orchestrator.adapter = Adapter()
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Input",
+                description="Need a valid runtime request.",
+                acceptance=["The proof passes."],
+            )
+            state.tasks = [task]
+
+            with mock.patch.object(
+                orchestrator, "_task_needs_evidence_preflight", return_value=True
+            ):
+                result = orchestrator._ensure_evidence_preflight(state, task)
+            routed = orchestrator._route_evidence_preflight(
+                state, [task], task, result
+            )
+
+            self.assertEqual(state.pending_input_requests, [])
+            self.assertEqual(task.operator_input_bindings, [])
+            self.assertEqual(routed.status, "blocked")
+            self.assertEqual(routed.active_blocker["owner"], "auto_agents")
+            self.assertEqual(
+                routed.active_blocker["category"],
+                "evidence_preflight_protocol_invalid",
+            )
+
+    def test_recovery_stop_routes_persisted_lineage_input_to_wait_user(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            owner = TaskSpec(
+                task_id="task-owner",
+                title="Owner",
+                description="Own the real proof.",
+                acceptance=["The proof passes."],
+            )
+            repair = TaskSpec(
+                task_id="repair-owner-r1-1",
+                title="Repair proof",
+                description="Repair the owner's proof.",
+                acceptance=["The proof passes."],
+                status="in_progress",
+                parent_task_id=owner.task_id,
+                task_origin="evidence_repair",
+            )
+            request = _request(task_id=repair.task_id)
+            state.tasks = [owner, repair]
+            state.pending_input_requests = [request.to_dict()]
+
+            stopped = orchestrator._block_for_recovery_stop(
+                state,
+                state.tasks,
+                repair,
+                owner,
+                reason="authorized source is required",
+                signature="same-failure",
+            )
+
+            self.assertTrue(stopped)
+            self.assertEqual(state.status, "waiting_user")
+            self.assertEqual(state.active_blocker, {})
+            self.assertEqual(repair.status, "waiting_user")
+            self.assertEqual(repair.required_inputs[0]["key"], request.key)
+            self.assertEqual(state.active_input_request_id, request.request_id)
+
+    def test_pending_task_with_persisted_input_is_reconciled_on_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="repair-owner-r1-1",
+                title="Repair proof",
+                description="Repair the proof.",
+                acceptance=["The proof passes."],
+                status="pending",
+                task_origin="evidence_repair",
+            )
+            request = _request(task_id=task.task_id)
+            state.tasks = [task]
+            state.pending_input_requests = [request.to_dict()]
+
+            changed = orchestrator._reconcile_orphaned_waiting_user_tasks(
+                state, state.tasks
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(task.status, "waiting_user")
+            self.assertEqual(task.required_inputs[0]["key"], request.key)
+            self.assertEqual(state.active_input_request_id, request.request_id)
+
     def test_declined_attestation_routes_to_clarify_without_silent_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "demo"

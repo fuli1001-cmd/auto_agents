@@ -3974,10 +3974,22 @@ class Orchestrator:
         task: TaskSpec,
         payloads: Iterable[object],
     ) -> List[UserInputRequest]:
+        """Validate the complete batch before publishing any input state."""
+
         requests: List[UserInputRequest] = []
+        pending_input_requests = [
+            dict(item)
+            for item in state.pending_input_requests
+            if isinstance(item, dict)
+        ]
+        operator_input_bindings = [
+            dict(item)
+            for item in task.operator_input_bindings
+            if isinstance(item, dict)
+        ]
         existing_ids = {
             str(item.get("request_id", ""))
-            for item in state.pending_input_requests
+            for item in pending_input_requests
             if isinstance(item, dict)
         }
         for payload in payloads:
@@ -4055,8 +4067,8 @@ class Orchestrator:
                     request = canonical
             for binding in request.bindings:
                 binding.setdefault("input_key", request.key)
-                if binding not in task.operator_input_bindings:
-                    task.operator_input_bindings.append(dict(binding))
+                if binding not in operator_input_bindings:
+                    operator_input_bindings.append(dict(binding))
             valid, _reason = self._operator_inputs.is_valid(request)
             if valid:
                 continue
@@ -4064,24 +4076,27 @@ class Orchestrator:
             if request.request_id not in existing_ids:
                 stale_ids = {
                     str(item.get("request_id", ""))
-                    for item in state.pending_input_requests
+                    for item in pending_input_requests
                     if isinstance(item, dict)
                     and str(item.get("key", "")) == request.key
                 }
                 if stale_ids:
-                    state.pending_input_requests = [
+                    pending_input_requests = [
                         item
-                        for item in state.pending_input_requests
+                        for item in pending_input_requests
                         if str(item.get("request_id", "")) not in stale_ids
                     ]
                     existing_ids.difference_update(stale_ids)
-                state.pending_input_requests = [
+                pending_input_requests = [
                     item
-                    for item in state.pending_input_requests
+                    for item in pending_input_requests
                     if str(item.get("key", "")) != request.key
                 ]
-                state.pending_input_requests.append(request.to_dict())
+                pending_input_requests.append(request.to_dict())
                 existing_ids.add(request.request_id)
+
+        task.operator_input_bindings = operator_input_bindings
+        state.pending_input_requests = pending_input_requests
         if requests:
             task.status = "waiting_user"
             task.required_inputs = [request.to_dict() for request in requests]
@@ -4216,14 +4231,28 @@ class Orchestrator:
         state: RunState,
         tasks: List[TaskSpec],
     ) -> bool:
-        pending_task_ids = {
-            request.task_id
-            for request in self._pending_input_requests(state)
-            if request.task_id
-        }
+        pending_by_task: Dict[str, List[UserInputRequest]] = {}
+        for request in self._pending_input_requests(state):
+            if request.task_id:
+                pending_by_task.setdefault(request.task_id, []).append(request)
+        pending_task_ids = set(pending_by_task)
         invalid: List[str] = []
         changed = False
         for task in tasks:
+            persisted_requests = pending_by_task.get(task.task_id, [])
+            if persisted_requests and task.status not in {"done", "waiting_user"}:
+                task.status = "waiting_user"
+                task.required_inputs = [
+                    request.to_dict() for request in persisted_requests
+                ]
+                task.evidence_preflight = {}
+                for request in persisted_requests:
+                    for binding in request.bindings:
+                        normalized = dict(binding)
+                        normalized.setdefault("input_key", request.key)
+                        if normalized not in task.operator_input_bindings:
+                            task.operator_input_bindings.append(normalized)
+                changed = True
             if (
                 task.status != "waiting_user"
                 or task.task_id in pending_task_ids
@@ -9477,7 +9506,9 @@ class Orchestrator:
         state.tasks = tasks
         save_run_state(self.project_root, state)
 
-        if any(task.status == "waiting_user" for task in tasks):
+        if state.pending_input_requests or any(
+            task.status == "waiting_user" for task in tasks
+        ):
             reconciled_inputs = self._reconcile_orphaned_waiting_user_tasks(
                 state,
                 tasks,
@@ -12899,6 +12930,14 @@ class Orchestrator:
         category: str = "recovery_external_action_required",
     ) -> bool:
         """Persist provider STOP as a resumable evidence blocker."""
+        if self._route_recovery_stop_to_pending_input(
+            state,
+            tasks,
+            task,
+            owner,
+            reason=reason,
+        ):
+            return True
         task.status = "pending"
         if owner.status != "done":
             owner.status = "pending"
@@ -12928,6 +12967,72 @@ class Orchestrator:
         )
         self._persist_tasks(tasks)
         save_run_state(self.project_root, state)
+        return True
+
+    def _route_recovery_stop_to_pending_input(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        *,
+        reason: str,
+    ) -> bool:
+        """Prefer a durable WAIT_USER route when the recovery lineage has input."""
+
+        pending = self._pending_input_requests(state)
+        if not pending:
+            return False
+        lineage_tasks = [
+            item
+            for item in tasks
+            if item is task
+            or item is owner
+            or (
+                item.task_origin == "evidence_repair"
+                and self._recovery_lineage_owner(tasks, item).task_id
+                == owner.task_id
+            )
+        ]
+        lineage_ids = {item.task_id for item in lineage_tasks}
+        matching = [
+            request for request in pending if request.task_id in lineage_ids
+        ]
+        if not matching:
+            return False
+
+        requests_by_task: Dict[str, List[UserInputRequest]] = {}
+        for request in matching:
+            requests_by_task.setdefault(request.task_id, []).append(request)
+        for candidate in lineage_tasks:
+            requests = requests_by_task.get(candidate.task_id, [])
+            if not requests:
+                if candidate is owner and candidate.status != "done":
+                    candidate.status = "pending"
+                continue
+            candidate.status = "waiting_user"
+            candidate.required_inputs = [request.to_dict() for request in requests]
+            candidate.evidence_preflight = {}
+            for request in requests:
+                for binding in request.bindings:
+                    normalized = dict(binding)
+                    normalized.setdefault("input_key", request.key)
+                    if normalized not in candidate.operator_input_bindings:
+                        candidate.operator_input_bindings.append(normalized)
+
+        state.active_input_request_id = matching[0].request_id
+        state.active_blocker = {}
+        state.status = "waiting_user"
+        state.last_error = ""
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        self.logger.warning(
+            "[recovery] task=%s decision=WAIT_USER requests=%s reason=%s",
+            task.task_id,
+            len(matching),
+            reason[:300],
+        )
         return True
 
     def _recover_review_rejected_task(
@@ -16207,6 +16312,7 @@ class Orchestrator:
             dependency_links = discover_dependency_links(self.project_root)
             install_dependency_links(worktree_path, dependency_links)
             parsed: Optional[Dict[str, object]] = None
+            pending_inputs: List[UserInputRequest] = []
             feedback = ""
             cumulative_usage: Optional[AgentUsage] = None
             usage_available = False
@@ -16266,8 +16372,23 @@ class Orchestrator:
                     result.summary or result.stdout
                 )
                 if parsed is None:
-                    raise ValueError("invalid EVIDENCE_PREFLIGHT response")
-                feedback = self._evidence_preflight_protocol_issue(parsed)
+                    feedback = "invalid EVIDENCE_PREFLIGHT response"
+                else:
+                    feedback = self._evidence_preflight_protocol_issue(parsed)
+                    raw_inputs = parsed.get("required_inputs", [])
+                    if not feedback and isinstance(raw_inputs, list) and raw_inputs:
+                        try:
+                            pending_inputs = self._normalize_input_requests(
+                                state,
+                                task,
+                                raw_inputs,
+                            )
+                        except (TypeError, ValueError) as error:
+                            pending_inputs = []
+                            feedback = (
+                                "required_inputs are invalid: "
+                                f"{error}. Return a complete valid input batch."
+                            )
                 if not feedback:
                     break
                 self.logger.warning(
@@ -16278,27 +16399,28 @@ class Orchestrator:
                     feedback,
                 )
             if parsed is None or feedback:
-                raise ValueError(
-                    "invalid EVIDENCE_PREFLIGHT prerequisite disposition: "
-                    + (feedback or "missing parsed response")
-                )
-            raw_inputs = parsed.get("required_inputs", [])
-            if isinstance(raw_inputs, list) and raw_inputs:
-                pending_inputs = self._normalize_input_requests(
-                    state,
-                    task,
-                    raw_inputs,
-                )
-                if pending_inputs:
-                    parsed["decision"] = "WAIT_USER"
-                    parsed["target_stage"] = ""
-                    parsed["required_inputs"] = [
-                        request.to_dict() for request in pending_inputs
-                    ]
-                    parsed["reason"] = (
-                        f"{str(parsed.get('reason', '')).strip()} Required operator "
-                        "input will be collected interactively one item at a time."
-                    ).strip()
+                parsed = {
+                    "decision": "PROTOCOL_BLOCK",
+                    "target_stage": "",
+                    "reason": (
+                        "Evidence preflight returned invalid structured prerequisites "
+                        f"after {protocol_attempt} attempt(s): "
+                        + (feedback or "missing parsed response")
+                    ),
+                    "checklist": [],
+                    "required_inputs": [],
+                    "required_mutations": [],
+                }
+            elif pending_inputs:
+                parsed["decision"] = "WAIT_USER"
+                parsed["target_stage"] = ""
+                parsed["required_inputs"] = [
+                    request.to_dict() for request in pending_inputs
+                ]
+                parsed["reason"] = (
+                    f"{str(parsed.get('reason', '')).strip()} Required operator "
+                    "input will be collected interactively one item at a time."
+                ).strip()
             required_mutations = parsed.get("required_mutations", [])
             if (
                 parsed.get("decision") != "WAIT_USER"
@@ -16743,6 +16865,29 @@ class Orchestrator:
             )
             return state
         decision = str(result.get("decision", "")).strip().upper()
+        if decision == "PROTOCOL_BLOCK":
+            task.status = "pending"
+            self._persist_tasks(tasks)
+            reason = str(result.get("reason", "")).strip()
+            fingerprint = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    {
+                        "task_id": task.task_id,
+                        "reason": reason,
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            self._block_run(
+                state,
+                owner="auto_agents",
+                category="evidence_preflight_protocol_invalid",
+                reason=reason,
+                fingerprint=fingerprint,
+            )
+            save_run_state(self.project_root, state)
+            self.logger.error(reason)
+            return state
         if decision == "WAIT_USER":
             task.status = "waiting_user"
             state.tasks = tasks

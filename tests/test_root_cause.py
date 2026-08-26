@@ -289,6 +289,11 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                             "verification_commands": [
                                 "auto-agents validate --project /path/to/target",
                                 f"auto-agents validate --project {repair_root}",
+                                (
+                                    "After supplying the approved URL through WAIT_USER, "
+                                    "rerun target/.conda/bin/python -m pytest -q "
+                                    "target/tests/system/test_boundary.py"
+                                ),
                                 "git status --short",
                                 "cd auto_agents && python -m unittest -q",
                             ]
@@ -314,6 +319,10 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertIn("skipped=supplemental unresolved example path", result.summary)
             self.assertIn(
                 "skipped=supplemental target-project validation belongs to post-resume verification",
+                result.summary,
+            )
+            self.assertIn(
+                "skipped=supplemental unsupported candidate-worktree verification command",
                 result.summary,
             )
             self.assertIn("$ git status --short", result.summary)
@@ -1016,7 +1025,16 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     "final": type(
                         "FinalReport",
                         (),
-                        {"verification_commands": ["test -f remote_fix.py"]},
+                        {
+                            "verification_commands": [
+                                (
+                                    "After supplying approved input through WAIT_USER, "
+                                    "rerun target/.conda/bin/python -m pytest -q "
+                                    "target/tests/system/test_boundary.py"
+                                ),
+                                "test -f remote_fix.py",
+                            ]
+                        },
                     )()
                 },
             )()
@@ -1042,6 +1060,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(orchestrator.calls, 0)
             self.assertTrue((auto_root / "remote_fix.py").is_file())
             self.assertIn("test -f remote_fix.py", result.verification)
+            self.assertNotIn("After supplying", result.verification)
 
 
 if __name__ == "__main__":

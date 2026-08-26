@@ -1357,20 +1357,40 @@ def _supplemental_verification_skip_reason(
                 )
         return "shell control operators are not allowed"
 
-    executable = Path(parts[0]).name
+    command_parts = list(parts)
+    while command_parts and re.fullmatch(
+        r"PYTHONDONTWRITEBYTECODE=(?:0|1)",
+        command_parts[0],
+    ):
+        command_parts.pop(0)
+    if not command_parts:
+        return "empty command"
+    executable_token = command_parts[0]
+    executable = Path(executable_token).name
     if executable in {"auto-agents", "auto_agents.py"} and "--project" in parts:
         return "target-project validation belongs to post-resume verification"
-    if _is_pytest_verification_command(normalized):
+    if (
+        executable_token in {"python", "python3"}
+        and command_parts[1:3] == ["-m", "pytest"]
+    ) or executable_token == "pytest":
         return ""
     if (
-        len(parts) >= 3
-        and executable in {"python", "python3"}
-        and parts[1:3] == ["-m", "unittest"]
+        len(command_parts) >= 3
+        and executable_token in {"python", "python3"}
+        and command_parts[1:3] == ["-m", "unittest"]
     ):
         return ""
-    if parts[:2] == ["git", "status"]:
+    if command_parts[:2] == ["git", "status"]:
         return ""
-    if parts[:3] == ["git", "diff", "--check"]:
+    if command_parts[:3] == ["git", "diff", "--check"]:
+        return ""
+    if (
+        len(command_parts) == 3
+        and executable == "test"
+        and command_parts[1] in {"-d", "-e", "-f"}
+        and not Path(command_parts[2]).is_absolute()
+        and ".." not in Path(command_parts[2]).parts
+    ):
         return ""
     return "unsupported candidate-worktree verification command"
 
@@ -1848,6 +1868,10 @@ class AutoAgentsSelfRepairRunner:
             " ".join(str(command).split())
             for command in self.diagnosis.final.verification_commands
             if str(command).strip()
+            and not _supplemental_verification_skip_reason(
+                command,
+                repository_aliases={self.repo_root.name},
+            )
         ]
         if not commands:
             return None
