@@ -41,7 +41,7 @@ from auto_agents.provider_contract import (
     PROVIDER_REFERENCE_V2_HEADINGS,
 )
 from auto_agents.requirements import requirement_contract_sha256
-from auto_agents.validation import validation_report
+from auto_agents.validation import validate_task_plan_payload, validation_report
 
 
 def _strict_requirement() -> dict:
@@ -2634,6 +2634,329 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(
                 changed_paths(project_root),
                 ["staged.txt", "tracked.txt", "untracked.txt"],
+            )
+
+    def test_policy_v4_retained_worktree_uses_exact_active_proof_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            retained_test = "tests/integration/test_active_contract.py"
+            write_text(project_root / retained_test, "def test_current(): pass\n")
+            write_text(project_root / "src" / "candidate.py", "VALUE = 'old'\n")
+            commit_all(project_root, "test: retained baseline")
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            retired = TaskSpec(
+                task_id="retired-owner",
+                title="Retired owner",
+                description="Produces a candidate retained for retry.",
+                acceptance=["The candidate is reviewed."],
+            )
+            state.tasks = [retired]
+            write_text(
+                project_root / retained_test,
+                "def test_current(): assert True\n",
+            )
+            write_text(project_root / "src" / "candidate.py", "VALUE = 'candidate'\n")
+            orchestrator._set_parallel_sequential_retry_ids(
+                state,
+                [retired.task_id],
+            )
+
+            focused_refs = [
+                f"{retained_test}::test_current",
+                f"{retained_test}::test_no_external_side_effects",
+            ]
+            replacements = [
+                TaskSpec(
+                    task_id="replacement-focused",
+                    title="Focused replacement",
+                    description="Implement the active replacement contract.",
+                    acceptance=["The active contract passes."],
+                    verification_refs=focused_refs,
+                ),
+                TaskSpec(
+                    task_id="replacement-unrelated",
+                    title="Unrelated replacement",
+                    description="Implement another active contract.",
+                    acceptance=["The other contract passes."],
+                    verification_refs=[
+                        "tests/integration/test_other_contract.py::test_other"
+                    ],
+                ),
+            ]
+            state.tasks = replacements
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "verification_policy_version": 4,
+                    "tasks": [task.to_dict() for task in replacements],
+                },
+            )
+
+            recovery_id = (
+                orchestrator._schedule_orphaned_retained_worktree_reconciliation(
+                    state,
+                    replacements,
+                )
+            )
+
+            self.assertTrue(recovery_id.startswith("reconcile-retained-worktree-"))
+            recovery = replacements[0]
+            self.assertEqual(recovery.verification_refs, focused_refs)
+            self.assertEqual(
+                recovery.mutable_artifacts,
+                ["src/candidate.py", retained_test],
+            )
+            self.assertLessEqual(len(recovery.description), 500)
+            persisted = load_task_plan(project_root)
+            self.assertEqual(persisted["verification_policy_version"], 4)
+            self.assertEqual(persisted["tasks"][0]["verification_refs"], focused_refs)
+            self.assertFalse(
+                any(
+                    "verification_refs" in error
+                    for error in validate_task_plan_payload(persisted)
+                )
+            )
+
+    def test_policy_v4_retained_worktree_blocks_without_focused_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "src" / "candidate.py", "VALUE = 'old'\n")
+            write_text(
+                project_root / "tests" / "test_active_contract.py",
+                "def test_contract(): pass\n",
+            )
+            commit_all(project_root, "test: retained baseline")
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            retired = TaskSpec(
+                task_id="retired-owner",
+                title="Retired owner",
+                description="Produces a candidate retained for retry.",
+                acceptance=["The candidate is reviewed."],
+            )
+            state.tasks = [retired]
+            write_text(project_root / "src" / "candidate.py", "VALUE = 'candidate'\n")
+            orchestrator._set_parallel_sequential_retry_ids(
+                state,
+                [retired.task_id],
+            )
+
+            replacement = TaskSpec(
+                task_id="replacement-task",
+                title="Replacement",
+                description="Implement the active replacement contract.",
+                acceptance=["The active contract passes."],
+                verification_refs=[
+                    "tests/test_active_contract.py::test_contract"
+                ],
+            )
+            state.tasks = [replacement]
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "verification_policy_version": 4,
+                    "verification_commands": ["python -m pytest -q"],
+                    "tasks": [replacement.to_dict()],
+                },
+            )
+            prior_plan = load_task_plan(project_root)
+
+            recovery_id = (
+                orchestrator._schedule_orphaned_retained_worktree_reconciliation(
+                    state,
+                    state.tasks,
+                )
+            )
+
+            self.assertEqual(recovery_id, "")
+            self.assertEqual(state.tasks, [replacement])
+            self.assertEqual(load_task_plan(project_root), prior_plan)
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(state.active_blocker["owner"], "auto_agents")
+            self.assertEqual(
+                state.active_blocker["category"],
+                "retained_reconciliation_proof_unavailable",
+            )
+            self.assertIn(
+                retired.task_id,
+                state.resume_context["retained_worktree_ownership"],
+            )
+            self.assertFalse(
+                any(
+                    "verification_refs" in error
+                    for error in validate_task_plan_payload(prior_plan)
+                )
+            )
+
+    def test_restart_backfills_policy_v4_retained_worktree_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            retained_test = "tests/integration/test_active_contract.py"
+            write_text(project_root / retained_test, "def test_current(): pass\n")
+            commit_all(project_root, "test: retained baseline")
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            retired = TaskSpec(
+                task_id="retired-owner",
+                title="Retired owner",
+                description="Produces a candidate retained for retry.",
+                acceptance=["The candidate is reviewed."],
+            )
+            state.tasks = [retired]
+            write_text(
+                project_root / retained_test,
+                "def test_current(): assert True\n",
+            )
+            orchestrator._set_parallel_sequential_retry_ids(
+                state,
+                [retired.task_id],
+            )
+            proof_ref = f"{retained_test}::test_current"
+            replacement = TaskSpec(
+                task_id="replacement-task",
+                title="Replacement",
+                description="Implement the active replacement contract.",
+                acceptance=["The active contract passes."],
+                verification_refs=[proof_ref],
+            )
+            state.tasks = [replacement]
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [replacement.to_dict()]},
+            )
+            recovery_id = (
+                orchestrator._schedule_orphaned_retained_worktree_reconciliation(
+                    state,
+                    state.tasks,
+                )
+            )
+            recovery = state.tasks[0]
+            self.assertEqual(recovery.task_id, recovery_id)
+            recovery.verification_refs = []
+            state.tasks = [replacement]
+            state.verify_recovery_refs = []
+            save_run_state(project_root, state)
+            legacy_plan = load_task_plan(project_root)
+            legacy_plan["verification_policy_version"] = 4
+            legacy_plan["tasks"][0]["verification_refs"] = []
+            write_json(task_plan_path(project_root), legacy_plan)
+
+            restarted = load_run_state(project_root)
+            restarted_orchestrator = Orchestrator(project_root)
+            self.assertTrue(
+                restarted_orchestrator._normalize_stage_recovery_verification_refs(
+                    restarted
+                )
+            )
+
+            persisted = load_task_plan(project_root)
+            self.assertEqual(persisted["tasks"][0]["verification_refs"], [proof_ref])
+            recovered_state_task = next(
+                task for task in restarted.tasks if task.task_id == recovery_id
+            )
+            self.assertEqual(recovered_state_task.verification_refs, [proof_ref])
+            self.assertNotEqual(restarted.status, "blocked")
+            self.assertFalse(
+                any(
+                    "verification_refs" in error
+                    for error in validate_task_plan_payload(persisted)
+                )
+            )
+
+    def test_restart_quarantines_policy_v4_retained_worktree_without_proof(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "src" / "candidate.py", "VALUE = 'old'\n")
+            commit_all(project_root, "test: retained baseline")
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            retired = TaskSpec(
+                task_id="retired-owner",
+                title="Retired owner",
+                description="Produces a candidate retained for retry.",
+                acceptance=["The candidate is reviewed."],
+            )
+            state.tasks = [retired]
+            write_text(project_root / "src" / "candidate.py", "VALUE = 'candidate'\n")
+            orchestrator._set_parallel_sequential_retry_ids(
+                state,
+                [retired.task_id],
+            )
+            replacement = TaskSpec(
+                task_id="replacement-task",
+                title="Replacement",
+                description="Implement the active replacement contract.",
+                acceptance=["The active contract passes."],
+                verification_refs=[
+                    "tests/test_active_contract.py::test_contract"
+                ],
+            )
+            state.tasks = [replacement]
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [replacement.to_dict()]},
+            )
+            recovery_id = (
+                orchestrator._schedule_orphaned_retained_worktree_reconciliation(
+                    state,
+                    state.tasks,
+                )
+            )
+            self.assertEqual(state.tasks[0].verification_refs, [])
+            save_run_state(project_root, state)
+            legacy_plan = load_task_plan(project_root)
+            legacy_plan["verification_policy_version"] = 4
+            write_json(task_plan_path(project_root), legacy_plan)
+
+            restarted = load_run_state(project_root)
+            restarted_orchestrator = Orchestrator(project_root)
+            self.assertTrue(
+                restarted_orchestrator._normalize_stage_recovery_verification_refs(
+                    restarted
+                )
+            )
+
+            persisted = load_task_plan(project_root)
+            self.assertNotIn(
+                recovery_id,
+                [task["task_id"] for task in persisted["tasks"]],
+            )
+            self.assertEqual(restarted.status, "blocked")
+            self.assertEqual(
+                restarted.active_blocker["category"],
+                "retained_reconciliation_proof_unavailable",
+            )
+            ownership = restarted.resume_context["retained_worktree_ownership"]
+            self.assertEqual(
+                ownership[retired.task_id]["source"],
+                "unverifiable_reconciliation_quarantine",
+            )
+            self.assertNotIn("status", ownership[retired.task_id])
+            self.assertNotIn(
+                "reconciliation_task_id",
+                ownership[retired.task_id],
+            )
+            self.assertIn("src/candidate.py", changed_paths(project_root))
+            self.assertFalse(
+                any(
+                    "verification_refs" in error
+                    for error in validate_task_plan_payload(persisted)
+                )
             )
 
     def test_replan_does_not_claim_mismatched_or_unrelated_dirty_changes(self) -> None:

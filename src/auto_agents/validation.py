@@ -895,6 +895,42 @@ def validate_task_dependencies(
     return errors
 
 
+def is_executable_verification_ref(
+    ref: object,
+    *,
+    implement_targets: Iterable[str] = (),
+) -> bool:
+    """Return whether a task proof ref can be executed by the verifier."""
+
+    if not isinstance(ref, str):
+        return False
+    normalized = ref.strip()
+    if normalized.startswith("cmd:"):
+        return bool(normalized[4:].strip())
+    path, separator, selector = normalized.partition("::")
+    is_test_file = bool(
+        re.search(
+            r"(?:^|/)(?:test_[^/]+\.py|[^/]+_test\.py)$",
+            path.replace("\\", "/"),
+            re.IGNORECASE,
+        )
+        or re.search(
+            r"\.(?:test|spec)\.[cm]?[jt]sx?$",
+            path,
+            re.IGNORECASE,
+        )
+    )
+    if not is_test_file:
+        return False
+    if separator and selector.strip():
+        return True
+    return path in {
+        str(target).strip()
+        for target in implement_targets
+        if str(target).strip()
+    }
+
+
 def validate_task_plan_payload(
     payload: object,
     require_verification: bool = False,
@@ -1131,9 +1167,12 @@ def validate_task_plan_payload(
                 if not isinstance(ref, str):
                     continue
                 normalized = ref.strip()
-                if normalized.startswith("cmd:") and normalized[4:].strip():
+                if is_executable_verification_ref(
+                    normalized,
+                    implement_targets=implement_targets,
+                ):
                     continue
-                path, separator, selector = normalized.partition("::")
+                path, _, _ = normalized.partition("::")
                 is_test_file = bool(
                     re.search(
                         r"(?:^|/)(?:test_[^/]+\.py|[^/]+_test\.py)$",
@@ -1150,8 +1189,6 @@ def validate_task_plan_payload(
                     errors.append(
                         f"{prefix} verification_refs entry is not executable: {normalized}"
                     )
-                    continue
-                if separator and selector.strip():
                     continue
                 if path not in implement_targets:
                     errors.append(

@@ -264,12 +264,14 @@ from .run_lock import runtime_status
 from .validation import (
     PYTEST_VALUE_OPTIONS,
     _unwrap_conda_run,
+    is_executable_verification_ref,
     project_config_warnings,
     validate_active_persistence_target_readiness,
     validate_persistence_config_payload,
     validate_persistence_plan_contract,
     validate_required_document,
     validate_task_dependencies,
+    validate_task_plan_payload,
     validate_task_plan_with_requirements,
     validate_verification_command_paths,
     validation_report,
@@ -7385,6 +7387,8 @@ class Orchestrator:
                 legacy_blocker=blocker,
             )
         )
+        if state.status == "blocked":
+            return []
         if retained_reconciliation_task_id:
             blocker["retained_worktree_reconciliation_task_id"] = (
                 retained_reconciliation_task_id
@@ -7952,26 +7956,187 @@ class Orchestrator:
             )
         return captured
 
+    def _task_plan_verification_context(self) -> Tuple[int, Set[str]]:
+        try:
+            payload = load_task_plan(self.project_root)
+            policy_version = max(
+                1, int(payload.get("verification_policy_version", 1) or 1)
+            )
+        except (OSError, TypeError, ValueError):
+            return 1, set()
+        raw_steps = payload.get("verification_steps", [])
+        implement_targets = {
+            str(target).strip()
+            for step in (raw_steps if isinstance(raw_steps, list) else [])
+            if isinstance(step, dict)
+            and str(step.get("cadence", "implement_and_final")).strip().lower()
+            == "implement_and_final"
+            for target in (step.get("targets", []) or [])
+            if isinstance(target, str) and target.strip()
+        }
+        return policy_version, implement_targets
+
+    @staticmethod
+    def _verification_ref_path(ref: object) -> str:
+        normalized = str(ref or "").strip()
+        if not normalized or normalized.startswith("cmd:"):
+            return ""
+        path, _, _ = normalized.partition("::")
+        path = path.strip().replace("\\", "/")
+        while path.startswith("./"):
+            path = path[2:]
+        return path
+
+    def _executable_verification_refs(
+        self,
+        refs: Iterable[object],
+    ) -> List[str]:
+        policy_version, implement_targets = self._task_plan_verification_context()
+        candidates = [str(ref).strip() for ref in refs if str(ref).strip()]
+        if policy_version < 2:
+            return list(dict.fromkeys(candidates))
+        return list(
+            dict.fromkeys(
+                ref
+                for ref in candidates
+                if is_executable_verification_ref(
+                    ref,
+                    implement_targets=implement_targets,
+                )
+                and (
+                    not ref.startswith("cmd:")
+                    or self._safe_execution_recovery_command(ref[4:])
+                )
+            )
+        )
+
     def _retained_reconciliation_verification_refs(
         self,
         state: RunState,
         tasks: Iterable[TaskSpec],
         paths: Iterable[str],
+        *,
+        owner_task_ids: Iterable[str] = (),
     ) -> List[str]:
-        owned_paths = set(paths)
+        owned_paths = {
+            self._normalize_mutable_artifact_path(path)
+            for path in paths
+            if self._normalize_mutable_artifact_path(path)
+        }
+        replacement_ids = {
+            str(replacement_id).strip()
+            for owner_id in owner_task_ids
+            for replacement_id in state.plan_task_replacements.get(
+                str(owner_id).strip(),
+                [],
+            )
+            if str(replacement_id).strip()
+        }
         refs: List[str] = []
         for task in tasks:
             if task.status == "done":
                 continue
             artifacts = set(self._effective_task_mutable_artifacts(task))
-            if not artifacts.intersection(owned_paths):
+            planned_refs = self._task_planned_evidence_refs(task)
+            owns_retained_proof_path = any(
+                self._verification_ref_path(ref) in owned_paths
+                for ref in planned_refs
+            )
+            if (
+                task.task_id not in replacement_ids
+                and not artifacts.intersection(owned_paths)
+                and not owns_retained_proof_path
+            ):
                 continue
-            for ref in self._task_planned_evidence_refs(task):
+            for ref in self._executable_verification_refs(planned_refs):
                 if ref not in refs:
                     refs.append(ref)
         if not refs:
-            refs.extend(self._stage_recovery_verification_refs(state))
+            refs.extend(
+                self._executable_verification_refs(
+                    self._stage_recovery_verification_refs(state)
+                )
+            )
         return list(dict.fromkeys(refs))
+
+    def _generated_task_plan_validation_errors(
+        self,
+        generated_task: TaskSpec,
+        existing_tasks: Iterable[TaskSpec],
+    ) -> List[str]:
+        current_payload = load_task_plan(self.project_root)
+        candidate_payload = dict(current_payload)
+        candidate_payload["tasks"] = [
+            {
+                key: value
+                for key, value in task.to_dict().items()
+                if key != "commit_sha"
+            }
+            for task in [generated_task, *list(existing_tasks)]
+        ]
+        return [
+            error
+            for error in validate_task_plan_payload(candidate_payload)
+            if error.startswith("task #1")
+        ]
+
+    def _block_retained_reconciliation_without_proof(
+        self,
+        state: RunState,
+        *,
+        owner_task_ids: Iterable[str],
+        paths: Iterable[str],
+        validation_errors: Iterable[str] = (),
+    ) -> None:
+        policy_version, _ = self._task_plan_verification_context()
+        owners = sorted(
+            {str(task_id).strip() for task_id in owner_task_ids if str(task_id).strip()}
+        )
+        retained_paths = sorted(
+            {
+                self._normalize_mutable_artifact_path(path)
+                for path in paths
+                if self._normalize_mutable_artifact_path(path)
+            }
+        )
+        errors = [str(error).strip() for error in validation_errors if str(error).strip()]
+        reason = (
+            "auto_agents cannot schedule retained-worktree reconciliation under "
+            f"verification policy v{policy_version}: no executable focused proof "
+            "is owned by the active replacement plan or recovery attestation"
+        )
+        fingerprint_payload = {
+            "policy_version": policy_version,
+            "owner_task_ids": owners,
+            "changed_paths": retained_paths,
+            "validation_errors": errors,
+        }
+        fingerprint = "sha256:" + hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self._block_run(
+            state,
+            owner="auto_agents",
+            category="retained_reconciliation_proof_unavailable",
+            reason=reason,
+            fingerprint=fingerprint,
+        )
+        state.active_blocker["retained_worktree_reconciliation"] = {
+            **fingerprint_payload,
+            "updated_at": utc_now_iso(),
+        }
+        save_run_state(self.project_root, state)
+        self.logger.error(
+            "[recovery] retained-worktree reconciliation blocked without "
+            "focused proof owners=%s paths=%s policy=%s",
+            len(owners),
+            len(retained_paths),
+            policy_version,
+        )
 
     def _schedule_orphaned_retained_worktree_reconciliation(
         self,
@@ -7980,11 +8145,38 @@ class Orchestrator:
         *,
         legacy_blocker: Optional[Mapping[str, object]] = None,
     ) -> str:
-        for task in tasks:
+        for task in list(tasks):
             if (
                 task.status != "done"
                 and self._is_retained_worktree_reconciliation_task(task)
             ):
+                policy_version, _ = self._task_plan_verification_context()
+                if (
+                    policy_version >= 2
+                    and not self._executable_verification_refs(
+                        task.verification_refs
+                    )
+                ):
+                    repaired_ids = self._backfill_stage_recovery_verification_refs(
+                        tasks,
+                        state=state,
+                    )
+                    if task.task_id in repaired_ids:
+                        state.tasks = tasks
+                        self._persist_tasks(tasks)
+                        save_run_state(self.project_root, state)
+                if (
+                    policy_version >= 2
+                    and not self._executable_verification_refs(
+                        task.verification_refs
+                    )
+                ):
+                    self._quarantine_unverifiable_retained_reconciliations(
+                        state,
+                        tasks,
+                        [task],
+                    )
+                    return ""
                 return task.task_id
 
         if legacy_blocker is not None:
@@ -8040,9 +8232,6 @@ class Orchestrator:
         while task_id in active_ids:
             task_id = f"{base_task_id}-{suffix}"
             suffix += 1
-        path_preview = ", ".join(paths[:8])
-        if len(paths) > 8:
-            path_preview += f", +{len(paths) - 8} more"
         marker: Dict[str, object] = {
             "kind": _RETAINED_WORKTREE_RECONCILIATION_KIND,
             "version": 1,
@@ -8071,7 +8260,7 @@ class Orchestrator:
                 "only the listed paths against the current requirements and task "
                 "plan: preserve compatible work, remove obsolete behavior, and "
                 "leave an intentional, reviewable candidate for the replacement "
-                f"tasks. Retained paths: {path_preview}"
+                "tasks. The recovery handoff is the authoritative path boundary."
             ),
             acceptance=[
                 "Every retained path is reconciled against the active requirements and task plan",
@@ -8084,6 +8273,7 @@ class Orchestrator:
                 state,
                 tasks,
                 paths,
+                owner_task_ids=owner_ids,
             ),
             mutable_artifacts=list(paths),
             scope_boundaries=(
@@ -8093,6 +8283,18 @@ class Orchestrator:
             commit_message="chore: reconcile retained worktree candidate",
             recovery_history=[marker],
         )
+        validation_errors = self._generated_task_plan_validation_errors(
+            recovery,
+            tasks,
+        )
+        if validation_errors:
+            self._block_retained_reconciliation_without_proof(
+                state,
+                owner_task_ids=owner_ids,
+                paths=paths,
+                validation_errors=validation_errors,
+            )
+            return ""
         tasks.insert(0, recovery)
         for owner_id, record in matched_records:
             record["status"] = "migrated"
@@ -8630,6 +8832,8 @@ class Orchestrator:
                 state,
                 blocker,
             )
+            if state.status == "blocked":
+                return False
             if requeued_task_ids:
                 self.logger.info(
                     "[self-repair] requeued tasks=%s with fresh verification retry lifecycle",
@@ -9763,7 +9967,9 @@ class Orchestrator:
     ) -> List[str]:
         """Return the configured proof surface for an orchestrator recovery task."""
         if state is not None and state.verify_recovery_refs:
-            return list(dict.fromkeys(state.verify_recovery_refs))
+            return self._executable_verification_refs(
+                state.verify_recovery_refs
+            )
         try:
             payload = load_task_plan(self.project_root)
             policy_version = max(
@@ -9811,21 +10017,127 @@ class Orchestrator:
     def _backfill_stage_recovery_verification_refs(
         self,
         tasks: Iterable[TaskSpec],
+        *,
+        state: Optional[RunState] = None,
     ) -> List[str]:
-        verification_refs = self._stage_recovery_verification_refs()
-        if not verification_refs:
-            return []
+        task_list = list(tasks)
+        verification_refs = self._executable_verification_refs(
+            self._stage_recovery_verification_refs(state)
+        )
+        effective_state = state
         repaired_ids: List[str] = []
-        for task in tasks:
+        for task in task_list:
             if (
                 task.status == "done"
                 or task.task_origin != "stage_recovery"
-                or any(str(ref).strip() for ref in task.verification_refs)
             ):
                 continue
-            task.verification_refs = list(verification_refs)
+            current_refs = [
+                str(ref).strip()
+                for ref in task.verification_refs
+                if str(ref).strip()
+            ]
+            executable_refs = self._executable_verification_refs(current_refs)
+            if executable_refs:
+                if executable_refs != current_refs:
+                    task.verification_refs = executable_refs
+                    repaired_ids.append(task.task_id)
+                continue
+
+            task_refs = list(verification_refs)
+            if self._is_retained_worktree_reconciliation_task(task):
+                if effective_state is None:
+                    effective_state = load_run_state(self.project_root)
+                marker = self._retained_worktree_reconciliation_marker(task)
+                raw_handoff = marker.get("worktree_handoff", {})
+                handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+                raw_paths = handoff.get("changed_paths", task.mutable_artifacts)
+                paths = raw_paths if isinstance(raw_paths, list) else task.mutable_artifacts
+                raw_owner_ids = marker.get("source_task_ids", [])
+                owner_ids = (
+                    raw_owner_ids if isinstance(raw_owner_ids, list) else []
+                )
+                task_refs = self._retained_reconciliation_verification_refs(
+                    effective_state,
+                    (
+                        candidate
+                        for candidate in task_list
+                        if candidate.task_id != task.task_id
+                    ),
+                    paths,
+                    owner_task_ids=owner_ids,
+                )
+            if not task_refs:
+                continue
+            task.verification_refs = list(task_refs)
             repaired_ids.append(task.task_id)
         return repaired_ids
+
+    def _quarantine_unverifiable_retained_reconciliations(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        invalid_tasks: Iterable[TaskSpec],
+    ) -> None:
+        invalid_list = list(invalid_tasks)
+        invalid_ids = {task.task_id for task in invalid_list}
+        records = self._retained_worktree_ownership_records(state)
+        owner_ids: Set[str] = set()
+        retained_paths: Set[str] = set()
+        for task in invalid_list:
+            marker = self._retained_worktree_reconciliation_marker(task)
+            raw_handoff = marker.get("worktree_handoff", {})
+            handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+            raw_owner_ids = marker.get("source_task_ids", [])
+            source_owner_ids = (
+                [str(item).strip() for item in raw_owner_ids if str(item).strip()]
+                if isinstance(raw_owner_ids, list)
+                else []
+            )
+            raw_paths = handoff.get("changed_paths", task.mutable_artifacts)
+            paths = (
+                [
+                    self._normalize_mutable_artifact_path(path)
+                    for path in raw_paths
+                    if self._normalize_mutable_artifact_path(path)
+                ]
+                if isinstance(raw_paths, list)
+                else list(task.mutable_artifacts)
+            )
+            owner_ids.update(source_owner_ids)
+            retained_paths.update(paths)
+            for owner_id in source_owner_ids:
+                if not handoff:
+                    continue
+                restored_record = {
+                    **records.get(owner_id, {}),
+                    **copy.deepcopy(handoff),
+                    "owner_task_id": owner_id,
+                    "source": "unverifiable_reconciliation_quarantine",
+                    "captured_at": utc_now_iso(),
+                }
+                restored_record.pop("status", None)
+                restored_record.pop("reconciliation_task_id", None)
+                records[owner_id] = restored_record
+
+        retained_tasks = [task for task in tasks if task.task_id not in invalid_ids]
+        tasks[:] = retained_tasks
+        state.tasks = [
+            task for task in state.tasks if task.task_id not in invalid_ids
+        ]
+        if records:
+            state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+        self._persist_tasks(retained_tasks)
+        self._block_retained_reconciliation_without_proof(
+            state,
+            owner_task_ids=owner_ids,
+            paths=retained_paths,
+            validation_errors=(
+                "persisted retained-worktree reconciliation has no executable "
+                "verification ref"
+                for _task in invalid_list
+            ),
+        )
 
     def _normalize_stage_recovery_verification_refs(self, state: RunState) -> bool:
         """Backfill proof refs that older orchestrators omitted from recovery tasks."""
@@ -9842,19 +10154,43 @@ class Orchestrator:
         except (KeyError, OSError, TypeError, ValueError):
             return False
 
-        repaired_ids = self._backfill_stage_recovery_verification_refs(tasks)
+        repaired_ids = self._backfill_stage_recovery_verification_refs(
+            tasks,
+            state=state,
+        )
+        policy_version, _ = self._task_plan_verification_context()
+        invalid_reconciliations = [
+            task
+            for task in tasks
+            if policy_version >= 2
+            and task.status != "done"
+            and self._is_retained_worktree_reconciliation_task(task)
+            and not self._executable_verification_refs(task.verification_refs)
+        ]
+        if invalid_reconciliations:
+            self._quarantine_unverifiable_retained_reconciliations(
+                state,
+                tasks,
+                invalid_reconciliations,
+            )
+            return True
         if not repaired_ids:
             return False
 
         state_tasks = {task.task_id: task for task in state.tasks}
+        recovered_state_tasks: List[TaskSpec] = []
         for task in tasks:
             state_task = state_tasks.get(task.task_id)
+            if task.task_id in repaired_ids and state_task is None:
+                recovered_state_tasks.append(copy.deepcopy(task))
+                continue
             if (
                 task.task_id in repaired_ids
                 and state_task is not None
-                and not any(str(ref).strip() for ref in state_task.verification_refs)
             ):
                 state_task.verification_refs = list(task.verification_refs)
+        if recovered_state_tasks:
+            state.tasks = [*recovered_state_tasks, *state.tasks]
         self._persist_tasks(tasks)
         self.logger.info(
             "[stage-recovery] restored verification refs tasks=%s",
