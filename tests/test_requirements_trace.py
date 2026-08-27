@@ -17,6 +17,7 @@ from auto_agents.config import (
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, ProviderConfig, TaskSpec
 from auto_agents.frontend_fidelity import (
+    requirement_is_frontend_fidelity,
     validate_frontend_fidelity_task_plan,
     validate_frontend_fidelity_trace,
 )
@@ -1767,6 +1768,19 @@ class RequirementsTraceTests(unittest.TestCase):
         self.assertTrue(any("frontend prototype fidelity" in item for item in errors))
         self.assertTrue(any("frontend_surfaces" in item for item in errors))
 
+    def test_non_frontend_screen_direction_and_typed_snapshot_spec_is_not_fidelity(self) -> None:
+        trace = {"version": 1, "requirements": [_requirement()]}
+        spec = (
+            "Preserve storyboard screen direction and its typed state snapshot; "
+            "this iteration changes backend contracts only."
+        )
+
+        errors = validate_frontend_fidelity_trace(trace, spec_text=spec)
+
+        self.assertFalse(
+            any("frontend prototype fidelity" in item for item in errors)
+        )
+
     def test_preservation_only_spec_can_explicitly_decline_frontend_work(self) -> None:
         trace = {
             "version": 1,
@@ -1890,6 +1904,82 @@ class RequirementsTraceTests(unittest.TestCase):
                 for error in errors
             )
         )
+
+    def test_image_asset_snapshot_three_view_and_guidance_is_not_frontend_fidelity(self) -> None:
+        requirement = _requirement(
+            id="REQ-249",
+            text=(
+                "A canonical asset that observed story_panel_pollution switches to a "
+                "low-entropy single-anchor image template."
+            ),
+            source="asset corrective recovery spec",
+            acceptance_oracles=[
+                "The canonical image must not become a character sheet or 三视图 layout.",
+                (
+                    "An empty wardrobe uses one typed snapshot, and the scorer and "
+                    "corrective guidance consume that same snapshot."
+                ),
+            ],
+            oracle_type="mixed",
+            oracle_strength="semantic",
+            evidence_boundary="system_boundary",
+        )
+        previous = {
+            "version": 1,
+            "frontend_scope": {"requested": False, "surfaces": []},
+            "requirements": [],
+        }
+        current = json.loads(json.dumps(previous))
+        current["requirements"].append(requirement)
+
+        errors = validate_frontend_fidelity_trace(
+            current,
+            previous_trace=previous,
+        )
+
+        self.assertFalse(requirement_is_frontend_fidelity(requirement))
+        self.assertFalse(
+            any("requested=false forbids introducing" in error for error in errors)
+        )
+
+    def test_legacy_untagged_ui_prototype_requirement_reports_match_fields(self) -> None:
+        requirement = _requirement(
+            id="REQ-020",
+            text="The Workbench UI must match the approved prototype.",
+            acceptance_oracles=[
+                "The rendered page matches the prototype screenshots."
+            ],
+            notes="legacy trace without frontend metadata",
+        )
+        previous = {
+            "version": 1,
+            "frontend_scope": {"requested": False, "surfaces": []},
+            "requirements": [],
+        }
+        current = json.loads(json.dumps(previous))
+        current["requirements"].append(requirement)
+
+        errors = validate_frontend_fidelity_trace(
+            current,
+            previous_trace=previous,
+        )
+
+        self.assertTrue(requirement_is_frontend_fidelity(requirement))
+        issue = next(
+            error
+            for error in errors
+            if "requested=false forbids introducing" in error
+        )
+        self.assertIn("Classification signals:", issue)
+        self.assertIn("text:ui", issue)
+        self.assertIn("text:prototype", issue)
+
+    def test_contextual_dom_snapshot_remains_a_legacy_fidelity_signal(self) -> None:
+        requirement = _requirement(
+            text="The UI page must match the approved DOM snapshot.",
+        )
+
+        self.assertTrue(requirement_is_frontend_fidelity(requirement))
 
     def test_preservation_only_iteration_allows_unchanged_historical_requirement(self) -> None:
         requirement = _requirement(

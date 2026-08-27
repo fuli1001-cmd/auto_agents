@@ -12,13 +12,11 @@ _FRONTEND_TERMS = (
     "ui",
     "web",
     "page",
-    "screen",
     "route",
     "browser",
     "前端",
     "页面",
     "界面",
-    "视图",
     "首页",
 )
 _PROTOTYPE_TERMS = (
@@ -27,7 +25,6 @@ _PROTOTYPE_TERMS = (
     "wireframe",
     "figma",
     "screenshot",
-    "snapshot",
     ".html",
     ".htm",
     ".png",
@@ -39,21 +36,15 @@ _PROTOTYPE_TERMS = (
     "视觉稿",
     "设计稿",
 )
-_VISUAL_TERMS = (
-    "visual",
-    "style",
-    "css",
-    "dom",
-    "layout",
-    "viewport",
-    "pixel",
-    "playwright",
-    "storybook",
-    "runway",
-    "视觉",
-    "样式",
-    "布局",
-    "颜色",
+_CONTEXTUAL_PROTOTYPE_PATTERNS = (
+    ("dom snapshot", re.compile(r"(?<![a-z0-9])dom[ _-]+snapshots?(?![a-z0-9])")),
+    ("ui snapshot", re.compile(r"(?<![a-z0-9])ui[ _-]+snapshots?(?![a-z0-9])")),
+    ("page snapshot", re.compile(r"(?<![a-z0-9])page[ _-]+snapshots?(?![a-z0-9])")),
+    ("browser snapshot", re.compile(r"(?<![a-z0-9])browser[ _-]+snapshots?(?![a-z0-9])")),
+    ("rendered snapshot", re.compile(r"(?<![a-z0-9])rendered[ _-]+snapshots?(?![a-z0-9])")),
+    ("页面快照", re.compile(r"页面快照")),
+    ("界面快照", re.compile(r"界面快照")),
+    ("渲染快照", re.compile(r"渲染快照")),
 )
 _VISUAL_EVIDENCE_TERMS = (
     "playwright",
@@ -142,6 +133,81 @@ _POSITIVE_CHANGE_MARKERS = (
 )
 
 
+def _term_pattern(term: str) -> re.Pattern[str]:
+    escaped = re.escape(term)
+    if re.fullmatch(r"[a-z0-9-]+", term):
+        return re.compile(rf"(?<![a-z0-9]){escaped}(?![a-z0-9])")
+    return re.compile(escaped)
+
+
+def _matching_terms(text: str, terms: Sequence[str]) -> List[str]:
+    lowered = str(text or "").lower()
+    return [term for term in terms if _term_pattern(term).search(lowered)]
+
+
+def _matching_prototype_terms(text: str) -> List[str]:
+    lowered = str(text or "").lower()
+    matches = _matching_terms(lowered, _PROTOTYPE_TERMS)
+    for label, pattern in _CONTEXTUAL_PROTOTYPE_PATTERNS:
+        if pattern.search(lowered) and label not in matches:
+            matches.append(label)
+    return matches
+
+
+def _requirement_fidelity_signal_details(
+    requirement: Mapping[str, object],
+) -> Mapping[str, List[str]]:
+    explicit: List[str] = []
+    if requirement.get("frontend_surface") is True:
+        explicit.append("frontend_surface=true")
+    notes = str(requirement.get("notes", ""))
+    if "frontend_surface" in notes.lower():
+        explicit.append("notes:frontend_surface")
+    if explicit:
+        return {"explicit": explicit}
+
+    fields = [
+        ("text", requirement.get("text", "")),
+        ("source", requirement.get("source", "")),
+        ("oracle_type", requirement.get("oracle_type", "")),
+        ("oracle_strength", requirement.get("oracle_strength", "")),
+        ("evidence_boundary", requirement.get("evidence_boundary", "")),
+        ("notes", requirement.get("notes", "")),
+    ]
+    fields.extend(
+        (f"acceptance_oracles[{index}]", oracle)
+        for index, oracle in enumerate(
+            requirement.get("acceptance_oracles") or [],
+            start=1,
+        )
+    )
+    frontend_matches: List[str] = []
+    prototype_matches: List[str] = []
+    for field, raw_value in fields:
+        value = str(raw_value)
+        frontend_matches.extend(
+            f"{field}:{term}" for term in _matching_terms(value, _FRONTEND_TERMS)
+        )
+        prototype_matches.extend(
+            f"{field}:{term}" for term in _matching_prototype_terms(value)
+        )
+    if not frontend_matches or not prototype_matches:
+        return {}
+    return {
+        "frontend": list(dict.fromkeys(frontend_matches)),
+        "prototype": list(dict.fromkeys(prototype_matches)),
+    }
+
+
+def _format_fidelity_signal_details(details: Mapping[str, Sequence[str]]) -> str:
+    groups = []
+    for kind in ("explicit", "frontend", "prototype"):
+        matches = [str(item) for item in details.get(kind, []) if str(item)]
+        if matches:
+            groups.append(f"{kind}=[{', '.join(matches)}]")
+    return "; ".join(groups)
+
+
 def frontend_prototype_signals_from_text(text: str) -> List[str]:
     """Return broad signals that a spec is asking for frontend prototype fidelity."""
 
@@ -149,14 +215,14 @@ def frontend_prototype_signals_from_text(text: str) -> List[str]:
     if not lowered:
         return []
 
-    has_frontend = any(term in lowered for term in _FRONTEND_TERMS)
-    has_prototype = any(term in lowered for term in _PROTOTYPE_TERMS)
-    if not (has_frontend and has_prototype):
+    frontend_matches = _matching_terms(lowered, _FRONTEND_TERMS)
+    prototype_matches = _matching_prototype_terms(lowered)
+    if not (frontend_matches and prototype_matches):
         return []
 
     signals: List[str] = []
-    for term in (*_FRONTEND_TERMS, *_PROTOTYPE_TERMS):
-        if term in lowered and term not in signals:
+    for term in (*frontend_matches, *prototype_matches):
+        if term not in signals:
             signals.append(term)
         if len(signals) >= 8:
             break
@@ -188,27 +254,7 @@ def frontend_surface_requirement_ids(trace_payload: object) -> List[str]:
 def requirement_is_frontend_fidelity(requirement: object) -> bool:
     if not isinstance(requirement, Mapping):
         return False
-    if requirement.get("frontend_surface") is True:
-        return True
-    notes = str(requirement.get("notes", "")).lower()
-    if "frontend_surface" in notes:
-        return True
-    fields: List[str] = [
-        str(requirement.get("id", "")),
-        str(requirement.get("text", "")),
-        str(requirement.get("source", "")),
-        str(requirement.get("oracle_type", "")),
-        str(requirement.get("oracle_strength", "")),
-        str(requirement.get("evidence_boundary", "")),
-        str(requirement.get("notes", "")),
-    ]
-    for oracle in requirement.get("acceptance_oracles") or []:
-        fields.append(str(oracle))
-    combined = " ".join(fields).lower()
-    has_frontend = any(term in combined for term in _FRONTEND_TERMS)
-    has_prototype = any(term in combined for term in _PROTOTYPE_TERMS)
-    has_visual = any(term in combined for term in _VISUAL_TERMS)
-    return has_prototype and (has_frontend or has_visual)
+    return bool(_requirement_fidelity_signal_details(requirement))
 
 
 def requirement_is_frontend_preservation_only(requirement: object) -> bool:
@@ -423,7 +469,8 @@ def validate_frontend_fidelity_trace(
                 continue
             if requirement.get("status") != "active":
                 continue
-            if not requirement_is_frontend_fidelity(requirement):
+            signal_details = _requirement_fidelity_signal_details(requirement)
+            if not signal_details:
                 continue
             requirement_id = str(requirement.get("id", "")).strip()
             previous_requirement = previous_requirements.get(requirement_id)
@@ -451,7 +498,9 @@ def validate_frontend_fidelity_trace(
                 errors.append(
                     f"frontend_scope.requested=false forbids introducing active frontend "
                     f"fidelity requirement {requirement_id or '<unknown>'}; preserve historical "
-                    "contracts unchanged and keep regression checks in affected or release verification."
+                    "contracts unchanged and keep regression checks in affected or release verification. "
+                    "Classification signals: "
+                    f"{_format_fidelity_signal_details(signal_details)}."
                 )
             elif _frontend_requirement_contract_changed(
                 previous_requirement,
@@ -459,7 +508,9 @@ def validate_frontend_fidelity_trace(
             ):
                 errors.append(
                     f"frontend_scope.requested=false forbids changing frontend fidelity "
-                    f"requirement {requirement_id}; restore its previous contract."
+                    f"requirement {requirement_id}; restore its previous contract. "
+                    "Classification signals: "
+                    f"{_format_fidelity_signal_details(signal_details)}."
                 )
 
     if (
