@@ -2534,6 +2534,252 @@ class RetryFlowTests(unittest.TestCase):
                 ),
             )
 
+    def test_replan_migrates_exact_retained_candidate_to_prebaseline_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "tracked.txt", "before\n")
+            write_text(project_root / "staged.txt", "before\n")
+            commit_all(project_root, "test: candidate baseline")
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            retired = TaskSpec(
+                task_id="retired-owner",
+                title="Retired owner",
+                description="Produces a candidate retained for retry.",
+                acceptance=["The candidate is reviewed."],
+                status="pending",
+            )
+            state.tasks = [retired]
+            write_text(project_root / "tracked.txt", "unstaged candidate\n")
+            write_text(project_root / "staged.txt", "staged candidate\n")
+            subprocess.run(
+                ["git", "add", "staged.txt"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            write_text(project_root / "untracked.txt", "untracked candidate\n")
+            orchestrator._set_parallel_sequential_retry_ids(
+                state,
+                [retired.task_id],
+            )
+
+            ownership = state.resume_context["retained_worktree_ownership"]
+            self.assertEqual(
+                ownership[retired.task_id]["changed_paths"],
+                ["staged.txt", "tracked.txt", "untracked.txt"],
+            )
+
+            replacements = [
+                TaskSpec(
+                    task_id=f"replacement-{index}",
+                    title=f"Replacement {index}",
+                    description="Implement the active replacement contract.",
+                    acceptance=["The replacement contract passes."],
+                    status="pending",
+                )
+                for index in (1, 2)
+            ]
+            state.tasks = replacements
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [task.to_dict() for task in replacements]},
+            )
+            write_text(project_root / "spec.md", "# Replacement contract\n")
+
+            recovery_id = (
+                orchestrator._schedule_orphaned_retained_worktree_reconciliation(
+                    state,
+                    replacements,
+                )
+            )
+
+            self.assertTrue(recovery_id.startswith("reconcile-retained-worktree-"))
+            recovery = replacements[0]
+            marker = orchestrator._retained_worktree_reconciliation_marker(
+                recovery
+            )
+            self.assertEqual(marker["source_task_ids"], [retired.task_id])
+            self.assertEqual(
+                marker["worktree_handoff"]["changed_paths"],
+                ["staged.txt", "tracked.txt", "untracked.txt"],
+            )
+            self.assertNotIn(
+                "parallel_sequential_retry_tasks",
+                state.resume_context,
+            )
+
+            before_planning_commit = head_ref(project_root)
+            orchestrator._commit_planning_baseline_if_needed(replacements)
+            orchestrator._refresh_retained_worktree_reconciliation_handoffs(
+                state,
+                replacements,
+            )
+            self.assertNotEqual(head_ref(project_root), before_planning_commit)
+            self.assertTrue(
+                orchestrator._retained_worktree_reconciliation_handoff_matches(
+                    recovery
+                )
+            )
+            selected, pending = orchestrator._ready_prebaseline_recovery_task(
+                state,
+                replacements,
+            )
+            self.assertTrue(pending)
+            self.assertIs(selected, recovery)
+            self.assertEqual(
+                changed_paths(project_root),
+                ["staged.txt", "tracked.txt", "untracked.txt"],
+            )
+
+    def test_replan_does_not_claim_mismatched_or_unrelated_dirty_changes(self) -> None:
+        for mutation in ("owned-content-changed", "unrelated-path-added"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                project_root = Path(tmp) / "demo"
+                Orchestrator.init_project(project_root, "demo", "mock")
+                write_text(project_root / "owned.txt", "before\n")
+                commit_all(project_root, "test: baseline")
+                orchestrator = Orchestrator(project_root)
+                state = load_run_state(project_root)
+                retired = TaskSpec(
+                    task_id="retired-owner",
+                    title="Retired owner",
+                    description="Produces a retained candidate.",
+                    acceptance=["The candidate is reviewed."],
+                    status="pending",
+                )
+                state.tasks = [retired]
+                write_text(project_root / "owned.txt", "captured candidate\n")
+                orchestrator._set_parallel_sequential_retry_ids(
+                    state,
+                    [retired.task_id],
+                )
+                if mutation == "owned-content-changed":
+                    write_text(project_root / "owned.txt", "changed after capture\n")
+                else:
+                    write_text(project_root / "user-edit.txt", "unrelated\n")
+
+                replacement = TaskSpec(
+                    task_id="replacement-task",
+                    title="Replacement",
+                    description="Implement the active contract.",
+                    acceptance=["The active contract passes."],
+                    status="pending",
+                )
+                state.tasks = [replacement]
+                write_json(
+                    task_plan_path(project_root),
+                    {"tasks": [replacement.to_dict()]},
+                )
+
+                recovery_id = (
+                    orchestrator._schedule_orphaned_retained_worktree_reconciliation(
+                        state,
+                        state.tasks,
+                    )
+                )
+
+                self.assertEqual(recovery_id, "")
+                self.assertEqual(state.tasks, [replacement])
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "working tree is not clean before task replacement-task",
+                ):
+                    orchestrator._execute_task_in_main_worktree(
+                        state,
+                        state.tasks,
+                        replacement,
+                    )
+
+    def test_self_repair_migrates_exact_legacy_orphan_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            commit_all(project_root, "test: planning baseline")
+            orchestrator = Orchestrator(project_root)
+            replacements = [
+                TaskSpec(
+                    task_id="replacement-task",
+                    title="Replacement",
+                    description="Implement the active contract.",
+                    acceptance=["The active contract passes."],
+                    status="pending",
+                )
+            ]
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [task.to_dict() for task in replacements]},
+            )
+            write_text(project_root / "retained.txt", "legacy candidate\n")
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.tasks = replacements
+            state.resume_context["implementation_ready_tasks"] = {
+                "retired-repair": True,
+            }
+            state.last_recovery_route = {
+                "outcome": "judge_stopped",
+                "task_id": "retired-repair",
+                "lineage_id": "retired-parent",
+                "repair_task_ids": ["retired-repair"],
+            }
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "orphaned_retained_worktree",
+                "status": "blocked",
+                "checkpoint": {
+                    "stage": "implement",
+                    "head": head_ref(project_root),
+                    "worktree": worktree_fingerprint(project_root),
+                },
+            }
+            save_run_state(project_root, state)
+
+            state = orchestrator.mark_self_repair_applied("repair-commit")
+            self.assertTrue(orchestrator._resume_blocked_run(state))
+
+            recovery = next(
+                task
+                for task in state.tasks
+                if orchestrator._is_retained_worktree_reconciliation_task(task)
+            )
+            marker = orchestrator._retained_worktree_reconciliation_marker(
+                recovery
+            )
+            self.assertEqual(marker["source_task_ids"], ["retired-repair"])
+            self.assertEqual(
+                marker["worktree_handoff"]["changed_paths"],
+                ["retained.txt"],
+            )
+            self.assertIn(
+                "retired-repair",
+                state.resume_context["implementation_ready_tasks"],
+            )
+
+            orchestrator._complete_retained_worktree_reconciliation(
+                state,
+                recovery,
+            )
+
+            self.assertNotIn(
+                "retired-repair",
+                state.resume_context.get("implementation_ready_tasks", {}),
+            )
+            self.assertNotIn(
+                "retained_worktree_ownership",
+                state.resume_context,
+            )
+            self.assertEqual(
+                state.last_recovery_route["outcome"],
+                "retained_worktree_reconciled",
+            )
+
     def test_pending_task_does_not_resume_from_orchestrator_only_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

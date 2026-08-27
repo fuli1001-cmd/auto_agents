@@ -323,6 +323,10 @@ _RECOVERY_CURSOR_RECONCILIATION_KEY = "recovery_cursor_reconciliation"
 _DANGLING_DEPENDENCIES_AFTER_TASK_PRUNING = (
     "dangling_dependencies_after_task_pruning"
 )
+_RETAINED_WORKTREE_OWNERSHIP_CONTEXT = "retained_worktree_ownership"
+_RETAINED_WORKTREE_RECONCILIATION_KIND = (
+    "retained_worktree_reconciliation"
+)
 _NON_COMPARABLE_BASELINE_PREFIXES = (
     "cmd-timeout:",
     "cmd-stalled:",
@@ -7353,6 +7357,18 @@ class Orchestrator:
                     if isinstance(item, dict)
                 ]
 
+        retained_reconciliation_task_id = (
+            self._schedule_orphaned_retained_worktree_reconciliation(
+                state,
+                tasks,
+                legacy_blocker=blocker,
+            )
+        )
+        if retained_reconciliation_task_id:
+            blocker["retained_worktree_reconciliation_task_id"] = (
+                retained_reconciliation_task_id
+            )
+
         cursor_reconciliations = (
             self._reconcile_noncontiguous_recovery_exhaustion(
                 state,
@@ -7539,6 +7555,626 @@ class Orchestrator:
             return False
         self._set_parallel_sequential_retry_ids(state, reordered)
         return True
+
+    @staticmethod
+    def _retained_worktree_ownership_records(
+        state: RunState,
+    ) -> Dict[str, Dict[str, object]]:
+        raw = state.resume_context.get(
+            _RETAINED_WORKTREE_OWNERSHIP_CONTEXT,
+            {},
+        )
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(task_id): dict(record)
+            for task_id, record in raw.items()
+            if str(task_id).strip() and isinstance(record, dict)
+        }
+
+    def _retained_worktree_path_fingerprints(
+        self,
+        paths: Iterable[str],
+    ) -> Dict[str, str]:
+        fingerprints: Dict[str, str] = {}
+        for raw_path in sorted(set(paths)):
+            path = str(raw_path).strip().replace("\\", "/")
+            if not path:
+                continue
+            candidate = self.project_root / path
+            hasher = hashlib.sha256()
+            if candidate.is_file():
+                hasher.update(candidate.read_bytes())
+            else:
+                hasher.update(b"[missing]")
+            fingerprints[path] = hasher.hexdigest()
+        return fingerprints
+
+    def _capture_retained_worktree_ownership(
+        self,
+        state: RunState,
+        task_ids: Iterable[str],
+        *,
+        source: str,
+        replace_existing: bool = False,
+    ) -> List[str]:
+        """Checkpoint a dirty candidate before its retry owner can be replanned."""
+
+        active_ids = {task.task_id for task in state.tasks}
+        owner_ids = list(
+            dict.fromkeys(
+                str(task_id).strip()
+                for task_id in task_ids
+                if str(task_id).strip() in active_ids
+            )
+        )
+        paths = sorted(set(self._changed_paths_excluding_agent_instructions()))
+        if not owner_ids or not paths:
+            return []
+
+        records = self._retained_worktree_ownership_records(state)
+        captured: List[str] = []
+        snapshot = {
+            "version": 1,
+            "head_ref": head_ref(self.project_root),
+            "worktree_fingerprint": (
+                self._worktree_fingerprint_excluding_agent_instructions()
+            ),
+            "changed_paths": paths,
+            "path_fingerprints": self._retained_worktree_path_fingerprints(
+                paths
+            ),
+            "source": str(source).strip() or "sequential_retry",
+            "captured_at": utc_now_iso(),
+        }
+        for task_id in owner_ids:
+            if task_id in records and not replace_existing:
+                continue
+            records[task_id] = {
+                **snapshot,
+                "owner_task_id": task_id,
+            }
+            captured.append(task_id)
+        if captured:
+            state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = (
+                records
+            )
+        return captured
+
+    def _planning_baseline_allowed_paths(self) -> Set[str]:
+        allowed = {".gitignore", "README.md", "DESIGN.md", "spec.md"}
+        if self._active_spec_file is not None:
+            try:
+                allowed.add(
+                    str(self._active_spec_file.relative_to(self.project_root))
+                )
+            except ValueError:
+                pass
+        return allowed
+
+    def _head_transition_contains_only_planning_artifacts(
+        self,
+        source_ref: str,
+        target_ref: str,
+    ) -> bool:
+        source = str(source_ref).strip()
+        target = str(target_ref).strip()
+        if source == target:
+            return True
+        if not source or not target:
+            return False
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", source, target],
+            cwd=str(self.project_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if ancestor.returncode != 0:
+            return False
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", source, target, "--"],
+            cwd=str(self.project_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if diff.returncode != 0:
+            return False
+        allowed = self._planning_baseline_allowed_paths()
+        paths = [line.strip() for line in diff.stdout.splitlines() if line.strip()]
+        return bool(paths) and all(
+            path.startswith(".auto-agents/") or path in allowed
+            for path in paths
+        )
+
+    def _retained_worktree_snapshot_matches(
+        self,
+        record: Mapping[str, object],
+        *,
+        allow_pending_planning_changes: bool,
+    ) -> bool:
+        if int(record.get("version", 0) or 0) != 1:
+            return False
+        raw_paths = record.get("changed_paths", [])
+        if not isinstance(raw_paths, list):
+            return False
+        expected_paths = sorted(
+            {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+            }
+        )
+        current_paths = sorted(
+            set(self._changed_paths_excluding_agent_instructions())
+        )
+        if not expected_paths or not set(expected_paths).issubset(current_paths):
+            return False
+
+        extra_paths = sorted(set(current_paths) - set(expected_paths))
+        if extra_paths and (
+            not allow_pending_planning_changes
+            or any(
+                path not in self._planning_baseline_allowed_paths()
+                for path in extra_paths
+            )
+        ):
+            return False
+
+        source_head = str(record.get("head_ref", "")).strip()
+        current_head = head_ref(self.project_root)
+        if source_head != current_head and not (
+            allow_pending_planning_changes
+            and self._head_transition_contains_only_planning_artifacts(
+                source_head,
+                current_head,
+            )
+        ):
+            return False
+
+        expected_fingerprint = str(
+            record.get("worktree_fingerprint", "")
+        ).strip()
+        if not expected_fingerprint:
+            return False
+        if not extra_paths:
+            return (
+                expected_fingerprint
+                == self._worktree_fingerprint_excluding_agent_instructions()
+            )
+
+        raw_path_fingerprints = record.get("path_fingerprints", {})
+        if not isinstance(raw_path_fingerprints, dict):
+            return False
+        expected_path_fingerprints = {
+            str(path): str(fingerprint)
+            for path, fingerprint in raw_path_fingerprints.items()
+            if str(path).strip() and str(fingerprint).strip()
+        }
+        return (
+            set(expected_path_fingerprints) == set(expected_paths)
+            and expected_path_fingerprints
+            == self._retained_worktree_path_fingerprints(expected_paths)
+        )
+
+    @staticmethod
+    def _retained_worktree_reconciliation_marker(
+        task: TaskSpec,
+    ) -> Dict[str, object]:
+        for entry in reversed(task.recovery_history):
+            if (
+                isinstance(entry, dict)
+                and str(entry.get("kind", ""))
+                == _RETAINED_WORKTREE_RECONCILIATION_KIND
+            ):
+                return entry
+        return {}
+
+    @classmethod
+    def _is_retained_worktree_reconciliation_task(
+        cls,
+        task: TaskSpec,
+    ) -> bool:
+        return bool(cls._retained_worktree_reconciliation_marker(task))
+
+    @classmethod
+    def _is_prebaseline_recovery_task(cls, task: TaskSpec) -> bool:
+        return bool(
+            is_execution_incident_recovery_task(task)
+            or cls._is_retained_worktree_reconciliation_task(task)
+        )
+
+    def _capture_legacy_self_repair_retained_worktree_ownership(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        blocker: Mapping[str, object],
+    ) -> List[str]:
+        """Migrate an exact old-engine blocker checkpoint into typed ownership."""
+
+        if (
+            str(blocker.get("owner", "")).strip() != "auto_agents"
+            or not str(blocker.get("self_repair_commit", "")).strip()
+            or state.current_stage != "implement"
+        ):
+            return []
+        raw_checkpoint = blocker.get("checkpoint", {})
+        checkpoint = (
+            dict(raw_checkpoint) if isinstance(raw_checkpoint, dict) else {}
+        )
+        if (
+            str(checkpoint.get("stage", "")).strip() != "implement"
+            or str(checkpoint.get("head", "")).strip()
+            != head_ref(self.project_root)
+            or not str(checkpoint.get("worktree", "")).strip()
+            or str(checkpoint.get("worktree", "")).strip()
+            != worktree_fingerprint(self.project_root)
+        ):
+            return []
+
+        route = (
+            dict(state.last_recovery_route)
+            if isinstance(state.last_recovery_route, dict)
+            else {}
+        )
+        routed_ids: List[str] = []
+        for value in (route.get("task_id"), route.get("lineage_id")):
+            task_id = str(value or "").strip()
+            if task_id and task_id not in routed_ids:
+                routed_ids.append(task_id)
+        raw_repair_ids = route.get("repair_task_ids", [])
+        if isinstance(raw_repair_ids, list):
+            for value in raw_repair_ids:
+                task_id = str(value).strip()
+                if task_id and task_id not in routed_ids:
+                    routed_ids.append(task_id)
+
+        active_ids = {task.task_id for task in tasks}
+        ready = self._implementation_ready_markers(state)
+        retry_ids = set(self._parallel_sequential_retry_ids(state))
+        owner_ids = [
+            task_id
+            for task_id in routed_ids
+            if task_id not in active_ids
+            and (
+                bool(ready.get(task_id))
+                or task_id in retry_ids
+                or task_id in state.task_failure_checkpoints
+            )
+        ]
+        paths = sorted(set(self._changed_paths_excluding_agent_instructions()))
+        if not owner_ids or not paths:
+            return []
+
+        records = self._retained_worktree_ownership_records(state)
+        snapshot = {
+            "version": 1,
+            "head_ref": head_ref(self.project_root),
+            "worktree_fingerprint": (
+                self._worktree_fingerprint_excluding_agent_instructions()
+            ),
+            "changed_paths": paths,
+            "path_fingerprints": self._retained_worktree_path_fingerprints(
+                paths
+            ),
+            "source": "legacy_self_repair_blocker_checkpoint",
+            "captured_at": utc_now_iso(),
+        }
+        captured: List[str] = []
+        for task_id in owner_ids:
+            if task_id in records:
+                continue
+            records[task_id] = {
+                **snapshot,
+                "owner_task_id": task_id,
+            }
+            captured.append(task_id)
+        if captured:
+            state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = (
+                records
+            )
+        return captured
+
+    def _retained_reconciliation_verification_refs(
+        self,
+        state: RunState,
+        tasks: Iterable[TaskSpec],
+        paths: Iterable[str],
+    ) -> List[str]:
+        owned_paths = set(paths)
+        refs: List[str] = []
+        for task in tasks:
+            if task.status == "done":
+                continue
+            artifacts = set(self._effective_task_mutable_artifacts(task))
+            if not artifacts.intersection(owned_paths):
+                continue
+            for ref in self._task_planned_evidence_refs(task):
+                if ref not in refs:
+                    refs.append(ref)
+        if not refs:
+            refs.extend(self._stage_recovery_verification_refs(state))
+        return list(dict.fromkeys(refs))
+
+    def _schedule_orphaned_retained_worktree_reconciliation(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        *,
+        legacy_blocker: Optional[Mapping[str, object]] = None,
+    ) -> str:
+        for task in tasks:
+            if (
+                task.status != "done"
+                and self._is_retained_worktree_reconciliation_task(task)
+            ):
+                return task.task_id
+
+        if legacy_blocker is not None:
+            self._capture_legacy_self_repair_retained_worktree_ownership(
+                state,
+                tasks,
+                legacy_blocker,
+            )
+
+        active_ids = {task.task_id for task in tasks}
+        records = self._retained_worktree_ownership_records(state)
+        matching: Dict[Tuple[Tuple[str, ...], str], List[Tuple[str, Dict[str, object]]]] = {}
+        for owner_id, record in records.items():
+            if owner_id in active_ids or not self._retained_worktree_snapshot_matches(
+                record,
+                allow_pending_planning_changes=True,
+            ):
+                continue
+            raw_paths = record.get("changed_paths", [])
+            paths = tuple(
+                sorted(
+                    {
+                        str(path).strip().replace("\\", "/")
+                        for path in raw_paths
+                        if str(path).strip()
+                    }
+                )
+            )
+            fingerprint = str(
+                record.get("worktree_fingerprint", "")
+            ).strip()
+            matching.setdefault((paths, fingerprint), []).append(
+                (owner_id, record)
+            )
+
+        if len(matching) != 1:
+            return ""
+        (paths, fingerprint), matched_records = next(iter(matching.items()))
+        if not paths or not fingerprint:
+            return ""
+        owner_ids = sorted({owner_id for owner_id, _ in matched_records})
+        source_heads = sorted(
+            {
+                str(record.get("head_ref", "")).strip()
+                for _, record in matched_records
+                if str(record.get("head_ref", "")).strip()
+            }
+        )
+
+        base_task_id = f"reconcile-retained-worktree-{fingerprint[:12]}"
+        task_id = base_task_id
+        suffix = 2
+        while task_id in active_ids:
+            task_id = f"{base_task_id}-{suffix}"
+            suffix += 1
+        path_preview = ", ".join(paths[:8])
+        if len(paths) > 8:
+            path_preview += f", +{len(paths) - 8} more"
+        marker: Dict[str, object] = {
+            "kind": _RETAINED_WORKTREE_RECONCILIATION_KIND,
+            "version": 1,
+            "result": "scheduled",
+            "source_task_ids": owner_ids,
+            "source_head_refs": source_heads,
+            "scheduled_at": utc_now_iso(),
+            "worktree_handoff": {
+                "version": 1,
+                "source_task_ids": owner_ids,
+                "source_head_refs": source_heads,
+                "head_ref": head_ref(self.project_root),
+                "worktree_fingerprint": fingerprint,
+                "changed_paths": list(paths),
+                "path_fingerprints": self._retained_worktree_path_fingerprints(
+                    paths
+                ),
+            },
+        }
+        recovery = TaskSpec(
+            task_id=task_id,
+            title="Reconcile retained implementation candidate",
+            description=(
+                "Audit the exact auto_agents-owned worktree candidate retained "
+                "from tasks removed by the active replacement plan. Reconcile "
+                "only the listed paths against the current requirements and task "
+                "plan: preserve compatible work, remove obsolete behavior, and "
+                "leave an intentional, reviewable candidate for the replacement "
+                f"tasks. Retained paths: {path_preview}"
+            ),
+            acceptance=[
+                "Every retained path is reconciled against the active requirements and task plan",
+                "Obsolete behavior is removed without silently accepting the superseded task outcome",
+                "The resulting candidate is reviewed and its focused verification passes",
+            ],
+            status="pending",
+            task_origin="stage_recovery",
+            verification_refs=self._retained_reconciliation_verification_refs(
+                state,
+                tasks,
+                paths,
+            ),
+            mutable_artifacts=list(paths),
+            scope_boundaries=(
+                "Modify only the retained worktree paths recorded in the recovery "
+                "handoff; do not implement unrelated replacement-plan tasks."
+            ),
+            commit_message="chore: reconcile retained worktree candidate",
+            recovery_history=[marker],
+        )
+        tasks.insert(0, recovery)
+        for owner_id, record in matched_records:
+            record["status"] = "migrated"
+            record["reconciliation_task_id"] = task_id
+            records[owner_id] = record
+        state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+        retry_ids = [
+            task_id
+            for task_id in self._parallel_sequential_retry_ids(state)
+            if task_id not in owner_ids
+        ]
+        self._set_parallel_sequential_retry_ids(state, retry_ids)
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        self.logger.warning(
+            "[recovery] scheduled retained-worktree reconciliation task=%s "
+            "owners=%s paths=%s",
+            recovery.task_id,
+            ",".join(owner_ids),
+            len(paths),
+        )
+        return recovery.task_id
+
+    def _refresh_retained_worktree_reconciliation_handoffs(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> bool:
+        current_head = head_ref(self.project_root)
+        changed = False
+        for task in tasks:
+            if task.status == "done":
+                continue
+            marker = self._retained_worktree_reconciliation_marker(task)
+            raw_handoff = marker.get("worktree_handoff", {})
+            handoff = (
+                raw_handoff if isinstance(raw_handoff, dict) else {}
+            )
+            previous_head = str(handoff.get("head_ref", "")).strip()
+            if (
+                not handoff
+                or previous_head == current_head
+                or not self._retained_worktree_snapshot_matches(
+                    handoff,
+                    allow_pending_planning_changes=True,
+                )
+            ):
+                continue
+            handoff["planning_head_ref"] = current_head
+            handoff["head_ref"] = current_head
+            marker["planning_head_transition"] = {
+                "from": previous_head,
+                "to": current_head,
+            }
+            changed = True
+        if changed:
+            state.tasks = tasks
+            self._persist_tasks(tasks)
+            save_run_state(self.project_root, state)
+        return changed
+
+    def _complete_retained_worktree_reconciliation(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> None:
+        marker = self._retained_worktree_reconciliation_marker(task)
+        if not marker:
+            return
+        owner_ids = {
+            str(task_id).strip()
+            for task_id in marker.get("source_task_ids", []) or []
+            if str(task_id).strip()
+        }
+        marker["result"] = "reconciled"
+        marker["completed_at"] = utc_now_iso()
+        marker["final_head_ref"] = head_ref(self.project_root)
+        marker["final_worktree_fingerprint"] = (
+            self._worktree_fingerprint_excluding_agent_instructions()
+        )
+
+        records = self._retained_worktree_ownership_records(state)
+        for owner_id in owner_ids:
+            records.pop(owner_id, None)
+            state.task_failure_checkpoints.pop(owner_id, None)
+            state.agent_attempts.pop(f"implement-{owner_id}", None)
+        if records:
+            state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+        else:
+            state.resume_context.pop(
+                _RETAINED_WORKTREE_OWNERSHIP_CONTEXT,
+                None,
+            )
+
+        ready = self._implementation_ready_markers(state)
+        attempt_refs = self._task_attempt_base_refs(state)
+        for owner_id in owner_ids:
+            ready.pop(owner_id, None)
+            attempt_refs.pop(owner_id, None)
+        if ready:
+            state.resume_context["implementation_ready_tasks"] = ready
+        else:
+            state.resume_context.pop("implementation_ready_tasks", None)
+        if attempt_refs:
+            state.resume_context["task_attempt_base_refs"] = attempt_refs
+        else:
+            state.resume_context.pop("task_attempt_base_refs", None)
+        self._set_parallel_sequential_retry_ids(
+            state,
+            [
+                task_id
+                for task_id in self._parallel_sequential_retry_ids(state)
+                if task_id not in owner_ids
+            ],
+        )
+
+        route = (
+            dict(state.last_recovery_route)
+            if isinstance(state.last_recovery_route, dict)
+            else {}
+        )
+        raw_route_repair_ids = route.get("repair_task_ids", [])
+        route_repair_ids = (
+            raw_route_repair_ids
+            if isinstance(raw_route_repair_ids, list)
+            else []
+        )
+        route_owner_ids = {
+            str(route.get("task_id", "")).strip(),
+            str(route.get("lineage_id", "")).strip(),
+            *(
+                str(task_id).strip()
+                for task_id in route_repair_ids
+            ),
+        }
+        if owner_ids.intersection(route_owner_ids):
+            route["outcome"] = "retained_worktree_reconciled"
+            route["reconciliation_task_id"] = task.task_id
+            route["reconciled_task_ids"] = sorted(owner_ids)
+            state.last_recovery_route = route
+
+    def _clear_retained_worktree_owner_record(
+        self,
+        state: RunState,
+        task_id: str,
+    ) -> None:
+        records = self._retained_worktree_ownership_records(state)
+        if task_id not in records:
+            return
+        records.pop(task_id, None)
+        if records:
+            state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+        else:
+            state.resume_context.pop(
+                _RETAINED_WORKTREE_OWNERSHIP_CONTEXT,
+                None,
+            )
 
     def _restore_interrupted_self_repair_retry_ownership(
         self,
@@ -8999,6 +9635,38 @@ class Orchestrator:
             )
         return matches
 
+    def _retained_worktree_reconciliation_handoff_matches(
+        self,
+        task: TaskSpec,
+    ) -> bool:
+        if (
+            task.status != "pending"
+            or task.task_origin != "stage_recovery"
+            or not self._is_retained_worktree_reconciliation_task(task)
+        ):
+            return False
+        marker = self._retained_worktree_reconciliation_marker(task)
+        raw_handoff = marker.get("worktree_handoff", {})
+        handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+        matches = bool(
+            handoff
+            and self._retained_worktree_snapshot_matches(
+                handoff,
+                allow_pending_planning_changes=False,
+            )
+        )
+        if matches:
+            self.logger.info(
+                "[recovery] carrying retained worktree task=%s owners=%s paths=%s",
+                task.task_id,
+                ",".join(
+                    str(owner_id)
+                    for owner_id in handoff.get("source_task_ids", []) or []
+                ),
+                len(handoff.get("changed_paths", []) or []),
+            )
+        return matches
+
     @staticmethod
     def _safe_execution_recovery_command(command: object) -> bool:
         normalized = str(command or "").strip()
@@ -9233,7 +9901,7 @@ class Orchestrator:
         seen: Set[str] = set()
         while current.task_id not in seen:
             seen.add(current.task_id)
-            if is_execution_incident_recovery_task(current):
+            if self._is_prebaseline_recovery_task(current):
                 return current
             parent_id = current.parent_task_id.strip()
             if not parent_id or parent_id not in tasks_by_id:
@@ -9250,7 +9918,7 @@ class Orchestrator:
         unfinished_roots = {
             task.task_id
             for task in tasks
-            if task.status != "done" and is_execution_incident_recovery_task(task)
+            if task.status != "done" and self._is_prebaseline_recovery_task(task)
         }
         if not unfinished_roots:
             return None, False
@@ -10072,6 +10740,14 @@ class Orchestrator:
             save_run_state(self.project_root, state)
 
         state.tasks = tasks
+        retained_reconciliation_task_id = (
+            self._schedule_orphaned_retained_worktree_reconciliation(
+                state,
+                tasks,
+            )
+        )
+        if retained_reconciliation_task_id:
+            state.tasks = tasks
         tasks_by_id = {task.task_id: task for task in tasks}
         retry_ids = self._parallel_sequential_retry_ids(state)
         retained_retry_ids = [
@@ -10092,6 +10768,10 @@ class Orchestrator:
             save_run_state(self.project_root, state)
         if not self._parallel_sequential_retry_ids(state):
             self._commit_planning_baseline_if_needed(tasks)
+            self._refresh_retained_worktree_reconciliation_handoffs(
+                state,
+                tasks,
+            )
         self._normalize_legacy_execution_recovery_tasks(state, tasks)
         if state.status in {"paused", "blocked"}:
             return state
@@ -10803,6 +11483,9 @@ class Orchestrator:
                     tasks,
                     task,
                 )
+                or self._retained_worktree_reconciliation_handoff_matches(
+                    task
+                )
             )
         ):
             self._require_clean_tree_for_task(task)
@@ -10816,7 +11499,7 @@ class Orchestrator:
             self._persist_tasks(tasks)
 
         if (
-            not is_execution_incident_recovery_task(task)
+            not self._is_prebaseline_recovery_task(task)
             and self._ensure_task_verify_baseline(task, state=state)
         ):
             self._persist_tasks(tasks)
@@ -10908,6 +11591,8 @@ class Orchestrator:
         self._clear_task_failure_checkpoint(state, task.task_id)
         self._clear_implementation_ready_marker(state, task)
         self._clear_task_attempt_base_ref(state, task)
+        self._complete_retained_worktree_reconciliation(state, task)
+        self._clear_retained_worktree_owner_record(state, task.task_id)
         task.review_summary = str(gate_result["review"])
         commit_message = task.commit_message or self.config.git.commit_message_template.format(
             task_id=task.task_id,
@@ -11288,11 +11973,19 @@ class Orchestrator:
         state: RunState,
         task_ids: Iterable[str],
     ) -> None:
+        previous = set(self._parallel_sequential_retry_ids(state))
         normalized = list(dict.fromkeys(str(item).strip() for item in task_ids if str(item).strip()))
         if normalized:
             state.resume_context["parallel_sequential_retry_tasks"] = normalized
         else:
             state.resume_context.pop("parallel_sequential_retry_tasks", None)
+        added = [task_id for task_id in normalized if task_id not in previous]
+        if added:
+            self._capture_retained_worktree_ownership(
+                state,
+                added,
+                source="sequential_retry_lane",
+            )
 
     def _persist_parallel_runtime_state(self, state: RunState, tasks: List[TaskSpec]) -> None:
         state.tasks = tasks
@@ -25526,12 +26219,7 @@ class Orchestrator:
         if any(task.status not in ("pending", "done") for task in task_list):
             return
 
-        allowed = {".gitignore", "README.md", "DESIGN.md", "spec.md"}
-        if self._active_spec_file is not None:
-            try:
-                allowed.add(str(self._active_spec_file.relative_to(self.project_root)))
-            except ValueError:
-                pass
+        allowed = self._planning_baseline_allowed_paths()
 
         only_known = True
         has_planning_changes = False
@@ -25651,6 +26339,13 @@ class Orchestrator:
         markers = self._implementation_ready_markers(state)
         markers[task.task_id] = bool(ready)
         state.resume_context["implementation_ready_tasks"] = markers
+        if ready:
+            self._capture_retained_worktree_ownership(
+                state,
+                [task.task_id],
+                source="implementation_ready",
+                replace_existing=True,
+            )
 
     def _clear_implementation_ready_marker(
         self,
