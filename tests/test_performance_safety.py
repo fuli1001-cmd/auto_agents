@@ -1036,7 +1036,9 @@ class EvidencePreflightTests(unittest.TestCase):
                 [".auto-agents/docs/provider_references/image.md"],
             )
 
-    def test_operator_owned_provider_route_is_not_downgraded_to_ready(self) -> None:
+    def test_operator_owned_provider_route_without_input_is_protocol_blocked(
+        self,
+    ) -> None:
         class OperatorInputAdapter:
             def run(self, request):
                 summary = (
@@ -1071,9 +1073,9 @@ class EvidencePreflightTests(unittest.TestCase):
             result = orchestrator._ensure_evidence_preflight(state, task)
 
             self.assertIsNotNone(result)
-            self.assertEqual(result["decision"], "BLOCK")
-            self.assertEqual(task.evidence_preflight["decision"], "BLOCK")
-            self.assertIn("target project", str(result["reason"]))
+            self.assertEqual(result["decision"], "PROTOCOL_BLOCK")
+            self.assertEqual(task.evidence_preflight["decision"], "PROTOCOL_BLOCK")
+            self.assertIn("structured prerequisites", str(result["reason"]))
 
     def test_invalid_provider_mutations_route_to_provider_research(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1138,6 +1140,151 @@ class EvidencePreflightTests(unittest.TestCase):
 
             self.assertEqual(owner, "target_project")
             self.assertEqual(paths, [".auto-agents/config.json"])
+
+    def test_mixed_preflight_mutations_preserve_owner_partitions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            task = TaskSpec(
+                task_id="task-boundary",
+                title="Boundary",
+                description="Prove a configured external boundary.",
+                acceptance=["The configured boundary is exercised."],
+            )
+            mutations = [
+                {
+                    "path": ".auto-agents/config.json",
+                    "reason": "bind an explicit target reset command",
+                    "owner": "target_project",
+                },
+                {
+                    "path": ".auto-agents/state/task_plan.json",
+                    "reason": "publish the generated verification step",
+                    "owner": "plan",
+                },
+                {
+                    "path": ".auto-agents/docs/provider_references/service.md",
+                    "reason": "verify the external service contract",
+                    "owner": "provider_research",
+                },
+            ]
+
+            partitions = (
+                orchestrator._actionable_preflight_upstream_mutation_partitions(
+                    task,
+                    mutations,
+                )
+            )
+            owner, paths = orchestrator._actionable_preflight_upstream_mutations(
+                task,
+                mutations,
+            )
+
+            self.assertEqual(
+                partitions,
+                {
+                    "target_project": [".auto-agents/config.json"],
+                    "plan": [".auto-agents/state/task_plan.json"],
+                    "provider_research": [
+                        ".auto-agents/docs/provider_references/service.md"
+                    ],
+                },
+            )
+            self.assertEqual(owner, "target_project")
+            self.assertEqual(paths, [".auto-agents/config.json"])
+            owner, paths = orchestrator._actionable_preflight_upstream_mutations(
+                task,
+                mutations[1:],
+            )
+            self.assertEqual(owner, "plan")
+            self.assertEqual(paths, [".auto-agents/state/task_plan.json"])
+
+    def test_target_label_does_not_override_earlier_stage_artifact_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            task = orchestrator._load_tasks_from_plan()[0]
+
+            partitions = (
+                orchestrator._actionable_preflight_upstream_mutation_partitions(
+                    task,
+                    [
+                        {
+                            "path": ".auto-agents/state/requirements_trace.json",
+                            "reason": "record an approved persistence choice",
+                            "owner": "target_project",
+                        },
+                        {
+                            "path": ".auto-agents/state/task_plan.json",
+                            "reason": "bind the resulting verification work",
+                            "owner": "plan",
+                        },
+                    ],
+                )
+            )
+
+            self.assertEqual(
+                partitions,
+                {
+                    "clarify": [".auto-agents/state/requirements_trace.json"],
+                    "plan": [".auto-agents/state/task_plan.json"],
+                },
+            )
+
+    def test_mixed_preflight_block_reports_only_target_owned_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            from auto_agents.config import load_run_state
+
+            state = load_run_state(root)
+            task = TaskSpec(
+                task_id="task-boundary",
+                title="Boundary",
+                description="Prove a configured external boundary.",
+                acceptance=["The configured boundary is exercised."],
+            )
+            state.tasks = [task]
+            result = {
+                "decision": "BLOCK",
+                "target_stage": "",
+                "reason": "Several prerequisite artifacts are unresolved.",
+                "checklist": [],
+                "required_inputs": [],
+                "required_mutations": [
+                    {
+                        "path": ".auto-agents/config.json",
+                        "reason": "bind an explicit target reset command",
+                        "owner": "target_project",
+                    },
+                    {
+                        "path": ".auto-agents/state/task_plan.json",
+                        "reason": "publish the generated verification step",
+                        "owner": "plan",
+                    },
+                    {
+                        "path": ".auto-agents/docs/provider_references/service.md",
+                        "reason": "verify the external service contract",
+                        "owner": "provider_research",
+                    },
+                ],
+            }
+
+            routed = orchestrator._route_evidence_preflight(
+                state,
+                [task],
+                task,
+                result,
+            )
+
+            self.assertEqual(routed.status, "blocked")
+            reason = str(routed.active_blocker["reason"])
+            self.assertIn(".auto-agents/config.json", reason)
+            self.assertNotIn(".auto-agents/state/task_plan.json", reason)
+            self.assertNotIn("provider_references/service.md", reason)
 
     def test_generated_verification_config_mutation_routes_to_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1368,6 +1515,24 @@ class EvidencePreflightTests(unittest.TestCase):
             after = orchestrator._evidence_preflight_fingerprint(task)
 
             self.assertNotEqual(before, after)
+
+    def test_preflight_routing_schema_change_invalidates_cached_fingerprint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            task = orchestrator._load_tasks_from_plan()[0]
+            current = orchestrator._evidence_preflight_fingerprint(task)
+
+            with patch(
+                "auto_agents.orchestrator.EVIDENCE_PREFLIGHT_FINGERPRINT_VERSION",
+                7,
+            ):
+                legacy = orchestrator._evidence_preflight_fingerprint(task)
+
+            self.assertNotEqual(current, legacy)
 
     def test_routing_happens_before_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

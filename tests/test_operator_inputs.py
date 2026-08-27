@@ -794,6 +794,112 @@ class OperatorInputStoreTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed["decision"], "WAIT_USER")
 
+    def test_semantic_target_approval_requires_structured_input(self):
+        issue = Orchestrator._evidence_preflight_protocol_issue(
+            {
+                "decision": "ROUTE",
+                "target_stage": "clarify",
+                "reason": "持久化边界尚未确定。",
+                "required_inputs": [],
+                "required_mutations": [
+                    {
+                        "path": ".auto-agents/state/requirements_trace.json",
+                        "reason": "记录结构扩展所需的用户批准持久化决策。",
+                        "owner": "target_project",
+                    },
+                    {
+                        "path": ".auto-agents/state/task_plan.json",
+                        "reason": "重绑后续验证任务。",
+                        "owner": "plan",
+                    },
+                ],
+            }
+        )
+
+        self.assertIn("structured required_inputs", issue)
+        self.assertIn("requirements_trace.json", issue)
+        self.assertNotIn("task_plan.json", issue)
+
+    def test_satisfied_preflight_input_advances_to_next_owner_partition(self):
+        approval = _request(
+            key="persistence.choice",
+            kind="boolean",
+            question="Has the persistence choice been approved?",
+            purpose="Bind the approved persistence boundary.",
+            why_required="Planning depends on the approved boundary.",
+            how_to_obtain=["Confirm the recorded project decision."],
+            recommended_answer="Answer no until the decision is recorded.",
+            validation={},
+            bindings=[],
+            subject_fingerprint="persistence-boundary",
+        )
+
+        class Adapter:
+            def run(self, request):
+                payload = {
+                    "decision": "WAIT_USER",
+                    "target_stage": "",
+                    "reason": "The operator choice is available; update the plan.",
+                    "checklist": ["publish the verification task"],
+                    "required_inputs": [approval.to_dict()],
+                    "required_mutations": [
+                        {
+                            "path": ".auto-agents/state/requirements_trace.json",
+                            "reason": "record the approved persistence boundary",
+                            "owner": "target_project",
+                        },
+                        {
+                            "path": ".auto-agents/state/task_plan.json",
+                            "reason": "bind the approved persistence boundary",
+                            "owner": "plan",
+                        }
+                    ],
+                }
+                summary = "EVIDENCE_PREFLIGHT: " + json.dumps(payload)
+                write_text(request.output_path, summary)
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=summary,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            orchestrator.adapter = Adapter()
+            orchestrator._operator_inputs.save_answer(approval, True)
+            state = load_run_state(project)
+            task = TaskSpec(
+                task_id="task-001",
+                title="Persistence boundary",
+                description="Bind an approved persistence choice into the plan.",
+                acceptance=["The plan publishes the real boundary proof."],
+                required_inputs=[approval.to_dict()],
+            )
+            state.tasks = [task]
+
+            with mock.patch.object(
+                orchestrator,
+                "_task_needs_evidence_preflight",
+                return_value=True,
+            ):
+                result = orchestrator._ensure_evidence_preflight(state, task)
+
+            self.assertEqual(result["decision"], "ROUTE")
+            self.assertEqual(result["target_stage"], "clarify")
+            self.assertEqual(
+                result["actionable_paths"],
+                [".auto-agents/state/requirements_trace.json"],
+            )
+            self.assertEqual(
+                result["actionable_mutations_by_owner"]["plan"],
+                [".auto-agents/state/task_plan.json"],
+            )
+            self.assertEqual(state.pending_input_requests, [])
+            self.assertEqual(task.status, "pending")
+
     def test_preflight_snapshot_sees_untracked_candidate_and_queues_input(self):
         class Adapter:
             def run(self, request):
@@ -954,7 +1060,7 @@ class OperatorInputStoreTests(unittest.TestCase):
                 state.pending_input_requests[0]["key"], "youtube.source_url"
             )
 
-    def test_cached_operator_mutation_is_invalidated_and_recollected(self):
+    def test_cached_semantic_target_mutation_is_invalidated_and_recollected(self):
         class Adapter:
             def __init__(self):
                 self.calls = 0
@@ -1016,10 +1122,12 @@ class OperatorInputStoreTests(unittest.TestCase):
                     "required_inputs": [],
                     "required_mutations": [
                         {
-                            "path": ".auto-agents/config.json",
-                            "reason": "bind the approved external fixture",
+                            "path": ".auto-agents/state/requirements_trace.json",
+                            "reason": (
+                                "Record the persistence choice that requires user "
+                                "approval."
+                            ),
                             "owner": "target_project",
-                            "config_scope": "operator",
                         }
                     ],
                 }

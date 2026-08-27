@@ -311,6 +311,7 @@ class StageOwnershipRouteError(RuntimeError):
 
 VERIFY_BASELINE_SCHEMA_VERSION = 2
 IMPLEMENTATION_SCOPE_POLICY_VERSION = 5
+EVIDENCE_PREFLIGHT_FINGERPRINT_VERSION = 8
 EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT = 2
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
@@ -20006,7 +20007,7 @@ class Orchestrator:
         ]
         effort = self.config.efforts.get("evidence_preflight", "balanced")
         payload = {
-            "version": 7,
+            "version": EVIDENCE_PREFLIGHT_FINGERPRINT_VERSION,
             "task": task_payload,
             "requirements": requirements,
             "head": head_ref(self.project_root),
@@ -20187,42 +20188,29 @@ class Orchestrator:
                     f"{str(parsed.get('reason', '')).strip()} Required operator "
                     "input will be collected interactively one item at a time."
                 ).strip()
+            elif parsed.get("decision") == "WAIT_USER":
+                raw_mutations = parsed.get("required_mutations", [])
+                parsed["decision"] = (
+                    "ROUTE"
+                    if isinstance(raw_mutations, list) and raw_mutations
+                    else "READY"
+                )
+                parsed["target_stage"] = ""
+                parsed["reason"] = (
+                    f"{str(parsed.get('reason', '')).strip()} All structured operator "
+                    "inputs in this preflight result are already satisfied."
+                ).strip()
             required_mutations = parsed.get("required_mutations", [])
             if (
                 parsed.get("decision") != "WAIT_USER"
                 and isinstance(required_mutations, list)
             ):
-                owner_stage, mutation_paths = (
-                    self._actionable_preflight_upstream_mutations(
+                parsed, _owner_stage, _mutation_paths = (
+                    self._normalize_evidence_preflight_mutation_ownership(
                         task,
-                        required_mutations,
+                        parsed,
                     )
                 )
-                if owner_stage:
-                    if owner_stage == "target_project":
-                        parsed["decision"] = "BLOCK"
-                        parsed["target_stage"] = ""
-                        parsed["reason"] = (
-                            f"{parsed['reason']} Required mutation(s) are owned by the "
-                            f"target project: {', '.join(mutation_paths)}. Update the "
-                            "project configuration outside implementation, then rerun "
-                            "the same auto-agents command."
-                        )
-                    else:
-                        parsed["decision"] = "ROUTE"
-                        parsed["target_stage"] = owner_stage
-                        parsed["reason"] = (
-                            f"{parsed['reason']} Required mutation(s) are owned by "
-                            f"{owner_stage}: {', '.join(mutation_paths)}"
-                        )
-                elif parsed.get("decision") == "ROUTE" and required_mutations:
-                    parsed["decision"] = "READY"
-                    parsed["target_stage"] = ""
-                    parsed["reason"] = (
-                        f"{parsed['reason']} All requested upstream mutations already "
-                        "satisfy their bound contracts; remaining mutations are "
-                        "implementation-owned."
-                    )
             self._emit_agent_metrics(
                 stage_key,
                 result,
@@ -20275,7 +20263,142 @@ class Orchestrator:
         return parsed if parsed["decision"] != "READY" else None
 
     @staticmethod
+    def _preflight_mutation_requires_operator_input(
+        mutation: Mapping[str, object],
+        *,
+        result_reason: str = "",
+    ) -> bool:
+        """Identify target mutations that are really unresolved user decisions."""
+
+        owner = str(mutation.get("owner", "")).strip().lower()
+        config_scope = str(
+            mutation.get("config_scope", mutation.get("scope", ""))
+        ).strip().lower()
+        if owner in {"operator", "user", "user_input"}:
+            return True
+        if config_scope == "operator":
+            return True
+        path = Orchestrator._normalize_audit_blocker_path(mutation.get("path", ""))
+        target_owned = owner in {"target", "target_project", "external"} or (
+            not owner and path == ".auto-agents/config.json"
+        )
+        if not target_owned:
+            return False
+        if mutation.get("requires_operator_input") is True or mutation.get(
+            "requires_user_input"
+        ) is True:
+            return True
+
+        chinese_actors = ("用户", "操作者", "操作员", "人工", "项目方", "业务方")
+        chinese_actions = (
+            "批准",
+            "审批",
+            "同意",
+            "授权",
+            "确认",
+            "选择",
+            "决定",
+            "决策",
+            "提供",
+            "输入",
+            "凭证",
+            "密钥",
+            "令牌",
+        )
+
+        def describes_missing_operator_input(value: str) -> bool:
+            text = value.casefold().strip()
+            if not text:
+                return False
+            english_actor = re.search(
+                r"\b(?:user|operator|human|customer|project owner|project team|"
+                r"target owner)\b",
+                text,
+            )
+            english_action = re.search(
+                r"\b(?:approv(?:e|ed|al|ing)|consent(?:ed)?|"
+                r"authori[sz](?:e|ed|ation)|attest(?:ed|ation)?|"
+                r"confirm(?:ed|ation)?|cho(?:ose|ice|sen)|decid(?:e|ed)|"
+                r"decision|select(?:ed|ion)?|provid(?:e|ed)|suppl(?:y|ied)|"
+                r"input|credential|secret|token|permission)\b",
+                text,
+            )
+            english_requirement = re.search(
+                r"\b(?:required|requires?|needed|needs?|missing|absent|awaiting|"
+                r"pending|unverified|must|collect|obtain)\b",
+                text,
+            )
+            if english_actor and english_action and english_requirement:
+                return True
+            if re.search(
+                r"\b(?:provide|choose|select|supply|obtain|approve|authorize)\b"
+                r".{0,48}\b(?:authorized fixture|licensed corpus|credential|"
+                r"secret|api[ _-]?key|access token)\b",
+                text,
+            ):
+                return True
+            if re.search(
+                r"\b(?:approval|consent|authorization|attestation|"
+                r"operator choice|user choice|network approval)\b.{0,48}"
+                r"\b(?:required|needed|missing|absent|pending|unverified)\b",
+                text,
+            ) or re.search(
+                r"\b(?:required|requires?|needs?|missing|awaiting|collect|obtain)\b"
+                r".{0,48}\b(?:approval|consent|authorization|attestation|"
+                r"operator choice|user choice|credential|secret|api[ _-]?key|"
+                r"access token)\b",
+                text,
+            ):
+                return True
+
+            chinese_requirement = any(
+                marker in text
+                for marker in (
+                    "需要",
+                    "所需",
+                    "必须",
+                    "尚未",
+                    "缺少",
+                    "等待",
+                    "待用户",
+                )
+            )
+            if (
+                chinese_requirement
+                and any(actor in text for actor in chinese_actors)
+                and any(action in text for action in chinese_actions)
+            ):
+                return True
+            return any(
+                phrase in text
+                for phrase in (
+                    "需要批准",
+                    "需要审批",
+                    "等待批准",
+                    "等待审批",
+                    "缺少授权",
+                    "提供授权素材",
+                    "选择授权素材",
+                    "提供授权语料",
+                    "选择授权语料",
+                    "提供访问凭证",
+                    "缺少访问凭证",
+                    "提供访问密钥",
+                    "缺少访问密钥",
+                )
+            )
+
+        return any(
+            describes_missing_operator_input(value)
+            for value in (
+                str(mutation.get("reason", "")),
+                str(result_reason),
+            )
+        )
+
+    @classmethod
     def _evidence_preflight_protocol_issue(
+        cls,
         parsed: Dict[str, object],
     ) -> str:
         """Reject operator prerequisites encoded only as terminal mutations."""
@@ -20286,23 +20409,15 @@ class Orchestrator:
         required_mutations = parsed.get("required_mutations", [])
         if not isinstance(required_mutations, list):
             return ""
+        result_reason = str(parsed.get("reason", "")).strip()
         operator_paths: List[str] = []
         for item in required_mutations:
-            if not isinstance(item, dict):
-                continue
-            owner = str(item.get("owner", "")).strip().lower()
-            config_scope = str(
-                item.get("config_scope", item.get("scope", ""))
-            ).strip().lower()
-            operator_owned = owner in {
-                "operator",
-                "user",
-                "user_input",
-            } or (
-                config_scope == "operator"
-                and owner in {"", "target", "target_project", "external"}
-            )
-            if not operator_owned:
+            if not isinstance(item, dict) or not (
+                cls._preflight_mutation_requires_operator_input(
+                    item,
+                    result_reason=result_reason,
+                )
+            ):
                 continue
             path = str(item.get("path", "")).strip()
             if path and path not in operator_paths:
@@ -20352,12 +20467,12 @@ class Orchestrator:
             issue,
         )
 
-    def _actionable_preflight_upstream_mutations(
+    def _actionable_preflight_upstream_mutation_partitions(
         self,
         task: TaskSpec,
         required_mutations: Iterable[object],
-    ) -> Tuple[str, List[str]]:
-        """Return unresolved mutations not owned by implementation."""
+    ) -> Dict[str, List[str]]:
+        """Partition unresolved upstream mutations without collapsing ownership."""
         required_mutations = list(required_mutations)
         trace = load_requirements_trace(self.project_root)
         task_requirement_ids = {
@@ -20411,8 +20526,13 @@ class Orchestrator:
             else {}
         )
 
-        actionable: List[str] = []
-        owners: Set[str] = set()
+        partitions: Dict[str, List[str]] = {}
+
+        def add(owner: str, path: str) -> None:
+            paths = partitions.setdefault(owner, [])
+            if path not in paths:
+                paths.append(path)
+
         for item in required_mutations:
             if not isinstance(item, dict):
                 continue
@@ -20425,21 +20545,31 @@ class Orchestrator:
                     item.get("config_scope", item.get("scope", "")),
                 )
             ).strip().lower()
-            if declared_owner in {
-                "operator",
-                "user",
-                "user_input",
+            config_scope = str(
+                item.get("config_scope", item.get("scope", ""))
+            ).strip().lower()
+            target_owner_aliases = {
                 "target",
                 "target_project",
                 "external",
-            }:
-                owners.add("target_project")
-                actionable.append(path)
+            }
+            explicitly_operator_owned = declared_owner in {
+                "operator",
+                "user",
+                "user_input",
+            } or (
+                config_scope == "operator"
+                and (not declared_owner or declared_owner in target_owner_aliases)
+            )
+            if explicitly_operator_owned:
+                add("target_project", path)
                 continue
+            if declared_owner in target_owner_aliases:
+                path_owner = self._forbidden_pattern_owner_stage({"path": path})
+                if path == ".auto-agents/config.json" or path_owner == "implement":
+                    add("target_project", path)
+                    continue
             if path == ".auto-agents/config.json":
-                config_scope = str(
-                    item.get("config_scope", item.get("scope", ""))
-                ).strip().lower()
                 explicitly_generated = config_scope in {
                     "generated_verification",
                     "generated_verification_steps",
@@ -20457,12 +20587,12 @@ class Orchestrator:
                     and persistence_change_strategy(task.persistence_change)
                     == "none"
                 )
-                owners.add(
+                add(
                     "plan"
                     if generated_verification_metadata
-                    else "target_project"
+                    else "target_project",
+                    path,
                 )
-                actionable.append(path)
                 continue
             owner = self._forbidden_pattern_owner_stage({"path": path})
             if owner == "provider_research":
@@ -20481,16 +20611,100 @@ class Orchestrator:
                 owner in STAGE_ORDER
                 and STAGE_ORDER.index(owner) < STAGE_ORDER.index("implement")
             ):
-                owners.add(owner)
-                actionable.append(path)
+                add(owner, path)
 
-        if not actionable:
+        return partitions
+
+    def _actionable_preflight_upstream_mutations(
+        self,
+        task: TaskSpec,
+        required_mutations: Iterable[object],
+    ) -> Tuple[str, List[str]]:
+        """Return the next unresolved owner partition and only that owner's paths."""
+
+        partitions = self._actionable_preflight_upstream_mutation_partitions(
+            task,
+            required_mutations,
+        )
+        if not partitions:
             return "", []
-        if "target_project" in owners:
-            return "target_project", list(dict.fromkeys(actionable))
-        if len(owners) == 1:
-            return next(iter(owners)), list(dict.fromkeys(actionable))
-        return "plan", list(dict.fromkeys(actionable))
+        if "target_project" in partitions:
+            return "target_project", list(partitions["target_project"])
+        owner = min(partitions, key=STAGE_ORDER.index)
+        return owner, list(partitions[owner])
+
+    def _normalize_evidence_preflight_mutation_ownership(
+        self,
+        task: TaskSpec,
+        result: Dict[str, object],
+    ) -> Tuple[Dict[str, object], str, List[str]]:
+        """Normalize one owner partition without relabeling the remaining paths."""
+
+        normalized = dict(result)
+        required_mutations = normalized.get("required_mutations", [])
+        if not isinstance(required_mutations, list):
+            return normalized, "", []
+        partitions = self._actionable_preflight_upstream_mutation_partitions(
+            task,
+            required_mutations,
+        )
+        normalized["actionable_mutations_by_owner"] = {
+            owner: list(paths) for owner, paths in partitions.items()
+        }
+        if "target_project" in partitions:
+            owner_stage = "target_project"
+        elif partitions:
+            owner_stage = min(partitions, key=STAGE_ORDER.index)
+        else:
+            owner_stage = ""
+        mutation_paths = list(partitions.get(owner_stage, []))
+        previous_owner = str(normalized.get("actionable_owner", "")).strip()
+        raw_previous_paths = normalized.get("actionable_paths", [])
+        previous_paths = (
+            [str(path) for path in raw_previous_paths if str(path).strip()]
+            if isinstance(raw_previous_paths, list)
+            else []
+        )
+
+        if owner_stage:
+            normalized["actionable_owner"] = owner_stage
+            normalized["actionable_paths"] = mutation_paths
+            if owner_stage == "target_project":
+                normalized["decision"] = "BLOCK"
+                normalized["target_stage"] = ""
+                disposition = (
+                    "Required mutation(s) are owned by the target project: "
+                    f"{', '.join(mutation_paths)}. Update the project configuration "
+                    "outside implementation, then rerun the same auto-agents command."
+                )
+            else:
+                normalized["decision"] = "ROUTE"
+                normalized["target_stage"] = owner_stage
+                disposition = (
+                    f"Required mutation(s) are owned by {owner_stage}: "
+                    f"{', '.join(mutation_paths)}"
+                )
+            if previous_owner != owner_stage or previous_paths != mutation_paths:
+                normalized["reason"] = (
+                    f"{str(normalized.get('reason', '')).strip()} {disposition}"
+                ).strip()
+            return normalized, owner_stage, mutation_paths
+
+        normalized.pop("actionable_owner", None)
+        normalized.pop("actionable_paths", None)
+        if (
+            required_mutations
+            and str(normalized.get("decision", "")).strip().upper()
+            in {"BLOCK", "ROUTE"}
+        ):
+            normalized["decision"] = "READY"
+            normalized["target_stage"] = ""
+            normalized["reason"] = (
+                f"{str(normalized.get('reason', '')).strip()} All requested upstream "
+                "mutations already satisfy their bound contracts; remaining mutations "
+                "are implementation-owned."
+            ).strip()
+        return normalized, "", []
 
     def _build_evidence_preflight_prompt(self, task: TaskSpec) -> str:
         requirement_context = format_requirement_context(
@@ -20550,6 +20764,7 @@ class Orchestrator:
                 "The operator-input summary below is authoritative for presence and validation. Do not ask again for a valid key already listed. A later attestation may bind to an earlier answer with validation.subject fields such as source_url_input_key.",
                 "Project configuration at .auto-agents/config.json is normally target-project-owned. The gates.steps graph generated from task_plan.json is plan-owned when gates.allow_agent_updates is enabled; route missing generated verification or artifact publication metadata to plan. If config.json must change, list it in required_mutations and set config_scope to generated_verification or operator.",
                 "Never use an operator-scoped required_mutation as a substitute for required_inputs. If an operator must supply or approve anything, required_inputs must describe it even when provider-research mutations are also needed.",
+                "A mixed-owner mutation batch is valid. Keep each mutation's actual owner; do not relabel plan or provider-research artifacts as target_project merely because a target-project prerequisite is also present. The orchestrator resolves owner partitions sequentially.",
                 "Always list required_mutations as objects with exact project-relative path and reason. Provider references under .auto-agents are read-only implementation inputs owned by provider_research.",
                 "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
                 "For every required mutation, set owner to implementation, plan, provider_research, or target_project. Credentials, authorized fixtures, pinned operator artifacts, and network policy are target_project-owned and must never be reported READY while absent.",
@@ -20667,25 +20882,31 @@ class Orchestrator:
                 len(result.get("required_inputs", []) or []),
             )
             return state
-        required_mutations = result.get("required_mutations", []) or []
-        route_paths = sorted(
-            {
-                self._normalize_audit_blocker_path(item.get("path", ""))
-                for item in required_mutations
-                if isinstance(item, dict)
-                and self._normalize_audit_blocker_path(item.get("path", ""))
-            }
+        result, owner_stage, mutation_paths = (
+            self._normalize_evidence_preflight_mutation_ownership(
+                task,
+                result,
+            )
         )
+        decision = str(result.get("decision", "")).strip().upper()
+        route_paths = sorted(mutation_paths)
+        if decision == "READY":
+            task.evidence_preflight = {}
+            route_history = state.resume_context.get("evidence_preflight_routes", {})
+            if isinstance(route_history, dict):
+                route_history.pop(task.task_id, None)
+                if route_history:
+                    state.resume_context["evidence_preflight_routes"] = route_history
+                else:
+                    state.resume_context.pop("evidence_preflight_routes", None)
+            self._persist_tasks(tasks)
+            save_run_state(self.project_root, state)
+            return state
         if (
-            decision in {"BLOCK", "ROUTE"}
+            decision == "ROUTE"
+            and owner_stage == "plan"
             and ".auto-agents/config.json" in route_paths
         ):
-            owner_stage, _mutation_paths = (
-                self._actionable_preflight_upstream_mutations(
-                    task,
-                    required_mutations,
-                )
-            )
             failure_ids = self._latest_artifact_publication_failure_ids(task)
             publication_metadata_repair = (
                 self._artifact_publication_metadata_repair(
@@ -20705,56 +20926,19 @@ class Orchestrator:
                     publication_metadata_repair,
                 ):
                     return state
-            if decision == "BLOCK" and owner_stage == "plan":
-                decision = "ROUTE"
-                result = {
-                    **result,
-                    "decision": "ROUTE",
-                    "target_stage": "plan",
-                    "reason": (
-                        "Generated verification configuration is plan-owned. "
-                        + str(result.get("reason", "")).strip()
-                    ).strip(),
-                }
-                task.evidence_preflight = {}
-        if decision == "ROUTE" and required_mutations:
-            owner_stage, mutation_paths = (
-                self._actionable_preflight_upstream_mutations(
-                    task,
-                    required_mutations,
-                )
-            )
-            if owner_stage == "target_project":
-                decision = "BLOCK"
-                route_paths = sorted(mutation_paths)
-                result = {
-                    **result,
-                    "decision": "BLOCK",
-                    "target_stage": "",
-                    "reason": (
-                        f"{str(result.get('reason', '')).strip()} Required "
-                        "mutation(s) are target-project-owned: "
-                        f"{', '.join(route_paths)}"
-                    ).strip(),
-                }
-            elif owner_stage:
-                route_paths = sorted(mutation_paths)
-                result = {
-                    **result,
-                    "target_stage": owner_stage,
-                }
-            else:
-                task.evidence_preflight = {}
-                route_history = state.resume_context.get(
-                    "evidence_preflight_routes",
-                    {},
-                )
-                if isinstance(route_history, dict):
-                    route_history.pop(task.task_id, None)
-                self._persist_tasks(tasks)
-                save_run_state(self.project_root, state)
-                return state
         if decision == "BLOCK":
+            if owner_stage != "target_project" or not route_paths:
+                self._invalidate_evidence_preflight_result(
+                    state,
+                    tasks,
+                    task,
+                    issue=(
+                        "Evidence preflight BLOCK has no actionable target-project "
+                        "mutation and cannot be assigned to target_project."
+                    ),
+                    source="route",
+                )
+                return state
             task.status = "pending"
             self._persist_tasks(tasks)
             reason = (
