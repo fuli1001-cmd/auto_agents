@@ -4760,7 +4760,7 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertIn("archive-aware next unused requirement ID as REQ-020", prompt)
             self.assertIn(
-                "active/deferred IDs already conflict with archived delivered proof contracts: REQ-004",
+                "requirement IDs conflict with archived delivered proof contracts: REQ-004",
                 prompt,
             )
 

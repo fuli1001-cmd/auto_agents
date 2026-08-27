@@ -21,6 +21,7 @@ from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import (
+    requirement_contract_sha256,
     stamp_requirement_contract_hashes,
     validate_requirements_trace_payload,
 )
@@ -174,6 +175,120 @@ class ClarifyResumeTests(unittest.TestCase):
             "sha256:stale",
         )
 
+    def test_contract_recovery_self_repair_reopens_fresh_clarify_attempts(self):
+        project_root, _spec_file = self._setup_project()
+        state = load_run_state(project_root)
+        state.status = "blocked"
+        state.current_stage = "clarify"
+        state.agent_attempts["requirements_audit_recovery"] = 3
+        state.agent_attempts["clarify-generate"] = 2
+        state.active_blocker = {
+            "owner": "auto_agents",
+            "category": "immutable_requirement_recovery_deadlock",
+            "status": "blocked",
+        }
+        save_run_state(project_root, state)
+
+        state = Orchestrator(project_root).mark_self_repair_applied(
+            "repair-contract-recovery"
+        )
+        resumed = Orchestrator(project_root)._resume_blocked_run(state)
+
+        self.assertTrue(resumed)
+        self.assertEqual(state.status, "pending")
+        self.assertEqual(state.current_stage, "clarify")
+        self.assertEqual(state.rejected_stage, "clarify")
+        self.assertNotIn("requirements_audit_recovery", state.agent_attempts)
+        self.assertNotIn("clarify-generate", state.agent_attempts)
+        self.assertIn("archive-authoritative", state.rejection_reason)
+        self.assertEqual(
+            state.active_blocker["requirements_recovery_epoch_reset_commit"],
+            "repair-contract-recovery",
+        )
+
+    def test_installed_engine_upgrade_reopens_immutable_contract_recovery_once(self):
+        project_root, _spec_file = self._setup_project()
+        archived = self._requirement()
+        corrupted = self._requirement()
+        corrupted.update(
+            {
+                "text": "Drifted deterministic output contract.",
+                "status": "superseded",
+                "superseded_by": ["REQ-002"],
+            }
+        )
+        replacement = self._requirement()
+        replacement.update(
+            {
+                "id": "REQ-002",
+                "text": "Provide deterministic replacement output.",
+                "supersedes": ["REQ-001"],
+            }
+        )
+        trace, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [corrupted, replacement]}
+        )
+        write_json(requirements_trace_path(project_root), trace)
+        write_json(
+            project_root
+            / ".auto-agents"
+            / "history"
+            / "task_plans"
+            / "archived-run.json",
+            {
+                "tasks": [
+                    {
+                        "task_id": "completed-task",
+                        "status": "done",
+                        "requirement_ids": ["REQ-001"],
+                        "requirement_proofs": [
+                            {
+                                "requirement_id": "REQ-001",
+                                "requirement_contract_sha256": (
+                                    requirement_contract_sha256(archived)
+                                ),
+                                "status": "verified",
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+        state = load_run_state(project_root)
+        state.status = "blocked"
+        state.current_stage = "clarify"
+        state.agent_attempts["clarify-generate"] = 2
+        state.active_blocker = {
+            "owner": "auto_agents",
+            "category": "immutable_requirement_recovery_deadlock",
+            "status": "blocked",
+        }
+        orchestrator = Orchestrator(project_root)
+
+        with patch.object(
+            orchestrator,
+            "_installed_engine_revision",
+            return_value="engine-contract-recovery",
+        ):
+            changed = orchestrator._normalize_installed_requirement_namespace_repair(
+                state
+            )
+            changed_again = (
+                orchestrator._normalize_installed_requirement_namespace_repair(state)
+            )
+
+        self.assertTrue(changed)
+        self.assertFalse(changed_again)
+        self.assertEqual(state.status, "pending")
+        self.assertNotIn("clarify-generate", state.agent_attempts)
+        self.assertIn("REQ-001", state.rejection_reason)
+        self.assertEqual(
+            state.resume_context[Orchestrator.INSTALLED_ENGINE_RECOVERY_CONTEXT][
+                "immutable_requirement_recovery_deadlock"
+            ],
+            "engine-contract-recovery",
+        )
+
     def test_clarify_validation_does_not_persist_hashes_before_all_checks_pass(self):
         project_root, spec_file = self._setup_project()
         orchestrator = Orchestrator(project_root)
@@ -265,18 +380,21 @@ class ClarifyResumeTests(unittest.TestCase):
             ).exists()
         )
 
-    def test_clarify_generate_retry_amends_reciprocal_replacement_candidate(self):
+    def test_clarify_retry_preserves_authoritative_contract_recovery_candidate(self):
         project_root, spec_file = self._setup_project()
         orchestrator = Orchestrator(project_root)
         state = load_run_state(project_root)
         trace_path = requirements_trace_path(project_root)
 
-        previous, _ = stamp_requirement_contract_hashes(
-            {"version": 1, "requirements": [self._requirement()]}
+        archived = self._requirement()
+        corrupted = self._requirement()
+        corrupted.update(
+            {
+                "text": "Drifted deterministic output contract.",
+                "status": "superseded",
+                "superseded_by": ["REQ-002"],
+            }
         )
-        predecessor = json.loads(json.dumps(previous["requirements"][0]))
-        predecessor["status"] = "superseded"
-        predecessor["superseded_by"] = ["REQ-002"]
         replacement = self._requirement()
         replacement.update(
             {
@@ -285,6 +403,12 @@ class ClarifyResumeTests(unittest.TestCase):
                 "supersedes": ["REQ-001"],
             }
         )
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [corrupted, replacement]}
+        )
+        predecessor = json.loads(json.dumps(archived))
+        predecessor["status"] = "superseded"
+        predecessor["superseded_by"] = ["REQ-002"]
         candidate, _ = stamp_requirement_contract_hashes(
             {"version": 1, "requirements": [predecessor, replacement]}
         )
@@ -297,6 +421,15 @@ class ClarifyResumeTests(unittest.TestCase):
                 "task_id": "completed-task",
                 "status": "done",
                 "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    {
+                        "requirement_id": "REQ-001",
+                        "requirement_contract_sha256": requirement_contract_sha256(
+                            archived
+                        ),
+                        "status": "verified",
+                    }
+                ],
             }
         ]
 

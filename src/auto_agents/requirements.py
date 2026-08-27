@@ -813,6 +813,87 @@ def validate_requirements_trace_payload(
     return errors
 
 
+def _verified_contract_hashes_by_requirement(
+    historical_tasks: Iterable[dict],
+) -> Dict[str, set[str]]:
+    """Collect proof-bound contract identities from archived verified work."""
+    hashes: Dict[str, set[str]] = {}
+    for task in historical_tasks:
+        if not isinstance(task, dict) or str(task.get("status", "")).strip() != "done":
+            continue
+        raw_proofs = task.get("requirement_proofs", [])
+        if not isinstance(raw_proofs, list):
+            continue
+        for proof in raw_proofs:
+            if (
+                not isinstance(proof, dict)
+                or str(proof.get("status", "")).strip() != "verified"
+            ):
+                continue
+            req_id = str(proof.get("requirement_id", "")).strip()
+            contract_hash = str(
+                proof.get("requirement_contract_sha256", "")
+            ).strip()
+            if req_id and contract_hash:
+                hashes.setdefault(req_id, set()).add(contract_hash)
+    return hashes
+
+
+def _has_reciprocal_unused_replacements(
+    req_id: str,
+    before: dict,
+    after: dict,
+    previous: Dict[str, dict],
+    current: Dict[str, dict],
+    proven_ids: set[str],
+    *,
+    require_retained_links: bool = False,
+) -> bool:
+    """Validate the replacement topology required for delivered-ID recovery."""
+    raw_replacements = after.get("superseded_by", [])
+    if not isinstance(raw_replacements, list) or not raw_replacements:
+        return False
+    replacement_ids = [
+        str(value).strip()
+        for value in raw_replacements
+        if isinstance(value, str) and str(value).strip()
+    ]
+    if len(replacement_ids) != len(raw_replacements):
+        return False
+    prior_replacements = {
+        str(value).strip()
+        for value in before.get("superseded_by", []) or []
+        if isinstance(value, str) and str(value).strip()
+    }
+    if require_retained_links and set(replacement_ids) != prior_replacements:
+        return False
+    for replacement_id in replacement_ids:
+        replacement = current.get(replacement_id)
+        if (
+            replacement_id == req_id
+            or (
+                replacement_id in proven_ids
+                and replacement_id not in prior_replacements
+            )
+            or replacement is None
+            or str(replacement.get("status", "active")).strip()
+            not in {"active", "deferred"}
+            or req_id
+            not in {
+                str(value).strip()
+                for value in replacement.get("supersedes", []) or []
+                if isinstance(value, str) and str(value).strip()
+            }
+        ):
+            return False
+        # A replacement retained from an earlier quarantine pass is valid.
+        # A newly linked replacement must itself be new in this transition;
+        # otherwise clarify could repurpose an unrelated existing requirement.
+        if replacement_id not in prior_replacements and replacement_id in previous:
+            return False
+    return True
+
+
 def validate_requirement_contract_transitions(
     previous_payload: object,
     current_payload: object,
@@ -834,6 +915,9 @@ def validate_requirement_contract_transitions(
         task for task in historical_tasks if isinstance(task, dict)
     ]
     proven_ids = delivered_requirement_ids(historical_task_list)
+    verified_hashes = _verified_contract_hashes_by_requirement(
+        historical_task_list
+    )
 
     errors: List[str] = []
     for req_id in sorted(set(current) - set(previous)):
@@ -856,7 +940,28 @@ def validate_requirement_contract_transitions(
             errors.append(f"superseded requirement {req_id} cannot be reactivated under the same ID")
         before_hash = requirement_contract_sha256(before)
         after_hash = requirement_contract_sha256(after)
-        if req_id in proven_ids and before_hash != after_hash:
+        archived_hashes = verified_hashes.get(req_id, set())
+        repairs_corrupted_archive = bool(
+            len(archived_hashes) == 1
+            and before_hash not in archived_hashes
+            and after_hash in archived_hashes
+            and before_status == "superseded"
+            and after_status == "superseded"
+            and _has_reciprocal_unused_replacements(
+                req_id,
+                before,
+                after,
+                previous,
+                current,
+                proven_ids,
+                require_retained_links=True,
+            )
+        )
+        if (
+            req_id in proven_ids
+            and before_hash != after_hash
+            and not repairs_corrupted_archive
+        ):
             errors.append(
                 f"requirement contract drift for {req_id}: delivered requirement IDs are immutable; "
                 "restore the previous contract, mark it superseded with reciprocal supersession links, "
@@ -870,11 +975,45 @@ def validate_requirement_contract_transitions(
         current_payload,
         historical_task_list,
     ):
+        before = previous.get(req_id)
+        after = current.get(req_id)
+        archived_hashes = verified_hashes.get(req_id, set())
+        if len(archived_hashes) > 1:
+            errors.append(
+                f"requirement contract recovery for {req_id} is ambiguous: archived "
+                "verified proofs disagree on the delivered contract hash; do not "
+                "choose a historical hash automatically"
+            )
+            continue
+        # Preserve the existing two-pass namespace recovery. The first pass may
+        # quarantine an active collided contract without rewriting it. A later
+        # pass must restore the unique verified archived identity while keeping
+        # the reciprocal replacement.
+        quarantines_unchanged_collision = bool(
+            before is not None
+            and after is not None
+            and str(before.get("status", "active")).strip() != "superseded"
+            and str(after.get("status", "active")).strip() == "superseded"
+            and requirement_contract_sha256(before)
+            == requirement_contract_sha256(after)
+            and _has_reciprocal_unused_replacements(
+                req_id,
+                before,
+                after,
+                previous,
+                current,
+                proven_ids,
+            )
+        )
+        if quarantines_unchanged_collision:
+            continue
         errors.append(
-            f"requirement ID namespace collision for {req_id}: the active contract "
-            "conflicts with an archived delivered proof using the same ID; preserve "
-            "the current entry as superseded with reciprocal links and append its "
-            "replacement under the archive-aware next unused REQ ID"
+            f"requirement archived-contract mismatch for {req_id}: the current "
+            "proof-bearing contract conflicts with archived delivered proof. If the "
+            "entry is active, preserve it as superseded with reciprocal links and "
+            "append its replacement under the archive-aware next unused REQ ID. If "
+            "it is already superseded, restore the unique verified archived contract "
+            "while retaining those lifecycle links"
         )
     return errors
 
@@ -1050,7 +1189,7 @@ def historical_requirement_contract_collision_ids(
     trace_payload: object,
     historical_tasks: Iterable[dict],
 ) -> List[str]:
-    """Find active IDs whose contract conflicts with an archived proof."""
+    """Find IDs whose contract conflicts with an archived delivered proof."""
     if not isinstance(trace_payload, dict):
         return []
     proofs_by_requirement: Dict[str, List[dict]] = {}
@@ -1063,14 +1202,15 @@ def historical_requirement_contract_collision_ids(
         for proof in raw_proofs:
             if not isinstance(proof, dict):
                 continue
+            proof_status = str(proof.get("status", "")).strip()
+            if proof_status and proof_status != "verified":
+                continue
             req_id = str(proof.get("requirement_id", "")).strip()
             if req_id:
                 proofs_by_requirement.setdefault(req_id, []).append(proof)
 
     collisions = []
     for requirement in requirement_records(trace_payload):
-        if str(requirement.get("status", "active")).strip() == "superseded":
-            continue
         req_id = str(requirement.get("id", "")).strip()
         expected_hash = requirement_contract_sha256(requirement)
         oracles = [

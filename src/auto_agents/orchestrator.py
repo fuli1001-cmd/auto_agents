@@ -407,6 +407,12 @@ class Orchestrator:
     RECOVERY_LOOP_REPEAT_THRESHOLD = 2
     FRONTEND_CONTRACT_RECOVERY_CONTEXT = "frontend_design_contract_recovery"
     INSTALLED_ENGINE_RECOVERY_CONTEXT = "installed_engine_recovery_revisions"
+    REQUIREMENT_CONTRACT_RECOVERY_CATEGORIES = frozenset(
+        {
+            "requirements_recovery_namespace_collision",
+            "immutable_requirement_recovery_deadlock",
+        }
+    )
     RECOVERY_STOP_OWNERS = frozenset(
         {
             "external_provider",
@@ -869,7 +875,7 @@ class Orchestrator:
         self,
         state: RunState,
     ) -> bool:
-        """Resume a namespace repair supplied by an externally upgraded engine.
+        """Resume a requirement-contract repair from an externally upgraded engine.
 
         Automatic self-repair marks its commit before resuming.  A user may instead
         update auto_agents out of band and rerun the original command.  In that
@@ -881,11 +887,11 @@ class Orchestrator:
             if isinstance(state.active_blocker, dict)
             else {}
         )
+        category = str(blocker.get("category", "")).strip()
         if (
             state.status != "blocked"
             or str(blocker.get("owner", "")).strip() != "auto_agents"
-            or str(blocker.get("category", "")).strip()
-            != "requirements_recovery_namespace_collision"
+            or category not in self.REQUIREMENT_CONTRACT_RECOVERY_CATEGORIES
         ):
             return False
 
@@ -896,10 +902,7 @@ class Orchestrator:
         )
         if not isinstance(recovery_revisions, dict):
             recovery_revisions = {}
-        if (
-            str(recovery_revisions.get("requirements_recovery_namespace_collision", ""))
-            == revision
-        ):
+        if str(recovery_revisions.get(category, "")) == revision:
             return False
 
         trace = load_requirements_trace(self.project_root, normalize=False)
@@ -918,20 +921,23 @@ class Orchestrator:
             trace,
             historical_tasks=historical_tasks,
         )
-        recovery_revisions["requirements_recovery_namespace_collision"] = revision
+        recovery_revisions[category] = revision
         state.resume_context[self.INSTALLED_ENGINE_RECOVERY_CONTEXT] = (
             recovery_revisions
         )
         state.agent_attempts.pop("requirements_audit_recovery", None)
+        state.agent_attempts.pop("clarify-generate", None)
         self._rewind_state_from_stage(state, "clarify")
         state.rejected_stage = "clarify"
         state.rejection_reason = (
-            "The installed auto_agents engine now has archive-aware requirement "
-            "namespace recovery. Recover forward from clarify: preserve collided "
-            f"delivered IDs {', '.join(collisions)} as superseded with reciprocal "
-            "links, allocate replacements starting at the archive-aware next unused "
-            f"ID {next_requirement_id}, and do not edit or delete archived tasks or "
-            "proofs."
+            "The installed auto_agents engine now has archive-authoritative "
+            "requirement contract recovery. Recover forward from clarify for "
+            f"collided delivered IDs {', '.join(collisions)}: quarantine active "
+            "collisions without rewriting their proof-bearing fields, restore any "
+            "already-superseded delivered entry only to the unique hash agreed by "
+            "verified archived proofs, retain reciprocal replacement links, and "
+            "allocate new replacements starting at the archive-aware next unused "
+            f"ID {next_requirement_id}. Do not edit or delete archived tasks or proofs."
         )
         blocker.update(
             {
@@ -945,7 +951,7 @@ class Orchestrator:
         state.active_blocker = blocker
         state.last_error = ""
         self.logger.info(
-            "[self-repair] resumed externally upgraded requirement namespace "
+            "[self-repair] resumed externally upgraded requirement contract "
             "repair revision=%s collisions=%s next=%s",
             revision.split(":", 1)[0],
             ",".join(collisions),
@@ -7273,18 +7279,21 @@ class Orchestrator:
         if reconciled_checkpoints:
             blocker["reconciled_attempt_checkpoints"] = reconciled_checkpoints
 
-        if str(blocker.get("category", "")).strip() == (
-            "requirements_recovery_namespace_collision"
+        if (
+            str(blocker.get("category", "")).strip()
+            in self.REQUIREMENT_CONTRACT_RECOVERY_CATEGORIES
         ):
             state.agent_attempts.pop("requirements_audit_recovery", None)
+            state.agent_attempts.pop("clarify-generate", None)
             self._rewind_state_from_stage(state, "clarify")
             state.rejected_stage = "clarify"
             state.rejection_reason = (
-                "auto_agents repaired the permanent requirement-ID namespace. "
-                "Recover forward from clarify: preserve every collided delivered ID "
-                "as superseded with reciprocal links, allocate replacements from the "
-                "archive-aware next unused REQ ID shown in the clarify prompt, and do "
-                "not edit or delete archived tasks or proofs."
+                "auto_agents repaired archive-authoritative delivered-requirement "
+                "recovery. Recover forward from clarify: quarantine active collisions "
+                "without rewriting proof-bearing fields; restore already-superseded "
+                "delivered entries only to the unique hashes agreed by verified "
+                "archived proofs; retain reciprocal replacement links; and do not "
+                "edit or delete archived tasks or proofs."
             )
             blocker["requirements_recovery_epoch_reset_commit"] = commit_sha
 
@@ -21013,12 +21022,16 @@ class Orchestrator:
                     ),
                     *(
                         [
-                            "The following active/deferred IDs already conflict with archived "
-                            "delivered proof contracts: "
+                            "The following requirement IDs conflict with archived delivered "
+                            "proof contracts: "
                             + ", ".join(historical_requirement_collisions)
-                            + ". Preserve each collided entry as status='superseded' with reciprocal "
-                            "links, and append its active replacement at or above the archive-aware "
-                            "next unused ID. Do not delete or rewrite archived tasks or proofs."
+                            + ". For an active/deferred collision, preserve its proof-bearing "
+                            "fields, mark it status='superseded' with reciprocal links, and append "
+                            "its active replacement at or above the archive-aware next unused ID. "
+                            "For an already-superseded collision, restore its proof-bearing fields "
+                            "only to the unique contract hash agreed by verified archived proofs "
+                            "while retaining its lifecycle links; never choose among disagreeing "
+                            "archived hashes. Do not delete or rewrite archived tasks or proofs."
                         ]
                         if historical_requirement_collisions
                         else []

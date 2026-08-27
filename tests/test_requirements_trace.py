@@ -289,7 +289,6 @@ class RequirementsTraceTests(unittest.TestCase):
                 ],
             }
         ]
-
         errors = validate_requirement_contract_transitions(
             previous,
             current,
@@ -353,10 +352,245 @@ class RequirementsTraceTests(unittest.TestCase):
         )
         self.assertTrue(
             any(
-                "active contract conflicts with an archived delivered proof" in error
+                "current proof-bearing contract conflicts with archived delivered proof"
+                in error
                 for error in errors
             )
         )
+
+    def test_corrupted_delivered_contract_recovers_over_two_clarify_transitions(self) -> None:
+        archived_requirement = _requirement(text="Delivered historical behavior.")
+        corrupted_requirement = _requirement(text="Drifted current behavior.")
+        initial, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [corrupted_requirement]}
+        )
+        quarantined_old = _requirement(
+            text="Drifted current behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        replacement = _requirement(
+            id="REQ-002",
+            text="Current replacement behavior.",
+            supersedes=["REQ-001"],
+        )
+        quarantined, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [quarantined_old, replacement]}
+        )
+        restored_old = _requirement(
+            text="Delivered historical behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        restored, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [restored_old, replacement]}
+        )
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            archived_requirement
+                        )
+                    )
+                ],
+            }
+        ]
+        later_historical = [
+            *historical,
+            {
+                "task_id": "task-replacement",
+                "status": "done",
+                "requirement_ids": ["REQ-002"],
+            },
+        ]
+
+        self.assertEqual(
+            validate_requirement_contract_transitions(
+                initial,
+                quarantined,
+                historical_tasks=historical,
+            ),
+            [],
+        )
+        self.assertEqual(
+            historical_requirement_contract_collision_ids(
+                quarantined,
+                historical,
+            ),
+            ["REQ-001"],
+        )
+        unchanged_errors = validate_requirement_contract_transitions(
+            quarantined,
+            json.loads(json.dumps(quarantined)),
+            historical_tasks=later_historical,
+        )
+        self.assertTrue(
+            any("archived-contract mismatch" in error for error in unchanged_errors)
+        )
+        self.assertEqual(
+            validate_requirement_contract_transitions(
+                quarantined,
+                restored,
+                historical_tasks=later_historical,
+            ),
+            [],
+        )
+        self.assertEqual(
+            historical_requirement_contract_collision_ids(
+                restored,
+                later_historical,
+            ),
+            [],
+        )
+
+    def test_corrupted_contract_recovery_rejects_ambiguous_verified_hashes(self) -> None:
+        first_archived = _requirement(text="First archived behavior.")
+        second_archived = _requirement(text="Second archived behavior.")
+        corrupted_old = _requirement(
+            text="Drifted current behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        replacement = _requirement(
+            id="REQ-002",
+            text="Current replacement behavior.",
+            supersedes=["REQ-001"],
+        )
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [corrupted_old, replacement]}
+        )
+        restored_old = _requirement(
+            text="First archived behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        current, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [restored_old, replacement]}
+        )
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            first_archived
+                        )
+                    ),
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            second_archived
+                        )
+                    ),
+                ],
+            }
+        ]
+
+        errors = validate_requirement_contract_transitions(
+            previous,
+            current,
+            historical_tasks=historical,
+        )
+
+        self.assertTrue(any("contract drift" in error for error in errors))
+        self.assertTrue(any("ambiguous" in error for error in errors))
+
+    def test_unverified_archived_hash_cannot_authorize_contract_recovery(self) -> None:
+        archived_requirement = _requirement(text="Unverified historical behavior.")
+        corrupted_old = _requirement(
+            text="Drifted current behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        replacement = _requirement(
+            id="REQ-002",
+            text="Current replacement behavior.",
+            supersedes=["REQ-001"],
+        )
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [corrupted_old, replacement]}
+        )
+        restored_old = _requirement(
+            text="Unverified historical behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        current, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [restored_old, replacement]}
+        )
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            archived_requirement
+                        ),
+                        status="planned",
+                    )
+                ],
+            }
+        ]
+
+        errors = validate_requirement_contract_transitions(
+            previous,
+            current,
+            historical_tasks=historical,
+        )
+
+        self.assertTrue(any("contract drift" in error for error in errors))
+
+    def test_corrupted_contract_recovery_requires_reciprocal_replacement(self) -> None:
+        archived_requirement = _requirement(text="Delivered historical behavior.")
+        corrupted_old = _requirement(
+            text="Drifted current behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        replacement = _requirement(
+            id="REQ-002",
+            text="Current replacement behavior.",
+        )
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [corrupted_old, replacement]}
+        )
+        restored_old = _requirement(
+            text="Delivered historical behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        current, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [restored_old, replacement]}
+        )
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            archived_requirement
+                        )
+                    )
+                ],
+            }
+        ]
+
+        errors = validate_requirement_contract_transitions(
+            previous,
+            current,
+            historical_tasks=historical,
+        )
+
+        self.assertTrue(any("contract drift" in error for error in errors))
 
     def test_legacy_oracle_drift_also_marks_historical_id_collision(self) -> None:
         current = {
