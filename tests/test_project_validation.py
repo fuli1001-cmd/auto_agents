@@ -52,6 +52,10 @@ from auto_agents.models import (
     VerificationStep,
 )
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.requirements import (
+    AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
+    NonAmendableRequirementContractRecoveryError,
+)
 from auto_agents.run_lock import (
     RUN_LOCK_FD_ENV,
     RUN_LOCK_KEY_ENV,
@@ -1647,6 +1651,26 @@ class ProjectValidationTests(unittest.TestCase):
             env={},
         )
         self.assertFalse(review_decision.eligible)
+
+    def test_self_repair_classifier_routes_ambiguous_contract_quarantine(self) -> None:
+        typed = classify_auto_agents_error(
+            NonAmendableRequirementContractRecoveryError(["REQ-017"]),
+            env={},
+        )
+        legacy = classify_auto_agents_error(
+            "clarify-generate exhausted retries: requirement contract recovery "
+            "for REQ-017 is ambiguous: archived verified proofs disagree on the "
+            "delivered contract hash; do not choose a historical hash automatically",
+            env={},
+        )
+
+        self.assertTrue(typed.eligible)
+        self.assertEqual(
+            typed.category,
+            AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
+        )
+        self.assertTrue(legacy.eligible)
+        self.assertEqual(legacy.category, typed.category)
 
     def test_self_repair_requires_structured_recovery_route_invariant(self) -> None:
         state = RunState(
@@ -4746,8 +4770,14 @@ class ProjectValidationTests(unittest.TestCase):
                     "requirement_proofs": [
                         {
                             "requirement_id": "REQ-004",
-                            "requirement_contract_sha256": "sha256:historical",
-                        }
+                            "requirement_contract_sha256": "sha256:historical-first",
+                            "status": "verified",
+                        },
+                        {
+                            "requirement_id": "REQ-004",
+                            "requirement_contract_sha256": "sha256:historical-second",
+                            "status": "verified",
+                        },
                     ],
                 }
             ]
@@ -4763,6 +4793,8 @@ class ProjectValidationTests(unittest.TestCase):
                 "requirement IDs conflict with archived delivered proof contracts: REQ-004",
                 prompt,
             )
+            self.assertIn("IDs with disagreeing verified hashes (REQ-004)", prompt)
+            self.assertIn("retain a reciprocal superseded quarantine permanently", prompt)
 
     def test_readme_prompt_uses_selected_document_language(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

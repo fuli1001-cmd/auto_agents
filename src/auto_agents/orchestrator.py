@@ -226,6 +226,9 @@ from .prototype_variants import (
 )
 from .supervision import process_start_identity
 from .requirements import (
+    AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
+    NonAmendableRequirementContractRecoveryError,
+    ambiguous_historical_requirement_contract_ids,
     external_doc_requirements,
     format_requirement_context,
     forbidden_pattern_definition_findings,
@@ -238,6 +241,7 @@ from .requirements import (
     migrate_legacy_provider_reference_consumer_hashes,
     normalize_generated_task_plan_statuses,
     next_unused_requirement_id,
+    non_amendable_ambiguous_requirement_contract_ids,
     provider_reference_paths,
     provider_reference_effective_status,
     provider_reference_status,
@@ -250,6 +254,7 @@ from .requirements import (
     task_is_fully_historically_covered,
     requirements_for_task,
     requirement_contract_payload,
+    unique_historical_requirement_contract_ids,
     validate_done_task_requirement_proofs,
     validate_requirement_contract_transitions,
     validate_requirements_trace_payload,
@@ -409,6 +414,7 @@ class Orchestrator:
     INSTALLED_ENGINE_RECOVERY_CONTEXT = "installed_engine_recovery_revisions"
     REQUIREMENT_CONTRACT_RECOVERY_CATEGORIES = frozenset(
         {
+            AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
             "requirements_recovery_namespace_collision",
             "immutable_requirement_recovery_deadlock",
         }
@@ -916,6 +922,17 @@ class Orchestrator:
         )
         if not collisions:
             return False
+        ambiguous_collisions = ambiguous_historical_requirement_contract_ids(
+            trace,
+            historical_tasks,
+        )
+        unique_collisions = unique_historical_requirement_contract_ids(
+            trace,
+            historical_tasks,
+        )
+        legacy_collisions = sorted(
+            set(collisions) - set(unique_collisions) - set(ambiguous_collisions)
+        )
 
         next_requirement_id = next_unused_requirement_id(
             trace,
@@ -929,21 +946,43 @@ class Orchestrator:
         state.agent_attempts.pop("clarify-generate", None)
         self._rewind_state_from_stage(state, "clarify")
         state.rejected_stage = "clarify"
-        state.rejection_reason = (
+        guidance = [
             "The installed auto_agents engine now has archive-authoritative "
-            "requirement contract recovery. Recover forward from clarify for "
-            f"collided delivered IDs {', '.join(collisions)}: quarantine active "
-            "collisions without rewriting their proof-bearing fields, restore any "
-            "already-superseded delivered entry only to the unique hash agreed by "
-            "verified archived proofs, retain reciprocal replacement links, and "
-            "allocate new replacements starting at the archive-aware next unused "
+            "requirement contract recovery. Recover forward from clarify."
+        ]
+        if unique_collisions:
+            guidance.append(
+                "For collisions with one verified historical identity "
+                f"({', '.join(unique_collisions)}), quarantine active records without "
+                "rewriting proof-bearing fields, or restore already-superseded records "
+                "to that unique identity while retaining reciprocal replacement links."
+            )
+        if ambiguous_collisions:
+            guidance.append(
+                "For collisions with disagreeing verified identities "
+                f"({', '.join(ambiguous_collisions)}), never select a historical hash; "
+                "preserve proof-bearing fields and contract_sha256 exactly and keep "
+                "their reciprocal superseded quarantine permanently."
+            )
+        if legacy_collisions:
+            guidance.append(
+                "For legacy collisions without a verified contract identity "
+                f"({', '.join(legacy_collisions)}), quarantine active records without "
+                "rewriting them and do not invent an archived identity."
+            )
+        guidance.append(
+            "Allocate new replacements starting at the archive-aware next unused "
             f"ID {next_requirement_id}. Do not edit or delete archived tasks or proofs."
         )
+        state.rejection_reason = " ".join(guidance)
         blocker.update(
             {
                 "status": "retrying",
                 "installed_engine_recovery_revision": revision,
                 "installed_engine_recovery_collisions": collisions,
+                "installed_engine_recovery_ambiguous_collisions": (
+                    ambiguous_collisions
+                ),
                 "installed_engine_recovery_next_requirement_id": next_requirement_id,
                 "updated_at": utc_now_iso(),
             }
@@ -4078,6 +4117,7 @@ class Orchestrator:
             self._clarify_pre_trace_ids = set()
             self._clarify_pre_trace_payload = {}
             self._clarify_historical_tasks = []
+        self._raise_for_non_amendable_ambiguous_requirement_recovery()
         generate_prompt = self._build_prompt(stage="clarify", spec_file=spec_file, is_iteration=is_iteration)
         if history:
             generate_prompt += "\n\n--- Conversation History ---\n"
@@ -7291,9 +7331,9 @@ class Orchestrator:
                 "auto_agents repaired archive-authoritative delivered-requirement "
                 "recovery. Recover forward from clarify: quarantine active collisions "
                 "without rewriting proof-bearing fields; restore already-superseded "
-                "delivered entries only to the unique hashes agreed by verified "
-                "archived proofs; retain reciprocal replacement links; and do not "
-                "edit or delete archived tasks or proofs."
+                "entries only when verified history agrees on one identity; permanently "
+                "retain proof-preserving reciprocal quarantines when verified identities "
+                "disagree; and do not edit or delete archived tasks or proofs."
             )
             blocker["requirements_recovery_epoch_reset_commit"] = commit_sha
 
@@ -20932,6 +20972,7 @@ class Orchestrator:
         archived_plan = self._previous_task_plan_archive_for_prompt()
         archive_aware_next_requirement_id = ""
         historical_requirement_collisions: List[str] = []
+        ambiguous_requirement_collisions: List[str] = []
         if stage == "clarify" and is_iteration:
             existing_trace = load_requirements_trace(
                 self.project_root,
@@ -20948,6 +20989,12 @@ class Orchestrator:
             )
             historical_requirement_collisions = (
                 historical_requirement_contract_collision_ids(
+                    existing_trace,
+                    historical_tasks,
+                )
+            )
+            ambiguous_requirement_collisions = (
+                ambiguous_historical_requirement_contract_ids(
                     existing_trace,
                     historical_tasks,
                 )
@@ -21029,9 +21076,18 @@ class Orchestrator:
                             "fields, mark it status='superseded' with reciprocal links, and append "
                             "its active replacement at or above the archive-aware next unused ID. "
                             "For an already-superseded collision, restore its proof-bearing fields "
-                            "only to the unique contract hash agreed by verified archived proofs "
-                            "while retaining its lifecycle links; never choose among disagreeing "
-                            "archived hashes. Do not delete or rewrite archived tasks or proofs."
+                            "only when verified archived proofs agree on one contract hash, while "
+                            "retaining its lifecycle links. For IDs with disagreeing verified "
+                            "hashes"
+                            + (
+                                " (" + ", ".join(ambiguous_requirement_collisions) + ")"
+                                if ambiguous_requirement_collisions
+                                else ""
+                            )
+                            + ", never choose a historical hash: preserve the pre-clarify "
+                            "proof-bearing fields and contract_sha256 exactly and retain a "
+                            "reciprocal superseded quarantine permanently. Do not delete or "
+                            "rewrite archived tasks or proofs."
                         ]
                         if historical_requirement_collisions
                         else []
@@ -24667,6 +24723,7 @@ class Orchestrator:
         return any(token in text for token in ("in_progress", "`in_progress`", "status", "`done`", "done"))
 
     def _clarify_validation_feedback(self, _: AgentResult) -> Optional[str]:
+        self._raise_for_non_amendable_ambiguous_requirement_recovery()
         raw_trace = load_requirements_trace(self.project_root, normalize=False)
         trace, stamp_updates = stamp_requirement_contract_hashes(raw_trace)
         if not isinstance(trace, dict):
@@ -24693,6 +24750,14 @@ class Orchestrator:
             "preserving required brief headings and valid requirements_trace.json shape.\n"
             f"{bullets}"
         )
+
+    def _raise_for_non_amendable_ambiguous_requirement_recovery(self) -> None:
+        requirement_ids = non_amendable_ambiguous_requirement_contract_ids(
+            getattr(self, "_clarify_pre_trace_payload", {}) or {},
+            getattr(self, "_clarify_historical_tasks", []) or [],
+        )
+        if requirement_ids:
+            raise NonAmendableRequirementContractRecoveryError(requirement_ids)
 
     def _clarify_artifact_validation_errors(
         self,

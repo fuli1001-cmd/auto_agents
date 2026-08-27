@@ -35,7 +35,11 @@ from .root_cause import (
     RootCauseDiagnosis,
     repository_guard_fingerprint,
 )
-from .requirements import forbidden_pattern_definition_reason
+from .requirements import (
+    AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
+    NonAmendableRequirementContractRecoveryError,
+    forbidden_pattern_definition_reason,
+)
 
 
 SELF_REPAIR_LAST_FINGERPRINT_ENV = "AUTO_AGENTS_SELF_REPAIR_LAST_FINGERPRINT"
@@ -458,6 +462,24 @@ def classify_auto_agents_error(
         return SelfRepairDecision(False, reason="empty error")
 
     lowered = text.lower()
+    if isinstance(error, NonAmendableRequirementContractRecoveryError) or (
+        "requirement contract recovery for" in lowered
+        and "archived verified proofs disagree" in lowered
+        and "do not choose a historical hash automatically" in lowered
+    ):
+        return _with_repetition_guard(
+            SelfRepairDecision(
+                True,
+                category=AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
+                reason=(
+                    "clarify reached a multi-hash delivered-requirement invariant "
+                    "that requires the engine's terminal quarantine recovery path"
+                ),
+            ),
+            text,
+            values,
+            max_attempts=1,
+        )
     active_blocker = (
         state.active_blocker
         if state is not None and isinstance(state.active_blocker, dict)

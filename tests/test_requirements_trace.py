@@ -27,12 +27,14 @@ from auto_agents.provider_contract import (
     PROVIDER_REFERENCE_V2_HEADINGS,
 )
 from auto_agents.requirements import (
+    ambiguous_historical_requirement_contract_ids,
     audit_requirements,
     historical_requirement_contract_collision_ids,
     load_requirements_trace,
     migrate_legacy_provider_reference_consumer_hashes,
     normalize_generated_task_plan_statuses,
     next_unused_requirement_id,
+    non_amendable_ambiguous_requirement_contract_ids,
     preserve_task_plan_negative_oracle_clauses,
     run_requirements_audit,
     requirement_contract_sha256,
@@ -41,6 +43,7 @@ from auto_agents.requirements import (
     provider_reference_consumer_contract_sha256,
     provider_reference_effective_status,
     stamp_provider_reference_consumer_hashes,
+    unique_historical_requirement_contract_ids,
     validate_done_task_requirement_proofs,
     validate_requirements_trace_payload,
     validate_requirement_contract_transitions,
@@ -499,6 +502,245 @@ class RequirementsTraceTests(unittest.TestCase):
 
         self.assertTrue(any("contract drift" in error for error in errors))
         self.assertTrue(any("ambiguous" in error for error in errors))
+
+    def test_ambiguous_contract_accepts_unchanged_terminal_quarantine(self) -> None:
+        first_archived = _requirement(text="First archived behavior.")
+        second_archived = _requirement(text="Second archived behavior.")
+        quarantined_old = _requirement(
+            text="Current preserved behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        replacement = _requirement(
+            id="REQ-002",
+            text="Current replacement behavior.",
+            supersedes=["REQ-001"],
+        )
+        trace, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [quarantined_old, replacement]}
+        )
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            first_archived
+                        )
+                    ),
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            second_archived
+                        )
+                    ),
+                ],
+            }
+        ]
+
+        self.assertEqual(
+            ambiguous_historical_requirement_contract_ids(trace, historical),
+            ["REQ-001"],
+        )
+        self.assertEqual(
+            unique_historical_requirement_contract_ids(trace, historical),
+            [],
+        )
+        self.assertEqual(
+            validate_requirement_contract_transitions(
+                trace,
+                json.loads(json.dumps(trace)),
+                historical_tasks=historical,
+            ),
+            [],
+        )
+        self.assertEqual(
+            non_amendable_ambiguous_requirement_contract_ids(trace, historical),
+            [],
+        )
+
+    def test_ambiguous_contract_can_enter_terminal_quarantine(self) -> None:
+        first_archived = _requirement(text="First archived behavior.")
+        second_archived = _requirement(text="Second archived behavior.")
+        active = _requirement(text="Current preserved behavior.")
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [active]}
+        )
+        quarantined = json.loads(json.dumps(active))
+        quarantined.update(
+            {"status": "superseded", "superseded_by": ["REQ-002"]}
+        )
+        replacement = _requirement(
+            id="REQ-002",
+            text="Current replacement behavior.",
+            supersedes=["REQ-001"],
+        )
+        current, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [quarantined, replacement]}
+        )
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            first_archived
+                        )
+                    ),
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            second_archived
+                        )
+                    ),
+                ],
+            }
+        ]
+
+        self.assertEqual(
+            validate_requirement_contract_transitions(
+                previous,
+                current,
+                historical_tasks=historical,
+            ),
+            [],
+        )
+        proof_transfer_errors = validate_requirement_contract_transitions(
+            previous,
+            current,
+            historical_tasks=[
+                *historical,
+                {
+                    "task_id": "task-reserved-replacement",
+                    "status": "done",
+                    "requirement_ids": ["REQ-002"],
+                },
+            ],
+        )
+        self.assertTrue(
+            any("ambiguous" in error for error in proof_transfer_errors),
+            proof_transfer_errors,
+        )
+
+    def test_ambiguous_terminal_quarantine_rejects_every_unsafe_escape(self) -> None:
+        first_archived = _requirement(text="First archived behavior.")
+        second_archived = _requirement(text="Second archived behavior.")
+        quarantined_old = _requirement(
+            text="Current preserved behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        replacement = _requirement(
+            id="REQ-002",
+            text="Current replacement behavior.",
+            supersedes=["REQ-001"],
+        )
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [quarantined_old, replacement]}
+        )
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            first_archived
+                        )
+                    ),
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            second_archived
+                        )
+                    ),
+                ],
+            }
+        ]
+
+        changed_contract = json.loads(json.dumps(previous))
+        changed_contract["requirements"][0]["text"] = "Selected archived behavior."
+        changed_contract, _ = stamp_requirement_contract_hashes(changed_contract)
+
+        changed_hash = json.loads(json.dumps(previous))
+        changed_hash["requirements"][0]["contract_sha256"] = "sha256:replacement"
+
+        reactivated = json.loads(json.dumps(previous))
+        reactivated["requirements"][0]["status"] = "active"
+
+        removed_link = json.loads(json.dumps(previous))
+        removed_link["requirements"][0]["superseded_by"] = []
+
+        substituted_link = json.loads(json.dumps(previous))
+        substituted_link["requirements"][0]["superseded_by"] = ["REQ-003"]
+        substituted_link["requirements"].append(
+            _requirement(
+                id="REQ-003",
+                text="Substituted replacement behavior.",
+                supersedes=["REQ-001"],
+            )
+        )
+        substituted_link, _ = stamp_requirement_contract_hashes(substituted_link)
+
+        missing_reciprocal = json.loads(json.dumps(previous))
+        missing_reciprocal["requirements"][1]["supersedes"] = []
+
+        for label, candidate in (
+            ("proof-bearing edit", changed_contract),
+            ("contract hash edit", changed_hash),
+            ("reactivation", reactivated),
+            ("link removal", removed_link),
+            ("link substitution", substituted_link),
+            ("missing reciprocity", missing_reciprocal),
+        ):
+            with self.subTest(label=label):
+                errors = validate_requirement_contract_transitions(
+                    previous,
+                    candidate,
+                    historical_tasks=historical,
+                )
+                self.assertTrue(
+                    any("ambiguous" in error for error in errors),
+                    errors,
+                )
+
+    def test_malformed_ambiguous_quarantine_is_non_amendable(self) -> None:
+        first_archived = _requirement(text="First archived behavior.")
+        second_archived = _requirement(text="Second archived behavior.")
+        quarantined_old = _requirement(
+            text="Current preserved behavior.",
+            status="superseded",
+            superseded_by=[],
+        )
+        trace, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [quarantined_old]}
+        )
+        historical = [
+            {
+                "task_id": "task-archived",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            first_archived
+                        )
+                    ),
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            second_archived
+                        )
+                    ),
+                ],
+            }
+        ]
+
+        self.assertEqual(
+            non_amendable_ambiguous_requirement_contract_ids(trace, historical),
+            ["REQ-001"],
+        )
 
     def test_unverified_archived_hash_cannot_authorize_contract_recovery(self) -> None:
         archived_requirement = _requirement(text="Unverified historical behavior.")

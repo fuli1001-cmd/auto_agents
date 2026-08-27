@@ -54,6 +54,9 @@ DEFAULT_EVIDENCE_BOUNDARY = "system_boundary"
 ORACLE_PROOF_SCHEMA_VERSION = 1
 LATEST_ORACLE_PROOF_SCHEMA_VERSION = 2
 CONTRACT_IDENTITY_SCHEMA_VERSION = 1
+AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY = (
+    "ambiguous_requirement_contract_quarantine_deadlock"
+)
 ORACLE_STRENGTH_ORDER = {"proxy": 0, "behavioral": 1, "semantic": 2, "human": 3}
 EVIDENCE_BOUNDARY_ORDER = {"internal_state": 0, "system_boundary": 1, "external_side_effect": 2}
 NEGATIVE_CONTRACT_MARKERS = (
@@ -100,6 +103,45 @@ CONTRACT_TOKEN_RE = re.compile(
     r"|/[A-Za-z0-9_{}:/?.=&%+~-]+"
     r"|[A-Za-z_][A-Za-z0-9_]*(?:_[A-Za-z0-9]+)+"
 )
+
+_PROOF_BEARING_REQUIREMENT_FIELDS = (
+    "id",
+    "text",
+    "source",
+    "priority",
+    "acceptance_oracles",
+    "oracle_type",
+    "oracle_strength",
+    "evidence_boundary",
+    "forbidden_proxy_oracles",
+    "forbidden_patterns",
+    "external_docs_required",
+    "provider_reference",
+    "provider_references",
+)
+
+
+class NonAmendableRequirementContractRecoveryError(RuntimeError):
+    """A historical requirement invariant cannot be repaired by clarify output."""
+
+    category = AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY
+
+    def __init__(self, requirement_ids: Iterable[str]) -> None:
+        self.requirement_ids = tuple(
+            sorted(
+                {
+                    str(requirement_id).strip()
+                    for requirement_id in requirement_ids
+                    if str(requirement_id).strip()
+                }
+            )
+        )
+        joined = ", ".join(self.requirement_ids) or "<unknown>"
+        super().__init__(
+            "non-amendable ambiguous requirement contract recovery for "
+            f"{joined}: verified historical proofs disagree, and the existing "
+            "record cannot be represented as a proof-preserving terminal quarantine"
+        )
 
 
 def _normalized_contract_text(value: object) -> str:
@@ -894,6 +936,200 @@ def _has_reciprocal_unused_replacements(
     return True
 
 
+def _preserves_proof_bearing_requirement_bytes(before: dict, after: dict) -> bool:
+    """Require the archived record and its stored identity to remain exact."""
+    if requirement_contract_payload(before) != requirement_contract_payload(after):
+        return False
+    for field in _PROOF_BEARING_REQUIREMENT_FIELDS:
+        if (
+            (field in before) != (field in after)
+            or before.get(field) != after.get(field)
+        ):
+            return False
+    return (
+        ("contract_sha256" in before) == ("contract_sha256" in after)
+        and before.get("contract_sha256") == after.get("contract_sha256")
+    )
+
+
+def _normalized_requirement_links(requirement: dict, field: str) -> set[str]:
+    raw_links = requirement.get(field, [])
+    if not isinstance(raw_links, list):
+        return set()
+    return {
+        str(value).strip()
+        for value in raw_links
+        if isinstance(value, str) and str(value).strip()
+    }
+
+
+def _is_terminal_ambiguous_contract_quarantine(
+    req_id: str,
+    before: dict,
+    after: dict,
+    previous: Dict[str, dict],
+    current: Dict[str, dict],
+    proven_ids: set[str],
+) -> bool:
+    """Accept ambiguity only as an immutable, reciprocal supersession quarantine."""
+    before_status = str(before.get("status", "active")).strip()
+    after_status = str(after.get("status", "active")).strip()
+    if (
+        before_status not in {"active", "deferred", "superseded"}
+        or after_status != "superseded"
+        or not _preserves_proof_bearing_requirement_bytes(before, after)
+        or str(before.get("contract_sha256", "")).strip()
+        != requirement_contract_sha256(before)
+        or _normalized_requirement_links(before, "supersedes")
+        != _normalized_requirement_links(after, "supersedes")
+    ):
+        return False
+
+    require_retained_links = before_status == "superseded"
+    if require_retained_links:
+        if _normalized_requirement_links(
+            before, "superseded_by"
+        ) != _normalized_requirement_links(after, "superseded_by"):
+            return False
+    elif _normalized_requirement_links(before, "superseded_by"):
+        # An active/deferred record with pre-existing replacement links is not a
+        # coherent source state from which clarify can infer a safe quarantine.
+        return False
+
+    return _has_reciprocal_unused_replacements(
+        req_id,
+        before,
+        after,
+        previous,
+        current,
+        proven_ids,
+        require_retained_links=require_retained_links,
+    )
+
+
+def ambiguous_historical_requirement_contract_ids(
+    trace_payload: object,
+    historical_tasks: Iterable[dict],
+) -> List[str]:
+    """Return collided IDs backed by multiple distinct verified identities."""
+    historical_task_list = [
+        task for task in historical_tasks if isinstance(task, dict)
+    ]
+    collisions = set(
+        historical_requirement_contract_collision_ids(
+            trace_payload,
+            historical_task_list,
+        )
+    )
+    verified_hashes = _verified_contract_hashes_by_requirement(
+        historical_task_list
+    )
+    return sorted(
+        req_id
+        for req_id in collisions
+        if len(verified_hashes.get(req_id, set())) > 1
+    )
+
+
+def unique_historical_requirement_contract_ids(
+    trace_payload: object,
+    historical_tasks: Iterable[dict],
+) -> List[str]:
+    """Return collided IDs backed by one authoritative verified identity."""
+    historical_task_list = [
+        task for task in historical_tasks if isinstance(task, dict)
+    ]
+    collisions = set(
+        historical_requirement_contract_collision_ids(
+            trace_payload,
+            historical_task_list,
+        )
+    )
+    verified_hashes = _verified_contract_hashes_by_requirement(
+        historical_task_list
+    )
+    return sorted(
+        req_id
+        for req_id in collisions
+        if len(verified_hashes.get(req_id, set())) == 1
+    )
+
+
+def non_amendable_ambiguous_requirement_contract_ids(
+    trace_payload: object,
+    historical_tasks: Iterable[dict],
+) -> List[str]:
+    """Find ambiguous records whose existing lifecycle cannot be quarantined safely."""
+    if not isinstance(trace_payload, dict):
+        return []
+    historical_task_list = [
+        task for task in historical_tasks if isinstance(task, dict)
+    ]
+    current = {
+        str(item.get("id", "")).strip(): item
+        for item in requirement_records(trace_payload)
+    }
+    proven_ids = delivered_requirement_ids(historical_task_list)
+    unamendable: List[str] = []
+    for req_id in ambiguous_historical_requirement_contract_ids(
+        trace_payload,
+        historical_task_list,
+    ):
+        requirement = current.get(req_id)
+        if requirement is None:
+            continue
+        status = str(requirement.get("status", "active")).strip()
+        has_coherent_identity = (
+            str(requirement.get("contract_sha256", "")).strip()
+            == requirement_contract_sha256(requirement)
+        )
+        if status in {"active", "deferred"}:
+            # Clarify can preserve this record and append a fresh reciprocal
+            # replacement, provided its stored identity is already coherent.
+            if (
+                has_coherent_identity
+                and not _normalized_requirement_links(
+                    requirement, "superseded_by"
+                )
+            ):
+                continue
+        elif status == "superseded" and has_coherent_identity:
+            raw_replacements = requirement.get("superseded_by", [])
+            replacement_ids = _normalized_requirement_links(
+                requirement,
+                "superseded_by",
+            )
+            if (
+                isinstance(raw_replacements, list)
+                and replacement_ids
+                and req_id not in replacement_ids
+            ):
+                can_complete_topology = True
+                for replacement_id in replacement_ids:
+                    replacement = current.get(replacement_id)
+                    if replacement is None:
+                        if replacement_id in proven_ids:
+                            can_complete_topology = False
+                            break
+                        # Clarify may append this previously unused linked ID.
+                        continue
+                    replacement_status = str(
+                        replacement.get("status", "active")
+                    ).strip()
+                    if (
+                        replacement_id in proven_ids
+                        and replacement_status not in {"active", "deferred"}
+                    ):
+                        can_complete_topology = False
+                        break
+                if can_complete_topology:
+                    # Missing reciprocity or an unproven replacement lifecycle is
+                    # amendable without changing the ambiguous record itself.
+                    continue
+        unamendable.append(req_id)
+    return unamendable
+
+
 def validate_requirement_contract_transitions(
     previous_payload: object,
     current_payload: object,
@@ -979,10 +1215,25 @@ def validate_requirement_contract_transitions(
         after = current.get(req_id)
         archived_hashes = verified_hashes.get(req_id, set())
         if len(archived_hashes) > 1:
+            if (
+                before is not None
+                and after is not None
+                and _is_terminal_ambiguous_contract_quarantine(
+                    req_id,
+                    before,
+                    after,
+                    previous,
+                    current,
+                    proven_ids,
+                )
+            ):
+                continue
             errors.append(
                 f"requirement contract recovery for {req_id} is ambiguous: archived "
-                "verified proofs disagree on the delivered contract hash; do not "
-                "choose a historical hash automatically"
+                "verified proofs disagree on the delivered contract hash. Preserve "
+                "the pre-clarify proof-bearing fields and contract_sha256 exactly, "
+                "keep or mark the record status='superseded', and retain reciprocal "
+                "replacement links; do not choose a historical hash automatically"
             )
             continue
         # Preserve the existing two-pass namespace recovery. The first pass may

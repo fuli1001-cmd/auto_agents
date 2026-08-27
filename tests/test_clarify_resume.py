@@ -21,6 +21,8 @@ from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import (
+    AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
+    NonAmendableRequirementContractRecoveryError,
     requirement_contract_sha256,
     stamp_requirement_contract_hashes,
     validate_requirements_trace_payload,
@@ -206,9 +208,42 @@ class ClarifyResumeTests(unittest.TestCase):
             "repair-contract-recovery",
         )
 
-    def test_installed_engine_upgrade_reopens_immutable_contract_recovery_once(self):
+    def test_ambiguous_contract_self_repair_reopens_fresh_clarify_attempts(self):
+        project_root, _spec_file = self._setup_project()
+        state = load_run_state(project_root)
+        state.status = "blocked"
+        state.current_stage = "clarify"
+        state.agent_attempts["requirements_audit_recovery"] = 3
+        state.agent_attempts["clarify-generate"] = 2
+        state.active_blocker = {
+            "owner": "auto_agents",
+            "category": AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
+            "status": "blocked",
+        }
+        save_run_state(project_root, state)
+
+        state = Orchestrator(project_root).mark_self_repair_applied(
+            "repair-ambiguous-quarantine"
+        )
+        resumed = Orchestrator(project_root)._resume_blocked_run(state)
+
+        self.assertTrue(resumed)
+        self.assertEqual(state.status, "pending")
+        self.assertEqual(state.current_stage, "clarify")
+        self.assertEqual(state.rejected_stage, "clarify")
+        self.assertNotIn("requirements_audit_recovery", state.agent_attempts)
+        self.assertNotIn("clarify-generate", state.agent_attempts)
+        self.assertIn("permanently retain", state.rejection_reason)
+        self.assertEqual(
+            state.active_blocker["requirements_recovery_epoch_reset_commit"],
+            "repair-ambiguous-quarantine",
+        )
+
+    def test_installed_engine_upgrade_reopens_ambiguous_contract_recovery_once(self):
         project_root, _spec_file = self._setup_project()
         archived = self._requirement()
+        second_archived = self._requirement()
+        second_archived["text"] = "A second delivered output contract."
         corrupted = self._requirement()
         corrupted.update(
             {
@@ -248,7 +283,14 @@ class ClarifyResumeTests(unittest.TestCase):
                                     requirement_contract_sha256(archived)
                                 ),
                                 "status": "verified",
-                            }
+                            },
+                            {
+                                "requirement_id": "REQ-001",
+                                "requirement_contract_sha256": (
+                                    requirement_contract_sha256(second_archived)
+                                ),
+                                "status": "verified",
+                            },
                         ],
                     }
                 ]
@@ -260,7 +302,7 @@ class ClarifyResumeTests(unittest.TestCase):
         state.agent_attempts["clarify-generate"] = 2
         state.active_blocker = {
             "owner": "auto_agents",
-            "category": "immutable_requirement_recovery_deadlock",
+            "category": AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
             "status": "blocked",
         }
         orchestrator = Orchestrator(project_root)
@@ -282,9 +324,17 @@ class ClarifyResumeTests(unittest.TestCase):
         self.assertEqual(state.status, "pending")
         self.assertNotIn("clarify-generate", state.agent_attempts)
         self.assertIn("REQ-001", state.rejection_reason)
+        self.assertIn("disagreeing verified identities", state.rejection_reason)
+        self.assertIn("never select a historical hash", state.rejection_reason)
+        self.assertEqual(
+            state.active_blocker[
+                "installed_engine_recovery_ambiguous_collisions"
+            ],
+            ["REQ-001"],
+        )
         self.assertEqual(
             state.resume_context[Orchestrator.INSTALLED_ENGINE_RECOVERY_CONTEXT][
-                "immutable_requirement_recovery_deadlock"
+                AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY
             ],
             "engine-contract-recovery",
         )
@@ -480,6 +530,180 @@ class ClarifyResumeTests(unittest.TestCase):
         self.assertEqual(
             final_trace["requirements"][1]["supersedes"],
             ["REQ-001"],
+        )
+
+    def test_clarify_accepts_ambiguous_terminal_quarantine_without_retry(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        trace_path = requirements_trace_path(project_root)
+
+        first_archived = self._requirement()
+        second_archived = self._requirement()
+        second_archived["text"] = "A different delivered output contract."
+        quarantined = self._requirement()
+        quarantined.update(
+            {"status": "superseded", "superseded_by": ["REQ-002"]}
+        )
+        replacement = self._requirement()
+        replacement.update(
+            {
+                "id": "REQ-002",
+                "text": "Provide the current replacement output.",
+                "supersedes": ["REQ-001"],
+            }
+        )
+        trace, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [quarantined, replacement]}
+        )
+        historical = [
+            {
+                "task_id": "completed-task",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    {
+                        "requirement_id": "REQ-001",
+                        "requirement_contract_sha256": (
+                            requirement_contract_sha256(first_archived)
+                        ),
+                        "status": "verified",
+                    },
+                    {
+                        "requirement_id": "REQ-001",
+                        "requirement_contract_sha256": (
+                            requirement_contract_sha256(second_archived)
+                        ),
+                        "status": "verified",
+                    },
+                ],
+            }
+        ]
+        write_json(trace_path, trace)
+        self._write_valid_brief(project_root)
+        orchestrator._active_spec_file = spec_file
+        orchestrator._clarify_pre_trace_payload = json.loads(json.dumps(trace))
+        orchestrator._clarify_historical_tasks = historical
+        calls = 0
+
+        def run_generate(request):
+            nonlocal calls
+            calls += 1
+            write_json(trace_path, trace)
+            self._write_valid_brief(project_root)
+            write_text(request.output_path, "generated\n")
+            return AgentResult(
+                ok=True,
+                command=["fake"],
+                output_path=request.output_path,
+                summary="generated",
+                returncode=0,
+            )
+
+        orchestrator.adapter.run = run_generate
+
+        result = orchestrator._run_agent_with_retries(
+            state=state,
+            stage="clarify",
+            stage_key="clarify-generate",
+            prompt="Generate clarify artifacts.",
+            validation_feedback=orchestrator._clarify_validation_feedback,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, 1)
+        self.assertEqual(
+            json.loads(trace_path.read_text(encoding="utf-8")),
+            trace,
+        )
+
+    def test_non_amendable_ambiguous_recovery_stops_retry_and_rolls_back(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        brief_path = docs_dir(project_root) / "project_brief.md"
+        trace_path = requirements_trace_path(project_root)
+
+        first_archived = self._requirement()
+        second_archived = self._requirement()
+        second_archived["text"] = "A different delivered output contract."
+        malformed_quarantine = self._requirement()
+        malformed_quarantine.update(
+            {"status": "superseded", "superseded_by": []}
+        )
+        previous, _ = stamp_requirement_contract_hashes(
+            {
+                "version": 1,
+                "requirements": [malformed_quarantine],
+            }
+        )
+        historical = [
+            {
+                "task_id": "completed-task",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    {
+                        "requirement_id": "REQ-001",
+                        "requirement_contract_sha256": (
+                            requirement_contract_sha256(first_archived)
+                        ),
+                        "status": "verified",
+                    },
+                    {
+                        "requirement_id": "REQ-001",
+                        "requirement_contract_sha256": (
+                            requirement_contract_sha256(second_archived)
+                        ),
+                        "status": "verified",
+                    },
+                ],
+            }
+        ]
+        original_brief = "# Original Brief\n"
+        write_text(brief_path, original_brief)
+        write_json(trace_path, previous)
+        orchestrator._active_spec_file = spec_file
+        orchestrator._clarify_pre_trace_payload = json.loads(json.dumps(previous))
+        orchestrator._clarify_historical_tasks = historical
+        calls = 0
+
+        def run_generate(request):
+            nonlocal calls
+            calls += 1
+            write_text(brief_path, "# Generated Candidate\n")
+            write_json(trace_path, {"version": 1, "requirements": []})
+            write_text(request.output_path, "generated\n")
+            return AgentResult(
+                ok=True,
+                command=["fake"],
+                output_path=request.output_path,
+                summary="generated",
+                returncode=0,
+            )
+
+        orchestrator.adapter.run = run_generate
+
+        with self.assertRaises(NonAmendableRequirementContractRecoveryError):
+            orchestrator._run_agent_with_retries(
+                state=state,
+                stage="clarify",
+                stage_key="clarify-generate",
+                prompt="Generate clarify artifacts.",
+                validation_feedback=orchestrator._clarify_validation_feedback,
+            )
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(brief_path.read_text(encoding="utf-8"), original_brief)
+        self.assertEqual(
+            json.loads(trace_path.read_text(encoding="utf-8")),
+            previous,
+        )
+        self.assertFalse(
+            orchestrator._attempt_recovery_checkpoint_root(
+                state.run_id,
+                "clarify-generate",
+            ).exists()
         )
 
     def test_clarify_generate_exhaustion_restores_worktree_and_index(self):
