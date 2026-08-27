@@ -311,7 +311,7 @@ class StageOwnershipRouteError(RuntimeError):
 
 VERIFY_BASELINE_SCHEMA_VERSION = 2
 IMPLEMENTATION_SCOPE_POLICY_VERSION = 5
-EVIDENCE_PREFLIGHT_FINGERPRINT_VERSION = 8
+EVIDENCE_PREFLIGHT_FINGERPRINT_VERSION = 9
 EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT = 2
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
@@ -4171,6 +4171,10 @@ class Orchestrator:
     ) -> List[UserInputRequest]:
         """Validate the complete batch before publishing any input state."""
 
+        payloads = list(payloads)
+        usability_issue = self._operator_input_usability_issue(payloads)
+        if usability_issue:
+            raise ValueError(usability_issue)
         requests: List[UserInputRequest] = []
         pending_input_requests = [
             dict(item)
@@ -4426,13 +4430,63 @@ class Orchestrator:
         state: RunState,
         tasks: List[TaskSpec],
     ) -> bool:
+        changed = False
+        for task in tasks:
+            if task.status != "waiting_user":
+                continue
+            payloads = list(task.required_inputs)
+            if not payloads and isinstance(task.evidence_preflight, dict):
+                raw_payloads = task.evidence_preflight.get("required_inputs", [])
+                if isinstance(raw_payloads, list):
+                    payloads = [
+                        dict(item) for item in raw_payloads if isinstance(item, dict)
+                    ]
+            usability_issue = self._operator_input_usability_issue(payloads)
+            if not usability_issue:
+                continue
+            stale_keys = {
+                str(item.get("key", "")).strip()
+                for item in payloads
+                if isinstance(item, Mapping) and str(item.get("key", "")).strip()
+            }
+            state.pending_input_requests = [
+                item
+                for item in state.pending_input_requests
+                if str(item.get("task_id", "")).strip() != task.task_id
+                and str(item.get("key", "")).strip() not in stale_keys
+            ]
+            task.operator_input_bindings = [
+                binding
+                for binding in task.operator_input_bindings
+                if str(binding.get("input_key", "")).strip() not in stale_keys
+            ]
+            task.status = "pending"
+            task.required_inputs = []
+            task.evidence_preflight = {}
+            changed = True
+            self.logger.warning(
+                "[user-input] task=%s discarded unusable request contract: %s",
+                task.task_id,
+                usability_issue,
+            )
+        if changed:
+            pending_ids = {
+                str(item.get("request_id", "")).strip()
+                for item in state.pending_input_requests
+                if isinstance(item, dict)
+            }
+            if state.active_input_request_id not in pending_ids:
+                state.active_input_request_id = ""
+            if not state.pending_input_requests and state.status == "waiting_user":
+                state.status = "pending"
+                state.last_error = ""
+
         pending_by_task: Dict[str, List[UserInputRequest]] = {}
         for request in self._pending_input_requests(state):
             if request.task_id:
                 pending_by_task.setdefault(request.task_id, []).append(request)
         pending_task_ids = set(pending_by_task)
         invalid: List[str] = []
-        changed = False
         for task in tasks:
             persisted_requests = pending_by_task.get(task.task_id, [])
             if persisted_requests and task.status not in {"done", "waiting_user"}:
@@ -20396,6 +20450,123 @@ class Orchestrator:
             )
         )
 
+    @staticmethod
+    def _operator_input_usability_issue(payloads: Iterable[object]) -> str:
+        """Reject implementation-shaped questions and unusable acquisition help."""
+
+        for index, payload in enumerate(payloads, start=1):
+            if not isinstance(payload, Mapping):
+                return f"required_inputs[{index}] must be an object"
+            try:
+                request = UserInputRequest.from_dict(payload)
+            except (TypeError, ValueError) as error:
+                return f"required_inputs[{index}] is invalid: {error}"
+
+            question = request.question.casefold()
+            question_and_purpose = " ".join(
+                (request.question, request.purpose, request.why_required)
+            ).casefold()
+            if re.search(
+                r"\b(?:json|ya?ml|toml)\b|序列化|配置对象|配置块|凭据对象",
+                question,
+                re.IGNORECASE,
+            ):
+                return (
+                    f"required input {request.key} asks the operator to construct a "
+                    "serialization or configuration object. Ask separately for each "
+                    "user-owned fact or atomic secret and let implementation assemble "
+                    "JSON, YAML, environment structures, and request headers."
+                )
+
+            if request.kind == "path" and re.search(
+                r"路由合同|route contract|凭据文件|credential file|"
+                r"清单(?:文件)?|manifest|证据(?:文件)?|evidence file|"
+                r"sha-?256|哈希|模型快照|model snapshot",
+                question_and_purpose,
+                re.IGNORECASE,
+            ):
+                return (
+                    f"required input {request.key} asks for a technical artifact that "
+                    "auto_agents should derive. Ask for the underlying user-owned facts, "
+                    "credential fields, authorized media, or reference material instead; "
+                    "implementation must generate contracts, manifests, hashes, and evidence."
+                )
+
+            credential_request = request.kind == "secret" and bool(
+                re.search(
+                    r"api[ _-]?key|access[ _-]?(?:key|token)|credential|"
+                    r"token|secret|凭据|密钥|令牌|口令",
+                    question_and_purpose,
+                    re.IGNORECASE,
+                )
+            )
+            if not credential_request:
+                continue
+
+            atomic_types = [
+                name
+                for name, pattern in (
+                    ("api_key", r"api[ _-]?key|API 密钥"),
+                    ("access_key", r"(?<!secret )access[ _-]?key|访问密钥"),
+                    ("access_token", r"access[ _-]?token|访问令牌"),
+                    ("secret_key", r"secret[ _-]?key|secret access key|秘密密钥"),
+                    ("token", r"(?<!access[ _-])\btoken\b|(?<!访问)令牌"),
+                    ("password", r"password|密码|口令"),
+                    ("private_key", r"private[ _-]?key|私钥"),
+                )
+                if re.search(pattern, question, re.IGNORECASE)
+            ]
+            generic_bundle = bool(
+                re.search(r"credentials?|凭据", question, re.IGNORECASE)
+            )
+            if len(atomic_types) > 1 or (generic_bundle and not atomic_types):
+                return (
+                    f"credential input {request.key} combines multiple or unnamed "
+                    "credential fields. Ask one question for exactly one named field "
+                    "such as API Key or Access Token; ask authentication mode as a "
+                    "separate choice when needed."
+                )
+
+            if request.persistence != "project" and not re.search(
+                r"one[ -]?time|single[ -]?use|ephemeral|temporary|short[ -]?lived|"
+                r"一次性|单次|临时|短期|短时",
+                question_and_purpose,
+                re.IGNORECASE,
+            ):
+                return (
+                    f"reusable credential input {request.key} must use "
+                    "persistence='project'; reserve run/one_time for credentials that "
+                    "are explicitly temporary or single-use."
+                )
+
+            help_text = "\n".join(request.how_to_obtain).strip()
+            has_official_url = bool(re.search(r"https://[^\s)]+", help_text))
+            has_enablement = bool(
+                re.search(
+                    r"开通|启用|激活|订阅|服务|模型|资源|权限|配额|"
+                    r"enable|activate|subscribe|service|model|resource|permission|quota",
+                    help_text,
+                    re.IGNORECASE,
+                )
+            )
+            has_retrieval_step = bool(
+                re.search(
+                    r"访问|打开|进入|登录|创建|生成|复制|获取|控制台|"
+                    r"visit|open|sign in|log in|create|generate|copy|obtain|console",
+                    help_text,
+                    re.IGNORECASE,
+                )
+            )
+            if not (has_official_url and has_enablement and has_retrieval_step):
+                return (
+                    f"credential input {request.key} has vague how_to_obtain guidance. "
+                    "Give the official HTTPS console or documentation URL, the exact "
+                    "service/model/resource or permission to enable, and plain-language "
+                    "steps to create or copy the requested credential. Security/storage "
+                    "warnings do not count as acquisition instructions."
+                )
+        return ""
+
     @classmethod
     def _evidence_preflight_protocol_issue(
         cls,
@@ -20405,7 +20576,7 @@ class Orchestrator:
 
         required_inputs = parsed.get("required_inputs", [])
         if isinstance(required_inputs, list) and required_inputs:
-            return ""
+            return cls._operator_input_usability_issue(required_inputs)
         required_mutations = parsed.get("required_mutations", [])
         if not isinstance(required_mutations, list):
             return ""
@@ -20758,6 +20929,11 @@ class Orchestrator:
                 "Choose WAIT_USER when progress requires a fact, choice, consent, authorized fixture, secret, or project-local install approval that only the operator can provide.",
                 "For WAIT_USER, return required_inputs. Ask for semantic user-owned facts, never derived paths, versions, or hashes that auto_agents can discover. Each item must contain key, kind, question, purpose, why_required, how_to_obtain, recommended_answer, default, persistence, sensitivity, validation, bindings, subject_fingerprint, and question_version.",
                 "Ask one plain-language question per required_inputs item. Attestation and install approval questions must be y/n with default=false. Never recommend answering yes unless the stated condition is actually true.",
+                "Never ask the operator to construct JSON, YAML, TOML, an environment-variable payload, request headers, a route contract, a fixture manifest, hashes, or an evidence document. Ask separately for each atomic user-owned fact or secret. Bind atomic answers directly; implementation must assemble all serialized objects and generated technical artifacts.",
+                "Do not ask for a provider, model, endpoint, region, resource ID, or authentication mode when the approved provider reference or project configuration already determines it. Ask a short choice question only when a genuine operator-owned choice remains. If official provider research is incomplete, route that work to provider_research instead of asking the operator to research or encode the contract.",
+                "For reusable API keys, access tokens, and account credentials, use persistence='project'. Use run or one_time only when the credential is explicitly temporary, short-lived, or single-use.",
+                "For every external-service credential, how_to_obtain must be practical for a first-time user: include the official HTTPS console or documentation URL, name the exact product/service and model/resource/permission that must be enabled, and give plain-language steps to create or copy the requested field. Focus this section on obtaining the answer; generic phrases such as 'use an approved key source' and storage/logging warnings are not acquisition instructions.",
+                "For authorized test media, ask for the actual media/reference paths and a plain-language rights attestation. The program must calculate hashes, duration, language metadata when detectable, and generate the fixture manifest itself.",
                 "Group all project-local missing software into one install_approval item whose validation.runtime_manifest contains the full pinned tool list. Do not ask the user for executable paths, versions, or hashes that the runtime manager can derive.",
                 "Install bindings must set input_key to runtime.<tool_id> and select runtime_path, version, or sha256. Other bindings may omit input_key to use the request's own key.",
                 "For an authorized video fixture, ask one attestation question only: '你是否确认：你或项目团队拥有该视频，或已获得权利人的明确授权，可以下载、处理、生成衍生内容，并长期用于自动化测试？' Bind it to the source URL input through validation.subject.source_url_input_key; do not separately ask for the authorization basis or evidence file.",

@@ -1582,6 +1582,15 @@ project-scoped answers. Ordinary/private inputs are stored in the Git-ignored
 `.auto-agents/operator/secrets.env`. Both files are mode `0600` on POSIX.
 Secrets are never written to prompts, run state, task plans, or logs.
 
+Generated questions expose user decisions and values, not implementation formats. For
+example, the operator enters one API key or access token at a time; implementation code
+constructs provider JSON, headers, route contracts, fixture manifests, hashes, and evidence
+files. A reusable credential is project-scoped so later runs can reuse it. Credential prompts
+must link to the official console or documentation, name the exact service/model/resource or
+permission to enable, and explain in plain language where to create or copy the requested
+field. Vague directions such as “obtain it from an approved key source” are rejected and
+regenerated.
+
 Secret echo is configurable with `--secret-echo auto|visible|hidden`. `auto`
 hides secret input and shows ordinary input. Passing a secret directly through
 `--value` is rejected to avoid shell history; use interactive input,

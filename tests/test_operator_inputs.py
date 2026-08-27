@@ -794,6 +794,244 @@ class OperatorInputStoreTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed["decision"], "WAIT_USER")
 
+    def test_preflight_rejects_serialized_credential_question(self):
+        request = _request(
+            key="remote_asr.credentials",
+            kind="secret",
+            question="请提供远程 ASR 测试账号凭据 JSON。",
+            purpose="执行真实远程 ASR 系统边界证明。",
+            why_required="没有凭据不能调用真实识别服务。",
+            how_to_obtain=[
+                "从已批准的远程 ASR 测试账号密钥源取得，不写入仓库或日志。"
+            ],
+            recommended_answer="提供最小权限测试凭据。",
+            persistence="run",
+            sensitivity="secret",
+            validation={},
+            bindings=[
+                {
+                    "env": "TEST_REMOTE_ASR_CREDENTIALS",
+                    "projection": "value",
+                }
+            ],
+            subject_fingerprint="remote-asr-credentials-v1",
+        )
+
+        issue = Orchestrator._evidence_preflight_protocol_issue(
+            {
+                "decision": "WAIT_USER",
+                "reason": "real credentials are required",
+                "required_inputs": [request.to_dict()],
+                "required_mutations": [],
+            }
+        )
+
+        self.assertIn("construct a serialization", issue)
+        self.assertIn("atomic secret", issue)
+
+    def test_preflight_rejects_vague_credential_acquisition_help(self):
+        request = _request(
+            key="remote_asr.api_key",
+            kind="secret",
+            question="请输入远程 ASR 的 API Key。",
+            purpose="调用真实远程 ASR 测试账号。",
+            why_required="真实系统边界证明需要一次真实识别。",
+            how_to_obtain=["从获批准的密钥源取得。"],
+            recommended_answer="请输入测试账号的 API Key。",
+            persistence="project",
+            sensitivity="secret",
+            validation={},
+            bindings=[
+                {
+                    "env": "TEST_REMOTE_ASR_API_KEY",
+                    "projection": "value",
+                }
+            ],
+            subject_fingerprint="remote-asr-api-key-v1",
+        )
+
+        issue = Orchestrator._evidence_preflight_protocol_issue(
+            {
+                "decision": "WAIT_USER",
+                "reason": "real credentials are required",
+                "required_inputs": [request.to_dict()],
+                "required_mutations": [],
+            }
+        )
+
+        self.assertIn("vague how_to_obtain", issue)
+        self.assertIn("official HTTPS", issue)
+
+    def test_preflight_rejects_unnamed_credential_bundle(self):
+        request = _request(
+            key="remote_asr.credentials",
+            kind="secret",
+            question="请输入远程 ASR 测试账号凭据。",
+            purpose="调用真实远程 ASR 测试账号。",
+            why_required="真实系统边界证明需要一次真实识别。",
+            how_to_obtain=[
+                "访问服务控制台：https://provider.example.com/console",
+                "开通录音文件识别服务并创建测试凭据。",
+            ],
+            recommended_answer="输入测试账号凭据。",
+            persistence="project",
+            sensitivity="secret",
+            validation={},
+            bindings=[],
+            subject_fingerprint="remote-asr-credentials-v1",
+        )
+
+        issue = Orchestrator._evidence_preflight_protocol_issue(
+            {
+                "decision": "WAIT_USER",
+                "reason": "real credentials are required",
+                "required_inputs": [request.to_dict()],
+                "required_mutations": [],
+            }
+        )
+
+        self.assertIn("multiple or unnamed credential fields", issue)
+        self.assertIn("one named field", issue)
+
+    def test_preflight_accepts_atomic_credential_with_actionable_help(self):
+        request = _request(
+            key="remote_asr.api_key",
+            kind="secret",
+            question="请输入豆包语音录音文件识别的 API Key。",
+            purpose="调用已批准的真实远程 ASR 测试账号。",
+            why_required="真实系统边界证明需要一次真实识别。",
+            how_to_obtain=[
+                "访问火山引擎豆包语音控制台：https://console.volcengine.com/speech/service/8",
+                "开通语音识别大模型录音文件极速版和 volc.bigasr.auc_turbo 资源。",
+                "在控制台的 API Key 页面创建测试 Key，然后复制这里要求的 API Key。",
+            ],
+            recommended_answer="粘贴刚创建的测试 API Key。",
+            persistence="project",
+            sensitivity="secret",
+            validation={},
+            bindings=[
+                {
+                    "env": "TEST_REMOTE_ASR_API_KEY",
+                    "projection": "value",
+                }
+            ],
+            subject_fingerprint="remote-asr-api-key-v1",
+        )
+
+        issue = Orchestrator._evidence_preflight_protocol_issue(
+            {
+                "decision": "WAIT_USER",
+                "reason": "real credentials are required",
+                "required_inputs": [request.to_dict()],
+                "required_mutations": [],
+            }
+        )
+
+        self.assertEqual(issue, "")
+
+    def test_preflight_rejects_operator_generated_route_contract(self):
+        request = _request(
+            key="remote_asr.route_contract",
+            kind="path",
+            question="请提供已批准的远程 ASR 路由合同 JSON 文件。",
+            purpose="将路由合同注入验证门禁。",
+            why_required="验证需要固定模型和端点。",
+            how_to_obtain=["在 .data 目录中手工创建该合同。"],
+            recommended_answer="输入合同文件路径。",
+            persistence="project",
+            sensitivity="private",
+            validation={"must_exist": True},
+            bindings=[],
+            subject_fingerprint="remote-asr-route-v1",
+        )
+
+        issue = Orchestrator._evidence_preflight_protocol_issue(
+            {
+                "decision": "WAIT_USER",
+                "reason": "route evidence is required",
+                "required_inputs": [request.to_dict()],
+                "required_mutations": [],
+            }
+        )
+
+        self.assertIn("serialization", issue)
+
+    def test_preflight_prompt_requires_user_focused_acquisition_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            prompt = orchestrator._build_evidence_preflight_prompt(
+                orchestrator._load_tasks_from_plan()[0]
+            )
+
+        self.assertIn("Never ask the operator to construct JSON", prompt)
+        self.assertIn("official HTTPS console or documentation URL", prompt)
+        self.assertIn("exact product/service and model/resource/permission", prompt)
+        self.assertIn("persistence='project'", prompt)
+
+    def test_reconcile_reopens_persisted_unusable_question_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            orchestrator = Orchestrator(project)
+            state = load_run_state(project)
+            request = _request(
+                key="remote_asr.credentials",
+                kind="secret",
+                question="请提供远程 ASR 凭据 JSON。",
+                purpose="执行真实远程 ASR 验证。",
+                why_required="真实验证需要远程账号。",
+                how_to_obtain=["从批准的密钥源取得。"],
+                persistence="run",
+                sensitivity="secret",
+                validation={},
+                bindings=[
+                    {
+                        "env": "TEST_REMOTE_ASR_CREDENTIALS",
+                        "projection": "value",
+                    }
+                ],
+                task_id="task-001",
+                subject_fingerprint="remote-asr-credentials-v1",
+            )
+            task = TaskSpec(
+                task_id="task-001",
+                title="Remote ASR",
+                description="Prove the remote boundary.",
+                acceptance=["Real ASR succeeds."],
+                status="waiting_user",
+                required_inputs=[request.to_dict()],
+                operator_input_bindings=[
+                    {
+                        "input_key": request.key,
+                        "env": "TEST_REMOTE_ASR_CREDENTIALS",
+                        "projection": "value",
+                    }
+                ],
+                evidence_preflight={
+                    "decision": "WAIT_USER",
+                    "required_inputs": [request.to_dict()],
+                },
+            )
+            state.status = "waiting_user"
+            state.tasks = [task]
+            state.pending_input_requests = [request.to_dict()]
+            state.active_input_request_id = request.request_id
+
+            changed = orchestrator._reconcile_orphaned_waiting_user_tasks(
+                state, [task]
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.pending_input_requests, [])
+            self.assertEqual(state.active_input_request_id, "")
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(task.required_inputs, [])
+            self.assertEqual(task.operator_input_bindings, [])
+            self.assertEqual(task.evidence_preflight, {})
+
     def test_semantic_target_approval_requires_structured_input(self):
         issue = Orchestrator._evidence_preflight_protocol_issue(
             {
