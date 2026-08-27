@@ -7694,7 +7694,16 @@ class Orchestrator:
         if ancestor.returncode != 0:
             return False
         diff = subprocess.run(
-            ["git", "diff", "--name-only", source, target, "--"],
+            [
+                "git",
+                "log",
+                "-m",
+                "--format=",
+                "--name-only",
+                "--no-renames",
+                f"{source}..{target}",
+                "--",
+            ],
             cwd=str(self.project_root),
             text=True,
             encoding="utf-8",
@@ -7704,7 +7713,7 @@ class Orchestrator:
             return False
         allowed = self._planning_baseline_allowed_paths()
         paths = [line.strip() for line in diff.stdout.splitlines() if line.strip()]
-        return bool(paths) and all(
+        return all(
             path.startswith(".auto-agents/") or path in allowed
             for path in paths
         )
@@ -7824,13 +7833,22 @@ class Orchestrator:
         checkpoint = (
             dict(raw_checkpoint) if isinstance(raw_checkpoint, dict) else {}
         )
+        checkpoint_head = str(checkpoint.get("head", "")).strip()
+        current_head = head_ref(self.project_root)
+        checkpoint_worktree = str(checkpoint.get("worktree", "")).strip()
         if (
             str(checkpoint.get("stage", "")).strip() != "implement"
-            or str(checkpoint.get("head", "")).strip()
-            != head_ref(self.project_root)
-            or not str(checkpoint.get("worktree", "")).strip()
-            or str(checkpoint.get("worktree", "")).strip()
-            != worktree_fingerprint(self.project_root)
+            or not checkpoint_head
+            or not current_head
+            or (
+                checkpoint_head != current_head
+                and not self._head_transition_contains_only_planning_artifacts(
+                    checkpoint_head,
+                    current_head,
+                )
+            )
+            or not checkpoint_worktree
+            or checkpoint_worktree != worktree_fingerprint(self.project_root)
         ):
             return []
 
@@ -7853,17 +7871,51 @@ class Orchestrator:
 
         active_ids = {task.task_id for task in tasks}
         ready = self._implementation_ready_markers(state)
-        retry_ids = set(self._parallel_sequential_retry_ids(state))
-        owner_ids = [
-            task_id
-            for task_id in routed_ids
-            if task_id not in active_ids
-            and (
+        retry_ids = self._parallel_sequential_retry_ids(state)
+        attempt_refs = self._task_attempt_base_refs(state)
+        provenance: Dict[str, Set[str]] = {}
+
+        def add_owner(task_id: object, source: str) -> None:
+            normalized = str(task_id or "").strip()
+            if not normalized or normalized in active_ids:
+                return
+            provenance.setdefault(normalized, set()).add(source)
+
+        for task_id in routed_ids:
+            if (
                 bool(ready.get(task_id))
                 or task_id in retry_ids
                 or task_id in state.task_failure_checkpoints
-            )
-        ]
+                or task_id in attempt_refs
+                or int(state.agent_attempts.get(f"implement-{task_id}", 0) or 0)
+                > 0
+            ):
+                add_owner(task_id, "recovery_route")
+        for task_id, marker in ready.items():
+            if bool(marker):
+                add_owner(task_id, "implementation_ready")
+        for task_id in retry_ids:
+            add_owner(task_id, "sequential_retry")
+        for task_id, failure_checkpoint in state.task_failure_checkpoints.items():
+            if isinstance(failure_checkpoint, dict) and (
+                bool(failure_checkpoint.get("has_candidate_changes"))
+                or bool(failure_checkpoint.get("changed_paths"))
+                or bool(failure_checkpoint.get("ref"))
+            ):
+                add_owner(task_id, "failure_checkpoint")
+        for task_id in attempt_refs:
+            add_owner(task_id, "attempt_base_ref")
+        for stage_key, attempts in state.agent_attempts.items():
+            if (
+                stage_key.startswith("implement-")
+                and int(attempts or 0) > 0
+            ):
+                add_owner(
+                    stage_key.removeprefix("implement-"),
+                    "implementation_attempt",
+                )
+
+        owner_ids = sorted(provenance)
         paths = sorted(set(self._changed_paths_excluding_agent_instructions()))
         if not owner_ids or not paths:
             return []
@@ -7871,7 +7923,7 @@ class Orchestrator:
         records = self._retained_worktree_ownership_records(state)
         snapshot = {
             "version": 1,
-            "head_ref": head_ref(self.project_root),
+            "head_ref": checkpoint_head,
             "worktree_fingerprint": (
                 self._worktree_fingerprint_excluding_agent_instructions()
             ),
@@ -7880,6 +7932,8 @@ class Orchestrator:
                 paths
             ),
             "source": "legacy_self_repair_blocker_checkpoint",
+            "migrated_at_head_ref": current_head,
+            "checkpoint_worktree_fingerprint": checkpoint_worktree,
             "captured_at": utc_now_iso(),
         }
         captured: List[str] = []
@@ -7889,6 +7943,7 @@ class Orchestrator:
             records[task_id] = {
                 **snapshot,
                 "owner_task_id": task_id,
+                "owner_provenance": sorted(provenance[task_id]),
             }
             captured.append(task_id)
         if captured:
@@ -8123,7 +8178,7 @@ class Orchestrator:
         records = self._retained_worktree_ownership_records(state)
         for owner_id in owner_ids:
             records.pop(owner_id, None)
-            state.task_failure_checkpoints.pop(owner_id, None)
+            self._clear_task_failure_checkpoint(state, owner_id)
             state.agent_attempts.pop(f"implement-{owner_id}", None)
         if records:
             state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
@@ -10797,7 +10852,7 @@ class Orchestrator:
         if retry_state_changed or restored_requeue:
             save_run_state(self.project_root, state)
         if not self._parallel_sequential_retry_ids(state):
-            self._commit_planning_baseline_if_needed(tasks)
+            self._commit_planning_baseline_if_needed(tasks, state=state)
             self._refresh_retained_worktree_reconciliation_handoffs(
                 state,
                 tasks,
@@ -26490,7 +26545,97 @@ class Orchestrator:
             return
         commit_all(self.project_root, message)
 
-    def _commit_planning_baseline_if_needed(self, tasks: Iterable[TaskSpec]) -> None:
+    def _block_unowned_retained_worktree_before_planning_baseline(
+        self,
+        state: RunState,
+        tasks: Iterable[TaskSpec],
+        non_planning_paths: Iterable[str],
+    ) -> bool:
+        """Fail closed when self-repair cannot prove a dirty candidate owner."""
+
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        if (
+            str(blocker.get("owner", "")).strip() != "auto_agents"
+            or not str(blocker.get("self_repair_commit", "")).strip()
+            or state.current_stage != "implement"
+        ):
+            return False
+
+        allowed = self._planning_baseline_allowed_paths()
+        expected_paths = {
+            str(path).strip().replace("\\", "/")
+            for path in non_planning_paths
+            if str(path).strip()
+        }
+        if not expected_paths:
+            return False
+        for task in tasks:
+            if task.status == "done":
+                continue
+            marker = self._retained_worktree_reconciliation_marker(task)
+            raw_handoff = marker.get("worktree_handoff", {})
+            handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+            raw_paths = handoff.get("changed_paths", [])
+            if not isinstance(raw_paths, list):
+                continue
+            owned_paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+                and str(path).strip().replace("\\", "/") not in allowed
+            }
+            if (
+                owned_paths == expected_paths
+                and self._retained_worktree_snapshot_matches(
+                    handoff,
+                    allow_pending_planning_changes=True,
+                )
+            ):
+                return False
+
+        reason = (
+            "auto_agents cannot advance the planning baseline while "
+            "non-planning changes lack an exact retained-worktree "
+            "reconciliation handoff"
+        )
+        blocker.update(
+            {
+                "owner": "auto_agents",
+                "category": "orphaned_retained_worktree",
+                "status": "blocked",
+                "reason": reason,
+                "planning_baseline_rejection": {
+                    "head": head_ref(self.project_root),
+                    "worktree": (
+                        self._worktree_fingerprint_excluding_agent_instructions()
+                    ),
+                    "changed_paths": sorted(expected_paths),
+                    "updated_at": utc_now_iso(),
+                },
+                "updated_at": utc_now_iso(),
+            }
+        )
+        state.active_blocker = blocker
+        state.status = "blocked"
+        state.last_error = reason
+        save_run_state(self.project_root, state)
+        self.logger.error(
+            "[recovery] refused planning baseline without retained ownership "
+            "paths=%s",
+            len(expected_paths),
+        )
+        return True
+
+    def _commit_planning_baseline_if_needed(
+        self,
+        tasks: Iterable[TaskSpec],
+        *,
+        state: Optional[RunState] = None,
+    ) -> None:
         changes = changed_files(self.project_root)
         if not changes:
             return
@@ -26518,6 +26663,21 @@ class Orchestrator:
             only_known = False
 
         if not has_planning_changes:
+            return
+
+        if (
+            not only_known
+            and state is not None
+            and self._block_unowned_retained_worktree_before_planning_baseline(
+                state,
+                task_list,
+                (
+                    path
+                    for path in self._changed_paths_excluding_agent_instructions()
+                    if path not in allowed
+                ),
+            )
+        ):
             return
 
         if only_known:

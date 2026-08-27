@@ -2780,6 +2780,325 @@ class RetryFlowTests(unittest.TestCase):
                 "retained_worktree_reconciled",
             )
 
+    def test_self_repair_migrates_legacy_orphan_after_planning_head_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "retained.txt", "before\n")
+            commit_all(project_root, "test: candidate baseline")
+
+            write_text(project_root / "retained.txt", "retained candidate\n")
+            checkpoint_head = head_ref(project_root)
+            checkpoint_worktree = worktree_fingerprint(project_root)
+
+            planning_path = (
+                project_root / ".auto-agents" / "docs" / "project_brief.md"
+            )
+            write_text(planning_path, "# Replacement planning baseline\n")
+            subprocess.run(
+                ["git", "add", ".auto-agents/docs/project_brief.md"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "-m",
+                    "docs: advance replacement plan",
+                    "--",
+                    ".auto-agents/docs/project_brief.md",
+                ],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            current_head = head_ref(project_root)
+            self.assertNotEqual(current_head, checkpoint_head)
+            self.assertEqual(
+                worktree_fingerprint(project_root),
+                checkpoint_worktree,
+            )
+
+            replacement = TaskSpec(
+                task_id="replacement-task",
+                title="Replacement",
+                description="Implement the active replacement contract.",
+                acceptance=["The active contract passes."],
+                status="pending",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [replacement.to_dict()]},
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.tasks = [replacement]
+            state.resume_context["implementation_ready_tasks"] = {
+                "retired-ready": True,
+                "retired-not-ready": False,
+                replacement.task_id: True,
+            }
+            state.resume_context["parallel_sequential_retry_tasks"] = [
+                "retired-retry"
+            ]
+            state.resume_context["task_attempt_base_refs"] = {
+                "retired-base-ref": checkpoint_head,
+            }
+            state.agent_attempts["implement-retired-attempt"] = 1
+            state.task_failure_checkpoints["retired-checkpoint"] = {
+                "has_candidate_changes": True,
+                "changed_paths": ["retained.txt"],
+            }
+            state.last_recovery_route = {}
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "orphaned_retained_worktree",
+                "status": "blocked",
+                "checkpoint": {
+                    "stage": "implement",
+                    "head": checkpoint_head,
+                    "worktree": checkpoint_worktree,
+                },
+            }
+            save_run_state(project_root, state)
+
+            orchestrator = Orchestrator(project_root)
+            state = orchestrator.mark_self_repair_applied("repair-commit")
+            self.assertTrue(orchestrator._resume_blocked_run(state))
+
+            recovery = next(
+                task
+                for task in state.tasks
+                if orchestrator._is_retained_worktree_reconciliation_task(task)
+            )
+            marker = orchestrator._retained_worktree_reconciliation_marker(
+                recovery
+            )
+            owner_ids = [
+                "retired-attempt",
+                "retired-base-ref",
+                "retired-checkpoint",
+                "retired-ready",
+                "retired-retry",
+            ]
+            self.assertEqual(marker["source_task_ids"], owner_ids)
+            self.assertEqual(marker["source_head_refs"], [checkpoint_head])
+            self.assertEqual(
+                marker["worktree_handoff"]["head_ref"],
+                current_head,
+            )
+            self.assertTrue(
+                orchestrator._retained_worktree_reconciliation_handoff_matches(
+                    recovery
+                )
+            )
+            self.assertNotIn(
+                replacement.task_id,
+                marker["source_task_ids"],
+            )
+            self.assertNotIn(
+                "retired-not-ready",
+                marker["source_task_ids"],
+            )
+
+            before_reconciliation_baseline = head_ref(project_root)
+            orchestrator._commit_planning_baseline_if_needed(
+                state.tasks,
+                state=state,
+            )
+            self.assertNotEqual(
+                head_ref(project_root),
+                before_reconciliation_baseline,
+            )
+            orchestrator._refresh_retained_worktree_reconciliation_handoffs(
+                state,
+                state.tasks,
+            )
+            self.assertTrue(
+                orchestrator._retained_worktree_reconciliation_handoff_matches(
+                    recovery
+                )
+            )
+
+            orchestrator._complete_retained_worktree_reconciliation(
+                state,
+                recovery,
+            )
+
+            self.assertNotIn(
+                "retained_worktree_ownership",
+                state.resume_context,
+            )
+            self.assertNotIn(
+                "parallel_sequential_retry_tasks",
+                state.resume_context,
+            )
+            self.assertNotIn(
+                "retired-base-ref",
+                state.resume_context.get("task_attempt_base_refs", {}),
+            )
+            self.assertNotIn(
+                "retired-checkpoint",
+                state.task_failure_checkpoints,
+            )
+            self.assertNotIn(
+                "implement-retired-attempt",
+                state.agent_attempts,
+            )
+
+    def test_legacy_orphan_migration_rejects_nonplanning_head_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "retained.txt", "before\n")
+            commit_all(project_root, "test: candidate baseline")
+
+            write_text(project_root / "retained.txt", "retained candidate\n")
+            checkpoint_head = head_ref(project_root)
+            checkpoint_worktree = worktree_fingerprint(project_root)
+            write_text(project_root / "unrelated.py", "VALUE = 1\n")
+            subprocess.run(
+                ["git", "add", "unrelated.py"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "-m",
+                    "feat: unrelated product change",
+                    "--",
+                    "unrelated.py",
+                ],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            (project_root / "unrelated.py").unlink()
+            subprocess.run(
+                ["git", "add", "--update", "unrelated.py"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "-m",
+                    "revert: unrelated product change",
+                    "--",
+                    "unrelated.py",
+                ],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            planning_path = (
+                project_root / ".auto-agents" / "docs" / "project_brief.md"
+            )
+            write_text(planning_path, "# Later replacement plan\n")
+            subprocess.run(
+                ["git", "add", ".auto-agents/docs/project_brief.md"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "commit",
+                    "-m",
+                    "docs: advance replacement plan",
+                    "--",
+                    ".auto-agents/docs/project_brief.md",
+                ],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                worktree_fingerprint(project_root),
+                checkpoint_worktree,
+            )
+
+            replacement = TaskSpec(
+                task_id="replacement-task",
+                title="Replacement",
+                description="Implement the active replacement contract.",
+                acceptance=["The active contract passes."],
+                status="pending",
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.tasks = [replacement]
+            state.resume_context["implementation_ready_tasks"] = {
+                "retired-owner": True,
+            }
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [replacement.to_dict()]},
+            )
+            blocker = {
+                "owner": "auto_agents",
+                "self_repair_commit": "repair-commit",
+                "checkpoint": {
+                    "stage": "implement",
+                    "head": checkpoint_head,
+                    "worktree": checkpoint_worktree,
+                },
+            }
+            state.active_blocker = blocker
+
+            orchestrator = Orchestrator(project_root)
+            recovery_id = (
+                orchestrator._schedule_orphaned_retained_worktree_reconciliation(
+                    state,
+                    state.tasks,
+                    legacy_blocker=blocker,
+                )
+            )
+
+            self.assertEqual(recovery_id, "")
+            self.assertNotIn(
+                "retained_worktree_ownership",
+                state.resume_context,
+            )
+            before_planning_baseline = head_ref(project_root)
+
+            orchestrator._commit_planning_baseline_if_needed(
+                state.tasks,
+                state=state,
+            )
+
+            self.assertEqual(head_ref(project_root), before_planning_baseline)
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(
+                state.active_blocker["category"],
+                "orphaned_retained_worktree",
+            )
+            self.assertEqual(
+                state.active_blocker["planning_baseline_rejection"][
+                    "changed_paths"
+                ],
+                ["retained.txt"],
+            )
+
     def test_pending_task_does_not_resume_from_orchestrator_only_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
