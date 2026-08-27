@@ -7240,6 +7240,26 @@ class Orchestrator:
         if not any(task.task_id == owner.task_id for task in lineage):
             return []
 
+        completion_reconciliations = (
+            self._reconcile_completed_lineage_terminal_recovery(
+                state,
+                tasks,
+                owner,
+            )
+        )
+        current_route = (
+            state.last_recovery_route
+            if isinstance(state.last_recovery_route, dict)
+            else {}
+        )
+        if (
+            str(current_route.get("lineage_id", "")).strip() != lineage_id
+            or str(current_route.get("outcome", "")) != "exhausted"
+            or int(current_route.get("epoch", 0) or 0) != route_epoch
+            or int(current_route.get("round", 0) or 0) != terminal_round
+        ):
+            return completion_reconciliations
+
         terminal_entries: List[Tuple[TaskSpec, Dict[str, object]]] = []
         consumed_rounds: Set[int] = set()
         for task in lineage:
@@ -7264,10 +7284,10 @@ class Orchestrator:
                     terminal_entries.append((task, entry))
 
         if not terminal_entries or not consumed_rounds:
-            return []
+            return completion_reconciliations
         last_consumed_round = max(consumed_rounds)
         if terminal_round <= last_consumed_round + 1:
-            return []
+            return completion_reconciliations
 
         restored_task_ids: List[str] = []
         for task in lineage:
@@ -7297,6 +7317,7 @@ class Orchestrator:
             last_consumed_round,
         )
         return [
+            *completion_reconciliations,
             {
                 "lineage_id": lineage_id,
                 **reconciliation,
@@ -8461,13 +8482,22 @@ class Orchestrator:
             and not self_repair_resume
         ):
             return False
+        completion_reconciliations = (
+            self._reconcile_completed_terminal_recovery_lineages(
+                state,
+                state.tasks,
+            )
+        )
         terminal_route, terminal_task, terminal_owner = (
             self._active_terminal_recovery_route(state, state.tasks)
         )
-        if terminal_route:
+        if terminal_route or completion_reconciliations:
             # Persist any load-time repair from a newer signed terminal history
-            # before deciding whether the run may leave the blocker.
+            # or accepted task completion before deciding whether the run may
+            # leave the blocker.
             self._persist_tasks(state.tasks)
+            if completion_reconciliations:
+                save_run_state(self.project_root, state)
         policy_v5_resume = self._prepare_policy_v5_reported_infrastructure_resume(
             state,
             active_incident,
@@ -8573,7 +8603,7 @@ class Orchestrator:
                     terminal_owner,
                     terminal_route,
                 )
-                if not bool(resume_evidence["changed"]):
+                if not bool(resume_evidence["resume_allowed"]):
                     blocker["status"] = "blocked"
                     blocker["resume_attempts"] = int(
                         blocker.get("resume_attempts", 0) or 0
@@ -8606,8 +8636,8 @@ class Orchestrator:
                 blocker["recovery_resume_evidence"] = resume_evidence
                 self._persist_tasks(state.tasks)
                 self.logger.info(
-                    "[recovery] reopened lineage=%s epoch=%s after changed "
-                    "recovery evidence",
+                    "[recovery] reopened lineage=%s epoch=%s after new or "
+                    "previously unrecorded recovery evidence",
                     terminal_owner.task_id,
                     terminal_owner.recovery_epoch,
                 )
@@ -11276,6 +11306,11 @@ class Orchestrator:
                     continue
 
                 self._apply_parallel_task_snapshot(task, dict(result["task"]))
+                self._reconcile_completed_lineage_terminal_recovery(
+                    state,
+                    tasks,
+                    self._recovery_lineage_owner(tasks, task),
+                )
                 commit_sha = self._integrate_parallel_task_result(task, tasks, str(result["commit_sha"]))
                 task.commit_sha = commit_sha
                 integrated_paths.update(result_changed_paths)
@@ -11588,6 +11623,11 @@ class Orchestrator:
             ) from error
 
         task.status = "done"
+        self._reconcile_completed_lineage_terminal_recovery(
+            state,
+            tasks,
+            self._recovery_lineage_owner(tasks, task),
+        )
         self._clear_task_failure_checkpoint(state, task.task_id)
         self._clear_implementation_ready_marker(state, task)
         self._clear_task_attempt_base_ref(state, task)
@@ -12464,6 +12504,11 @@ class Orchestrator:
                 return dict(self._rebase_parallel_worker_paths(result, worktree_path))
 
             worker_task.status = "done"
+            worker._reconcile_completed_lineage_terminal_recovery(
+                worker_state,
+                worker_tasks,
+                worker._recovery_lineage_owner(worker_tasks, worker_task),
+            )
             worker_task.review_summary = str(gate_result["review"])
             worker._persist_tasks(worker_tasks)
             commit_message = worker_task.commit_message or worker.config.git.commit_message_template.format(
@@ -12705,6 +12750,11 @@ class Orchestrator:
                 task_payload = entry.get("task", {})
                 if isinstance(task_payload, dict):
                     self._apply_parallel_task_snapshot(task, task_payload)
+                    self._reconcile_completed_lineage_terminal_recovery(
+                        state,
+                        tasks,
+                        self._recovery_lineage_owner(tasks, task),
+                    )
                 commit_sha = self._integrate_parallel_task_result(
                     task,
                     tasks,
@@ -15135,10 +15185,228 @@ class Orchestrator:
             owner,
             route,
         )
-        if not bool(resume_evidence["changed"]):
+        if not bool(resume_evidence["resume_allowed"]):
             return False
         self._reopen_terminal_recovery_epoch(state, tasks, owner)
         return True
+
+    @staticmethod
+    def _verified_completion_after_terminal_round(
+        owner: TaskSpec,
+        *,
+        epoch: int,
+        terminal_round: int,
+    ) -> Dict[str, object]:
+        """Return the accepted verification that supersedes a terminal record.
+
+        A passing verification alone is not authoritative: review and proof gates
+        can still reject the task after verification.  ``done`` is the durable
+        completion boundary, and tasks with requirement proofs must retain every
+        proof as verified before their older recovery terminal can be retired.
+        """
+
+        if owner.status != "done":
+            return {}
+        if owner.requirement_proofs and any(
+            not isinstance(proof, dict)
+            or str(proof.get("status", "")).strip() != "verified"
+            for proof in owner.requirement_proofs
+        ):
+            return {}
+
+        verification_results: List[
+            Tuple[int, int, str, Dict[str, object]]
+        ] = []
+        for history_index, entry in enumerate(owner.verify_history):
+            if not isinstance(entry, dict):
+                continue
+            decision = str(entry.get("decision", "")).strip().lower()
+            if decision not in {"pass", "fail"}:
+                continue
+            try:
+                entry_epoch = max(0, int(entry.get("recovery_epoch", 0) or 0))
+                entry_round = max(0, int(entry.get("recovery_round", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            if entry_epoch != epoch or entry_round < terminal_round:
+                continue
+            verification_results.append(
+                (entry_round, history_index, decision, entry)
+            )
+
+        if not verification_results:
+            return {}
+        completion_round, history_index, decision, completion = max(
+            verification_results,
+            key=lambda item: item[:2],
+        )
+        if decision != "pass":
+            return {}
+        return {
+            "task_id": owner.task_id,
+            "epoch": epoch,
+            "verification_round": completion_round,
+            "verify_history_index": history_index,
+            "candidate_fingerprint": str(
+                completion.get("candidate_fingerprint", "")
+            ).strip(),
+        }
+
+    def _reconcile_completed_lineage_terminal_recovery(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        owner: TaskSpec,
+    ) -> List[Dict[str, object]]:
+        """Supersede terminal history made stale by accepted task completion."""
+
+        epoch = int(owner.recovery_epoch)
+        completion = self._verified_completion_after_terminal_round(
+            owner,
+            epoch=epoch,
+            terminal_round=0,
+        )
+        if not completion:
+            return []
+        completion_round = int(completion["verification_round"])
+        reconciliation_base = {
+            "outcome": "superseded_by_verified_completion",
+            "epoch": epoch,
+            "verification_round": completion_round,
+            "verification_task_id": owner.task_id,
+            "verify_history_index": int(completion["verify_history_index"]),
+        }
+        candidate_fingerprint = str(
+            completion.get("candidate_fingerprint", "")
+        ).strip()
+        if candidate_fingerprint:
+            reconciliation_base["candidate_fingerprint"] = candidate_fingerprint
+
+        reconciled: List[Dict[str, object]] = []
+        lineage_tasks = self._recovery_lineage_tasks(tasks, owner)
+        for lineage_task in lineage_tasks:
+            for entry in lineage_task.recovery_history:
+                if (
+                    not isinstance(entry, dict)
+                    or entry.get(_RECOVERY_CURSOR_RECONCILIATION_KEY)
+                    or str(entry.get("result", ""))
+                    not in {"exhausted", "judge_stopped"}
+                ):
+                    continue
+                try:
+                    entry_epoch = max(0, int(entry.get("epoch", 0) or 0))
+                    entry_round = max(0, int(entry.get("round", 0) or 0))
+                except (TypeError, ValueError):
+                    continue
+                if entry_epoch != epoch or entry_round > completion_round:
+                    continue
+                reconciliation = {
+                    **reconciliation_base,
+                    "terminal_round": entry_round,
+                }
+                entry[_RECOVERY_CURSOR_RECONCILIATION_KEY] = dict(
+                    reconciliation
+                )
+                reconciled.append(
+                    {
+                        "lineage_id": owner.task_id,
+                        "task_id": lineage_task.task_id,
+                        "terminal_outcome": str(entry.get("result", "")),
+                        **reconciliation,
+                    }
+                )
+
+        route = (
+            state.last_recovery_route
+            if isinstance(state.last_recovery_route, dict)
+            else {}
+        )
+        lineage_task_ids = {task.task_id for task in lineage_tasks}
+        route_lineage_id = str(route.get("lineage_id", "")).strip()
+        route_task_id = str(route.get("task_id", "")).strip()
+        route_matches = False
+        if (
+            (
+                route_lineage_id == owner.task_id
+                or (
+                    not route_lineage_id
+                    and route_task_id in lineage_task_ids
+                )
+            )
+            and str(route.get("outcome", ""))
+            in {"exhausted", "judge_stopped"}
+        ):
+            try:
+                route_epoch = max(0, int(route.get("epoch", 0) or 0))
+                route_round = max(0, int(route.get("round", 0) or 0))
+            except (TypeError, ValueError):
+                route_epoch = -1
+                route_round = completion_round + 1
+            route_matches = bool(
+                route_epoch == epoch and route_round <= completion_round
+            )
+        if route_matches:
+            state.last_recovery_route = {}
+            blocker = (
+                state.active_blocker
+                if isinstance(state.active_blocker, dict)
+                else {}
+            )
+            blocker_reason = str(blocker.get("reason", "")).strip()
+            if (
+                str(blocker.get("category", ""))
+                in self.RECOVERY_ACTION_CATEGORIES
+                or blocker_reason.startswith(
+                    f"Recovery is terminal for {owner.task_id};"
+                )
+                or blocker_reason.startswith(
+                    f"Recovery stopped for {owner.task_id};"
+                )
+            ):
+                self._clear_run_blocker(state)
+            if not reconciled:
+                reconciled.append(
+                    {
+                        "lineage_id": owner.task_id,
+                        "task_id": str(route.get("task_id", "")).strip()
+                        or owner.task_id,
+                        "terminal_outcome": str(route.get("outcome", "")),
+                        "terminal_round": int(route.get("round", 0) or 0),
+                        **reconciliation_base,
+                    }
+                )
+
+        if reconciled:
+            self.logger.info(
+                "[recovery] superseded terminal history after verified "
+                "completion lineage=%s epoch=%s verification_round=%s records=%s",
+                owner.task_id,
+                epoch,
+                completion_round,
+                len(reconciled),
+            )
+        return reconciled
+
+    def _reconcile_completed_terminal_recovery_lineages(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> List[Dict[str, object]]:
+        reconciled: List[Dict[str, object]] = []
+        seen_lineages: Set[str] = set()
+        for candidate in tasks:
+            candidate_owner = self._recovery_lineage_owner(tasks, candidate)
+            if candidate_owner.task_id in seen_lineages:
+                continue
+            seen_lineages.add(candidate_owner.task_id)
+            reconciled.extend(
+                self._reconcile_completed_lineage_terminal_recovery(
+                    state,
+                    tasks,
+                    candidate_owner,
+                )
+            )
+        return reconciled
 
     def _terminal_recovery_route_for_owner(
         self,
@@ -15146,6 +15414,11 @@ class Orchestrator:
         tasks: List[TaskSpec],
         owner: TaskSpec,
     ) -> Dict[str, object]:
+        self._reconcile_completed_lineage_terminal_recovery(
+            state,
+            tasks,
+            owner,
+        )
         epoch = int(owner.recovery_epoch)
         route = (
             dict(state.last_recovery_route)
@@ -15347,6 +15620,7 @@ class Orchestrator:
 
         if not tasks:
             return {}, None, None
+        self._reconcile_completed_terminal_recovery_lineages(state, tasks)
         by_id = {task.task_id: task for task in tasks}
         route = (
             state.last_recovery_route
@@ -15452,9 +15726,17 @@ class Orchestrator:
             and current_prerequisite
             and previous_prerequisite != current_prerequisite
         )
+        evidence_unknown = not previous_evidence or not current_evidence
         return {
             "changed": evidence_changed or prerequisite_changed,
+            "resume_allowed": (
+                evidence_changed
+                or prerequisite_changed
+                or evidence_unknown
+            ),
             "evidence_changed": evidence_changed,
+            "evidence_unknown": evidence_unknown,
+            "evidence_comparable": not evidence_unknown,
             "prerequisite_changed": prerequisite_changed,
             "previous_evidence_fingerprint": previous_evidence,
             "current_evidence_fingerprint": current_evidence,
@@ -15749,7 +16031,7 @@ class Orchestrator:
             owner,
             route,
         )
-        if bool(resume_evidence["changed"]):
+        if bool(resume_evidence["resume_allowed"]):
             return False
 
         reason = str(route.get("reason", "")).strip() or (

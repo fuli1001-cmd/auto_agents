@@ -8792,6 +8792,360 @@ class RetryFlowTests(unittest.TestCase):
                 task.recovery_history[-1],
             )
 
+    def test_done_lineage_later_pass_supersedes_stale_exhaustion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            candidate_fingerprint = "same-completed-candidate"
+            task = TaskSpec(
+                task_id="completed-contract",
+                title="Complete the observable contract",
+                description="Keep the completed proof authoritative.",
+                acceptance=["The observable proof passes."],
+                status="done",
+                recovery_epoch=0,
+                recovery_round=2,
+                requirement_proofs=[{"status": "verified"}],
+                verify_history=[
+                    {
+                        "attempt": 1,
+                        "decision": "fail",
+                        "recovery_epoch": 0,
+                        "recovery_round": 2,
+                        "candidate_fingerprint": candidate_fingerprint,
+                    },
+                    {
+                        "attempt": 2,
+                        "decision": "fail",
+                        "recovery_epoch": 0,
+                        "recovery_round": 2,
+                        "candidate_fingerprint": candidate_fingerprint,
+                    },
+                    {
+                        "attempt": 1,
+                        "decision": "pass",
+                        "recovery_epoch": 0,
+                        "recovery_round": 3,
+                        "candidate_fingerprint": candidate_fingerprint,
+                    },
+                ],
+                recovery_history=[
+                    {
+                        "epoch": 0,
+                        "round": 2,
+                        "result": "requeued",
+                    },
+                    {
+                        "epoch": 0,
+                        "round": 3,
+                        "result": "exhausted",
+                        "signature": "stale-terminal",
+                    },
+                    {
+                        "epoch": 0,
+                        "round": 4,
+                        "result": "exhausted",
+                        "signature": "stale-terminal",
+                        "recovery_cursor_reconciliation": {
+                            "outcome": "ignored_noncontiguous_exhaustion",
+                            "epoch": 0,
+                            "terminal_round": 4,
+                            "last_consumed_round": 2,
+                        },
+                    },
+                ],
+            )
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.tasks = [task]
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "lineage_id": task.task_id,
+                "epoch": 0,
+                "round": 3,
+                "outcome": "exhausted",
+                "evidence_fingerprint": "",
+                "reason": "the old verification failure repeated",
+            }
+            state.active_blocker = {
+                "owner": "target_project",
+                "category": "recovery_evidence_change_required",
+                "reason": (
+                    "Recovery is terminal for completed-contract; changed "
+                    "evidence is required before resume."
+                ),
+                "status": "blocked",
+            }
+
+            route, routed_task, owner = (
+                orchestrator._active_terminal_recovery_route(
+                    state,
+                    state.tasks,
+                )
+            )
+
+            self.assertEqual(route, {})
+            self.assertIsNone(routed_task)
+            self.assertIsNone(owner)
+            self.assertEqual(state.last_recovery_route, {})
+            self.assertEqual(state.active_blocker, {})
+            self.assertEqual(state.status, "pending")
+            reconciliation = task.recovery_history[1][
+                "recovery_cursor_reconciliation"
+            ]
+            self.assertEqual(
+                reconciliation["outcome"],
+                "superseded_by_verified_completion",
+            )
+            self.assertEqual(reconciliation["terminal_round"], 3)
+            self.assertEqual(reconciliation["verification_round"], 3)
+            self.assertEqual(
+                reconciliation["candidate_fingerprint"],
+                candidate_fingerprint,
+            )
+            self.assertEqual(
+                task.recovery_history[2]["recovery_cursor_reconciliation"][
+                    "outcome"
+                ],
+                "ignored_noncontiguous_exhaustion",
+            )
+            self.assertFalse(
+                orchestrator._restore_unchanged_terminal_recovery_blocker(
+                    state,
+                    state.tasks,
+                )
+            )
+
+    def test_done_lineage_reconciles_later_noncontiguous_exhaustion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="completed-after-recovery",
+                title="Complete after bounded recovery",
+                description="Retain successful completion evidence.",
+                acceptance=["The contract passes."],
+                status="done",
+                recovery_round=2,
+                verify_history=[
+                    {
+                        "attempt": 1,
+                        "decision": "pass",
+                        "recovery_epoch": 0,
+                        "recovery_round": 3,
+                    }
+                ],
+                recovery_history=[
+                    {"epoch": 0, "round": 2, "result": "requeued"},
+                    {"epoch": 0, "round": 3, "result": "exhausted"},
+                    {"epoch": 0, "round": 4, "result": "exhausted"},
+                ],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "lineage_id": task.task_id,
+                "epoch": 0,
+                "round": 4,
+                "outcome": "exhausted",
+            }
+
+            reconciled = (
+                orchestrator._reconcile_noncontiguous_recovery_exhaustion(
+                    state,
+                    state.tasks,
+                )
+            )
+
+            self.assertEqual(state.last_recovery_route, {})
+            self.assertEqual(len(reconciled), 2)
+            self.assertEqual(
+                task.recovery_history[1]["recovery_cursor_reconciliation"][
+                    "outcome"
+                ],
+                "superseded_by_verified_completion",
+            )
+            self.assertEqual(
+                task.recovery_history[2]["recovery_cursor_reconciliation"][
+                    "outcome"
+                ],
+                "ignored_noncontiguous_exhaustion",
+            )
+
+    def test_self_repair_persists_completed_terminal_recovery_supersession(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="completed-before-resume",
+                title="Keep accepted completion durable",
+                description="Do not revive an older terminal failure.",
+                acceptance=["The accepted proof remains complete."],
+                status="done",
+                recovery_round=2,
+                verify_history=[
+                    {
+                        "attempt": 1,
+                        "decision": "pass",
+                        "recovery_epoch": 0,
+                        "recovery_round": 3,
+                    }
+                ],
+                recovery_history=[
+                    {
+                        "epoch": 0,
+                        "round": 3,
+                        "result": "exhausted",
+                        "signature": "superseded-terminal",
+                    }
+                ],
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [task]
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "lineage_id": task.task_id,
+                "epoch": 0,
+                "round": 3,
+                "outcome": "exhausted",
+                "evidence_fingerprint": "",
+            }
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "stale_terminal_recovery_route",
+                "reason": "Terminal recovery was reconstructed after completion.",
+                "status": "blocked",
+            }
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(project_root, state)
+
+            marked = orchestrator.mark_self_repair_applied("repair123")
+            resumed = Orchestrator(project_root)
+            changed = resumed._resume_blocked_run(marked)
+
+            self.assertTrue(changed)
+            self.assertEqual(marked.status, "pending")
+            self.assertEqual(marked.last_recovery_route, {})
+            self.assertEqual(marked.tasks[0].status, "done")
+            self.assertEqual(
+                marked.tasks[0].recovery_history[0][
+                    "recovery_cursor_reconciliation"
+                ]["outcome"],
+                "superseded_by_verified_completion",
+            )
+            persisted_task = load_task_plan(project_root)["tasks"][0]
+            self.assertEqual(
+                persisted_task["recovery_history"][0][
+                    "recovery_cursor_reconciliation"
+                ]["outcome"],
+                "superseded_by_verified_completion",
+            )
+            self.assertFalse(
+                resumed._restore_unchanged_terminal_recovery_blocker(
+                    marked,
+                    marked.tasks,
+                )
+            )
+
+    def test_pending_lineage_keeps_unchanged_exhaustion_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="pending-contract",
+                title="Finish the pending contract",
+                description="Keep genuine exhaustion terminal.",
+                acceptance=["The pending proof passes."],
+                status="pending",
+                recovery_round=2,
+                recovery_history=[
+                    {"epoch": 0, "round": 1, "result": "requeued"},
+                    {"epoch": 0, "round": 2, "result": "requeued"},
+                    {
+                        "epoch": 0,
+                        "round": 3,
+                        "result": "exhausted",
+                        "signature": "active-terminal",
+                    },
+                ],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            terminal_fingerprint = orchestrator._recovery_evidence_fingerprint(
+                task,
+                state=state,
+                tasks=state.tasks,
+            )
+            task.recovery_history[-1][
+                "evidence_fingerprint"
+            ] = terminal_fingerprint
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "lineage_id": task.task_id,
+                "epoch": 0,
+                "round": 3,
+                "outcome": "exhausted",
+                "evidence_fingerprint": terminal_fingerprint,
+                "reason": "the bounded recovery budget is exhausted",
+            }
+
+            restored = orchestrator._restore_unchanged_terminal_recovery_blocker(
+                state,
+                state.tasks,
+            )
+
+            self.assertTrue(restored)
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(state.last_recovery_route["outcome"], "exhausted")
+            self.assertNotIn(
+                "recovery_cursor_reconciliation",
+                task.recovery_history[-1],
+            )
+
+    def test_missing_terminal_fingerprint_is_unknown_not_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="legacy-terminal",
+                title="Recover legacy terminal evidence",
+                description="Compare a legacy terminal record safely.",
+                acceptance=["The proof passes."],
+                status="pending",
+                recovery_round=2,
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            evidence = orchestrator._terminal_recovery_resume_evidence(
+                state,
+                state.tasks,
+                task,
+                task,
+                {
+                    "task_id": task.task_id,
+                    "lineage_id": task.task_id,
+                    "epoch": 0,
+                    "round": 3,
+                    "outcome": "exhausted",
+                    "evidence_fingerprint": "",
+                },
+            )
+
+            self.assertFalse(evidence["changed"])
+            self.assertTrue(evidence["evidence_unknown"])
+            self.assertFalse(evidence["evidence_comparable"])
+            self.assertTrue(evidence["resume_allowed"])
+
     def test_self_repair_requeued_contiguous_exhaustion_stays_requeued(
         self,
     ) -> None:
