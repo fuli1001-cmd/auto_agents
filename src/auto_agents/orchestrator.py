@@ -7871,6 +7871,30 @@ class Orchestrator:
                 ",".join(restored_retry_ids),
             )
         if (
+            str(terminal_route.get("outcome", "")) == "judge_stopped"
+            and terminal_task is not None
+            and terminal_owner is not None
+        ):
+            resume_evidence = self._terminal_recovery_resume_evidence(
+                state,
+                state.tasks,
+                terminal_task,
+                terminal_owner,
+                terminal_route,
+            )
+            if (
+                not bool(resume_evidence["changed"])
+                and self._reconcile_invalid_restored_recovery_stop(
+                    state,
+                    state.tasks,
+                    terminal_task,
+                    terminal_owner,
+                    terminal_route,
+                )
+            ):
+                if isinstance(state.active_blocker, dict):
+                    blocker = {**blocker, **dict(state.active_blocker)}
+        if (
             str(blocker.get("owner", "")) == "auto_agents"
             and str(blocker.get("status", "blocked")) != "retrying"
             and (had_persisted_blocker or legacy_self_repair_incident)
@@ -7879,15 +7903,6 @@ class Orchestrator:
             blocker["updated_at"] = utc_now_iso()
             state.active_blocker = blocker
             state.status = "blocked"
-            return False
-        if (
-            self_repair_resume
-            and str(terminal_route.get("outcome", "")) == "judge_stopped"
-            and self._restore_unchanged_terminal_recovery_blocker(
-                state,
-                state.tasks,
-            )
-        ):
             return False
         if self_repair_resume:
             requeued_task_ids = self._prepare_self_repair_task_retries(
@@ -7904,6 +7919,8 @@ class Orchestrator:
                 state.tasks,
             ):
                 return False
+            if isinstance(state.active_blocker, dict):
+                blocker = {**blocker, **dict(state.active_blocker)}
         if str(blocker.get("category", "")) in self.RECOVERY_ACTION_CATEGORIES:
             terminal_route, terminal_task, terminal_owner = (
                 self._active_terminal_recovery_route(state, state.tasks)
@@ -14765,6 +14782,265 @@ class Orchestrator:
             task.recovery_round = 0
         state.last_recovery_route = {}
 
+    def _validate_restored_recovery_stop(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        route: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Revalidate persisted STOP provenance before restoring its blocker."""
+
+        if str(route.get("outcome", "")).strip() != "judge_stopped":
+            return {
+                "valid": False,
+                "reason": "terminal route is not a judge_stopped recovery STOP",
+            }
+        if str(route.get("judge_decision", "")).strip() != "STOP":
+            return {
+                "valid": False,
+                "reason": "restored recovery STOP has no STOP judge decision",
+            }
+
+        reason = str(route.get("reason", "")).strip()
+        judge_source = str(route.get("judge_source", "")).strip()
+        blocker_owner = str(route.get("stop_owner", "")).strip()
+        category = str(route.get("stop_category", "")).strip()
+        raw_prerequisite_keys = route.get("prerequisite_keys", [])
+        raw_evidence_refs = route.get("evidence_refs", [])
+        if not isinstance(raw_prerequisite_keys, list) or not isinstance(
+            raw_evidence_refs,
+            list,
+        ):
+            return {
+                "valid": False,
+                "reason": (
+                    "restored recovery STOP prerequisites and evidence refs "
+                    "must be lists"
+                ),
+            }
+        prerequisite_keys = [
+            str(item).strip()
+            for item in raw_prerequisite_keys
+            if str(item).strip()
+        ]
+        evidence_refs = [
+            str(item).strip()
+            for item in raw_evidence_refs
+            if str(item).strip()
+        ]
+        prerequisite_fingerprint = str(
+            route.get("prerequisite_fingerprint", "")
+        ).strip()
+        engine_invariant = str(route.get("engine_invariant", "")).strip()
+        deterministic_stop = bool(
+            (
+                judge_source == "deterministic"
+                and reason.startswith("deterministic no-progress:")
+            )
+            or engine_invariant == "replan_split_depth_limit"
+            or (
+                reason.startswith("replan requested at split depth limit:")
+                and not prerequisite_keys
+                and not evidence_refs
+            )
+        )
+        if deterministic_stop:
+            if prerequisite_keys or evidence_refs or prerequisite_fingerprint:
+                return {
+                    "valid": False,
+                    "reason": (
+                        "deterministic recovery STOP unexpectedly declares "
+                        "provider prerequisites"
+                    ),
+                }
+            if blocker_owner not in {"", "target_project"}:
+                return {
+                    "valid": False,
+                    "reason": "deterministic recovery STOP has invalid ownership",
+                }
+            if category not in {"", "recovery_evidence_change_required"}:
+                return {
+                    "valid": False,
+                    "reason": "deterministic recovery STOP has invalid category",
+                }
+            return {
+                "valid": True,
+                "reason": "engine-generated deterministic recovery STOP",
+            }
+
+        if judge_source != "provider":
+            return {
+                "valid": False,
+                "reason": (
+                    "restored provider recovery STOP has invalid judge_source: "
+                    + (judge_source or "<empty>")
+                ),
+            }
+
+        validation = self._validate_recovery_stop(
+            state,
+            task,
+            owner,
+            reason,
+            int(route.get("round", 0) or 0),
+            {
+                "owner": blocker_owner,
+                "prerequisite_keys": prerequisite_keys,
+                "evidence_refs": evidence_refs,
+            },
+        )
+        if not bool(validation.get("valid")):
+            return validation
+        if blocker_owner != str(validation.get("owner", "")).strip():
+            return {
+                "valid": False,
+                "reason": "restored recovery STOP owner no longer matches evidence",
+            }
+        if category != str(validation.get("category", "")).strip():
+            return {
+                "valid": False,
+                "reason": "restored recovery STOP category no longer matches evidence",
+            }
+
+        current_prerequisite_fingerprint = (
+            self._recovery_prerequisite_fingerprint(
+                state,
+                tasks,
+                task,
+                owner,
+                prerequisite_keys=prerequisite_keys,
+                evidence_refs=evidence_refs,
+            )
+        )
+        if not prerequisite_fingerprint:
+            return {
+                "valid": False,
+                "reason": "restored recovery STOP has no prerequisite_fingerprint",
+            }
+        if prerequisite_fingerprint != current_prerequisite_fingerprint:
+            return {
+                "valid": False,
+                "reason": (
+                    "restored recovery STOP prerequisite_fingerprint no longer "
+                    "matches current evidence"
+                ),
+            }
+        return {
+            "valid": True,
+            "reason": "restored provider STOP is bound to current typed evidence",
+        }
+
+    def _reconcile_malformed_recovery_stop(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        route: Mapping[str, object],
+        *,
+        reason: str,
+    ) -> None:
+        """Quarantine an invalid historical STOP and reopen one bounded epoch."""
+
+        epoch = int(route.get("epoch", owner.recovery_epoch) or 0)
+        terminal_round = int(route.get("round", 0) or 0)
+        signature = str(route.get("failure_signature", "")).strip()
+        reconciliation = {
+            "outcome": "ignored_malformed_recovery_stop",
+            "epoch": epoch,
+            "terminal_round": terminal_round,
+            "reason": reason,
+        }
+        for lineage_task in self._recovery_lineage_tasks(tasks, task):
+            for entry in lineage_task.recovery_history:
+                if (
+                    not isinstance(entry, dict)
+                    or entry.get(_RECOVERY_CURSOR_RECONCILIATION_KEY)
+                    or str(entry.get("result", "")) != "judge_stopped"
+                    or int(entry.get("epoch", 0) or 0) != epoch
+                    or int(entry.get("round", 0) or 0) != terminal_round
+                ):
+                    continue
+                entry_signature = str(
+                    entry.get("failure_signature", entry.get("signature", ""))
+                ).strip()
+                if signature and entry_signature and entry_signature != signature:
+                    continue
+                entry[_RECOVERY_CURSOR_RECONCILIATION_KEY] = dict(reconciliation)
+
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        raw_history = blocker.get("recovery_stop_reconciliations", [])
+        history = list(raw_history) if isinstance(raw_history, list) else []
+        identity = (owner.task_id, epoch, terminal_round, signature)
+        if not any(
+            isinstance(entry, dict)
+            and (
+                str(entry.get("lineage_id", "")),
+                int(entry.get("epoch", 0) or 0),
+                int(entry.get("terminal_round", 0) or 0),
+                str(entry.get("failure_signature", "")),
+            )
+            == identity
+            for entry in history
+        ):
+            history.append(
+                {
+                    "lineage_id": owner.task_id,
+                    "task_id": task.task_id,
+                    "failure_signature": signature,
+                    **reconciliation,
+                    "reconciled_at": utc_now_iso(),
+                }
+            )
+        blocker["recovery_stop_reconciliations"] = history
+        blocker["status"] = "retrying"
+        blocker["updated_at"] = utc_now_iso()
+        state.active_blocker = blocker
+        self._reopen_terminal_recovery_epoch(state, tasks, owner)
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        self.logger.warning(
+            "[recovery] quarantined malformed STOP lineage=%s epoch=%s "
+            "round=%s reason=%s",
+            owner.task_id,
+            epoch,
+            terminal_round,
+            reason,
+        )
+
+    def _reconcile_invalid_restored_recovery_stop(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        route: Mapping[str, object],
+    ) -> bool:
+        validation = self._validate_restored_recovery_stop(
+            state,
+            tasks,
+            task,
+            owner,
+            route,
+        )
+        if bool(validation.get("valid")):
+            return False
+        self._reconcile_malformed_recovery_stop(
+            state,
+            tasks,
+            task,
+            owner,
+            route,
+            reason=str(validation.get("reason", "invalid recovery STOP")),
+        )
+        return True
+
     def _restore_unchanged_terminal_recovery_blocker(
         self,
         state: RunState,
@@ -14787,6 +15063,14 @@ class Orchestrator:
             "terminal recovery evidence is unchanged"
         )
         if str(route.get("outcome", "")) == "judge_stopped":
+            if self._reconcile_invalid_restored_recovery_stop(
+                state,
+                tasks,
+                task,
+                owner,
+                route,
+            ):
+                return False
             return self._block_for_recovery_stop(
                 state,
                 tasks,
@@ -15351,7 +15635,10 @@ class Orchestrator:
                     result="judge_stopped",
                     judge_decision=decision,
                     judge_reason=judge_reason,
-                    judge_source=judge_source,
+                    judge_source="deterministic",
+                    stop_owner="target_project",
+                    stop_category="recovery_evidence_change_required",
+                    engine_invariant="replan_split_depth_limit",
                 )
                 self._advance_recovery_stop_cursor(task, owner, next_round)
                 self._append_recovery_history_once(task, stopped_entry)
@@ -15369,9 +15656,12 @@ class Orchestrator:
                     signature=signature,
                     round_number=next_round,
                     judge_decision=decision,
-                    judge_source=judge_source,
+                    judge_source="deterministic",
+                    engine_invariant="replan_split_depth_limit",
                     repair_task_ids=[task.task_id],
                     lineage_owner=owner,
+                    stop_owner="target_project",
+                    stop_category="recovery_evidence_change_required",
                 )
                 self._persist_tasks(tasks)
                 save_run_state(self.project_root, state)

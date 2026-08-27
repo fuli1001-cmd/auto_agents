@@ -7986,6 +7986,217 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.last_recovery_route["outcome"], "replanned")
             self.assertEqual(state.last_recovery_route["judge_decision"], "REPLAN")
 
+    def test_self_repair_reopens_malformed_legacy_provider_stop_for_rejudgment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            repair = TaskSpec(
+                task_id="external-proof-repair",
+                title="Repair external proof evidence",
+                description="Run the bounded external proof.",
+                acceptance=["The external proof completes."],
+                status="pending",
+                task_origin="evidence_repair",
+                parent_task_id="external-contract",
+                recovery_epoch=3,
+                recovery_round=2,
+            )
+            parent = TaskSpec(
+                task_id="external-contract",
+                title="Exercise the external contract",
+                description="Keep the provider contract observable.",
+                acceptance=["The provider contract is proven."],
+                status="pending",
+                recovery_epoch=3,
+                recovery_round=2,
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [repair, parent]
+            evidence_fingerprint = orchestrator._recovery_evidence_fingerprint(
+                parent,
+                state=state,
+                tasks=state.tasks,
+            )
+            malformed_stop = {
+                "epoch": 3,
+                "round": 2,
+                "max_rounds": 2,
+                "result": "judge_stopped",
+                "failure_kind": "verification_failed",
+                "signature": "legacy-terminal-failure",
+                "failure_signature": "legacy-terminal-failure",
+                "evidence_fingerprint": evidence_fingerprint,
+                "judge_decision": "STOP",
+                "judge_reason": "Anonymous provider access is unavailable.",
+                "judge_source": "",
+                "stop_owner": "external_provider",
+                "stop_category": "recovery_provider_action_required",
+                "prerequisite_keys": ["external.anonymous_availability"],
+                "evidence_refs": [
+                    f"verification:{repair.task_id}:0",
+                    f"lineage-contract:{parent.task_id}",
+                ],
+                "prerequisite_fingerprint": "",
+                "repair_task_ids": [repair.task_id],
+            }
+            repair.recovery_history = [dict(malformed_stop)]
+            parent.recovery_history = [dict(malformed_stop)]
+            state.last_recovery_route = {
+                "task_id": repair.task_id,
+                "task_origin": repair.task_origin,
+                "lineage_id": parent.task_id,
+                "epoch": 3,
+                "round": 2,
+                "max_rounds": 2,
+                "failure_kind": "verification_failed",
+                "failure_signature": "legacy-terminal-failure",
+                "evidence_fingerprint": evidence_fingerprint,
+                "judge_decision": "STOP",
+                "judge_source": "",
+                "outcome": "judge_stopped",
+                "reason": "Anonymous provider access is unavailable.",
+                "repair_task_ids": [repair.task_id],
+                "engine_invariant": "",
+                "stop_owner": "external_provider",
+                "stop_category": "recovery_provider_action_required",
+                "prerequisite_keys": ["external.anonymous_availability"],
+                "evidence_refs": [
+                    f"verification:{repair.task_id}:0",
+                    f"lineage-contract:{parent.task_id}",
+                ],
+                "prerequisite_fingerprint": "",
+            }
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "malformed_recovery_stop_reblocked_on_restore",
+                "reason": "Legacy STOP provenance is invalid.",
+                "status": "blocked",
+            }
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(project_root, state)
+
+            resumed = Orchestrator(project_root)
+            marked = load_run_state(project_root)
+            restored = resumed._resume_blocked_run(marked)
+            repaired_task = next(
+                task for task in marked.tasks if task.task_id == repair.task_id
+            )
+            repaired_parent = next(
+                task for task in marked.tasks if task.task_id == parent.task_id
+            )
+
+            self.assertTrue(restored)
+            self.assertEqual(repaired_parent.recovery_epoch, 4)
+            self.assertEqual(repaired_task.recovery_epoch, 4)
+            self.assertEqual(repaired_parent.recovery_round, 0)
+            self.assertEqual(repaired_task.recovery_round, 0)
+            self.assertEqual(marked.last_recovery_route, {})
+            for task in (repaired_task, repaired_parent):
+                self.assertEqual(
+                    task.recovery_history[0]["recovery_cursor_reconciliation"][
+                        "outcome"
+                    ],
+                    "ignored_malformed_recovery_stop",
+                )
+            reconciliations = marked.active_blocker[
+                "recovery_stop_reconciliations"
+            ]
+            self.assertEqual(len(reconciliations), 1)
+            self.assertIn("judge_source", reconciliations[0]["reason"])
+            self.assertEqual(marked.active_blocker["status"], "retrying")
+
+            restored_again = (
+                resumed._restore_unchanged_terminal_recovery_blocker(
+                    marked,
+                    marked.tasks,
+                )
+            )
+            self.assertFalse(restored_again)
+            self.assertEqual(repaired_parent.recovery_epoch, 4)
+
+    def test_restore_preserves_engine_generated_deterministic_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="deterministic-proof",
+                title="Repair deterministic proof",
+                description="Run the bounded proof.",
+                acceptance=["The proof completes."],
+                status="pending",
+                recovery_epoch=2,
+                recovery_round=2,
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.status = "pending"
+            state.tasks = [task]
+            evidence_fingerprint = orchestrator._recovery_evidence_fingerprint(
+                task,
+                state=state,
+                tasks=state.tasks,
+            )
+            stopped_entry = {
+                "epoch": 2,
+                "round": 2,
+                "max_rounds": 2,
+                "result": "judge_stopped",
+                "failure_kind": "verification_failed",
+                "signature": "unchanged-proof",
+                "failure_signature": "unchanged-proof",
+                "evidence_fingerprint": evidence_fingerprint,
+                "judge_decision": "STOP",
+                "judge_reason": (
+                    "deterministic no-progress: failure and owner artifacts "
+                    "are unchanged"
+                ),
+                "judge_source": "deterministic",
+                "stop_owner": "target_project",
+                "stop_category": "recovery_evidence_change_required",
+                "repair_task_ids": [task.task_id],
+            }
+            task.recovery_history = [dict(stopped_entry)]
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "task_origin": task.task_origin,
+                "lineage_id": task.task_id,
+                "epoch": 2,
+                "round": 2,
+                "max_rounds": 2,
+                "failure_kind": "verification_failed",
+                "failure_signature": "unchanged-proof",
+                "evidence_fingerprint": evidence_fingerprint,
+                "judge_decision": "STOP",
+                "judge_source": "deterministic",
+                "outcome": "judge_stopped",
+                "reason": stopped_entry["judge_reason"],
+                "repair_task_ids": [task.task_id],
+                "engine_invariant": "",
+                "stop_owner": "target_project",
+                "stop_category": "recovery_evidence_change_required",
+            }
+
+            restored = orchestrator._restore_unchanged_terminal_recovery_blocker(
+                state,
+                state.tasks,
+            )
+
+            self.assertTrue(restored)
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(task.recovery_epoch, 2)
+            self.assertEqual(task.recovery_round, 2)
+            self.assertNotIn(
+                "recovery_cursor_reconciliation",
+                task.recovery_history[0],
+            )
+            self.assertEqual(state.active_blocker["owner"], "target_project")
+
     def test_self_repair_reconciles_newer_terminal_recovery_history_without_retry(
         self,
     ) -> None:
@@ -8018,10 +8229,33 @@ class RetryFlowTests(unittest.TestCase):
             state.current_stage = "implement"
             state.status = "blocked"
             state.tasks = [repair, parent]
-            prerequisite_keys = ["external.anonymous_availability"]
+            state.execution_incident_budget_epoch = 4
+            state.active_execution_incident_id = "provider-incident"
+            state.execution_incidents = [
+                {
+                    "incident_id": "provider-incident",
+                    "source": "provider",
+                    "kind": "provider_protocol_error",
+                    "task_id": repair.task_id,
+                    "status": "needs_human",
+                    "budget_epoch": 4,
+                    "incident_fingerprint": "provider-identity",
+                    "evidence_fingerprint": "provider-evidence",
+                }
+            ]
+            stop_reason = "The external prerequisite remains unavailable."
+            stop_evidence = orchestrator._recovery_judge_evidence(
+                state,
+                repair,
+                parent,
+                stop_reason,
+                2,
+            )
+            prerequisite = stop_evidence["recovery_prerequisites"][0]
+            prerequisite_keys = [prerequisite["key"]]
             evidence_refs = [
-                f"verification:{repair.task_id}:0",
-                f"lineage-contract:{parent.task_id}",
+                prerequisite["evidence_ref"],
+                *prerequisite["evidence_refs"],
             ]
             evidence_fingerprint = orchestrator._recovery_evidence_fingerprint(
                 parent,
@@ -8048,7 +8282,7 @@ class RetryFlowTests(unittest.TestCase):
                 "failure_signature": "signed-terminal-failure",
                 "evidence_fingerprint": evidence_fingerprint,
                 "judge_decision": "STOP",
-                "judge_reason": "The external prerequisite remains unavailable.",
+                "judge_reason": stop_reason,
                 "judge_source": "provider",
                 "stop_owner": "external_provider",
                 "stop_category": "recovery_provider_action_required",
@@ -8122,7 +8356,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(marked.last_recovery_route["judge_source"], "provider")
             self.assertEqual(
                 marked.last_recovery_route["reason"],
-                "The external prerequisite remains unavailable.",
+                stop_reason,
             )
             self.assertEqual(marked.active_blocker["owner"], "external_provider")
             self.assertEqual(
