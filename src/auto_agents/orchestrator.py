@@ -11765,20 +11765,31 @@ class Orchestrator:
         max_tasks: Optional[int],
     ) -> RunState:
         processed = 0
-        tasks_by_id = {task.task_id: task for task in tasks}
-        retry_ids = self._parallel_sequential_retry_ids(state)
-        retry_tasks = [
-            tasks_by_id[task_id]
-            for task_id in retry_ids
-            if task_id in tasks_by_id and tasks_by_id[task_id].status != "done"
-        ]
-        retry_task_ids = {task.task_id for task in retry_tasks}
-        ordered_tasks = [
-            *retry_tasks,
-            *(task for task in tasks if task.task_id not in retry_task_ids),
-        ]
         while True:
-            if not any(task.status != "done" for task in ordered_tasks):
+            # Task-plan synchronization can reload TaskSpec objects while this
+            # loop is running.  Keep only stable IDs in the ordering and resolve
+            # them against the current canonical list on every iteration.
+            tasks_by_id = {task.task_id: task for task in tasks}
+            retry_ids = self._parallel_sequential_retry_ids(state)
+            retry_task_ids = {
+                task_id
+                for task_id in retry_ids
+                if task_id in tasks_by_id
+                and tasks_by_id[task_id].status != "done"
+            }
+            ordered_task_ids = [
+                *(
+                    task_id
+                    for task_id in retry_ids
+                    if task_id in retry_task_ids
+                ),
+                *(
+                    task.task_id
+                    for task in tasks
+                    if task.task_id not in retry_task_ids
+                ),
+            ]
+            if not any(task.status != "done" for task in tasks):
                 break
             if not self._has_task_budget(max_tasks, processed):
                 self._task_budget_exhausted = True
@@ -11789,7 +11800,9 @@ class Orchestrator:
             task = next(
                 (
                     candidate
-                    for candidate in ordered_tasks
+                    for task_id in ordered_task_ids
+                    if task_id in tasks_by_id
+                    for candidate in (tasks_by_id[task_id],)
                     if candidate.status not in {"done", "waiting_user"}
                     and all(
                         dependency in completed
@@ -11801,7 +11814,7 @@ class Orchestrator:
             if task is None:
                 if any(
                     candidate.status == "waiting_user"
-                    for candidate in ordered_tasks
+                    for candidate in tasks
                 ):
                     resumed = self._process_pending_user_input(state, tasks)
                     if not resumed:
@@ -11809,26 +11822,10 @@ class Orchestrator:
                         return state
                     refreshed_tasks = self._load_implementation_tasks(state)
                     tasks[:] = refreshed_tasks
-                    tasks_by_id = {item.task_id: item for item in tasks}
-                    retry_tasks = [
-                        tasks_by_id[task_id]
-                        for task_id in retry_ids
-                        if task_id in tasks_by_id
-                        and tasks_by_id[task_id].status != "done"
-                    ]
-                    retry_task_ids = {item.task_id for item in retry_tasks}
-                    ordered_tasks = [
-                        *retry_tasks,
-                        *(
-                            item
-                            for item in tasks
-                            if item.task_id not in retry_task_ids
-                        ),
-                    ]
                     continue
                 unfinished = [
                     candidate
-                    for candidate in ordered_tasks
+                    for candidate in tasks
                     if candidate.status != "done"
                 ]
                 if unfinished:

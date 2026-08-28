@@ -12538,6 +12538,76 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(execution_order, ["prerequisite", "dependent"])
             self.assertTrue(all(task.status == "done" for task in result.tasks))
 
+    def test_sequential_tasks_resolve_canonical_instances_after_plan_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            repair = TaskSpec(
+                task_id="repair",
+                title="Repair proof",
+                description="Repair the prerequisite proof.",
+                acceptance=["proof passes"],
+                status="pending",
+            )
+            parent = TaskSpec(
+                task_id="parent",
+                title="Retry parent",
+                description="Retry after the proof repair.",
+                acceptance=["parent passes"],
+                status="pending",
+                depends_on=[repair.task_id],
+            )
+            dependent = TaskSpec(
+                task_id="dependent",
+                title="Consume parent",
+                description="Run after the parent completes.",
+                acceptance=["dependency is consumed"],
+                status="pending",
+                depends_on=[parent.task_id],
+            )
+            tasks = [repair, parent, dependent]
+            state.tasks = tasks
+            execution_order = []
+            executed_instances = []
+
+            def complete_task(_state, active_tasks, task):
+                canonical = next(
+                    candidate
+                    for candidate in active_tasks
+                    if candidate.task_id == task.task_id
+                )
+                self.assertIs(task, canonical)
+                execution_order.append(task.task_id)
+                executed_instances.append(task)
+                task.status = "done"
+                task.verify_history.append({"decision": "pass"})
+                if task.task_id == repair.task_id:
+                    active_tasks[:] = [
+                        TaskSpec.from_dict(candidate.to_dict())
+                        for candidate in active_tasks
+                    ]
+                return None
+
+            with patch.object(
+                orchestrator,
+                "_execute_task_in_main_worktree",
+                side_effect=complete_task,
+            ):
+                result = orchestrator._run_sequential_implementation_loop(
+                    state,
+                    tasks,
+                    max_tasks=None,
+                )
+
+            self.assertEqual(execution_order, ["repair", "parent", "dependent"])
+            self.assertIsNot(executed_instances[1], parent)
+            self.assertTrue(all(task.status == "done" for task in result.tasks))
+            self.assertTrue(
+                all(task.verify_history == [{"decision": "pass"}] for task in result.tasks)
+            )
+
     def test_parallel_tasks_strict_mode_requires_depends_on(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
