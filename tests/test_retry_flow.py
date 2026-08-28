@@ -3069,6 +3069,263 @@ class RetryFlowTests(unittest.TestCase):
                 )
             )
 
+    def test_saved_run_rehydrates_missing_ready_owner_before_blocked_resume(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Persisted evidence repair\n")
+            write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+            parent = TaskSpec(
+                task_id="candidate-owner",
+                title="Candidate owner",
+                description="Own the retained implementation candidate.",
+                acceptance=["The focused proof passes."],
+                status="in_progress",
+                verification_refs=["tests/test_candidate.py::test_candidate"],
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [parent.to_dict()]},
+            )
+            commit_all(project_root, "test: persisted repair baseline")
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "pending"
+            state.current_stage = "implement"
+            state.stage_summaries = {
+                "clarify": "done",
+                "prototype": "done",
+                "design": "done",
+                "plan": "done",
+                "provider_research": "done",
+            }
+            state.tasks = [parent]
+            orchestrator._capture_resume_context(
+                state,
+                spec_file=spec_file,
+                auto_approve=True,
+                allow_dirty_tree=False,
+                max_tasks=1,
+                skip_validate=True,
+                print_agent_output=False,
+                provider_kind="mock",
+                doc_language=None,
+            )
+            write_text(project_root / "candidate.py", "VALUE = 'retained'\n")
+            orchestrator._set_implementation_ready_marker(state, parent, True)
+            orchestrator._record_verify_result(
+                parent,
+                attempt=1,
+                decision="fail",
+                summary="owned proof evidence failed",
+                failure_ids=["tests/test_candidate.py::test_candidate"],
+            )
+            self.assertTrue(
+                orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    parent,
+                    {
+                        "reason": "owned proof evidence failed",
+                        "failure_ids": [
+                            "tests/test_candidate.py::test_candidate"
+                        ],
+                    },
+                )
+            )
+            repair = next(
+                task
+                for task in state.tasks
+                if task.task_origin == "evidence_repair"
+            )
+            state.resume_context.pop("retained_worktree_ownership")
+            state.resume_context.pop("parallel_sequential_retry_tasks", None)
+            candidate_fingerprint = (
+                orchestrator._worktree_fingerprint_excluding_agent_instructions()
+            )
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "orphaned_retained_worktree",
+                "status": "blocked",
+                "reason": "retained ownership is missing",
+                "self_repair_commit": "historical-repair-commit",
+                "prepared_self_repair_commit": "historical-repair-commit",
+                "planning_baseline_rejection": {
+                    "head": head_ref(project_root),
+                    "worktree": candidate_fingerprint,
+                    "changed_paths": ["candidate.py"],
+                },
+            }
+            state.status = "blocked"
+            state.last_error = "retained ownership is missing"
+            save_run_state(project_root, state)
+            before_planning_head = head_ref(project_root)
+            executed: list[str] = []
+
+            restarted = Orchestrator(project_root)
+
+            def execute_one(
+                _state: RunState,
+                active_tasks: list[TaskSpec],
+                task: TaskSpec,
+            ) -> None:
+                executed.append(task.task_id)
+                task.status = "done"
+                restarted._persist_tasks(active_tasks)
+                return None
+
+            with patch.object(
+                restarted,
+                "_ensure_implement_verify_baseline",
+            ), patch.object(
+                restarted,
+                "_execute_task_in_main_worktree",
+                side_effect=execute_one,
+            ):
+                result = restarted.resume_saved_run()
+
+            self.assertEqual(executed, [repair.task_id])
+            self.assertEqual(result.status, "pending")
+            self.assertNotEqual(head_ref(project_root), before_planning_head)
+            record = result.resume_context["retained_worktree_ownership"][
+                parent.task_id
+            ]
+            self.assertEqual(
+                record["source"],
+                "persisted_evidence_repair_resume",
+            )
+            self.assertEqual(record["changed_paths"], ["candidate.py"])
+            self.assertEqual(
+                result.active_blocker[
+                    "retained_worktree_ownership_rehydration"
+                ]["owner_task_ids"],
+                [parent.task_id],
+            )
+            self.assertEqual(
+                (project_root / "candidate.py").read_text(encoding="utf-8"),
+                "VALUE = 'retained'\n",
+            )
+            self.assertEqual(changed_paths(project_root), ["candidate.py"])
+            committed_paths = subprocess.run(
+                ["git", "show", "--pretty=format:", "--name-only", "HEAD"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.splitlines()
+            self.assertNotIn("candidate.py", committed_paths)
+
+    def test_saved_run_ownership_rehydration_requires_exact_evidence(self) -> None:
+        for case in (
+            "candidate_mismatch",
+            "missing_ready_marker",
+            "repair_lineage_mismatch",
+            "blocker_snapshot_mismatch",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                project_root = Path(tmp) / "demo"
+                Orchestrator.init_project(project_root, "demo", "mock")
+                self._configure_git_identity(project_root)
+                write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+                commit_all(project_root, "test: exact rehydration baseline")
+
+                parent = TaskSpec(
+                    task_id="candidate-owner",
+                    title="Candidate owner",
+                    description="Own the retained implementation candidate.",
+                    acceptance=["The focused proof passes."],
+                    status="in_progress",
+                    verification_refs=[
+                        "tests/test_candidate.py::test_candidate"
+                    ],
+                )
+                state = load_run_state(project_root)
+                state.current_stage = "implement"
+                state.status = "pending"
+                state.tasks = [parent]
+                orchestrator = Orchestrator(project_root)
+                write_text(
+                    project_root / "candidate.py",
+                    "VALUE = 'retained'\n",
+                )
+                orchestrator._set_implementation_ready_marker(
+                    state,
+                    parent,
+                    True,
+                )
+                orchestrator._record_verify_result(
+                    parent,
+                    attempt=1,
+                    decision="fail",
+                    summary="owned proof evidence failed",
+                    failure_ids=["tests/test_candidate.py::test_candidate"],
+                )
+                self.assertTrue(
+                    orchestrator._schedule_repair_tasks_for_failure(
+                        state,
+                        state.tasks,
+                        parent,
+                        {
+                            "reason": "owned proof evidence failed",
+                            "failure_ids": [
+                                "tests/test_candidate.py::test_candidate"
+                            ],
+                        },
+                    )
+                )
+                repair = next(
+                    task
+                    for task in state.tasks
+                    if task.task_origin == "evidence_repair"
+                )
+                state.resume_context.pop("retained_worktree_ownership")
+                if case == "candidate_mismatch":
+                    write_text(
+                        project_root / "candidate.py",
+                        "VALUE = 'changed-after-verification'\n",
+                    )
+                elif case == "missing_ready_marker":
+                    state.resume_context["implementation_ready_tasks"].pop(
+                        parent.task_id
+                    )
+                elif case == "repair_lineage_mismatch":
+                    repair.parent_task_id = "another-parent"
+
+                current_fingerprint = (
+                    orchestrator._worktree_fingerprint_excluding_agent_instructions()
+                )
+                state.active_blocker = {
+                    "owner": "auto_agents",
+                    "category": "orphaned_retained_worktree",
+                    "status": "blocked",
+                    "reason": "retained ownership is missing",
+                    "self_repair_commit": "historical-repair-commit",
+                    "prepared_self_repair_commit": "historical-repair-commit",
+                    "planning_baseline_rejection": {
+                        "head": head_ref(project_root),
+                        "worktree": (
+                            "0" * 64
+                            if case == "blocker_snapshot_mismatch"
+                            else current_fingerprint
+                        ),
+                        "changed_paths": ["candidate.py"],
+                    },
+                }
+                state.status = "blocked"
+                state.last_error = "retained ownership is missing"
+
+                self.assertFalse(orchestrator._resume_blocked_run(state))
+                self.assertEqual(state.status, "blocked")
+                self.assertNotIn(
+                    "retained_worktree_ownership",
+                    state.resume_context,
+                )
+
     def test_completed_self_repair_lifecycle_does_not_arm_baseline_guard(
         self,
     ) -> None:

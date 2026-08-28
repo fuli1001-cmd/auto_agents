@@ -7775,6 +7775,177 @@ class Orchestrator:
         )
         return True
 
+    def _restore_persisted_evidence_repair_ownership(
+        self,
+        state: RunState,
+        tasks: Iterable[TaskSpec],
+    ) -> List[str]:
+        """Rehydrate exact ownership lost after repair scheduling was persisted."""
+
+        if state.current_stage != "implement":
+            return []
+        records = self._retained_worktree_ownership_records(state)
+        if records:
+            # This migration is only for the old-engine state that lost the
+            # entire ownership projection. Existing records stay subject to
+            # the normal exact/ambiguity validators and must not be rewritten.
+            return []
+
+        route = (
+            dict(state.last_recovery_route)
+            if isinstance(state.last_recovery_route, dict)
+            else {}
+        )
+        if str(route.get("outcome", "")).strip() not in {
+            "repair_tasks_scheduled",
+            "waiting_for_repairs",
+        }:
+            return []
+        route_owner_ids = {
+            str(route.get(key, "")).strip()
+            for key in ("task_id", "lineage_id")
+            if str(route.get(key, "")).strip()
+        }
+        if len(route_owner_ids) != 1:
+            return []
+        owner_id = next(iter(route_owner_ids))
+
+        task_list = list(tasks)
+        tasks_by_id = {task.task_id: task for task in task_list}
+        if len(tasks_by_id) != len(task_list):
+            return []
+        owner = tasks_by_id.get(owner_id)
+        ready = self._implementation_ready_markers(state)
+        if (
+            owner is None
+            or owner.status not in {"pending", "in_progress"}
+            or not bool(ready.get(owner_id))
+        ):
+            return []
+
+        raw_repair_ids = route.get("repair_task_ids", [])
+        if not isinstance(raw_repair_ids, list):
+            return []
+        repair_ids = {
+            str(task_id).strip()
+            for task_id in raw_repair_ids
+            if str(task_id).strip()
+        }
+        if not repair_ids or not repair_ids.issubset(set(owner.depends_on)):
+            return []
+        open_repair_ids = {
+            task.task_id
+            for task in task_list
+            if task.parent_task_id == owner_id
+            and task.task_origin == "evidence_repair"
+            and task.status != "done"
+        }
+        if open_repair_ids != repair_ids:
+            return []
+        scheduled = next(
+            (
+                entry
+                for entry in reversed(owner.recovery_history)
+                if isinstance(entry, dict)
+                and str(entry.get("result", "")).strip() == "scheduled"
+            ),
+            None,
+        )
+        if scheduled is None:
+            return []
+        raw_scheduled_repair_ids = scheduled.get("repair_task_ids", [])
+        if not isinstance(raw_scheduled_repair_ids, list) or {
+            str(task_id).strip()
+            for task_id in raw_scheduled_repair_ids
+            if str(task_id).strip()
+        } != repair_ids:
+            return []
+
+        current_paths = sorted(
+            set(self._changed_paths_excluding_agent_instructions())
+        )
+        if not current_paths:
+            return []
+        current_fingerprint = (
+            self._worktree_fingerprint_excluding_agent_instructions()
+        )
+        latest_candidate_fingerprint = next(
+            (
+                str(entry.get("candidate_fingerprint", "")).strip()
+                for entry in reversed(owner.verify_history)
+                if isinstance(entry, dict)
+                and str(entry.get("candidate_fingerprint", "")).strip()
+            ),
+            "",
+        )
+        if (
+            not latest_candidate_fingerprint
+            or latest_candidate_fingerprint != current_fingerprint
+        ):
+            return []
+
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        if blocker and str(blocker.get("owner", "")).strip() not in {
+            "",
+            "auto_agents",
+        }:
+            return []
+        raw_rejection = blocker.get("planning_baseline_rejection", {})
+        rejection = (
+            dict(raw_rejection) if isinstance(raw_rejection, dict) else {}
+        )
+        if rejection:
+            allowed = self._planning_baseline_allowed_paths()
+            non_planning_paths = {
+                path for path in current_paths if path not in allowed
+            }
+            raw_rejected_paths = rejection.get("changed_paths", [])
+            if not isinstance(raw_rejected_paths, list):
+                return []
+            rejected_paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_rejected_paths
+                if str(path).strip()
+            }
+            if (
+                str(rejection.get("head", "")).strip()
+                != head_ref(self.project_root)
+                or str(rejection.get("worktree", "")).strip()
+                != current_fingerprint
+                or rejected_paths != non_planning_paths
+            ):
+                return []
+
+        captured = self._capture_retained_worktree_ownership(
+            state,
+            [owner_id],
+            source="persisted_evidence_repair_resume",
+        )
+        if owner_id not in captured:
+            return []
+        if blocker:
+            blocker["retained_worktree_ownership_rehydration"] = {
+                "owner_task_ids": [owner_id],
+                "repair_task_ids": sorted(repair_ids),
+                "head": head_ref(self.project_root),
+                "worktree": current_fingerprint,
+                "changed_paths": current_paths,
+                "updated_at": utc_now_iso(),
+            }
+            state.active_blocker = blocker
+        self.logger.info(
+            "[recovery] rehydrated persisted evidence-repair ownership "
+            "task=%s repairs=%s paths=%s",
+            owner_id,
+            ",".join(sorted(repair_ids)),
+            len(current_paths),
+        )
+        return [owner_id]
+
     def _planning_baseline_allowed_paths(self) -> Set[str]:
         allowed = {".gitignore", "README.md", "DESIGN.md", "spec.md"}
         if self._active_spec_file is not None:
@@ -9093,6 +9264,21 @@ class Orchestrator:
             and active_incident is not None
             and active_incident.status == "self_repair"
         )
+        restored_persisted_owner_ids = (
+            self._restore_persisted_evidence_repair_ownership(
+                state,
+                state.tasks,
+            )
+        )
+        if restored_persisted_owner_ids:
+            blocker = {
+                **blocker,
+                **(
+                    dict(state.active_blocker)
+                    if isinstance(state.active_blocker, dict)
+                    else {}
+                ),
+            }
         restored_retry_ids = self._restore_interrupted_self_repair_retry_ownership(
             state,
             blocker,
@@ -9130,6 +9316,7 @@ class Orchestrator:
             str(blocker.get("owner", "")) == "auto_agents"
             and str(blocker.get("status", "blocked")) != "retrying"
             and (had_persisted_blocker or legacy_self_repair_incident)
+            and not restored_persisted_owner_ids
         ):
             blocker["status"] = "blocked"
             blocker["updated_at"] = utc_now_iso()
@@ -11406,7 +11593,20 @@ class Orchestrator:
         tasks = self._load_implementation_tasks(state)
         state.current_stage = "implement"
         state.tasks = tasks
+        restored_persisted_owner_ids = (
+            self._restore_persisted_evidence_repair_ownership(
+                state,
+                tasks,
+            )
+        )
         save_run_state(self.project_root, state)
+
+        if restored_persisted_owner_ids:
+            self.logger.info(
+                "[recovery] restored saved-run ownership before planning "
+                "baseline tasks=%s",
+                ",".join(restored_persisted_owner_ids),
+            )
 
         if state.pending_input_requests or any(
             task.status == "waiting_user"
