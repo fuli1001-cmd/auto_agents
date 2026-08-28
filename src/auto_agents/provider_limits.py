@@ -24,6 +24,14 @@ _LIMITS: Dict[str, Dict[str, ProviderLimit]] = {
         "team": ProviderLimit(initial_workers=2, worker_ceiling=4),
         "enterprise": ProviderLimit(initial_workers=3, worker_ceiling=6),
     },
+    "claude-code": {
+        "default": ProviderLimit(initial_workers=2, worker_ceiling=2),
+        "free": ProviderLimit(initial_workers=1, worker_ceiling=1),
+        "pro": ProviderLimit(initial_workers=2, worker_ceiling=3),
+        "max": ProviderLimit(initial_workers=2, worker_ceiling=4),
+        "team": ProviderLimit(initial_workers=2, worker_ceiling=4),
+        "enterprise": ProviderLimit(initial_workers=3, worker_ceiling=6),
+    },
     "copilot-cli": {
         "default": ProviderLimit(initial_workers=2, worker_ceiling=2),
         "free": ProviderLimit(initial_workers=1, worker_ceiling=1),

@@ -16,6 +16,7 @@ from auto_agents.adapters.antigravity import (
     AntigravityProgressDecoder,
 )
 from auto_agents.adapters.codex import CodexAdapter, CodexProgressDecoder
+from auto_agents.adapters.claude_code import ClaudeCodeAdapter
 from auto_agents.adapters.copilot_cli import CopilotCliAdapter, CopilotProgressDecoder
 from auto_agents.adapters.shell import ShellProgressDecoder
 from auto_agents.adapters.base import run_subprocess_with_optional_streaming
@@ -482,6 +483,22 @@ def test_native_provider_resume_commands_use_exact_session(tmp_path):
     assert codex_command[codex_command.index("--image") + 1] == str(
         tmp_path / "comparison.png"
     )
+
+    claude = ClaudeCodeAdapter(
+        ProviderConfig(kind="claude-code", binary="claude", extra_args=["--model", "opus-x"])
+    )
+    with patch(
+        "auto_agents.adapters.claude_code.run_subprocess_with_optional_streaming",
+        return_value=("", "", 0, False, False),
+    ) as run_mock:
+        claude.run(request)
+    claude_command = run_mock.call_args.args[0]
+    assert claude_command[0] == "claude"
+    assert claude_command[claude_command.index("--resume") + 1] == "session-123"
+    assert claude_command[claude_command.index("--model") + 1] == "opus-x"
+    # Attachments are referenced in the stdin prompt, not as command-line flags.
+    assert str(tmp_path / "comparison.png") not in claude_command
+    assert str(tmp_path / "comparison.png") in run_mock.call_args.kwargs["stdin_input"]
 
     copilot = CopilotCliAdapter(
         ProviderConfig(kind="copilot-cli", binary="copilot", profile_map={})

@@ -2529,7 +2529,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
     if isinstance(execution, dict) and isinstance(execution.get("smart_timeout", {}), dict):
         smart_timeout_enabled = execution.get("smart_timeout", {}).get("enabled", True) is True
     if smart_timeout_enabled and isinstance(providers, dict):
-        native_kinds = {"codex", "copilot-cli", "antigravity", "mock"}
+        native_kinds = {"codex", "claude-code", "copilot-cli", "antigravity", "mock"}
         for provider_name, provider in providers.items():
             if not isinstance(provider, dict):
                 continue

@@ -58,7 +58,7 @@ PERSISTENCE_COMPATIBILITY_POLICIES = (
 PERSISTENCE_TARGET_LIFECYCLES = ("pending_bootstrap", "ready")
 PERSISTENCE_ENVIRONMENTS = ("development", "test", "production")
 PERSISTENCE_TARGET_KINDS = ("local_file", "compose_service")
-SUPPORTED_PROVIDER_KINDS = ("codex", "copilot-cli", "antigravity-claude", "antigravity-gemini")
+SUPPORTED_PROVIDER_KINDS = ("codex", "claude-code", "copilot-cli", "antigravity-claude", "antigravity-gemini")
 DEFAULT_EFFORTS = {
     "clarify": "deep",
     "prototype": "max",
@@ -79,6 +79,12 @@ DEFAULT_EFFORTS = {
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 1800
 DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS = 3600
 LEGACY_PROVIDER_IDLE_TIMEOUT_SECONDS = 300
+DEFAULT_CLAUDE_CODE_TIMEOUT_SECONDS = 3600
+DEFAULT_CLAUDE_CODE_PROFILE_MAP = {
+    "balanced": "sonnet",
+    "deep": "opus",
+    "max": "opus",
+}
 DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS = 3600
 DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS = 3600
 DEFAULT_GATE_COMMAND_TIMEOUT_SECONDS = 7200
@@ -275,28 +281,38 @@ class ProviderConfig:
     def from_dict(cls, data: Dict[str, object]) -> "ProviderConfig":
         kind = str(data.get("kind", "codex"))
         timeout_default = (
-            DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS
-            if kind == "copilot-cli"
-            else DEFAULT_PROVIDER_TIMEOUT_SECONDS
+            DEFAULT_CLAUDE_CODE_TIMEOUT_SECONDS
+            if kind == "claude-code"
+            else (
+                DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS
+                if kind == "copilot-cli"
+                else DEFAULT_PROVIDER_TIMEOUT_SECONDS
+            )
         )
         idle_timeout_default = (
             DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS
             if kind == "copilot-cli"
             else DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS
         )
+        is_claude_code = kind == "claude-code"
+        default_profile_map = (
+            DEFAULT_CLAUDE_CODE_PROFILE_MAP
+            if is_claude_code
+            else {"balanced": "balanced", "deep": "deep", "max": "max"}
+        )
         return cls(
             kind=kind,
-            binary=str(data.get("binary", "codex")),
+            binary=str(data.get("binary", "claude" if is_claude_code else "codex")),
             profile_map={str(k): str(v) for k, v in dict(data.get("profile_map", {})).items()}
-            or {"balanced": "balanced", "deep": "deep", "max": "max"},
+            or dict(default_profile_map),
             extra_args=[str(item) for item in data.get("extra_args", [])],
-            cwd_flag=str(data.get("cwd_flag", "-C")),
+            cwd_flag=str(data.get("cwd_flag", "" if is_claude_code else "-C")),
             prompt_via_stdin=(
                 False
                 if kind == "antigravity"
                 else bool(data.get("prompt_via_stdin", True))
             ),
-            output_flag=str(data.get("output_flag", "-o")),
+            output_flag=str(data.get("output_flag", "" if is_claude_code else "-o")),
             timeout_seconds=cls._timeout_seconds_from_dict(data, timeout_default),
             idle_timeout_seconds=int(data.get("idle_timeout_seconds", idle_timeout_default)),
             subscription_tier=str(data.get("subscription_tier", "default")),
@@ -1316,6 +1332,18 @@ class ProjectConfig:
                 output_flag="",
                 timeout_seconds=DEFAULT_COPILOT_CLI_TIMEOUT_SECONDS,
                 idle_timeout_seconds=DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
+                vision="auto",
+            ),
+            "claude-code": ProviderConfig(
+                kind="claude-code",
+                binary="claude",
+                profile_map=dict(DEFAULT_CLAUDE_CODE_PROFILE_MAP),
+                extra_args=[],
+                cwd_flag="",
+                prompt_via_stdin=True,
+                output_flag="",
+                timeout_seconds=DEFAULT_CLAUDE_CODE_TIMEOUT_SECONDS,
+                idle_timeout_seconds=DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
                 vision="auto",
             ),
             "antigravity-claude": ProviderConfig(

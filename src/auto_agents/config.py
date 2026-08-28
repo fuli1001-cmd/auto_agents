@@ -9,11 +9,14 @@ from uuid import uuid4
 
 from .io_utils import read_json, read_text, write_if_missing, write_json, write_text
 from .models import (
+    DEFAULT_CLAUDE_CODE_PROFILE_MAP,
+    DEFAULT_CLAUDE_CODE_TIMEOUT_SECONDS,
     DEFAULT_COPILOT_CLI_IDLE_TIMEOUT_SECONDS,
     DEFAULT_EFFORTS,
     DEFAULT_RETRY_PER_STAGE,
     DEFAULT_SESSION_MAX_ATTEMPTS,
     DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
+    ProviderConfig,
     ProjectConfig,
     RunState,
     SESSION_HARD_CEILING,
@@ -165,6 +168,19 @@ DEFAULT_CONFIG = {
             "cwd_flag": "-C",
             "prompt_via_stdin": True,
             "output_flag": "-o",
+            "idle_timeout_seconds": DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
+            "subscription_tier": "default",
+            "vision": "auto",
+        },
+        "claude-code": {
+            "kind": "claude-code",
+            "binary": "claude",
+            "profile_map": dict(DEFAULT_CLAUDE_CODE_PROFILE_MAP),
+            "extra_args": [],
+            "cwd_flag": "",
+            "prompt_via_stdin": True,
+            "output_flag": "",
+            "timeout_seconds": DEFAULT_CLAUDE_CODE_TIMEOUT_SECONDS,
             "idle_timeout_seconds": DEFAULT_PROVIDER_IDLE_TIMEOUT_SECONDS,
             "subscription_tier": "default",
             "vision": "auto",
@@ -393,6 +409,17 @@ DEFAULT_CONFIG = {
         "targets": [],
     },
 }
+
+
+def default_provider_config(provider_name: str) -> ProviderConfig:
+    """Return an independent typed copy of a built-in provider config."""
+    raw = DEFAULT_CONFIG["providers"].get(provider_name)
+    if not isinstance(raw, dict):
+        supported = ", ".join(sorted(DEFAULT_CONFIG["providers"]))
+        raise ValueError(
+            f"Unsupported provider '{provider_name}'. Supported providers: {supported}"
+        )
+    return ProviderConfig.from_dict(copy.deepcopy(raw))
 
 
 def auto_dir(project_root: Path) -> Path:

@@ -455,6 +455,33 @@ when `--config-dir` is provided. The adapter works around this by reading `model
 By default, the adapter adds `--allow-all` for headless automation. To override this, pass
 explicit tool-permission flags in `extra_args`.
 
+### Claude Code
+
+Claude Code is a fully native provider and can replace Codex without workflow changes. The adapter
+runs `claude -p --output-format stream-json --verbose` and consumes the JSONL event stream: the
+`system/init` event yields the session id (used for `--resume` on retries and interrupted-session
+recovery), `tool_use`/`tool_result` blocks feed the smart-timeout supervisor, and the final
+`result` event carries the answer text plus token usage (`input_tokens` is normalized to include
+uncached, cache-created, and cache-read input; `cache_read_input_tokens` also maps to cached input).
+
+`profile_map` values are passed as `--model` (e.g. `balanced -> sonnet`, `deep/max -> opus`),
+unless `--model` is already set in `extra_args`. Image attachments have no dedicated flag; the
+adapter appends the file paths to the prompt so Claude Code reads them with its Read tool, and
+`supports_image_attachments` reports `true`.
+
+Permission handling maps the request sandbox mode to Claude Code flags:
+
+- default / `workspace-write` / `danger-full-access`: `--dangerously-skip-permissions` —
+  non-interactive Claude Code denies unapproved tools, which would stall an autonomous run at its
+  first edit; use this default only on a trusted host or inside an external sandbox (the
+  orchestrator's Git worktree is not an OS security boundary)
+- `read-only`: `--permission-mode dontAsk` (read-only tools run, writes are denied)
+- any permission flag in `extra_args` (`--permission-mode`, `--allowedTools`,
+  `--dangerously-skip-permissions`, ...) disables the adapter's defaults entirely
+
+`sync-agent-instructions` also writes a generated `CLAUDE.md` next to `AGENTS.md`, so Claude Code
+sees the same normalized project rules as the other providers.
+
 Example project config (`providers` and `active_provider` only):
 
 ```json
@@ -475,6 +502,21 @@ Example project config (`providers` and `active_provider` only):
       "timeout_seconds": 1800,
       "idle_timeout_seconds": 3600
     },
+    "claude-code": {
+      "kind": "claude-code",
+      "binary": "claude",
+      "profile_map": {
+        "balanced": "sonnet",
+        "deep": "opus",
+        "max": "opus"
+      },
+      "extra_args": [],
+      "cwd_flag": "",
+      "prompt_via_stdin": true,
+      "output_flag": "",
+      "timeout_seconds": 3600,
+      "idle_timeout_seconds": 3600
+    },
     "copilot-cli": {
       "kind": "copilot-cli",
       "binary": "copilot",
@@ -491,8 +533,14 @@ Example project config (`providers` and `active_provider` only):
       "idle_timeout_seconds": 3600
     }
   },
-  "active_provider": "codex"
+  "active_provider": "claude-code"
 }
+```
+
+Switch to Claude Code at run time with:
+
+```bash
+python3 -m auto_agents run --project /tmp/demo --provider claude-code
 ```
 
 Legacy auto-generated `copilot-cli.timeout_seconds = 1800` configs are treated as the old default

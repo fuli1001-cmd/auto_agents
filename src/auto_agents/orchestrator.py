@@ -24,6 +24,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Set, TextI
 from .adapters import (
     AgentAdapter,
     AntigravityAdapter,
+    ClaudeCodeAdapter,
     CodexAdapter,
     CopilotCliAdapter,
     MockAdapter,
@@ -49,6 +50,7 @@ from .config import (
     archived_task_plan_path,
     bootstrap_project,
     conversation_history_path,
+    default_provider_config,
     docs_dir,
     design_md_path,
     frontend_design_docs_dir,
@@ -179,6 +181,7 @@ from .models import (
     RunState,
     SmartTimeoutConfig,
     STAGE_ORDER,
+    SUPPORTED_PROVIDER_KINDS,
     TaskSpec,
     VerificationStep,
 )
@@ -629,16 +632,8 @@ class Orchestrator:
                         prompt_via_stdin=True,
                         output_flag="-o",
                     )
-                elif provider_kind == "codex":
-                    config.providers[provider_kind] = ProviderConfig(
-                        kind="codex",
-                        binary="codex",
-                        profile_map={"balanced": "balanced", "deep": "deep", "max": "max"},
-                        extra_args=[],
-                        cwd_flag="-C",
-                        prompt_via_stdin=True,
-                        output_flag="-o",
-                    )
+                elif provider_kind in SUPPORTED_PROVIDER_KINDS:
+                    config.providers[provider_kind] = default_provider_config(provider_kind)
                 else:
                     config.providers[provider_kind] = ProviderConfig(
                         kind=provider_kind,
@@ -2921,6 +2916,8 @@ class Orchestrator:
     def _build_adapter(self, config: ProjectConfig):
         if config.provider.kind == "codex":
             return CodexAdapter(config.provider, config.execution.smart_timeout)
+        if config.provider.kind == "claude-code":
+            return ClaudeCodeAdapter(config.provider, config.execution.smart_timeout)
         if config.provider.kind == "copilot-cli":
             return CopilotCliAdapter(config.provider, config.execution.smart_timeout)
         if config.provider.kind == "antigravity":
@@ -25704,7 +25701,7 @@ class Orchestrator:
         provider_kind = self.config.provider.kind
         if provider_kind == "mock":
             return "mock"
-        if provider_kind not in ("codex", "copilot-cli"):
+        if provider_kind not in ("codex", "claude-code", "copilot-cli"):
             return self.config.provider.binary
 
         explicit_model = self._configured_explicit_model()
@@ -25721,6 +25718,8 @@ class Orchestrator:
         for index, value in enumerate(extra_args):
             if value in {"--model", "-m"} and index + 1 < len(extra_args):
                 return extra_args[index + 1]
+            if value.startswith("--model="):
+                return value.partition("=")[2]
         return ""
 
     # -- provider failover ------------------------------------------------
@@ -25906,6 +25905,8 @@ class Orchestrator:
         )
         if probe_provider.kind == "codex":
             return CodexAdapter(probe_provider, smart)
+        if probe_provider.kind == "claude-code":
+            return ClaudeCodeAdapter(probe_provider, smart)
         if probe_provider.kind == "copilot-cli":
             return CopilotCliAdapter(probe_provider, smart)
         if probe_provider.kind == "antigravity":
@@ -25994,6 +25995,8 @@ class Orchestrator:
         prov = self.config.providers[provider_kind]
         if prov.kind == "codex":
             return CodexAdapter(prov, self.config.execution.smart_timeout)
+        if prov.kind == "claude-code":
+            return ClaudeCodeAdapter(prov, self.config.execution.smart_timeout)
         if prov.kind == "copilot-cli":
             return CopilotCliAdapter(prov, self.config.execution.smart_timeout)
         if prov.kind == "antigravity":
@@ -26378,10 +26381,13 @@ class Orchestrator:
         save_project_config(self.project_root, self.config)
 
     def _set_active_provider(self, provider_kind: str) -> None:
-        self._current_provider = provider_kind
         if self.config.active_provider == provider_kind:
+            self._current_provider = provider_kind
             return
+        if provider_kind not in self.config.providers:
+            self.config.providers[provider_kind] = default_provider_config(provider_kind)
         self.config.set_active_provider(provider_kind)
+        self._current_provider = provider_kind
         save_project_config(self.project_root, self.config)
         self.adapter = self._build_adapter(self.config)
 
