@@ -403,6 +403,12 @@ class ParallelTuningTests(unittest.TestCase):
                     "task-b": {"fingerprint": "fp", "paths": ["app/shared.py"]}
                 },
                 "implementation_ready_tasks": {"task-d": True},
+                "evidence_preflight_routes": {
+                    "task-provider": {"repeat": 1, "identity": "route-fp"}
+                },
+                "provider_recovery_contract_receipts": {
+                    "contract-fp": {"attempts": 1}
+                },
                 Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT: True,
             }
 
@@ -424,6 +430,18 @@ class ParallelTuningTests(unittest.TestCase):
             )
             self.assertEqual(
                 state.resume_context["implementation_ready_tasks"], {"task-d": True}
+            )
+            self.assertEqual(
+                state.resume_context["evidence_preflight_routes"]["task-provider"][
+                    "repeat"
+                ],
+                1,
+            )
+            self.assertEqual(
+                state.resume_context["provider_recovery_contract_receipts"][
+                    "contract-fp"
+                ]["attempts"],
+                1,
             )
             self.assertTrue(
                 state.resume_context[
@@ -1602,6 +1620,76 @@ class EvidencePreflightTests(unittest.TestCase):
             self.assertIn(
                 ".auto-agents/docs/provider_references/image.md",
                 routed.active_blocker["reason"],
+            )
+
+    def test_provider_reference_refresh_churn_does_not_reset_route_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator, task = self._provider_contract_task(
+                root,
+                valid_reference=False,
+            )
+            from auto_agents.config import load_run_state
+
+            state = load_run_state(root)
+            tasks = [task]
+            result = {
+                "decision": "ROUTE",
+                "target_stage": "provider_research",
+                "reason": "the provider proof is still incomplete",
+                "required_mutations": [
+                    {
+                        "path": ".auto-agents/docs/provider_references/image.md",
+                        "reason": "refresh the provider evidence",
+                    },
+                    {
+                        "path": ".auto-agents/state/provider_references.lock.json",
+                        "reason": "refresh the provider lock",
+                    },
+                ],
+            }
+
+            orchestrator._route_evidence_preflight(state, tasks, task, result)
+            write_text(
+                root / ".auto-agents/docs/provider_references/image.md",
+                "# Rewritten provider reference\n\nRetrieved at a later time.\n",
+            )
+            write_json(
+                root / ".auto-agents/state/provider_references.lock.json",
+                {
+                    "version": 1,
+                    "references": {
+                        "image": {
+                            "path": (
+                                ".auto-agents/docs/provider_references/image.md"
+                            ),
+                            "status": "needs_user_input",
+                            "contract_version": 2,
+                            "retrieved_at": "2026-08-20T00:00:00Z",
+                            "source_urls": ["https://provider.example/docs"],
+                            "notes": "Rewritten notes with the same missing proof.",
+                        }
+                    },
+                },
+            )
+
+            routed = orchestrator._route_evidence_preflight(
+                state,
+                tasks,
+                task,
+                result,
+            )
+
+            self.assertEqual(routed.status, "blocked")
+            self.assertEqual(
+                routed.active_blocker["category"],
+                "evidence_preflight_route_stalled",
+            )
+            self.assertEqual(
+                routed.resume_context["evidence_preflight_routes"][task.task_id][
+                    "repeat"
+                ],
+                2,
             )
 
     def test_preflight_route_progress_resets_repeat_guard(self) -> None:

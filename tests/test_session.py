@@ -1491,6 +1491,118 @@ class SessionProviderResolveTests(unittest.TestCase):
                 "assumption_approved",
             )
 
+    def test_provider_resolve_blocks_same_unsatisfied_consumer_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, reference = _make_provider_blocked_project(tmp)
+            blocked_error = load_run_state(project_root).last_error
+            run_state = load_run_state(project_root)
+            run_state.tasks = [
+                TaskSpec(
+                    task_id="task-consumer",
+                    title="Consume provider contract",
+                    description="Exercise the provider boundary.",
+                    acceptance=[
+                        "The provider evidence is verified; assumptions are insufficient."
+                    ],
+                    requirement_ids=["REQ-001"],
+                )
+            ]
+            save_run_state(project_root, run_state)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda _prompt: "",
+            )
+            call_count = {"n": 0}
+
+            def mock_run(request):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    content = "I understand the provider blocker.\nGOAL_CLEAR\n"
+                else:
+                    write_text(
+                        project_root / reference,
+                        "# Provider Reference\n\n## Status\n\nassumption_approved\n",
+                    )
+                    write_json(
+                        provider_references_lock_path(project_root),
+                        {
+                            "version": 1,
+                            "references": {
+                                "provider": {
+                                    "path": reference,
+                                    "status": "assumption_approved",
+                                    "retrieved_at": "2026-04-24T00:30:00Z",
+                                    "source_urls": ["https://example.com/official"],
+                                    "notes": "Assumptions were approved for development.",
+                                }
+                            },
+                        },
+                    )
+                    content = "Recorded the approved development assumptions.\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content.strip(),
+                    stdout=content,
+                    returncode=0,
+                )
+
+            resume_calls = {"n": 0}
+
+            def mock_resume_saved_run():
+                resume_calls["n"] += 1
+                raise RuntimeError(blocked_error)
+
+            orchestrator.adapter.run = mock_run
+            orchestrator.resume_saved_run = mock_resume_saved_run
+
+            state = Session(orchestrator, mode="provider_resolve").start()
+            persisted_run = load_run_state(project_root)
+
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(
+                state.resolution,
+                "provider_recovery_contract_unsatisfied",
+            )
+            self.assertEqual(call_count["n"], 2)
+            self.assertEqual(resume_calls["n"], 1)
+            self.assertEqual(persisted_run.status, "blocked")
+            self.assertEqual(
+                persisted_run.active_blocker["owner"],
+                "verification_contract",
+            )
+            self.assertEqual(
+                persisted_run.active_blocker["category"],
+                "provider_recovery_contract_unsatisfied",
+            )
+            self.assertEqual(
+                len(
+                    [
+                        entry
+                        for entry in state.execution_log
+                        if entry.get("action") == "provider_verify"
+                    ]
+                ),
+                1,
+            )
+
+            retried_run = load_run_state(project_root)
+            retried_run.status = "failed"
+            retried_run.last_error = blocked_error
+            retried_run.active_blocker = {}
+            save_run_state(project_root, retried_run)
+
+            second_session = Session(
+                orchestrator,
+                mode="provider_resolve",
+            ).start()
+
+            self.assertEqual(second_session.status, "blocked")
+            self.assertEqual(call_count["n"], 2)
+            self.assertEqual(resume_calls["n"], 1)
+
     def test_provider_resolve_rejects_and_restores_contract_field_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root, _reference = _make_provider_blocked_project(tmp)

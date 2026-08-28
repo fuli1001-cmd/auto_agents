@@ -2301,6 +2301,67 @@ class ProjectValidationTests(unittest.TestCase):
             notify.assert_called_once()
             self.assertEqual(notify.call_args.args[1]["status"], "completed")
 
+    def test_cli_auto_provider_recovery_surfaces_durable_contract_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+            blocked_error = (
+                "provider research is blocked; provide official docs, defer the "
+                "requirement, choose another provider, or explicitly approve "
+                "assumptions before resuming.\n"
+                "- REQ-001: provider reference is ambiguous"
+            )
+            run_state = load_run_state(project_root)
+            run_state.status = "failed"
+            run_state.current_stage = "provider_research"
+            run_state.last_error = blocked_error
+            save_run_state(project_root, run_state)
+
+            def mock_run(_self, *args, **kwargs):
+                raise RuntimeError(blocked_error)
+
+            def mock_start(_self):
+                persisted = load_run_state(project_root)
+                persisted.status = "blocked"
+                persisted.last_error = "The consumer contract still requires verified evidence."
+                persisted.active_blocker = {
+                    "owner": "verification_contract",
+                    "category": "provider_recovery_contract_unsatisfied",
+                    "reason": persisted.last_error,
+                }
+                save_run_state(project_root, persisted)
+                return SessionState(
+                    session_id="provider-auto-blocked",
+                    mode="provider_resolve",
+                    status="blocked",
+                    resolution="provider_recovery_contract_unsatisfied",
+                )
+
+            stdout = io.StringIO()
+            with (
+                patch.object(Orchestrator, "run", mock_run),
+                patch("auto_agents.session.Session.start", mock_start),
+                patch("auto_agents.cli._notify_run_blocked") as notify_blocked,
+                patch("auto_agents.cli._notify_run_failure") as notify_failure,
+                contextlib.redirect_stdout(stdout),
+            ):
+                exit_code = main(
+                    [
+                        "run",
+                        "--project",
+                        str(project_root),
+                        "--spec-file",
+                        str(spec_file),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 3)
+            self.assertIn("Run blocked at stage: provider_research", stdout.getvalue())
+            notify_blocked.assert_called_once()
+            notify_failure.assert_not_called()
+
     def test_cli_run_resumes_when_remote_already_repaired_auto_agents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

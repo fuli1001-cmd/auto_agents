@@ -827,6 +827,24 @@ def _auto_resolve_provider_blocker(
         print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
         return 1
     if session_state.status != "completed":
+        resumed_state = load_run_state(project_root)
+        if (
+            session_state.status in {"blocked", "waiting_user"}
+            and resumed_state.status == session_state.status
+        ):
+            if resumed_state.status == "waiting_user":
+                _safe_notify(
+                    notify_run_waiting,
+                    project_root,
+                    resumed_state.to_dict(),
+                )
+            else:
+                _notify_run_blocked(
+                    project_root,
+                    resumed_state.last_error or "provider recovery is blocked",
+                )
+            print(_render_run_summary(project_root, resumed_state.to_dict()))
+            return 3
         _notify_run_failure(
             project_root,
             (

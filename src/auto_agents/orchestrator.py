@@ -317,6 +317,16 @@ IMPLEMENTATION_SCOPE_POLICY_VERSION = 5
 EVIDENCE_PREFLIGHT_FINGERPRINT_VERSION = 10
 EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT = 2
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
+_PROVIDER_RECOVERY_CONTRACT_REASON = (
+    "Provider recovery reached a generally passing reference status, but "
+    "resuming the run recreated the same provider-research dependency for an "
+    "unchanged downstream verification contract. A generic status such as "
+    "assumption_approved cannot override a consumer that requires stronger "
+    "provider or operator evidence. Automatic provider edits have stopped. "
+    "Provide evidence that satisfies the consumer, select another provider, "
+    "explicitly defer the affected requirement, or revise the requirement "
+    "through clarify."
+)
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
 _ARTIFACT_PUBLICATION_METADATA_REPAIR_CONTEXT = (
     "artifact_publication_metadata_repair"
@@ -2843,6 +2853,8 @@ class Orchestrator:
         previous_run_id = state.run_id
         task_archive, _state_archive = self._archive_completed_run(state)
         context = dict(state.resume_context)
+        context.pop("evidence_preflight_routes", None)
+        context.pop("provider_recovery_contract_receipts", None)
         context["previous_run_id"] = previous_run_id
         context["previous_task_plan_archive"] = str(task_archive)
 
@@ -19885,6 +19897,226 @@ class Orchestrator:
         return status in {"verified", "assumption_approved", "deferred"}
 
     @staticmethod
+    def _provider_consumer_task_contract(task: TaskSpec) -> Dict[str, object]:
+        """Return proof-bearing task semantics without execution bookkeeping."""
+
+        payload = task.to_dict()
+        for key in (
+            "status",
+            "commit_sha",
+            "review_summary",
+            "review_history",
+            "verify_history",
+            "verify_baseline_failures",
+            "verify_baseline_ref",
+            "scratchpad",
+            "arbitration_history",
+            "recovery_history",
+            "evidence_preflight",
+            "recovery_epoch",
+            "recovery_round",
+            "verify_retry_epoch",
+            "verify_baseline_schema_version",
+        ):
+            payload.pop(key, None)
+        return payload
+
+    def _provider_reference_semantic_identities(
+        self,
+        references: Iterable[str],
+    ) -> List[Dict[str, object]]:
+        """Identify a provider selection without volatile research metadata."""
+
+        try:
+            lock = load_provider_references_lock(self.project_root)
+        except Exception:
+            lock = {}
+        identities: List[Dict[str, object]] = []
+        for reference in sorted(
+            {
+                self._normalize_relative_artifact_path(item)
+                for item in references
+                if self._normalize_relative_artifact_path(item)
+            }
+        ):
+            entry = provider_reference_lock_entry(lock, reference) or {}
+            raw_urls = entry.get("source_urls", [])
+            source_urls = (
+                sorted(
+                    {
+                        str(item).strip()
+                        for item in raw_urls
+                        if str(item).strip()
+                    }
+                )
+                if isinstance(raw_urls, list)
+                else []
+            )
+            identities.append(
+                {
+                    "path": reference,
+                    "contract_version": provider_reference_contract_version(entry),
+                    "source_urls": source_urls,
+                }
+            )
+        return identities
+
+    def provider_recovery_contract_fingerprint(
+        self,
+        *,
+        state: Optional[RunState] = None,
+        blocker_message: str = "",
+    ) -> str:
+        """Fingerprint the downstream contract behind a provider blocker.
+
+        Reference status, retrieval timestamps, notes, and markdown bytes are
+        intentionally excluded.  Those fields are rewritten by provider
+        research and do not prove that a stronger consumer contract changed.
+        """
+
+        state = state or load_run_state(self.project_root)
+        trace = load_requirements_trace(self.project_root)
+        requirement_ids = {
+            item.upper()
+            for item in re.findall(
+                r"\bREQ-[A-Za-z0-9_-]+\b",
+                blocker_message or state.last_error,
+                flags=re.IGNORECASE,
+            )
+        }
+        requirements = [
+            requirement
+            for requirement in external_doc_requirements(trace)
+            if not requirement_ids
+            or str(requirement.get("id", "")).strip().upper() in requirement_ids
+        ]
+        scoped_ids = {
+            str(requirement.get("id", "")).strip()
+            for requirement in requirements
+            if str(requirement.get("id", "")).strip()
+        }
+        references = {
+            reference
+            for requirement in requirements
+            for reference in provider_reference_paths(requirement)
+        }
+
+        tasks = list(state.tasks)
+        try:
+            raw_tasks = load_task_plan(self.project_root).get("tasks", [])
+        except Exception:
+            raw_tasks = []
+        if isinstance(raw_tasks, list) and raw_tasks:
+            tasks = [
+                TaskSpec.from_dict(item)
+                for item in raw_tasks
+                if isinstance(item, dict)
+            ]
+        consumers = [
+            self._provider_consumer_task_contract(task)
+            for task in tasks
+            if not scoped_ids
+            or scoped_ids.intersection(
+                {
+                    str(requirement_id).strip()
+                    for requirement_id in task.requirement_ids
+                    if str(requirement_id).strip()
+                }
+            )
+        ]
+        payload = {
+            "requirements": [
+                requirement_contract_payload(requirement)
+                for requirement in requirements
+            ],
+            "consumers": consumers,
+            "provider_identities": self._provider_reference_semantic_identities(
+                references
+            ),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:24]
+
+    def block_repeated_provider_recovery(
+        self,
+        *,
+        expected_contract_fingerprint: str,
+        blocker_message: str,
+        contract_scope_message: str = "",
+    ) -> Optional[RunState]:
+        """Stop recovery when resuming recreates the same consumer contract."""
+
+        state = load_run_state(self.project_root)
+        current_fingerprint = self.provider_recovery_contract_fingerprint(
+            state=state,
+            blocker_message=contract_scope_message or blocker_message,
+        )
+        if (
+            not expected_contract_fingerprint
+            or current_fingerprint != expected_contract_fingerprint
+        ):
+            return None
+
+        receipts = state.resume_context.get("provider_recovery_contract_receipts", {})
+        if not isinstance(receipts, dict):
+            receipts = {}
+        previous = receipts.get(current_fingerprint, {})
+        attempts = (
+            int(previous.get("attempts", 0) or 0) + 1
+            if isinstance(previous, dict)
+            else 1
+        )
+        receipts[current_fingerprint] = {
+            "attempts": attempts,
+            "outcome": "consumer_contract_unsatisfied",
+        }
+        state.resume_context["provider_recovery_contract_receipts"] = receipts
+        self._block_run(
+            state,
+            owner="verification_contract",
+            category="provider_recovery_contract_unsatisfied",
+            reason=_PROVIDER_RECOVERY_CONTRACT_REASON,
+            fingerprint=f"sha256:{current_fingerprint}",
+        )
+        save_run_state(self.project_root, state)
+        return state
+
+    def restore_exhausted_provider_recovery(
+        self,
+        state: Optional[RunState] = None,
+    ) -> Optional[RunState]:
+        """Reapply a semantic provider block before another recovery session."""
+
+        state = state or load_run_state(self.project_root)
+        if not self.is_provider_research_blocked_error(state.last_error):
+            return None
+        current_fingerprint = self.provider_recovery_contract_fingerprint(
+            state=state,
+            blocker_message=state.last_error,
+        )
+        receipts = state.resume_context.get("provider_recovery_contract_receipts", {})
+        receipt = (
+            receipts.get(current_fingerprint, {})
+            if isinstance(receipts, dict)
+            else {}
+        )
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("outcome") != "consumer_contract_unsatisfied"
+        ):
+            return None
+        self._block_run(
+            state,
+            owner="verification_contract",
+            category="provider_recovery_contract_unsatisfied",
+            reason=_PROVIDER_RECOVERY_CONTRACT_REASON,
+            fingerprint=f"sha256:{current_fingerprint}",
+        )
+        save_run_state(self.project_root, state)
+        return state
+
+    @staticmethod
     def is_provider_research_blocked_error(message: str) -> bool:
         return message.strip().startswith("provider research is blocked;")
 
@@ -20122,6 +20354,8 @@ class Orchestrator:
                 "parallel_sequential_retry_tasks",
                 "parallel_integration_metrics",
                 "parallel_task_path_history",
+                "evidence_preflight_routes",
+                "provider_recovery_contract_receipts",
                 "restarted_blocked_run_id",
                 "auto_agents_runtime",
                 self.FRONTEND_CONTRACT_RECOVERY_CONTEXT,
@@ -21486,6 +21720,8 @@ class Orchestrator:
             "recovery_history",
         ):
             task_payload.pop(key, None)
+        if target_stage == "provider_research":
+            task_payload = self._provider_consumer_task_contract(task)
         normalized_paths = sorted(
             {
                 self._normalize_audit_blocker_path(path)
@@ -21496,8 +21732,25 @@ class Orchestrator:
         task_plan = self._normalize_audit_blocker_path(
             self._relative_repo_path(task_plan_path(self.project_root))
         )
+        provider_lock = self._normalize_audit_blocker_path(
+            self._relative_repo_path(provider_references_lock_path(self.project_root))
+        )
+        provider_dir = self._normalize_audit_blocker_path(
+            self._relative_repo_path(provider_references_dir(self.project_root))
+        ).rstrip("/") + "/"
+        provider_paths = [
+            path
+            for path in normalized_paths
+            if path == provider_lock or path.startswith(provider_dir)
+        ]
         artifact_paths = [
-            path for path in normalized_paths if path != task_plan
+            path
+            for path in normalized_paths
+            if path != task_plan
+            and not (
+                target_stage == "provider_research"
+                and path in provider_paths
+            )
         ]
         payload = {
             "task": task_payload,
@@ -21505,6 +21758,28 @@ class Orchestrator:
             "paths": normalized_paths,
             "artifacts": self._artifact_fingerprints(artifact_paths),
         }
+        if target_stage == "provider_research":
+            requirements = requirements_for_task(self.project_root, task)
+            references = {
+                reference
+                for requirement in requirements
+                for reference in provider_reference_paths(requirement)
+            }
+            references.update(
+                path
+                for path in provider_paths
+                if path != provider_lock
+            )
+            payload["provider_contract"] = {
+                "requirements": [
+                    requirement_contract_payload(requirement)
+                    for requirement in requirements
+                    if bool(requirement.get("external_docs_required", False))
+                ],
+                "provider_identities": self._provider_reference_semantic_identities(
+                    references
+                ),
+            }
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()

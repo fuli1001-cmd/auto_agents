@@ -16,6 +16,7 @@ from .config import (
     create_session,
     docs_dir,
     list_sessions,
+    load_run_state,
     load_session_state,
     provider_references_dir,
     provider_references_lock_path,
@@ -365,6 +366,24 @@ class Session:
     def _phase_converse(self, state: SessionState) -> SessionState:
         if not state.goal:
             if self.mode == "provider_resolve":
+                blocked_run = self.orch.restore_exhausted_provider_recovery()
+                if blocked_run is not None:
+                    state.status = "blocked"
+                    state.resolution = "provider_recovery_contract_unsatisfied"
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": "provider_contract_blocked",
+                        "result": str(
+                            blocked_run.active_blocker.get("reason", "")
+                        )[:500],
+                        "timestamp": self._now(),
+                    })
+                    self._save(state)
+                    self._print(
+                        "Provider recovery remains blocked because its consumer "
+                        "contract has not changed."
+                    )
+                    return state
                 state.goal = self.orch.build_provider_resolve_goal()
                 self._print("Loaded current provider_research blockers into a recovery session.")
             else:
@@ -1113,6 +1132,14 @@ class Session:
                     })
                     self._save(state)
                     raise RuntimeError(reason)
+                blocked_run_before_resume = load_run_state(self.project_root)
+                contract_scope_message = blocked_run_before_resume.last_error
+                consumer_contract_fingerprint = (
+                    self.orch.provider_recovery_contract_fingerprint(
+                        state=blocked_run_before_resume,
+                        blocker_message=contract_scope_message,
+                    )
+                )
                 self._print("Provider references and full preflight now pass. Resuming run...")
                 try:
                     resumed = self.orch.resume_saved_run()
@@ -1126,6 +1153,15 @@ class Session:
                     })
                     self._save(state)
                     if self.orch.is_provider_research_blocked_error(err_msg):
+                        if self._handoff_unsatisfied_provider_contract(
+                            state,
+                            expected_contract_fingerprint=(
+                                consumer_contract_fingerprint
+                            ),
+                            blocker_message=err_msg,
+                            contract_scope_message=contract_scope_message,
+                        ):
+                            return state
                         diff_hash = self._compute_diff_hash()
                         verify_sig = self._compute_verify_sig(err_msg)
                         self._update_stall_state(state, diff_hash, verify_sig)
@@ -1147,17 +1183,53 @@ class Session:
                     self._save(state)
                     raise
 
+                if resumed.status in {"blocked", "waiting_user"}:
+                    state.status = resumed.status
+                    state.resolution = (
+                        "provider_recovery_contract_unsatisfied"
+                        if resumed.status == "blocked"
+                        else "provider_recovery_waiting_user"
+                    )
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": f"resume_run_{resumed.status}",
+                        "result": (
+                            resumed.last_error
+                            or f"run status={resumed.status}"
+                        )[:500],
+                        "timestamp": self._now(),
+                    })
+                    self._save(state)
+                    self._print(
+                        "Provider recovery handed off to the persisted run "
+                        f"state ({resumed.status})."
+                    )
+                    return state
+
                 if resumed.status == "failed":
+                    resumed_error = resumed.last_error or "resumed run returned failed"
+                    if (
+                        self.orch.is_provider_research_blocked_error(resumed_error)
+                        and self._handoff_unsatisfied_provider_contract(
+                            state,
+                            expected_contract_fingerprint=(
+                                consumer_contract_fingerprint
+                            ),
+                            blocker_message=resumed_error,
+                            contract_scope_message=contract_scope_message,
+                        )
+                    ):
+                        return state
                     state.status = "failed"
                     state.resolution = "provider_research_resolved_run_failed"
                     state.execution_log.append({
                         "attempt": state.current_attempt,
                         "action": "resume_run_failed",
-                        "result": (resumed.last_error or "resumed run returned failed")[:500],
+                        "result": resumed_error[:500],
                         "timestamp": self._now(),
                     })
                     self._save(state)
-                    raise RuntimeError(resumed.last_error or "resumed run returned failed")
+                    raise RuntimeError(resumed_error)
 
                 state.status = "completed"
                 state.resolution = "provider_research_resolved"
@@ -1594,6 +1666,36 @@ class Session:
     def _format_provider_validation_errors(title: str, errors: List[str]) -> str:
         detail = "\n".join(f"- {item}" for item in errors if str(item).strip())
         return f"{title}:\n{detail}" if detail else title
+
+    def _handoff_unsatisfied_provider_contract(
+        self,
+        state: SessionState,
+        *,
+        expected_contract_fingerprint: str,
+        blocker_message: str,
+        contract_scope_message: str,
+    ) -> bool:
+        blocked_run = self.orch.block_repeated_provider_recovery(
+            expected_contract_fingerprint=expected_contract_fingerprint,
+            blocker_message=blocker_message,
+            contract_scope_message=contract_scope_message,
+        )
+        if blocked_run is None:
+            return False
+        state.status = "blocked"
+        state.resolution = "provider_recovery_contract_unsatisfied"
+        state.execution_log.append({
+            "attempt": state.current_attempt,
+            "action": "provider_contract_blocked",
+            "result": str(blocked_run.active_blocker.get("reason", ""))[:500],
+            "timestamp": self._now(),
+        })
+        self._save(state)
+        self._print(
+            "Provider recovery stopped because the downstream verification "
+            "contract is unchanged."
+        )
+        return True
 
     @staticmethod
     def _provider_defer_approved_ids(state: SessionState) -> set[str]:

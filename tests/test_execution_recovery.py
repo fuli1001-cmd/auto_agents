@@ -592,6 +592,12 @@ class ExecutionRecoveryTests(unittest.TestCase):
             state.active_blocker = {"owner": "auto_agents", "status": "blocked"}
             state.recovery_loop_events = [{"event": "old recovery"}]
             state.last_recovery_route = {"action": "RETRY"}
+            state.resume_context["evidence_preflight_routes"] = {
+                "task-old": {"repeat": 2}
+            }
+            state.resume_context["provider_recovery_contract_receipts"] = {
+                "old-contract": {"outcome": "consumer_contract_unsatisfied"}
+            }
             save_run_state(root, state)
 
             next_state = orchestrator._start_new_iteration(state)
@@ -604,6 +610,11 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertEqual(next_state.active_blocker, {})
             self.assertEqual(next_state.recovery_loop_events, [])
             self.assertEqual(next_state.last_recovery_route, {})
+            self.assertNotIn("evidence_preflight_routes", next_state.resume_context)
+            self.assertNotIn(
+                "provider_recovery_contract_receipts",
+                next_state.resume_context,
+            )
 
     def test_run_incident_budget_counts_only_the_current_epoch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
