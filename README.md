@@ -1637,7 +1637,10 @@ files. A reusable credential is project-scoped so later runs can reuse it. Crede
 must link to the official console or documentation, name the exact service/model/resource or
 permission to enable, and explain in plain language where to create or copy the requested
 field. Vague directions such as “obtain it from an approved key source” are rejected and
-regenerated.
+regenerated. Rejected question contracts retain a redacted rewrite marker until evidence
+preflight publishes a complete valid replacement batch. A provider-research or planning route
+cannot silently discard those operator prerequisites; it is retried at the protocol boundary and
+enters `waiting_user` before upstream work continues.
 
 Secret echo is configurable with `--secret-echo auto|visible|hidden`. `auto`
 hides secret input and shows ordinary input. Passing a secret directly through

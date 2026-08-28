@@ -314,7 +314,7 @@ class StageOwnershipRouteError(RuntimeError):
 
 VERIFY_BASELINE_SCHEMA_VERSION = 2
 IMPLEMENTATION_SCOPE_POLICY_VERSION = 5
-EVIDENCE_PREFLIGHT_FINGERPRINT_VERSION = 9
+EVIDENCE_PREFLIGHT_FINGERPRINT_VERSION = 10
 EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT = 2
 _VERIFICATION_CONTRACT_FAILURE_OWNER = "verification_contract"
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
@@ -4429,15 +4429,21 @@ class Orchestrator:
     ) -> bool:
         changed = False
         for task in tasks:
-            if task.status != "waiting_user":
+            if task.status == "done":
                 continue
             payloads = list(task.required_inputs)
-            if not payloads and isinstance(task.evidence_preflight, dict):
+            if (
+                not payloads
+                and task.status == "waiting_user"
+                and isinstance(task.evidence_preflight, dict)
+            ):
                 raw_payloads = task.evidence_preflight.get("required_inputs", [])
                 if isinstance(raw_payloads, list):
                     payloads = [
                         dict(item) for item in raw_payloads if isinstance(item, dict)
                     ]
+            if not payloads:
+                continue
             usability_issue = self._operator_input_usability_issue(payloads)
             if not usability_issue:
                 continue
@@ -4459,10 +4465,16 @@ class Orchestrator:
             ]
             task.status = "pending"
             task.required_inputs = []
-            task.evidence_preflight = {}
+            task.evidence_preflight = {
+                "decision": "INPUT_REWRITE_REQUIRED",
+                "reason": usability_issue,
+                "rejected_required_inputs": [
+                    dict(item) for item in payloads if isinstance(item, Mapping)
+                ],
+            }
             changed = True
             self.logger.warning(
-                "[user-input] task=%s discarded unusable request contract: %s",
+                "[user-input] task=%s queued unusable request contract for rewrite: %s",
                 task.task_id,
                 usability_issue,
             )
@@ -11152,7 +11164,9 @@ class Orchestrator:
         save_run_state(self.project_root, state)
 
         if state.pending_input_requests or any(
-            task.status == "waiting_user" for task in tasks
+            task.status == "waiting_user"
+            or (task.status != "done" and bool(task.required_inputs))
+            for task in tasks
         ):
             reconciled_inputs = self._reconcile_orphaned_waiting_user_tasks(
                 state,
@@ -20362,6 +20376,8 @@ class Orchestrator:
                     feedback = "invalid EVIDENCE_PREFLIGHT response"
                 else:
                     feedback = self._evidence_preflight_protocol_issue(parsed)
+                    if not feedback:
+                        feedback = self._operator_input_rewrite_issue(task, parsed)
                     raw_inputs = parsed.get("required_inputs", [])
                     if not feedback and isinstance(raw_inputs, list) and raw_inputs:
                         try:
@@ -20733,6 +20749,49 @@ class Orchestrator:
                 )
         return ""
 
+    @staticmethod
+    def _rejected_operator_input_contracts(
+        task: TaskSpec,
+    ) -> List[Dict[str, object]]:
+        """Return question contracts that evidence preflight must replace."""
+
+        preflight = task.evidence_preflight
+        if not isinstance(preflight, dict):
+            return []
+        raw = preflight.get("rejected_required_inputs", [])
+        if not isinstance(raw, list):
+            return []
+        return [dict(item) for item in raw if isinstance(item, Mapping)]
+
+    @classmethod
+    def _operator_input_rewrite_issue(
+        cls,
+        task: TaskSpec,
+        parsed: Mapping[str, object],
+    ) -> str:
+        """Prevent an upstream route from silently dropping rejected questions."""
+
+        rejected = cls._rejected_operator_input_contracts(task)
+        if not rejected:
+            return ""
+        required_inputs = parsed.get("required_inputs", [])
+        if isinstance(required_inputs, list) and required_inputs:
+            return ""
+        keys = [
+            str(item.get("key", "")).strip()
+            for item in rejected
+            if str(item.get("key", "")).strip()
+        ]
+        return (
+            "A prior operator-input contract was rejected and still represents "
+            "unresolved operator-owned prerequisites. Return a complete replacement "
+            "required_inputs batch with plain-language, atomic questions before "
+            "routing any provider-research or plan mutations. Do not copy the rejected "
+            "serialization, configuration object, generated artifact, or generic "
+            "credential bundle. Rejected input key(s): "
+            + (", ".join(keys) or "(unnamed)")
+        )
+
     @classmethod
     def _evidence_preflight_protocol_issue(
         cls,
@@ -21072,6 +21131,13 @@ class Orchestrator:
             }
             for key, record in sorted(self._operator_inputs.records().items())
         ]
+        rejected_input_contracts = self._rejected_operator_input_contracts(task)
+        rejected_input_context = (
+            "Previously rejected operator-input contracts (values are not present):\n"
+            + json.dumps(rejected_input_contracts, indent=2, ensure_ascii=False)
+            if rejected_input_contracts
+            else "Previously rejected operator-input contracts: (none)"
+        )
         task_text = json.dumps(task.to_dict(), ensure_ascii=False)
         for relative in re.findall(
             r"\.auto-agents/failed-verification-logs/[A-Za-z0-9_.-]+\.log",
@@ -21106,6 +21172,7 @@ class Orchestrator:
                 "The operator-input summary below is authoritative for presence and validation. Do not ask again for a valid key already listed. A later attestation may bind to an earlier answer with validation.subject fields such as source_url_input_key.",
                 "Project configuration at .auto-agents/config.json is normally target-project-owned. The gates.steps graph generated from task_plan.json is plan-owned when gates.allow_agent_updates is enabled; route missing generated verification or artifact publication metadata to plan. If config.json must change, list it in required_mutations and set config_scope to generated_verification or operator.",
                 "Never use an operator-scoped required_mutation as a substitute for required_inputs. If an operator must supply or approve anything, required_inputs must describe it even when provider-research mutations are also needed.",
+                "If previously rejected operator-input contracts are listed below, their underlying operator-owned prerequisites remain unresolved. Return a complete valid replacement required_inputs batch in this response. Do not omit the replacements merely because provider_research or another owner also has work; upstream mutations may remain in the same response and will run after the answers are collected.",
                 "A mixed-owner mutation batch is valid. Keep each mutation's actual owner; do not relabel plan or provider-research artifacts as target_project merely because a target-project prerequisite is also present. The orchestrator resolves owner partitions sequentially.",
                 "Always list required_mutations as objects with exact project-relative path and reason. Provider references under .auto-agents are read-only implementation inputs owned by provider_research.",
                 "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
@@ -21114,6 +21181,7 @@ class Orchestrator:
                 f"Task JSON:\n{json.dumps(task.to_dict(), indent=2, ensure_ascii=False)}",
                 "Operator input summary (values redacted):\n"
                 + json.dumps(operator_records, indent=2, ensure_ascii=False),
+                rejected_input_context,
                 *(failure_logs or ["Failure logs: (none retained)"]),
                 requirement_context,
             ]
