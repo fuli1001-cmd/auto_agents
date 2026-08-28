@@ -12052,6 +12052,13 @@ class Orchestrator:
                 self._persist_tasks(tasks)
                 save_run_state(self.project_root, state)
                 return state
+            if self._route_pre_mutation_persistence_failure(
+                state,
+                tasks,
+                task,
+                error,
+            ):
+                return state
             task.status = "blocked"
             task.review_summary = str(error)
             self._persist_tasks(tasks)
@@ -14104,6 +14111,168 @@ class Orchestrator:
             "failure signature",
             owner.task_id,
             owner.recovery_epoch,
+        )
+        return True
+
+    def _route_pre_mutation_persistence_failure(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        error: PersistenceContractError,
+    ) -> bool:
+        """Requeue target implementation only when persistence is proven untouched."""
+
+        if error.mutation_started is not False:
+            return False
+
+        recovery_config = self.config.execution.recovery
+        failure_kind = "persistence_pre_mutation_failed"
+        reason = str(error).strip() or "persistence pre-mutation contract failed"
+        target_id = error.target_id or "<unknown>"
+        step = error.step or "<unknown>"
+        failure_identity = (
+            f"persistence:{target_id}:{step}:"
+            f"{error.code or 'persistence_contract_error'}"
+        )
+        signature = self._recovery_signature([failure_identity], reason)
+        owner = self._recovery_lineage_owner(tasks, task)
+        candidate_record = self._retained_worktree_ownership_records(state).get(
+            task.task_id,
+            {},
+        )
+        raw_candidate_paths = candidate_record.get("changed_paths", [])
+        candidate_paths = (
+            [
+                str(path).strip()
+                for path in raw_candidate_paths
+                if str(path).strip()
+            ]
+            if isinstance(raw_candidate_paths, list)
+            else []
+        )
+        if not candidate_paths:
+            candidate_paths = sorted(
+                set(self._changed_paths_excluding_agent_instructions())
+            )
+        failure = error.to_dict()
+        failure["candidate_paths"] = list(candidate_paths)
+
+        if not recovery_config.enabled:
+            self._record_recovery_route(
+                state,
+                task,
+                outcome="disabled",
+                failure_kind=failure_kind,
+                reason="execution.recovery.enabled is false",
+                signature=signature,
+                lineage_owner=owner,
+            )
+            state.last_recovery_route["persistence_failure"] = failure
+            save_run_state(self.project_root, state)
+            return False
+
+        next_round = max(
+            int(task.recovery_round),
+            int(owner.recovery_round),
+        ) + 1
+        history_entry: Dict[str, object] = {
+            "signature": signature,
+            "round": next_round,
+            "epoch": int(owner.recovery_epoch),
+            "reason": reason,
+            "failure_kind": failure_kind,
+            "failure_ids": [failure_identity],
+            "persistence_failure": failure,
+        }
+        if next_round > int(recovery_config.max_rounds):
+            exhausted_entry = dict(history_entry, result="exhausted")
+            self._append_recovery_history_once(task, exhausted_entry)
+            if owner is not task:
+                self._append_recovery_history_once(owner, dict(exhausted_entry))
+            self._record_recovery_route(
+                state,
+                task,
+                outcome="exhausted",
+                failure_kind=failure_kind,
+                reason=reason,
+                signature=signature,
+                round_number=next_round,
+                lineage_owner=owner,
+            )
+            state.last_recovery_route["persistence_failure"] = failure
+            self._persist_tasks(tasks)
+            state.tasks = tasks
+            save_run_state(self.project_root, state)
+            return False
+
+        feedback_reason = (
+            f"{reason}\n"
+            f"Persistence target: {target_id}. Failed step: {step}.\n"
+            "The persistence action stopped before any mutating command began. "
+            "Repair the target-owned command or persistence interface, then let "
+            "the orchestrator rerun status and the normal persistence lifecycle. "
+            "Do not run a migration manually or weaken the engine's contract."
+        )
+        feedback = self._format_retry_feedback(
+            failure_kind,
+            reason=feedback_reason,
+            implicated_paths=candidate_paths,
+        )
+        task.status = "pending"
+        task.commit_sha = ""
+        task.review_summary = feedback
+        task.recovery_epoch = int(owner.recovery_epoch)
+        task.recovery_round = next_round
+        owner.recovery_round = max(int(owner.recovery_round), next_round)
+        requeued_entry = dict(
+            history_entry,
+            result="requeued",
+            review=feedback,
+        )
+        self._append_recovery_history_once(task, requeued_entry)
+        if owner is not task:
+            self._append_recovery_history_once(owner, dict(requeued_entry))
+        self._begin_fresh_verify_retry_lifecycle(task)
+        self._clear_implementation_ready_marker(state, task)
+        self._clear_stale_implementation_resume_markers(
+            state,
+            task_ids=[task.task_id],
+        )
+        state.task_review_cache.pop(task.task_id, None)
+        state.tasks = tasks
+        retry_ids = self._parallel_sequential_retry_ids(state)
+        self._set_parallel_sequential_retry_ids(
+            state,
+            [task.task_id, *retry_ids],
+        )
+        state.current_stage = "implement"
+        state.last_error = ""
+        if state.status in {"blocked", "failed"}:
+            state.status = "pending"
+        self._record_recovery_route(
+            state,
+            task,
+            outcome="requeued",
+            failure_kind=failure_kind,
+            reason=reason,
+            signature=signature,
+            round_number=next_round,
+            judge_decision="CONTINUE",
+            judge_source="deterministic",
+            lineage_owner=owner,
+        )
+        state.last_recovery_route["persistence_failure"] = failure
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        self.logger.info(
+            "[recovery] requeued pre-mutation persistence failure "
+            "task=%s target=%s step=%s round=%s max_rounds=%s",
+            task.task_id,
+            target_id,
+            step,
+            next_round,
+            recovery_config.max_rounds,
         )
         return True
 
@@ -23784,10 +23953,15 @@ class Orchestrator:
                 self.config.persistence,
             )
         except PersistenceContractError as error:
+            failure = error.to_dict()
             state.persistence_actions[task.task_id].update(
                 status="failed",
                 failed_at=utc_now_iso(),
                 error=str(error),
+                failure=failure,
+                target_id=error.target_id,
+                step=error.step,
+                mutation_started=error.mutation_started,
             )
             save_run_state(self.project_root, state)
             raise
@@ -23878,8 +24052,29 @@ class Orchestrator:
             }
         max_attempts = self._max_attempts("implement")
         feedback = ""
-        current_proof_evidence = self._run_task_proof_evidence(task) if task.review_summary.strip() else None
-        if task.review_summary.strip():
+        pending_persistence_feedback = ""
+        for recovery_entry in reversed(task.recovery_history):
+            if not isinstance(recovery_entry, dict):
+                continue
+            if (
+                str(recovery_entry.get("result", "")) == "requeued"
+                and str(recovery_entry.get("failure_kind", ""))
+                == "persistence_pre_mutation_failed"
+                and int(recovery_entry.get("epoch", 0) or 0)
+                == int(task.recovery_epoch)
+                and int(recovery_entry.get("round", 0) or 0)
+                == int(task.recovery_round)
+            ):
+                pending_persistence_feedback = task.review_summary.strip()
+            break
+        current_proof_evidence = (
+            self._run_task_proof_evidence(task)
+            if task.review_summary.strip() and not pending_persistence_feedback
+            else None
+        )
+        if pending_persistence_feedback:
+            feedback = pending_persistence_feedback
+        elif task.review_summary.strip():
             feedback = self._format_task_review_retry_feedback(
                 task,
                 reason="review rejected the task",

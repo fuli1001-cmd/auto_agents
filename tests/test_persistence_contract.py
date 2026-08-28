@@ -1309,6 +1309,169 @@ class PersistenceContractV2Tests(unittest.TestCase):
             for suffix in ("-wal", "-shm", "-journal"):
                 self.assertFalse(Path(f"{database}{suffix}").exists())
 
+    def test_v2_status_contract_error_is_structured_as_pre_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "runner.py"
+            script.write_text(
+                "import json,sys\n"
+                "from pathlib import Path\n"
+                "op=sys.argv[1]\n"
+                "data=Path('.data'); data.mkdir(exist_ok=True)\n"
+                "with (data/'calls.log').open('a') as stream: stream.write(op+'\\n')\n"
+                "if op=='migrate': (data/'applied').write_text('yes')\n"
+                "print(json.dumps({'protocol_version':2 if op=='status' else 1,"
+                "'operation':op,'ok':True,'state':'ready','current_version':'2',"
+                "'latest_version':'2','pending_versions':[]}))\n",
+                encoding="utf-8",
+            )
+            command = [sys.executable, "runner.py"]
+            target = PersistenceTargetConfig(
+                target_id="local-db",
+                environment="test",
+                kind="local_file",
+                locator={"path": ".data/app.db"},
+                interface_version=2,
+                lifecycle="ready",
+                status_argv=[*command, "status"],
+                migrate_argv=[*command, "migrate"],
+                verify_argv=[*command, "verify"],
+            )
+
+            with self.assertRaises(PersistenceContractError) as raised:
+                execute_persistence_action(
+                    root,
+                    {
+                        "storage_transition": "migrate_in_place",
+                        "compatibility_policy": "backward_compatible",
+                        "decision_id": "PERSIST-001",
+                        "target_ids": ["local-db"],
+                        "to_version": "2",
+                    },
+                    PersistenceConfig([target]),
+                )
+
+            error = raised.exception
+            self.assertEqual(error.target_id, "local-db")
+            self.assertEqual(error.step, "status")
+            self.assertEqual(error.code, "unsupported_protocol")
+            self.assertIs(error.mutation_started, False)
+            self.assertEqual(error.command_outcome["returncode"], 0)
+            self.assertEqual(error.command_outcome["protocol_version"], 2)
+            self.assertEqual(
+                (root / ".data" / "calls.log").read_text(encoding="utf-8"),
+                "status\n",
+            )
+            self.assertFalse((root / ".data" / "applied").exists())
+
+    def test_v2_verify_contract_error_is_structured_as_post_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "runner.py"
+            script.write_text(
+                "import json,sys\n"
+                "from pathlib import Path\n"
+                "op=sys.argv[1]\n"
+                "data=Path('.data'); data.mkdir(exist_ok=True)\n"
+                "with (data/'calls.log').open('a') as stream: stream.write(op+'\\n')\n"
+                "if op=='migrate': (data/'applied').write_text('yes')\n"
+                "print(json.dumps({'protocol_version':2 if op=='verify' else 1,"
+                "'operation':op,'ok':True,'state':'ready','current_version':'2',"
+                "'latest_version':'2','pending_versions':[]}))\n",
+                encoding="utf-8",
+            )
+            command = [sys.executable, "runner.py"]
+            target = PersistenceTargetConfig(
+                target_id="local-db",
+                environment="test",
+                kind="local_file",
+                locator={"path": ".data/app.db"},
+                interface_version=2,
+                lifecycle="ready",
+                status_argv=[*command, "status"],
+                migrate_argv=[*command, "migrate"],
+                verify_argv=[*command, "verify"],
+            )
+
+            with self.assertRaises(PersistenceContractError) as raised:
+                execute_persistence_action(
+                    root,
+                    {
+                        "storage_transition": "migrate_in_place",
+                        "compatibility_policy": "backward_compatible",
+                        "decision_id": "PERSIST-001",
+                        "target_ids": ["local-db"],
+                        "to_version": "2",
+                    },
+                    PersistenceConfig([target]),
+                )
+
+            error = raised.exception
+            self.assertEqual(error.step, "verify")
+            self.assertIs(error.mutation_started, True)
+            self.assertEqual(
+                (root / ".data" / "calls.log").read_text(encoding="utf-8"),
+                "status\nmigrate\nverify\n",
+            )
+            self.assertTrue((root / ".data" / "applied").exists())
+
+    def test_later_status_error_stays_post_mutation_across_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "runner.py"
+            script.write_text(
+                "import json,sys\n"
+                "from pathlib import Path\n"
+                "target,op=sys.argv[1:3]\n"
+                "data=Path('.data'); data.mkdir(exist_ok=True)\n"
+                "with (data/'calls.log').open('a') as stream: "
+                "stream.write(target+':'+op+'\\n')\n"
+                "if op=='migrate': (data/('applied-'+target)).write_text('yes')\n"
+                "protocol=2 if target=='second' and op=='status' else 1\n"
+                "print(json.dumps({'protocol_version':protocol,'operation':op,"
+                "'ok':True,'state':'ready','current_version':'2',"
+                "'latest_version':'2','pending_versions':[]}))\n",
+                encoding="utf-8",
+            )
+
+            def target(target_id: str) -> PersistenceTargetConfig:
+                command = [sys.executable, "runner.py", target_id]
+                return PersistenceTargetConfig(
+                    target_id=target_id,
+                    environment="test",
+                    kind="local_file",
+                    locator={"path": f".data/{target_id}.db"},
+                    interface_version=2,
+                    lifecycle="ready",
+                    status_argv=[*command, "status"],
+                    migrate_argv=[*command, "migrate"],
+                    verify_argv=[*command, "verify"],
+                )
+
+            with self.assertRaises(PersistenceContractError) as raised:
+                execute_persistence_action(
+                    root,
+                    {
+                        "storage_transition": "migrate_in_place",
+                        "compatibility_policy": "backward_compatible",
+                        "decision_id": "PERSIST-001",
+                        "target_ids": ["first", "second"],
+                        "to_version": "2",
+                    },
+                    PersistenceConfig([target("first"), target("second")]),
+                )
+
+            error = raised.exception
+            self.assertEqual(error.target_id, "second")
+            self.assertEqual(error.step, "status")
+            self.assertIs(error.mutation_started, True)
+            self.assertEqual(
+                (root / ".data" / "calls.log").read_text(encoding="utf-8"),
+                "first:status\nfirst:migrate\nfirst:verify\nsecond:status\n",
+            )
+            self.assertTrue((root / ".data" / "applied-first").exists())
+            self.assertFalse((root / ".data" / "applied-second").exists())
+
     def test_pending_v2_target_requires_bootstrap_interface(self) -> None:
         trace = {
             "persistence_decisions": [{

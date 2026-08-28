@@ -31,11 +31,13 @@ from auto_agents.models import (
     CommandResult,
     GateParallelGroup,
     GateResult,
+    PersistenceTargetConfig,
     RunState,
     TaskSpec,
     VerificationStep,
 )
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.persistence import PersistenceContractError
 from auto_agents.provider_contract import (
     PROVIDER_REFERENCE_CONTRACT_VERSION,
     PROVIDER_REFERENCE_V2_HEADINGS,
@@ -2441,6 +2443,242 @@ class AuditRecoveryAdapter:
 
 
 class RetryFlowTests(unittest.TestCase):
+    def test_pre_mutation_persistence_failure_requeues_and_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+
+            command = [sys.executable, "persistence_runner.py"]
+            config = load_project_config(project_root)
+            config.execution.recovery.enabled = True
+            config.execution.recovery.max_rounds = 2
+            config.persistence.targets = [
+                PersistenceTargetConfig(
+                    target_id="local-db",
+                    environment="test",
+                    kind="local_file",
+                    locator={"path": ".data/app.db"},
+                    interface_version=2,
+                    lifecycle="ready",
+                    status_argv=[*command, "status"],
+                    migrate_argv=[*command, "migrate"],
+                    verify_argv=[*command, "verify"],
+                )
+            ]
+            save_project_config(project_root, config)
+
+            def runner_source(protocol_version: int) -> str:
+                return (
+                    "import json,sys\n"
+                    "from pathlib import Path\n"
+                    f"PROTOCOL_VERSION = {protocol_version}\n"
+                    "op=sys.argv[1]\n"
+                    "data=Path('.data'); data.mkdir(exist_ok=True)\n"
+                    "with (data/'calls.log').open('a') as stream: stream.write(op+'\\n')\n"
+                    "applied=data/'applied'\n"
+                    "if op=='migrate': applied.write_text('yes')\n"
+                    "ready=applied.exists()\n"
+                    "print(json.dumps({'protocol_version':PROTOCOL_VERSION,"
+                    "'operation':op,'ok':True,'state':'ready' if ready else 'missing',"
+                    "'current_version':'2' if ready else '', 'latest_version':'2',"
+                    "'pending_versions':[] if ready else ['2']}))\n"
+                )
+
+            gitignore = project_root / ".gitignore"
+            gitignore.write_text(
+                gitignore.read_text(encoding="utf-8") + "\n.data/\n",
+                encoding="utf-8",
+            )
+            write_text(project_root / "persistence_runner.py", runner_source(1))
+            write_text(project_root / "schema_version.py", "SCHEMA_VERSION = 1\n")
+            task = TaskSpec(
+                task_id="task-db",
+                title="Migrate schema",
+                description="Advance the schema without changing the wire protocol.",
+                acceptance=["The migration lifecycle completes."],
+                status="pending",
+                mutable_artifacts=["persistence_runner.py", "schema_version.py"],
+                persistence_change={
+                    "storage_transition": "migrate_in_place",
+                    "compatibility_policy": "backward_compatible",
+                    "decision_id": "PERSIST-001",
+                    "target_ids": ["local-db"],
+                    "to_version": "2",
+                },
+            )
+            write_json(task_plan_path(project_root), {"tasks": [task.to_dict()]})
+            commit_all(project_root, "test: persistence baseline")
+
+            # The candidate advances its schema and accidentally advances the
+            # stable command protocol too.
+            write_text(project_root / "schema_version.py", "SCHEMA_VERSION = 2\n")
+            write_text(project_root / "persistence_runner.py", runner_source(2))
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.tasks = orchestrator._load_tasks_from_plan()
+            task = state.tasks[0]
+            task.status = "in_progress"
+            orchestrator._set_implementation_ready_marker(state, task, True)
+            gate_result = {
+                "ok": True,
+                "reason": "",
+                "review": "review passed",
+                "verify_current_failure_ids": [],
+            }
+
+            with patch.object(
+                orchestrator,
+                "_ensure_task_verify_baseline",
+                return_value=False,
+            ), patch.object(
+                orchestrator,
+                "_ensure_evidence_preflight",
+                return_value={},
+            ), patch.object(
+                orchestrator,
+                "_execute_task_with_retries",
+                return_value=gate_result,
+            ):
+                first = orchestrator._execute_task_in_main_worktree(
+                    state,
+                    state.tasks,
+                    task,
+                )
+
+            self.assertIs(first, state)
+            self.assertEqual(task.status, "pending")
+            self.assertEqual(
+                state.last_recovery_route["failure_kind"],
+                "persistence_pre_mutation_failed",
+            )
+            self.assertEqual(state.last_recovery_route["outcome"], "requeued")
+            self.assertEqual(
+                state.last_recovery_route["persistence_failure"]["step"],
+                "status",
+            )
+            self.assertIs(
+                state.persistence_actions[task.task_id]["mutation_started"],
+                False,
+            )
+            self.assertIn("before any mutating command began", task.review_summary)
+            self.assertEqual(
+                (project_root / ".data" / "calls.log").read_text(encoding="utf-8"),
+                "status\n",
+            )
+            self.assertFalse((project_root / ".data" / "applied").exists())
+            ownership = state.resume_context["retained_worktree_ownership"][
+                task.task_id
+            ]
+            self.assertEqual(
+                set(ownership["changed_paths"]),
+                {"persistence_runner.py", "schema_version.py"},
+            )
+
+            # A normal target implementation retry repairs only the command wire
+            # version; the schema version remains advanced.
+            write_text(project_root / "persistence_runner.py", runner_source(1))
+            with patch.object(
+                orchestrator,
+                "_ensure_task_verify_baseline",
+                return_value=False,
+            ), patch.object(
+                orchestrator,
+                "_ensure_evidence_preflight",
+                return_value={},
+            ), patch.object(
+                orchestrator,
+                "_execute_task_with_retries",
+                return_value=gate_result,
+            ), patch.object(
+                orchestrator,
+                "_warm_clean_head_verify_baseline",
+            ):
+                second = orchestrator._execute_task_in_main_worktree(
+                    state,
+                    state.tasks,
+                    task,
+                )
+
+            self.assertIsNone(second)
+            self.assertEqual(task.status, "done")
+            self.assertEqual(
+                (project_root / "schema_version.py").read_text(encoding="utf-8"),
+                "SCHEMA_VERSION = 2\n",
+            )
+            self.assertEqual(
+                (project_root / ".data" / "calls.log").read_text(encoding="utf-8"),
+                "status\nstatus\nmigrate\nverify\n",
+            )
+            self.assertEqual(
+                state.persistence_actions[task.task_id]["status"],
+                "verified",
+            )
+            self.assertNotIn(
+                task.task_id,
+                state.resume_context.get("retained_worktree_ownership", {}),
+            )
+
+    def test_post_mutation_persistence_failure_remains_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-db",
+                title="Migrate schema",
+                description="Apply the registered migration.",
+                acceptance=["The migration verifies."],
+                status="in_progress",
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            gate_result = {
+                "ok": True,
+                "reason": "",
+                "review": "review passed",
+                "verify_current_failure_ids": [],
+            }
+            failure = PersistenceContractError(
+                "persistence verify returned unsupported protocol for local-db",
+                target_id="local-db",
+                step="verify",
+                mutation_started=True,
+                code="unsupported_protocol",
+            )
+
+            with patch.object(
+                orchestrator,
+                "_ensure_task_verify_baseline",
+                return_value=False,
+            ), patch.object(
+                orchestrator,
+                "_ensure_evidence_preflight",
+                return_value={},
+            ), patch.object(
+                orchestrator,
+                "_execute_task_with_retries",
+                return_value=gate_result,
+            ), patch.object(
+                orchestrator,
+                "_run_task_persistence_action",
+                side_effect=failure,
+            ):
+                with self.assertRaises(RuntimeError):
+                    orchestrator._execute_task_in_main_worktree(
+                        state,
+                        state.tasks,
+                        task,
+                    )
+
+            self.assertEqual(task.status, "blocked")
+            self.assertEqual(state.last_recovery_route, {})
+            self.assertNotIn(
+                task.task_id,
+                state.resume_context.get("parallel_sequential_retry_tasks", []),
+            )
+
     def test_pending_replan_commits_current_contract_with_unrelated_product_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

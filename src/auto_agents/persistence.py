@@ -51,7 +51,63 @@ _SHELL_CONTROL_PATTERN = re.compile(r"[|;&<>`\n\r]")
 
 
 class PersistenceContractError(RuntimeError):
-    pass
+    """Persistence failure with enough execution context for safe recovery.
+
+    ``mutation_started`` is deliberately tri-state.  Only an explicit ``False``
+    proves that retrying target implementation is safe; legacy or otherwise
+    unclassified failures remain fail-closed with ``None``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        target_id: str = "",
+        step: str = "",
+        mutation_started: bool | None = None,
+        code: str = "persistence_contract_error",
+        command_outcome: Mapping[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.target_id = str(target_id).strip()
+        self.step = str(step).strip()
+        self.mutation_started = (
+            mutation_started if isinstance(mutation_started, bool) else None
+        )
+        self.code = str(code).strip() or "persistence_contract_error"
+        self.command_outcome = dict(command_outcome or {})
+
+    def with_execution_context(
+        self,
+        *,
+        target_id: str = "",
+        step: str = "",
+        mutation_started: bool | None = None,
+        code: str = "",
+        command_outcome: Mapping[str, object] | None = None,
+    ) -> "PersistenceContractError":
+        if target_id and not self.target_id:
+            self.target_id = str(target_id).strip()
+        if step and not self.step:
+            self.step = str(step).strip()
+        if isinstance(mutation_started, bool):
+            # The action-level tracker is authoritative across all targets.
+            self.mutation_started = mutation_started
+        if code and self.code == "persistence_contract_error":
+            self.code = str(code).strip()
+        if command_outcome and not self.command_outcome:
+            self.command_outcome = dict(command_outcome)
+        return self
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "message": str(self),
+            "target_id": self.target_id,
+            "step": self.step,
+            "mutation_started": self.mutation_started,
+            "code": self.code,
+            "command_outcome": dict(self.command_outcome),
+        }
 
 
 @dataclass(frozen=True)
@@ -327,14 +383,21 @@ def persistence_targets_for_change(
 ) -> List[PersistenceTargetConfig]:
     target_ids = change.get("target_ids", [])
     if not isinstance(target_ids, list) or not target_ids:
-        raise PersistenceContractError("persistence change has no target_ids")
+        raise PersistenceContractError(
+            "persistence change has no target_ids",
+            step="preflight",
+            code="missing_target_ids",
+        )
     targets: List[PersistenceTargetConfig] = []
     for raw_target_id in target_ids:
         target_id = str(raw_target_id).strip()
         target = config.target(target_id)
         if target is None:
             raise PersistenceContractError(
-                f"persistence target is not configured: {target_id}; run persistence-configure"
+                f"persistence target is not configured: {target_id}; run persistence-configure",
+                target_id=target_id,
+                step="preflight",
+                code="target_not_configured",
             )
         targets.append(target)
     return targets
@@ -413,13 +476,21 @@ def execute_persistence_action(
     # not execute a target command. v2 initialize is an explicit lifecycle action.
     if "storage_transition" not in change and strategy == "initial_schema":
         return {"ok": True, "strategy": strategy, "targets": [], "executed": False}
-    targets = persistence_targets_for_change(config, change)
-    _preflight_persistence_targets(
-        root,
-        transition if "storage_transition" in change else strategy,
-        targets,
-    )
+    try:
+        targets = persistence_targets_for_change(config, change)
+        _preflight_persistence_targets(
+            root,
+            transition if "storage_transition" in change else strategy,
+            targets,
+        )
+    except PersistenceContractError as error:
+        raise error.with_execution_context(
+            step="preflight",
+            mutation_started=False,
+        )
+
     results: List[Dict[str, object]] = []
+    mutation_started = False
     for target in targets:
         if target.environment == "production":
             results.append(
@@ -439,66 +510,128 @@ def execute_persistence_action(
         }
         steps = target_result["steps"]
         assert isinstance(steps, list)
-        if target.interface_version >= 2 and target.status_argv:
-            steps.append(_run_target_command(root, target, "status", target.status_argv))
-        if transition == "rebuild":
-            if target.kind == "compose_service" and not target.reset_argv:
-                raise PersistenceContractError(
-                    f"compose rebuild target {target.target_id} requires reset_argv"
+        active_step = "status"
+        try:
+            if target.interface_version >= 2 and target.status_argv:
+                steps.append(
+                    _run_target_command(root, target, "status", target.status_argv)
                 )
-            if target.reset_argv:
-                steps.append(_run_target_command(root, target, "reset", target.reset_argv))
-            for path in _destructive_target_paths(root, target):
-                _remove_path(path)
-                steps.append({"step": "delete", "path": str(path.relative_to(root)), "ok": True})
-            if not target.initialize_argv:
-                raise PersistenceContractError(
-                    f"rebuild target {target.target_id} requires initialize_argv"
+            if transition == "rebuild":
+                active_step = "reset"
+                if target.kind == "compose_service" and not target.reset_argv:
+                    raise PersistenceContractError(
+                        f"compose rebuild target {target.target_id} requires reset_argv",
+                        code="missing_mutation_command",
+                    )
+                if target.reset_argv:
+                    # Once a mutating command is attempted, every later error is
+                    # conservatively terminal even if the process reports failure.
+                    mutation_started = True
+                    steps.append(
+                        _run_target_command(root, target, "reset", target.reset_argv)
+                    )
+                active_step = "delete"
+                destructive_paths = _destructive_target_paths(root, target)
+                if destructive_paths:
+                    mutation_started = True
+                for path in destructive_paths:
+                    _remove_path(path)
+                    steps.append(
+                        {
+                            "step": "delete",
+                            "path": str(path.relative_to(root)),
+                            "ok": True,
+                        }
+                    )
+                active_step = "initialize"
+                if not target.initialize_argv:
+                    raise PersistenceContractError(
+                        f"rebuild target {target.target_id} requires initialize_argv",
+                        code="missing_mutation_command",
+                    )
+                mutation_started = True
+                steps.append(
+                    _run_target_command(
+                        root,
+                        target,
+                        "initialize",
+                        target.initialize_argv,
+                    )
                 )
-            steps.append(
-                _run_target_command(root, target, "initialize", target.initialize_argv)
-            )
-        elif transition == "initialize":
-            if not target.initialize_argv:
-                raise PersistenceContractError(
-                    f"initialize target {target.target_id} requires initialize_argv"
+            elif transition == "initialize":
+                active_step = "initialize"
+                if not target.initialize_argv:
+                    raise PersistenceContractError(
+                        f"initialize target {target.target_id} requires initialize_argv",
+                        code="missing_mutation_command",
+                    )
+                mutation_started = True
+                steps.append(
+                    _run_target_command(
+                        root,
+                        target,
+                        "initialize",
+                        target.initialize_argv,
+                    )
                 )
-            steps.append(_run_target_command(root, target, "initialize", target.initialize_argv))
-        else:
-            migrate_argv = target.migrate_argv or target.apply_argv
-            if not migrate_argv:
-                raise PersistenceContractError(
-                    f"{transition} target {target.target_id} requires migrate_argv"
+            else:
+                active_step = "migrate"
+                migrate_argv = target.migrate_argv or target.apply_argv
+                if not migrate_argv:
+                    raise PersistenceContractError(
+                        f"{transition} target {target.target_id} requires migrate_argv",
+                        code="missing_mutation_command",
+                    )
+                mutation_started = True
+                steps.append(
+                    _run_target_command(root, target, "migrate", migrate_argv)
                 )
-            steps.append(_run_target_command(root, target, "migrate", migrate_argv))
 
-        if not target.verify_argv:
-            raise PersistenceContractError(
-                f"persistence target {target.target_id} requires verify_argv"
+            active_step = "verify"
+            if not target.verify_argv:
+                raise PersistenceContractError(
+                    f"persistence target {target.target_id} requires verify_argv",
+                    code="missing_verify_command",
+                )
+            verification = _run_target_command(
+                root,
+                target,
+                "verify",
+                target.verify_argv,
             )
-        verification = _run_target_command(root, target, "verify", target.verify_argv)
-        if target.interface_version >= 2:
-            protocol = verification.get("protocol", {})
-            assert isinstance(protocol, dict)
-            expected_version = str(change.get("to_version", "")).strip()
-            current_version = str(protocol.get("current_version", "")).strip()
-            latest_version = str(protocol.get("latest_version", "")).strip()
-            pending = protocol.get("pending_versions", [])
-            if protocol.get("state") != "ready" or pending not in ([], None):
-                raise PersistenceContractError(
-                    f"persistence verify did not report a ready target for {target.target_id}"
-                )
-            if expected_version and (
-                current_version != expected_version or latest_version != expected_version
-            ):
-                raise PersistenceContractError(
-                    f"persistence verify version mismatch for {target.target_id}: "
-                    f"expected {expected_version}, current {current_version or '<missing>'}, "
-                    f"latest {latest_version or '<missing>'}"
-                )
-        steps.append(verification)
-        target_result["status"] = "verified"
-        results.append(target_result)
+            if target.interface_version >= 2:
+                protocol = verification.get("protocol", {})
+                assert isinstance(protocol, dict)
+                expected_version = str(change.get("to_version", "")).strip()
+                current_version = str(protocol.get("current_version", "")).strip()
+                latest_version = str(protocol.get("latest_version", "")).strip()
+                pending = protocol.get("pending_versions", [])
+                if protocol.get("state") != "ready" or pending not in ([], None):
+                    raise PersistenceContractError(
+                        "persistence verify did not report a ready target for "
+                        f"{target.target_id}",
+                        code="verify_not_ready",
+                    )
+                if expected_version and (
+                    current_version != expected_version
+                    or latest_version != expected_version
+                ):
+                    raise PersistenceContractError(
+                        f"persistence verify version mismatch for {target.target_id}: "
+                        f"expected {expected_version}, "
+                        f"current {current_version or '<missing>'}, "
+                        f"latest {latest_version or '<missing>'}",
+                        code="verify_version_mismatch",
+                    )
+            steps.append(verification)
+            target_result["status"] = "verified"
+            results.append(target_result)
+        except PersistenceContractError as error:
+            raise error.with_execution_context(
+                target_id=target.target_id,
+                step=active_step,
+                mutation_started=mutation_started,
+            )
     return {
         "ok": True,
         "strategy": strategy,
@@ -527,31 +660,46 @@ def _preflight_persistence_targets(
         commands: List[tuple[str, Sequence[str]]] = []
         if target.lifecycle != "ready":
             raise PersistenceContractError(
-                f"persistence target {target.target_id} is pending bootstrap"
+                f"persistence target {target.target_id} is pending bootstrap",
+                target_id=target.target_id,
+                step="preflight",
+                code="target_not_ready",
             )
         if target.interface_version >= 2:
             if not target.status_argv:
                 raise PersistenceContractError(
-                    f"persistence target {target.target_id} requires status_argv"
+                    f"persistence target {target.target_id} requires status_argv",
+                    target_id=target.target_id,
+                    step="status",
+                    code="missing_status_command",
                 )
             commands.append(("status", target.status_argv))
         if transition == "rebuild":
             if target.kind == "compose_service" and not target.reset_argv:
                 raise PersistenceContractError(
-                    f"compose rebuild target {target.target_id} requires reset_argv"
+                    f"compose rebuild target {target.target_id} requires reset_argv",
+                    target_id=target.target_id,
+                    step="reset",
+                    code="missing_mutation_command",
                 )
             if target.reset_argv:
                 commands.append(("reset", target.reset_argv))
             _destructive_target_paths(root, target)
             if not target.initialize_argv:
                 raise PersistenceContractError(
-                    f"rebuild target {target.target_id} requires initialize_argv"
+                    f"rebuild target {target.target_id} requires initialize_argv",
+                    target_id=target.target_id,
+                    step="initialize",
+                    code="missing_mutation_command",
                 )
             commands.append(("initialize", target.initialize_argv))
         elif transition == "initialize":
             if not target.initialize_argv:
                 raise PersistenceContractError(
-                    f"initialize target {target.target_id} requires initialize_argv"
+                    f"initialize target {target.target_id} requires initialize_argv",
+                    target_id=target.target_id,
+                    step="initialize",
+                    code="missing_mutation_command",
                 )
             commands.append(("initialize", target.initialize_argv))
         else:
@@ -559,12 +707,18 @@ def _preflight_persistence_targets(
             if not migrate_argv:
                 raise PersistenceContractError(
                     f"{action} target {target.target_id} requires "
-                    f"{'apply_argv' if legacy else 'migrate_argv'}"
+                    f"{'apply_argv' if legacy else 'migrate_argv'}",
+                    target_id=target.target_id,
+                    step="migrate",
+                    code="missing_mutation_command",
                 )
             commands.append(("migrate", migrate_argv))
         if not target.verify_argv:
             raise PersistenceContractError(
-                f"persistence target {target.target_id} requires verify_argv"
+                f"persistence target {target.target_id} requires verify_argv",
+                target_id=target.target_id,
+                step="verify",
+                code="missing_verify_command",
             )
         commands.append(("verify", target.verify_argv))
         for step, argv in commands:
@@ -593,14 +747,27 @@ def _preflight_pytest_command(
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise PersistenceContractError(
-            f"persistence {step} preflight failed for {target.target_id}: {error}"
+            f"persistence {step} preflight failed for {target.target_id}: {error}",
+            target_id=target.target_id,
+            step=f"{step}_preflight",
+            code="preflight_command_failed",
         ) from error
     if process.returncode != 0:
         detail = (process.stderr or process.stdout or "pytest collection failed")[-2000:]
         raise PersistenceContractError(
             f"persistence {step} configuration is stale for {target.target_id}: "
             "pytest could not collect the configured selector(s) before any persistence "
-            f"action was executed: {detail.strip()}; run persistence-configure"
+            f"action was executed: {detail.strip()}; run persistence-configure",
+            target_id=target.target_id,
+            step=f"{step}_preflight",
+            code="stale_pytest_selector",
+            command_outcome={
+                "argv": collect_argv,
+                "execution_started": True,
+                "returncode": int(process.returncode),
+                "stdout_tail": (process.stdout or "")[-1000:],
+                "stderr_tail": (process.stderr or "")[-1000:],
+            },
         )
 
 
@@ -633,14 +800,46 @@ def _run_target_command(
             timeout=target.timeout_seconds,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except OSError as error:
         raise PersistenceContractError(
-            f"persistence {step} failed for {target.target_id}: {error}"
+            f"persistence {step} failed for {target.target_id}: {error}",
+            target_id=target.target_id,
+            step=step,
+            code="command_start_failed",
+            command_outcome={
+                "argv": list(argv),
+                "execution_started": False,
+                "error": str(error),
+            },
         ) from error
+    except subprocess.TimeoutExpired as error:
+        raise PersistenceContractError(
+            f"persistence {step} failed for {target.target_id}: {error}",
+            target_id=target.target_id,
+            step=step,
+            code="command_timed_out",
+            command_outcome={
+                "argv": list(argv),
+                "execution_started": True,
+                "timed_out": True,
+            },
+        ) from error
+
+    command_outcome: Dict[str, object] = {
+        "argv": list(argv),
+        "execution_started": True,
+        "returncode": int(process.returncode),
+        "stdout_tail": (process.stdout or "")[-1000:],
+        "stderr_tail": (process.stderr or "")[-1000:],
+    }
     if process.returncode != 0:
         detail = (process.stderr or process.stdout or "command failed")[-2000:]
         raise PersistenceContractError(
-            f"persistence {step} failed for {target.target_id}: {detail.strip()}"
+            f"persistence {step} failed for {target.target_id}: {detail.strip()}",
+            target_id=target.target_id,
+            step=step,
+            code="command_failed",
+            command_outcome=command_outcome,
         )
     payload: object = None
     if target.interface_version >= 2:
@@ -648,15 +847,31 @@ def _run_target_command(
             payload = json.loads((process.stdout or "").strip())
         except json.JSONDecodeError as error:
             raise PersistenceContractError(
-                f"persistence {step} returned invalid protocol JSON for {target.target_id}"
+                f"persistence {step} returned invalid protocol JSON for {target.target_id}",
+                target_id=target.target_id,
+                step=step,
+                code="invalid_protocol_json",
+                command_outcome=command_outcome,
             ) from error
         if not isinstance(payload, dict) or payload.get("protocol_version") != 1:
+            if isinstance(payload, dict):
+                command_outcome["protocol_version"] = payload.get(
+                    "protocol_version"
+                )
             raise PersistenceContractError(
-                f"persistence {step} returned unsupported protocol for {target.target_id}"
+                f"persistence {step} returned unsupported protocol for {target.target_id}",
+                target_id=target.target_id,
+                step=step,
+                code="unsupported_protocol",
+                command_outcome=command_outcome,
             )
         if payload.get("ok") is not True:
             raise PersistenceContractError(
-                f"persistence {step} did not report ok for {target.target_id}"
+                f"persistence {step} did not report ok for {target.target_id}",
+                target_id=target.target_id,
+                step=step,
+                code="protocol_not_ok",
+                command_outcome=command_outcome,
             )
     result = {
         "step": step,
@@ -677,7 +892,10 @@ def _validate_runtime_argv(argv: Sequence[str], target_id: str, step: str) -> No
         for item in argv
     ):
         raise PersistenceContractError(
-            f"persistence {step} argv is unsafe for target {target_id}"
+            f"persistence {step} argv is unsafe for target {target_id}",
+            target_id=target_id,
+            step=step,
+            code="unsafe_argv",
         )
 
 
