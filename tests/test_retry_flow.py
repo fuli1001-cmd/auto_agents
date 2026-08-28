@@ -2772,6 +2772,269 @@ class RetryFlowTests(unittest.TestCase):
                 ),
             )
 
+    def test_active_retained_owner_reaches_evidence_repair_after_self_repair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+            commit_all(project_root, "test: candidate baseline")
+
+            orchestrator = Orchestrator(project_root)
+            completed_reconciliation = TaskSpec(
+                task_id="completed-reconciliation",
+                title="Completed reconciliation",
+                description="Historical self-repair worktree reconciliation.",
+                acceptance=["The retained candidate was reconciled."],
+                status="done",
+                task_origin="stage_recovery",
+                recovery_history=[
+                    {
+                        "kind": "retained_worktree_reconciliation",
+                        "result": "reconciled",
+                    }
+                ],
+            )
+            parent = TaskSpec(
+                task_id="active-parent",
+                title="Active parent",
+                description="Own the retained implementation candidate.",
+                acceptance=["The focused proof passes."],
+                status="in_progress",
+                verification_refs=["tests/test_candidate.py::test_candidate"],
+            )
+            stale_owner = TaskSpec(
+                task_id="stale-owner",
+                title="Stale owner",
+                description="Carries an older, non-matching ownership record.",
+                acceptance=["Its candidate remains isolated."],
+                status="pending",
+            )
+            tasks = [completed_reconciliation, parent, stale_owner]
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.tasks = tasks
+            write_text(project_root / "candidate.py", "VALUE = 'retained'\n")
+            orchestrator._set_implementation_ready_marker(state, parent, True)
+
+            scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                state,
+                tasks,
+                parent,
+                {
+                    "reason": "owned proof evidence failed",
+                    "failure_ids": [
+                        "tests/test_candidate.py::test_candidate"
+                    ],
+                },
+            )
+
+            self.assertTrue(scheduled)
+            repair = next(
+                task
+                for task in tasks
+                if task.task_origin == "evidence_repair"
+            )
+            ownership = state.resume_context["retained_worktree_ownership"]
+            stale_record = json.loads(json.dumps(ownership[parent.task_id]))
+            stale_record["owner_task_id"] = stale_owner.task_id
+            stale_record["path_fingerprints"]["candidate.py"] = "0" * 64
+            ownership[stale_owner.task_id] = stale_record
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "historical_self_repair",
+                "status": "retrying",
+                "self_repair_commit": "historical-repair-commit",
+                "retained_worktree_reconciliation_task_id": (
+                    completed_reconciliation.task_id
+                ),
+            }
+            state.status = "pending"
+            before_planning_head = head_ref(project_root)
+            executed: list[str] = []
+
+            def execute_one(
+                _state: RunState,
+                _tasks: list[TaskSpec],
+                task: TaskSpec,
+            ) -> None:
+                executed.append(task.task_id)
+                task.status = "done"
+                return None
+
+            with patch.object(
+                orchestrator,
+                "_ensure_implement_verify_baseline",
+            ), patch.object(
+                orchestrator,
+                "_execute_task_in_main_worktree",
+                side_effect=execute_one,
+            ):
+                result = orchestrator._run_implementation_loop(
+                    state,
+                    max_tasks=1,
+                )
+
+            self.assertEqual(executed, [repair.task_id])
+            self.assertIs(result, state)
+            self.assertNotEqual(head_ref(project_root), before_planning_head)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(
+                (project_root / "candidate.py").read_text(encoding="utf-8"),
+                "VALUE = 'retained'\n",
+            )
+            self.assertEqual(changed_paths(project_root), ["candidate.py"])
+            committed_paths = subprocess.run(
+                ["git", "show", "--pretty=format:", "--name-only", "HEAD"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.splitlines()
+            self.assertNotIn("candidate.py", committed_paths)
+
+    def test_completed_self_repair_lifecycle_does_not_arm_baseline_guard(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+            commit_all(project_root, "test: completed recovery baseline")
+
+            completed_reconciliation = TaskSpec(
+                task_id="completed-reconciliation",
+                title="Completed reconciliation",
+                description="Historical retained worktree recovery.",
+                acceptance=["The recovery completed."],
+                status="done",
+                task_origin="stage_recovery",
+                recovery_history=[
+                    {
+                        "kind": "retained_worktree_reconciliation",
+                        "result": "reconciled",
+                    }
+                ],
+            )
+            active = TaskSpec(
+                task_id="active-task",
+                title="Active task",
+                description="Continue ordinary implementation.",
+                acceptance=["The task completes."],
+                status="pending",
+            )
+            tasks = [completed_reconciliation, active]
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [task.to_dict() for task in tasks]},
+            )
+            write_text(project_root / "candidate.py", "VALUE = 'later'\n")
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.status = "pending"
+            state.tasks = tasks
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "historical_self_repair",
+                "status": "retrying",
+                "self_repair_commit": "historical-repair-commit",
+                "retained_worktree_reconciliation_task_id": (
+                    completed_reconciliation.task_id
+                ),
+            }
+            orchestrator = Orchestrator(project_root)
+            before_planning_head = head_ref(project_root)
+
+            orchestrator._commit_planning_baseline_if_needed(
+                tasks,
+                state=state,
+            )
+
+            self.assertNotEqual(head_ref(project_root), before_planning_head)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(changed_paths(project_root), ["candidate.py"])
+
+    def test_active_retained_owner_guard_rejects_untrusted_records(self) -> None:
+        for case in ("mismatch", "ambiguous", "unreachable"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                project_root = Path(tmp) / "demo"
+                Orchestrator.init_project(project_root, "demo", "mock")
+                self._configure_git_identity(project_root)
+                write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+                commit_all(project_root, "test: ownership baseline")
+
+                owner = TaskSpec(
+                    task_id="candidate-owner",
+                    title="Candidate owner",
+                    description="Own the retained candidate.",
+                    acceptance=["The candidate is verified."],
+                    status="pending",
+                    depends_on=(
+                        ["missing-dependency"]
+                        if case == "unreachable"
+                        else []
+                    ),
+                )
+                tasks = [owner]
+                if case == "ambiguous":
+                    tasks.append(
+                        TaskSpec(
+                            task_id="second-owner",
+                            title="Second owner",
+                            description="Claims the same retained candidate.",
+                            acceptance=["Its ownership is unambiguous."],
+                            status="pending",
+                        )
+                    )
+                state = load_run_state(project_root)
+                state.current_stage = "implement"
+                state.status = "pending"
+                state.tasks = tasks
+                write_text(project_root / "candidate.py", "VALUE = 'captured'\n")
+                orchestrator = Orchestrator(project_root)
+                orchestrator._capture_retained_worktree_ownership(
+                    state,
+                    [task.task_id for task in tasks],
+                    source="test",
+                )
+                if case == "mismatch":
+                    write_text(
+                        project_root / "candidate.py",
+                        "VALUE = 'changed-after-capture'\n",
+                    )
+                write_json(
+                    task_plan_path(project_root),
+                    {"tasks": [task.to_dict() for task in tasks]},
+                )
+                state.active_blocker = {
+                    "owner": "auto_agents",
+                    "category": "self_repair",
+                    "status": "retrying",
+                    "self_repair_commit": "repair-commit",
+                }
+                before_planning_head = head_ref(project_root)
+
+                orchestrator._commit_planning_baseline_if_needed(
+                    tasks,
+                    state=state,
+                )
+
+                self.assertEqual(head_ref(project_root), before_planning_head)
+                self.assertEqual(state.status, "blocked")
+                self.assertEqual(
+                    state.active_blocker["category"],
+                    "orphaned_retained_worktree",
+                )
+                self.assertEqual(
+                    state.active_blocker["planning_baseline_rejection"][
+                        "changed_paths"
+                    ],
+                    ["candidate.py"],
+                )
+
     def test_replan_migrates_exact_retained_candidate_to_prebaseline_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -3323,6 +3586,7 @@ class RetryFlowTests(unittest.TestCase):
                 state.resume_context["implementation_ready_tasks"],
             )
 
+            recovery.status = "done"
             orchestrator._complete_retained_worktree_reconciliation(
                 state,
                 recovery,
@@ -3339,6 +3603,12 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(
                 state.last_recovery_route["outcome"],
                 "retained_worktree_reconciled",
+            )
+            self.assertEqual(
+                state.active_blocker["retained_worktree_reconciliation"][
+                    "status"
+                ],
+                "resolved",
             )
 
     def test_self_repair_migrates_legacy_orphan_after_planning_head_advance(self) -> None:

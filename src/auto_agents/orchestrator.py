@@ -7469,6 +7469,11 @@ class Orchestrator:
             blocker["retained_worktree_reconciliation_task_id"] = (
                 retained_reconciliation_task_id
             )
+            blocker["retained_worktree_reconciliation"] = {
+                "task_id": retained_reconciliation_task_id,
+                "status": "pending",
+                "updated_at": utc_now_iso(),
+            }
 
         cursor_reconciliations = (
             self._reconcile_noncontiguous_recovery_exhaustion(
@@ -7804,7 +7809,11 @@ class Orchestrator:
         *,
         allow_pending_planning_changes: bool,
     ) -> bool:
-        if int(record.get("version", 0) or 0) != 1:
+        try:
+            version = int(record.get("version", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if version != 1:
             return False
         raw_paths = record.get("changed_paths", [])
         if not isinstance(raw_paths, list):
@@ -7866,6 +7875,178 @@ class Orchestrator:
             set(expected_path_fingerprints) == set(expected_paths)
             and expected_path_fingerprints
             == self._retained_worktree_path_fingerprints(expected_paths)
+        )
+
+    @staticmethod
+    def _execution_reachable_task_ids(
+        tasks: Iterable[TaskSpec],
+    ) -> Set[str]:
+        """Return tasks that can run after a valid dependency progression."""
+
+        task_list = list(tasks)
+        tasks_by_id = {task.task_id: task for task in task_list}
+        if len(tasks_by_id) != len(task_list):
+            return set()
+
+        completed = {
+            task.task_id for task in task_list if task.status == "done"
+        }
+        candidates = {
+            task.task_id: task
+            for task in task_list
+            if task.status not in {"done", "waiting_user"}
+        }
+        reachable: Set[str] = set()
+        while True:
+            available = completed | reachable
+            newly_reachable = {
+                task_id
+                for task_id, task in candidates.items()
+                if task_id not in reachable
+                and all(dependency in available for dependency in task.depends_on)
+            }
+            if not newly_reachable:
+                return reachable
+            reachable.update(newly_reachable)
+
+    def _retained_worktree_record_has_exact_path_fingerprints(
+        self,
+        record: Mapping[str, object],
+    ) -> bool:
+        """Validate the redundant per-path evidence on an ownership record."""
+
+        raw_paths = record.get("changed_paths", [])
+        raw_fingerprints = record.get("path_fingerprints", {})
+        if not isinstance(raw_paths, list) or not isinstance(
+            raw_fingerprints,
+            dict,
+        ):
+            return False
+        paths = {
+            str(path).strip().replace("\\", "/")
+            for path in raw_paths
+            if str(path).strip()
+        }
+        fingerprints: Dict[str, str] = {}
+        for raw_path, raw_fingerprint in raw_fingerprints.items():
+            path = str(raw_path).strip().replace("\\", "/")
+            fingerprint = str(raw_fingerprint).strip()
+            if not path or not fingerprint or path in fingerprints:
+                return False
+            fingerprints[path] = fingerprint
+        return bool(
+            paths
+            and set(fingerprints) == paths
+            and fingerprints
+            == self._retained_worktree_path_fingerprints(paths)
+        )
+
+    def _active_retained_worktree_ownership_matches(
+        self,
+        state: RunState,
+        tasks: Iterable[TaskSpec],
+        non_planning_paths: Iterable[str],
+    ) -> bool:
+        """Authorize one exact, execution-reachable active owner lineage."""
+
+        task_list = list(tasks)
+        tasks_by_id = {task.task_id: task for task in task_list}
+        if len(tasks_by_id) != len(task_list):
+            return False
+        reachable_ids = self._execution_reachable_task_ids(task_list)
+        if not reachable_ids:
+            return False
+
+        allowed = self._planning_baseline_allowed_paths()
+        expected_paths = {
+            str(path).strip().replace("\\", "/")
+            for path in non_planning_paths
+            if str(path).strip()
+        }
+        matching_lineages: Dict[str, Set[str]] = {}
+        records = self._retained_worktree_ownership_records(state)
+        for owner_id, record in records.items():
+            owner = tasks_by_id.get(owner_id)
+            if (
+                owner is None
+                or owner_id not in reachable_ids
+                or str(record.get("owner_task_id", "")).strip() != owner_id
+            ):
+                continue
+            raw_paths = record.get("changed_paths", [])
+            if not isinstance(raw_paths, list):
+                continue
+            owned_paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+                and str(path).strip().replace("\\", "/") not in allowed
+            }
+            if (
+                owned_paths != expected_paths
+                or not self._retained_worktree_snapshot_matches(
+                    record,
+                    allow_pending_planning_changes=True,
+                )
+                or not self._retained_worktree_record_has_exact_path_fingerprints(
+                    record
+                )
+            ):
+                continue
+            lineage = self._recovery_lineage_owner(task_list, owner)
+            matching_lineages.setdefault(lineage.task_id, set()).add(owner_id)
+
+        if len(matching_lineages) != 1:
+            return False
+        lineage_id, owner_ids = next(iter(matching_lineages.items()))
+        self.logger.info(
+            "[recovery] carrying active retained worktree lineage=%s "
+            "owners=%s paths=%s",
+            lineage_id,
+            ",".join(sorted(owner_ids)),
+            len(expected_paths),
+        )
+        return True
+
+    def _self_repair_retained_worktree_lifecycle_unresolved(
+        self,
+        blocker: Mapping[str, object],
+        tasks: Iterable[TaskSpec],
+    ) -> bool:
+        """Recognize whether a historical self-repair guard is still live."""
+
+        if (
+            str(blocker.get("owner", "")).strip() != "auto_agents"
+            or not str(blocker.get("self_repair_commit", "")).strip()
+        ):
+            return False
+
+        raw_lifecycle = blocker.get("retained_worktree_reconciliation", {})
+        lifecycle = (
+            dict(raw_lifecycle) if isinstance(raw_lifecycle, dict) else {}
+        )
+        lifecycle_status = str(lifecycle.get("status", "")).strip()
+        if lifecycle_status in {"completed", "reconciled", "resolved"}:
+            return False
+
+        task_id = str(lifecycle.get("task_id", "")).strip() or str(
+            blocker.get("retained_worktree_reconciliation_task_id", "")
+        ).strip()
+        if not task_id:
+            # Old engines did not persist a lifecycle identity. Keep their
+            # guard fail-closed until exact ownership or a handoff is proven.
+            return True
+
+        task = next(
+            (candidate for candidate in tasks if candidate.task_id == task_id),
+            None,
+        )
+        if task is None:
+            return True
+        marker = self._retained_worktree_reconciliation_marker(task)
+        return not bool(
+            task.status == "done"
+            and str(marker.get("result", "")).strip() == "reconciled"
         )
 
     @staticmethod
@@ -8512,6 +8693,30 @@ class Orchestrator:
             route["reconciliation_task_id"] = task.task_id
             route["reconciled_task_ids"] = sorted(owner_ids)
             state.last_recovery_route = route
+
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        raw_lifecycle = blocker.get("retained_worktree_reconciliation", {})
+        lifecycle = (
+            dict(raw_lifecycle) if isinstance(raw_lifecycle, dict) else {}
+        )
+        lifecycle_task_id = str(lifecycle.get("task_id", "")).strip() or str(
+            blocker.get("retained_worktree_reconciliation_task_id", "")
+        ).strip()
+        if lifecycle_task_id == task.task_id:
+            lifecycle.update(
+                {
+                    "task_id": task.task_id,
+                    "status": "resolved",
+                    "completed_at": marker["completed_at"],
+                    "updated_at": utc_now_iso(),
+                }
+            )
+            blocker["retained_worktree_reconciliation"] = lifecycle
+            state.active_blocker = blocker
 
     def _clear_retained_worktree_owner_record(
         self,
@@ -27863,15 +28068,26 @@ class Orchestrator:
     ) -> bool:
         """Fail closed when self-repair cannot prove a dirty candidate owner."""
 
+        task_list = list(tasks)
         blocker = (
             dict(state.active_blocker)
             if isinstance(state.active_blocker, dict)
             else {}
         )
+        self_repair_guard = bool(
+            str(blocker.get("owner", "")).strip() == "auto_agents"
+            and str(blocker.get("self_repair_commit", "")).strip()
+        )
         if (
-            str(blocker.get("owner", "")).strip() != "auto_agents"
-            or not str(blocker.get("self_repair_commit", "")).strip()
-            or state.current_stage != "implement"
+            state.current_stage != "implement"
+            or not self_repair_guard
+            or not (
+                self._retained_worktree_ownership_records(state)
+                or self._self_repair_retained_worktree_lifecycle_unresolved(
+                    blocker,
+                    task_list,
+                )
+            )
         ):
             return False
 
@@ -27883,7 +28099,7 @@ class Orchestrator:
         }
         if not expected_paths:
             return False
-        for task in tasks:
+        for task in task_list:
             if task.status == "done":
                 continue
             marker = self._retained_worktree_reconciliation_marker(task)
@@ -27906,6 +28122,13 @@ class Orchestrator:
                 )
             ):
                 return False
+
+        if self._active_retained_worktree_ownership_matches(
+            state,
+            task_list,
+            expected_paths,
+        ):
+            return False
 
         reason = (
             "auto_agents cannot advance the planning baseline while "
