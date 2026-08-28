@@ -131,6 +131,46 @@ def _make_provider_blocked_project(tmp: str, name: str = "demo") -> tuple[Path, 
     return project_root, reference
 
 
+def _add_second_provider_requirement(project_root: Path) -> str:
+    reference = ".auto-agents/docs/provider_references/provider-two.md"
+    trace = load_requirements_trace(project_root, normalize=False)
+    trace["requirements"].append(
+        {
+            "id": "REQ-002",
+            "text": "Use a second verified provider dependency.",
+            "source": "spec",
+            "status": "active",
+            "priority": "mandatory",
+            "acceptance_oracles": ["second provider reference is resolved"],
+            "oracle_type": "deterministic_test",
+            "oracle_strength": "behavioral",
+            "evidence_boundary": "internal_state",
+            "forbidden_proxy_oracles": [],
+            "forbidden_patterns": [],
+            "external_docs_required": True,
+            "provider_reference": reference,
+            "notes": "",
+        }
+    )
+    write_json(requirements_trace_path(project_root), trace)
+    write_text(
+        project_root / reference,
+        "# Second Provider Reference\n\n## Status\n\nambiguous\n",
+    )
+    lock = json.loads(
+        provider_references_lock_path(project_root).read_text(encoding="utf-8")
+    )
+    lock["references"]["provider-two"] = {
+        "path": reference,
+        "status": "ambiguous",
+        "retrieved_at": "2026-04-24T00:00:00Z",
+        "source_urls": ["https://example.net/official"],
+        "notes": "Needs a separate decision.",
+    }
+    write_json(provider_references_lock_path(project_root), lock)
+    return reference
+
+
 def _configure_git_identity(project_root: Path) -> None:
     subprocess.run(
         ["git", "config", "user.name", "test"],
@@ -1602,6 +1642,126 @@ class SessionProviderResolveTests(unittest.TestCase):
             self.assertEqual(second_session.status, "blocked")
             self.assertEqual(call_count["n"], 2)
             self.assertEqual(resume_calls["n"], 1)
+
+    def test_provider_recovery_allows_a_disjoint_consumer_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, _reference = _make_provider_blocked_project(tmp)
+            _add_second_provider_requirement(project_root)
+            run_state = load_run_state(project_root)
+            run_state.tasks = [
+                TaskSpec(
+                    task_id="task-first-consumer",
+                    title="Consume first provider contract",
+                    description="Exercise the first provider boundary.",
+                    acceptance=["The first provider evidence is verified."],
+                    requirement_ids=["REQ-001"],
+                ),
+                TaskSpec(
+                    task_id="task-second-consumer",
+                    title="Consume second provider contract",
+                    description="Exercise the second provider boundary.",
+                    acceptance=["The second provider evidence is verified."],
+                    requirement_ids=["REQ-002"],
+                ),
+            ]
+            save_run_state(project_root, run_state)
+            orchestrator = Orchestrator(project_root)
+            original_blocker = run_state.last_error
+            expected = orchestrator.provider_recovery_contract_fingerprint(
+                state=run_state,
+                blocker_message=original_blocker,
+            )
+            recreated_blocker = (
+                "provider research is blocked; resolve the new dependency.\n"
+                "- REQ-002: second provider reference is ambiguous"
+            )
+
+            blocked = orchestrator.block_repeated_provider_recovery(
+                expected_contract_fingerprint=expected,
+                blocker_message=recreated_blocker,
+                contract_scope_message=original_blocker,
+            )
+
+            self.assertIsNone(blocked)
+            persisted = load_run_state(project_root)
+            self.assertEqual(persisted.status, "failed")
+            self.assertNotIn(
+                "provider_recovery_contract_receipts",
+                persisted.resume_context,
+            )
+
+    def test_provider_recovery_receipt_survives_a_narrower_blocker_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root, reference = _make_provider_blocked_project(tmp)
+            second_reference = _add_second_provider_requirement(project_root)
+            run_state = load_run_state(project_root)
+            run_state.tasks = [
+                TaskSpec(
+                    task_id="task-provider-consumer",
+                    title="Consume both provider contracts",
+                    description="Exercise both provider boundaries.",
+                    acceptance=["Both provider references are verified."],
+                    requirement_ids=["REQ-001", "REQ-002"],
+                )
+            ]
+            original_blocker = (
+                "provider research is blocked; resolve provider dependencies.\n"
+                f"- REQ-001: {reference} is ambiguous\n"
+                f"- REQ-002: {second_reference} is ambiguous"
+            )
+            run_state.last_error = original_blocker
+            save_run_state(project_root, run_state)
+            orchestrator = Orchestrator(project_root)
+            expected = orchestrator.provider_recovery_contract_fingerprint(
+                state=run_state,
+                blocker_message=original_blocker,
+            )
+            narrower_blocker = (
+                "provider research is blocked; one dependency remains.\n"
+                f"- REQ-002: {second_reference} is ambiguous"
+            )
+
+            blocked = orchestrator.block_repeated_provider_recovery(
+                expected_contract_fingerprint=expected,
+                blocker_message=narrower_blocker,
+                contract_scope_message=original_blocker,
+            )
+
+            self.assertIsNotNone(blocked)
+            retried_run = load_run_state(project_root)
+            retried_run.status = "failed"
+            retried_run.last_error = narrower_blocker
+            retried_run.active_blocker = {}
+            save_run_state(project_root, retried_run)
+
+            restored = orchestrator.restore_exhausted_provider_recovery()
+
+            self.assertIsNotNone(restored)
+            self.assertEqual(
+                restored.active_blocker["category"],
+                "provider_recovery_contract_unsatisfied",
+            )
+
+    def test_provider_resolve_does_not_exceed_configured_attempt_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            session = Session(orchestrator, mode="provider_resolve")
+            state = SessionState(
+                session_id="bounded-provider-recovery",
+                mode="provider_resolve",
+                status="executing",
+                current_attempt=2,
+                max_attempts=2,
+                hard_ceiling=15,
+            )
+
+            with patch.object(session, "_call_agent") as call_agent:
+                result = session._phase_provider_resolve_execute(state)
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.current_attempt, 2)
+            call_agent.assert_not_called()
 
     def test_provider_resolve_rejects_and_restores_contract_field_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

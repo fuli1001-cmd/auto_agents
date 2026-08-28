@@ -878,6 +878,12 @@ class Session:
         self._current_state = state
         feedback = ""
         while True:
+            if state.current_attempt >= state.max_attempts:
+                self._print(
+                    f"Provider recovery attempt limit ({state.max_attempts}) "
+                    "reached. Stopping."
+                )
+                break
             state.current_attempt += 1
             self._print(f"\n--- Provider recovery iteration {state.current_attempt} ---")
 
@@ -2307,6 +2313,14 @@ class Session:
             return (
                 f"Agent encountered {state.consecutive_agent_errors} consecutive "
                 f"transient errors. Stopping."
+            )
+        if (
+            state.mode == "provider_resolve"
+            and state.current_attempt >= state.max_attempts
+        ):
+            return (
+                f"Provider recovery attempt limit ({state.max_attempts}) reached. "
+                "Stopping."
             )
         if state.current_attempt >= state.hard_ceiling:
             return (

@@ -19961,6 +19961,19 @@ class Orchestrator:
             )
         return identities
 
+    @staticmethod
+    def _provider_blocker_requirement_ids(message: str) -> Set[str]:
+        """Return the normalized requirement scope named by a blocker."""
+
+        return {
+            item.upper()
+            for item in re.findall(
+                r"\bREQ-[A-Za-z0-9_-]+\b",
+                message,
+                flags=re.IGNORECASE,
+            )
+        }
+
     def provider_recovery_contract_fingerprint(
         self,
         *,
@@ -19976,14 +19989,9 @@ class Orchestrator:
 
         state = state or load_run_state(self.project_root)
         trace = load_requirements_trace(self.project_root)
-        requirement_ids = {
-            item.upper()
-            for item in re.findall(
-                r"\bREQ-[A-Za-z0-9_-]+\b",
-                blocker_message or state.last_error,
-                flags=re.IGNORECASE,
-            )
-        }
+        requirement_ids = self._provider_blocker_requirement_ids(
+            blocker_message or state.last_error
+        )
         requirements = [
             requirement
             for requirement in external_doc_requirements(trace)
@@ -20048,6 +20056,18 @@ class Orchestrator:
         """Stop recovery when resuming recreates the same consumer contract."""
 
         state = load_run_state(self.project_root)
+        expected_requirement_ids = self._provider_blocker_requirement_ids(
+            contract_scope_message
+        )
+        recreated_requirement_ids = self._provider_blocker_requirement_ids(
+            blocker_message
+        )
+        if (
+            expected_requirement_ids
+            and recreated_requirement_ids
+            and expected_requirement_ids.isdisjoint(recreated_requirement_ids)
+        ):
+            return None
         current_fingerprint = self.provider_recovery_contract_fingerprint(
             state=state,
             blocker_message=contract_scope_message or blocker_message,
@@ -20067,10 +20087,34 @@ class Orchestrator:
             if isinstance(previous, dict)
             else 1
         )
-        receipts[current_fingerprint] = {
-            "attempts": attempts,
-            "outcome": "consumer_contract_unsatisfied",
-        }
+        receipt_requirement_ids = (
+            expected_requirement_ids or recreated_requirement_ids
+        )
+        receipt_scopes = [receipt_requirement_ids]
+        if len(receipt_requirement_ids) > 1:
+            receipt_scopes.extend({requirement_id} for requirement_id in sorted(
+                receipt_requirement_ids
+            ))
+        for requirement_scope in receipt_scopes:
+            receipt_fingerprint = (
+                current_fingerprint
+                if requirement_scope == receipt_requirement_ids
+                else self.provider_recovery_contract_fingerprint(
+                    state=state,
+                    blocker_message=" ".join(sorted(requirement_scope)),
+                )
+            )
+            prior_receipt = receipts.get(receipt_fingerprint, {})
+            prior_attempts = (
+                int(prior_receipt.get("attempts", 0) or 0)
+                if isinstance(prior_receipt, dict)
+                else 0
+            )
+            receipts[receipt_fingerprint] = {
+                "attempts": max(attempts, prior_attempts + 1),
+                "outcome": "consumer_contract_unsatisfied",
+                "requirement_ids": sorted(requirement_scope),
+            }
         state.resume_context["provider_recovery_contract_receipts"] = receipts
         self._block_run(
             state,
@@ -20101,6 +20145,32 @@ class Orchestrator:
             if isinstance(receipts, dict)
             else {}
         )
+        if isinstance(receipts, dict) and not receipt:
+            current_requirement_ids = self._provider_blocker_requirement_ids(
+                state.last_error
+            )
+            for fingerprint, candidate in receipts.items():
+                if not isinstance(candidate, dict):
+                    continue
+                requirement_ids = {
+                    str(item).strip().upper()
+                    for item in candidate.get("requirement_ids", [])
+                    if str(item).strip()
+                }
+                if (
+                    current_requirement_ids
+                    and requirement_ids
+                    and current_requirement_ids.isdisjoint(requirement_ids)
+                ):
+                    continue
+                candidate_fingerprint = self.provider_recovery_contract_fingerprint(
+                    state=state,
+                    blocker_message=" ".join(sorted(requirement_ids)),
+                )
+                if candidate_fingerprint == fingerprint:
+                    current_fingerprint = fingerprint
+                    receipt = candidate
+                    break
         if (
             not isinstance(receipt, dict)
             or receipt.get("outcome") != "consumer_contract_unsatisfied"
