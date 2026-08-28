@@ -2895,6 +2895,180 @@ class RetryFlowTests(unittest.TestCase):
             ).stdout.splitlines()
             self.assertNotIn("candidate.py", committed_paths)
 
+    def test_resume_context_preserves_retained_worktree_for_evidence_repair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Retained candidate recovery\n")
+            write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+            parent = TaskSpec(
+                task_id="candidate-owner",
+                title="Candidate owner",
+                description="Own the retained implementation candidate.",
+                acceptance=["The focused proof passes."],
+                status="in_progress",
+                verification_refs=["tests/test_candidate.py::test_candidate"],
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [parent.to_dict()]},
+            )
+            commit_all(project_root, "test: resume ownership baseline")
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "pending"
+            state.current_stage = "implement"
+            state.stage_summaries = {
+                "clarify": "done",
+                "prototype": "done",
+                "design": "done",
+                "plan": "done",
+                "provider_research": "done",
+            }
+            state.tasks = [parent]
+            orchestrator._capture_resume_context(
+                state,
+                spec_file=spec_file,
+                auto_approve=True,
+                allow_dirty_tree=False,
+                max_tasks=1,
+                skip_validate=True,
+                print_agent_output=False,
+                provider_kind="mock",
+                doc_language=None,
+            )
+            write_text(project_root / "candidate.py", "VALUE = 'retained'\n")
+            orchestrator._set_implementation_ready_marker(state, parent, True)
+            self.assertIn(
+                parent.task_id,
+                state.resume_context["retained_worktree_ownership"],
+            )
+
+            self.assertTrue(
+                orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    parent,
+                    {
+                        "reason": "owned proof evidence failed",
+                        "failure_ids": [
+                            "tests/test_candidate.py::test_candidate"
+                        ],
+                    },
+                )
+            )
+            repair = next(
+                task
+                for task in state.tasks
+                if task.task_origin == "evidence_repair"
+            )
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "historical_self_repair",
+                "status": "historical",
+                "self_repair_commit": "historical-repair-commit",
+            }
+            save_run_state(project_root, state)
+            before_planning_head = head_ref(project_root)
+            executed: list[str] = []
+
+            restarted = Orchestrator(project_root)
+
+            def execute_one(
+                _state: RunState,
+                active_tasks: list[TaskSpec],
+                task: TaskSpec,
+            ) -> None:
+                executed.append(task.task_id)
+                task.status = "done"
+                restarted._persist_tasks(active_tasks)
+                return None
+
+            with patch.object(
+                restarted,
+                "_ensure_implement_verify_baseline",
+            ), patch.object(
+                restarted,
+                "_execute_task_in_main_worktree",
+                side_effect=execute_one,
+            ):
+                result = restarted.resume_saved_run()
+
+            self.assertEqual(executed, [repair.task_id])
+            self.assertEqual(result.status, "pending")
+            self.assertNotEqual(head_ref(project_root), before_planning_head)
+            self.assertIn(
+                parent.task_id,
+                result.resume_context["retained_worktree_ownership"],
+            )
+            self.assertIn(
+                parent.task_id,
+                load_run_state(project_root).resume_context[
+                    "retained_worktree_ownership"
+                ],
+            )
+            self.assertEqual(
+                (project_root / "candidate.py").read_text(encoding="utf-8"),
+                "VALUE = 'retained'\n",
+            )
+
+    def test_evidence_repair_restores_missing_ready_owner_before_persist(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+            commit_all(project_root, "test: repair ownership baseline")
+
+            parent = TaskSpec(
+                task_id="candidate-owner",
+                title="Candidate owner",
+                description="Own the retained implementation candidate.",
+                acceptance=["The focused proof passes."],
+                status="in_progress",
+                verification_refs=["tests/test_candidate.py::test_candidate"],
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.tasks = [parent]
+            orchestrator = Orchestrator(project_root)
+            write_text(project_root / "candidate.py", "VALUE = 'retained'\n")
+            orchestrator._set_implementation_ready_marker(state, parent, True)
+            state.resume_context.pop("retained_worktree_ownership")
+
+            self.assertTrue(
+                orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    parent,
+                    {
+                        "reason": "owned proof evidence failed",
+                        "failure_ids": [
+                            "tests/test_candidate.py::test_candidate"
+                        ],
+                    },
+                )
+            )
+
+            record = state.resume_context["retained_worktree_ownership"][
+                parent.task_id
+            ]
+            self.assertEqual(record["source"], "evidence_repair_scheduled")
+            self.assertEqual(record["changed_paths"], ["candidate.py"])
+            self.assertTrue(
+                orchestrator._retained_worktree_snapshot_matches(
+                    record,
+                    allow_pending_planning_changes=False,
+                )
+            )
+
     def test_completed_self_repair_lifecycle_does_not_arm_baseline_guard(
         self,
     ) -> None:

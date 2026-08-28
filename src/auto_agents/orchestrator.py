@@ -7747,6 +7747,34 @@ class Orchestrator:
             )
         return captured
 
+    def _restore_missing_ready_owner_before_evidence_repair(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> bool:
+        """Recapture a ready candidate if its ownership metadata was lost."""
+
+        records = self._retained_worktree_ownership_records(state)
+        if task.task_id in records:
+            # Existing records remain subject to the exact snapshot validator.
+            # Do not overwrite stale or mismatched evidence with a newer claim.
+            return False
+        if not bool(self._implementation_ready_markers(state).get(task.task_id)):
+            return False
+        captured = self._capture_retained_worktree_ownership(
+            state,
+            [task.task_id],
+            source="evidence_repair_scheduled",
+        )
+        if task.task_id not in captured:
+            return False
+        self.logger.info(
+            "[recovery] restored missing retained-worktree ownership "
+            "before evidence repair task=%s",
+            task.task_id,
+        )
+        return True
+
     def _planning_baseline_allowed_paths(self) -> Set[str]:
         allowed = {".gitignore", "README.md", "DESIGN.md", "spec.md"}
         if self._active_spec_file is not None:
@@ -14594,8 +14622,12 @@ class Orchestrator:
             for repair in existing_open_repairs:
                 if repair.task_id not in task.depends_on:
                     task.depends_on.append(repair.task_id)
-            self._persist_tasks(tasks)
             state.tasks = tasks
+            self._restore_missing_ready_owner_before_evidence_repair(
+                state,
+                task,
+            )
+            self._persist_tasks(tasks)
             self._record_recovery_route(
                 state,
                 task,
@@ -14722,8 +14754,12 @@ class Orchestrator:
             "failure_ids": refs,
             "repair_task_ids": [repair.task_id for repair in repair_tasks],
         })
-        self._persist_tasks(tasks)
         state.tasks = tasks
+        self._restore_missing_ready_owner_before_evidence_repair(
+            state,
+            task,
+        )
+        self._persist_tasks(tasks)
         state.current_stage = "implement"
         state.last_error = ""
         self._record_recovery_route(
@@ -20625,6 +20661,7 @@ class Orchestrator:
             key: state.resume_context[key]
             for key in (
                 "implementation_ready_tasks",
+                _RETAINED_WORKTREE_OWNERSHIP_CONTEXT,
                 "parallel_integration_pending",
                 "parallel_sequential_retry_tasks",
                 "parallel_integration_metrics",
