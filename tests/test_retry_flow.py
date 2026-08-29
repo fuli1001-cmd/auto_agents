@@ -24,7 +24,15 @@ from auto_agents.config import (
     task_plan_path,
 )
 from auto_agents.gates import FailureExtraction
-from auto_agents.git_ops import changed_files, changed_paths, commit_all, hard_reset_clean, head_ref, worktree_fingerprint
+from auto_agents.git_ops import (
+    changed_files,
+    changed_paths,
+    commit_all,
+    commit_changed_paths,
+    hard_reset_clean,
+    head_ref,
+    worktree_fingerprint,
+)
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import (
     AgentResult,
@@ -574,6 +582,51 @@ class VerifyFailureClassificationTests(unittest.TestCase):
                 result.last_recovery_route["outcome"],
                 "repair_tasks_scheduled",
             )
+
+    def test_pytest_selector_inherits_producing_step_artifact_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            config = load_project_config(project_root)
+            config.gates.steps = [
+                VerificationStep(
+                    kind="test",
+                    runner="pytest",
+                    targets=["tests/test_storage_smoke.py"],
+                    args=["--maxfail=1"],
+                    artifact_globs=[".tmp-tests/storage/current/*.json"],
+                    cadence="implement_and_final",
+                    resource_class="heavy",
+                )
+            ]
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-storage",
+                title="Publish selector evidence",
+                description="Run one owned storage proof.",
+                acceptance=["The selector publishes portable evidence."],
+                verification_refs=[
+                    "tests/test_storage_smoke.py::test_publishes_receipt"
+                ],
+            )
+
+            commands = orchestrator._build_task_verify_commands(task)
+            known = orchestrator._resolved_gate_plan("final").metadata
+            metadata = orchestrator._task_gate_command_metadata(
+                task,
+                commands,
+                known,
+            )
+
+            self.assertEqual(len(commands), 1)
+            self.assertIn("--maxfail=1", commands[0])
+            self.assertIn("::test_publishes_receipt", commands[0])
+            self.assertEqual(
+                metadata[commands[0]].artifact_globs,
+                [".tmp-tests/storage/current/*.json"],
+            )
+            self.assertEqual(metadata[commands[0]].resource_class, "heavy")
 
     def test_artifact_contract_missing_generated_glob_routes_plan_and_syncs_config(
         self,
@@ -3340,6 +3393,7 @@ class RetryFlowTests(unittest.TestCase):
                 "self_repair_commit": "current-repair",
                 "prepared_self_repair_commit": "previous-repair",
             }
+            write_text(project_root / "operator-fixture.bin", "operator input\n")
 
             with patch.object(
                 orchestrator,
@@ -3356,7 +3410,10 @@ class RetryFlowTests(unittest.TestCase):
                 state.resume_context["parallel_sequential_retry_tasks"],
                 [repair.task_id],
             )
-            self.assertEqual(changed_paths(project_root), ["candidate.py"])
+            self.assertEqual(
+                changed_paths(project_root),
+                ["candidate.py", "operator-fixture.bin"],
+            )
 
             state.pending_input_requests = [
                 {
@@ -3373,6 +3430,72 @@ class RetryFlowTests(unittest.TestCase):
                 self.assertTrue(orchestrator._resume_blocked_run(state))
 
             resume_input.assert_called_once_with(state)
+
+    def test_blocked_ownership_mismatch_resumes_with_preserved_extra_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+            commit_all(project_root, "test: blocked ownership baseline")
+            parent = TaskSpec(
+                task_id="candidate-owner",
+                title="Candidate owner",
+                description="Own the retained implementation candidate.",
+                acceptance=["The focused proof passes."],
+                status="in_progress",
+                verification_refs=["tests/test_candidate.py::test_candidate"],
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.tasks = [parent]
+            orchestrator = Orchestrator(project_root)
+            write_text(project_root / "candidate.py", "VALUE = 'retained'\n")
+            orchestrator._set_implementation_ready_marker(state, parent, True)
+            self.assertTrue(
+                orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    parent,
+                    {
+                        "reason": "owned proof evidence failed",
+                        "failure_ids": [
+                            "tests/test_candidate.py::test_candidate"
+                        ],
+                    },
+                )
+            )
+            repair = next(
+                task
+                for task in state.tasks
+                if task.task_origin == "evidence_repair"
+            )
+            state.resume_context.pop("parallel_sequential_retry_tasks", None)
+            write_text(project_root / "operator-fixture.bin", "operator input\n")
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "target_project",
+                "category": "retained_worktree_repair_ownership_mismatch",
+                "reason": "historical exact-path ownership mismatch",
+                "resume_attempts": 2,
+            }
+
+            self.assertTrue(orchestrator._resume_blocked_run(state))
+
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(
+                orchestrator._retained_evidence_repair_priority_ids(
+                    state,
+                    state.tasks,
+                ),
+                [repair.task_id],
+            )
+            self.assertEqual(
+                changed_paths(project_root),
+                ["candidate.py", "operator-fixture.bin"],
+            )
 
     def test_saved_run_rehydrates_missing_ready_owner_before_blocked_resume(
         self,
@@ -7288,7 +7411,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(state.tasks[0].status, "done")
             self.assertEqual((project_root / "artifact.txt").read_text(encoding="utf-8").strip(), "fixed")
 
-    def test_pending_repair_blocks_extra_unowned_dirty_path(self) -> None:
+    def test_pending_repair_preserves_extra_unowned_dirty_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -7307,51 +7430,106 @@ class RetryFlowTests(unittest.TestCase):
                 title="Parent task",
                 description="Own the retained implementation.",
                 acceptance=["The focused proof passes."],
-                status="in_progress",
-                verification_refs=["tests/test_candidate.py::test_candidate"],
+                depends_on=["repair-task-001-r1-1"],
+                status="pending",
+            )
+            repair = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair proof evidence",
+                description="Repair failed verification evidence.",
+                acceptance=["The focused proof passes."],
+                status="pending",
+                parent_task_id=parent.task_id,
+                task_origin="evidence_repair",
             )
             write_json(
                 task_plan_path(project_root),
-                {"tasks": [parent.to_dict()]},
+                {"tasks": [parent.to_dict(), repair.to_dict()]},
             )
             commit_all(project_root, "test: repair contamination baseline")
 
             state = load_run_state(project_root)
             state.current_stage = "implement"
             state.status = "pending"
-            state.tasks = [parent]
+            state.tasks = [parent, repair]
             write_text(project_root / "candidate.py", "VALUE = 'retained'\n")
             orchestrator._set_implementation_ready_marker(state, parent, True)
-            self.assertTrue(
-                orchestrator._schedule_repair_tasks_for_failure(
-                    state,
-                    state.tasks,
-                    parent,
-                    {
-                        "reason": "owned proof evidence failed",
-                        "failure_ids": [
-                            "tests/test_candidate.py::test_candidate"
-                        ],
-                    },
-                )
-            )
-            state.resume_context.pop("parallel_sequential_retry_tasks", None)
+            state.tasks = [repair, parent]
+            orchestrator._persist_tasks(state.tasks)
             write_text(project_root / "unowned.txt", "unowned contamination\n")
 
             result = orchestrator._run_implementation_loop(state, max_tasks=1)
 
-            self.assertEqual(result.status, "blocked")
-            self.assertEqual(
-                result.active_blocker["category"],
-                "retained_worktree_repair_ownership_mismatch",
-            )
-            self.assertEqual(result.active_blocker["owner"], "target_project")
-            ownership = result.active_blocker["retained_worktree_repair_ownership"]
-            self.assertEqual(ownership["extra_paths"], ["unowned.txt"])
-            self.assertEqual(orchestrator.adapter.implement_calls, 0)
+            self.assertEqual(orchestrator.adapter.implement_calls, 1)
+            self.assertEqual(orchestrator.adapter.review_calls, 1)
+            self.assertEqual(result.tasks[0].status, "done")
             self.assertEqual(
                 changed_paths(project_root),
-                ["candidate.py", "unowned.txt"],
+                ["unowned.txt"],
+            )
+            self.assertEqual(
+                (project_root / "unowned.txt").read_text(encoding="utf-8"),
+                "unowned contamination\n",
+            )
+            committed_paths = commit_changed_paths(
+                project_root,
+                result.tasks[0].commit_sha,
+            )
+            self.assertIn("candidate.py", committed_paths)
+            self.assertIn("artifact.txt", committed_paths)
+            self.assertNotIn("unowned.txt", committed_paths)
+
+    def test_retained_repair_detects_preserved_path_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+            parent = TaskSpec(
+                task_id="task-001",
+                title="Parent task",
+                description="Own the retained implementation.",
+                acceptance=["The focused proof passes."],
+                depends_on=["repair-task-001-r1-1"],
+                status="pending",
+            )
+            repair = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair proof evidence",
+                description="Repair failed verification evidence.",
+                acceptance=["The focused proof passes."],
+                status="pending",
+                parent_task_id=parent.task_id,
+                task_origin="evidence_repair",
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [parent.to_dict(), repair.to_dict()]},
+            )
+            commit_all(project_root, "test: repair preservation baseline")
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.tasks = [repair, parent]
+            write_text(project_root / "candidate.py", "VALUE = 'retained'\n")
+            orchestrator._set_implementation_ready_marker(state, parent, True)
+            write_text(project_root / "unowned.txt", "operator input\n")
+
+            self.assertTrue(
+                orchestrator._evidence_repair_worktree_handoff_matches(
+                    state,
+                    state.tasks,
+                    repair,
+                )
+            )
+            write_text(project_root / "unowned.txt", "repair changed it\n")
+
+            self.assertFalse(
+                orchestrator._retained_repair_preserved_paths_match(
+                    state,
+                    repair.task_id,
+                )
             )
 
     def test_repair_task_routes_provider_reference_mutation_to_owner(self) -> None:

@@ -341,6 +341,7 @@ _DANGLING_DEPENDENCIES_AFTER_TASK_PRUNING = (
     "dangling_dependencies_after_task_pruning"
 )
 _RETAINED_WORKTREE_OWNERSHIP_CONTEXT = "retained_worktree_ownership"
+_RETAINED_REPAIR_PRESERVED_PATHS_CONTEXT = "retained_repair_preserved_paths"
 _RETAINED_WORKTREE_RECONCILIATION_KIND = (
     "retained_worktree_reconciliation"
 )
@@ -6593,7 +6594,11 @@ class Orchestrator:
         )
         with log_timing(self.logger, f"gate:{context} commands={len(commands)}"):
             known = self._resolved_gate_plan("final").metadata
-            metadata = {command: known.get(command, {}) for command in commands}
+            metadata = self._task_gate_command_metadata(
+                getattr(self, "_active_task_gate_metadata_task", None),
+                commands,
+                known,
+            )
             with self._gate_executor_context(
                 metadata,
                 source_ref=source_ref,
@@ -6625,6 +6630,33 @@ class Orchestrator:
                 f"{self._changed_path_preview(changed)}"
             )
         return gate, reason
+
+    def _run_task_gate_commands_for_commands(
+        self,
+        task: Optional[TaskSpec],
+        commands: List[str],
+        *,
+        collect_all: bool,
+        context: str,
+        source_ref: str = "",
+    ):
+        previous = getattr(self, "_active_task_gate_metadata_task", None)
+        self._active_task_gate_metadata_task = task
+        try:
+            if source_ref:
+                return self._run_gate_commands_for_commands(
+                    commands,
+                    collect_all=collect_all,
+                    context=context,
+                    source_ref=source_ref,
+                )
+            return self._run_gate_commands_for_commands(
+                commands,
+                collect_all=collect_all,
+                context=context,
+            )
+        finally:
+            self._active_task_gate_metadata_task = previous
 
     def _serial_fallback_for_parallel_failures(
         self,
@@ -8342,11 +8374,11 @@ class Orchestrator:
             == self._retained_worktree_path_fingerprints(paths)
         )
 
-    def _retained_worktree_record_matches_exact_handoff(
+    def _retained_worktree_record_matches_repair_handoff(
         self,
         record: Mapping[str, object],
     ) -> bool:
-        """Match the full dirty set while allowing planning-only HEAD changes."""
+        """Validate the retained owner while permitting preserved extra paths."""
 
         raw_paths = record.get("changed_paths", [])
         if not isinstance(raw_paths, list):
@@ -8357,17 +8389,171 @@ class Orchestrator:
             if str(path).strip()
         }
         current_paths = set(self._changed_paths_excluding_agent_instructions())
+        try:
+            version = int(record.get("version", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        source_head = str(record.get("head_ref", "")).strip()
+        current_head = head_ref(self.project_root)
         return bool(
-            expected_paths
-            and current_paths == expected_paths
-            and self._retained_worktree_snapshot_matches(
-                record,
-                allow_pending_planning_changes=True,
+            version == 1
+            and expected_paths
+            and expected_paths.issubset(current_paths)
+            and (
+                source_head == current_head
+                or self._head_transition_contains_only_planning_artifacts(
+                    source_head,
+                    current_head,
+                )
             )
             and self._retained_worktree_record_has_exact_path_fingerprints(
                 record
             )
         )
+
+    @staticmethod
+    def _retained_repair_preserved_path_records(
+        state: RunState,
+    ) -> Dict[str, Dict[str, object]]:
+        raw = state.resume_context.get(
+            _RETAINED_REPAIR_PRESERVED_PATHS_CONTEXT,
+            {},
+        )
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(task_id): dict(record)
+            for task_id, record in raw.items()
+            if str(task_id).strip() and isinstance(record, dict)
+        }
+
+    def _capture_or_validate_retained_repair_preserved_paths(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        owner: TaskSpec,
+        owner_record: Mapping[str, object],
+    ) -> bool:
+        """Keep pre-existing non-owner paths byte-for-byte outside a repair."""
+
+        records = self._retained_repair_preserved_path_records(state)
+        existing = records.get(task.task_id)
+        if existing is not None:
+            raw_paths = existing.get("paths", [])
+            raw_fingerprints = existing.get("path_fingerprints", {})
+            if not isinstance(raw_paths, list) or not isinstance(
+                raw_fingerprints,
+                dict,
+            ):
+                return False
+            paths = sorted(
+                {
+                    str(path).strip().replace("\\", "/")
+                    for path in raw_paths
+                    if str(path).strip()
+                }
+            )
+            fingerprints = {
+                str(path).strip().replace("\\", "/"): str(fingerprint).strip()
+                for path, fingerprint in raw_fingerprints.items()
+                if str(path).strip() and str(fingerprint).strip()
+            }
+            return bool(
+                str(existing.get("owner_task_id", "")).strip()
+                == owner.task_id
+                and set(fingerprints) == set(paths)
+                and fingerprints
+                == self._retained_worktree_path_fingerprints(paths)
+            )
+
+        raw_owned_paths = owner_record.get("changed_paths", [])
+        if not isinstance(raw_owned_paths, list):
+            return False
+        owned_paths = {
+            str(path).strip().replace("\\", "/")
+            for path in raw_owned_paths
+            if str(path).strip()
+        }
+        current_paths = set(self._changed_paths_excluding_agent_instructions())
+        preserved_paths = sorted(current_paths - owned_paths)
+        if not preserved_paths:
+            return True
+        records[task.task_id] = {
+            "version": 1,
+            "owner_task_id": owner.task_id,
+            "paths": preserved_paths,
+            "path_fingerprints": self._retained_worktree_path_fingerprints(
+                preserved_paths
+            ),
+            "captured_at": utc_now_iso(),
+        }
+        state.resume_context[_RETAINED_REPAIR_PRESERVED_PATHS_CONTEXT] = records
+        self.logger.info(
+            "[recovery] preserving unowned paths outside evidence repair "
+            "task=%s owner=%s paths=%s",
+            task.task_id,
+            owner.task_id,
+            len(preserved_paths),
+        )
+        return True
+
+    def _retained_repair_preserved_paths(
+        self,
+        state: RunState,
+        task_id: str,
+    ) -> List[str]:
+        record = self._retained_repair_preserved_path_records(state).get(task_id)
+        if not isinstance(record, dict):
+            return []
+        raw_paths = record.get("paths", [])
+        if not isinstance(raw_paths, list):
+            return []
+        return sorted(
+            {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+            }
+        )
+
+    def _retained_repair_preserved_paths_match(
+        self,
+        state: RunState,
+        task_id: str,
+    ) -> bool:
+        record = self._retained_repair_preserved_path_records(state).get(task_id)
+        if record is None:
+            return True
+        paths = self._retained_repair_preserved_paths(state, task_id)
+        raw_fingerprints = record.get("path_fingerprints", {})
+        if not isinstance(raw_fingerprints, dict):
+            return False
+        fingerprints = {
+            str(path).strip().replace("\\", "/"): str(fingerprint).strip()
+            for path, fingerprint in raw_fingerprints.items()
+            if str(path).strip() and str(fingerprint).strip()
+        }
+        return bool(
+            set(fingerprints) == set(paths)
+            and fingerprints == self._retained_worktree_path_fingerprints(paths)
+        )
+
+    @staticmethod
+    def _clear_retained_repair_preserved_paths(
+        state: RunState,
+        task_id: str,
+    ) -> None:
+        records = Orchestrator._retained_repair_preserved_path_records(state)
+        if task_id not in records:
+            return
+        records.pop(task_id, None)
+        if records:
+            state.resume_context[_RETAINED_REPAIR_PRESERVED_PATHS_CONTEXT] = records
+        else:
+            state.resume_context.pop(
+                _RETAINED_REPAIR_PRESERVED_PATHS_CONTEXT,
+                None,
+            )
 
     def _active_retained_worktree_ownership_matches(
         self,
@@ -8673,7 +8859,7 @@ class Orchestrator:
         if not owner_records:
             return []
         if require_exact_handoff and not any(
-            self._retained_worktree_record_matches_exact_handoff(record)
+            self._retained_worktree_record_matches_repair_handoff(record)
             for record in owner_records
         ):
             return []
@@ -8801,12 +8987,21 @@ class Orchestrator:
         matching = [
             (owner, record)
             for owner, record in records
-            if self._retained_worktree_record_matches_exact_handoff(record)
+            if self._retained_worktree_record_matches_repair_handoff(record)
         ]
         if not matching:
             return False
+        owner, record = matching[0]
+        if not self._capture_or_validate_retained_repair_preserved_paths(
+            state,
+            task,
+            owner,
+            record,
+        ):
+            return False
+        save_run_state(self.project_root, state)
         self.logger.info(
-            "[recovery] evidence repair carries exact retained worktree "
+            "[recovery] evidence repair carries scoped retained worktree "
             "task=%s owners=%s paths=%s",
             task.task_id,
             ",".join(owner.task_id for owner, _record in matching),
@@ -8870,11 +9065,39 @@ class Orchestrator:
         extra_paths = sorted(set(current_paths) - set(expected_paths))
         missing_paths = sorted(set(expected_paths) - set(current_paths))
         owner_id = owner.task_id if owner is not None else task.parent_task_id
+        preserved_record = self._retained_repair_preserved_path_records(state).get(
+            task.task_id,
+            {},
+        )
+        preserved_paths = self._retained_repair_preserved_paths(
+            state,
+            task.task_id,
+        )
+        raw_preserved_fingerprints = preserved_record.get("path_fingerprints", {})
+        preserved_fingerprints = (
+            {
+                str(path).strip().replace("\\", "/"): str(fingerprint).strip()
+                for path, fingerprint in raw_preserved_fingerprints.items()
+                if str(path).strip() and str(fingerprint).strip()
+            }
+            if isinstance(raw_preserved_fingerprints, dict)
+            else {}
+        )
+        actual_preserved_fingerprints = self._retained_worktree_path_fingerprints(
+            preserved_paths
+        )
+        changed_preserved_paths = sorted(
+            path
+            for path in preserved_paths
+            if preserved_fingerprints.get(path)
+            != actual_preserved_fingerprints.get(path)
+        )
         reason = (
             f"evidence repair {task.task_id} cannot consume the dirty worktree: "
-            f"the current changes do not exactly match retained owner {owner_id or '(missing)'}. "
-            "Reconcile the extra, missing, or altered target paths before resuming; "
-            "auto_agents will not include unowned changes in the repair commit."
+            f"the retained owner snapshot for {owner_id or '(missing)'} is no longer safe. "
+            "Reconcile missing or altered owner paths, unsafe HEAD changes, or modified "
+            "preserved paths before resuming. Unchanged non-owner paths are preserved "
+            "outside the repair commit."
         )
         detail: Dict[str, object] = {
             "repair_task_id": task.task_id,
@@ -8884,6 +9107,8 @@ class Orchestrator:
             "extra_paths": extra_paths,
             "missing_paths": missing_paths,
             "altered_paths": altered_paths,
+            "preserved_paths": preserved_paths,
+            "changed_preserved_paths": changed_preserved_paths,
             "expected_head": str(record.get("head_ref", "")).strip(),
             "current_head": head_ref(self.project_root),
         }
@@ -8902,13 +9127,15 @@ class Orchestrator:
         self._persist_tasks(tasks)
         save_run_state(self.project_root, state)
         self.logger.error(
-            "[recovery] blocked evidence repair without exact retained "
-            "ownership task=%s owner=%s extra=%s missing=%s altered=%s",
+            "[recovery] blocked evidence repair without safe retained "
+            "ownership task=%s owner=%s extra=%s missing=%s altered=%s "
+            "preserved_altered=%s",
             task.task_id,
             owner_id or "missing",
             len(extra_paths),
             len(missing_paths),
             len(altered_paths),
+            len(changed_preserved_paths),
         )
         return state
 
@@ -13320,6 +13547,35 @@ class Orchestrator:
                 )
             ) from error
 
+        preserved_repair_paths = self._retained_repair_preserved_paths(
+            state,
+            task.task_id,
+        )
+        if preserved_repair_paths and not self._retained_repair_preserved_paths_match(
+            state,
+            task.task_id,
+        ):
+            reason = (
+                f"evidence repair {task.task_id} modified or removed paths that "
+                "were present before the repair and owned by another workflow. "
+                "The repair commit was not created."
+            )
+            task.status = "blocked"
+            task.review_summary = reason
+            self._block_run(
+                state,
+                owner="auto_agents",
+                category="retained_repair_preserved_path_mutation",
+                reason=reason,
+            )
+            state.active_blocker["retained_repair_preserved_paths"] = (
+                preserved_repair_paths
+            )
+            self._persist_tasks(tasks)
+            save_run_state(self.project_root, state)
+            self._emit_task_blocked(task, reason)
+            return state
+
         task.status = "done"
         self._reconcile_completed_lineage_terminal_recovery(
             state,
@@ -13331,6 +13587,7 @@ class Orchestrator:
         self._clear_task_attempt_base_ref(state, task)
         self._complete_retained_worktree_reconciliation(state, task)
         self._clear_retained_worktree_owner_record(state, task.task_id)
+        self._clear_retained_repair_preserved_paths(state, task.task_id)
         task.review_summary = str(gate_result["review"])
         commit_message = task.commit_message or self.config.git.commit_message_template.format(
             task_id=task.task_id,
@@ -13338,7 +13595,18 @@ class Orchestrator:
         )
         self._persist_tasks(tasks)
         save_run_state(self.project_root, state)
-        task.commit_sha = commit_all(self.project_root, commit_message)
+        if preserved_repair_paths:
+            repair_commit_paths = sorted(
+                set(changed_paths(self.project_root, ignored_prefixes=()))
+                - set(preserved_repair_paths)
+            )
+            task.commit_sha = commit_only_paths(
+                self.project_root,
+                commit_message,
+                repair_commit_paths,
+            )
+        else:
+            task.commit_sha = commit_all(self.project_root, commit_message)
         self._warm_clean_head_verify_baseline(
             state,
             failure_ids=gate_result.get("verify_current_failure_ids", []),
@@ -18999,7 +19267,8 @@ class Orchestrator:
                 return failure_result
         task_scope_label = self._task_verify_command_scope_label(task)
         if task_commands:
-            verify_gate, mutation_error = self._run_gate_commands_for_commands(
+            verify_gate, mutation_error = self._run_task_gate_commands_for_commands(
+                task,
                 task_commands,
                 collect_all=True,
                 context=(
@@ -19101,7 +19370,8 @@ class Orchestrator:
                 )
             )
             baseline_gate, baseline_mutation_error = (
-                self._run_gate_commands_for_commands(
+                self._run_task_gate_commands_for_commands(
+                    task,
                     failed_commands,
                     collect_all=True,
                     context=f"lazy task baseline verification ({task.task_id})",
@@ -19624,6 +19894,85 @@ class Orchestrator:
         path, selector = normalized.split("::", 1)
         return path.strip(), selector.strip()
 
+    def _configured_verification_step_for_evidence_ref(
+        self,
+        ref: str,
+        *,
+        runner: str,
+    ) -> Optional[VerificationStep]:
+        path, selector = self._split_evidence_ref(ref)
+        normalized_path = path.replace("\\", "/").strip().removeprefix("./")
+        fallback: Optional[VerificationStep] = None
+        for step in self.config.gates.steps:
+            if step.runner.strip().lower() != runner:
+                continue
+            targets = {
+                target.replace("\\", "/").strip().removeprefix("./")
+                for target in step.targets
+                if target.strip()
+            }
+            if normalized_path not in targets:
+                continue
+            if runner != "vitest":
+                return step
+            args = [arg.strip() for arg in step.args if arg.strip()]
+            if selector and args == ["-t", selector]:
+                return step
+            if not selector and not args:
+                return step
+            if not args and fallback is None:
+                fallback = step
+        return fallback
+
+    def _task_gate_command_metadata(
+        self,
+        task: Optional[TaskSpec],
+        commands: Iterable[str],
+        known: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Carry a producing verification step's metadata onto task selectors."""
+
+        metadata: Dict[str, object] = {
+            command: known.get(command, {}) for command in commands
+        }
+        if task is None:
+            return metadata
+        command_set = set(commands)
+        for ref in self._task_gate_evidence_refs(task):
+            command = self._build_task_proof_evidence_command_for_ref(ref)
+            if not command or command not in command_set or metadata.get(command):
+                continue
+            runner = (
+                "pytest"
+                if self._looks_like_pytest_evidence_ref(ref)
+                else "vitest"
+                if self._looks_like_vitest_evidence_ref(ref)
+                else ""
+            )
+            if not runner:
+                continue
+            step = self._configured_verification_step_for_evidence_ref(
+                ref,
+                runner=runner,
+            )
+            if step is None:
+                continue
+            producer_command = command_from_verification_step(
+                step,
+                project_root=self.project_root,
+            )
+            producer_metadata = known.get(producer_command)
+            if producer_metadata is None:
+                resolved = resolve_gate_plan_from_verification_steps(
+                    [step],
+                    self.project_root,
+                    phase="final",
+                )
+                producer_metadata = resolved.metadata.get(producer_command)
+            if producer_metadata is not None:
+                metadata[command] = producer_metadata
+        return metadata
+
     @staticmethod
     def _looks_like_vitest_evidence_ref(ref: str) -> bool:
         path, _ = Orchestrator._split_evidence_ref(ref)
@@ -19896,6 +20245,15 @@ class Orchestrator:
         if command_ref:
             return command_ref
         if self._looks_like_pytest_evidence_ref(ref):
+            step = self._configured_verification_step_for_evidence_ref(
+                ref,
+                runner="pytest",
+            )
+            if step is not None:
+                return command_from_verification_step(
+                    replace(step, targets=[ref]),
+                    project_root=self.project_root,
+                )
             return self._build_task_proof_evidence_command([ref])
         if self._looks_like_vitest_evidence_ref(ref):
             return self._build_vitest_evidence_command(ref)
