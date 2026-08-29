@@ -7937,6 +7937,7 @@ class Orchestrator:
         *,
         source: str,
         replace_existing: bool = False,
+        exclude_paths: Iterable[str] = (),
     ) -> List[str]:
         """Checkpoint a dirty candidate before its retry owner can be replanned."""
 
@@ -7948,7 +7949,14 @@ class Orchestrator:
                 if str(task_id).strip() in active_ids
             )
         )
-        paths = sorted(set(self._changed_paths_excluding_agent_instructions()))
+        excluded = {
+            str(path).strip().replace("\\", "/")
+            for path in exclude_paths
+            if str(path).strip()
+        }
+        paths = sorted(
+            set(self._changed_paths_excluding_agent_instructions()) - excluded
+        )
         if not owner_ids or not paths:
             return []
 
@@ -8427,9 +8435,50 @@ class Orchestrator:
             if str(task_id).strip() and isinstance(record, dict)
         }
 
+    @staticmethod
+    def _retained_repair_self_checkpoint_is_ready(
+        state: RunState,
+        task: TaskSpec,
+        owner: TaskSpec,
+        record: Mapping[str, object],
+    ) -> bool:
+        """Require durable implementation-ready evidence for a repair owner."""
+
+        return bool(
+            owner.task_id == task.task_id
+            and task.status == "in_progress"
+            and bool(
+                Orchestrator._implementation_ready_markers(state).get(
+                    task.task_id
+                )
+            )
+            and str(record.get("owner_task_id", "")).strip() == task.task_id
+            and str(record.get("source", "")).strip()
+            == "implementation_ready"
+        )
+
+    def _retained_repair_self_checkpoint_is_requeued(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        owner: TaskSpec,
+        record: Mapping[str, object],
+    ) -> bool:
+        """Recognize a repair candidate retained for an intentional rerun."""
+
+        return bool(
+            owner.task_id == task.task_id
+            and str(record.get("owner_task_id", "")).strip() == task.task_id
+            and str(record.get("source", "")).strip()
+            in {"implementation_ready", "sequential_retry_lane"}
+            and task.task_id in self._parallel_sequential_retry_ids(state)
+            and self._requeued_route_owns_task(state, task)
+        )
+
     def _capture_or_validate_retained_repair_preserved_paths(
         self,
         state: RunState,
+        tasks: Iterable[TaskSpec],
         task: TaskSpec,
         owner: TaskSpec,
         owner_record: Mapping[str, object],
@@ -8439,6 +8488,10 @@ class Orchestrator:
         records = self._retained_repair_preserved_path_records(state)
         existing = records.get(task.task_id)
         if existing is not None:
+            try:
+                version = int(existing.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                return False
             raw_paths = existing.get("paths", [])
             raw_fingerprints = existing.get("path_fingerprints", {})
             if not isinstance(raw_paths, list) or not isinstance(
@@ -8458,13 +8511,70 @@ class Orchestrator:
                 for path, fingerprint in raw_fingerprints.items()
                 if str(path).strip() and str(fingerprint).strip()
             }
-            return bool(
-                str(existing.get("owner_task_id", "")).strip()
-                == owner.task_id
-                and set(fingerprints) == set(paths)
-                and fingerprints
-                == self._retained_worktree_path_fingerprints(paths)
+            existing_owner_id = str(
+                existing.get("owner_task_id", "")
+            ).strip()
+            owner_record_id = str(
+                owner_record.get("owner_task_id", "")
+            ).strip()
+            if (
+                version != 1
+                or not paths
+                or owner_record_id != owner.task_id
+                or set(fingerprints) != set(paths)
+                or fingerprints
+                != self._retained_worktree_path_fingerprints(paths)
+            ):
+                return False
+
+            if existing_owner_id == owner.task_id:
+                return True
+
+            task_list = list(tasks)
+            tasks_by_id = {
+                candidate.task_id: candidate for candidate in task_list
+            }
+            if len(tasks_by_id) != len(task_list):
+                return False
+            lineage_ids: List[str] = []
+            cursor = tasks_by_id.get(task.task_id)
+            seen: Set[str] = set()
+            while cursor is not None and cursor.task_id not in seen:
+                seen.add(cursor.task_id)
+                lineage_ids.append(cursor.task_id)
+                if (
+                    cursor.task_origin != "evidence_repair"
+                    or not cursor.parent_task_id
+                ):
+                    break
+                cursor = tasks_by_id.get(cursor.parent_task_id)
+                if cursor is None:
+                    return False
+            if (
+                existing_owner_id not in lineage_ids
+                or owner.task_id not in lineage_ids
+                or lineage_ids.index(owner.task_id)
+                > lineage_ids.index(existing_owner_id)
+            ):
+                return False
+
+            rebound = dict(existing)
+            rebound["owner_task_id"] = owner.task_id
+            rebound["inherited_from_owner_task_id"] = existing_owner_id
+            rebound["rebound_at"] = utc_now_iso()
+            records[task.task_id] = rebound
+            state.resume_context[
+                _RETAINED_REPAIR_PRESERVED_PATHS_CONTEXT
+            ] = records
+            self.logger.info(
+                "[recovery] rebound unchanged preserved paths across repair "
+                "lineage task=%s owner=%s previous_owner=%s paths=%s",
+                task.task_id,
+                owner.task_id,
+                existing_owner_id,
+                len(paths),
             )
+            return True
 
         raw_owned_paths = owner_record.get("changed_paths", [])
         if not isinstance(raw_owned_paths, list):
@@ -8721,16 +8831,15 @@ class Orchestrator:
                 or not all(dependency in completed for dependency in repair.depends_on)
             ):
                 continue
-            records = [
-                item
-                for item in self._evidence_repair_retained_owner_records(
-                    state,
-                    tasks,
-                    repair,
-                )
-                if item[0].task_id != repair.task_id
-            ]
-            if not records:
+            records = self._evidence_repair_retained_owner_records(
+                state,
+                tasks,
+                repair,
+            )
+            if not any(
+                record_owner.task_id != repair.task_id
+                for record_owner, _record in records
+            ):
                 continue
             lineage_id = self._recovery_lineage_owner(tasks, repair).task_id
             by_lineage.setdefault(lineage_id, []).append(repair)
@@ -8858,15 +8967,81 @@ class Orchestrator:
         ]
         if not owner_records:
             return []
-        if require_exact_handoff and not any(
-            self._retained_worktree_record_matches_repair_handoff(record)
-            for record in owner_records
-        ):
-            return []
+        if require_exact_handoff:
+            parent_handoff_matches = any(
+                self._retained_worktree_record_matches_repair_handoff(record)
+                for record in owner_records
+            )
+            exact_runnable_ids = {
+                repair.task_id
+                for repair in repairs
+                if parent_handoff_matches
+                or any(
+                    record_owner.task_id == repair.task_id
+                    and self._retained_repair_self_checkpoint_is_ready(
+                        state,
+                        repair,
+                        record_owner,
+                        record,
+                    )
+                    and self._retained_worktree_record_matches_repair_handoff(
+                        record
+                    )
+                    for record_owner, record in records_by_lineage.get(
+                        route_owner_id,
+                        [],
+                    )
+                )
+            }
+            runnable_ids.intersection_update(exact_runnable_ids)
+            if not runnable_ids:
+                return []
         return [
             repair_id
             for repair_id in route_repair_ids
             if repair_id in runnable_ids
+        ]
+
+    def _matching_evidence_repair_owner_records(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+    ) -> List[Tuple[TaskSpec, Dict[str, object]]]:
+        """Return exact owners, including an authorized repair checkpoint."""
+
+        self_checkpoint_authorized = task.task_id in set(
+            self._retained_evidence_repair_priority_ids(
+                state,
+                tasks,
+            )
+        )
+        return [
+            (owner, record)
+            for owner, record in self._evidence_repair_retained_owner_records(
+                state,
+                tasks,
+                task,
+            )
+            if self._retained_worktree_record_matches_repair_handoff(record)
+            and (
+                owner.task_id != task.task_id
+                or (
+                    self_checkpoint_authorized
+                    and self._retained_repair_self_checkpoint_is_ready(
+                        state,
+                        task,
+                        owner,
+                        record,
+                    )
+                )
+                or self._retained_repair_self_checkpoint_is_requeued(
+                    state,
+                    task,
+                    owner,
+                    record,
+                )
+            )
         ]
 
     def _prepend_evidence_repair_priority_ids(
@@ -8979,21 +9154,17 @@ class Orchestrator:
         tasks: List[TaskSpec],
         task: TaskSpec,
     ) -> bool:
-        records = self._evidence_repair_retained_owner_records(
+        matching = self._matching_evidence_repair_owner_records(
             state,
             tasks,
             task,
         )
-        matching = [
-            (owner, record)
-            for owner, record in records
-            if self._retained_worktree_record_matches_repair_handoff(record)
-        ]
         if not matching:
             return False
         owner, record = matching[0]
         if not self._capture_or_validate_retained_repair_preserved_paths(
             state,
+            tasks,
             task,
             owner,
             record,
@@ -9020,17 +9191,17 @@ class Orchestrator:
             tasks,
             task,
         )
+        matching = self._matching_evidence_repair_owner_records(
+            state,
+            tasks,
+            task,
+        )
         owner: Optional[TaskSpec] = None
         record: Dict[str, object] = {}
-        if records:
-            owner, record = next(
-                (
-                    item
-                    for item in records
-                    if item[0].task_id != task.task_id
-                ),
-                records[0],
-            )
+        if matching:
+            owner, record = matching[0]
+        elif records:
+            owner, record = records[0]
         raw_expected_paths = record.get("changed_paths", [])
         expected_paths = sorted(
             {
@@ -9092,13 +9263,28 @@ class Orchestrator:
             if preserved_fingerprints.get(path)
             != actual_preserved_fingerprints.get(path)
         )
-        reason = (
-            f"evidence repair {task.task_id} cannot consume the dirty worktree: "
-            f"the retained owner snapshot for {owner_id or '(missing)'} is no longer safe. "
-            "Reconcile missing or altered owner paths, unsafe HEAD changes, or modified "
-            "preserved paths before resuming. Unchanged non-owner paths are preserved "
-            "outside the repair commit."
+        preserved_paths_match = bool(
+            not preserved_paths
+            or (
+                set(preserved_fingerprints) == set(preserved_paths)
+                and not changed_preserved_paths
+            )
         )
+        engine_owned_mismatch = bool(matching and preserved_paths_match)
+        if engine_owned_mismatch:
+            reason = (
+                f"evidence repair {task.task_id} has an exact retained checkpoint "
+                "and unchanged preserved paths, but the retained ownership metadata "
+                "could not validate its repair-lineage transition."
+            )
+        else:
+            reason = (
+                f"evidence repair {task.task_id} cannot consume the dirty worktree: "
+                f"the retained owner snapshot for {owner_id or '(missing)'} is no longer safe. "
+                "Reconcile missing or altered owner paths, unsafe HEAD changes, or modified "
+                "preserved paths before resuming. Unchanged non-owner paths are preserved "
+                "outside the repair commit."
+            )
         detail: Dict[str, object] = {
             "repair_task_id": task.task_id,
             "owner_task_id": owner_id,
@@ -9117,7 +9303,7 @@ class Orchestrator:
         ).hexdigest()
         self._block_run(
             state,
-            owner="target_project",
+            owner="auto_agents" if engine_owned_mismatch else "target_project",
             category="retained_worktree_repair_ownership_mismatch",
             reason=reason,
             fingerprint=fingerprint,
@@ -29711,11 +29897,17 @@ class Orchestrator:
         markers[task.task_id] = bool(ready)
         state.resume_context["implementation_ready_tasks"] = markers
         if ready:
+            preserved_paths = (
+                self._retained_repair_preserved_paths(state, task.task_id)
+                if self._is_repair_task(task)
+                else []
+            )
             self._capture_retained_worktree_ownership(
                 state,
                 [task.task_id],
                 source="implementation_ready",
                 replace_existing=True,
+                exclude_paths=preserved_paths,
             )
 
     def _clear_implementation_ready_marker(

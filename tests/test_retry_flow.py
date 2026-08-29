@@ -7479,6 +7479,150 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("artifact.txt", committed_paths)
             self.assertNotIn("unowned.txt", committed_paths)
 
+    def test_ready_repair_reenters_with_its_own_retained_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+
+            config = load_project_config(project_root)
+            config.gates.commands = []
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+
+            write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+            parent = TaskSpec(
+                task_id="candidate-owner",
+                title="Candidate owner",
+                description="Own the retained implementation candidate.",
+                acceptance=["The focused proof passes."],
+                status="in_progress",
+                verification_refs=["tests/test_candidate.py::test_candidate"],
+            )
+            write_json(
+                task_plan_path(project_root),
+                {"tasks": [parent.to_dict()]},
+            )
+            commit_all(project_root, "test: retained repair reentry baseline")
+
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.status = "pending"
+            state.tasks = [parent]
+            write_text(project_root / "candidate.py", "VALUE = 'retained'\n")
+            orchestrator._set_implementation_ready_marker(state, parent, True)
+            self.assertTrue(
+                orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    parent,
+                    {
+                        "reason": "owned proof evidence failed",
+                        "failure_ids": [
+                            "tests/test_candidate.py::test_candidate"
+                        ],
+                    },
+                )
+            )
+            repair = next(
+                task
+                for task in state.tasks
+                if task.task_origin == "evidence_repair"
+            )
+            write_text(project_root / "operator-input.bin", "preserve me\n")
+            self.assertTrue(
+                orchestrator._evidence_repair_worktree_handoff_matches(
+                    state,
+                    state.tasks,
+                    repair,
+                )
+            )
+            preserved = state.resume_context[
+                "retained_repair_preserved_paths"
+            ][repair.task_id]
+            self.assertEqual(preserved["owner_task_id"], parent.task_id)
+
+            write_text(project_root / "candidate.py", "VALUE = 'repaired'\n")
+            write_text(project_root / "repair-proof.txt", "proof\n")
+            repair.status = "in_progress"
+            repair.verification_refs = []
+            orchestrator._set_implementation_ready_marker(state, repair, True)
+            orchestrator._persist_tasks(state.tasks)
+
+            ownership = state.resume_context["retained_worktree_ownership"]
+            self.assertEqual(
+                ownership[repair.task_id]["changed_paths"],
+                ["candidate.py", "repair-proof.txt"],
+            )
+            # Older checkpoints claimed the whole dirty set before preserved
+            # paths were separated. They must still resume when both ledgers
+            # remain exact.
+            legacy_paths = [
+                "candidate.py",
+                "operator-input.bin",
+                "repair-proof.txt",
+            ]
+            ownership[repair.task_id]["changed_paths"] = legacy_paths
+            ownership[repair.task_id]["path_fingerprints"] = (
+                orchestrator._retained_worktree_path_fingerprints(legacy_paths)
+            )
+            save_run_state(project_root, state)
+            self.assertFalse(
+                orchestrator._retained_worktree_record_matches_repair_handoff(
+                    ownership[parent.task_id]
+                )
+            )
+            self.assertEqual(
+                orchestrator._retained_evidence_repair_priority_ids(
+                    state,
+                    state.tasks,
+                ),
+                [repair.task_id],
+            )
+
+            restarted = Orchestrator(project_root)
+            restarted.adapter = BlockedRetryAdapter(project_root)
+            restarted_state = load_run_state(project_root)
+            restarted_repair = next(
+                task
+                for task in restarted_state.tasks
+                if task.task_id == repair.task_id
+            )
+            self.assertTrue(
+                restarted._evidence_repair_worktree_handoff_matches(
+                    restarted_state,
+                    restarted_state.tasks,
+                    restarted_repair,
+                )
+            )
+            rebound = restarted_state.resume_context[
+                "retained_repair_preserved_paths"
+            ][repair.task_id]
+            self.assertEqual(rebound["owner_task_id"], repair.task_id)
+            self.assertEqual(
+                rebound["inherited_from_owner_task_id"],
+                parent.task_id,
+            )
+            result = restarted._run_implementation_loop(
+                restarted_state,
+                max_tasks=1,
+            )
+
+            completed = next(
+                task for task in result.tasks if task.task_id == repair.task_id
+            )
+            self.assertEqual(completed.status, "done")
+            self.assertEqual(restarted.adapter.implement_calls, 0)
+            self.assertEqual(restarted.adapter.review_calls, 1)
+            self.assertEqual(changed_paths(project_root), ["operator-input.bin"])
+            committed_paths = commit_changed_paths(
+                project_root,
+                completed.commit_sha,
+            )
+            self.assertIn("candidate.py", committed_paths)
+            self.assertIn("repair-proof.txt", committed_paths)
+            self.assertNotIn("operator-input.bin", committed_paths)
+
     def test_retained_repair_detects_preserved_path_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -7523,8 +7667,41 @@ class RetryFlowTests(unittest.TestCase):
                     repair,
                 )
             )
+            parent.recovery_history.append(
+                {
+                    "result": "scheduled",
+                    "epoch": 0,
+                    "round": 0,
+                    "repair_task_ids": [repair.task_id],
+                }
+            )
+            state.last_recovery_route = {
+                "outcome": "repair_tasks_scheduled",
+                "task_id": parent.task_id,
+                "lineage_id": parent.task_id,
+                "repair_task_ids": [repair.task_id],
+                "epoch": 0,
+                "round": 0,
+            }
+            write_text(project_root / "candidate.py", "VALUE = 'repaired'\n")
+            repair.status = "in_progress"
+            orchestrator._set_implementation_ready_marker(state, repair, True)
+            self.assertEqual(
+                orchestrator._retained_evidence_repair_priority_ids(
+                    state,
+                    state.tasks,
+                ),
+                [repair.task_id],
+            )
             write_text(project_root / "unowned.txt", "repair changed it\n")
 
+            self.assertFalse(
+                orchestrator._evidence_repair_worktree_handoff_matches(
+                    state,
+                    state.tasks,
+                    repair,
+                )
+            )
             self.assertFalse(
                 orchestrator._retained_repair_preserved_paths_match(
                     state,
