@@ -34,6 +34,39 @@ class RecoveryResilienceTests(unittest.TestCase):
         Orchestrator.init_project(root, "demo", "mock")
         return Orchestrator(root)
 
+    def test_failure_identity_diagnostic_uses_recovery_probe_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            orchestrator.config.gates.command_timeout_seconds = 7200
+            orchestrator.config.gates.command_idle_timeout_seconds = 900
+            orchestrator.config.execution.recovery.diagnostic_probe_timeout_seconds = 300
+            gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=(
+                            "python -m pytest -q "
+                            "tests/test_demo.py::test_contract"
+                        ),
+                        ok=False,
+                        returncode=4,
+                        stderr="pytest could not resolve the selector",
+                    )
+                ],
+                summary="command failed",
+            )
+
+            with patch(
+                "auto_agents.orchestrator.run_commands_collect_all",
+                return_value=GateResult(ok=True, commands=[], summary="ok"),
+            ) as run:
+                result = orchestrator._run_verify_failure_identity_diagnostic(gate)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(run.call_args.kwargs["command_timeout_seconds"], 300)
+            self.assertEqual(run.call_args.kwargs["command_idle_timeout_seconds"], 300)
+
     def test_non_comparable_test_baseline_is_not_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"
@@ -448,6 +481,41 @@ class RecoveryResilienceTests(unittest.TestCase):
             self.assertIn(apiyi_reference, feedback)
             self.assertNotIn(unrelated_reference, feedback)
 
+    def test_behavioral_failure_does_not_route_from_incidental_provider_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            failure_id = (
+                "tests/test_asset_recovery.py::"
+                "test_safety_result_is_redacted"
+            )
+            task = TaskSpec(
+                task_id="repair-task-433-r1-1",
+                title="repair behavioral evidence",
+                description="",
+                acceptance=[],
+                task_origin="evidence_repair",
+                verification_refs=[failure_id],
+            )
+
+            stage, feedback = orchestrator._verification_failure_owner_route(
+                task,
+                {
+                    "reason": (
+                        f"command failed: {failure_id}\n"
+                        "request evidence mentioned "
+                        ".auto-agents/docs/provider_references/"
+                        "apiyi_gpt_image_2.md"
+                    ),
+                    "failure_ids": [failure_id],
+                    "new_failure_ids": [failure_id],
+                    "baseline_comparison_comparable": True,
+                },
+            )
+
+            self.assertEqual(stage, "")
+            self.assertEqual(feedback, "")
+
     def test_doc_only_provider_proof_routes_without_test_name_heuristics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"
@@ -680,6 +748,37 @@ class RecoveryResilienceTests(unittest.TestCase):
             self.assertFalse(first)
             self.assertFalse(second)
             self.assertTrue(third)
+
+    def test_recovery_loop_detects_same_failure_across_changed_owner_artifacts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            state = RunState(run_id="run-001")
+            task = TaskSpec(
+                task_id="repair-task-433-r1-1",
+                title="candidate",
+                description="",
+                acceptance=[],
+                requirement_ids=["REQ-248"],
+            )
+            failure_id = "tests/test_asset_recovery.py::test_redacted"
+
+            results = [
+                orchestrator._record_recovery_loop_event(
+                    state,
+                    task=task,
+                    target_stage="provider_research",
+                    review_text="provider reference changed",
+                    failure_ids=[failure_id],
+                    failure_signature="stable-assertion",
+                    artifact_fingerprints={"provider.md": fingerprint},
+                )
+                for fingerprint in ("first", "second", "third")
+            ]
+
+            self.assertEqual(results, [False, False, True])
 
     def test_review_rewind_uses_task_attempt_base_and_pre_reset_owner_hashes(
         self,

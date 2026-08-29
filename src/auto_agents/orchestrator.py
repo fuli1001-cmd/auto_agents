@@ -484,6 +484,7 @@ class Orchestrator:
     MAX_RECOVERY_LOOP_EVENTS = 20
     MAX_CHANGED_FAILURE_RECOVERY_EPOCHS = 1
     RECOVERY_LOOP_REPEAT_THRESHOLD = 2
+    RECOVERY_SEMANTIC_LOOP_REPEAT_THRESHOLD = 3
     FRONTEND_CONTRACT_RECOVERY_CONTEXT = "frontend_design_contract_recovery"
     INSTALLED_ENGINE_RECOVERY_CONTEXT = "installed_engine_recovery_revisions"
     REQUIREMENT_CONTRACT_RECOVERY_CATEGORIES = frozenset(
@@ -667,9 +668,15 @@ class Orchestrator:
         return run_commands_collect_all(
             commands,
             self.project_root,
-            command_timeout_seconds=self.config.gates.command_timeout_seconds,
+            command_timeout_seconds=min(
+                self.config.gates.command_timeout_seconds,
+                self.config.execution.recovery.diagnostic_probe_timeout_seconds,
+            ),
             adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-            command_idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+            command_idle_timeout_seconds=min(
+                self.config.gates.command_idle_timeout_seconds,
+                self.config.execution.recovery.diagnostic_probe_timeout_seconds,
+            ),
             progress=self._gate_progress_callback("failure identity diagnostic"),
         )
 
@@ -5444,7 +5451,15 @@ class Orchestrator:
             if str(entry.get("scope_key", "")) == scope_key
             and entry.get("artifact_fingerprints") == fingerprints
         ]
-        return len(matches) >= self.RECOVERY_LOOP_REPEAT_THRESHOLD
+        semantic_matches = [
+            entry for entry in state.recovery_loop_events
+            if str(entry.get("scope_key", "")) == scope_key
+        ]
+        return bool(
+            len(matches) >= self.RECOVERY_LOOP_REPEAT_THRESHOLD
+            or len(semantic_matches)
+            >= self.RECOVERY_SEMANTIC_LOOP_REPEAT_THRESHOLD
+        )
 
     def _build_arbiter_prompt(self, task: TaskSpec, last_review: str) -> str:
         history_lines: List[str] = []
@@ -24129,6 +24144,7 @@ class Orchestrator:
             )
             if value
         )
+        ownership_evidence = "\n".join(active_failure_ids)
         proof_evidence = (
             verify_result.get("proof_evidence")
             if isinstance(verify_result.get("proof_evidence"), dict)
@@ -24142,14 +24158,14 @@ class Orchestrator:
         provider_signal = re.search(
             r"provider[_ -]?reference|canonical[_ -]?reference|"
             r"canonical provider|\.auto-agents/docs/provider_references/",
-            current_evidence,
+            ownership_evidence,
             flags=re.IGNORECASE,
         )
         if not provider_signal and not proof_references:
             return "", ""
 
         scoped_evidence = "\n".join(
-            [current_evidence, *sorted(set(task.requirement_ids))]
+            [ownership_evidence, *sorted(set(task.requirement_ids))]
         )
         references = set(proof_references)
         references.update(
