@@ -360,6 +360,58 @@ _FAILOVER_PROTOCOL_PATTERN = re.compile(
     r"provider.protocol.error|prompt.transport.error",
     re.IGNORECASE,
 )
+
+
+def _utf8_safe_text(value: object) -> str:
+    """Return text with terminal-origin surrogate code points repaired.
+
+    ``/dev/tty`` is deliberately opened with ``surrogateescape`` so input is
+    never lost at the read boundary.  Those surrogate code points must not be
+    passed to provider subprocess stdin, which is strict UTF-8.  Recover byte
+    runs when possible, combine well-formed UTF-16 surrogate pairs, and replace
+    only irrecoverable code points.
+    """
+
+    text = str(value)
+    if not any("\ud800" <= char <= "\udfff" for char in text):
+        return text
+
+    repaired: List[str] = []
+    escaped_bytes = bytearray()
+
+    def flush_escaped_bytes() -> None:
+        if escaped_bytes:
+            repaired.append(bytes(escaped_bytes).decode("utf-8", errors="replace"))
+            escaped_bytes.clear()
+
+    index = 0
+    while index < len(text):
+        codepoint = ord(text[index])
+        if (
+            0xD800 <= codepoint <= 0xDBFF
+            and index + 1 < len(text)
+            and 0xDC00 <= ord(text[index + 1]) <= 0xDFFF
+        ):
+            flush_escaped_bytes()
+            low = ord(text[index + 1])
+            repaired.append(
+                chr(0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00))
+            )
+            index += 2
+            continue
+        if 0xDC80 <= codepoint <= 0xDCFF:
+            escaped_bytes.append(codepoint - 0xDC00)
+        elif 0xD800 <= codepoint <= 0xDFFF:
+            flush_escaped_bytes()
+            repaired.append("\ufffd")
+        else:
+            flush_escaped_bytes()
+            repaired.append(text[index])
+        index += 1
+    flush_escaped_bytes()
+    return "".join(repaired)
+
+
 _FAILOVER_CAPACITY_PATTERN = re.compile(r"\bcapacity\b", re.IGNORECASE)
 _FAILOVER_RATE_PATTERN = re.compile(
     r"rate.limit|\b429\b|too many requests|throttl", re.IGNORECASE
@@ -4705,7 +4757,7 @@ class Orchestrator:
     def _parse_operator_input_interpretation(
         raw: str,
     ) -> Tuple[str, object, str]:
-        text = str(raw or "").strip()
+        text = _utf8_safe_text(raw or "").strip()
         fenced = re.search(
             r"```(?:json)?\s*(\{.*\})\s*```",
             text,
@@ -4726,8 +4778,11 @@ class Orchestrator:
             raise ValueError(
                 "answer interpretation action must be answer, reply, or retry"
             )
-        message = str(payload.get("message", "")).strip()
-        return action, payload.get("value", ""), message
+        message = _utf8_safe_text(payload.get("message", "")).strip()
+        interpreted_value = payload.get("value", "")
+        if isinstance(interpreted_value, str):
+            interpreted_value = _utf8_safe_text(interpreted_value)
+        return action, interpreted_value, message
 
     def _interpret_operator_input_answer(
         self,
@@ -4748,22 +4803,24 @@ class Orchestrator:
             "default": request.default,
             "validation": request.validation,
         }
-        prompt = "\n".join(
-            (
-                "You are the conversational input interpreter for auto_agents.",
-                "Understand the user's reply in the context of the pending question, but do not use tools, inspect files, or modify anything.",
-                "Return exactly one JSON object and no markdown, using one of these forms:",
-                '{"action":"answer","value":"the normalized answer","message":""}',
-                '{"action":"reply","value":"","message":"a concise helpful answer to the user before asking again"}',
-                '{"action":"retry","value":"","message":"a concise explanation of what is still needed"}',
-                "Use action=answer only when the user actually supplied the requested value. Normalize choice answers to one exact validation choice and boolean answers to true or false.",
-                "Use action=reply when the user asked a question or requested clarification. Answer it directly in the user's language.",
-                "Never invent or guess a path, URL, credential, authorization, attestation, or approval. Local deterministic validation will check every normalized answer.",
-                "Pending request JSON:",
-                json.dumps(request_context, ensure_ascii=False, sort_keys=True),
-                f"Local validation result: {validation_error}",
-                "User reply JSON:",
-                json.dumps(answer, ensure_ascii=False),
+        prompt = _utf8_safe_text(
+            "\n".join(
+                (
+                    "You are the conversational input interpreter for auto_agents.",
+                    "Understand the user's reply in the context of the pending question, but do not use tools, inspect files, or modify anything.",
+                    "Return exactly one JSON object and no markdown, using one of these forms:",
+                    '{"action":"answer","value":"the normalized answer","message":""}',
+                    '{"action":"reply","value":"","message":"a concise helpful answer to the user before asking again"}',
+                    '{"action":"retry","value":"","message":"a concise explanation of what is still needed"}',
+                    "Use action=answer only when the user actually supplied the requested value. Normalize choice answers to one exact validation choice and boolean answers to true or false.",
+                    "Use action=reply when the user asked a question or requested clarification. Answer it directly in the user's language.",
+                    "Never invent or guess a path, URL, credential, authorization, attestation, or approval. Local deterministic validation will check every normalized answer.",
+                    "Pending request JSON:",
+                    json.dumps(request_context, ensure_ascii=False, sort_keys=True),
+                    f"Local validation result: {validation_error}",
+                    "User reply JSON:",
+                    json.dumps(answer, ensure_ascii=False),
+                )
             )
         )
         try:
@@ -4822,6 +4879,8 @@ class Orchestrator:
                     else getpass.getpass
                 ),
             )
+            if isinstance(answer, str):
+                answer = _utf8_safe_text(answer)
             normalized, error = validate_answer(request, answer)
             needs_semantic_interpretation = bool(error) or request.kind == "text"
             if not needs_semantic_interpretation:
@@ -4908,7 +4967,7 @@ class Orchestrator:
 
     def _prompt_user(self, prompt: str, default: str = "", multiline: bool = False) -> str:
         if self._user_input_fn:
-            return self._user_input_fn(prompt)
+            return _utf8_safe_text(self._user_input_fn(prompt))
         if "unittest" in sys.modules:
             return default
         if sys.stdin.isatty():
@@ -4925,7 +4984,7 @@ class Orchestrator:
                 # Reopen stdin from the terminal so subsequent reads work.
                 self._reopen_stdin_from_tty()
                 # Fix surrogate escapes from Windows console encoding mismatches
-                return text.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
+                return _utf8_safe_text(text)
             else:
                 return self._read_single_line_input(prompt, default)
         if not multiline and self._reopen_stdin_from_tty():
@@ -4942,11 +5001,11 @@ class Orchestrator:
 
     def _read_single_line_input(self, prompt: str, default: str) -> str:
         try:
-            return input(prompt)
+            return _utf8_safe_text(input(prompt))
         except EOFError:
             if self._reopen_stdin_from_tty():
                 try:
-                    return input(prompt)
+                    return _utf8_safe_text(input(prompt))
                 except EOFError:
                     return default
             return default

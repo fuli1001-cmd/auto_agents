@@ -6,7 +6,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_agents.orchestrator import Orchestrator
+from auto_agents.orchestrator import Orchestrator, _utf8_safe_text
 
 
 class PromptUserTests(unittest.TestCase):
@@ -35,6 +35,23 @@ class PromptUserTests(unittest.TestCase):
 
         self.assertEqual(result, "n")
         self.assertEqual(reopen.call_count, 1)
+
+    def test_single_line_repairs_surrogateescaped_utf8(self) -> None:
+        orchestrator = self._make_orchestrator()
+        escaped = "".join(chr(0xDC00 + byte) for byte in "音频".encode("utf-8"))
+
+        with mock.patch("builtins.input", return_value=f"中文{escaped}"):
+            result = orchestrator._read_single_line_input("Audio? ", default="")
+
+        self.assertEqual(result, "中文音频")
+        result.encode("utf-8")
+
+    def test_utf8_safe_text_combines_surrogate_pair_and_replaces_garbage(self) -> None:
+        result = _utf8_safe_text("ok\ud83d\ude00\udcff\udcfe")
+
+        self.assertTrue(result.startswith("ok😀"))
+        self.assertNotRegex(result, r"[\ud800-\udfff]")
+        result.encode("utf-8")
 
     def test_prompt_reopens_tty_when_stdin_is_not_tty(self) -> None:
         orchestrator = self._make_orchestrator()

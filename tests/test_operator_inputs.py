@@ -237,6 +237,7 @@ class OperatorInputStoreTests(unittest.TestCase):
 
             def run(self, request):
                 self.calls += 1
+                request.prompt.encode("utf-8")
                 return AgentResult(
                     ok=True,
                     command=["fake"],
@@ -256,7 +257,9 @@ class OperatorInputStoreTests(unittest.TestCase):
             Orchestrator.init_project(project, "demo", "mock")
             audio = project / "fixture.wav"
             audio.write_bytes(b"RIFF-test")
-            answers = iter(["需要多长时间的音频？", str(audio)])
+            answers = iter(
+                ["需要多长时间的音频？\udcff\udcfe", str(audio)]
+            )
             prompts = []
             output = io.StringIO()
 
