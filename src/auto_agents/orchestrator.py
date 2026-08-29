@@ -8756,6 +8756,37 @@ class Orchestrator:
                 return True
         return False
 
+    def _retained_evidence_repair_defers_user_input(
+        self,
+        state: RunState,
+        tasks: Iterable[TaskSpec],
+        repair_task_ids: Iterable[str],
+    ) -> bool:
+        """Defer only input unrelated to a runnable retained repair."""
+
+        task_list = list(tasks)
+        repair_ids = list(
+            dict.fromkeys(
+                str(task_id).strip()
+                for task_id in repair_task_ids
+                if str(task_id).strip()
+            )
+        )
+        has_pending_user_input = bool(state.pending_input_requests) or any(
+            task.status == "waiting_user"
+            or (task.status != "done" and bool(task.required_inputs))
+            for task in task_list
+        )
+        return bool(
+            repair_ids
+            and has_pending_user_input
+            and not self._retained_evidence_repair_requires_user_input(
+                state,
+                task_list,
+                repair_ids,
+            )
+        )
+
     def _evidence_repair_worktree_handoff_matches(
         self,
         state: RunState,
@@ -9931,13 +9962,6 @@ class Orchestrator:
                 "occurrence_count": 1,
                 "resume_attempts": 0,
             }
-        if self._resume_blocked_pending_user_input(state):
-            return True
-        legacy_self_repair_incident = bool(
-            not had_persisted_blocker
-            and active_incident is not None
-            and active_incident.status == "self_repair"
-        )
         restored_persisted_owner_ids = (
             self._restore_persisted_evidence_repair_ownership(
                 state,
@@ -9953,6 +9977,35 @@ class Orchestrator:
                     else {}
                 ),
             }
+        retained_repair_ids = self._retained_evidence_repair_priority_ids(
+            state,
+            state.tasks,
+        )
+        defer_pending_user_input = (
+            self._retained_evidence_repair_defers_user_input(
+                state,
+                state.tasks,
+                retained_repair_ids,
+            )
+        )
+        if defer_pending_user_input:
+            self._prepend_evidence_repair_priority_ids(
+                state,
+                state.tasks,
+                retained_repair_ids,
+            )
+            self.logger.info(
+                "[recovery] deferred blocked-run user input until retained "
+                "evidence repair runs tasks=%s",
+                ",".join(retained_repair_ids),
+            )
+        elif self._resume_blocked_pending_user_input(state):
+            return True
+        legacy_self_repair_incident = bool(
+            not had_persisted_blocker
+            and active_incident is not None
+            and active_incident.status == "self_repair"
+        )
         restored_retry_ids = self._restore_interrupted_self_repair_retry_ownership(
             state,
             blocker,
@@ -12323,10 +12376,8 @@ class Orchestrator:
             or (task.status != "done" and bool(task.required_inputs))
             for task in tasks
         )
-        defer_pending_user_input = bool(
-            safe_repair_route_ids
-            and has_pending_user_input
-            and not self._retained_evidence_repair_requires_user_input(
+        defer_pending_user_input = (
+            self._retained_evidence_repair_defers_user_input(
                 state,
                 tasks,
                 safe_repair_route_ids,

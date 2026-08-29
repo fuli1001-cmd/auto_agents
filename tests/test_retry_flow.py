@@ -3276,6 +3276,104 @@ class RetryFlowTests(unittest.TestCase):
             self.assertFalse((project_root / "operator-fixture.bin").exists())
             self.assertEqual(changed_paths(project_root), ["candidate.py"])
 
+    def test_blocked_resume_does_not_dispatch_unrelated_input_before_repair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            write_text(project_root / "candidate.py", "VALUE = 'before'\n")
+            commit_all(project_root, "test: blocked resume baseline")
+
+            waiting = TaskSpec(
+                task_id="waiting-task",
+                title="Waiting unrelated task",
+                description="Becomes runnable after operator input.",
+                acceptance=["The unrelated task completes."],
+                status="waiting_user",
+            )
+            parent = TaskSpec(
+                task_id="candidate-owner",
+                title="Candidate owner",
+                description="Own the retained implementation candidate.",
+                acceptance=["The focused proof passes."],
+                status="in_progress",
+                verification_refs=["tests/test_candidate.py::test_candidate"],
+            )
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.tasks = [waiting, parent]
+            orchestrator = Orchestrator(project_root)
+            write_text(project_root / "candidate.py", "VALUE = 'retained'\n")
+            orchestrator._set_implementation_ready_marker(state, parent, True)
+            self.assertTrue(
+                orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    parent,
+                    {
+                        "reason": "owned proof evidence failed",
+                        "failure_ids": [
+                            "tests/test_candidate.py::test_candidate"
+                        ],
+                    },
+                )
+            )
+            repair = next(
+                task
+                for task in state.tasks
+                if task.task_origin == "evidence_repair"
+            )
+            state.resume_context.pop("parallel_sequential_retry_tasks", None)
+            state.pending_input_requests = [
+                {
+                    "request_id": "unrelated-input",
+                    "task_id": waiting.task_id,
+                }
+            ]
+            state.status = "pending"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "synthetic_lifecycle_ordering",
+                "status": "retrying",
+                "self_repair_commit": "current-repair",
+                "prepared_self_repair_commit": "previous-repair",
+            }
+
+            with patch.object(
+                orchestrator,
+                "_resume_blocked_pending_user_input",
+                side_effect=AssertionError(
+                    "unrelated input must remain deferred"
+                ),
+            ) as resume_input:
+                self.assertTrue(orchestrator._resume_blocked_run(state))
+
+            resume_input.assert_not_called()
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(
+                state.resume_context["parallel_sequential_retry_tasks"],
+                [repair.task_id],
+            )
+            self.assertEqual(changed_paths(project_root), ["candidate.py"])
+
+            state.pending_input_requests = [
+                {
+                    "request_id": "repair-input",
+                    "task_id": repair.task_id,
+                }
+            ]
+            state.active_blocker["self_repair_commit"] = "next-repair"
+            with patch.object(
+                orchestrator,
+                "_resume_blocked_pending_user_input",
+                return_value=True,
+            ) as resume_input:
+                self.assertTrue(orchestrator._resume_blocked_run(state))
+
+            resume_input.assert_called_once_with(state)
+
     def test_saved_run_rehydrates_missing_ready_owner_before_blocked_resume(
         self,
     ) -> None:
