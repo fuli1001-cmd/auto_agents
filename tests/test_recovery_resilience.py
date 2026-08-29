@@ -17,6 +17,7 @@ from auto_agents.git_ops import (
     changed_files,
     changed_paths,
     commit_all,
+    delete_ref,
     hard_reset_clean,
     head_ref,
     ref_exists,
@@ -344,6 +345,18 @@ class RecoveryResilienceTests(unittest.TestCase):
                 later_record["verify_baseline_snapshot_ref"],
                 snapshot_ref,
             )
+            archived_snapshots = later_record[
+                "verify_baseline_snapshot_history"
+            ]
+            self.assertEqual(len(archived_snapshots), 1)
+            self.assertEqual(
+                archived_snapshots[0]["verify_baseline_snapshot_ref"],
+                snapshot_ref,
+            )
+            self.assertEqual(
+                archived_snapshots[0]["verify_baseline_snapshot_commit"],
+                snapshot_commit,
+            )
             self.assertEqual(task.verify_baseline_source_ref, snapshot_commit)
             orchestrator._persist_tasks(state.tasks)
             save_run_state(root, state)
@@ -351,6 +364,11 @@ class RecoveryResilienceTests(unittest.TestCase):
             commit_all(root, "test: commit later candidate")
             write_text(retained, "VALUE = 'recovery-head'\n")
             recovery_head = commit_all(root, "test: advance recovery head")
+            task.verify_baseline_source_ref = recovery_head
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(root, state)
+            delete_ref(root, snapshot_ref)
+            self.assertFalse(ref_exists(root, snapshot_ref))
 
             restarted = Orchestrator(root)
             restarted.config.gates.steps = [
@@ -377,6 +395,7 @@ class RecoveryResilienceTests(unittest.TestCase):
                 resumed_task.verify_baseline_ref,
                 dirty_baseline_ref,
             )
+            self.assertTrue(ref_exists(root, snapshot_ref))
             captured = subprocess.run(
                 ["git", "show", f"{snapshot_ref}:retained.py"],
                 cwd=root,
