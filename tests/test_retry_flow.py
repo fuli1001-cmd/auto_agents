@@ -23,7 +23,10 @@ from auto_agents.config import (
     save_run_state,
     task_plan_path,
 )
-from auto_agents.gates import FailureExtraction
+from auto_agents.gates import (
+    FailureExtraction,
+    build_failure_identity_diagnostic_command,
+)
 from auto_agents.git_ops import (
     changed_files,
     changed_paths,
@@ -6229,6 +6232,159 @@ class RetryFlowTests(unittest.TestCase):
                     "conda run -p ./.conda python -m pytest -vv -rA --tb=short -o console_output_style=classic tests"
                 ],
             )
+
+    def test_task_verify_uses_diagnostic_identity_for_absent_lazy_baseline_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.gates.verification_policy_version = 3
+            orchestrator.config.gates.incremental_mode = "auto"
+            orchestrator.config.gates.steps = [
+                VerificationStep(
+                    kind="test",
+                    runner="pytest",
+                    targets=["tests/test_new_contract.py::test_new_contract"],
+                )
+            ]
+            failure_id = "tests/test_new_contract.py::test_new_contract"
+            task = TaskSpec(
+                task_id="task-001",
+                title="Add focused contract proof",
+                description="Add a proof that was absent from the task baseline.",
+                acceptance=["The focused proof runs."],
+                verification_refs=[failure_id],
+                verify_baseline_ref="abcdef1",
+            )
+            command = orchestrator._build_task_verify_commands(task)[0]
+            diagnostic_command = build_failure_identity_diagnostic_command(command)
+            current_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout="pytest exited before printing a failure summary\n",
+                    )
+                ],
+                summary="command failed without a stable identity",
+            )
+            diagnostic_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=diagnostic_command,
+                        ok=False,
+                        returncode=1,
+                        stdout=f"FAILED {failure_id} - AssertionError\n",
+                    )
+                ],
+                summary="diagnostic captured a stable identity",
+            )
+            baseline_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=4,
+                        stdout=(
+                            f"ERROR: not found: {failure_id}\n"
+                            "(no match in any of [<Module test_new_contract.py>])\n"
+                        ),
+                    )
+                ],
+                summary="baseline target is absent",
+            )
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_quick_verify_failure",
+                    return_value=None,
+                ),
+                patch.object(
+                    orchestrator,
+                    "_run_task_gate_commands_for_commands",
+                    side_effect=[
+                        (current_gate, ""),
+                        (baseline_gate, ""),
+                    ],
+                ),
+                patch.object(
+                    orchestrator,
+                    "_run_verify_failure_identity_diagnostic",
+                    return_value=diagnostic_gate,
+                ),
+            ):
+                result = orchestrator._run_task_verify(task)
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["comparable_failures"])
+            self.assertEqual(result["failure_ids"], [failure_id])
+            self.assertEqual(result["baseline_failure_ids"], [])
+            self.assertEqual(
+                result["baseline_not_applicable_commands"],
+                [command],
+            )
+            self.assertEqual(task.verify_baseline_failures, [])
+
+    def test_lazy_baseline_target_absence_rejects_unresolved_current_selector(
+        self,
+    ) -> None:
+        command = "python -m pytest -q tests/test_missing.py::test_missing"
+        missing_output = (
+            "ERROR: not found: tests/test_missing.py::test_missing\n"
+            "(no match in any of [<Module test_missing.py>])\n"
+        )
+        current_gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command=command,
+                    ok=False,
+                    returncode=4,
+                    stdout=missing_output,
+                )
+            ],
+            summary="current target is absent",
+        )
+        baseline_gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command=command,
+                    ok=False,
+                    returncode=4,
+                    stdout=missing_output,
+                )
+            ],
+            summary="baseline target is absent",
+        )
+        diagnostic_gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command=build_failure_identity_diagnostic_command(command),
+                    ok=False,
+                    returncode=4,
+                    stdout=missing_output,
+                )
+            ],
+            summary="diagnostic target is still absent",
+        )
+
+        self.assertEqual(
+            Orchestrator._lazy_baseline_target_absent_commands(
+                baseline_gate,
+                current_gate,
+                diagnostic_gate=diagnostic_gate,
+            ),
+            [],
+        )
 
     def test_task_verify_does_not_call_stable_id_new_against_command_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

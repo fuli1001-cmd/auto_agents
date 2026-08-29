@@ -489,6 +489,7 @@ class Orchestrator:
     RECOVERY_LOOP_REPEAT_THRESHOLD = 2
     RECOVERY_SEMANTIC_LOOP_REPEAT_THRESHOLD = 3
     EXECUTION_ROOT_PROGRESS_CONTEXT = "execution_incident_root_progress"
+    EXECUTION_ROOT_PROGRESS_SCHEMA_VERSION = 2
     FRONTEND_CONTRACT_RECOVERY_CONTEXT = "frontend_design_contract_recovery"
     INSTALLED_ENGINE_RECOVERY_CONTEXT = "installed_engine_recovery_revisions"
     REQUIREMENT_CONTRACT_RECOVERY_CATEGORIES = frozenset(
@@ -7330,6 +7331,121 @@ class Orchestrator:
             and str(entry.get("stage", "")) == incident.stage
         )
 
+    def _execution_incident_root_historical_total(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+    ) -> int:
+        return sum(
+            max(1, int(entry.get("occurrence_count", 1) or 1))
+            for entry in state.execution_incidents
+            if self._execution_incident_summary_matches_root(
+                entry,
+                incident,
+            )
+        )
+
+    def _migrate_self_repair_execution_root_progress(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+    ) -> bool:
+        """Acknowledge a legacy self-repair boundary exactly once.
+
+        The CLI that applies an engine repair is still running the old imported
+        orchestrator when it records ``self_repair_applied``. Older engines did
+        not persist a versioned root-progress checkpoint, so the replacement
+        engine must repair that handoff before counting a resumed occurrence.
+        """
+
+        root_fingerprint = self._execution_incident_root_fingerprint(incident)
+        if not root_fingerprint:
+            return False
+        repair_event = next(
+            (
+                entry
+                for entry in reversed(incident.history)
+                if isinstance(entry, dict)
+                and str(entry.get("event", "")) == "self_repair_applied"
+            ),
+            None,
+        )
+        if repair_event is None:
+            return False
+        raw_progress = state.resume_context.get(
+            self.EXECUTION_ROOT_PROGRESS_CONTEXT,
+            {},
+        )
+        progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
+        raw_checkpoint = progress.get(root_fingerprint, {})
+        checkpoint = (
+            dict(raw_checkpoint) if isinstance(raw_checkpoint, dict) else {}
+        )
+        try:
+            checkpoint_version = max(
+                0,
+                int(checkpoint.get("schema_version", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            checkpoint_version = 0
+        if checkpoint_version >= self.EXECUTION_ROOT_PROGRESS_SCHEMA_VERSION:
+            return False
+
+        historical_total = self._execution_incident_root_historical_total(
+            state,
+            incident,
+        )
+        try:
+            checkpoint_total = max(
+                0,
+                int(checkpoint.get("occurrence_count", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            checkpoint_total = 0
+        try:
+            recorded_boundary = max(
+                0,
+                int(repair_event.get("root_occurrence_count", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            recorded_boundary = 0
+        total = max(
+            historical_total,
+            checkpoint_total,
+            recorded_boundary,
+        )
+        if not total:
+            total = max(1, int(incident.occurrence_count or 1))
+        try:
+            acknowledged = max(
+                0,
+                int(
+                    checkpoint.get("acknowledged_occurrence_count", 0)
+                    or 0
+                ),
+            )
+        except (TypeError, ValueError):
+            acknowledged = 0
+        if not acknowledged:
+            # Newer repair events record the exact boundary. For an unversioned
+            # event, migration runs during load/resume, before the replacement
+            # engine can record its first recurrence, so the historical total is
+            # the repair boundary.
+            acknowledged = recorded_boundary or total
+        checkpoint.update(
+            {
+                "schema_version": self.EXECUTION_ROOT_PROGRESS_SCHEMA_VERSION,
+                "occurrence_count": total,
+                "acknowledged_occurrence_count": min(total, acknowledged),
+                "incident_id": incident.incident_id,
+                "reason": "auto_agents self repair boundary migrated",
+                "updated_at": utc_now_iso(),
+            }
+        )
+        progress[root_fingerprint] = checkpoint
+        state.resume_context[self.EXECUTION_ROOT_PROGRESS_CONTEXT] = progress
+        return True
+
     def _execution_incident_root_occurrences_since_progress(
         self,
         state: RunState,
@@ -7338,6 +7454,7 @@ class Orchestrator:
         root_fingerprint = self._execution_incident_root_fingerprint(incident)
         if not root_fingerprint:
             return 0
+        self._migrate_self_repair_execution_root_progress(state, incident)
         raw_progress = state.resume_context.get(
             self.EXECUTION_ROOT_PROGRESS_CONTEXT,
             {},
@@ -7352,13 +7469,9 @@ class Orchestrator:
             int(checkpoint.get("occurrence_count", 0) or 0),
         )
         if not total:
-            total = sum(
-                max(1, int(entry.get("occurrence_count", 1) or 1))
-                for entry in state.execution_incidents
-                if self._execution_incident_summary_matches_root(
-                    entry,
-                    incident,
-                )
+            total = self._execution_incident_root_historical_total(
+                state,
+                incident,
             )
         acknowledged = max(
             0,
@@ -7377,6 +7490,7 @@ class Orchestrator:
         root_fingerprint = self._execution_incident_root_fingerprint(incident)
         if not root_fingerprint:
             return
+        self._migrate_self_repair_execution_root_progress(state, incident)
         raw_progress = state.resume_context.get(
             self.EXECUTION_ROOT_PROGRESS_CONTEXT,
             {},
@@ -7386,19 +7500,18 @@ class Orchestrator:
         checkpoint = (
             dict(raw_checkpoint) if isinstance(raw_checkpoint, dict) else {}
         )
-        historical_total = sum(
-            max(1, int(entry.get("occurrence_count", 1) or 1))
-            for entry in state.execution_incidents
-            if self._execution_incident_summary_matches_root(
-                entry,
-                incident,
-            )
+        historical_total = self._execution_incident_root_historical_total(
+            state,
+            incident,
         )
         checkpoint["occurrence_count"] = max(
             historical_total,
             int(checkpoint.get("occurrence_count", 0) or 0),
         ) + 1
         checkpoint.setdefault("acknowledged_occurrence_count", 0)
+        checkpoint["schema_version"] = (
+            self.EXECUTION_ROOT_PROGRESS_SCHEMA_VERSION
+        )
         checkpoint["last_incident_id"] = incident.incident_id
         checkpoint["last_seen_at"] = utc_now_iso()
         progress[root_fingerprint] = checkpoint
@@ -7427,17 +7540,14 @@ class Orchestrator:
             0,
             int(checkpoint.get("occurrence_count", 0) or 0),
         )
-        if not total:
-            total = sum(
-                max(1, int(entry.get("occurrence_count", 1) or 1))
-                for entry in state.execution_incidents
-                if self._execution_incident_summary_matches_root(
-                    entry,
-                    incident,
-                )
-            )
+        total = max(
+            total,
+            self._execution_incident_root_historical_total(state, incident),
+            max(1, int(incident.occurrence_count or 1)),
+        )
         checkpoint.update(
             {
+                "schema_version": self.EXECUTION_ROOT_PROGRESS_SCHEMA_VERSION,
                 "occurrence_count": total,
                 "acknowledged_occurrence_count": total,
                 "incident_id": incident.incident_id,
@@ -7645,8 +7755,32 @@ class Orchestrator:
         if incident is not None:
             incident.status = "recovering"
             incident.recovery_round = 0
+            raw_progress = state.resume_context.get(
+                self.EXECUTION_ROOT_PROGRESS_CONTEXT,
+                {},
+            )
+            progress = raw_progress if isinstance(raw_progress, dict) else {}
+            raw_checkpoint = progress.get(
+                self._execution_incident_root_fingerprint(incident),
+                {},
+            )
+            checkpoint = (
+                raw_checkpoint if isinstance(raw_checkpoint, dict) else {}
+            )
+            repair_boundary_total = max(
+                self._execution_incident_root_historical_total(state, incident),
+                int(checkpoint.get("occurrence_count", 0) or 0),
+                max(1, int(incident.occurrence_count or 1)),
+            )
             incident.history.append(
-                {"event": "self_repair_applied", "commit_sha": commit_sha}
+                {
+                    "event": "self_repair_applied",
+                    "commit_sha": commit_sha,
+                    "root_occurrence_count": repair_boundary_total,
+                    "root_progress_schema_version": (
+                        self.EXECUTION_ROOT_PROGRESS_SCHEMA_VERSION
+                    ),
+                }
             )
             self._incident_store(state).save(incident, state)
             self._record_execution_incident_root_progress(
@@ -10567,6 +10701,19 @@ class Orchestrator:
 
     def _resume_blocked_run(self, state: RunState) -> bool:
         active_incident = self._incident_store(state).active(state)
+        if (
+            active_incident is not None
+            and self._migrate_self_repair_execution_root_progress(
+                state,
+                active_incident,
+            )
+        ):
+            save_run_state(self.project_root, state)
+            self.logger.info(
+                "[self-repair] migrated legacy execution root progress "
+                "root=%s",
+                self._execution_incident_root_fingerprint(active_incident),
+            )
         if active_incident is not None and active_incident.status == "resolved":
             state.active_execution_incident_id = ""
             active_incident = None
@@ -20581,6 +20728,7 @@ class Orchestrator:
                 state,
             )
         extraction = extract_failure_info(verify_gate)
+        diagnostic_gate: Optional[GateResult] = None
         diagnostic_identity_only = False
         baseline_not_applicable_commands: List[str] = []
         raw_output = self._gate_raw_output(verify_gate)
@@ -20637,6 +20785,7 @@ class Orchestrator:
                 self._lazy_baseline_target_absent_commands(
                     baseline_gate,
                     verify_gate,
+                    diagnostic_gate=diagnostic_gate,
                 )
             )
             if baseline_not_applicable_commands:
@@ -22023,6 +22172,8 @@ class Orchestrator:
         cls,
         baseline_gate: GateResult,
         current_gate: GateResult,
+        *,
+        diagnostic_gate: Optional[GateResult] = None,
     ) -> List[str]:
         """Return selectors introduced after the lazy baseline snapshot.
 
@@ -22034,6 +22185,12 @@ class Orchestrator:
 
         current_results = {
             result.command: result for result in current_gate.commands
+        }
+        diagnostic_results = {
+            result.command: result
+            for result in (
+                diagnostic_gate.commands if diagnostic_gate is not None else []
+            )
         }
         absent: List[str] = []
         for baseline_result in baseline_gate.commands:
@@ -22048,12 +22205,44 @@ class Orchestrator:
                 GateResult(
                     ok=False,
                     commands=[current_result],
-                    summary=current_gate.summary,
+                    summary=(
+                        current_gate.summary
+                        if len(current_gate.commands) == 1
+                        else ""
+                    ),
                 )
             )
             if (
                 not current_extraction.comparable
                 or not current_extraction.failure_ids
+                or not cls._baseline_failure_ids_are_valid(
+                    current_extraction.failure_ids
+                )
+            ):
+                diagnostic_command = build_failure_identity_diagnostic_command(
+                    current_result.command
+                )
+                diagnostic_result = diagnostic_results.get(diagnostic_command)
+                if diagnostic_result is None or diagnostic_result.ok:
+                    return []
+                current_extraction = extract_failure_info(
+                    GateResult(
+                        ok=False,
+                        commands=[diagnostic_result],
+                        summary=(
+                            diagnostic_gate.summary
+                            if diagnostic_gate is not None
+                            and len(diagnostic_gate.commands) == 1
+                            else ""
+                        ),
+                    )
+                )
+            if (
+                not current_extraction.comparable
+                or not current_extraction.failure_ids
+                or not cls._baseline_failure_ids_are_valid(
+                    current_extraction.failure_ids
+                )
             ):
                 return []
             absent.append(baseline_result.command)

@@ -1045,6 +1045,168 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 "execution_recovery_semantic_loop",
             )
 
+    def test_self_repair_resume_migrates_legacy_root_progress_before_recurrence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            orchestrator.config.execution.recovery.max_occurrences_per_root_cause = 3
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            root_fingerprint = "stable-root"
+            command = "python -m pytest -q tests/test_contract.py::test_contract"
+            store = ExecutionIncidentStore(root, state.run_id)
+            for index, occurrence_count in enumerate((8, 9, 12)):
+                incident = ExecutionIncident(
+                    incident_id=f"legacy-root-{index}",
+                    run_id=state.run_id,
+                    source="gate",
+                    kind=BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                    stage="implement",
+                    context="lazy task baseline verification",
+                    command=command,
+                    baseline=True,
+                    status="resolved" if index < 2 else "recovering",
+                    incident_fingerprint=f"context-{index}",
+                    root_cause_fingerprint=root_fingerprint,
+                    origin_command=command,
+                    occurrence_count=occurrence_count,
+                )
+                if index == 2:
+                    incident.history.append(
+                        {
+                            "event": "self_repair_applied",
+                            "commit_sha": "repair-commit",
+                        }
+                    )
+                store.save(incident, state)
+            state.status = "pending"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "execution_recovery_semantic_loop",
+                "status": "retrying",
+                "self_repair_commit": "repair-commit",
+            }
+            state.resume_context.pop(
+                orchestrator.EXECUTION_ROOT_PROGRESS_CONTEXT,
+                None,
+            )
+            save_run_state(root, state)
+
+            resumed = Orchestrator(root)
+            loaded = load_run_state(root)
+            self.assertTrue(resumed._resume_blocked_run(loaded))
+            checkpoint = loaded.resume_context[
+                resumed.EXECUTION_ROOT_PROGRESS_CONTEXT
+            ][root_fingerprint]
+            self.assertEqual(checkpoint["occurrence_count"], 29)
+            self.assertEqual(checkpoint["acknowledged_occurrence_count"], 29)
+            self.assertEqual(
+                checkpoint["schema_version"],
+                resumed.EXECUTION_ROOT_PROGRESS_SCHEMA_VERSION,
+            )
+
+            recurrence = ExecutionIncident(
+                incident_id="post-repair-recurrence",
+                run_id=loaded.run_id,
+                source="gate",
+                kind=BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                stage="implement",
+                context="lazy task baseline verification",
+                command=command,
+                baseline=True,
+                incident_fingerprint="context-2",
+                root_cause_fingerprint=root_fingerprint,
+                origin_command=command,
+                evidence_fingerprint="post-repair-evidence",
+            )
+            recurrence = resumed._merge_or_save_execution_incident(
+                loaded,
+                recurrence,
+            )
+
+            self.assertEqual(
+                resumed._execution_incident_root_occurrences_since_progress(
+                    loaded,
+                    recurrence,
+                ),
+                1,
+            )
+            with patch.object(
+                resumed,
+                "_schedule_prebaseline_recovery_task",
+            ):
+                recovered = resumed._apply_execution_incident_diagnosis(
+                    loaded,
+                    recurrence,
+                    IncidentDiagnosis(
+                        owner="verification_contract",
+                        action="RECOVER_TARGET",
+                        confidence=1.0,
+                        reason="the focused baseline identity remains unresolved",
+                        cause_status="confirmed",
+                    ),
+                )
+            self.assertTrue(recovered)
+            self.assertNotEqual(loaded.status, "blocked")
+
+    def test_self_repair_resume_repairs_zeroed_legacy_root_checkpoint_once(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            root_fingerprint = "stable-root"
+            incident = ExecutionIncident(
+                incident_id="legacy-active",
+                run_id=state.run_id,
+                source="gate",
+                kind=BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                stage="implement",
+                context="lazy task baseline verification",
+                command="python -m pytest -q tests/test_contract.py::test_contract",
+                status="recovering",
+                incident_fingerprint="context-sensitive-root",
+                root_cause_fingerprint=root_fingerprint,
+                origin_command="python -m pytest -q tests/test_contract.py::test_contract",
+                occurrence_count=7,
+                history=[
+                    {
+                        "event": "self_repair_applied",
+                        "commit_sha": "repair-commit",
+                    }
+                ],
+            )
+            ExecutionIncidentStore(root, state.run_id).save(incident, state)
+            state.resume_context[orchestrator.EXECUTION_ROOT_PROGRESS_CONTEXT] = {
+                root_fingerprint: {
+                    "occurrence_count": 7,
+                    "acknowledged_occurrence_count": 0,
+                }
+            }
+
+            self.assertTrue(
+                orchestrator._migrate_self_repair_execution_root_progress(
+                    state,
+                    incident,
+                )
+            )
+            checkpoint = state.resume_context[
+                orchestrator.EXECUTION_ROOT_PROGRESS_CONTEXT
+            ][root_fingerprint]
+            self.assertEqual(checkpoint["acknowledged_occurrence_count"], 7)
+            self.assertFalse(
+                orchestrator._migrate_self_repair_execution_root_progress(
+                    state,
+                    incident,
+                )
+            )
+            self.assertEqual(checkpoint["acknowledged_occurrence_count"], 7)
+
     def test_agent_diagnosis_requires_strict_bounded_json(self) -> None:
         diagnosis = parse_incident_diagnosis(
             '{"owner":"target_project","action":"RECOVER_TARGET",'
