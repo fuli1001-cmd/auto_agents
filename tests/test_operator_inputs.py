@@ -64,6 +64,8 @@ class OperatorInputStoreTests(unittest.TestCase):
         self.assertEqual(request.kind, "attestation")
         self.assertFalse(request.default)
         self.assertIn("不确定时选择 n", request.render())
+        self.assertIn("作用：", request.render())
+        self.assertNotIn("为什么需要：", request.render())
 
     def test_project_values_and_secrets_are_persisted_separately(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,6 +179,235 @@ class OperatorInputStoreTests(unittest.TestCase):
         )
         self.assertEqual((visible, hidden), ("a", "b"))
         self.assertEqual(calls, ["visible", "hidden"])
+
+    def test_provider_normalizes_a_natural_language_choice_answer(self):
+        class Adapter:
+            def __init__(self):
+                self.requests = []
+
+            def run(self, request):
+                self.requests.append(request)
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=json.dumps(
+                        {"action": "answer", "value": "x_api_key", "message": ""}
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            answers = iter(["新版"])
+            orchestrator = Orchestrator(
+                project,
+                user_input_fn=lambda _prompt: next(answers),
+            )
+            adapter = Adapter()
+            orchestrator.adapter = adapter
+            request = _request(
+                key="volcengine.asr.auth_generation",
+                kind="choice",
+                question=(
+                    "测试账号使用新版 X-Api-Key 还是旧版 App-Key 加 Access-Key？"
+                ),
+                validation={
+                    "choices": ["x_api_key", "legacy_app_access_keys"]
+                },
+                bindings=[],
+            )
+
+            value = orchestrator._prompt_for_operator_input(request)
+
+            self.assertEqual(value, "x_api_key")
+            self.assertEqual(len(adapter.requests), 1)
+            self.assertEqual(adapter.requests[0].stage, "operator_input")
+            self.assertEqual(adapter.requests[0].sandbox_mode, "read-only")
+            self.assertEqual(adapter.requests[0].timeout_seconds, 120)
+            self.assertFalse(
+                str(adapter.requests[0].cwd).startswith(str(project))
+            )
+            self.assertIn("新版", adapter.requests[0].prompt)
+
+    def test_provider_answers_a_user_question_before_reprompting_for_path(self):
+        class Adapter:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, request):
+                self.calls += 1
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=json.dumps(
+                        {
+                            "action": "reply",
+                            "value": "",
+                            "message": "没有硬性时长要求；建议使用 10–30 秒的清晰中文音频。",
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            audio = project / "fixture.wav"
+            audio.write_bytes(b"RIFF-test")
+            answers = iter(["需要多长时间的音频？", str(audio)])
+            prompts = []
+            output = io.StringIO()
+
+            def answer(prompt):
+                prompts.append(prompt)
+                return next(answers)
+
+            orchestrator = Orchestrator(
+                project,
+                agent_output_stream=output,
+                user_input_fn=answer,
+            )
+            adapter = Adapter()
+            orchestrator.adapter = adapter
+            request = _request(
+                key="volcengine.asr.audio_path",
+                kind="path",
+                question="请提供一份可长期自动化测试的获授权中文音频文件路径。",
+                validation={"must_exist": True},
+                bindings=[],
+            )
+
+            value = orchestrator._prompt_for_operator_input(request)
+
+            self.assertEqual(value, str(audio.resolve()))
+            self.assertEqual(adapter.calls, 1)
+            self.assertEqual(len(prompts), 2)
+            self.assertIn("10–30 秒", output.getvalue())
+
+    def test_text_reply_gets_semantic_interpretation_even_when_nonempty(self):
+        class Adapter:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, request):
+                self.calls += 1
+                payload = (
+                    {
+                        "action": "reply",
+                        "value": "",
+                        "message": "请从测试账号的应用详情页复制 App ID。",
+                    }
+                    if self.calls == 1
+                    else {
+                        "action": "answer",
+                        "value": "app-123",
+                        "message": "",
+                    }
+                )
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=json.dumps(payload, ensure_ascii=False),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            answers = iter(["这个值在哪里找？", "app-123"])
+            output = io.StringIO()
+            orchestrator = Orchestrator(
+                project,
+                agent_output_stream=output,
+                user_input_fn=lambda _prompt: next(answers),
+            )
+            adapter = Adapter()
+            orchestrator.adapter = adapter
+            request = _request(
+                key="volcengine.asr.app_id",
+                kind="text",
+                validation={},
+                bindings=[],
+            )
+
+            value = orchestrator._prompt_for_operator_input(request)
+
+            self.assertEqual(value, "app-123")
+            self.assertEqual(adapter.calls, 2)
+            self.assertIn("应用详情页", output.getvalue())
+
+    def test_interpreted_answer_still_has_to_pass_local_validation(self):
+        class Adapter:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, request):
+                self.calls += 1
+                return AgentResult(
+                    ok=True,
+                    command=["fake"],
+                    output_path=request.output_path,
+                    summary=json.dumps(
+                        {
+                            "action": "answer",
+                            "value": "/path/invented/by-provider.wav",
+                            "message": "",
+                        }
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            audio = project / "fixture.wav"
+            audio.write_bytes(b"RIFF-test")
+            answers = iter(["fixture", str(audio)])
+            orchestrator = Orchestrator(
+                project,
+                user_input_fn=lambda _prompt: next(answers),
+            )
+            adapter = Adapter()
+            orchestrator.adapter = adapter
+            request = _request(
+                key="volcengine.asr.audio_path",
+                kind="path",
+                validation={"must_exist": True},
+                bindings=[],
+            )
+
+            value = orchestrator._prompt_for_operator_input(request)
+
+            self.assertEqual(value, str(audio.resolve()))
+            self.assertEqual(adapter.calls, 1)
+
+    def test_secret_answer_is_never_sent_to_interpreter(self):
+        class Adapter:
+            def run(self, request):
+                raise AssertionError("secret answer was sent to the provider")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "demo"
+            Orchestrator.init_project(project, "demo", "mock")
+            answers = iter(["", "test-secret"])
+            orchestrator = Orchestrator(
+                project,
+                user_input_fn=lambda _prompt: next(answers),
+            )
+            orchestrator.adapter = Adapter()
+            request = _request(
+                key="volcengine.asr.api_key",
+                kind="secret",
+                sensitivity="secret",
+                validation={},
+                bindings=[],
+            )
+
+            self.assertEqual(
+                orchestrator._prompt_for_operator_input(request),
+                "test-secret",
+            )
 
     def test_waiting_request_is_answered_and_task_requeued(self):
         with tempfile.TemporaryDirectory() as tmp:

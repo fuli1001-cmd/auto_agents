@@ -1623,10 +1623,16 @@ python3 -m auto_agents answer --project /tmp/demo
 The answer command resumes the saved run automatically after the last pending
 input validates. When several inputs are pending and a TTY is attached, both
 `run` and `answer` keep asking one question at a time in the same process, then
-resume the workflow after the complete batch validates. Pass `--no-resume` to
-save only. `inputs list`, `inputs set`, and `inputs remove` manage reusable
-project-scoped answers. Ordinary/private inputs are stored in the Git-ignored
-`.auto-agents/operator/inputs.json`; secrets are stored in
+resume the workflow after the complete batch validates. If an ordinary answer
+does not pass the local contract literally, the provider selected for the run
+interprets it conversationally: it may normalize a natural-language choice or
+answer the operator's clarification question before asking again. The normalized
+value still has to pass the same deterministic validation. Secret answers bypass
+this interpretation turn and are never sent back to the provider. Each displayed
+question shows its purpose once, without a redundant separate "why required"
+line. Pass `--no-resume` to save only. `inputs list`, `inputs set`, and `inputs
+remove` manage reusable project-scoped answers. Ordinary/private inputs are
+stored in the Git-ignored `.auto-agents/operator/inputs.json`; secrets are stored in
 `.auto-agents/operator/secrets.env`. Both files are mode `0600` on POSIX.
 Secrets are never written to prompts, run state, task plans, or logs.
 

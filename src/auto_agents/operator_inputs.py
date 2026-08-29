@@ -178,7 +178,6 @@ class UserInputRequest:
         lines = [
             f"问题：{self.question}",
             f"作用：{self.purpose}",
-            f"为什么需要：{self.why_required}",
         ]
         if self.how_to_obtain:
             lines.append("如何获得或回答：")

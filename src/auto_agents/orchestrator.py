@@ -189,6 +189,7 @@ from .operator_inputs import (
     OperatorInputStore,
     UserInputRequest,
     prompt_for_request,
+    validate_answer,
 )
 from .project_runtime import ProjectRuntimeManager
 from .provider_limits import ParallelTuningStore, provider_limit
@@ -4700,6 +4701,157 @@ class Orchestrator:
             "resume": not state.pending_input_requests,
         }
 
+    @staticmethod
+    def _parse_operator_input_interpretation(
+        raw: str,
+    ) -> Tuple[str, object, str]:
+        text = str(raw or "").strip()
+        fenced = re.search(
+            r"```(?:json)?\s*(\{.*\})\s*```",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        candidate = fenced.group(1) if fenced else text
+        if not candidate.startswith("{"):
+            start = candidate.find("{")
+            end = candidate.rfind("}")
+            if start < 0 or end <= start:
+                raise ValueError("answer interpretation did not contain a JSON object")
+            candidate = candidate[start : end + 1]
+        payload = json.loads(candidate)
+        if not isinstance(payload, dict):
+            raise ValueError("answer interpretation must be a JSON object")
+        action = str(payload.get("action", "")).strip().lower()
+        if action not in {"answer", "reply", "retry"}:
+            raise ValueError(
+                "answer interpretation action must be answer, reply, or retry"
+            )
+        message = str(payload.get("message", "")).strip()
+        return action, payload.get("value", ""), message
+
+    def _interpret_operator_input_answer(
+        self,
+        request: UserInputRequest,
+        answer: object,
+        validation_error: str,
+    ) -> Optional[Tuple[str, object, str]]:
+        # Do not send credentials through an extra agent turn merely to improve
+        # input ergonomics. Secret answers have a deterministic non-empty check.
+        if request.kind == "secret" or request.sensitivity == "secret":
+            return None
+        request_context = {
+            "kind": request.kind,
+            "question": request.question,
+            "purpose": request.purpose,
+            "how_to_obtain": request.how_to_obtain,
+            "recommended_answer": request.recommended_answer,
+            "default": request.default,
+            "validation": request.validation,
+        }
+        prompt = "\n".join(
+            (
+                "You are the conversational input interpreter for auto_agents.",
+                "Understand the user's reply in the context of the pending question, but do not use tools, inspect files, or modify anything.",
+                "Return exactly one JSON object and no markdown, using one of these forms:",
+                '{"action":"answer","value":"the normalized answer","message":""}',
+                '{"action":"reply","value":"","message":"a concise helpful answer to the user before asking again"}',
+                '{"action":"retry","value":"","message":"a concise explanation of what is still needed"}',
+                "Use action=answer only when the user actually supplied the requested value. Normalize choice answers to one exact validation choice and boolean answers to true or false.",
+                "Use action=reply when the user asked a question or requested clarification. Answer it directly in the user's language.",
+                "Never invent or guess a path, URL, credential, authorization, attestation, or approval. Local deterministic validation will check every normalized answer.",
+                "Pending request JSON:",
+                json.dumps(request_context, ensure_ascii=False, sort_keys=True),
+                f"Local validation result: {validation_error}",
+                "User reply JSON:",
+                json.dumps(answer, ensure_ascii=False),
+            )
+        )
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix="auto-agents-input-interpretation-"
+            ) as temporary:
+                root = Path(temporary)
+                output_path = root / "answer.json"
+                agent_request = AgentRequest(
+                    stage="operator_input",
+                    effort=self.config.efforts.get("clarify", "balanced"),
+                    prompt=prompt,
+                    cwd=root,
+                    output_path=output_path,
+                    attempt_id=f"operator-input-{request.request_id}",
+                    sandbox_mode="read-only",
+                    timeout_seconds=120,
+                )
+                provider = self.config.active_provider
+                with log_timing(
+                    self.logger,
+                    f"agent:operator-input provider={provider}",
+                ):
+                    result = self.adapter.run(agent_request)
+                if not result.ok:
+                    self.logger.warning(
+                        "[user-input] provider=%s could not interpret the answer: %s",
+                        provider,
+                        result.stderr or result.summary or "provider call failed",
+                    )
+                    return None
+                raw = result.summary or result.stdout or read_text(output_path)
+                return self._parse_operator_input_interpretation(raw)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.logger.warning(
+                "[user-input] provider=%s returned an unusable answer interpretation: %s",
+                self.config.active_provider,
+                error,
+            )
+            return None
+
+    def _prompt_for_operator_input(
+        self,
+        request: UserInputRequest,
+        *,
+        echo_mode: Optional[str] = None,
+    ) -> object:
+        while True:
+            answer = prompt_for_request(
+                request,
+                echo_mode=echo_mode or self._secret_echo,
+                input_fn=lambda prompt: self._prompt_user(prompt, default="n"),
+                secret_input_fn=(
+                    (lambda prompt: self._user_input_fn(prompt))
+                    if self._user_input_fn is not None
+                    else getpass.getpass
+                ),
+            )
+            normalized, error = validate_answer(request, answer)
+            needs_semantic_interpretation = bool(error) or request.kind == "text"
+            if not needs_semantic_interpretation:
+                return normalized
+
+            interpretation = self._interpret_operator_input_answer(
+                request,
+                answer,
+                error,
+            )
+            if interpretation is None:
+                if not error:
+                    return normalized
+                self.logger.warning("Invalid answer: %s", error)
+                continue
+            action, interpreted_value, message = interpretation
+            if action == "answer":
+                normalized, interpreted_error = validate_answer(
+                    request,
+                    interpreted_value,
+                )
+                if not interpreted_error:
+                    return normalized
+                self.logger.warning("Invalid answer: %s", interpreted_error)
+                continue
+            if message:
+                self.logger.info("[user-input] %s", message)
+            else:
+                self.logger.warning("Invalid answer: %s", error)
+
     def _process_pending_user_input(
         self, state: RunState, tasks: Optional[List[TaskSpec]] = None
     ) -> bool:
@@ -4734,16 +4886,7 @@ class Orchestrator:
                 )
                 return False
             while True:
-                answer = prompt_for_request(
-                    request,
-                    echo_mode=self._secret_echo,
-                    input_fn=lambda prompt: self._prompt_user(prompt, default="n"),
-                    secret_input_fn=(
-                        (lambda prompt: self._user_input_fn(prompt))
-                        if self._user_input_fn is not None
-                        else getpass.getpass
-                    ),
-                )
+                answer = self._prompt_for_operator_input(request)
                 try:
                     result = self.answer_input_request(
                         request_id=request.request_id,

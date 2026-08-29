@@ -754,15 +754,9 @@ def _input_value_from_args(
                 "--from-env, or --from-file"
             )
         return explicit
-    return prompt_for_request(
+    return orchestrator._prompt_for_operator_input(
         request,
         echo_mode=str(getattr(args, "echo", "auto")),
-        input_fn=lambda prompt: orchestrator._prompt_user(prompt, default="n"),
-        secret_input_fn=(
-            (lambda prompt: orchestrator._user_input_fn(prompt))
-            if orchestrator._user_input_fn is not None
-            else getpass.getpass
-        ),
     )
 
 
