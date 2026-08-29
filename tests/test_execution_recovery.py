@@ -1287,6 +1287,447 @@ class ExecutionRecoveryTests(unittest.TestCase):
             execute.assert_called_once()
             self.assertEqual(recovery.status, "done")
 
+    def test_recovery_commit_preserves_borrowed_owner_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            owner_path = root / "owner.py"
+            owner_path.write_text("VALUE = 'base'\n", encoding="utf-8")
+            commit_all(root, "test: add borrowed owner baseline")
+
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            source = TaskSpec(
+                task_id="source-task",
+                title="Source task",
+                description="Owns an uncommitted implementation candidate.",
+                acceptance=["The focused verification passes."],
+                status="in_progress",
+            )
+            state.tasks = [source]
+            orchestrator._persist_tasks(state.tasks)
+            orchestrator._set_implementation_ready_marker(state, source, True)
+            owner_path.write_text("VALUE = 'borrowed'\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "--", "owner.py"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                orchestrator._capture_retained_worktree_ownership(
+                    state,
+                    [source.task_id],
+                    source="implementation_ready",
+                ),
+                [source.task_id],
+            )
+            incident = ExecutionIncident(
+                incident_id="borrowed-owner",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q tests/test_owned.py",
+                task_id=source.task_id,
+                recovery_round=1,
+            )
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+            tasks = orchestrator._load_tasks_from_plan()
+            recovery = tasks[0]
+            borrowed_fingerprint = worktree_fingerprint(root)
+
+            def finish_recovery(*_args, **_kwargs):
+                (root / "recovery_support.py").write_text(
+                    "RECOVERED = True\n",
+                    encoding="utf-8",
+                )
+                return {
+                    "ok": True,
+                    "review": "recovery verified",
+                    "verify_current_failure_ids": [],
+                }
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_route_frontend_design_contract_prerequisite",
+                    return_value=None,
+                ),
+                patch.object(orchestrator, "_ensure_evidence_preflight", return_value={}),
+                patch.object(
+                    orchestrator,
+                    "_execute_task_with_retries",
+                    side_effect=finish_recovery,
+                ),
+                patch.object(orchestrator, "_warm_clean_head_verify_baseline"),
+            ):
+                result = orchestrator._execute_task_in_main_worktree(
+                    state,
+                    tasks,
+                    recovery,
+                )
+
+            self.assertIsNone(result)
+            self.assertEqual(recovery.status, "done")
+            self.assertEqual(
+                owner_path.read_text(encoding="utf-8"),
+                "VALUE = 'borrowed'\n",
+            )
+            self.assertEqual(
+                worktree_fingerprint(root),
+                borrowed_fingerprint,
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "status", "--short", "--", "owner.py"],
+                    cwd=root,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    check=True,
+                ).stdout.strip(),
+                "M  owner.py",
+            )
+            committed = commit_changed_paths(root, recovery.commit_sha)
+            self.assertIn("recovery_support.py", committed)
+            self.assertNotIn("owner.py", committed)
+            marker = orchestrator._execution_recovery_marker(recovery)
+            self.assertEqual(
+                marker["worktree_handoff"]["borrowed_paths"],
+                ["owner.py"],
+            )
+            self.assertIn(
+                "recovery_support.py",
+                marker["borrowed_worktree_validation"]["recovery_delta_paths"],
+            )
+            owner_record = state.resume_context["retained_worktree_ownership"][
+                source.task_id
+            ]
+            self.assertEqual(owner_record["head_ref"], head_ref(root))
+            self.assertTrue(
+                orchestrator._retained_worktree_snapshot_matches(
+                    owner_record,
+                    allow_pending_planning_changes=False,
+                )
+            )
+
+    def test_recovery_blocks_when_borrowed_index_state_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            owner_path = root / "owner.py"
+            owner_path.write_text("VALUE = 'base'\n", encoding="utf-8")
+            commit_all(root, "test: add staged owner baseline")
+
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            source = TaskSpec(
+                task_id="source-task",
+                title="Source task",
+                description="Owns a staged implementation candidate.",
+                acceptance=["The focused verification passes."],
+                status="in_progress",
+            )
+            state.tasks = [source]
+            orchestrator._persist_tasks(state.tasks)
+            orchestrator._set_implementation_ready_marker(state, source, True)
+            owner_path.write_text("VALUE = 'borrowed'\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "add", "--", "owner.py"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            incident = ExecutionIncident(
+                incident_id="borrowed-index",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q tests/test_owned.py",
+                task_id=source.task_id,
+                recovery_round=1,
+            )
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+            tasks = orchestrator._load_tasks_from_plan()
+            recovery = tasks[0]
+            original_head = head_ref(root)
+
+            def alter_only_the_index(*_args, **_kwargs):
+                subprocess.run(
+                    ["git", "reset", "-q", "HEAD", "--", "owner.py"],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                )
+                (root / "recovery_support.py").write_text(
+                    "RECOVERED = True\n",
+                    encoding="utf-8",
+                )
+                return {
+                    "ok": True,
+                    "review": "recovery verified",
+                    "verify_current_failure_ids": [],
+                }
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_route_frontend_design_contract_prerequisite",
+                    return_value=None,
+                ),
+                patch.object(orchestrator, "_ensure_evidence_preflight", return_value={}),
+                patch.object(
+                    orchestrator,
+                    "_execute_task_with_retries",
+                    side_effect=alter_only_the_index,
+                ),
+                patch.object(orchestrator, "_warm_clean_head_verify_baseline"),
+            ):
+                result = orchestrator._execute_task_in_main_worktree(
+                    state,
+                    tasks,
+                    recovery,
+                )
+
+            self.assertIs(result, state)
+            self.assertEqual(head_ref(root), original_head)
+            self.assertEqual(recovery.status, "blocked")
+            self.assertEqual(
+                state.active_blocker["category"],
+                "execution_recovery_borrowed_worktree_mutation",
+            )
+            detail = state.active_blocker["execution_recovery_borrowed_worktree"]
+            self.assertEqual(detail["changed_index_paths"], ["owner.py"])
+
+    def test_prebaseline_recovery_preempts_stale_repair_ownership_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            owner_path = root / "owner.py"
+            owner_path.write_text("VALUE = 'base'\n", encoding="utf-8")
+            commit_all(root, "test: add stale ownership baseline")
+
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            source = TaskSpec(
+                task_id="source-task",
+                title="Source task",
+                description="Owns retained proof work.",
+                acceptance=["The proof passes."],
+                status="in_progress",
+                recovery_round=1,
+                verification_refs=["tests/test_owned.py::test_contract"],
+            )
+            state.tasks = [source]
+            orchestrator._set_implementation_ready_marker(state, source, True)
+            owner_path.write_text("VALUE = 'retained'\n", encoding="utf-8")
+            self.assertTrue(
+                orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    source,
+                    {
+                        "reason": "owned proof failed",
+                        "failure_ids": ["tests/test_owned.py::test_contract"],
+                    },
+                )
+            )
+            repair = next(
+                task for task in state.tasks if task.task_origin == "evidence_repair"
+            )
+            commit_all(root, "test: emulate legacy recovery absorption")
+            (root / "interrupted_recovery.py").write_text(
+                "PARTIAL = True\n",
+                encoding="utf-8",
+            )
+            recovery = TaskSpec(
+                task_id="recover-execution-active-r1",
+                title="Resume interrupted recovery",
+                description="Complete the active pre-baseline recovery.",
+                acceptance=["The original command passes."],
+                status="in_progress",
+                task_origin="stage_recovery",
+                recovery_history=[
+                    recovery_task_marker(
+                        "active-incident",
+                        "python -m pytest -q tests/test_owned.py",
+                        recovery_round=1,
+                    )
+                ],
+                verification_refs=["cmd:python -m pytest -q tests/test_owned.py"],
+            )
+            state.tasks = [repair, source, recovery]
+            state.status = "pending"
+            orchestrator._persist_tasks(state.tasks)
+            executed = []
+
+            def execute_recovery(_state, _tasks, task):
+                executed.append(task.task_id)
+                return _state
+
+            with patch.object(
+                orchestrator,
+                "_execute_task_in_main_worktree",
+                side_effect=execute_recovery,
+            ):
+                result = orchestrator._run_implementation_loop(state, max_tasks=1)
+
+            self.assertIs(result, state)
+            self.assertEqual(executed, [recovery.task_id])
+            self.assertNotEqual(state.status, "blocked")
+
+    def test_legacy_recovery_commit_reconciles_absorbed_owner_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            owner_path = root / "owner.py"
+            owner_path.write_text("VALUE = 'base'\n", encoding="utf-8")
+            commit_all(root, "test: add migration baseline")
+
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            source = TaskSpec(
+                task_id="source-task",
+                title="Source task",
+                description="Owns a retained implementation candidate.",
+                acceptance=["The focused verification passes."],
+                status="in_progress",
+            )
+            state.tasks = [source]
+            orchestrator._persist_tasks(state.tasks)
+            orchestrator._set_implementation_ready_marker(state, source, True)
+            owner_path.write_text("VALUE = 'ancestor'\n", encoding="utf-8")
+            self.assertEqual(
+                orchestrator._capture_retained_worktree_ownership(
+                    state,
+                    [source.task_id],
+                    source="implementation_ready",
+                ),
+                [source.task_id],
+            )
+            repair = TaskSpec(
+                task_id="repair-task",
+                title="Evidence repair",
+                description="Owns a superseding retained candidate.",
+                acceptance=["The focused verification passes."],
+                status="in_progress",
+                parent_task_id=source.task_id,
+                task_origin="evidence_repair",
+            )
+            source.depends_on = [repair.task_id]
+            state.tasks = [repair, source]
+            orchestrator._persist_tasks(state.tasks)
+            orchestrator._set_implementation_ready_marker(state, repair, True)
+            owner_path.write_text("VALUE = 'borrowed'\n", encoding="utf-8")
+            self.assertEqual(
+                orchestrator._capture_retained_worktree_ownership(
+                    state,
+                    [repair.task_id],
+                    source="implementation_ready",
+                    replace_existing=True,
+                ),
+                [repair.task_id],
+            )
+            incident = ExecutionIncident(
+                incident_id="legacy-absorption",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q tests/test_owned.py",
+                task_id=repair.task_id,
+                recovery_round=1,
+            )
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+            tasks = orchestrator._load_tasks_from_plan()
+            recovery = tasks[0]
+            recovery.status = "done"
+            orchestrator._persist_tasks(tasks)
+            legacy_message = orchestrator.config.git.commit_message_template.format(
+                task_id=recovery.task_id,
+                title=recovery.title,
+            )
+            commit_all(root, legacy_message)
+            recovery.commit_sha = ""
+            (root / "active_recovery_delta.py").write_text(
+                "PARTIAL = True\n",
+                encoding="utf-8",
+            )
+
+            reconciled = (
+                orchestrator._reconcile_retained_worktree_absorbed_by_execution_recovery(
+                    state,
+                    tasks,
+                )
+            )
+
+            self.assertEqual(reconciled, [repair.task_id, source.task_id])
+            self.assertNotIn("retained_worktree_ownership", state.resume_context)
+            migrations = state.resume_context[
+                "retained_worktree_execution_recovery_migrations"
+            ]
+            self.assertEqual(
+                migrations[-2]["migration_kind"],
+                "direct_recovery_commit",
+            )
+            self.assertEqual(migrations[-2]["owner_task_id"], repair.task_id)
+            self.assertEqual(
+                migrations[-1]["migration_kind"],
+                "superseded_owner_lineage",
+            )
+            self.assertEqual(migrations[-1]["owner_task_id"], source.task_id)
+            self.assertEqual(migrations[-1]["changed_paths"], ["owner.py"])
+
+    def test_legacy_owner_migration_rejects_unrecorded_target_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            owner_path = root / "owner.py"
+            owner_path.write_text("VALUE = 'base'\n", encoding="utf-8")
+            commit_all(root, "test: add untrusted migration baseline")
+
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            source = TaskSpec(
+                task_id="source-task",
+                title="Source task",
+                description="Owns a retained implementation candidate.",
+                acceptance=["The focused verification passes."],
+                status="in_progress",
+            )
+            tasks = [source]
+            state.tasks = tasks
+            orchestrator._persist_tasks(tasks)
+            orchestrator._set_implementation_ready_marker(state, source, True)
+            owner_path.write_text("VALUE = 'borrowed'\n", encoding="utf-8")
+            self.assertEqual(
+                orchestrator._capture_retained_worktree_ownership(
+                    state,
+                    [source.task_id],
+                    source="implementation_ready",
+                ),
+                [source.task_id],
+            )
+            commit_all(root, "user: commit a target-project candidate")
+
+            self.assertEqual(
+                orchestrator._reconcile_retained_worktree_absorbed_by_execution_recovery(
+                    state,
+                    tasks,
+                ),
+                [],
+            )
+            self.assertIn(
+                source.task_id,
+                state.resume_context["retained_worktree_ownership"],
+            )
+
     def test_recurring_incident_requeues_same_task_for_fresh_implementation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -1336,6 +1777,56 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 state.resume_context.get("implementation_ready_tasks", {}),
             )
             self.assertNotIn(f"implement-{requeued.task_id}", state.agent_attempts)
+
+    def test_recurring_recovery_does_not_borrow_its_own_partial_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            source = TaskSpec(
+                task_id="source-task",
+                title="Source task",
+                description="Owns the original dirty candidate.",
+                acceptance=["The original command passes."],
+                status="in_progress",
+            )
+            state.tasks = [source]
+            orchestrator._persist_tasks(state.tasks)
+            orchestrator._set_implementation_ready_marker(state, source, True)
+            (root / "owner.py").write_text("BORROWED = True\n", encoding="utf-8")
+            incident = ExecutionIncident(
+                incident_id="recurring-with-handoff",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_reported_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q tests/test_owned.py",
+                task_id=source.task_id,
+                recovery_round=1,
+            )
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+            tasks = orchestrator._load_tasks_from_plan()
+            recovery = tasks[0]
+            recovery.status = "in_progress"
+            orchestrator._set_implementation_ready_marker(state, recovery, True)
+            (root / "recovery_delta.py").write_text(
+                "PARTIAL = True\n",
+                encoding="utf-8",
+            )
+            orchestrator._persist_tasks(tasks)
+
+            incident.task_id = recovery.task_id
+            incident.recovery_round = 2
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+
+            requeued = orchestrator._load_tasks_from_plan()[0]
+            handoff = orchestrator._execution_recovery_marker(requeued)[
+                "worktree_handoff"
+            ]
+            self.assertEqual(handoff["source_task_id"], source.task_id)
+            self.assertEqual(handoff["borrowed_paths"], ["owner.py"])
 
     def test_recovery_verify_without_current_round_implementation_is_invariant(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -342,6 +342,9 @@ _DANGLING_DEPENDENCIES_AFTER_TASK_PRUNING = (
 )
 _RETAINED_WORKTREE_OWNERSHIP_CONTEXT = "retained_worktree_ownership"
 _RETAINED_REPAIR_PRESERVED_PATHS_CONTEXT = "retained_repair_preserved_paths"
+_RETAINED_WORKTREE_EXECUTION_RECOVERY_MIGRATIONS_CONTEXT = (
+    "retained_worktree_execution_recovery_migrations"
+)
 _RETAINED_WORKTREE_RECONCILIATION_KIND = (
     "retained_worktree_reconciliation"
 )
@@ -11597,6 +11600,18 @@ class Orchestrator:
             marker["implementation_required_round"] = incident.recovery_round
             marker["evidence_fingerprint"] = incident.evidence_fingerprint
             marker["result"] = "rescheduled"
+            if str(incident.task_id).strip() != existing_task.task_id:
+                worktree_handoff = (
+                    self._capture_execution_recovery_worktree_handoff(
+                        state,
+                        tasks,
+                        source_task_id=incident.task_id,
+                    )
+                )
+                if worktree_handoff:
+                    marker["worktree_handoff"] = worktree_handoff
+                else:
+                    marker.pop("worktree_handoff", None)
             existing_task.recovery_round = incident.recovery_round
             existing_task.status = "blocked"
             existing_task.review_summary = ""
@@ -11700,14 +11715,101 @@ class Orchestrator:
         if not changed:
             return {}
         return {
-            "version": 1,
+            "version": 2,
             "source_task_id": source_task.task_id,
             "head_ref": head_ref(self.project_root),
             "worktree_fingerprint": (
                 self._worktree_fingerprint_excluding_agent_instructions()
             ),
             "changed_paths": changed,
+            "borrowed_paths": changed,
+            "path_fingerprints": self._retained_worktree_path_fingerprints(
+                changed
+            ),
+            "index_fingerprints": self._worktree_index_fingerprints(changed),
         }
+
+    def _worktree_index_fingerprints(
+        self,
+        paths: Iterable[str],
+    ) -> Dict[str, str]:
+        """Hash each path's exact index entries, including an empty index state."""
+
+        normalized_paths = sorted(
+            {
+                str(path).strip().replace("\\", "/")
+                for path in paths
+                if str(path).strip()
+            }
+        )
+        if not normalized_paths:
+            return {}
+        process = subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "--stage",
+                "-z",
+                "--",
+                *(f":(top,literal){path}" for path in normalized_paths),
+            ],
+            cwd=str(self.project_root),
+            capture_output=True,
+        )
+        if process.returncode != 0:
+            raise RuntimeError(
+                process.stderr.decode("utf-8", errors="replace").strip()
+                or "git ls-files failed while capturing recovery handoff"
+            )
+        entries: Dict[str, bytearray] = {
+            path: bytearray() for path in normalized_paths
+        }
+        for raw_entry in process.stdout.split(b"\0"):
+            if not raw_entry:
+                continue
+            _metadata, separator, raw_path = raw_entry.partition(b"\t")
+            path = raw_path.decode("utf-8", errors="surrogateescape")
+            if separator and path in entries:
+                entries[path].extend(raw_entry)
+                entries[path].extend(b"\0")
+        return {
+            path: hashlib.sha256(bytes(entries[path])).hexdigest()
+            for path in normalized_paths
+        }
+
+    def _upgrade_execution_recovery_worktree_handoff(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        marker: Dict[str, object],
+        handoff: Dict[str, object],
+        paths: List[str],
+    ) -> None:
+        """Upgrade a legacy exact handoff before the recovery can mutate it."""
+
+        if str(handoff.get("version", "")).strip() == "2":
+            return
+        upgraded = {
+            **handoff,
+            "version": 2,
+            "borrowed_paths": paths,
+            "path_fingerprints": self._retained_worktree_path_fingerprints(
+                paths
+            ),
+            "index_fingerprints": self._worktree_index_fingerprints(paths),
+            "upgraded_at": utc_now_iso(),
+        }
+        marker["worktree_handoff"] = upgraded
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        self.logger.info(
+            "[execution-recovery] upgraded borrowed-worktree handoff task=%s "
+            "paths=%s",
+            task.task_id,
+            len(paths),
+        )
 
     def _migrate_execution_recovery_worktree_handoff(
         self,
@@ -11788,7 +11890,8 @@ class Orchestrator:
                 task,
                 marker,
             )
-        if str(handoff.get("version", "")).strip() != "1":
+        version = str(handoff.get("version", "")).strip()
+        if version not in {"1", "2"}:
             return False
 
         source_id = str(handoff.get("source_task_id", "")).strip()
@@ -11823,7 +11926,35 @@ class Orchestrator:
             and str(handoff.get("worktree_fingerprint", ""))
             == self._worktree_fingerprint_excluding_agent_instructions()
         )
+        if matches and version == "2":
+            raw_path_fingerprints = handoff.get("path_fingerprints", {})
+            raw_index_fingerprints = handoff.get("index_fingerprints", {})
+            matches = bool(
+                isinstance(raw_path_fingerprints, dict)
+                and isinstance(raw_index_fingerprints, dict)
+                and {
+                    str(path).strip().replace("\\", "/"): str(fingerprint)
+                    for path, fingerprint in raw_path_fingerprints.items()
+                    if str(path).strip() and str(fingerprint).strip()
+                }
+                == self._retained_worktree_path_fingerprints(expected_paths)
+                and {
+                    str(path).strip().replace("\\", "/"): str(fingerprint)
+                    for path, fingerprint in raw_index_fingerprints.items()
+                    if str(path).strip() and str(fingerprint).strip()
+                }
+                == self._worktree_index_fingerprints(expected_paths)
+            )
         if matches:
+            if version == "1":
+                self._upgrade_execution_recovery_worktree_handoff(
+                    state,
+                    tasks,
+                    task,
+                    marker,
+                    handoff,
+                    expected_paths,
+                )
             self.logger.info(
                 "[execution-recovery] carrying worktree handoff task=%s source=%s paths=%s",
                 task.task_id,
@@ -11831,6 +11962,583 @@ class Orchestrator:
                 len(current_paths),
             )
         return matches
+
+    def _execution_recovery_borrowed_paths(
+        self,
+        task: TaskSpec,
+    ) -> List[str]:
+        marker = self._execution_recovery_marker(task)
+        raw_handoff = marker.get("worktree_handoff", {})
+        handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+        raw_paths = handoff.get(
+            "borrowed_paths",
+            handoff.get("changed_paths", []),
+        )
+        if not isinstance(raw_paths, list):
+            return []
+        return sorted(
+            {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+            }
+        )
+
+    def _execution_recovery_borrowed_worktree_mismatch(
+        self,
+        task: TaskSpec,
+    ) -> Dict[str, object]:
+        """Describe any mutation of paths borrowed from the source task."""
+
+        marker = self._execution_recovery_marker(task)
+        raw_handoff = marker.get("worktree_handoff", {})
+        handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+        expected_paths = self._execution_recovery_borrowed_paths(task)
+        if not expected_paths:
+            return {}
+
+        current_paths = sorted(
+            set(self._changed_paths_excluding_agent_instructions())
+        )
+        raw_path_fingerprints = handoff.get("path_fingerprints", {})
+        raw_index_fingerprints = handoff.get("index_fingerprints", {})
+        expected_path_fingerprints = (
+            {
+                str(path).strip().replace("\\", "/"): str(fingerprint).strip()
+                for path, fingerprint in raw_path_fingerprints.items()
+                if str(path).strip() and str(fingerprint).strip()
+            }
+            if isinstance(raw_path_fingerprints, dict)
+            else {}
+        )
+        expected_index_fingerprints = (
+            {
+                str(path).strip().replace("\\", "/"): str(fingerprint).strip()
+                for path, fingerprint in raw_index_fingerprints.items()
+                if str(path).strip() and str(fingerprint).strip()
+            }
+            if isinstance(raw_index_fingerprints, dict)
+            else {}
+        )
+        actual_path_fingerprints = self._retained_worktree_path_fingerprints(
+            expected_paths
+        )
+        actual_index_fingerprints = self._worktree_index_fingerprints(
+            expected_paths
+        )
+        missing_paths = sorted(set(expected_paths) - set(current_paths))
+        altered_paths = sorted(
+            path
+            for path in expected_paths
+            if expected_path_fingerprints.get(path)
+            != actual_path_fingerprints.get(path)
+        )
+        changed_index_paths = sorted(
+            path
+            for path in expected_paths
+            if expected_index_fingerprints.get(path)
+            != actual_index_fingerprints.get(path)
+        )
+        expected_head = str(handoff.get("head_ref", "")).strip()
+        current_head = head_ref(self.project_root)
+        snapshot_incomplete = bool(
+            str(handoff.get("version", "")).strip() != "2"
+            or set(expected_path_fingerprints) != set(expected_paths)
+            or set(expected_index_fingerprints) != set(expected_paths)
+        )
+        if not (
+            snapshot_incomplete
+            or missing_paths
+            or altered_paths
+            or changed_index_paths
+            or expected_head != current_head
+        ):
+            return {}
+        return {
+            "source_task_id": str(handoff.get("source_task_id", "")).strip(),
+            "expected_paths": expected_paths,
+            "current_paths": current_paths,
+            "extra_paths": sorted(set(current_paths) - set(expected_paths)),
+            "missing_paths": missing_paths,
+            "altered_paths": altered_paths,
+            "changed_index_paths": changed_index_paths,
+            "expected_head": expected_head,
+            "current_head": current_head,
+            "snapshot_incomplete": snapshot_incomplete,
+        }
+
+    def _block_execution_recovery_borrowed_worktree_mutation(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        detail: Dict[str, object],
+    ) -> RunState:
+        reason = (
+            f"execution recovery {task.task_id} modified, removed, or restaged "
+            "paths borrowed from its source task. The recovery commit was not "
+            "created; restore the exact borrowed snapshot or reconcile ownership "
+            "explicitly before retrying."
+        )
+        task.status = "blocked"
+        task.review_summary = reason
+        marker = self._execution_recovery_marker(task)
+        marker["borrowed_worktree_validation"] = {
+            "status": "blocked",
+            **detail,
+            "updated_at": utc_now_iso(),
+        }
+        self._block_run(
+            state,
+            owner="auto_agents",
+            category="execution_recovery_borrowed_worktree_mutation",
+            reason=reason,
+        )
+        state.active_blocker["execution_recovery_borrowed_worktree"] = detail
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        self._emit_task_blocked(task, reason)
+        return state
+
+    def _advance_retained_owner_after_execution_recovery(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        *,
+        previous_head: str,
+    ) -> bool:
+        """Advance an exact retained owner across a recovery-only commit."""
+
+        marker = self._execution_recovery_marker(task)
+        raw_handoff = marker.get("worktree_handoff", {})
+        handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+        source_task_id = str(handoff.get("source_task_id", "")).strip()
+        borrowed_paths = set(self._execution_recovery_borrowed_paths(task))
+        records = self._retained_worktree_ownership_records(state)
+        record = records.get(source_task_id)
+        if not source_task_id or not borrowed_paths or not isinstance(record, dict):
+            return False
+        raw_paths = record.get("changed_paths", [])
+        owner_paths = {
+            str(path).strip().replace("\\", "/")
+            for path in raw_paths
+            if str(path).strip()
+        } if isinstance(raw_paths, list) else set()
+        if not (
+            owner_paths
+            and owner_paths.issubset(borrowed_paths)
+            and str(record.get("head_ref", "")).strip() == previous_head
+            and self._retained_worktree_record_has_exact_path_fingerprints(record)
+        ):
+            return False
+        current_head = head_ref(self.project_root)
+        if not current_head or current_head == previous_head:
+            return False
+        advanced = dict(record)
+        advanced["head_ref"] = current_head
+        advanced["worktree_fingerprint"] = (
+            self._worktree_fingerprint_excluding_agent_instructions()
+        )
+        advanced["path_fingerprints"] = (
+            self._retained_worktree_path_fingerprints(owner_paths)
+        )
+        advanced["execution_recovery_head_transition"] = {
+            "task_id": task.task_id,
+            "commit_sha": task.commit_sha,
+            "from": previous_head,
+            "to": current_head,
+            "updated_at": utc_now_iso(),
+        }
+        records[source_task_id] = advanced
+        state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+        self.logger.info(
+            "[execution-recovery] advanced retained owner task=%s recovery=%s "
+            "head=%s",
+            source_task_id,
+            task.task_id,
+            current_head[:12],
+        )
+        return True
+
+    def _git_ref_is_ancestor(self, source_ref: str, target_ref: str) -> bool:
+        source = str(source_ref).strip()
+        target = str(target_ref).strip()
+        if not source or not target:
+            return False
+        process = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", source, target],
+            cwd=str(self.project_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        return process.returncode == 0
+
+    def _git_commit_subjects_between(
+        self,
+        source_ref: str,
+        target_ref: str,
+    ) -> Dict[str, str]:
+        process = subprocess.run(
+            [
+                "git",
+                "log",
+                "--format=%H%x1f%s",
+                f"{source_ref}..{target_ref}",
+            ],
+            cwd=str(self.project_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if process.returncode != 0:
+            return {}
+        subjects: Dict[str, str] = {}
+        for line in process.stdout.splitlines():
+            commit_sha, separator, subject = line.partition("\x1f")
+            if separator and commit_sha.strip():
+                subjects[commit_sha.strip()] = subject
+        return subjects
+
+    def _git_commits_touching_paths(
+        self,
+        source_ref: str,
+        target_ref: str,
+        paths: Iterable[str],
+    ) -> Set[str]:
+        normalized_paths = sorted(
+            {
+                str(path).strip().replace("\\", "/")
+                for path in paths
+                if str(path).strip()
+            }
+        )
+        if not normalized_paths:
+            return set()
+        process = subprocess.run(
+            [
+                "git",
+                "log",
+                "--format=%H",
+                "--no-renames",
+                f"{source_ref}..{target_ref}",
+                "--",
+                *(f":(top,literal){path}" for path in normalized_paths),
+            ],
+            cwd=str(self.project_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if process.returncode != 0:
+            return set()
+        return {
+            line.strip()
+            for line in process.stdout.splitlines()
+            if line.strip()
+        }
+
+    @staticmethod
+    def _execution_recovery_source_descends_from_owner(
+        tasks_by_id: Mapping[str, TaskSpec],
+        source_task_id: str,
+        owner_task_id: str,
+    ) -> bool:
+        cursor = tasks_by_id.get(source_task_id)
+        seen: Set[str] = set()
+        while cursor is not None and cursor.task_id not in seen:
+            if cursor.task_id == owner_task_id:
+                return True
+            seen.add(cursor.task_id)
+            if cursor.task_origin != "evidence_repair" or not cursor.parent_task_id:
+                return False
+            cursor = tasks_by_id.get(cursor.parent_task_id)
+        return False
+
+    def _authorized_legacy_execution_recovery_commits(
+        self,
+        tasks: Iterable[TaskSpec],
+        *,
+        owner_task_id: str,
+        source_ref: str,
+        target_ref: str,
+        owner_paths: Set[str],
+    ) -> Dict[str, str]:
+        """Map proven legacy recovery commits to their recovery task ids."""
+
+        task_list = list(tasks)
+        tasks_by_id = {task.task_id: task for task in task_list}
+        if len(tasks_by_id) != len(task_list):
+            return {}
+        subjects = self._git_commit_subjects_between(source_ref, target_ref)
+        if not subjects:
+            return {}
+        authorized: Dict[str, str] = {}
+        for task in task_list:
+            if task.status != "done" or not is_execution_incident_recovery_task(task):
+                continue
+            marker = self._execution_recovery_marker(task)
+            raw_handoff = marker.get("worktree_handoff", {})
+            handoff = raw_handoff if isinstance(raw_handoff, dict) else {}
+            source_task_id = str(handoff.get("source_task_id", "")).strip()
+            raw_paths = handoff.get("changed_paths", [])
+            handoff_paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+            } if isinstance(raw_paths, list) else set()
+            handoff_head = str(handoff.get("head_ref", "")).strip()
+            if not (
+                source_task_id
+                and handoff_paths
+                and handoff_head
+                and self._execution_recovery_source_descends_from_owner(
+                    tasks_by_id,
+                    source_task_id,
+                    owner_task_id,
+                )
+            ):
+                continue
+            expected_subject = (
+                task.commit_message
+                or self.config.git.commit_message_template.format(
+                    task_id=task.task_id,
+                    title=task.title,
+                )
+            ).splitlines()[0]
+            matching_commits = [
+                commit_sha
+                for commit_sha, subject in subjects.items()
+                if subject == expected_subject
+                and (not task.commit_sha or task.commit_sha == commit_sha)
+            ]
+            if len(matching_commits) != 1:
+                continue
+            for commit_sha in matching_commits:
+                if not self._git_ref_is_ancestor(handoff_head, commit_sha):
+                    continue
+                try:
+                    committed_owner_paths = (
+                        set(commit_changed_paths(self.project_root, commit_sha))
+                        & owner_paths
+                    )
+                except RuntimeError:
+                    continue
+                if (
+                    committed_owner_paths
+                    and committed_owner_paths.issubset(handoff_paths)
+                ):
+                    authorized[commit_sha] = task.task_id
+        return authorized
+
+    def _reconcile_retained_worktree_absorbed_by_execution_recovery(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> List[str]:
+        """Migrate owner records consumed by old recovery-wide commits.
+
+        This is intentionally strict: every commit that touched an expected
+        owner path must map to a completed execution-recovery task whose exact
+        handoff names that owner lineage, and the committed bytes must still
+        equal the retained checkpoint.
+        """
+
+        records = self._retained_worktree_ownership_records(state)
+        if not records:
+            return []
+        tasks_by_id = {task.task_id: task for task in tasks}
+        if len(tasks_by_id) != len(tasks):
+            return []
+        current_head = head_ref(self.project_root)
+        current_paths = set(self._changed_paths_excluding_agent_instructions())
+        reconciled: List[str] = []
+        migrations = state.resume_context.get(
+            _RETAINED_WORKTREE_EXECUTION_RECOVERY_MIGRATIONS_CONTEXT,
+            [],
+        )
+        migration_history = list(migrations) if isinstance(migrations, list) else []
+        direct_migrations: Dict[str, Dict[str, object]] = {}
+        for owner_task_id, record in list(records.items()):
+            owner = tasks_by_id.get(owner_task_id)
+            try:
+                record_version = int(record.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            raw_paths = record.get("changed_paths", [])
+            raw_fingerprints = record.get("path_fingerprints", {})
+            owner_paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+            } if isinstance(raw_paths, list) else set()
+            expected_fingerprints = (
+                {
+                    str(path).strip().replace("\\", "/"): str(fingerprint).strip()
+                    for path, fingerprint in raw_fingerprints.items()
+                    if str(path).strip() and str(fingerprint).strip()
+                }
+                if isinstance(raw_fingerprints, dict)
+                else {}
+            )
+            source_head = str(record.get("head_ref", "")).strip()
+            if not (
+                owner is not None
+                and owner.status not in {"done", "waiting_user"}
+                and record_version == 1
+                and str(record.get("owner_task_id", "")).strip()
+                == owner_task_id
+                and owner_paths
+                and set(expected_fingerprints) == owner_paths
+                and owner_paths.isdisjoint(current_paths)
+                and source_head
+                and current_head
+                and str(record.get("worktree_fingerprint", "")).strip()
+                and source_head != current_head
+                and self._git_ref_is_ancestor(source_head, current_head)
+                and expected_fingerprints
+                == self._retained_worktree_path_fingerprints(owner_paths)
+            ):
+                continue
+            touching_commits = self._git_commits_touching_paths(
+                source_head,
+                current_head,
+                owner_paths,
+            )
+            if not touching_commits:
+                continue
+            authorized = self._authorized_legacy_execution_recovery_commits(
+                tasks,
+                owner_task_id=owner_task_id,
+                source_ref=source_head,
+                target_ref=current_head,
+                owner_paths=owner_paths,
+            )
+            if not touching_commits.issubset(set(authorized)):
+                continue
+            records.pop(owner_task_id, None)
+            reconciled.append(owner_task_id)
+            migration = {
+                "version": 1,
+                "migration_kind": "direct_recovery_commit",
+                "owner_task_id": owner_task_id,
+                "source_head_ref": source_head,
+                "current_head_ref": current_head,
+                "changed_paths": sorted(owner_paths),
+                "recovery_task_ids": sorted(
+                    {authorized[commit_sha] for commit_sha in touching_commits}
+                ),
+                "recovery_commit_shas": sorted(touching_commits),
+                "reconciled_at": utc_now_iso(),
+            }
+            migration_history.append(migration)
+            direct_migrations[owner_task_id] = migration
+            self.logger.warning(
+                "[execution-recovery] reconciled legacy consumed owner task=%s "
+                "paths=%s commits=%s",
+                owner_task_id,
+                len(owner_paths),
+                len(touching_commits),
+            )
+
+        for owner_task_id, record in list(records.items()):
+            owner = tasks_by_id.get(owner_task_id)
+            try:
+                record_version = int(record.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            raw_paths = record.get("changed_paths", [])
+            raw_fingerprints = record.get("path_fingerprints", {})
+            owner_paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+            } if isinstance(raw_paths, list) else set()
+            fingerprint_paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_fingerprints
+                if str(path).strip()
+            } if isinstance(raw_fingerprints, dict) else set()
+            source_head = str(record.get("head_ref", "")).strip()
+            if not (
+                owner is not None
+                and owner.status not in {"done", "waiting_user"}
+                and record_version == 1
+                and str(record.get("owner_task_id", "")).strip()
+                == owner_task_id
+                and owner_paths
+                and fingerprint_paths == owner_paths
+                and owner_paths.isdisjoint(current_paths)
+                and source_head
+                and str(record.get("worktree_fingerprint", "")).strip()
+            ):
+                continue
+            descendants = [
+                (descendant_task_id, migration)
+                for descendant_task_id, migration in direct_migrations.items()
+                if descendant_task_id != owner_task_id
+                and self._execution_recovery_source_descends_from_owner(
+                    tasks_by_id,
+                    descendant_task_id,
+                    owner_task_id,
+                )
+                and owner_paths.issubset(
+                    {
+                        str(path).strip().replace("\\", "/")
+                        for path in migration.get("changed_paths", [])
+                        if str(path).strip()
+                    }
+                )
+                and (
+                    source_head
+                    == str(migration.get("source_head_ref", "")).strip()
+                    or self._git_ref_is_ancestor(
+                        source_head,
+                        str(migration.get("source_head_ref", "")).strip(),
+                    )
+                )
+            ]
+            if len(descendants) != 1:
+                continue
+            descendant_task_id, descendant_migration = descendants[0]
+            records.pop(owner_task_id, None)
+            reconciled.append(owner_task_id)
+            migration_history.append(
+                {
+                    "version": 1,
+                    "migration_kind": "superseded_owner_lineage",
+                    "owner_task_id": owner_task_id,
+                    "superseded_by_owner_task_id": descendant_task_id,
+                    "source_head_ref": source_head,
+                    "current_head_ref": current_head,
+                    "changed_paths": sorted(owner_paths),
+                    "recovery_task_ids": list(
+                        descendant_migration.get("recovery_task_ids", [])
+                    ),
+                    "recovery_commit_shas": list(
+                        descendant_migration.get("recovery_commit_shas", [])
+                    ),
+                    "reconciled_at": utc_now_iso(),
+                }
+            )
+            self.logger.warning(
+                "[execution-recovery] reconciled superseded retained owner "
+                "task=%s descendant=%s paths=%s",
+                owner_task_id,
+                descendant_task_id,
+                len(owner_paths),
+            )
+        if not reconciled:
+            return []
+        if records:
+            state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+        else:
+            state.resume_context.pop(_RETAINED_WORKTREE_OWNERSHIP_CONTEXT, None)
+        state.resume_context[
+            _RETAINED_WORKTREE_EXECUTION_RECOVERY_MIGRATIONS_CONTEXT
+        ] = migration_history
+        return reconciled
 
     def _retained_worktree_reconciliation_handoff_matches(
         self,
@@ -13040,6 +13748,44 @@ class Orchestrator:
                 ",".join(restored_persisted_owner_ids),
             )
 
+        self._normalize_legacy_execution_recovery_tasks(state, tasks)
+        prebaseline_recovery: Optional[TaskSpec] = None
+        recovery_pending = False
+        if state.status not in {"paused", "blocked"}:
+            prebaseline_recovery, recovery_pending = (
+                self._ready_prebaseline_recovery_task(state, tasks)
+            )
+        if recovery_pending and prebaseline_recovery is not None:
+            if not self._has_task_budget(max_tasks, 0):
+                self._task_budget_exhausted = True
+                return state
+            self.logger.info(
+                "[execution-recovery] pre-baseline lane task=%s",
+                prebaseline_recovery.task_id,
+            )
+            rewind_state = self._execute_task_in_main_worktree(
+                state,
+                tasks,
+                prebaseline_recovery,
+            )
+            state.tasks = tasks
+            self._consume_task_budget()
+            # End this implementation pass. The next pass must establish a fresh
+            # clean-head baseline before ordinary tasks may resume.
+            state.stage_summaries.pop("implement", None)
+            return rewind_state or state
+
+        migrated_owner_ids: List[str] = []
+        if state.status not in {"paused", "blocked"}:
+            migrated_owner_ids = (
+                self._reconcile_retained_worktree_absorbed_by_execution_recovery(
+                    state,
+                    tasks,
+                )
+            )
+        if migrated_owner_ids:
+            save_run_state(self.project_root, state)
+
         tasks_by_id = {task.task_id: task for task in tasks}
         repair_route_ids = self._retained_evidence_repair_priority_ids(
             state,
@@ -13186,29 +13932,8 @@ class Orchestrator:
                 state,
                 tasks,
             )
-        self._normalize_legacy_execution_recovery_tasks(state, tasks)
         if state.status in {"paused", "blocked"}:
             return state
-        prebaseline_recovery, recovery_pending = self._ready_prebaseline_recovery_task(
-            state, tasks
-        )
-        if recovery_pending and prebaseline_recovery is not None:
-            if not self._has_task_budget(max_tasks, 0):
-                self._task_budget_exhausted = True
-                return state
-            self.logger.info(
-                "[execution-recovery] pre-baseline lane task=%s",
-                prebaseline_recovery.task_id,
-            )
-            rewind_state = self._execute_task_in_main_worktree(
-                state, tasks, prebaseline_recovery
-            )
-            state.tasks = tasks
-            self._consume_task_budget()
-            # End this implementation pass. The next pass must establish a fresh
-            # clean-head baseline before ordinary tasks may resume.
-            state.stage_summaries.pop("implement", None)
-            return rewind_state or state
         self._ensure_implement_verify_baseline(state, tasks)
         if self.config.execution.parallel_tasks.enabled:
             return self._run_parallel_implementation_loop(state, tasks, max_tasks)
@@ -14025,6 +14750,20 @@ class Orchestrator:
                 )
             ) from error
 
+        borrowed_recovery_paths = self._execution_recovery_borrowed_paths(task)
+        borrowed_worktree_mismatch = (
+            self._execution_recovery_borrowed_worktree_mismatch(task)
+            if borrowed_recovery_paths
+            else {}
+        )
+        if borrowed_worktree_mismatch:
+            return self._block_execution_recovery_borrowed_worktree_mutation(
+                state,
+                tasks,
+                task,
+                borrowed_worktree_mismatch,
+            )
+
         preserved_repair_paths = self._retained_repair_preserved_paths(
             state,
             task.task_id,
@@ -14054,6 +14793,14 @@ class Orchestrator:
             self._emit_task_blocked(task, reason)
             return state
 
+        if borrowed_recovery_paths:
+            marker = self._execution_recovery_marker(task)
+            marker["borrowed_worktree_validation"] = {
+                "status": "preserved",
+                "paths": borrowed_recovery_paths,
+                "validated_at": utc_now_iso(),
+            }
+
         task.status = "done"
         self._reconcile_completed_lineage_terminal_recovery(
             state,
@@ -14073,18 +14820,38 @@ class Orchestrator:
         )
         self._persist_tasks(tasks)
         save_run_state(self.project_root, state)
-        if preserved_repair_paths:
-            repair_commit_paths = sorted(
+        previous_head = head_ref(self.project_root)
+        excluded_commit_paths = set(preserved_repair_paths) | set(
+            borrowed_recovery_paths
+        )
+        if excluded_commit_paths:
+            selected_commit_paths = sorted(
                 set(changed_paths(self.project_root, ignored_prefixes=()))
-                - set(preserved_repair_paths)
+                - excluded_commit_paths
             )
             task.commit_sha = commit_only_paths(
                 self.project_root,
                 commit_message,
-                repair_commit_paths,
+                selected_commit_paths,
             )
         else:
             task.commit_sha = commit_all(self.project_root, commit_message)
+        if borrowed_recovery_paths:
+            marker = self._execution_recovery_marker(task)
+            marker["borrowed_worktree_validation"] = {
+                "status": "committed_recovery_delta",
+                "paths": borrowed_recovery_paths,
+                "recovery_delta_paths": selected_commit_paths,
+                "commit_sha": task.commit_sha,
+                "validated_at": utc_now_iso(),
+            }
+            self._advance_retained_owner_after_execution_recovery(
+                state,
+                task,
+                previous_head=previous_head,
+            )
+            self._persist_tasks(tasks)
+            save_run_state(self.project_root, state)
         self._warm_clean_head_verify_baseline(
             state,
             failure_ids=gate_result.get("verify_current_failure_ids", []),
