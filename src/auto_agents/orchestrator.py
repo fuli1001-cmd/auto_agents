@@ -8342,6 +8342,33 @@ class Orchestrator:
             == self._retained_worktree_path_fingerprints(paths)
         )
 
+    def _retained_worktree_record_matches_exact_handoff(
+        self,
+        record: Mapping[str, object],
+    ) -> bool:
+        """Match the full dirty set while allowing planning-only HEAD changes."""
+
+        raw_paths = record.get("changed_paths", [])
+        if not isinstance(raw_paths, list):
+            return False
+        expected_paths = {
+            str(path).strip().replace("\\", "/")
+            for path in raw_paths
+            if str(path).strip()
+        }
+        current_paths = set(self._changed_paths_excluding_agent_instructions())
+        return bool(
+            expected_paths
+            and current_paths == expected_paths
+            and self._retained_worktree_snapshot_matches(
+                record,
+                allow_pending_planning_changes=True,
+            )
+            and self._retained_worktree_record_has_exact_path_fingerprints(
+                record
+            )
+        )
+
     def _active_retained_worktree_ownership_matches(
         self,
         state: RunState,
@@ -8408,6 +8435,416 @@ class Orchestrator:
             len(expected_paths),
         )
         return True
+
+    def _evidence_repair_retained_owner_records(
+        self,
+        state: RunState,
+        tasks: Iterable[TaskSpec],
+        task: TaskSpec,
+    ) -> List[Tuple[TaskSpec, Dict[str, object]]]:
+        """Return structurally valid retained owners in a repair's lineage."""
+
+        if not self._is_repair_task(task) or not task.parent_task_id:
+            return []
+        task_list = list(tasks)
+        tasks_by_id = {candidate.task_id: candidate for candidate in task_list}
+        if len(tasks_by_id) != len(task_list):
+            return []
+        parent = tasks_by_id.get(task.parent_task_id)
+        if (
+            parent is None
+            or parent.status in {"done", "waiting_user"}
+            or task.task_id not in parent.depends_on
+        ):
+            return []
+
+        lineage_ids: List[str] = [task.task_id]
+        cursor = parent
+        seen = {task.task_id}
+        while cursor.task_id not in seen:
+            seen.add(cursor.task_id)
+            lineage_ids.append(cursor.task_id)
+            if cursor.task_origin != "evidence_repair" or not cursor.parent_task_id:
+                break
+            next_cursor = tasks_by_id.get(cursor.parent_task_id)
+            if next_cursor is None:
+                return []
+            cursor = next_cursor
+
+        reachable_ids = self._execution_reachable_task_ids(task_list)
+        records = self._retained_worktree_ownership_records(state)
+        matched: List[Tuple[TaskSpec, Dict[str, object]]] = []
+        for owner_id in lineage_ids:
+            owner = tasks_by_id.get(owner_id)
+            record = records.get(owner_id)
+            if (
+                owner is None
+                or owner_id not in reachable_ids
+                or not isinstance(record, dict)
+                or str(record.get("owner_task_id", "")).strip() != owner_id
+            ):
+                continue
+            try:
+                version = int(record.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            raw_paths = record.get("changed_paths", [])
+            raw_fingerprints = record.get("path_fingerprints", {})
+            if (
+                version != 1
+                or not isinstance(raw_paths, list)
+                or not isinstance(raw_fingerprints, dict)
+            ):
+                continue
+            paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+            }
+            fingerprint_paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_fingerprints
+                if str(path).strip()
+            }
+            if not paths or fingerprint_paths != paths:
+                continue
+            matched.append((owner, record))
+        return matched
+
+    def _retained_evidence_repair_priority_ids(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        *,
+        require_exact_handoff: bool = True,
+    ) -> List[str]:
+        """Validate a durable repair route and return its runnable repairs."""
+
+        if state.current_stage != "implement":
+            return []
+        completed = {task.task_id for task in tasks if task.status == "done"}
+        by_lineage: Dict[str, List[TaskSpec]] = {}
+        records_by_lineage: Dict[
+            str,
+            List[Tuple[TaskSpec, Dict[str, object]]],
+        ] = {}
+        for repair in tasks:
+            if (
+                repair.status not in {"pending", "in_progress"}
+                or not self._is_repair_task(repair)
+                or not all(dependency in completed for dependency in repair.depends_on)
+            ):
+                continue
+            records = [
+                item
+                for item in self._evidence_repair_retained_owner_records(
+                    state,
+                    tasks,
+                    repair,
+                )
+                if item[0].task_id != repair.task_id
+            ]
+            if not records:
+                continue
+            lineage_id = self._recovery_lineage_owner(tasks, repair).task_id
+            by_lineage.setdefault(lineage_id, []).append(repair)
+            records_by_lineage.setdefault(lineage_id, []).extend(records)
+        if not by_lineage:
+            return []
+
+        route = (
+            dict(state.last_recovery_route)
+            if isinstance(state.last_recovery_route, dict)
+            else {}
+        )
+        if str(route.get("outcome", "")).strip() not in {
+            "repair_tasks_scheduled",
+            "waiting_for_repairs",
+        }:
+            return []
+        route_owner_ids = {
+            str(route.get(key, "")).strip()
+            for key in ("task_id", "lineage_id")
+            if str(route.get(key, "")).strip()
+        }
+        if len(route_owner_ids) != 1:
+            return []
+        route_owner_id = next(iter(route_owner_ids))
+        owner = next(
+            (task for task in tasks if task.task_id == route_owner_id),
+            None,
+        )
+        if owner is None or owner.status not in {"pending", "in_progress"}:
+            return []
+
+        raw_route_repair_ids = route.get("repair_task_ids", [])
+        route_repair_ids = (
+            [
+                str(task_id).strip()
+                for task_id in raw_route_repair_ids
+                if str(task_id).strip()
+            ]
+            if isinstance(raw_route_repair_ids, list)
+            else []
+        )
+        if (
+            not route_repair_ids
+            or len(route_repair_ids) != len(set(route_repair_ids))
+        ):
+            return []
+
+        tasks_by_id = {task.task_id: task for task in tasks}
+        if len(tasks_by_id) != len(tasks):
+            return []
+        route_repairs: List[TaskSpec] = []
+        for repair_id in route_repair_ids:
+            repair = tasks_by_id.get(repair_id)
+            if (
+                repair is None
+                or not self._is_repair_task(repair)
+                or repair.parent_task_id != owner.task_id
+                or repair.task_id not in owner.depends_on
+                or self._recovery_lineage_owner(tasks, repair).task_id
+                != owner.task_id
+            ):
+                return []
+            route_repairs.append(repair)
+
+        open_route_ids = {
+            repair.task_id
+            for repair in route_repairs
+            if repair.status != "done"
+        }
+        open_parent_repair_ids = {
+            repair.task_id
+            for repair in tasks
+            if self._is_repair_task(repair)
+            and repair.parent_task_id == owner.task_id
+            and repair.task_id in owner.depends_on
+            and repair.status != "done"
+        }
+        if not open_route_ids or open_route_ids != open_parent_repair_ids:
+            return []
+
+        try:
+            route_epoch = int(route.get("epoch", 0) or 0)
+            route_round = int(route.get("round", 0) or 0)
+        except (TypeError, ValueError):
+            return []
+        if (
+            route_epoch != int(owner.recovery_epoch)
+            or route_round != int(owner.recovery_round)
+            or any(
+                int(repair.recovery_epoch) != route_epoch
+                or int(repair.recovery_round) != route_round
+                for repair in route_repairs
+            )
+        ):
+            return []
+
+        scheduled_route_ids = set(route_repair_ids)
+        if not any(
+            isinstance(entry, dict)
+            and str(entry.get("result", "")).strip() == "scheduled"
+            and int(entry.get("epoch", 0) or 0) == route_epoch
+            and int(entry.get("round", 0) or 0) == route_round
+            and {
+                str(task_id).strip()
+                for task_id in entry.get("repair_task_ids", []) or []
+                if str(task_id).strip()
+            }
+            == scheduled_route_ids
+            for entry in owner.recovery_history
+        ):
+            return []
+
+        repairs = by_lineage.get(route_owner_id, [])
+        runnable_ids = {repair.task_id for repair in repairs}
+        if not runnable_ids or not runnable_ids.issubset(scheduled_route_ids):
+            return []
+        owner_records = [
+            record
+            for record_owner, record in records_by_lineage.get(
+                route_owner_id,
+                [],
+            )
+            if record_owner.task_id == owner.task_id
+        ]
+        if not owner_records:
+            return []
+        if require_exact_handoff and not any(
+            self._retained_worktree_record_matches_exact_handoff(record)
+            for record in owner_records
+        ):
+            return []
+        return [
+            repair_id
+            for repair_id in route_repair_ids
+            if repair_id in runnable_ids
+        ]
+
+    def _prepend_evidence_repair_priority_ids(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        repair_task_ids: Iterable[str],
+    ) -> bool:
+        """Persist dependency-ready evidence repairs ahead of ordinary work."""
+
+        tasks_by_id = {task.task_id: task for task in tasks}
+        completed = {task.task_id for task in tasks if task.status == "done"}
+        prioritized = [
+            task_id
+            for task_id in dict.fromkeys(
+                str(task_id).strip()
+                for task_id in repair_task_ids
+                if str(task_id).strip()
+            )
+            if task_id in tasks_by_id
+            and tasks_by_id[task_id].status in {"pending", "in_progress"}
+            and self._is_repair_task(tasks_by_id[task_id])
+            and all(
+                dependency in completed
+                for dependency in tasks_by_id[task_id].depends_on
+            )
+        ]
+        if not prioritized:
+            return False
+        current = self._parallel_sequential_retry_ids(state)
+        reordered = list(dict.fromkeys([*prioritized, *current]))
+        if reordered == current:
+            return False
+        self._set_parallel_sequential_retry_ids(
+            state,
+            reordered,
+            capture_retained_ownership=False,
+        )
+        return True
+
+    def _evidence_repair_worktree_handoff_matches(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+    ) -> bool:
+        records = self._evidence_repair_retained_owner_records(
+            state,
+            tasks,
+            task,
+        )
+        matching = [
+            (owner, record)
+            for owner, record in records
+            if self._retained_worktree_record_matches_exact_handoff(record)
+        ]
+        if not matching:
+            return False
+        self.logger.info(
+            "[recovery] evidence repair carries exact retained worktree "
+            "task=%s owners=%s paths=%s",
+            task.task_id,
+            ",".join(owner.task_id for owner, _record in matching),
+            len(self._changed_paths_excluding_agent_instructions()),
+        )
+        return True
+
+    def _block_evidence_repair_worktree_ownership_mismatch(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+    ) -> RunState:
+        records = self._evidence_repair_retained_owner_records(
+            state,
+            tasks,
+            task,
+        )
+        owner: Optional[TaskSpec] = None
+        record: Dict[str, object] = {}
+        if records:
+            owner, record = next(
+                (
+                    item
+                    for item in records
+                    if item[0].task_id != task.task_id
+                ),
+                records[0],
+            )
+        raw_expected_paths = record.get("changed_paths", [])
+        expected_paths = sorted(
+            {
+                str(path).strip().replace("\\", "/")
+                for path in raw_expected_paths
+                if str(path).strip()
+            }
+            if isinstance(raw_expected_paths, list)
+            else set()
+        )
+        current_paths = sorted(
+            set(self._changed_paths_excluding_agent_instructions())
+        )
+        expected_fingerprints = record.get("path_fingerprints", {})
+        expected_fingerprints = (
+            {
+                str(path).strip().replace("\\", "/"): str(fingerprint).strip()
+                for path, fingerprint in expected_fingerprints.items()
+                if str(path).strip() and str(fingerprint).strip()
+            }
+            if isinstance(expected_fingerprints, dict)
+            else {}
+        )
+        actual_fingerprints = self._retained_worktree_path_fingerprints(
+            expected_paths
+        )
+        altered_paths = sorted(
+            path
+            for path in expected_paths
+            if expected_fingerprints.get(path) != actual_fingerprints.get(path)
+        )
+        extra_paths = sorted(set(current_paths) - set(expected_paths))
+        missing_paths = sorted(set(expected_paths) - set(current_paths))
+        owner_id = owner.task_id if owner is not None else task.parent_task_id
+        reason = (
+            f"evidence repair {task.task_id} cannot consume the dirty worktree: "
+            f"the current changes do not exactly match retained owner {owner_id or '(missing)'}. "
+            "Reconcile the extra, missing, or altered target paths before resuming; "
+            "auto_agents will not include unowned changes in the repair commit."
+        )
+        detail: Dict[str, object] = {
+            "repair_task_id": task.task_id,
+            "owner_task_id": owner_id,
+            "expected_paths": expected_paths,
+            "current_paths": current_paths,
+            "extra_paths": extra_paths,
+            "missing_paths": missing_paths,
+            "altered_paths": altered_paths,
+            "expected_head": str(record.get("head_ref", "")).strip(),
+            "current_head": head_ref(self.project_root),
+        }
+        fingerprint = "sha256:" + hashlib.sha256(
+            json.dumps(detail, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        self._block_run(
+            state,
+            owner="target_project",
+            category="retained_worktree_repair_ownership_mismatch",
+            reason=reason,
+            fingerprint=fingerprint,
+        )
+        state.active_blocker["retained_worktree_repair_ownership"] = detail
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
+        self.logger.error(
+            "[recovery] blocked evidence repair without exact retained "
+            "ownership task=%s owner=%s extra=%s missing=%s altered=%s",
+            task.task_id,
+            owner_id or "missing",
+            len(extra_paths),
+            len(missing_paths),
+            len(altered_paths),
+        )
+        return state
 
     def _self_repair_retained_worktree_lifecycle_unresolved(
         self,
@@ -11898,7 +12335,40 @@ class Orchestrator:
                 "[recovery] restored retained worktree ownership task=%s",
                 self._requeued_task_id(state),
             )
-        if retry_state_changed or restored_requeue:
+        repair_route_ids = self._retained_evidence_repair_priority_ids(
+            state,
+            tasks,
+            require_exact_handoff=False,
+        )
+        safe_repair_route_ids = self._retained_evidence_repair_priority_ids(
+            state,
+            tasks,
+        )
+        if (
+            repair_route_ids
+            and not safe_repair_route_ids
+            and self._changed_paths_excluding_agent_instructions()
+        ):
+            return self._block_evidence_repair_worktree_ownership_mismatch(
+                state,
+                tasks,
+                tasks_by_id[repair_route_ids[0]],
+            )
+        restored_repair_ids = (
+            safe_repair_route_ids
+            if self._prepend_evidence_repair_priority_ids(
+                state,
+                tasks,
+                safe_repair_route_ids,
+            )
+            else []
+        )
+        if restored_repair_ids:
+            self.logger.info(
+                "[recovery] restored evidence-repair priority tasks=%s",
+                ",".join(restored_repair_ids),
+            )
+        if retry_state_changed or restored_requeue or restored_repair_ids:
             save_run_state(self.project_root, state)
         if not self._parallel_sequential_retry_ids(state):
             self._commit_planning_baseline_if_needed(tasks, state=state)
@@ -12601,7 +13071,22 @@ class Orchestrator:
             or task.task_id in sequential_retry_ids
             or route_retry
         )
-        allow_dirty_repair = self._is_repair_task(task)
+        allow_dirty_repair = False
+        if (
+            self._is_repair_task(task)
+            and self._changed_paths_excluding_agent_instructions()
+        ):
+            allow_dirty_repair = self._evidence_repair_worktree_handoff_matches(
+                state,
+                tasks,
+                task,
+            )
+            if not allow_dirty_repair:
+                return self._block_evidence_repair_worktree_ownership_mismatch(
+                    state,
+                    tasks,
+                    task,
+                )
         if (resume_existing or allow_dirty_retry) and task.status != "in_progress":
             task.status = "in_progress"
             self._persist_tasks(tasks)
@@ -13120,6 +13605,8 @@ class Orchestrator:
         self,
         state: RunState,
         task_ids: Iterable[str],
+        *,
+        capture_retained_ownership: bool = True,
     ) -> None:
         previous = set(self._parallel_sequential_retry_ids(state))
         normalized = list(dict.fromkeys(str(item).strip() for item in task_ids if str(item).strip()))
@@ -13128,7 +13615,7 @@ class Orchestrator:
         else:
             state.resume_context.pop("parallel_sequential_retry_tasks", None)
         added = [task_id for task_id in normalized if task_id not in previous]
-        if added:
+        if added and capture_retained_ownership:
             self._capture_retained_worktree_ownership(
                 state,
                 added,
@@ -15026,6 +15513,11 @@ class Orchestrator:
                 state,
                 task,
             )
+            self._prepend_evidence_repair_priority_ids(
+                state,
+                tasks,
+                [item.task_id for item in existing_open_repairs],
+            )
             self._persist_tasks(tasks)
             self._record_recovery_route(
                 state,
@@ -15157,6 +15649,11 @@ class Orchestrator:
         self._restore_missing_ready_owner_before_evidence_repair(
             state,
             task,
+        )
+        self._prepend_evidence_repair_priority_ids(
+            state,
+            tasks,
+            [repair.task_id for repair in repair_tasks],
         )
         self._persist_tasks(tasks)
         state.current_stage = "implement"
