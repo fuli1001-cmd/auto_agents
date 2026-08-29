@@ -353,6 +353,9 @@ _RETAINED_REPAIR_PRESERVED_PATHS_CONTEXT = "retained_repair_preserved_paths"
 _RETAINED_WORKTREE_EXECUTION_RECOVERY_MIGRATIONS_CONTEXT = (
     "retained_worktree_execution_recovery_migrations"
 )
+_EXECUTION_RECOVERY_IDENTITY_MIGRATIONS_CONTEXT = (
+    "execution_recovery_identity_migrations"
+)
 _RETAINED_WORKTREE_RECONCILIATION_KIND = (
     "retained_worktree_reconciliation"
 )
@@ -2624,6 +2627,8 @@ class Orchestrator:
             self._max_tasks_remaining = max_tasks
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
+            if self._normalize_legacy_execution_recovery_task_id_collisions(state):
+                save_run_state(self.project_root, state)
             runtime_identity = self._auto_agents_runtime_identity()
             if state.resume_context.get("auto_agents_runtime") != runtime_identity:
                 state.resume_context["auto_agents_runtime"] = runtime_identity
@@ -11777,15 +11782,16 @@ class Orchestrator:
         incident: ExecutionIncident,
     ) -> None:
         tasks = self._load_tasks_from_plan()
+        incident_tasks = [
+            task
+            for task in tasks
+            if self._execution_recovery_incident_id(task) == incident.incident_id
+        ]
         existing_task = next(
             (
                 task
-                for task in tasks
-                if any(
-                str(item.get("execution_incident_id", "")) == incident.incident_id
-                for item in task.recovery_history
-                )
-                and task.status != "done"
+                for task in incident_tasks
+                if task.status != "done"
             ),
             None,
         )
@@ -11812,6 +11818,17 @@ class Orchestrator:
             task_marker["implementation_required_round"] = incident.recovery_round
             task_marker["implementation_completed_round"] = 0
             task_marker["evidence_fingerprint"] = incident.evidence_fingerprint
+            route_generation = max(
+                len(incident_tasks),
+                max(
+                    (
+                        self._execution_recovery_route_generation(task)
+                        for task in incident_tasks
+                    ),
+                    default=0,
+                ),
+            ) + 1
+            task_marker["route_generation"] = route_generation
             worktree_handoff = self._capture_execution_recovery_worktree_handoff(
                 state,
                 tasks,
@@ -11819,8 +11836,20 @@ class Orchestrator:
             )
             if worktree_handoff:
                 task_marker["worktree_handoff"] = worktree_handoff
+            base_task_id = (
+                f"recover-execution-{incident.incident_id}"
+                f"-r{incident.recovery_round}"
+            )
+            used_task_ids = {task.task_id for task in tasks}
+            task_id = base_task_id
+            if task_id in used_task_ids:
+                task_id = f"{base_task_id}-g{route_generation}"
+                while task_id in used_task_ids:
+                    route_generation += 1
+                    task_marker["route_generation"] = route_generation
+                    task_id = f"{base_task_id}-g{route_generation}"
             task = TaskSpec(
-                task_id=f"recover-execution-{incident.incident_id}-r{incident.recovery_round}",
+                task_id=task_id,
                 title=(
                     "Repair verification infrastructure"
                     if reported_infrastructure
@@ -11870,8 +11899,26 @@ class Orchestrator:
             )
             tasks.insert(0, task)
             self._persist_tasks(tasks)
+            scheduled_task = task
         else:
             marker = self._execution_recovery_marker(existing_task)
+            route_generation = self._execution_recovery_route_generation(
+                existing_task
+            )
+            if route_generation <= 0:
+                used_generations = {
+                    self._execution_recovery_route_generation(task)
+                    for task in incident_tasks
+                    if task is not existing_task
+                    and self._execution_recovery_route_generation(task) > 0
+                }
+                route_generation = max(
+                    len(incident_tasks),
+                    max(used_generations, default=0),
+                )
+                while route_generation in used_generations:
+                    route_generation += 1
+                marker["route_generation"] = max(1, route_generation)
             marker["implementation_required_round"] = incident.recovery_round
             marker["evidence_fingerprint"] = incident.evidence_fingerprint
             marker["result"] = "rescheduled"
@@ -11906,6 +11953,24 @@ class Orchestrator:
                 }
             )
             self._persist_tasks(tasks)
+            scheduled_task = existing_task
+        route_entry: Optional[Dict[str, object]] = None
+        for entry in reversed(incident.history):
+            if (
+                not isinstance(entry, dict)
+                or str(entry.get("event", "")) != "route"
+            ):
+                continue
+            try:
+                entry_round = int(entry.get("round", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if entry_round == incident.recovery_round:
+                route_entry = entry
+                break
+        if route_entry is not None:
+            route_entry["route_generation"] = route_generation
+            route_entry["task_id"] = scheduled_task.task_id
         self._rewind_state_from_stage(state, "implement")
         state.tasks = tasks
         state.status = "pending"
@@ -13086,6 +13151,225 @@ class Orchestrator:
         self.logger.info(
             "[stage-recovery] restored verification refs tasks=%s",
             ",".join(repaired_ids),
+        )
+        return True
+
+    @staticmethod
+    def _duplicate_task_ids(tasks: Iterable[TaskSpec]) -> List[str]:
+        seen: Set[str] = set()
+        duplicates: Set[str] = set()
+        for task in tasks:
+            task_id = str(task.task_id).strip()
+            if not task_id:
+                continue
+            if task_id in seen:
+                duplicates.add(task_id)
+            seen.add(task_id)
+        return sorted(duplicates)
+
+    @staticmethod
+    def _execution_recovery_route_generation(task: TaskSpec) -> int:
+        marker = Orchestrator._execution_recovery_marker(task)
+        try:
+            return max(0, int(marker.get("route_generation", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _execution_recovery_incident_id(task: TaskSpec) -> str:
+        return str(
+            Orchestrator._execution_recovery_marker(task).get(
+                "execution_incident_id",
+                "",
+            )
+        ).strip()
+
+    def _repair_execution_recovery_task_id_collisions(
+        self,
+        tasks: List[TaskSpec],
+    ) -> List[Dict[str, object]]:
+        """Assign durable identities to legacy engine-generated duplicates."""
+
+        duplicate_ids = self._duplicate_task_ids(tasks)
+        if not duplicate_ids:
+            return []
+
+        used_task_ids = {
+            str(task.task_id).strip()
+            for task in tasks
+            if str(task.task_id).strip()
+        }
+        migrations: List[Dict[str, object]] = []
+        for duplicate_id in duplicate_ids:
+            duplicate_tasks = [
+                task for task in tasks if task.task_id == duplicate_id
+            ]
+            incident_ids = {
+                self._execution_recovery_incident_id(task)
+                for task in duplicate_tasks
+            }
+            if (
+                any(task.task_origin != "stage_recovery" for task in duplicate_tasks)
+                or any(
+                    not is_execution_incident_recovery_task(task)
+                    for task in duplicate_tasks
+                )
+                or len(incident_ids) != 1
+                or not next(iter(incident_ids), "")
+            ):
+                continue
+
+            active_tasks = [
+                task for task in duplicate_tasks if task.status != "done"
+            ]
+            if len(active_tasks) > 1:
+                # More than one live task under one identity cannot be rebound
+                # safely because runtime ownership maps are keyed by task_id.
+                continue
+            canonical = active_tasks[0] if active_tasks else duplicate_tasks[0]
+            incident_id = next(iter(incident_ids))
+            incident_tasks = [
+                task
+                for task in tasks
+                if self._execution_recovery_incident_id(task) == incident_id
+            ]
+
+            used_generations: Set[int] = set()
+            next_generation = 1
+            for incident_task in incident_tasks:
+                marker = self._execution_recovery_marker(incident_task)
+                generation = self._execution_recovery_route_generation(incident_task)
+                if generation <= 0 or generation in used_generations:
+                    while next_generation in used_generations:
+                        next_generation += 1
+                    generation = next_generation
+                    marker["route_generation"] = generation
+                used_generations.add(generation)
+                next_generation = max(next_generation, generation + 1)
+
+            for task in duplicate_tasks:
+                if task is canonical:
+                    continue
+                marker = self._execution_recovery_marker(task)
+                generation = self._execution_recovery_route_generation(task)
+                try:
+                    recovery_round = max(0, int(task.recovery_round))
+                except (TypeError, ValueError):
+                    recovery_round = 0
+                if recovery_round <= 0:
+                    try:
+                        recovery_round = max(
+                            0,
+                            int(marker.get("initial_recovery_round", 0) or 0),
+                        )
+                    except (TypeError, ValueError):
+                        recovery_round = 0
+                base_task_id = (
+                    f"recover-execution-{incident_id}-r{recovery_round}"
+                )
+                candidate = f"{base_task_id}-g{generation}"
+                while candidate in used_task_ids:
+                    generation = max(used_generations, default=0) + 1
+                    used_generations.add(generation)
+                    marker["route_generation"] = generation
+                    candidate = f"{base_task_id}-g{generation}"
+
+                repair_task_ids = {
+                    str(repair_task_id).strip()
+                    for entry in task.recovery_history
+                    if isinstance(entry, dict)
+                    for repair_task_id in (entry.get("repair_task_ids", []) or [])
+                    if str(repair_task_id).strip()
+                }
+                task.task_id = candidate
+                task.recovery_history.append(
+                    {
+                        "kind": "execution_recovery_identity_migration",
+                        "result": "renamed_duplicate",
+                        "previous_task_id": duplicate_id,
+                        "task_id": candidate,
+                        "route_generation": generation,
+                    }
+                )
+                for child in tasks:
+                    if (
+                        child.task_id in repair_task_ids
+                        and child.parent_task_id == duplicate_id
+                    ):
+                        child.parent_task_id = candidate
+                used_task_ids.add(candidate)
+                migrations.append(
+                    {
+                        "previous_task_id": duplicate_id,
+                        "task_id": candidate,
+                        "execution_incident_id": incident_id,
+                        "route_generation": generation,
+                        "evidence_fingerprint": str(
+                            marker.get("evidence_fingerprint", "")
+                        ).strip(),
+                    }
+                )
+        return migrations
+
+    def _normalize_legacy_execution_recovery_task_id_collisions(
+        self,
+        state: RunState,
+    ) -> bool:
+        """Repair completed recovery-route ID collisions before preflight."""
+
+        payload = load_task_plan(self.project_root)
+        raw_tasks = payload.get("tasks", [])
+        if not isinstance(raw_tasks, list) or not raw_tasks:
+            return False
+        try:
+            plan_tasks = [
+                TaskSpec.from_dict(item)
+                for item in raw_tasks
+                if isinstance(item, dict)
+            ]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if len(plan_tasks) != len(raw_tasks):
+            return False
+
+        migrations = self._repair_execution_recovery_task_id_collisions(
+            plan_tasks
+        )
+        if not migrations or self._duplicate_task_ids(plan_tasks):
+            return False
+
+        migrated_state_tasks = copy.deepcopy(state.tasks)
+        if migrated_state_tasks:
+            self._repair_execution_recovery_task_id_collisions(
+                migrated_state_tasks
+            )
+            if self._duplicate_task_ids(migrated_state_tasks):
+                return False
+            state.tasks = migrated_state_tasks
+
+        self._persist_tasks(plan_tasks)
+        history = state.resume_context.setdefault(
+            _EXECUTION_RECOVERY_IDENTITY_MIGRATIONS_CONTEXT,
+            [],
+        )
+        if isinstance(history, list):
+            known_task_ids = {
+                str(entry.get("task_id", ""))
+                for entry in history
+                if isinstance(entry, dict)
+            }
+            history.extend(
+                migration
+                for migration in migrations
+                if str(migration.get("task_id", "")) not in known_task_ids
+            )
+        self.logger.warning(
+            "[execution-recovery] migrated duplicate durable task identities "
+            "tasks=%s",
+            ",".join(
+                str(migration.get("task_id", ""))
+                for migration in migrations
+            ),
         )
         return True
 
@@ -24352,6 +24636,7 @@ class Orchestrator:
                 "provider_recovery_contract_receipts",
                 "restarted_blocked_run_id",
                 "auto_agents_runtime",
+                _EXECUTION_RECOVERY_IDENTITY_MIGRATIONS_CONTEXT,
                 self.FRONTEND_CONTRACT_RECOVERY_CONTEXT,
                 self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
             )
@@ -27330,6 +27615,12 @@ class Orchestrator:
     def _persist_tasks(self, tasks: Iterable[TaskSpec]) -> None:
         current_payload = load_task_plan(self.project_root)
         task_list = list(tasks)
+        duplicate_ids = self._duplicate_task_ids(task_list)
+        if duplicate_ids:
+            raise RuntimeError(
+                "task plan persistence refused duplicate task_id values: "
+                + ", ".join(duplicate_ids)
+            )
         self._backfill_stage_recovery_verification_refs(task_list)
         self._backfill_mutable_artifact_ownership(task_list)
         payload = []

@@ -42,7 +42,10 @@ from auto_agents.git_ops import (
 )
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.self_repair import classify_auto_agents_error
-from auto_agents.validation import validate_task_dependencies
+from auto_agents.validation import (
+    validate_task_dependencies,
+    validate_task_plan_payload,
+)
 from auto_agents.config import (
     load_run_state,
     load_task_plan,
@@ -1939,6 +1942,290 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 state.resume_context.get("implementation_ready_tasks", {}),
             )
             self.assertNotIn(f"implement-{requeued.task_id}", state.agent_attempts)
+
+    def test_completed_recovery_round_reuse_allocates_fresh_durable_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            incident = ExecutionIncident(
+                incident_id="round-reuse",
+                run_id=state.run_id,
+                source="gate",
+                kind=BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                stage="implement",
+                context="task verification",
+                command="python -m pytest -q tests/test_owned.py",
+                recovery_round=1,
+                evidence_fingerprint="evidence-1",
+            )
+
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+            first_round = orchestrator._load_tasks_from_plan()
+            self.assertEqual(
+                orchestrator._execution_recovery_marker(first_round[0])[
+                    "route_generation"
+                ],
+                1,
+            )
+            first_round[0].status = "done"
+            orchestrator._persist_tasks(first_round)
+
+            incident.recovery_round = 2
+            incident.evidence_fingerprint = "evidence-2"
+            orchestrator._schedule_prebaseline_recovery_task(state, incident)
+            second_round = orchestrator._load_tasks_from_plan()
+            self.assertEqual(
+                orchestrator._execution_recovery_marker(second_round[0])[
+                    "route_generation"
+                ],
+                2,
+            )
+            second_round[0].status = "done"
+            orchestrator._persist_tasks(second_round)
+
+            state.tasks = second_round
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "verification_contract",
+                "category": BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                "reason": "resume the bounded recovery budget",
+                "status": "blocked",
+            }
+            incident.status = "recovering"
+            ExecutionIncidentStore(root, state.run_id).save(incident, state)
+            save_run_state(root, state)
+
+            # Ordinary blocked-run resume resets the bounded budget round. The
+            # next diagnosed route must not reuse its durable task namespace.
+            self.assertTrue(orchestrator._resume_blocked_run(state))
+            resumed_incident = ExecutionIncidentStore(
+                root,
+                state.run_id,
+            ).load(incident.incident_id)
+            self.assertIsNotNone(resumed_incident)
+            assert resumed_incident is not None
+            self.assertEqual(resumed_incident.recovery_round, 0)
+            resumed_incident.evidence_fingerprint = "evidence-3"
+            self.assertTrue(
+                orchestrator._apply_execution_incident_diagnosis(
+                    state,
+                    resumed_incident,
+                    IncidentDiagnosis(
+                        owner="verification_contract",
+                        action="RECOVER_TARGET",
+                        confidence=1.0,
+                        reason="repair the recurring verification contract",
+                        cause_status="confirmed",
+                    ),
+                )
+            )
+
+            persisted = load_task_plan(root)
+            task_ids = [task["task_id"] for task in persisted["tasks"]]
+            self.assertEqual(len(task_ids), len(set(task_ids)))
+            self.assertEqual(
+                task_ids[0],
+                "recover-execution-round-reuse-r1-g3",
+            )
+            self.assertEqual(
+                persisted["tasks"][0]["recovery_history"][0][
+                    "route_generation"
+                ],
+                3,
+            )
+            persisted_incident = ExecutionIncidentStore(
+                root,
+                state.run_id,
+            ).load(incident.incident_id)
+            self.assertIsNotNone(persisted_incident)
+            assert persisted_incident is not None
+            self.assertEqual(
+                persisted_incident.history[-1]["route_generation"],
+                3,
+            )
+            self.assertEqual(
+                persisted_incident.history[-1]["task_id"],
+                task_ids[0],
+            )
+            self.assertFalse(
+                any(
+                    "duplicates task_id" in error
+                    for error in validate_task_plan_payload(persisted)
+                )
+            )
+
+    def test_legacy_completed_recovery_duplicates_migrate_without_history_loss(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            duplicate_id = "recover-execution-legacy-incident-r1"
+
+            first_child = TaskSpec(
+                task_id="first-repair",
+                title="First repair",
+                description="Preserve the first route repair.",
+                acceptance=["The first repair remains recorded."],
+                status="done",
+                parent_task_id=duplicate_id,
+                task_origin="evidence_repair",
+            )
+            second_child = TaskSpec(
+                task_id="second-repair",
+                title="Second repair",
+                description="Preserve the second route repair.",
+                acceptance=["The second repair remains recorded."],
+                status="done",
+                parent_task_id=duplicate_id,
+                task_origin="evidence_repair",
+            )
+
+            def recovery_task(
+                evidence_fingerprint: str,
+                child_id: str,
+                commit_sha: str,
+            ) -> TaskSpec:
+                marker = recovery_task_marker(
+                    "legacy-incident",
+                    "python -m pytest -q tests/test_owned.py",
+                    recovery_round=1,
+                )
+                marker["evidence_fingerprint"] = evidence_fingerprint
+                return TaskSpec(
+                    task_id=duplicate_id,
+                    title="Completed recovery route",
+                    description="Preserve a distinct completed recovery route.",
+                    acceptance=["The route history remains durable."],
+                    status="done",
+                    commit_sha=commit_sha,
+                    task_origin="stage_recovery",
+                    recovery_round=1,
+                    recovery_history=[
+                        marker,
+                        {
+                            "round": 1,
+                            "result": "scheduled",
+                            "repair_task_ids": [child_id],
+                        },
+                    ],
+                    verification_refs=[
+                        "cmd:python -m pytest -q tests/test_owned.py"
+                    ],
+                )
+
+            first = recovery_task("evidence-first", first_child.task_id, "commit-1")
+            second = recovery_task(
+                "evidence-second",
+                second_child.task_id,
+                "commit-2",
+            )
+            legacy_tasks = [first, first_child, second, second_child]
+            plan_payloads = []
+            for task in legacy_tasks:
+                item = task.to_dict()
+                item.pop("commit_sha", None)
+                plan_payloads.append(item)
+            save_task_plan(root, {"tasks": plan_payloads})
+            state = load_run_state(root)
+            state.tasks = legacy_tasks
+            save_run_state(root, state)
+            spec_file = root / "spec.md"
+            spec_file.write_text("Synthetic recovery run.\n", encoding="utf-8")
+            observed_preflight = []
+
+            def stop_at_preflight(*_args, **_kwargs):
+                task_ids = [
+                    task["task_id"]
+                    for task in load_task_plan(root)["tasks"]
+                ]
+                observed_preflight.append(task_ids)
+                self.assertEqual(len(task_ids), len(set(task_ids)))
+                raise RuntimeError("stop after migrated preflight observation")
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_ensure_preconditions",
+                    side_effect=stop_at_preflight,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "migrated preflight observation",
+                ),
+            ):
+                orchestrator.run(spec_file=spec_file)
+
+            self.assertTrue(observed_preflight)
+
+            persisted = load_task_plan(root)
+            persisted_ids = [task["task_id"] for task in persisted["tasks"]]
+            migrated_id = "recover-execution-legacy-incident-r1-g2"
+            self.assertEqual(len(persisted_ids), len(set(persisted_ids)))
+            self.assertIn(duplicate_id, persisted_ids)
+            self.assertIn(migrated_id, persisted_ids)
+            second_payload = next(
+                task
+                for task in persisted["tasks"]
+                if task["task_id"] == migrated_id
+            )
+            self.assertEqual(
+                second_payload["recovery_history"][0]["evidence_fingerprint"],
+                "evidence-second",
+            )
+            self.assertEqual(
+                next(
+                    task
+                    for task in persisted["tasks"]
+                    if task["task_id"] == second_child.task_id
+                )["parent_task_id"],
+                migrated_id,
+            )
+            reloaded_state = load_run_state(root)
+            migrated_state_task = next(
+                task
+                for task in reloaded_state.tasks
+                if task.task_id == migrated_id
+            )
+            self.assertEqual(migrated_state_task.commit_sha, "commit-2")
+            self.assertEqual(
+                reloaded_state.resume_context[
+                    "execution_recovery_identity_migrations"
+                ][0]["task_id"],
+                migrated_id,
+            )
+            self.assertFalse(
+                any(
+                    "duplicates task_id" in error
+                    for error in validate_task_plan_payload(persisted)
+                )
+            )
+
+    def test_task_persistence_rejects_duplicate_ids_before_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            task = TaskSpec(
+                task_id="duplicate-task",
+                title="Duplicate task",
+                description="Exercise the persistence invariant.",
+                acceptance=["Duplicate identities are rejected."],
+            )
+            original_plan = load_task_plan(root)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "persistence refused duplicate task_id",
+            ):
+                orchestrator._persist_tasks([task, TaskSpec.from_dict(task.to_dict())])
+
+            self.assertEqual(load_task_plan(root), original_plan)
 
     def test_recurring_recovery_does_not_borrow_its_own_partial_delta(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
