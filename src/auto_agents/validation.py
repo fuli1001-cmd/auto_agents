@@ -2519,6 +2519,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     "max_repair_tasks_per_round",
                     "max_refs_per_repair_task",
                     "max_incidents_per_run",
+                    "max_occurrences_per_root_cause",
                     "diagnostic_probe_timeout_seconds",
                 ):
                     value = recovery.get(key, 2 if key == "max_rounds" else 1)

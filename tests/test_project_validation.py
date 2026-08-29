@@ -796,6 +796,10 @@ class ProjectValidationTests(unittest.TestCase):
         self.assertEqual(config.gates.worker_slot_wait_timeout_seconds, 7200)
         self.assertEqual(config.gates.command_idle_timeout_seconds, 900)
         self.assertTrue(config.gates.adaptive_timeout_enabled)
+        self.assertEqual(
+            config.execution.recovery.max_occurrences_per_root_cause,
+            3,
+        )
 
     def test_validate_project_config_payload_rejects_invalid_gate_timeout(self) -> None:
         for field in (

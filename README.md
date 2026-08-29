@@ -945,10 +945,13 @@ On a stall or ceiling timeout, auto_agents terminates the entire command process
 `SIGTERM`/`SIGKILL` cleanup and persists a structured execution incident. Deterministic rules route
 high-confidence incidents to bounded retry, stage rewind, or a pre-baseline target-project repair
 task. The same incident gets at most `execution.recovery.max_rounds` recovery rounds (two by
-default), and the current recovery epoch gets at most `max_incidents_per_run` distinct incidents.
-An epoch closes only after a concrete stable checkpoint, such as the original recovery command,
-baseline, provider attempt, task retry, or stage completing successfully. Earlier incidents remain
-in the run history for audit but no longer consume the next epoch's budget. Cleanup uncertainty,
+default), the current recovery epoch gets at most `max_incidents_per_run` distinct incidents, and
+the same semantic root cause gets at most `max_occurrences_per_root_cause` consecutive occurrences
+across epochs (three by default). A repair task passing is only a completed repair attempt; an epoch
+closes after the original owner boundary, baseline, provider attempt, task retry, or stage completes
+successfully. Earlier incidents remain in the run history and no longer consume the next epoch's
+distinct-incident budget, while an unchanged semantic root continues to count until meaningful
+progress is recorded. Cleanup uncertainty,
 low-confidence diagnosis, or exhausted budgets pause safely instead of mutating blindly.
 
 A pre-baseline repair task owns the exact command that created the incident; it does not fall back
@@ -1060,6 +1063,7 @@ worktrees. Example:
       "max_repair_tasks_per_round": 6,
       "max_refs_per_repair_task": 8,
       "max_incidents_per_run": 6,
+      "max_occurrences_per_root_cause": 3,
       "diagnostic_probe_timeout_seconds": 300
     }
   }

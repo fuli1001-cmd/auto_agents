@@ -310,6 +310,16 @@ def command_incident(
     if kind != "gate_reported_infrastructure_error":
         identity["context"] = context
     incident_fp = _fingerprint_payload(identity)
+    root_identity = {
+        "source": "gate",
+        "kind": kind,
+        "stage": stage,
+        "command": " ".join(command.split()),
+        "termination_reason": result.termination_reason,
+        "infrastructure_failure_id": result.infrastructure_failure_id,
+        "infrastructure_cause_id": infrastructure_cause_id,
+    }
+    root_cause_fp = _fingerprint_payload(root_identity)
     evidence_fp = _fingerprint_payload(
         {
             "incident": incident_fp,
@@ -353,7 +363,7 @@ def command_incident(
         head_ref=head_ref,
         worktree_fingerprint=worktree_fingerprint,
         incident_fingerprint=incident_fp,
-        root_cause_fingerprint=incident_fp,
+        root_cause_fingerprint=root_cause_fp,
         origin_command=command,
         evidence_fingerprint=evidence_fp,
         repair_history=repair_history,

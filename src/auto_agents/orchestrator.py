@@ -485,6 +485,7 @@ class Orchestrator:
     MAX_CHANGED_FAILURE_RECOVERY_EPOCHS = 1
     RECOVERY_LOOP_REPEAT_THRESHOLD = 2
     RECOVERY_SEMANTIC_LOOP_REPEAT_THRESHOLD = 3
+    EXECUTION_ROOT_PROGRESS_CONTEXT = "execution_incident_root_progress"
     FRONTEND_CONTRACT_RECOVERY_CONTEXT = "frontend_design_contract_recovery"
     INSTALLED_ENGINE_RECOVERY_CONTEXT = "installed_engine_recovery_revisions"
     REQUIREMENT_CONTRACT_RECOVERY_CATEGORIES = frozenset(
@@ -665,19 +666,24 @@ class Orchestrator:
                 commands.append(diagnostic_command)
         if not commands:
             return None
+        probe_timeout = min(
+            self.config.gates.command_timeout_seconds,
+            self.config.execution.recovery.diagnostic_probe_timeout_seconds,
+        )
+        probe_idle_timeout = min(
+            self.config.gates.command_idle_timeout_seconds,
+            self.config.execution.recovery.diagnostic_probe_timeout_seconds,
+        )
         return run_commands_collect_all(
             commands,
             self.project_root,
-            command_timeout_seconds=min(
-                self.config.gates.command_timeout_seconds,
-                self.config.execution.recovery.diagnostic_probe_timeout_seconds,
-            ),
+            command_timeout_seconds=probe_timeout,
             adaptive_timeout_enabled=self.config.gates.adaptive_timeout_enabled,
-            command_idle_timeout_seconds=min(
-                self.config.gates.command_idle_timeout_seconds,
-                self.config.execution.recovery.diagnostic_probe_timeout_seconds,
+            command_idle_timeout_seconds=probe_idle_timeout,
+            progress=self._gate_progress_callback(
+                "failure identity diagnostic",
+                timeout_seconds=probe_timeout,
             ),
-            progress=self._gate_progress_callback("failure identity diagnostic"),
         )
 
     @staticmethod
@@ -7091,13 +7097,24 @@ class Orchestrator:
         }
         write_json(run_path(self.project_root, run_id) / "performance.json", report)
 
-    def _gate_progress_callback(self, context: str):
+    def _gate_progress_callback(
+        self,
+        context: str,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ):
+        effective_timeout = (
+            self.config.gates.command_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+
         def emit(event: str, command: str, elapsed_seconds: float) -> None:
             if event == "start":
                 self.logger.info(
                     "[gate-command] context=%s state=start timeout_seconds=%s command=%s",
                     context,
-                    self.config.gates.command_timeout_seconds,
+                    effective_timeout,
                     command[:300],
                 )
             elif event == "cache_hit":
@@ -7248,6 +7265,7 @@ class Orchestrator:
             )
             existing.origin_command = existing.origin_command or incident.origin_command
             incident = existing
+        self._record_execution_incident_root_occurrence(state, incident)
         store.save(incident, state)
         return incident
 
@@ -7266,6 +7284,223 @@ class Orchestrator:
             )
             and int(entry.get("budget_epoch", 0) or 0) == epoch
         }
+
+    @staticmethod
+    def _execution_incident_root_fingerprint(
+        incident: ExecutionIncident,
+    ) -> str:
+        return str(
+            incident.root_cause_fingerprint
+            or incident.incident_fingerprint
+        ).strip()
+
+    @classmethod
+    def _execution_incident_summary_matches_root(
+        cls,
+        entry: Mapping[str, object],
+        incident: ExecutionIncident,
+    ) -> bool:
+        stored_root = str(
+            entry.get("root_cause_fingerprint")
+            or entry.get("incident_fingerprint", "")
+        ).strip()
+        current_root = cls._execution_incident_root_fingerprint(incident)
+        if stored_root and stored_root == current_root:
+            return True
+        # Policy-v5 summaries used the context-sensitive incident identity as
+        # their root. Reconstruct the stable semantic match so an upgraded run
+        # cannot forget a loop merely because recovery task IDs changed.
+        stored_command = " ".join(
+            str(
+                entry.get("origin_command")
+                or entry.get("command", "")
+            ).split()
+        )
+        current_command = " ".join(
+            str(incident.origin_command or incident.command).split()
+        )
+        return bool(
+            stored_command
+            and stored_command == current_command
+            and str(entry.get("source", "")) == incident.source
+            and str(entry.get("kind", "")) == incident.kind
+            and str(entry.get("stage", "")) == incident.stage
+        )
+
+    def _execution_incident_root_occurrences_since_progress(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+    ) -> int:
+        root_fingerprint = self._execution_incident_root_fingerprint(incident)
+        if not root_fingerprint:
+            return 0
+        raw_progress = state.resume_context.get(
+            self.EXECUTION_ROOT_PROGRESS_CONTEXT,
+            {},
+        )
+        progress = raw_progress if isinstance(raw_progress, dict) else {}
+        raw_checkpoint = progress.get(root_fingerprint, {})
+        checkpoint = (
+            raw_checkpoint if isinstance(raw_checkpoint, dict) else {}
+        )
+        total = max(
+            0,
+            int(checkpoint.get("occurrence_count", 0) or 0),
+        )
+        if not total:
+            total = sum(
+                max(1, int(entry.get("occurrence_count", 1) or 1))
+                for entry in state.execution_incidents
+                if self._execution_incident_summary_matches_root(
+                    entry,
+                    incident,
+                )
+            )
+        acknowledged = max(
+            0,
+            int(
+                checkpoint.get("acknowledged_occurrence_count", 0)
+                or 0
+            ),
+        )
+        return max(0, total - acknowledged)
+
+    def _record_execution_incident_root_occurrence(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+    ) -> None:
+        root_fingerprint = self._execution_incident_root_fingerprint(incident)
+        if not root_fingerprint:
+            return
+        raw_progress = state.resume_context.get(
+            self.EXECUTION_ROOT_PROGRESS_CONTEXT,
+            {},
+        )
+        progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
+        raw_checkpoint = progress.get(root_fingerprint, {})
+        checkpoint = (
+            dict(raw_checkpoint) if isinstance(raw_checkpoint, dict) else {}
+        )
+        historical_total = sum(
+            max(1, int(entry.get("occurrence_count", 1) or 1))
+            for entry in state.execution_incidents
+            if self._execution_incident_summary_matches_root(
+                entry,
+                incident,
+            )
+        )
+        checkpoint["occurrence_count"] = max(
+            historical_total,
+            int(checkpoint.get("occurrence_count", 0) or 0),
+        ) + 1
+        checkpoint.setdefault("acknowledged_occurrence_count", 0)
+        checkpoint["last_incident_id"] = incident.incident_id
+        checkpoint["last_seen_at"] = utc_now_iso()
+        progress[root_fingerprint] = checkpoint
+        state.resume_context[self.EXECUTION_ROOT_PROGRESS_CONTEXT] = progress
+
+    def _record_execution_incident_root_progress(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+        *,
+        reason: str,
+    ) -> None:
+        root_fingerprint = self._execution_incident_root_fingerprint(incident)
+        if not root_fingerprint:
+            return
+        raw_progress = state.resume_context.get(
+            self.EXECUTION_ROOT_PROGRESS_CONTEXT,
+            {},
+        )
+        progress = dict(raw_progress) if isinstance(raw_progress, dict) else {}
+        raw_checkpoint = progress.get(root_fingerprint, {})
+        checkpoint = (
+            dict(raw_checkpoint) if isinstance(raw_checkpoint, dict) else {}
+        )
+        total = max(
+            0,
+            int(checkpoint.get("occurrence_count", 0) or 0),
+        )
+        if not total:
+            total = sum(
+                max(1, int(entry.get("occurrence_count", 1) or 1))
+                for entry in state.execution_incidents
+                if self._execution_incident_summary_matches_root(
+                    entry,
+                    incident,
+                )
+            )
+        checkpoint.update(
+            {
+                "occurrence_count": total,
+                "acknowledged_occurrence_count": total,
+                "incident_id": incident.incident_id,
+                "reason": reason,
+                "updated_at": utc_now_iso(),
+            }
+        )
+        progress[root_fingerprint] = checkpoint
+        # The incident store retains at most fifty summaries. Keep the progress
+        # ledger under the same bound so old runs cannot grow state indefinitely.
+        if len(progress) > 50:
+            ordered = sorted(
+                progress.items(),
+                key=lambda item: str(
+                    item[1].get("updated_at", "")
+                    if isinstance(item[1], dict)
+                    else ""
+                ),
+            )
+            progress = dict(ordered[-50:])
+        state.resume_context[self.EXECUTION_ROOT_PROGRESS_CONTEXT] = progress
+
+    def _block_execution_recovery_semantic_loop(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+        *,
+        occurrences: int,
+    ) -> bool:
+        root_fingerprint = self._execution_incident_root_fingerprint(incident)
+        reason = (
+            "execution recovery semantic loop detected before another repair: "
+            f"root_cause={root_fingerprint or 'unknown'} occurrences={occurrences} "
+            f"limit={self.config.execution.recovery.max_occurrences_per_root_cause}; "
+            "recovery tasks completed without the original owner boundary making progress; "
+            "engine_invariant=recovery_checkpoint_false_positive"
+        )
+        incident.status = "needs_human"
+        incident.history.append(
+            {
+                "event": "semantic_loop_blocked",
+                "occurrences": occurrences,
+                "root_cause_fingerprint": root_fingerprint,
+                "engine_invariant": "recovery_checkpoint_false_positive",
+            }
+        )
+        state.last_recovery_route = {
+            "outcome": "invariant_violation",
+            "failure_kind": "execution_recovery_semantic_loop",
+            "reason": reason,
+            "engine_invariant": "recovery_checkpoint_false_positive",
+            "incident_id": incident.incident_id,
+            "root_cause_fingerprint": root_fingerprint,
+            "occurrences": occurrences,
+        }
+        self._block_run(
+            state,
+            owner="auto_agents",
+            category="execution_recovery_semantic_loop",
+            reason=reason,
+            incident_id=incident.incident_id,
+            fingerprint=root_fingerprint or incident.evidence_fingerprint,
+        )
+        self._incident_store(state).save(incident, state)
+        self.logger.error(reason)
+        return False
 
     def _advance_execution_incident_budget_epoch(
         self,
@@ -7411,6 +7646,11 @@ class Orchestrator:
                 {"event": "self_repair_applied", "commit_sha": commit_sha}
             )
             self._incident_store(state).save(incident, state)
+            self._record_execution_incident_root_progress(
+                state,
+                incident,
+                reason="auto_agents self repair applied",
+            )
         save_run_state(self.project_root, state)
         return state
 
@@ -10837,6 +11077,23 @@ class Orchestrator:
         incident.history.append(
             {"event": "diagnosed", "diagnosis": diagnosis.to_dict()}
         )
+        root_occurrences = (
+            self._execution_incident_root_occurrences_since_progress(
+                state,
+                incident,
+            )
+        )
+        if (
+            diagnosis.action
+            in {"RETRY", "RECOVER_TARGET", "REPAIR_INFRASTRUCTURE"}
+            and root_occurrences
+            >= self.config.execution.recovery.max_occurrences_per_root_cause
+        ):
+            return self._block_execution_recovery_semantic_loop(
+                state,
+                incident,
+                occurrences=root_occurrences,
+            )
         if diagnosis.action == "REPAIR_INFRASTRUCTURE":
             repair = repair_workspace_local_conda(
                 self.project_root,
@@ -12038,16 +12295,21 @@ class Orchestrator:
         incident = store.load(incident_id)
         if incident is None:
             return
-        incident.status = "resolved"
+        # Passing the repair task proves only that a candidate repair was
+        # produced. It does not prove that the original owner boundary can now
+        # cross the baseline/verification transition that opened the incident.
+        # Keep the same incident and recovery budget active until that boundary
+        # is observed succeeding.
+        incident.status = "repair_attempt_completed"
         incident.history.append(
-            {"event": "resolved", "task_id": task.task_id, "commit_sha": task.commit_sha}
+            {
+                "event": "repair_attempt_completed",
+                "task_id": task.task_id,
+                "commit_sha": task.commit_sha,
+                "round": incident.recovery_round,
+            }
         )
         store.save(incident, state)
-        self._advance_execution_incident_budget_epoch(
-            state,
-            reason="execution recovery task passed its original command",
-            incident=incident,
-        )
         self._clear_run_blocker(state)
 
     def _resolve_inline_task_incident(self, state: RunState, task: TaskSpec) -> None:
@@ -12065,6 +12327,11 @@ class Orchestrator:
             {"event": "resolved", "task_id": task.task_id, "reason": "task retry succeeded"}
         )
         store.save(incident, state)
+        self._record_execution_incident_root_progress(
+            state,
+            incident,
+            reason="task retry passed",
+        )
         self._advance_execution_incident_budget_epoch(
             state,
             reason="task retry passed",
@@ -12088,6 +12355,11 @@ class Orchestrator:
         incident.status = "resolved"
         incident.history.append({"event": "resolved", "stage": stage})
         store.save(incident, state)
+        self._record_execution_incident_root_progress(
+            state,
+            incident,
+            reason=f"stage {stage} completed after execution recovery",
+        )
         self._advance_execution_incident_budget_epoch(
             state,
             reason=f"stage {stage} completed after execution recovery",
@@ -12108,7 +12380,7 @@ class Orchestrator:
             or incident.source != "gate"
             or not incident.baseline
             or incident.context != context
-            or incident.status != "recovering"
+            or incident.status not in {"recovering", "repair_attempt_completed"}
         ):
             return
         incident.status = "resolved"
@@ -12119,6 +12391,11 @@ class Orchestrator:
             }
         )
         store.save(incident, state)
+        self._record_execution_incident_root_progress(
+            state,
+            incident,
+            reason="baseline commands produced a finite result",
+        )
         self._advance_execution_incident_budget_epoch(
             state,
             reason="baseline commands produced a finite result",
@@ -19538,6 +19815,7 @@ class Orchestrator:
             )
         extraction = extract_failure_info(verify_gate)
         diagnostic_identity_only = False
+        baseline_not_applicable_commands: List[str] = []
         raw_output = self._gate_raw_output(verify_gate)
         if not verify_gate.ok and not extraction.comparable:
             diagnostic_gate = self._run_verify_failure_identity_diagnostic(verify_gate)
@@ -19588,14 +19866,35 @@ class Orchestrator:
             )
             if baseline_mutation_error:
                 raise RuntimeError(baseline_mutation_error)
-            lazy_failures = self._validated_baseline_failures(
-                baseline_gate,
-                context=f"lazy task baseline verification ({task.task_id})",
-                task_id=task.task_id,
+            baseline_not_applicable_commands = (
+                self._lazy_baseline_target_absent_commands(
+                    baseline_gate,
+                    verify_gate,
+                )
             )
+            if baseline_not_applicable_commands:
+                lazy_failures = []
+                for command in baseline_not_applicable_commands:
+                    self.logger.info(
+                        "[gate-baseline] context=lazy task=%s state=not_applicable "
+                        "reason=target_absent_at_baseline command=%s",
+                        task.task_id,
+                        command[:300],
+                    )
+            else:
+                lazy_failures = self._validated_baseline_failures(
+                    baseline_gate,
+                    context=f"lazy task baseline verification ({task.task_id})",
+                    task_id=task.task_id,
+                )
             task.verify_baseline_failures = list(
                 dict.fromkeys([*task.verify_baseline_failures, *lazy_failures])
             )
+            if state is not None:
+                self._resolve_successful_baseline_execution_incident(
+                    state,
+                    context=f"lazy task baseline verification ({task.task_id})",
+                )
         baseline_failure_ids = (
             self._normalize_verify_failure_ids(task.verify_baseline_failures, verify_gate.summary)
             if task is not None and task.verify_baseline_failures
@@ -19725,6 +20024,9 @@ class Orchestrator:
                     "retryable_missing_owned_evidence_refs": retryable_missing_owned_evidence,
                     "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
                     "contract_scope_issue": True,
+                    "baseline_not_applicable_commands": list(
+                        baseline_not_applicable_commands
+                    ),
                 }
             failure_result = {
                 "ok": False,
@@ -19744,6 +20046,9 @@ class Orchestrator:
                 "baseline_identity_transition": baseline_identity_transition,
                 "retryable_missing_owned_evidence_refs": retryable_missing_owned_evidence,
                 "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
+                "baseline_not_applicable_commands": list(
+                    baseline_not_applicable_commands
+                ),
             }
             return failure_result
         portability_failure = self._ignored_supporting_evidence_portability_failure(
@@ -19824,6 +20129,9 @@ class Orchestrator:
             "comparable_failures": extraction.comparable,
             "baseline_comparison_comparable": comparison_comparable,
             "proof_evidence": proof_evidence,
+            "baseline_not_applicable_commands": list(
+                baseline_not_applicable_commands
+            ),
         }
 
     _REQUIREMENTS_AUDIT_EVIDENCE_MARKERS = (
@@ -20848,6 +21156,48 @@ class Orchestrator:
         base = f"{head_ref(self.project_root)}:{worktree_fingerprint(self.project_root)}"
         return f"{base}:{verification_context}" if verification_context else base
 
+    def _exact_task_verify_baseline_ref(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        verification_context: str,
+    ) -> str:
+        """Capture a durable source ref when a task inherits a dirty worktree.
+
+        A ``HEAD:fingerprint`` cache key identifies dirty content but cannot be
+        executed by a Git-ref-backed gate. Materialize that content for retained
+        evidence repairs so their lazy baseline observes the exact handoff.
+        """
+
+        if task.task_origin != "evidence_repair":
+            return ""
+        if not self._changed_paths_excluding_agent_instructions():
+            return ""
+        fingerprint = self._worktree_fingerprint_excluding_agent_instructions()
+        material = "\n".join(
+            (
+                state.run_id,
+                task.task_id,
+                str(task.verify_retry_epoch),
+                fingerprint,
+            )
+        )
+        snapshot_id = hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+        snapshot = GateSnapshotManager(
+            self.project_root,
+            f"task-baseline-{snapshot_id}",
+        ).create()
+        self.logger.info(
+            "[gate-baseline] task=%s state=exact_snapshot ref=%s",
+            task.task_id,
+            snapshot.ref_name,
+        )
+        return (
+            f"{snapshot.ref_name}:{verification_context}"
+            if verification_context
+            else snapshot.ref_name
+        )
+
     @staticmethod
     def _is_test_verification_command(command: str) -> bool:
         if build_failure_identity_diagnostic_command(command):
@@ -20882,6 +21232,65 @@ class Orchestrator:
             ):
                 return False
         return True
+
+    @staticmethod
+    def _is_missing_pytest_target_result(result: CommandResult) -> bool:
+        if result.ok or result.returncode != 4:
+            return False
+        if not build_failure_identity_diagnostic_command(result.command):
+            return False
+        output = "\n".join(
+            part for part in (result.stdout, result.stderr) if part
+        )
+        return bool(
+            re.search(
+                r"(?:ERROR:\s*)?(?:file or directory )?not found\s*:"
+                r"|no match in any of",
+                output,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _lazy_baseline_target_absent_commands(
+        cls,
+        baseline_gate: GateResult,
+        current_gate: GateResult,
+    ) -> List[str]:
+        """Return selectors introduced after the lazy baseline snapshot.
+
+        A focused pytest node can legitimately be absent from the pre-task
+        source ref when the task itself introduced that proof. The current
+        execution must still have produced a stable semantic failure identity;
+        otherwise a typo or broken current selector remains a hard failure.
+        """
+
+        current_results = {
+            result.command: result for result in current_gate.commands
+        }
+        absent: List[str] = []
+        for baseline_result in baseline_gate.commands:
+            if baseline_result.ok:
+                continue
+            if not cls._is_missing_pytest_target_result(baseline_result):
+                return []
+            current_result = current_results.get(baseline_result.command)
+            if current_result is None or current_result.ok:
+                return []
+            current_extraction = extract_failure_info(
+                GateResult(
+                    ok=False,
+                    commands=[current_result],
+                    summary=current_gate.summary,
+                )
+            )
+            if (
+                not current_extraction.comparable
+                or not current_extraction.failure_ids
+            ):
+                return []
+            absent.append(baseline_result.command)
+        return list(dict.fromkeys(absent))
 
     def _validated_baseline_failures(
         self,
@@ -20985,7 +21394,10 @@ class Orchestrator:
             return ""
         head, sep, _ = candidate.partition(":")
         if sep:
-            if re.fullmatch(r"[0-9a-f]{7,40}", head, flags=re.IGNORECASE):
+            if (
+                re.fullmatch(r"[0-9a-f]{7,40}", head, flags=re.IGNORECASE)
+                or head.startswith("refs/auto-agents/gate-snapshots/")
+            ):
                 return head
             if not head:
                 return ""
@@ -21016,13 +21428,25 @@ class Orchestrator:
                 assume_done_task_ids=assumed,
             )
             verification_context = str(audit_result.get("input_context_sha256", ""))
-        baseline_ref = (
+        lazy_incremental = bool(
+            self.config.gates.verification_policy_version >= 3
+            and self.config.gates.incremental_mode == "auto"
+            and self.config.gates.steps
+        )
+        exact_baseline_ref = (
+            self._exact_task_verify_baseline_ref(
+                state,
+                task,
+                verification_context,
+            )
+            if state is not None and lazy_incremental
+            else ""
+        )
+        baseline_ref = exact_baseline_ref or (
             state.implement_verify_baseline_ref
             if (
                 state is not None
-                and self.config.gates.verification_policy_version >= 3
-                and self.config.gates.incremental_mode == "auto"
-                and self.config.gates.steps
+                and lazy_incremental
                 and state.implement_verify_baseline_ref
             )
             else self._task_verify_baseline_ref(verification_context)
@@ -21034,11 +21458,7 @@ class Orchestrator:
             == VERIFY_BASELINE_SCHEMA_VERSION
         ):
             return False
-        if (
-            self.config.gates.verification_policy_version >= 3
-            and self.config.gates.incremental_mode == "auto"
-            and bool(self.config.gates.steps)
-        ):
+        if lazy_incremental:
             task.verify_baseline_failures = []
             task.verify_baseline_ref = baseline_ref
             task.verify_baseline_schema_version = VERIFY_BASELINE_SCHEMA_VERSION
@@ -28661,6 +29081,11 @@ class Orchestrator:
         incident.status = "resolved"
         incident.history.append({"event": "resolved", "reason": "provider attempt succeeded"})
         self._incident_store(state).save(incident, state)
+        self._record_execution_incident_root_progress(
+            state,
+            incident,
+            reason="provider attempt succeeded",
+        )
         self._advance_execution_incident_budget_epoch(
             state,
             reason="provider attempt succeeded",

@@ -41,6 +41,7 @@ from auto_agents.git_ops import (
     worktree_fingerprint,
 )
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.self_repair import classify_auto_agents_error
 from auto_agents.validation import validate_task_dependencies
 from auto_agents.config import (
     load_run_state,
@@ -113,6 +114,43 @@ class ExecutionRecoveryTests(unittest.TestCase):
 
         self.assertEqual(first.incident_fingerprint, second.incident_fingerprint)
         self.assertNotEqual(first.evidence_fingerprint, second.evidence_fingerprint)
+
+    def test_gate_root_cause_identity_ignores_volatile_task_context(self) -> None:
+        result = CommandResult(
+            command=(
+                "python -m pytest -q "
+                "tests/test_owned.py::test_contract"
+            ),
+            ok=False,
+            returncode=4,
+            stderr="ERROR: not found: tests/test_owned.py::test_contract",
+            process_snapshot={
+                "baseline_failure_identity": {
+                    "status": "unresolved",
+                    "contract": "stable_test_failure_ids",
+                }
+            },
+        )
+        first = command_incident(
+            run_id="run-1",
+            stage="implement",
+            context="lazy task baseline verification (repair-task-r1)",
+            result=result,
+            baseline=True,
+        )
+        second = command_incident(
+            run_id="run-1",
+            stage="implement",
+            context="lazy task baseline verification (repair-task-r2)",
+            result=result,
+            baseline=True,
+        )
+
+        self.assertNotEqual(first.incident_fingerprint, second.incident_fingerprint)
+        self.assertEqual(
+            first.root_cause_fingerprint,
+            second.root_cause_fingerprint,
+        )
 
     def test_reported_infrastructure_incident_preserves_worker_evidence(self) -> None:
         incident = command_incident(
@@ -822,6 +860,190 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertEqual(merged.incident_id, "current")
             self.assertEqual(merged.budget_epoch, 1)
             self.assertEqual(len(state.execution_incidents), 2)
+
+    def test_recovery_task_completion_waits_for_original_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            incident = ExecutionIncident(
+                incident_id="baseline-identity",
+                run_id=state.run_id,
+                source="gate",
+                kind=BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                stage="implement",
+                context="lazy task baseline verification (repair-task)",
+                command=(
+                    "python -m pytest -q "
+                    "tests/test_owned.py::test_contract"
+                ),
+                task_id="repair-task",
+                baseline=True,
+                status="recovering",
+                recovery_round=1,
+                incident_fingerprint="baseline-root",
+                root_cause_fingerprint="baseline-root",
+                evidence_fingerprint="evidence-1",
+            )
+            orchestrator._merge_or_save_execution_incident(state, incident)
+            task = TaskSpec(
+                task_id="recover-execution-baseline-identity-r1",
+                title="Repair baseline identity",
+                description="",
+                acceptance=[],
+                task_origin="stage_recovery",
+                recovery_history=[
+                    recovery_task_marker(
+                        incident.incident_id,
+                        incident.command,
+                        recovery_round=1,
+                    )
+                ],
+                commit_sha="repair-commit",
+            )
+
+            orchestrator._resolve_execution_incident_for_task(state, task)
+
+            saved = ExecutionIncidentStore(root, state.run_id).load(
+                incident.incident_id
+            )
+            self.assertEqual(saved.status, "repair_attempt_completed")
+            self.assertEqual(state.active_execution_incident_id, incident.incident_id)
+            self.assertEqual(state.execution_incident_budget_epoch, 0)
+            self.assertFalse(state.execution_incident_budget_checkpoint)
+
+    def test_original_baseline_boundary_resolves_completed_repair_attempt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            context = "lazy task baseline verification (repair-task)"
+            incident = ExecutionIncident(
+                incident_id="baseline-identity",
+                run_id=state.run_id,
+                source="gate",
+                kind=BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                stage="implement",
+                context=context,
+                command=(
+                    "python -m pytest -q "
+                    "tests/test_owned.py::test_contract"
+                ),
+                task_id="repair-task",
+                baseline=True,
+                status="repair_attempt_completed",
+                recovery_round=1,
+                incident_fingerprint="baseline-context",
+                root_cause_fingerprint="baseline-root",
+                evidence_fingerprint="evidence-1",
+            )
+            orchestrator._merge_or_save_execution_incident(state, incident)
+
+            orchestrator._resolve_successful_baseline_execution_incident(
+                state,
+                context=context,
+            )
+
+            saved = ExecutionIncidentStore(root, state.run_id).load(
+                incident.incident_id
+            )
+            self.assertEqual(saved.status, "resolved")
+            self.assertEqual(state.active_execution_incident_id, "")
+            self.assertEqual(state.execution_incident_budget_epoch, 1)
+            progress = state.resume_context[
+                orchestrator.EXECUTION_ROOT_PROGRESS_CONTEXT
+            ]["baseline-root"]
+            self.assertEqual(progress["occurrence_count"], 1)
+
+    def test_same_root_cause_across_epochs_triggers_engine_circuit_breaker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            orchestrator.config.execution.recovery.max_occurrences_per_root_cause = 3
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            diagnosis = IncidentDiagnosis(
+                owner="verification_contract",
+                action="RECOVER_TARGET",
+                confidence=1.0,
+                reason="the same baseline identity is unresolved",
+                evidence=["same semantic root"],
+                cause_status="confirmed",
+            )
+            outcomes = []
+
+            for index in range(3):
+                incident = ExecutionIncident(
+                    incident_id=f"same-root-{index}",
+                    run_id=state.run_id,
+                    source="gate",
+                    kind=BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                    stage="implement",
+                    context="lazy task baseline verification (repair-task)",
+                    command=(
+                        "python -m pytest -q "
+                        "tests/test_owned.py::test_contract"
+                    ),
+                    task_id="repair-task",
+                    baseline=True,
+                    incident_fingerprint=f"context-sensitive-{index}",
+                    root_cause_fingerprint=(
+                        f"legacy-context-sensitive-{index}"
+                        if index < 2
+                        else "stable-root"
+                    ),
+                    evidence_fingerprint=f"changed-evidence-{index}",
+                )
+                incident = orchestrator._merge_or_save_execution_incident(
+                    state,
+                    incident,
+                )
+                outcomes.append(
+                    orchestrator._apply_execution_incident_diagnosis(
+                        state,
+                        incident,
+                        diagnosis,
+                    )
+                )
+                if index < 2:
+                    # Model the old false-positive checkpoint: a repair task
+                    # passed, the incident was closed, and a new epoch began.
+                    incident.status = "resolved"
+                    orchestrator._incident_store(state).save(incident, state)
+                    orchestrator._advance_execution_incident_budget_epoch(
+                        state,
+                        reason="repair task passed without owner progress",
+                        incident=incident,
+                    )
+
+            self.assertEqual(outcomes, [True, True, False])
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(state.active_blocker["owner"], "auto_agents")
+            self.assertEqual(
+                state.active_blocker["category"],
+                "execution_recovery_semantic_loop",
+            )
+            self.assertEqual(
+                state.last_recovery_route["engine_invariant"],
+                "recovery_checkpoint_false_positive",
+            )
+            self_repair = classify_auto_agents_error(
+                RuntimeError(state.last_error),
+                state=state,
+                env={},
+            )
+            self.assertTrue(self_repair.eligible)
+            self.assertEqual(
+                self_repair.category,
+                "execution_recovery_semantic_loop",
+            )
 
     def test_agent_diagnosis_requires_strict_bounded_json(self) -> None:
         diagnosis = parse_incident_diagnosis(

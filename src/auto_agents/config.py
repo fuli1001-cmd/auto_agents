@@ -376,6 +376,7 @@ DEFAULT_CONFIG = {
             "max_repair_tasks_per_round": 6,
             "max_refs_per_repair_task": 8,
             "max_incidents_per_run": 6,
+            "max_occurrences_per_root_cause": 3,
             "diagnostic_probe_timeout_seconds": 300,
             "managed_runtime_downloads_enabled": True,
             "max_managed_runtime_candidates": 3,

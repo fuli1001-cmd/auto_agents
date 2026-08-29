@@ -561,6 +561,11 @@
               "minimum": 1,
               "default": 6
             },
+            "max_occurrences_per_root_cause": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 3
+            },
             "diagnostic_probe_timeout_seconds": {
               "type": "integer",
               "minimum": 1,

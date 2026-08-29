@@ -22,7 +22,13 @@ from auto_agents.git_ops import (
     update_ref,
 )
 from auto_agents.io_utils import read_json, write_json, write_text
-from auto_agents.models import CommandResult, GateResult, RunState, TaskSpec
+from auto_agents.models import (
+    CommandResult,
+    GateResult,
+    RunState,
+    TaskSpec,
+    VerificationStep,
+)
 from auto_agents.orchestrator import (
     VERIFY_BASELINE_SCHEMA_VERSION,
     Orchestrator,
@@ -115,6 +121,162 @@ class RecoveryResilienceTests(unittest.TestCase):
             self.assertEqual(task.verify_baseline_failures, [])
             self.assertEqual(task.verify_baseline_schema_version, 0)
             orchestrator._gate_baseline_cache.put.assert_not_called()
+
+    def test_lazy_baseline_treats_new_pytest_node_as_not_applicable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            test_path = root / "tests" / "test_demo.py"
+            write_text(
+                test_path,
+                "def test_new_contract():\n    assert False\n",
+            )
+            command = (
+                "python -m pytest -q "
+                "tests/test_demo.py::test_new_contract"
+            )
+            orchestrator.config.gates.steps = [
+                VerificationStep(
+                    proof_id="new-contract",
+                    command=command,
+                )
+            ]
+            task = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair new proof",
+                description="",
+                acceptance=[],
+                task_origin="evidence_repair",
+                parent_task_id="task-001",
+                verification_refs=[
+                    "tests/test_demo.py::test_new_contract"
+                ],
+                verify_baseline_ref="deadbeef",
+                verify_baseline_schema_version=VERIFY_BASELINE_SCHEMA_VERSION,
+            )
+            state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[task],
+            )
+            current = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout=(
+                            "FAILED tests/test_demo.py::test_new_contract "
+                            "- assert False\n"
+                        ),
+                    )
+                ],
+                summary="one failed",
+            )
+            baseline = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=4,
+                        stderr=(
+                            "ERROR: not found: /tmp/demo/tests/test_demo.py::"
+                            "test_new_contract\n"
+                            "(no match in any of [<Module test_demo.py>])\n"
+                        ),
+                    )
+                ],
+                summary="pytest selector missing at baseline",
+            )
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_run_task_gate_commands_for_commands",
+                    side_effect=[(current, ""), (baseline, "")],
+                ),
+                patch.object(
+                    orchestrator,
+                    "_run_verify_failure_identity_diagnostic",
+                    side_effect=AssertionError(
+                        "an absent pre-task node is a typed non-applicable baseline"
+                    ),
+                ),
+            ):
+                result = orchestrator._run_task_verify(task, state=state)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(
+                result["failure_ids"],
+                ["tests/test_demo.py::test_new_contract"],
+            )
+            self.assertEqual(task.verify_baseline_failures, [])
+            self.assertEqual(
+                result["baseline_not_applicable_commands"],
+                [command],
+            )
+
+    def test_dirty_repair_baseline_materializes_exact_git_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            write_text(
+                root / "tests" / "test_owned.py",
+                "def test_owned():\n    assert True\n",
+            )
+            commit_all(root, "test: add owned proof")
+            write_text(root / "retained.py", "VALUE = 'retained'\n")
+            command = "python -m pytest -q tests/test_owned.py::test_owned"
+            orchestrator.config.gates.steps = [
+                VerificationStep(proof_id="owned", command=command)
+            ]
+            task = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair retained proof",
+                description="",
+                acceptance=[],
+                task_origin="evidence_repair",
+                parent_task_id="task-001",
+                verification_refs=["tests/test_owned.py::test_owned"],
+            )
+            state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[task],
+                implement_verify_baseline_ref=head_ref(root),
+            )
+
+            changed = orchestrator._ensure_task_verify_baseline(
+                task,
+                state=state,
+            )
+
+            self.assertTrue(changed)
+            source_ref = orchestrator._git_ref_from_verify_baseline_ref(
+                task.verify_baseline_ref
+            )
+            self.assertTrue(
+                source_ref.startswith(
+                    "refs/auto-agents/gate-snapshots/task-baseline-"
+                )
+            )
+            self.assertEqual(
+                orchestrator._git_ref_from_verify_baseline_ref(
+                    f"{source_ref}:audit-context"
+                ),
+                source_ref,
+            )
+            captured = subprocess.run(
+                ["git", "show", f"{source_ref}:retained.py"],
+                cwd=root,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            self.assertEqual(captured.returncode, 0, msg=captured.stderr)
+            self.assertEqual(captured.stdout, "VALUE = 'retained'\n")
 
     def test_bracketed_vitest_suite_baseline_has_stable_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

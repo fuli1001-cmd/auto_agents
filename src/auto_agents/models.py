@@ -928,6 +928,7 @@ class RecoveryConfig:
     max_repair_tasks_per_round: int = 6
     max_refs_per_repair_task: int = 8
     max_incidents_per_run: int = 6
+    max_occurrences_per_root_cause: int = 3
     diagnostic_probe_timeout_seconds: int = 300
     managed_runtime_downloads_enabled: bool = True
     max_managed_runtime_candidates: int = 3
@@ -942,6 +943,9 @@ class RecoveryConfig:
             max_repair_tasks_per_round=int(data.get("max_repair_tasks_per_round", 6)),
             max_refs_per_repair_task=int(data.get("max_refs_per_repair_task", 8)),
             max_incidents_per_run=int(data.get("max_incidents_per_run", 6)),
+            max_occurrences_per_root_cause=max(
+                1, int(data.get("max_occurrences_per_root_cause", 3))
+            ),
             diagnostic_probe_timeout_seconds=int(
                 data.get("diagnostic_probe_timeout_seconds", 300)
             ),
