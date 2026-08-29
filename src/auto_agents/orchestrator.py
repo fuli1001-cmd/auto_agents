@@ -8721,6 +8721,41 @@ class Orchestrator:
         )
         return True
 
+    @staticmethod
+    def _retained_evidence_repair_requires_user_input(
+        state: RunState,
+        tasks: Iterable[TaskSpec],
+        repair_task_ids: Iterable[str],
+    ) -> bool:
+        """Keep inputs needed by the active repair lineage ahead of execution."""
+
+        task_list = list(tasks)
+        tasks_by_id = {task.task_id: task for task in task_list}
+        lineage_ids: set[str] = set()
+        for repair_task_id in repair_task_ids:
+            cursor = tasks_by_id.get(str(repair_task_id).strip())
+            while cursor is not None and cursor.task_id not in lineage_ids:
+                lineage_ids.add(cursor.task_id)
+                cursor = tasks_by_id.get(cursor.parent_task_id)
+
+        if any(
+            task.task_id in lineage_ids
+            and (
+                task.status == "waiting_user"
+                or (task.status != "done" and bool(task.required_inputs))
+            )
+            for task in task_list
+        ):
+            return True
+
+        for payload in state.pending_input_requests:
+            if not isinstance(payload, Mapping):
+                return True
+            task_id = str(payload.get("task_id", "")).strip()
+            if not task_id or task_id in lineage_ids:
+                return True
+        return False
+
     def _evidence_repair_worktree_handoff_matches(
         self,
         state: RunState,
@@ -12247,11 +12282,63 @@ class Orchestrator:
                 ",".join(restored_persisted_owner_ids),
             )
 
-        if state.pending_input_requests or any(
+        tasks_by_id = {task.task_id: task for task in tasks}
+        repair_route_ids = self._retained_evidence_repair_priority_ids(
+            state,
+            tasks,
+            require_exact_handoff=False,
+        )
+        safe_repair_route_ids = self._retained_evidence_repair_priority_ids(
+            state,
+            tasks,
+        )
+        if (
+            repair_route_ids
+            and not safe_repair_route_ids
+            and self._changed_paths_excluding_agent_instructions()
+        ):
+            return self._block_evidence_repair_worktree_ownership_mismatch(
+                state,
+                tasks,
+                tasks_by_id[repair_route_ids[0]],
+            )
+        restored_repair_ids = (
+            safe_repair_route_ids
+            if self._prepend_evidence_repair_priority_ids(
+                state,
+                tasks,
+                safe_repair_route_ids,
+            )
+            else []
+        )
+        if restored_repair_ids:
+            self.logger.info(
+                "[recovery] restored evidence-repair priority tasks=%s",
+                ",".join(restored_repair_ids),
+            )
+            save_run_state(self.project_root, state)
+
+        has_pending_user_input = bool(state.pending_input_requests) or any(
             task.status == "waiting_user"
             or (task.status != "done" and bool(task.required_inputs))
             for task in tasks
-        ):
+        )
+        defer_pending_user_input = bool(
+            safe_repair_route_ids
+            and has_pending_user_input
+            and not self._retained_evidence_repair_requires_user_input(
+                state,
+                tasks,
+                safe_repair_route_ids,
+            )
+        )
+        if defer_pending_user_input:
+            self.logger.info(
+                "[recovery] deferred unrelated user input until retained "
+                "evidence repair runs tasks=%s",
+                ",".join(safe_repair_route_ids),
+            )
+        elif has_pending_user_input:
             reconciled_inputs = self._reconcile_orphaned_waiting_user_tasks(
                 state,
                 tasks,
@@ -12335,40 +12422,7 @@ class Orchestrator:
                 "[recovery] restored retained worktree ownership task=%s",
                 self._requeued_task_id(state),
             )
-        repair_route_ids = self._retained_evidence_repair_priority_ids(
-            state,
-            tasks,
-            require_exact_handoff=False,
-        )
-        safe_repair_route_ids = self._retained_evidence_repair_priority_ids(
-            state,
-            tasks,
-        )
-        if (
-            repair_route_ids
-            and not safe_repair_route_ids
-            and self._changed_paths_excluding_agent_instructions()
-        ):
-            return self._block_evidence_repair_worktree_ownership_mismatch(
-                state,
-                tasks,
-                tasks_by_id[repair_route_ids[0]],
-            )
-        restored_repair_ids = (
-            safe_repair_route_ids
-            if self._prepend_evidence_repair_priority_ids(
-                state,
-                tasks,
-                safe_repair_route_ids,
-            )
-            else []
-        )
-        if restored_repair_ids:
-            self.logger.info(
-                "[recovery] restored evidence-repair priority tasks=%s",
-                ",".join(restored_repair_ids),
-            )
-        if retry_state_changed or restored_requeue or restored_repair_ids:
+        if retry_state_changed or restored_requeue:
             save_run_state(self.project_root, state)
         if not self._parallel_sequential_retry_ids(state):
             self._commit_planning_baseline_if_needed(tasks, state=state)

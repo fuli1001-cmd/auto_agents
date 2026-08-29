@@ -3223,6 +3223,10 @@ class RetryFlowTests(unittest.TestCase):
                 _state: RunState,
                 active_tasks: list[TaskSpec],
             ) -> bool:
+                write_text(
+                    project_root / "operator-fixture.bin",
+                    "unowned operator input\n",
+                )
                 active_tasks[0].status = "pending"
                 orchestrator._persist_tasks(active_tasks)
                 return True
@@ -3245,7 +3249,7 @@ class RetryFlowTests(unittest.TestCase):
                 orchestrator,
                 "_process_pending_user_input",
                 side_effect=resume_input,
-            ), patch.object(
+            ) as process_input, patch.object(
                 orchestrator,
                 "_ensure_implement_verify_baseline",
             ), patch.object(
@@ -3259,6 +3263,7 @@ class RetryFlowTests(unittest.TestCase):
                 )
 
             self.assertIs(result, state)
+            process_input.assert_not_called()
             self.assertEqual(executed, [repair.task_id])
             self.assertEqual(
                 next(
@@ -3266,8 +3271,10 @@ class RetryFlowTests(unittest.TestCase):
                     for task in result.tasks
                     if task.task_id == waiting.task_id
                 ),
-                "pending",
+                "waiting_user",
             )
+            self.assertFalse((project_root / "operator-fixture.bin").exists())
+            self.assertEqual(changed_paths(project_root), ["candidate.py"])
 
     def test_saved_run_rehydrates_missing_ready_owner_before_blocked_resume(
         self,
