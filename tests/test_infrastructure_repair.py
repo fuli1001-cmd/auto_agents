@@ -11,6 +11,7 @@ from auto_agents.execution_recovery import (
 )
 from auto_agents.infrastructure_repair import (
     InfrastructureRepairResult,
+    _chrome_cdp_probe,
     managed_diagnostic_refs,
     repair_workspace_local_conda,
     scoped_verification_repair_instructions,
@@ -68,6 +69,26 @@ def test_managed_repair_result_is_json_serializable(tmp_path: Path) -> None:
         artifact_fingerprint="abc",
     )
     assert json.loads(json.dumps(result.to_dict()))["repaired"] is True
+
+
+def test_chrome_cdp_probe_avoids_desktop_keyring(tmp_path: Path) -> None:
+    class FailedProcess:
+        returncode = 1
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return "", "probe stopped"
+
+    with patch(
+        "auto_agents.infrastructure_repair.subprocess.Popen",
+        return_value=FailedProcess(),
+    ) as popen:
+        result = _chrome_cdp_probe(tmp_path / "google-chrome")
+
+    assert result["state"] == "unhealthy"
+    assert "--password-store=basic" in popen.call_args.args[0]
 
 
 def test_verification_repair_guard_rejects_weakened_tests() -> None:

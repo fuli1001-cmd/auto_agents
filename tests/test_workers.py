@@ -34,6 +34,7 @@ from auto_agents.workers import (
     WorkerEndpoint,
     WorkerSlotLease,
     build_environment_manifest,
+    enrich_worker_probe,
     forwarded_environment,
     worker_execute,
     worker_probe,
@@ -279,6 +280,36 @@ def test_worker_probe_reports_ffmpeg_and_ffprobe_capabilities(
     assert {"ffmpeg", "ffprobe"}.issubset(probe["capabilities"])
     assert probe["runtimes"]["ffmpeg"] == "ffmpeg version test"
     assert probe["runtimes"]["ffprobe"] == "ffprobe version test"
+
+
+def test_enriched_worker_chrome_probe_avoids_desktop_keyring(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    browser = tmp_path / "google-chrome"
+    browser.write_bytes(b"test browser")
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "auto_agents.workers.shutil.which",
+        lambda program: str(browser) if program == "google-chrome" else None,
+    )
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="Google Chrome test\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("auto_agents.workers.subprocess.run", fake_run)
+
+    probe = enrich_worker_probe({"capabilities": ["chrome"]})
+
+    assert probe["capability_details"]["chrome"]["state"] == "healthy"
+    launch = next(command for command in commands if "--dump-dom" in command)
+    assert "--password-store=basic" in launch
 
 
 def test_worker_probe_reports_docker_only_when_daemon_is_reachable(

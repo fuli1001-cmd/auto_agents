@@ -185,6 +185,7 @@ def enrich_worker_probe(probe: Mapping[str, object]) -> dict[str, object]:
                             "--disable-gpu",
                             "--disable-dev-shm-usage",
                             "--no-sandbox",
+                            "--password-store=basic",
                             f"--user-data-dir={data_dir}",
                             "--dump-dom",
                             "about:blank",
