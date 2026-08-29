@@ -127,6 +127,7 @@ class TaskSpec:
     verify_history: List[Dict[str, object]] = field(default_factory=list)
     verify_baseline_failures: List[str] = field(default_factory=list)
     verify_baseline_ref: str = ""
+    verify_baseline_source_ref: str = ""
     parent_task_id: str = ""
     split_depth: int = 0
     task_origin: str = "planned"
@@ -188,6 +189,9 @@ class TaskSpec:
             verify_history=verify_history,
             verify_baseline_failures=[str(item) for item in data.get("verify_baseline_failures", [])],
             verify_baseline_ref=str(data.get("verify_baseline_ref", "")),
+            verify_baseline_source_ref=str(
+                data.get("verify_baseline_source_ref", "")
+            ),
             parent_task_id=str(data.get("parent_task_id", "")),
             split_depth=int(data.get("split_depth", 0) or 0),
             task_origin=str(data.get("task_origin", "planned") or "planned"),

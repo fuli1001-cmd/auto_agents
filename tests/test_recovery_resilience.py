@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gates import GateCommandBaselineIdentityError
+from auto_agents.config import load_run_state, save_run_state
 from auto_agents.git_ops import (
     add_worktree,
     changed_files,
@@ -20,6 +21,7 @@ from auto_agents.git_ops import (
     head_ref,
     ref_exists,
     update_ref,
+    worktree_fingerprint,
 )
 from auto_agents.io_utils import read_json, write_json, write_text
 from auto_agents.models import (
@@ -277,6 +279,352 @@ class RecoveryResilienceTests(unittest.TestCase):
             )
             self.assertEqual(captured.returncode, 0, msg=captured.stderr)
             self.assertEqual(captured.stdout, "VALUE = 'retained'\n")
+
+    def test_persisted_dirty_repair_reuses_captured_snapshot_after_restart(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            retained = root / "retained.py"
+            command = "python -m pytest -q tests/test_owned.py::test_owned"
+            write_text(retained, "VALUE = 'base'\n")
+            write_text(
+                root / "tests" / "test_owned.py",
+                "def test_owned():\n    assert True\n",
+            )
+            base_ref = commit_all(root, "test: add baseline source")
+            write_text(retained, "VALUE = 'handoff'\n")
+            dirty_fingerprint = worktree_fingerprint(root)
+            dirty_baseline_ref = f"{base_ref}:{dirty_fingerprint}"
+            task = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair retained proof",
+                description="",
+                acceptance=[],
+                task_origin="evidence_repair",
+                verification_refs=[f"cmd:{command}"],
+                verify_baseline_ref=dirty_baseline_ref,
+                verify_baseline_schema_version=VERIFY_BASELINE_SCHEMA_VERSION,
+            )
+            state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[task],
+            )
+
+            self.assertEqual(
+                orchestrator._capture_retained_worktree_ownership(
+                    state,
+                    [task.task_id],
+                    source="implementation_ready",
+                ),
+                [task.task_id],
+            )
+            record = state.resume_context["retained_worktree_ownership"][
+                task.task_id
+            ]
+            snapshot_ref = str(record["verify_baseline_snapshot_ref"])
+            snapshot_commit = str(record["verify_baseline_snapshot_commit"])
+            self.assertEqual(task.verify_baseline_source_ref, snapshot_commit)
+            write_text(retained, "VALUE = 'later-candidate'\n")
+            self.assertEqual(
+                orchestrator._capture_retained_worktree_ownership(
+                    state,
+                    [task.task_id],
+                    source="implementation_ready",
+                    replace_existing=True,
+                ),
+                [task.task_id],
+            )
+            later_record = state.resume_context[
+                "retained_worktree_ownership"
+            ][task.task_id]
+            self.assertNotEqual(
+                later_record["verify_baseline_snapshot_ref"],
+                snapshot_ref,
+            )
+            self.assertEqual(task.verify_baseline_source_ref, snapshot_commit)
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(root, state)
+
+            commit_all(root, "test: commit later candidate")
+            write_text(retained, "VALUE = 'recovery-head'\n")
+            recovery_head = commit_all(root, "test: advance recovery head")
+
+            restarted = Orchestrator(root)
+            restarted.config.gates.steps = [
+                VerificationStep(
+                    proof_id="owned",
+                    command=command,
+                )
+            ]
+            resumed = load_run_state(root)
+            resumed_task = resumed.tasks[0]
+
+            self.assertFalse(
+                restarted._ensure_task_verify_baseline(
+                    resumed_task,
+                    state=resumed,
+                )
+            )
+            self.assertEqual(head_ref(root), recovery_head)
+            self.assertEqual(
+                resumed_task.verify_baseline_source_ref,
+                snapshot_commit,
+            )
+            self.assertEqual(
+                resumed_task.verify_baseline_ref,
+                dirty_baseline_ref,
+            )
+            captured = subprocess.run(
+                ["git", "show", f"{snapshot_ref}:retained.py"],
+                cwd=root,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            self.assertEqual(captured.returncode, 0, msg=captured.stderr)
+            self.assertEqual(captured.stdout, "VALUE = 'handoff'\n")
+
+            current_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout="FAILED tests/test_owned.py::test_owned - assert False\n",
+                    )
+                ],
+                summary="one failed",
+            )
+            baseline_gate = GateResult(
+                ok=True,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=True,
+                        returncode=0,
+                    )
+                ],
+                summary="one passed",
+            )
+            with patch.object(
+                restarted,
+                "_run_task_gate_commands_for_commands",
+                side_effect=[(current_gate, ""), (baseline_gate, "")],
+            ) as run_gate:
+                verify_result = restarted._run_task_verify(
+                    resumed_task,
+                    state=resumed,
+                )
+            self.assertFalse(verify_result["ok"])
+            self.assertEqual(
+                run_gate.call_args_list[1].kwargs["source_ref"],
+                snapshot_commit,
+            )
+
+    def test_legacy_dirty_baseline_migrates_from_matching_attempt_checkpoint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            retained = root / "retained.py"
+            write_text(retained, "VALUE = 'base'\n")
+            base_ref = commit_all(root, "test: add baseline source")
+            write_text(retained, "VALUE = 'handoff'\n")
+            paths = orchestrator._changed_paths_excluding_agent_instructions()
+            path_fingerprints = (
+                orchestrator._retained_worktree_path_fingerprints(paths)
+            )
+            dirty_fingerprint = (
+                orchestrator._worktree_fingerprint_excluding_agent_instructions()
+            )
+            handoff_ref = commit_all(root, "test: preserve legacy handoff")
+            write_text(retained, "VALUE = 'recovery-head'\n")
+            recovery_head = commit_all(root, "test: advance recovery head")
+            task = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair retained proof",
+                description="",
+                acceptance=[],
+                task_origin="evidence_repair",
+                verify_baseline_ref=f"{base_ref}:{dirty_fingerprint}",
+                verify_baseline_schema_version=VERIFY_BASELINE_SCHEMA_VERSION,
+            )
+            state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[task],
+                resume_context={
+                    "retained_worktree_ownership": {
+                        task.task_id: {
+                            "version": 1,
+                            "owner_task_id": task.task_id,
+                            "head_ref": base_ref,
+                            "worktree_fingerprint": dirty_fingerprint,
+                            "changed_paths": paths,
+                            "path_fingerprints": path_fingerprints,
+                            "source": "implementation_ready",
+                        }
+                    },
+                    "task_attempt_base_refs": {
+                        task.task_id: handoff_ref,
+                    },
+                },
+            )
+            orchestrator.config.gates.steps = [
+                VerificationStep(
+                    proof_id="owned",
+                    command="python -m pytest -q tests/test_owned.py",
+                )
+            ]
+
+            self.assertTrue(
+                orchestrator._ensure_task_verify_baseline(task, state=state)
+            )
+            self.assertEqual(head_ref(root), recovery_head)
+            source_ref = orchestrator._git_ref_from_verify_baseline_ref(
+                task.verify_baseline_ref
+            )
+            self.assertTrue(
+                source_ref.startswith(
+                    "refs/auto-agents/gate-snapshots/retained-baseline-"
+                )
+            )
+            captured = subprocess.run(
+                ["git", "show", f"{source_ref}:retained.py"],
+                cwd=root,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            self.assertEqual(captured.returncode, 0, msg=captured.stderr)
+            self.assertEqual(captured.stdout, "VALUE = 'handoff'\n")
+            self.assertEqual(
+                task.verify_baseline_source_ref,
+                state.resume_context["retained_worktree_ownership"][
+                    task.task_id
+                ]["verify_baseline_snapshot_commit"],
+            )
+            self.assertEqual(
+                state.resume_context["verify_baseline_migrations"][
+                    task.task_id
+                ]["source"],
+                "matching_retained_checkpoint",
+            )
+
+    def test_clean_repair_baseline_remains_commit_backed_after_head_advances(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            write_text(root / "baseline.py", "VALUE = 'base'\n")
+            base_ref = commit_all(root, "test: add clean baseline")
+            task = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair clean proof",
+                description="",
+                acceptance=[],
+                task_origin="evidence_repair",
+                verify_baseline_ref=(
+                    f"{base_ref}:{hashlib.sha256(b'').hexdigest()}"
+                ),
+                verify_baseline_schema_version=VERIFY_BASELINE_SCHEMA_VERSION,
+            )
+            state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[task],
+            )
+            write_text(root / "later.py", "VALUE = 'later'\n")
+            commit_all(root, "test: advance head")
+            orchestrator.config.gates.steps = [
+                VerificationStep(
+                    proof_id="owned",
+                    command="python -m pytest -q tests/test_owned.py",
+                )
+            ]
+
+            self.assertFalse(
+                orchestrator._ensure_task_verify_baseline(task, state=state)
+            )
+            self.assertNotEqual(state.status, "blocked")
+            self.assertEqual(task.verify_baseline_source_ref, base_ref)
+
+    def test_legacy_dirty_baseline_blocks_once_when_checkpoint_is_lost(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            retained = root / "retained.py"
+            write_text(retained, "VALUE = 'base'\n")
+            base_ref = commit_all(root, "test: add baseline source")
+            write_text(retained, "VALUE = 'lost-handoff'\n")
+            paths = orchestrator._changed_paths_excluding_agent_instructions()
+            path_fingerprints = (
+                orchestrator._retained_worktree_path_fingerprints(paths)
+            )
+            dirty_fingerprint = (
+                orchestrator._worktree_fingerprint_excluding_agent_instructions()
+            )
+            self.assertTrue(hard_reset_clean(root, base_ref))
+            write_text(retained, "VALUE = 'recovery-head'\n")
+            recovery_head = commit_all(root, "test: advance without handoff")
+            task = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair retained proof",
+                description="",
+                acceptance=[],
+                task_origin="evidence_repair",
+                verify_baseline_ref=f"{base_ref}:{dirty_fingerprint}",
+                verify_baseline_schema_version=VERIFY_BASELINE_SCHEMA_VERSION,
+            )
+            state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[task],
+                resume_context={
+                    "retained_worktree_ownership": {
+                        task.task_id: {
+                            "version": 1,
+                            "owner_task_id": task.task_id,
+                            "head_ref": base_ref,
+                            "worktree_fingerprint": dirty_fingerprint,
+                            "changed_paths": paths,
+                            "path_fingerprints": path_fingerprints,
+                            "source": "implementation_ready",
+                        }
+                    },
+                    "task_attempt_base_refs": {
+                        task.task_id: recovery_head,
+                    },
+                },
+            )
+            orchestrator.config.gates.steps = [
+                VerificationStep(
+                    proof_id="owned",
+                    command="python -m pytest -q tests/test_owned.py",
+                )
+            ]
+
+            self.assertFalse(
+                orchestrator._ensure_task_verify_baseline(task, state=state)
+            )
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(
+                state.active_blocker["category"],
+                "retained_verify_baseline_snapshot_lost",
+            )
+            self.assertEqual(
+                state.last_recovery_route["engine_invariant"],
+                "dirty_verify_baseline_checkpoint_lost",
+            )
+            self.assertEqual(task.verify_baseline_ref, f"{base_ref}:{dirty_fingerprint}")
 
     def test_bracketed_vitest_suite_baseline_has_stable_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

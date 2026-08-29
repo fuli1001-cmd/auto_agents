@@ -314,6 +314,7 @@ class StageOwnershipRouteError(RuntimeError):
 
 
 VERIFY_BASELINE_SCHEMA_VERSION = 2
+_EMPTY_WORKTREE_FINGERPRINT = hashlib.sha256(b"").hexdigest()
 IMPLEMENTATION_SCOPE_POLICY_VERSION = 5
 EVIDENCE_PREFLIGHT_FINGERPRINT_VERSION = 10
 EVIDENCE_PREFLIGHT_ROUTE_REPEAT_LIMIT = 2
@@ -341,6 +342,13 @@ _DANGLING_DEPENDENCIES_AFTER_TASK_PRUNING = (
     "dangling_dependencies_after_task_pruning"
 )
 _RETAINED_WORKTREE_OWNERSHIP_CONTEXT = "retained_worktree_ownership"
+_RETAINED_VERIFY_BASELINE_SNAPSHOT_REF = "verify_baseline_snapshot_ref"
+_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT = "verify_baseline_snapshot_commit"
+_RETAINED_VERIFY_BASELINE_SNAPSHOT_TREE = "verify_baseline_snapshot_tree"
+_RETAINED_VERIFY_BASELINE_SNAPSHOT_VERSION = 1
+_RETAINED_VERIFY_BASELINE_LOST_CATEGORY = (
+    "retained_verify_baseline_snapshot_lost"
+)
 _RETAINED_REPAIR_PRESERVED_PATHS_CONTEXT = "retained_repair_preserved_paths"
 _RETAINED_WORKTREE_EXECUTION_RECOVERY_MIGRATIONS_CONTEXT = (
     "retained_worktree_execution_recovery_migrations"
@@ -1125,6 +1133,7 @@ class Orchestrator:
 
             invalid_task_ids.append(task.task_id)
             task.verify_baseline_ref = ""
+            task.verify_baseline_source_ref = ""
             task.verify_baseline_failures = []
             task.verify_baseline_schema_version = (
                 VERIFY_BASELINE_SCHEMA_VERSION
@@ -8322,6 +8331,105 @@ class Orchestrator:
             fingerprints[path] = hasher.hexdigest()
         return fingerprints
 
+    @staticmethod
+    def _retained_verify_baseline_snapshot_payload(
+        snapshot: object,
+    ) -> Dict[str, object]:
+        return {
+            _RETAINED_VERIFY_BASELINE_SNAPSHOT_REF: str(
+                getattr(snapshot, "ref_name", "")
+            ),
+            _RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT: str(
+                getattr(snapshot, "commit_sha", "")
+            ),
+            _RETAINED_VERIFY_BASELINE_SNAPSHOT_TREE: str(
+                getattr(snapshot, "tree_sha", "")
+            ),
+            "verify_baseline_snapshot_version": (
+                _RETAINED_VERIFY_BASELINE_SNAPSHOT_VERSION
+            ),
+        }
+
+    def _retained_verify_baseline_snapshot_plan_id(
+        self,
+        state: RunState,
+        record: Mapping[str, object],
+    ) -> str:
+        material = {
+            "run_id": state.run_id,
+            "head_ref": str(record.get("head_ref", "")).strip(),
+            "verify_baseline_cache_identity": str(
+                record.get("verify_baseline_cache_identity", "")
+            ).strip(),
+            "verify_baseline_snapshot_id": str(
+                record.get("verify_baseline_snapshot_id", "")
+            ).strip(),
+            "captured_at": str(record.get("captured_at", "")).strip(),
+            "worktree_fingerprint": str(
+                record.get("worktree_fingerprint", "")
+            ).strip(),
+            "changed_paths": sorted(
+                str(path).strip().replace("\\", "/")
+                for path in record.get("changed_paths", []) or []
+                if str(path).strip()
+            ),
+            "path_fingerprints": dict(
+                record.get("path_fingerprints", {})
+                if isinstance(record.get("path_fingerprints", {}), dict)
+                else {}
+            ),
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                material,
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        return f"retained-baseline-{digest}"
+
+    def _create_retained_verify_baseline_snapshot(
+        self,
+        state: RunState,
+        record: Mapping[str, object],
+        *,
+        project_root: Optional[Path] = None,
+    ) -> Dict[str, object]:
+        snapshot = GateSnapshotManager(
+            project_root or self.project_root,
+            self._retained_verify_baseline_snapshot_plan_id(state, record),
+        ).create()
+        return self._retained_verify_baseline_snapshot_payload(snapshot)
+
+    def _bind_retained_verify_baseline_source(
+        self,
+        state: RunState,
+        task_ids: Iterable[str],
+        record: Mapping[str, object],
+    ) -> None:
+        source_ref = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")
+            or record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_REF, "")
+        ).strip()
+        if not source_ref:
+            return
+        task_ids_set = {
+            str(task_id).strip()
+            for task_id in task_ids
+            if str(task_id).strip()
+        }
+        for task in state.tasks:
+            if (
+                task.task_id in task_ids_set
+                and task.task_origin == "evidence_repair"
+                and self._dirty_verify_baseline_identity(
+                    task.verify_baseline_ref
+                )
+                == self._retained_record_verify_baseline_identity(record)
+            ):
+                task.verify_baseline_source_ref = source_ref
+                task.verify_baseline_failures = []
+
     def _capture_retained_worktree_ownership(
         self,
         state: RunState,
@@ -8353,10 +8461,18 @@ class Orchestrator:
             return []
 
         records = self._retained_worktree_ownership_records(state)
-        captured: List[str] = []
+        captured = [
+            task_id
+            for task_id in owner_ids
+            if replace_existing or task_id not in records
+        ]
+        if not captured:
+            return []
         snapshot = {
             "version": 1,
             "head_ref": head_ref(self.project_root),
+            "verify_baseline_cache_identity": self._task_verify_baseline_ref(),
+            "verify_baseline_snapshot_id": uuid.uuid4().hex,
             "worktree_fingerprint": (
                 self._worktree_fingerprint_excluding_agent_instructions()
             ),
@@ -8367,18 +8483,20 @@ class Orchestrator:
             "source": str(source).strip() or "sequential_retry",
             "captured_at": utc_now_iso(),
         }
-        for task_id in owner_ids:
-            if task_id in records and not replace_existing:
-                continue
+        snapshot.update(
+            self._create_retained_verify_baseline_snapshot(state, snapshot)
+        )
+        for task_id in captured:
             records[task_id] = {
                 **snapshot,
                 "owner_task_id": task_id,
             }
-            captured.append(task_id)
-        if captured:
-            state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = (
-                records
-            )
+        state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+        self._bind_retained_verify_baseline_source(
+            state,
+            captured,
+            snapshot,
+        )
         return captured
 
     def _restore_missing_ready_owner_before_evidence_repair(
@@ -9894,6 +10012,8 @@ class Orchestrator:
         snapshot = {
             "version": 1,
             "head_ref": checkpoint_head,
+            "verify_baseline_cache_identity": self._task_verify_baseline_ref(),
+            "verify_baseline_snapshot_id": uuid.uuid4().hex,
             "worktree_fingerprint": (
                 self._worktree_fingerprint_excluding_agent_instructions()
             ),
@@ -9906,6 +10026,9 @@ class Orchestrator:
             "checkpoint_worktree_fingerprint": checkpoint_worktree,
             "captured_at": utc_now_iso(),
         }
+        snapshot.update(
+            self._create_retained_verify_baseline_snapshot(state, snapshot)
+        )
         captured: List[str] = []
         for task_id in owner_ids:
             if task_id in records:
@@ -9919,6 +10042,11 @@ class Orchestrator:
         if captured:
             state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = (
                 records
+            )
+            self._bind_retained_verify_baseline_source(
+                state,
+                captured,
+                snapshot,
             )
         return captured
 
@@ -14801,11 +14929,18 @@ class Orchestrator:
             task.status = "in_progress"
             self._persist_tasks(tasks)
 
-        if (
-            not self._is_prebaseline_recovery_task(task)
-            and self._ensure_task_verify_baseline(task, state=state)
-        ):
-            self._persist_tasks(tasks)
+        if not self._is_prebaseline_recovery_task(task):
+            baseline_changed = self._ensure_task_verify_baseline(
+                task,
+                state=state,
+            )
+            if baseline_changed:
+                self._persist_tasks(tasks)
+            if state.status == "blocked":
+                state.tasks = tasks
+                self._persist_tasks(tasks)
+                save_run_state(self.project_root, state)
+                return state
 
         restored_checkpoint_ref = self._restore_task_failure_checkpoint(
             state,
@@ -15235,6 +15370,7 @@ class Orchestrator:
             "verify_history",
             "verify_baseline_failures",
             "verify_baseline_ref",
+            "verify_baseline_source_ref",
             "scratchpad",
             "arbitration_history",
             "recovery_history",
@@ -15549,6 +15685,7 @@ class Orchestrator:
             "commit_sha": checkpoint_sha,
             "base_ref": (
                 self._task_attempt_base_ref(state, task)
+                or task.verify_baseline_source_ref
                 or self._git_ref_from_verify_baseline_ref(
                     task.verify_baseline_ref
                 )
@@ -16182,6 +16319,7 @@ class Orchestrator:
         task.verify_history = list(updated.verify_history)
         task.verify_baseline_failures = list(updated.verify_baseline_failures)
         task.verify_baseline_ref = updated.verify_baseline_ref
+        task.verify_baseline_source_ref = updated.verify_baseline_source_ref
         task.expected_test_migrations = list(updated.expected_test_migrations)
         task.mutable_artifacts = list(updated.mutable_artifacts)
         task.requirement_proofs = list(updated.requirement_proofs)
@@ -20357,6 +20495,7 @@ class Orchestrator:
         attempt_base_ref = self._task_attempt_base_ref(state, task)
         baseline_ref = (
             attempt_base_ref
+            or task.verify_baseline_source_ref
             or task.verify_baseline_ref
             or state.implement_verify_baseline_ref
             or state.stage_summaries.get("implement_baseline_ref", "")
@@ -20428,6 +20567,7 @@ class Orchestrator:
                 if pending_task.status == "done":
                     continue
                 pending_task.verify_baseline_ref = ""
+                pending_task.verify_baseline_source_ref = ""
                 pending_task.verify_baseline_failures = []
                 pending_task.verify_baseline_schema_version = 0
             self._persist_tasks(tasks)
@@ -20507,7 +20647,8 @@ class Orchestrator:
             return None
 
         baseline_ref = (
-            task.verify_baseline_ref
+            task.verify_baseline_source_ref
+            or task.verify_baseline_ref
             or state.implement_verify_baseline_ref
             or state.stage_summaries.get("implement_baseline_ref", "")
         )
@@ -20769,8 +20910,11 @@ class Orchestrator:
                     failed_commands,
                     collect_all=True,
                     context=f"lazy task baseline verification ({task.task_id})",
-                    source_ref=self._git_ref_from_verify_baseline_ref(
-                        task.verify_baseline_ref
+                    source_ref=(
+                        task.verify_baseline_source_ref
+                        or self._git_ref_from_verify_baseline_ref(
+                            task.verify_baseline_ref
+                        )
                     ),
                 )
             )
@@ -22072,6 +22216,390 @@ class Orchestrator:
         base = f"{head_ref(self.project_root)}:{worktree_fingerprint(self.project_root)}"
         return f"{base}:{verification_context}" if verification_context else base
 
+    @staticmethod
+    def _dirty_verify_baseline_identity(
+        baseline_ref: str,
+    ) -> Tuple[str, str]:
+        parts = str(baseline_ref or "").strip().split(":", 2)
+        if (
+            len(parts) >= 2
+            and re.fullmatch(r"[0-9a-f]{7,40}", parts[0], flags=re.IGNORECASE)
+            and re.fullmatch(r"[0-9a-f]{64}", parts[1], flags=re.IGNORECASE)
+        ):
+            return parts[0], parts[1]
+        return "", ""
+
+    @classmethod
+    def _retained_record_verify_baseline_identity(
+        cls,
+        record: Mapping[str, object],
+    ) -> Tuple[str, str]:
+        cache_identity = cls._dirty_verify_baseline_identity(
+            str(record.get("verify_baseline_cache_identity", ""))
+        )
+        if cache_identity != ("", ""):
+            return cache_identity
+        return (
+            str(record.get("head_ref", "")).strip(),
+            str(record.get("worktree_fingerprint", "")).strip(),
+        )
+
+    @staticmethod
+    def _git_commit_and_tree(
+        project_root: Path,
+        source_ref: str,
+    ) -> Tuple[str, str]:
+        candidate = str(source_ref).strip()
+        if not candidate:
+            return "", ""
+        commit = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{candidate}^{{commit}}"],
+            cwd=str(project_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if commit.returncode != 0 or not commit.stdout.strip():
+            return "", ""
+        commit_sha = commit.stdout.strip()
+        tree = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{commit_sha}^{{tree}}"],
+            cwd=str(project_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if tree.returncode != 0 or not tree.stdout.strip():
+            return "", ""
+        return commit_sha, tree.stdout.strip()
+
+    def _retained_verify_baseline_records_for_task(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> List[Tuple[str, Dict[str, object]]]:
+        records = self._retained_worktree_ownership_records(state)
+        tasks_by_id = {candidate.task_id: candidate for candidate in state.tasks}
+        owner_ids: List[str] = []
+        cursor: Optional[TaskSpec] = task
+        while cursor is not None and cursor.task_id not in owner_ids:
+            owner_ids.append(cursor.task_id)
+            if not cursor.parent_task_id:
+                break
+            cursor = tasks_by_id.get(cursor.parent_task_id)
+
+        matched: List[Tuple[str, Dict[str, object]]] = []
+        for owner_id in owner_ids:
+            record = records.get(owner_id)
+            if not isinstance(record, dict):
+                continue
+            try:
+                version = int(record.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            raw_paths = record.get("changed_paths", [])
+            raw_fingerprints = record.get("path_fingerprints", {})
+            paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+            } if isinstance(raw_paths, list) else set()
+            fingerprint_paths = {
+                str(path).strip().replace("\\", "/")
+                for path in raw_fingerprints
+                if str(path).strip()
+            } if isinstance(raw_fingerprints, dict) else set()
+            if (
+                version == 1
+                and paths
+                and fingerprint_paths == paths
+                and str(record.get("owner_task_id", "")).strip() == owner_id
+                and str(record.get("head_ref", "")).strip()
+                and str(record.get("worktree_fingerprint", "")).strip()
+            ):
+                matched.append((owner_id, record))
+        return matched
+
+    def _resolved_retained_verify_baseline_snapshot(
+        self,
+        record: Mapping[str, object],
+    ) -> str:
+        snapshot_ref = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_REF, "")
+        ).strip()
+        expected_commit = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")
+        ).strip()
+        expected_tree = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_TREE, "")
+        ).strip()
+        if not snapshot_ref or not expected_commit or not expected_tree:
+            return ""
+
+        commit_sha, tree_sha = self._git_commit_and_tree(
+            self.project_root,
+            snapshot_ref,
+        )
+        if commit_sha == expected_commit and tree_sha == expected_tree:
+            return snapshot_ref
+
+        retained_commit, retained_tree = self._git_commit_and_tree(
+            self.project_root,
+            expected_commit,
+        )
+        if retained_commit != expected_commit or retained_tree != expected_tree:
+            return ""
+        update_ref(self.project_root, snapshot_ref, expected_commit)
+        return snapshot_ref
+
+    def _git_path_bytes_at_commit(
+        self,
+        commit_sha: str,
+        path: str,
+    ) -> Tuple[bool, bytes]:
+        pathspec = f":(top,literal){path}"
+        entry = subprocess.run(
+            ["git", "ls-tree", "-z", commit_sha, "--", pathspec],
+            cwd=str(self.project_root),
+            capture_output=True,
+        )
+        if entry.returncode != 0:
+            return False, b""
+        if not entry.stdout:
+            return True, b"[missing]"
+        entries = [item for item in entry.stdout.split(b"\0") if item]
+        exact: List[bytes] = []
+        for item in entries:
+            metadata, separator, raw_path = item.partition(b"\t")
+            if not separator:
+                return False, b""
+            decoded_path = raw_path.decode("utf-8", errors="surrogateescape")
+            if decoded_path == path:
+                exact.append(metadata)
+        if len(exact) != 1:
+            return False, b""
+        metadata = exact[0].split()
+        if len(metadata) != 3 or metadata[1] != b"blob":
+            return False, b""
+        blob = subprocess.run(
+            ["git", "cat-file", "blob", metadata[2].decode("ascii")],
+            cwd=str(self.project_root),
+            capture_output=True,
+        )
+        if blob.returncode != 0:
+            return False, b""
+        return True, blob.stdout
+
+    def _legacy_retained_verify_baseline_candidate_refs(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        owner_id: str,
+    ) -> List[str]:
+        candidates: List[str] = []
+
+        def add(value: object) -> None:
+            candidate = str(value or "").strip()
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        for task_id in dict.fromkeys([task.task_id, owner_id]):
+            checkpoint = state.task_failure_checkpoints.get(task_id, {})
+            if isinstance(checkpoint, dict):
+                add(checkpoint.get("ref"))
+                add(checkpoint.get("commit_sha"))
+            add(self._task_attempt_base_refs(state).get(task_id))
+        add(task.verify_baseline_source_ref)
+        for candidate_task in state.tasks:
+            add(candidate_task.commit_sha)
+        add(head_ref(self.project_root))
+        add(self._git_ref_from_verify_baseline_ref(task.verify_baseline_ref))
+        return candidates
+
+    def _materialize_legacy_retained_verify_baseline(
+        self,
+        state: RunState,
+        record: Mapping[str, object],
+        source_ref: str,
+    ) -> Dict[str, object]:
+        base_ref = str(record.get("head_ref", "")).strip()
+        base_commit, _base_tree = self._git_commit_and_tree(
+            self.project_root,
+            base_ref,
+        )
+        source_commit, source_tree = self._git_commit_and_tree(
+            self.project_root,
+            source_ref,
+        )
+        raw_paths = record.get("changed_paths", [])
+        paths = {
+            str(path).strip().replace("\\", "/")
+            for path in raw_paths
+            if str(path).strip()
+        } if isinstance(raw_paths, list) else set()
+        raw_fingerprints = record.get("path_fingerprints", {})
+        if not isinstance(raw_fingerprints, dict):
+            return {}
+        if not base_commit or not source_commit or not paths:
+            return {}
+        diff = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "-z",
+                base_commit,
+                source_commit,
+                "--",
+            ],
+            cwd=str(self.project_root),
+            capture_output=True,
+        )
+        if diff.returncode != 0:
+            return {}
+        changed_at_source = {
+            raw_path.decode("utf-8", errors="surrogateescape")
+            for raw_path in diff.stdout.split(b"\0")
+            if raw_path
+        }
+        if changed_at_source != paths:
+            return {}
+
+        worktree_hasher = hashlib.sha256()
+        for path in sorted(paths):
+            expected = str(raw_fingerprints.get(path, "")).strip()
+            if (
+                not path
+                or path.startswith("/")
+                or ".." in path.split("/")
+                or not expected
+            ):
+                return {}
+            readable, content = self._git_path_bytes_at_commit(
+                source_commit,
+                path,
+            )
+            if (
+                not readable
+                or hashlib.sha256(content).hexdigest() != expected
+            ):
+                return {}
+            worktree_hasher.update(path.encode("utf-8"))
+            worktree_hasher.update(b"\0")
+            worktree_hasher.update(content)
+            worktree_hasher.update(b"\0")
+        if worktree_hasher.hexdigest() != str(
+            record.get("worktree_fingerprint", "")
+        ).strip():
+            return {}
+
+        snapshot_ref = (
+            "refs/auto-agents/gate-snapshots/"
+            + self._retained_verify_baseline_snapshot_plan_id(state, record)
+        )
+        update_ref(self.project_root, snapshot_ref, source_commit)
+        return {
+            _RETAINED_VERIFY_BASELINE_SNAPSHOT_REF: snapshot_ref,
+            _RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT: source_commit,
+            _RETAINED_VERIFY_BASELINE_SNAPSHOT_TREE: source_tree,
+            "verify_baseline_snapshot_version": (
+                _RETAINED_VERIFY_BASELINE_SNAPSHOT_VERSION
+            ),
+        }
+
+    def _store_retained_verify_baseline_snapshot(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        owner_id: str,
+        record: Dict[str, object],
+        snapshot: Mapping[str, object],
+        *,
+        migration_source: str,
+    ) -> str:
+        record.update(dict(snapshot))
+        records = self._retained_worktree_ownership_records(state)
+        records[owner_id] = record
+        state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+        source_ref = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_REF, "")
+        ).strip()
+        source_commit = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")
+        ).strip()
+        task.verify_baseline_source_ref = source_commit or source_ref
+        raw_migrations = state.resume_context.get(
+            "verify_baseline_migrations",
+            {},
+        )
+        migrations = (
+            dict(raw_migrations) if isinstance(raw_migrations, dict) else {}
+        )
+        migrations[task.task_id] = {
+            "schema_version": VERIFY_BASELINE_SCHEMA_VERSION,
+            "migrated_at": utc_now_iso(),
+            "reason": "legacy dirty baseline materialized from retained checkpoint",
+            "source": migration_source,
+            "source_ref": source_ref,
+            "source_commit": source_commit,
+            "owner_task_id": owner_id,
+        }
+        state.resume_context["verify_baseline_migrations"] = migrations
+        return source_ref
+
+    def _block_lost_retained_verify_baseline_snapshot(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        owner_id: str,
+        record: Mapping[str, object],
+        candidate_refs: Iterable[str],
+    ) -> None:
+        detail = {
+            "task_id": task.task_id,
+            "owner_task_id": owner_id,
+            "baseline_ref": task.verify_baseline_ref,
+            "expected_head_ref": str(record.get("head_ref", "")).strip(),
+            "expected_worktree_fingerprint": str(
+                record.get("worktree_fingerprint", "")
+            ).strip(),
+            "changed_paths": sorted(
+                str(path).strip().replace("\\", "/")
+                for path in record.get("changed_paths", []) or []
+                if str(path).strip()
+            ),
+            "candidate_refs": list(dict.fromkeys(candidate_refs)),
+        }
+        fingerprint = "sha256:" + hashlib.sha256(
+            json.dumps(detail, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        reason = (
+            f"evidence repair {task.task_id} retained a dirty verification "
+            "baseline, but no durable snapshot or byte-matching checkpoint is "
+            "available. The immutable pre-repair baseline cannot be reconstructed "
+            "safely. auto_agents will not rebase it to the current HEAD or schedule "
+            "another target recovery."
+        )
+        self._block_run(
+            state,
+            owner="auto_agents",
+            category=_RETAINED_VERIFY_BASELINE_LOST_CATEGORY,
+            reason=reason,
+            fingerprint=fingerprint,
+        )
+        state.active_blocker["retained_verify_baseline_snapshot"] = detail
+        state.last_recovery_route = {
+            "outcome": "invariant_violation",
+            "failure_kind": _RETAINED_VERIFY_BASELINE_LOST_CATEGORY,
+            "reason": reason,
+            "engine_invariant": "dirty_verify_baseline_checkpoint_lost",
+            "task_id": task.task_id,
+        }
+        self._persist_tasks(state.tasks)
+        save_run_state(self.project_root, state)
+        self.logger.error(reason)
+
     def _exact_task_verify_baseline_ref(
         self,
         state: RunState,
@@ -22087,6 +22615,160 @@ class Orchestrator:
 
         if task.task_origin != "evidence_repair":
             return ""
+
+        def with_context(source_ref: str) -> str:
+            return (
+                f"{source_ref}:{verification_context}"
+                if source_ref and verification_context
+                else source_ref
+            )
+
+        configured_source_ref = str(task.verify_baseline_source_ref).strip()
+        configured_commit, _configured_tree = self._git_commit_and_tree(
+            self.project_root,
+            configured_source_ref,
+        )
+        if configured_commit:
+            return with_context(configured_source_ref)
+
+        baseline_git_ref = self._git_ref_from_verify_baseline_ref(
+            task.verify_baseline_ref
+        )
+        missing_baseline_snapshot_ref = False
+        if baseline_git_ref.startswith("refs/auto-agents/gate-snapshots/"):
+            baseline_commit, _baseline_tree = self._git_commit_and_tree(
+                self.project_root,
+                baseline_git_ref,
+            )
+            if baseline_commit:
+                task.verify_baseline_source_ref = baseline_git_ref
+                return with_context(baseline_git_ref)
+            missing_baseline_snapshot_ref = True
+
+        all_retained_records = self._retained_verify_baseline_records_for_task(
+            state,
+            task,
+        )
+        dirty_identity = self._dirty_verify_baseline_identity(
+            task.verify_baseline_ref
+        )
+        if dirty_identity[1] == _EMPTY_WORKTREE_FINGERPRINT:
+            baseline_commit, _baseline_tree = self._git_commit_and_tree(
+                self.project_root,
+                baseline_git_ref,
+            )
+            if baseline_commit:
+                task.verify_baseline_source_ref = baseline_commit
+                return with_context(baseline_commit)
+        retained_records = all_retained_records
+        if dirty_identity != ("", ""):
+            retained_records = [
+                (owner_id, record)
+                for owner_id, record in all_retained_records
+                if self._retained_record_verify_baseline_identity(record)
+                == dirty_identity
+            ]
+            if not retained_records:
+                current_identity = (
+                    head_ref(self.project_root),
+                    self._worktree_fingerprint_excluding_agent_instructions(),
+                )
+                if current_identity != dirty_identity:
+                    owner_id, record = (
+                        all_retained_records[0]
+                        if all_retained_records
+                        else (task.task_id, {})
+                    )
+                    self._block_lost_retained_verify_baseline_snapshot(
+                        state,
+                        task,
+                        owner_id,
+                        record,
+                        [
+                            configured_source_ref,
+                            baseline_git_ref,
+                            head_ref(self.project_root),
+                        ],
+                    )
+                    return ""
+        elif task.verify_baseline_ref:
+            if configured_source_ref or missing_baseline_snapshot_ref:
+                self._block_lost_retained_verify_baseline_snapshot(
+                    state,
+                    task,
+                    task.task_id,
+                    {},
+                    [configured_source_ref, baseline_git_ref],
+                )
+            return ""
+
+        for owner_id, record in retained_records:
+            source_ref = self._resolved_retained_verify_baseline_snapshot(record)
+            if source_ref:
+                task.verify_baseline_source_ref = str(
+                    record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")
+                    or source_ref
+                ).strip()
+                return with_context(source_ref)
+
+        if retained_records:
+            for owner_id, record in retained_records:
+                if self._retained_worktree_snapshot_matches(
+                    record,
+                    allow_pending_planning_changes=False,
+                ):
+                    snapshot = self._create_retained_verify_baseline_snapshot(
+                        state,
+                        record,
+                    )
+                    source_ref = self._store_retained_verify_baseline_snapshot(
+                        state,
+                        task,
+                        owner_id,
+                        record,
+                        snapshot,
+                        migration_source="active_retained_worktree",
+                    )
+                    return with_context(source_ref)
+
+                candidates = self._legacy_retained_verify_baseline_candidate_refs(
+                    state,
+                    task,
+                    owner_id,
+                )
+                for candidate_ref in candidates:
+                    snapshot = self._materialize_legacy_retained_verify_baseline(
+                        state,
+                        record,
+                        candidate_ref,
+                    )
+                    if not snapshot:
+                        continue
+                    source_ref = self._store_retained_verify_baseline_snapshot(
+                        state,
+                        task,
+                        owner_id,
+                        record,
+                        snapshot,
+                        migration_source="matching_retained_checkpoint",
+                    )
+                    return with_context(source_ref)
+
+            owner_id, record = retained_records[0]
+            candidates = self._legacy_retained_verify_baseline_candidate_refs(
+                state,
+                task,
+                owner_id,
+            )
+            self._block_lost_retained_verify_baseline_snapshot(
+                state,
+                task,
+                owner_id,
+                record,
+                candidates,
+            )
+            return ""
+
         if not self._changed_paths_excluding_agent_instructions():
             return ""
         fingerprint = self._worktree_fingerprint_excluding_agent_instructions()
@@ -22108,11 +22790,8 @@ class Orchestrator:
             task.task_id,
             snapshot.ref_name,
         )
-        return (
-            f"{snapshot.ref_name}:{verification_context}"
-            if verification_context
-            else snapshot.ref_name
-        )
+        task.verify_baseline_source_ref = snapshot.commit_sha
+        return with_context(snapshot.ref_name)
 
     @staticmethod
     def _is_test_verification_command(command: str) -> bool:
@@ -22365,15 +23044,65 @@ class Orchestrator:
         *,
         state: Optional[RunState] = None,
     ) -> bool:
-        if (
+        lazy_incremental = bool(
             self.config.gates.verification_policy_version >= 3
             and self.config.gates.incremental_mode == "auto"
-            and bool(self.config.gates.steps)
+            and self.config.gates.steps
+        )
+        reusable_baseline = bool(
+            lazy_incremental
             and task.verify_baseline_ref
             and task.verify_baseline_schema_version
             == VERIFY_BASELINE_SCHEMA_VERSION
-        ):
+        )
+        if reusable_baseline and task.task_origin != "evidence_repair":
             return False
+        if reusable_baseline:
+            dirty_identity = self._dirty_verify_baseline_identity(
+                task.verify_baseline_ref
+            )
+            source_ref = (
+                task.verify_baseline_source_ref
+                or self._git_ref_from_verify_baseline_ref(
+                    task.verify_baseline_ref
+                )
+            )
+            source_commit, _source_tree = self._git_commit_and_tree(
+                self.project_root,
+                source_ref,
+            )
+            if source_commit and (
+                bool(task.verify_baseline_source_ref)
+                or source_ref.startswith("refs/auto-agents/gate-snapshots/")
+                or dirty_identity[1] == _EMPTY_WORKTREE_FINGERPRINT
+            ):
+                if state is not None and task.verify_baseline_source_ref:
+                    for _owner_id, record in (
+                        self._retained_verify_baseline_records_for_task(
+                            state,
+                            task,
+                        )
+                    ):
+                        if str(
+                            record.get(
+                                _RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT,
+                                "",
+                            )
+                        ).strip() == source_commit:
+                            self._resolved_retained_verify_baseline_snapshot(
+                                record
+                            )
+                            break
+                task.verify_baseline_source_ref = source_ref
+                return False
+            if (
+                not task.verify_baseline_source_ref
+                and dirty_identity == ("", "")
+                and not source_ref.startswith(
+                    "refs/auto-agents/gate-snapshots/"
+                )
+            ):
+                return False
         verification_context = ""
         if self._task_depends_on_requirements_audit(task):
             tasks = state.tasks if state is not None and state.tasks else self._load_tasks_from_plan()
@@ -22384,11 +23113,6 @@ class Orchestrator:
                 assume_done_task_ids=assumed,
             )
             verification_context = str(audit_result.get("input_context_sha256", ""))
-        lazy_incremental = bool(
-            self.config.gates.verification_policy_version >= 3
-            and self.config.gates.incremental_mode == "auto"
-            and self.config.gates.steps
-        )
         exact_baseline_ref = (
             self._exact_task_verify_baseline_ref(
                 state,
@@ -22398,6 +23122,15 @@ class Orchestrator:
             if state is not None and lazy_incremental
             else ""
         )
+        if (
+            state is not None
+            and state.status == "blocked"
+            and str(state.active_blocker.get("category", ""))
+            == _RETAINED_VERIFY_BASELINE_LOST_CATEGORY
+        ):
+            return False
+        if reusable_baseline and not exact_baseline_ref:
+            return False
         baseline_ref = exact_baseline_ref or (
             state.implement_verify_baseline_ref
             if (
@@ -22406,6 +23139,14 @@ class Orchestrator:
                 and state.implement_verify_baseline_ref
             )
             else self._task_verify_baseline_ref(verification_context)
+        )
+        baseline_source_ref = (
+            task.verify_baseline_source_ref
+            or (
+                self._git_ref_from_verify_baseline_ref(exact_baseline_ref)
+                if exact_baseline_ref
+                else ""
+            )
         )
         task_commands = self._build_task_verify_commands(task)
         if (
@@ -22417,10 +23158,12 @@ class Orchestrator:
         if lazy_incremental:
             task.verify_baseline_failures = []
             task.verify_baseline_ref = baseline_ref
+            task.verify_baseline_source_ref = baseline_source_ref
             task.verify_baseline_schema_version = VERIFY_BASELINE_SCHEMA_VERSION
             return True
         if not task_commands:
             task.verify_baseline_ref = baseline_ref
+            task.verify_baseline_source_ref = baseline_source_ref
             task.verify_baseline_schema_version = VERIFY_BASELINE_SCHEMA_VERSION
             return True
         cached_failures = self._gate_baseline_cache.get(
@@ -22437,6 +23180,7 @@ class Orchestrator:
         if cached_failures is not None:
             task.verify_baseline_failures = list(cached_failures)
             task.verify_baseline_ref = baseline_ref
+            task.verify_baseline_source_ref = baseline_source_ref
             task.verify_baseline_schema_version = VERIFY_BASELINE_SCHEMA_VERSION
             return True
         gate, mutation_error = self._run_missing_baseline_commands(
@@ -22473,6 +23217,7 @@ class Orchestrator:
             failures = list(cached_failures)
         task.verify_baseline_failures = list(failures)
         task.verify_baseline_ref = baseline_ref
+        task.verify_baseline_source_ref = baseline_source_ref
         task.verify_baseline_schema_version = VERIFY_BASELINE_SCHEMA_VERSION
         return True
 
@@ -23086,6 +23831,7 @@ class Orchestrator:
             "verify_history",
             "verify_baseline_failures",
             "verify_baseline_ref",
+            "verify_baseline_source_ref",
             "scratchpad",
             "arbitration_history",
             "recovery_history",
@@ -24963,6 +25709,7 @@ class Orchestrator:
             "verify_history",
             "verify_baseline_failures",
             "verify_baseline_ref",
+            "verify_baseline_source_ref",
             "scratchpad",
             "arbitration_history",
             "recovery_history",
