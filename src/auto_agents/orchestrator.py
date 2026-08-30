@@ -349,6 +349,10 @@ _RETAINED_VERIFY_BASELINE_SNAPSHOT_VERSION = 1
 _RETAINED_VERIFY_BASELINE_SNAPSHOT_HISTORY = (
     "verify_baseline_snapshot_history"
 )
+_RETAINED_VERIFY_BASELINE_RECONSTRUCTION_CONTEXT = (
+    "retained_verify_baseline_reconstruction"
+)
+_LEGACY_RETAINED_VERIFY_BASELINE_MAX_ANCESTRY_CANDIDATES = 512
 _RETAINED_VERIFY_BASELINE_LOST_CATEGORY = (
     "retained_verify_baseline_snapshot_lost"
 )
@@ -10908,6 +10912,42 @@ class Orchestrator:
         self._incident_store(state).save(incident, state)
         return True
 
+    def _resume_lost_retained_verify_baseline(
+        self,
+        state: RunState,
+        blocker: Mapping[str, object],
+    ) -> bool:
+        if (
+            str(blocker.get("category", "")).strip()
+            != _RETAINED_VERIFY_BASELINE_LOST_CATEGORY
+        ):
+            return False
+        raw_detail = blocker.get("retained_verify_baseline_snapshot", {})
+        detail = dict(raw_detail) if isinstance(raw_detail, dict) else {}
+        task_id = str(detail.get("task_id", "")).strip()
+        task = next(
+            (candidate for candidate in state.tasks if candidate.task_id == task_id),
+            None,
+        )
+        if task is None or task.task_origin != "evidence_repair":
+            return False
+
+        self._ensure_task_verify_baseline(task, state=state)
+        if (
+            not task.verify_baseline_source_ref
+            or str(state.active_blocker.get("category", "")).strip()
+            == _RETAINED_VERIFY_BASELINE_LOST_CATEGORY
+        ):
+            return False
+        self._persist_tasks(state.tasks)
+        save_run_state(self.project_root, state)
+        self.logger.info(
+            "[gate-baseline] resumed blocked legacy baseline task=%s source=%s",
+            task.task_id,
+            task.verify_baseline_source_ref,
+        )
+        return True
+
     def _resume_blocked_run(self, state: RunState) -> bool:
         active_incident = self._incident_store(state).active(state)
         if (
@@ -10936,6 +10976,34 @@ class Orchestrator:
             dict(state.active_blocker)
             if isinstance(state.active_blocker, dict)
             else {}
+        )
+        raw_retained_detail = persisted_blocker.get(
+            "retained_verify_baseline_snapshot",
+            {},
+        )
+        retained_detail = (
+            dict(raw_retained_detail)
+            if isinstance(raw_retained_detail, dict)
+            else {}
+        )
+        if self._resume_lost_retained_verify_baseline(
+            state,
+            persisted_blocker,
+        ):
+            if active_incident is not None:
+                active_incident.status = "recovering"
+                active_incident.history.append(
+                    {
+                        "event": "legacy_verify_baseline_reconstructed",
+                        "task_id": str(retained_detail.get("task_id", "")),
+                    }
+                )
+                self._incident_store(state).save(active_incident, state)
+            return True
+        persisted_blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else persisted_blocker
         )
         self_repair_resume = bool(
             state.status == "pending"
@@ -22633,6 +22701,23 @@ class Orchestrator:
             return "", ""
         return commit_sha, tree.stdout.strip()
 
+    @staticmethod
+    def _git_commit_is_ancestor(
+        project_root: Path,
+        ancestor: str,
+        descendant: str,
+    ) -> bool:
+        if not ancestor or not descendant:
+            return False
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+            cwd=str(project_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        return result.returncode == 0
+
     def _retained_verify_baseline_records_for_task(
         self,
         state: RunState,
@@ -22852,6 +22937,7 @@ class Orchestrator:
         state: RunState,
         task: TaskSpec,
         owner_id: str,
+        record: Mapping[str, object],
     ) -> List[str]:
         candidates: List[str] = []
 
@@ -22869,8 +22955,44 @@ class Orchestrator:
         add(task.verify_baseline_source_ref)
         for candidate_task in state.tasks:
             add(candidate_task.commit_sha)
-        add(head_ref(self.project_root))
+        current_ref = head_ref(self.project_root)
+        add(current_ref)
         add(self._git_ref_from_verify_baseline_ref(task.verify_baseline_ref))
+
+        base_ref = str(record.get("head_ref", "")).strip()
+        base_commit, _base_tree = self._git_commit_and_tree(
+            self.project_root,
+            base_ref,
+        )
+        current_commit, _current_tree = self._git_commit_and_tree(
+            self.project_root,
+            current_ref,
+        )
+        if self._git_commit_is_ancestor(
+            self.project_root,
+            base_commit,
+            current_commit,
+        ):
+            ancestry = subprocess.run(
+                [
+                    "git",
+                    "rev-list",
+                    "--ancestry-path",
+                    "--reverse",
+                    (
+                        "--max-count="
+                        f"{_LEGACY_RETAINED_VERIFY_BASELINE_MAX_ANCESTRY_CANDIDATES}"
+                    ),
+                    f"{base_commit}..{current_commit}",
+                ],
+                cwd=str(self.project_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if ancestry.returncode == 0:
+                for candidate in ancestry.stdout.splitlines():
+                    add(candidate)
         return candidates
 
     def _materialize_legacy_retained_verify_baseline(
@@ -22878,15 +23000,37 @@ class Orchestrator:
         state: RunState,
         record: Mapping[str, object],
         source_ref: str,
+        *,
+        validation: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
+        validation = validation if validation is not None else {}
+        validation.update(
+            {
+                "source_ref": str(source_ref).strip(),
+                "status": "rejected",
+                "reason": "unvalidated",
+                "matched_path_count": 0,
+            }
+        )
+
+        def reject(reason: str, **detail: object) -> Dict[str, object]:
+            validation.update({"status": "rejected", "reason": reason, **detail})
+            return {}
+
         base_ref = str(record.get("head_ref", "")).strip()
         base_commit, _base_tree = self._git_commit_and_tree(
             self.project_root,
             base_ref,
         )
-        source_commit, source_tree = self._git_commit_and_tree(
+        source_commit, _source_tree = self._git_commit_and_tree(
             self.project_root,
             source_ref,
+        )
+        validation.update(
+            {
+                "base_commit": base_commit,
+                "source_commit": source_commit,
+            }
         )
         raw_paths = record.get("changed_paths", [])
         paths = {
@@ -22896,34 +23040,25 @@ class Orchestrator:
         } if isinstance(raw_paths, list) else set()
         raw_fingerprints = record.get("path_fingerprints", {})
         if not isinstance(raw_fingerprints, dict):
-            return {}
+            return reject("invalid_path_fingerprints")
         if not base_commit or not source_commit or not paths:
-            return {}
-        diff = subprocess.run(
-            [
-                "git",
-                "diff",
-                "--name-only",
-                "--no-renames",
-                "-z",
-                base_commit,
-                source_commit,
-                "--",
-            ],
-            cwd=str(self.project_root),
-            capture_output=True,
-        )
-        if diff.returncode != 0:
-            return {}
-        changed_at_source = {
-            raw_path.decode("utf-8", errors="surrogateescape")
-            for raw_path in diff.stdout.split(b"\0")
-            if raw_path
+            return reject("invalid_commit_or_paths")
+        if not self._git_commit_is_ancestor(
+            self.project_root,
+            base_commit,
+            source_commit,
+        ):
+            return reject("source_not_descended_from_baseline")
+        fingerprint_paths = {
+            str(path).strip().replace("\\", "/")
+            for path in raw_fingerprints
+            if str(path).strip()
         }
-        if changed_at_source != paths:
-            return {}
+        if fingerprint_paths != paths:
+            return reject("path_fingerprint_set_mismatch")
 
         worktree_hasher = hashlib.sha256()
+        matched_path_count = 0
         for path in sorted(paths):
             expected = str(raw_fingerprints.get(path, "")).strip()
             if (
@@ -22932,37 +23067,96 @@ class Orchestrator:
                 or ".." in path.split("/")
                 or not expected
             ):
-                return {}
+                return reject("unsafe_or_unhashed_path", path=path)
             readable, content = self._git_path_bytes_at_commit(
                 source_commit,
                 path,
             )
-            if (
-                not readable
-                or hashlib.sha256(content).hexdigest() != expected
-            ):
-                return {}
+            actual = hashlib.sha256(content).hexdigest() if readable else ""
+            if not readable or actual != expected:
+                return reject(
+                    "path_bytes_mismatch",
+                    path=path,
+                    expected_sha256=expected,
+                    actual_sha256=actual,
+                    matched_path_count=matched_path_count,
+                )
+            matched_path_count += 1
             worktree_hasher.update(path.encode("utf-8"))
             worktree_hasher.update(b"\0")
             worktree_hasher.update(content)
             worktree_hasher.update(b"\0")
-        if worktree_hasher.hexdigest() != str(
+        actual_worktree_fingerprint = worktree_hasher.hexdigest()
+        expected_worktree_fingerprint = str(
             record.get("worktree_fingerprint", "")
-        ).strip():
-            return {}
-
-        snapshot_ref = (
-            "refs/auto-agents/gate-snapshots/"
-            + self._retained_verify_baseline_snapshot_plan_id(state, record)
+        ).strip()
+        validation.update(
+            {
+                "expected_worktree_fingerprint": expected_worktree_fingerprint,
+                "actual_worktree_fingerprint": actual_worktree_fingerprint,
+                "worktree_fingerprint_consistent": (
+                    actual_worktree_fingerprint == expected_worktree_fingerprint
+                ),
+            }
         )
-        update_ref(self.project_root, snapshot_ref, source_commit)
+
+        try:
+            snapshot = GateSnapshotManager(
+                self.project_root,
+                self._retained_verify_baseline_snapshot_plan_id(state, record),
+            ).create_from_commit_paths(
+                base_ref=base_commit,
+                source_ref=source_commit,
+                paths=sorted(paths),
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            return reject(
+                "snapshot_construction_failed",
+                error=str(error)[:500],
+                matched_path_count=matched_path_count,
+            )
+
+        diff = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "-z",
+                base_commit,
+                snapshot.commit_sha,
+                "--",
+            ],
+            cwd=str(self.project_root),
+            capture_output=True,
+        )
+        snapshot_paths = {
+            raw_path.decode("utf-8", errors="surrogateescape")
+            for raw_path in diff.stdout.split(b"\0")
+            if raw_path
+        } if diff.returncode == 0 else set()
+        if diff.returncode != 0 or snapshot_paths != paths:
+            if ref_exists(self.project_root, snapshot.ref_name):
+                delete_ref(self.project_root, snapshot.ref_name)
+            return reject(
+                "snapshot_changed_paths_mismatch",
+                matched_path_count=matched_path_count,
+                snapshot_changed_paths=sorted(snapshot_paths),
+            )
+
+        validation.update(
+            {
+                "status": "matched",
+                "reason": "snapshot_created",
+                "matched_path_count": matched_path_count,
+                "snapshot_commit": snapshot.commit_sha,
+                "snapshot_tree": snapshot.tree_sha,
+            }
+        )
         return {
-            _RETAINED_VERIFY_BASELINE_SNAPSHOT_REF: snapshot_ref,
-            _RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT: source_commit,
-            _RETAINED_VERIFY_BASELINE_SNAPSHOT_TREE: source_tree,
-            "verify_baseline_snapshot_version": (
-                _RETAINED_VERIFY_BASELINE_SNAPSHOT_VERSION
-            ),
+            **self._retained_verify_baseline_snapshot_payload(snapshot),
+            "verify_baseline_snapshot_base_commit": base_commit,
+            "verify_baseline_snapshot_source_commit": source_commit,
         }
 
     def _store_retained_verify_baseline_snapshot(
@@ -22975,6 +23169,10 @@ class Orchestrator:
         *,
         migration_source: str,
     ) -> str:
+        if self._dirty_verify_baseline_identity(
+            str(record.get("verify_baseline_cache_identity", ""))
+        ) == ("", ""):
+            record["verify_baseline_cache_identity"] = task.verify_baseline_ref
         record.update(dict(snapshot))
         records = self._retained_worktree_ownership_records(state)
         records[owner_id] = record
@@ -23001,9 +23199,57 @@ class Orchestrator:
             "source_ref": source_ref,
             "source_commit": source_commit,
             "owner_task_id": owner_id,
+            "baseline_cache_identity": str(
+                record.get("verify_baseline_cache_identity", "")
+            ).strip(),
         }
         state.resume_context["verify_baseline_migrations"] = migrations
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        blocker_detail = blocker.get("retained_verify_baseline_snapshot", {})
+        blocker_task_id = (
+            str(blocker_detail.get("task_id", "")).strip()
+            if isinstance(blocker_detail, dict)
+            else ""
+        )
+        if (
+            str(blocker.get("category", "")).strip()
+            == _RETAINED_VERIFY_BASELINE_LOST_CATEGORY
+            and blocker_task_id == task.task_id
+        ):
+            self._clear_run_blocker(state)
         return source_ref
+
+    @staticmethod
+    def _store_retained_verify_baseline_reconstruction_audit(
+        state: RunState,
+        task: TaskSpec,
+        owner_id: str,
+        record: Mapping[str, object],
+        results: Iterable[Mapping[str, object]],
+    ) -> None:
+        raw_context = state.resume_context.get(
+            _RETAINED_VERIFY_BASELINE_RECONSTRUCTION_CONTEXT,
+            {},
+        )
+        context = dict(raw_context) if isinstance(raw_context, dict) else {}
+        context[task.task_id] = {
+            "schema_version": 1,
+            "attempted_at": utc_now_iso(),
+            "owner_task_id": owner_id,
+            "baseline_ref": task.verify_baseline_ref,
+            "expected_head_ref": str(record.get("head_ref", "")).strip(),
+            "expected_worktree_fingerprint": str(
+                record.get("worktree_fingerprint", "")
+            ).strip(),
+            "results": [dict(result) for result in results],
+        }
+        state.resume_context[
+            _RETAINED_VERIFY_BASELINE_RECONSTRUCTION_CONTEXT
+        ] = context
 
     def _block_lost_retained_verify_baseline_snapshot(
         self,
@@ -23113,12 +23359,22 @@ class Orchestrator:
                 return with_context(baseline_commit)
         retained_records = all_retained_records
         if dirty_identity != ("", ""):
-            retained_records = [
+            exact_records = [
                 (owner_id, record)
                 for owner_id, record in all_retained_records
                 if self._retained_record_verify_baseline_identity(record)
                 == dirty_identity
             ]
+            legacy_records = [
+                (owner_id, record)
+                for owner_id, record in all_retained_records
+                if not str(
+                    record.get("verify_baseline_cache_identity", "")
+                ).strip()
+                and str(record.get("head_ref", "")).strip()
+                == dirty_identity[0]
+            ]
+            retained_records = exact_records or legacy_records
             if not retained_records:
                 current_identity = (
                     head_ref(self.project_root),
@@ -23156,13 +23412,30 @@ class Orchestrator:
         for owner_id, record in retained_records:
             source_ref = self._resolved_retained_verify_baseline_snapshot(record)
             if source_ref:
-                task.verify_baseline_source_ref = str(
-                    record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")
-                    or source_ref
-                ).strip()
+                if not str(
+                    record.get("verify_baseline_cache_identity", "")
+                ).strip():
+                    source_ref = self._store_retained_verify_baseline_snapshot(
+                        state,
+                        task,
+                        owner_id,
+                        record,
+                        {},
+                        migration_source="existing_retained_snapshot",
+                    )
+                else:
+                    task.verify_baseline_source_ref = str(
+                        record.get(
+                            _RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT,
+                            "",
+                        )
+                        or source_ref
+                    ).strip()
                 return with_context(source_ref)
 
         if retained_records:
+            reconstruction_results: List[Dict[str, object]] = []
+            attempted_candidates: List[str] = []
             for owner_id, record in retained_records:
                 if self._retained_worktree_snapshot_matches(
                     record,
@@ -23182,19 +23455,43 @@ class Orchestrator:
                     )
                     return with_context(source_ref)
 
+                reconstruction_results.append(
+                    {
+                        "owner_task_id": owner_id,
+                        "source_ref": "active_worktree",
+                        "status": "rejected",
+                        "reason": "live_worktree_bytes_or_head_mismatch",
+                    }
+                )
+
                 candidates = self._legacy_retained_verify_baseline_candidate_refs(
                     state,
                     task,
                     owner_id,
+                    record,
                 )
                 for candidate_ref in candidates:
+                    if candidate_ref not in attempted_candidates:
+                        attempted_candidates.append(candidate_ref)
+                    validation: Dict[str, object] = {
+                        "owner_task_id": owner_id,
+                    }
                     snapshot = self._materialize_legacy_retained_verify_baseline(
                         state,
                         record,
                         candidate_ref,
+                        validation=validation,
                     )
+                    reconstruction_results.append(validation)
                     if not snapshot:
                         continue
+                    self._store_retained_verify_baseline_reconstruction_audit(
+                        state,
+                        task,
+                        owner_id,
+                        record,
+                        reconstruction_results,
+                    )
                     source_ref = self._store_retained_verify_baseline_snapshot(
                         state,
                         task,
@@ -23210,13 +23507,24 @@ class Orchestrator:
                 state,
                 task,
                 owner_id,
+                record,
+            )
+            for candidate_ref in candidates:
+                if candidate_ref not in attempted_candidates:
+                    attempted_candidates.append(candidate_ref)
+            self._store_retained_verify_baseline_reconstruction_audit(
+                state,
+                task,
+                owner_id,
+                record,
+                reconstruction_results,
             )
             self._block_lost_retained_verify_baseline_snapshot(
                 state,
                 task,
                 owner_id,
                 record,
-                candidates,
+                attempted_candidates,
             )
             return ""
 

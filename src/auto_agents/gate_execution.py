@@ -165,6 +165,139 @@ class GateSnapshotManager:
         finally:
             index_path.unlink(missing_ok=True)
 
+    def create_from_commit_paths(
+        self,
+        *,
+        base_ref: str,
+        source_ref: str,
+        paths: Sequence[str],
+    ) -> GateSourceSnapshot:
+        """Create a snapshot by overlaying selected source paths on a base tree."""
+
+        normalized_paths = sorted(
+            {
+                str(path).strip().replace("\\", "/")
+                for path in paths
+                if str(path).strip()
+            }
+        )
+        if not normalized_paths or any(
+            PurePosixPath(path).is_absolute()
+            or ".." in PurePosixPath(path).parts
+            for path in normalized_paths
+        ):
+            raise ValueError("snapshot paths must be safe repository-relative paths")
+
+        base_commit = _run_git(
+            self.project_root,
+            "rev-parse",
+            "--verify",
+            f"{base_ref}^{{commit}}",
+        ).stdout.strip()
+        source_commit = _run_git(
+            self.project_root,
+            "rev-parse",
+            "--verify",
+            f"{source_ref}^{{commit}}",
+        ).stdout.strip()
+        git_dir = _run_git(
+            self.project_root, "rev-parse", "--git-common-dir"
+        ).stdout.strip()
+        common_dir = Path(git_dir)
+        if not common_dir.is_absolute():
+            common_dir = (self.project_root / common_dir).resolve()
+        index_dir = common_dir / "auto-agents-gate-indexes"
+        index_dir.mkdir(parents=True, exist_ok=True)
+        index_path = index_dir / f"{self.plan_id}.index"
+        index_path.unlink(missing_ok=True)
+        env = dict(os.environ)
+        env["GIT_INDEX_FILE"] = str(index_path)
+        env["GIT_AUTHOR_NAME"] = "auto_agents gate snapshot"
+        env["GIT_AUTHOR_EMAIL"] = "auto-agents@localhost"
+        env["GIT_COMMITTER_NAME"] = "auto_agents gate snapshot"
+        env["GIT_COMMITTER_EMAIL"] = "auto-agents@localhost"
+        try:
+            _run_git(self.project_root, "read-tree", base_commit, env=env)
+            for path in normalized_paths:
+                entry = subprocess.run(
+                    [
+                        "git",
+                        "ls-tree",
+                        "-z",
+                        source_commit,
+                        "--",
+                        f":(top,literal){path}",
+                    ],
+                    cwd=str(self.project_root),
+                    capture_output=True,
+                )
+                if entry.returncode != 0:
+                    raise RuntimeError(
+                        entry.stderr.decode("utf-8", errors="replace").strip()
+                        or f"could not inspect snapshot source path {path}"
+                    )
+                entries = [item for item in entry.stdout.split(b"\0") if item]
+                if not entries:
+                    _run_git(
+                        self.project_root,
+                        "update-index",
+                        "--force-remove",
+                        "--",
+                        path,
+                        env=env,
+                    )
+                    continue
+                exact_entries = []
+                for item in entries:
+                    metadata, separator, raw_path = item.partition(b"\t")
+                    if separator and raw_path.decode(
+                        "utf-8", errors="surrogateescape"
+                    ) == path:
+                        exact_entries.append(metadata.split())
+                if (
+                    len(exact_entries) != 1
+                    or len(exact_entries[0]) != 3
+                    or exact_entries[0][1] != b"blob"
+                ):
+                    raise RuntimeError(
+                        f"snapshot source path is not one exact blob: {path}"
+                    )
+                mode, _kind, object_id = exact_entries[0]
+                _run_git(
+                    self.project_root,
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    mode.decode("ascii"),
+                    object_id.decode("ascii"),
+                    path,
+                    env=env,
+                )
+
+            tree = _run_git(
+                self.project_root, "write-tree", env=env
+            ).stdout.strip()
+            commit = _run_git(
+                self.project_root,
+                "commit-tree",
+                tree,
+                "-m",
+                f"auto_agents gate snapshot {self.plan_id}",
+                "-p",
+                base_commit,
+                env=env,
+            ).stdout.strip()
+            ref_name = f"refs/auto-agents/gate-snapshots/{self.plan_id}"
+            _run_git(self.project_root, "update-ref", ref_name, commit)
+            self.snapshot = GateSourceSnapshot(
+                commit_sha=commit,
+                tree_sha=tree,
+                ref_name=ref_name,
+            )
+            return self.snapshot
+        finally:
+            index_path.unlink(missing_ok=True)
+
     def use_ref(self, source_ref: str) -> GateSourceSnapshot:
         """Use an immutable existing commit/ref as the plan source."""
         commit = _run_git(
