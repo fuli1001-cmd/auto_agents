@@ -163,6 +163,12 @@ from .infrastructure_repair import (
     repair_workspace_local_conda,
 )
 from .io_utils import read_json, read_text, write_json, write_text
+from .health_watch import (
+    HealthActionRequest,
+    HealthSelfRepairRequired,
+    RunHealthSupervisor,
+    build_progress_vector,
+)
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
 from .models import (
     APPROVAL_ORDER,
@@ -185,6 +191,7 @@ from .models import (
     TaskSpec,
     VerificationStep,
 )
+from .repair_cases import RepairCaseStore
 from .operator_inputs import (
     OperatorInputStore,
     UserInputRequest,
@@ -593,6 +600,10 @@ class Orchestrator:
         self._interaction_mode = self.config.execution.user_input.mode
         self._secret_echo = self.config.execution.user_input.secret_echo
         self._autonomy_mode = self.config.execution.autonomy.mode
+        self._run_token = ""
+        self._health_supervisor: Optional[RunHealthSupervisor] = None
+        self._health_action_in_progress = False
+        self._watchdog_launcher: Optional[Callable[[RunState], object]] = None
         gate_environment = gate_environment_fingerprint(
             isolation_mode=(
                 self.config.gates.isolation.mode
@@ -946,6 +957,12 @@ class Orchestrator:
         return state
 
     def _rewind_state_from_stage(self, state: RunState, target_stage: str) -> None:
+        self._record_health_control(
+            "stage_rewind",
+            stage=target_stage,
+            action="rewind",
+            rewind=True,
+        )
         target_index = STAGE_ORDER.index(target_stage)
         for stage in STAGE_ORDER[target_index:]:
             state.stage_summaries.pop(stage, None)
@@ -2630,6 +2647,7 @@ class Orchestrator:
         self._autonomy_mode = str(
             autonomy_mode or self.config.execution.autonomy.mode
         )
+        health_handoff = False
         try:
             self._cleanup_failed_verification_logs()
             if provider_kind is not None:
@@ -2668,6 +2686,7 @@ class Orchestrator:
                 state.workflow_version = 2
                 save_run_state(self.project_root, state)
             self._attach_run_logger(state.run_id)
+            self._start_health_supervision(state)
             resolved_spec_file = spec_file.expanduser().resolve()
             self._active_spec_file = resolved_spec_file
             if self._reconcile_interrupted_clarify_generate_checkpoint(state):
@@ -2739,7 +2758,13 @@ class Orchestrator:
                 self.logger.info("Project execution is already completed. Do you want to start a new iteration for further development? [y/N]")
                 user_conf = self._prompt_user("").strip().lower()
                 if user_conf in ("y", "yes"):
+                    previous_run_id = state.run_id
                     state = self._start_new_iteration(state)
+                    self.stop_health_supervision(
+                        status="superseded",
+                        reason=f"new iteration replaced run {previous_run_id}",
+                    )
+                    self._start_health_supervision(state)
                     self._attach_run_logger(state.run_id)
                     save_run_state(self.project_root, state)
                 else:
@@ -2757,6 +2782,8 @@ class Orchestrator:
                     return state
 
             while True:
+                if self._process_health_action() is not None:
+                    state = load_run_state(self.project_root)
                 pending = self._pending_stages(state)
                 if not pending:
                     break
@@ -2784,11 +2811,19 @@ class Orchestrator:
                         else:
                             state = self._run_agent_stage(stage, state, spec_file, auto_approve=auto_approve)
                 except GateCommandExecutionError as error:
+                    if (
+                        self._health_supervisor is not None
+                        and self._health_supervisor.quiesce_requested()
+                    ):
+                        self._process_health_action()
+                        continue
                     recovered = self._handle_gate_execution_incident(state, stage, error)
                     save_run_state(self.project_root, state)
                     if recovered:
                         continue
                     return state
+                except HealthSelfRepairRequired:
+                    raise
                 except RuntimeError as error:
                     self._merge_persisted_execution_incidents(state)
                     active_incident = self._incident_store(state).active(state)
@@ -2876,7 +2911,34 @@ class Orchestrator:
             save_run_state(self.project_root, state)
             self._commit_if_dirty("chore: finalize run state")
             return state
+        except HealthSelfRepairRequired:
+            health_handoff = True
+            raise
         finally:
+            if not health_handoff:
+                try:
+                    final_health_state = load_run_state(self.project_root)
+                    terminal_health_status = (
+                        final_health_state.status
+                        if final_health_state.status
+                        in {
+                            "completed",
+                            "paused",
+                            "waiting_user",
+                            "blocked",
+                            "failed",
+                        }
+                        else "stopped"
+                    )
+                    self.stop_health_supervision(
+                        status=terminal_health_status,
+                        reason=(
+                            final_health_state.last_error
+                            or f"run returned with state={final_health_state.status}"
+                        ),
+                    )
+                except Exception:
+                    self.stop_health_supervision(status="stopped")
             self._print_agent_output = False
             self._active_spec_file = None
             self._allow_dirty_tree = False
@@ -2975,6 +3037,9 @@ class Orchestrator:
         state.execution_incident_budget_epoch = 0
         state.execution_incident_budget_checkpoint = {}
         state.active_blocker = {}
+        state.active_repair_case_id = ""
+        state.repair_phase = ""
+        state.repair_checkpoint_ref = ""
         state.last_error = ""
         state.rejection_reason = ""
         state.rejected_stage = ""
@@ -7818,8 +7883,288 @@ class Orchestrator:
         save_run_state(self.project_root, state)
         return state
 
+    def _start_health_supervision(self, state: RunState) -> None:
+        config = self.config.execution.health_watch
+        if not config.enabled or self._health_supervisor is not None:
+            return
+        supervisor = RunHealthSupervisor(
+            self.project_root,
+            state.run_id,
+            config=config,
+            smart_timeout=self.config.execution.smart_timeout,
+            autonomy_mode=self._autonomy_mode,
+            run_token=self._run_token,
+        )
+        self._health_supervisor = supervisor
+        supervisor.start()
+        if self._watchdog_launcher is not None:
+            try:
+                self._watchdog_launcher(state)
+            except Exception as error:
+                self.logger.warning(
+                    "[health-watch] sidecar launch failed: %s",
+                    error,
+                )
+
+    def stop_health_supervision(self, status: str = "stopped", reason: str = "") -> None:
+        supervisor, self._health_supervisor = self._health_supervisor, None
+        if supervisor is not None:
+            supervisor.stop(status=status, reason=reason)
+
+    def _health_termination_probe(self) -> str:
+        supervisor = self._health_supervisor
+        if (
+            supervisor is not None
+            and self._autonomy_mode == "max"
+            and not self._health_action_in_progress
+            and supervisor.quiesce_requested()
+        ):
+            return "health_quiesce"
+        return ""
+
+    def _gate_preempt_probe(self) -> bool:
+        external = bool(
+            self._gate_preempt_requested is not None
+            and self._gate_preempt_requested()
+        )
+        return external or bool(self._health_termination_probe())
+
+    def _record_health_control(
+        self,
+        kind: str,
+        *,
+        stage: str = "",
+        task_id: str = "",
+        root_fingerprint: str = "",
+        action: str = "",
+        rewind: bool = False,
+    ) -> None:
+        if self._health_supervisor is not None:
+            self._health_supervisor.record_control_event(
+                kind,
+                stage=stage,
+                task_id=task_id,
+                root_fingerprint=root_fingerprint,
+                action=action,
+                rewind=rewind,
+            )
+
+    def _process_health_action(self) -> Optional[object]:
+        supervisor = self._health_supervisor
+        if supervisor is None or self._health_action_in_progress:
+            return None
+        request = supervisor.pop_action()
+        if request is None:
+            return None
+        return self._handle_health_action(request)
+
+    def _handle_health_action(self, request: HealthActionRequest) -> object:
+        from .self_repair import adjudicate_repair_case
+
+        repair_case = RepairCaseStore(
+            self.project_root,
+            load_run_state(self.project_root).run_id,
+        ).load(request.repair_case_id)
+        if repair_case is None:
+            raise RuntimeError(
+                f"health repair case is missing: {request.repair_case_id}"
+            )
+        self.logger.warning(
+            "[health-watch] kind=%s scope=%s stage=%s task=%s root=%s action=diagnose",
+            repair_case.kind,
+            repair_case.failure_scope,
+            repair_case.stage,
+            repair_case.task_id or "none",
+            repair_case.root_fingerprint,
+        )
+        self._health_action_in_progress = True
+        try:
+            state = load_run_state(self.project_root)
+            state.active_repair_case_id = repair_case.case_id
+            state.repair_phase = "diagnosing"
+            save_run_state(self.project_root, state)
+            if request.action == "exhausted":
+                repair_case.status = "needs_human"
+                repair_case.history.append(
+                    {
+                        "event": "intervention_budget_exhausted",
+                        "at": utc_now_iso(),
+                    }
+                )
+                RepairCaseStore(self.project_root, state.run_id).save(repair_case)
+                self._block_run(
+                    state,
+                    owner=repair_case.owner_hint,
+                    category="health_intervention_budget_exhausted",
+                    reason=(
+                        "run-health interventions were exhausted without crossing "
+                        f"the original boundary: {repair_case.symptom}"
+                    ),
+                    fingerprint=repair_case.root_fingerprint,
+                    task_id=repair_case.task_id,
+                )
+                if state.status == "pending":
+                    state.active_repair_case_id = ""
+                    state.repair_phase = ""
+                else:
+                    state.repair_phase = "needs_human"
+                save_run_state(self.project_root, state)
+                return repair_case
+            if not self.config.execution.health_watch.agent_triage_enabled:
+                repair_case.status = "observed"
+                repair_case.history.append(
+                    {
+                        "event": "triage_skipped",
+                        "reason": "health-watch agent triage is disabled",
+                        "at": utc_now_iso(),
+                    }
+                )
+                RepairCaseStore(self.project_root, state.run_id).save(repair_case)
+                state.active_repair_case_id = ""
+                state.repair_phase = ""
+                save_run_state(self.project_root, state)
+                return repair_case
+            triage = adjudicate_repair_case(
+                self,
+                target_project_root=self.project_root,
+                repair_case=repair_case,
+                state=state,
+            )
+            write_json(
+                run_path(self.project_root, state.run_id)
+                / "outputs"
+                / f"health-self-repair-triage-{repair_case.case_id}.json",
+                triage.to_dict(),
+            )
+            repair_case.history.append(
+                {
+                    "event": "triaged",
+                    "eligible": triage.decision.eligible,
+                    "source": triage.source,
+                    "reason": triage.reason,
+                    "at": utc_now_iso(),
+                }
+            )
+            judgment = triage.judgment
+            if judgment is not None:
+                repair_case.owner_hint = judgment.owner
+            if triage.decision.eligible:
+                self.logger.warning(
+                    "[health-watch] root=%s action=self_repair category=%s",
+                    repair_case.root_fingerprint,
+                    triage.decision.category,
+                )
+                repair_case.status = "self_repair"
+                RepairCaseStore(self.project_root, state.run_id).save(repair_case)
+                state = load_run_state(self.project_root)
+                state.active_repair_case_id = repair_case.case_id
+                state.repair_phase = "quiescing"
+                save_run_state(self.project_root, state)
+                raise HealthSelfRepairRequired(repair_case, triage)
+
+            repair_case.status = "routed"
+            self.logger.info(
+                "[health-watch] root=%s action=%s owner=%s",
+                repair_case.root_fingerprint,
+                repair_case.status,
+                repair_case.owner_hint,
+            )
+            RepairCaseStore(self.project_root, state.run_id).save(repair_case)
+            state = load_run_state(self.project_root)
+            state.active_repair_case_id = ""
+            state.repair_phase = ""
+            state.repair_checkpoint_ref = ""
+            save_run_state(self.project_root, state)
+            return triage
+        finally:
+            self._health_action_in_progress = False
+
+    def verify_health_repair_boundary(self, case_id: str) -> Dict[str, object]:
+        state = load_run_state(self.project_root)
+        normalized = str(case_id).strip()
+        if not normalized or state.active_repair_case_id != normalized:
+            raise RuntimeError(
+                "health repair boundary does not match the active repair case"
+            )
+        repair_case = RepairCaseStore(self.project_root, state.run_id).load(normalized)
+        if repair_case is None or repair_case.source != "health_watch":
+            raise RuntimeError("active repair case is not a health-watch case")
+        checkpoint_path = Path(
+            repair_case.resume_checkpoint_ref or state.repair_checkpoint_ref
+        )
+        checkpoint = read_json(checkpoint_path, default={})
+        if (
+            not isinstance(checkpoint, dict)
+            or str(checkpoint.get("run_id", "")) != state.run_id
+            or str(checkpoint.get("case_id", "")) != normalized
+        ):
+            raise RuntimeError("health repair checkpoint identity is invalid")
+        if not repair_case.expected_postconditions:
+            raise RuntimeError("health repair case has no expected postconditions")
+        current = build_progress_vector(state)
+        before_atoms = {
+            str(item)
+            for item in repair_case.progress_before.get("durable_atoms", [])
+        }
+        if not before_atoms.issubset(set(current.durable_atoms)):
+            raise RuntimeError(
+                "health repair boundary would regress durable progress"
+            )
+        before_unresolved = {
+            str(item)
+            for item in repair_case.progress_before.get("unresolved_roots", [])
+        }
+        if not set(current.unresolved_roots).issubset(before_unresolved):
+            raise RuntimeError(
+                "health repair boundary introduced a new unresolved root"
+            )
+        receipt = {
+            "schema_version": 1,
+            "run_id": state.run_id,
+            "case_id": normalized,
+            "checkpoint": str(checkpoint_path),
+            "progress_digest": current.digest,
+            "expected_postconditions": list(
+                repair_case.expected_postconditions
+            ),
+            "verified_at": utc_now_iso(),
+        }
+        repair_case.status = "boundary_verified"
+        repair_case.history.append(
+            {"event": "boundary_verified", **receipt}
+        )
+        RepairCaseStore(self.project_root, state.run_id).save(repair_case)
+        state.repair_phase = "boundary_verified"
+        save_run_state(self.project_root, state)
+        write_json(
+            run_path(self.project_root, state.run_id)
+            / "repair-boundaries"
+            / f"{normalized}.json",
+            receipt,
+        )
+        return receipt
+
     def mark_self_repair_applied(self, commit_sha: str) -> RunState:
         state = load_run_state(self.project_root)
+        if state.active_repair_case_id:
+            repair_case = RepairCaseStore(
+                self.project_root, state.run_id
+            ).load(state.active_repair_case_id)
+            if repair_case is not None and repair_case.source == "health_watch":
+                repair_case.status = "resuming"
+                repair_case.history.append(
+                    {
+                        "event": "self_repair_applied",
+                        "commit": commit_sha,
+                        "at": utc_now_iso(),
+                    }
+                )
+                RepairCaseStore(self.project_root, state.run_id).save(repair_case)
+                state.repair_phase = "resuming"
+                state.status = "pending"
+                state.last_error = ""
+                save_run_state(self.project_root, state)
+                return state
         blocker = dict(state.active_blocker)
         blocker.update(
             {
@@ -14095,7 +14440,7 @@ class Orchestrator:
             source_ref=source_ref,
             use_result_cache=use_result_cache,
             cache_path=self._shared_gate_cache_path,
-            preempt_requested=self._gate_preempt_requested,
+            preempt_requested=self._gate_preempt_probe,
             environment_overrides=operator_environment,
         )
 
@@ -14541,6 +14886,12 @@ class Orchestrator:
             # End this implementation pass. The next pass must establish a fresh
             # clean-head baseline before ordinary tasks may resume.
             state.stage_summaries.pop("implement", None)
+            self._record_health_control(
+                "implementation_recovery_rewind",
+                stage="implement",
+                task_id=prebaseline_recovery.task_id,
+                rewind=True,
+            )
             return rewind_state or state
 
         migrated_owner_ids: List[str] = []
@@ -15659,6 +16010,12 @@ class Orchestrator:
             }
 
         task.status = "done"
+        self._record_health_control(
+            "task_completed",
+            stage="implement",
+            task_id=task.task_id,
+            action="accepted",
+        )
         self._reconcile_completed_lineage_terminal_recovery(
             state,
             tasks,
@@ -16914,6 +17271,12 @@ class Orchestrator:
     def _apply_parallel_task_snapshot(self, task: TaskSpec, payload: Dict[str, object]) -> None:
         self._copy_parallel_task_snapshot_fields(task, payload)
         task.status = "done"
+        self._record_health_control(
+            "task_completed",
+            stage="implement",
+            task_id=task.task_id,
+            action="accepted",
+        )
 
     def _apply_parallel_task_failure_snapshot(self, task: TaskSpec, payload: Dict[str, object]) -> None:
         self._copy_parallel_task_snapshot_fields(task, payload)
@@ -27399,6 +27762,11 @@ class Orchestrator:
                 )
                 if not bool(audit_result["ok"]):
                     state.stage_summaries.pop("verify", None)
+                    self._record_health_control(
+                        "verify_audit_rewind",
+                        stage="verify",
+                        rewind=True,
+                    )
                     if self._handle_requirements_audit_failure(state, audit_result):
                         self._emit_stage_verify_result(
                             "fail",
@@ -27447,6 +27815,11 @@ class Orchestrator:
         audit_report = str(audit_result["report"])
         if not audit_ok:
             state.stage_summaries.pop("verify", None)
+            self._record_health_control(
+                "verify_audit_rewind",
+                stage="verify",
+                rewind=True,
+            )
             if self._handle_requirements_audit_failure(state, audit_result):
                 self._emit_stage_verify_result(
                     "fail",
@@ -30725,6 +31098,7 @@ class Orchestrator:
     def _emit_stage_start(self, stage: str) -> None:
         model = self._model_label_for_top_level_stage(stage)
         self.logger.info(f"[stage:{stage}] start provider={self._current_provider} model={model}")
+        self._record_health_control("stage_start", stage=stage)
 
     def _emit_stage_verify_result(self, decision: str, summary: str, route: str = "") -> None:
         header = f"[stage:verify] decision={decision}"
@@ -31563,6 +31937,39 @@ class Orchestrator:
         while True:
             result = adapter.run(provider_request)
             reason = result.termination.reason if result.termination is not None else ""
+            if reason == "health_quiesce":
+                triage = self._process_health_action()
+                judgment = getattr(triage, "judgment", None)
+                if getattr(judgment, "owner", "") in {
+                    "external_provider",
+                    "execution_environment",
+                    "verification_infrastructure",
+                }:
+                    self.logger.warning(
+                        "[health-watch] provider=%s action=failover owner=%s",
+                        provider,
+                        judgment.owner,
+                    )
+                    return result
+                resume_count += 1
+                handoff = self._smart_timeout_handoff(result, reason)
+                session_id = result.provider_session_id
+                provider_request = self._provider_request_for_attempt(
+                    replace(
+                        request,
+                        prompt=(handoff if session_id else f"{request.prompt}\n\n{handoff}"),
+                        resume_session_id=session_id,
+                    ),
+                    provider=provider,
+                    resume_index=resume_count,
+                    allow_interrupted_resume=False,
+                )
+                self.logger.info(
+                    "[health-watch] provider=%s action=resume-after-diagnosis session=%s",
+                    provider,
+                    session_id or "fresh",
+                )
+                continue
             incident = self._record_provider_execution_incident(
                 request.stage, provider, result
             )
@@ -31773,6 +32180,7 @@ class Orchestrator:
             attempt_id=f"{attempt_id}:{provider}:{resume_index}",
             progress_report_path=report_path,
             resume_session_id=resume_session_id,
+            termination_probe=self._health_termination_probe,
         )
 
     @staticmethod

@@ -33,7 +33,7 @@ from .config import (
 )
 from .config import supported_provider_kinds
 from .env import load_dotenv
-from .io_utils import write_json
+from .io_utils import read_json, write_json
 from .notifications import (
     notify_run_finished,
     notify_run_started,
@@ -56,6 +56,14 @@ from .prototype_variants import (
 )
 from .foreground_activity import ForegroundActivity
 from .git_ops import add_worktree, changed_paths, remove_worktree
+from .health_watch import HealthSelfRepairRequired, build_progress_vector
+from .health_watchdog import (
+    mark_watchdog_stop_intent,
+    mark_watchdog_supervisor_parent,
+    run_watchdog,
+    start_run_watchdog,
+    watchdog_recovery_requested,
+)
 from .process_supervision import (
     ACTIVE_PROCESSES,
     RunInterruptedError,
@@ -65,6 +73,7 @@ from .process_supervision import (
 from .run_lock import (
     ProjectRunLock,
     RunAlreadyActiveError,
+    runtime_status,
     stop_project_run,
 )
 from .release_attestation import (
@@ -84,6 +93,11 @@ from .self_repair import (
     classify_auto_agents_error,
     self_repair_verification_command,
     self_repair_verify_commands,
+)
+from .repair_cases import RepairCase, RepairCaseStore
+from .repair_checkpoint import (
+    create_repair_checkpoint,
+    restore_repair_control_checkpoint,
 )
 from .self_repair_playbooks import SelfRepairPlaybookRegistry
 from .validation import validate_persistence_config_payload, validation_report
@@ -942,16 +956,24 @@ def _run_command_for_self_repair_resume(
         command.append("--skip-validate")
     if bool(getattr(args, "print_agent_output", False)):
         command.append("--print-agent-output")
+    if bool(getattr(args, "full_verify", False)):
+        command.append("--full-verify")
     if getattr(args, "provider", None):
         command.extend(["--provider", str(args.provider)])
     if getattr(args, "doc_language", None):
         command.extend(["--doc-language", str(args.doc_language)])
     if bool(getattr(args, "no_repo_map", False)):
         command.append("--no-repo-map")
+    if bool(getattr(args, "no_health_watch", False)):
+        command.append("--no-health-watch")
     if bool(getattr(args, "strict_self_repair", False)):
         command.append("--strict-self-repair")
     if getattr(args, "autonomy", None):
         command.extend(["--autonomy", str(args.autonomy)])
+    if getattr(args, "interaction_mode", None):
+        command.extend(["--interaction-mode", str(args.interaction_mode)])
+    if getattr(args, "secret_echo", None):
+        command.extend(["--secret-echo", str(args.secret_echo)])
     return command
 
 
@@ -989,6 +1011,69 @@ def _run_self_repair_resume_process(
         )
 
 
+def _finalize_health_live_boundary(
+    project_root: Path,
+    repair_case: RepairCase,
+    *,
+    exit_code: int,
+) -> bool:
+    after = _try_load_run_state(project_root)
+    before_atoms = {
+        str(item) for item in repair_case.progress_before.get("durable_atoms", [])
+    }
+    after_progress = build_progress_vector(after) if after is not None else None
+    crossed = bool(
+        exit_code == 0
+        and after_progress is not None
+        and (
+            set(after_progress.durable_atoms) - before_atoms
+            or len(after_progress.unresolved_roots)
+            < len(repair_case.progress_before.get("unresolved_roots", []))
+        )
+    )
+    if after is not None:
+        stored = RepairCaseStore(project_root, after.run_id).load(repair_case.case_id)
+        if stored is not None:
+            stored.status = "resolved" if crossed else "live_boundary_failed"
+            stored.history.append(
+                {
+                    "event": "live_boundary",
+                    "crossed": crossed,
+                    "exit_code": exit_code,
+                }
+            )
+            RepairCaseStore(project_root, after.run_id).save(stored)
+        if crossed:
+            after.active_repair_case_id = ""
+            after.repair_phase = ""
+            after.repair_checkpoint_ref = ""
+            save_run_state(project_root, after)
+    return crossed
+
+
+def _restore_failed_health_boundary(
+    project_root: Path,
+    repair_case: RepairCase,
+    checkpoint: Path,
+) -> None:
+    try:
+        restore_repair_control_checkpoint(project_root, checkpoint)
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
+        state = _try_load_run_state(project_root)
+        if state is None:
+            return
+        stored = RepairCaseStore(project_root, state.run_id).load(repair_case.case_id)
+        if stored is not None:
+            stored.status = "checkpoint_restore_failed"
+            stored.history.append(
+                {
+                    "event": "checkpoint_restore_failed",
+                    "reason": str(error),
+                }
+            )
+            RepairCaseStore(project_root, state.run_id).save(stored)
+
+
 def _auto_repair_auto_agents_and_resume(
     project_root: Path,
     orchestrator: Orchestrator,
@@ -997,23 +1082,96 @@ def _auto_repair_auto_agents_and_resume(
     args,
     run_lock: ProjectRunLock,
     diagnosis=None,
+    repair_case: Optional[RepairCase] = None,
 ) -> int:
-    orchestrator.record_run_blocker(
-        owner="auto_agents",
-        category=decision.category or "auto_agents_error",
-        reason=decision.reason or str(error),
-        fingerprint=decision.fingerprint,
-    )
-    if diagnosis is not None:
+    health_repair = bool(repair_case is not None and repair_case.source == "health_watch")
+    if health_repair:
         state = load_run_state(project_root)
-        blocker = dict(state.active_blocker)
-        blocker["root_cause_diagnosis"] = {
-            "diagnosis_id": diagnosis.diagnosis_id,
-            "evidence_path": diagnosis.evidence_path,
-            "final": diagnosis.final.to_dict(),
-        }
-        state.active_blocker = blocker
+        state.active_repair_case_id = repair_case.case_id
+        state.repair_phase = "quiescing"
         save_run_state(project_root, state)
+        ACTIVE_PROCESSES.terminate_all()
+        deadline = time.monotonic() + max(
+            60,
+            int(orchestrator.config.execution.health_watch.quiesce_timeout_seconds),
+        )
+        while time.monotonic() < deadline:
+            if not any(
+                process_group_exists(record.pgid)
+                for record in ACTIVE_PROCESSES.snapshot()
+            ):
+                break
+            time.sleep(0.1)
+        else:
+            message = "health self-repair could not quiesce all managed process groups"
+            orchestrator.record_self_repair_failure(
+                category=repair_case.kind,
+                reason=message,
+                summary="",
+                verification="",
+            )
+            orchestrator.stop_health_supervision(status="blocked", reason=message)
+            _notify_run_blocked(project_root, message)
+            print(json.dumps({"ok": False, "error": message}, indent=2, ensure_ascii=False))
+            return 3
+        try:
+            checkpoint = create_repair_checkpoint(
+                project_root,
+                state.run_id,
+                repair_case.case_id,
+            )
+        except (OSError, RuntimeError) as checkpoint_error:
+            message = f"health self-repair checkpoint failed: {checkpoint_error}"
+            orchestrator.record_self_repair_failure(
+                category=repair_case.kind,
+                reason=message,
+                summary="",
+                verification="",
+            )
+            orchestrator.stop_health_supervision(status="blocked", reason=message)
+            _notify_run_blocked(project_root, message)
+            print(json.dumps({"ok": False, "error": message}, indent=2, ensure_ascii=False))
+            return 3
+        repair_case.resume_checkpoint_ref = str(checkpoint)
+        repair_case.status = "self_repairing"
+        RepairCaseStore(project_root, state.run_id).save(repair_case)
+        state = load_run_state(project_root)
+        state.repair_phase = "self_repairing"
+        state.repair_checkpoint_ref = str(checkpoint)
+        save_run_state(project_root, state)
+    else:
+        orchestrator.record_run_blocker(
+            owner="auto_agents",
+            category=decision.category or "auto_agents_error",
+            reason=decision.reason or str(error),
+            fingerprint=decision.fingerprint,
+        )
+    if diagnosis is not None:
+        if health_repair:
+            state = load_run_state(project_root)
+            stored_case = RepairCaseStore(
+                project_root, state.run_id
+            ).load(repair_case.case_id)
+            if stored_case is not None:
+                stored_case.history.append(
+                    {
+                        "event": "root_cause_diagnosis",
+                        "diagnosis_id": diagnosis.diagnosis_id,
+                        "evidence_path": diagnosis.evidence_path,
+                        "final": diagnosis.final.to_dict(),
+                    }
+                )
+                RepairCaseStore(project_root, state.run_id).save(stored_case)
+        else:
+            state = load_run_state(project_root)
+            blocker = dict(state.active_blocker)
+            blocker["root_cause_diagnosis"] = {
+                "diagnosis_id": diagnosis.diagnosis_id,
+                "evidence_path": diagnosis.evidence_path,
+                "final": diagnosis.final.to_dict(),
+            }
+            state.active_blocker = blocker
+            save_run_state(project_root, state)
     print(
         "Run hit an auto_agents-owned failure. Starting automatic auto_agents self-repair...",
         file=sys.stderr,
@@ -1024,6 +1182,7 @@ def _auto_repair_auto_agents_and_resume(
         error=error,
         decision=decision,
         diagnosis=diagnosis,
+        repair_case=repair_case,
         print_agent_output=bool(getattr(args, "print_agent_output", False)),
     )
     result = runner.run()
@@ -1035,12 +1194,21 @@ def _auto_repair_auto_agents_and_resume(
             summary=result.summary,
             verification=result.verification,
         )
+        if health_repair:
+            orchestrator.stop_health_supervision(status="blocked", reason=message)
         _notify_run_blocked(project_root, message)
         payload = {"ok": False, "error": message}
         if result.verification.strip():
             payload["verification"] = result.verification
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 3
+
+    if health_repair:
+        mark_watchdog_supervisor_parent(
+            project_root,
+            load_run_state(project_root).run_id,
+            active=True,
+        )
 
     if result.status == "already_repaired" or not result.candidate_commit:
         orchestrator.mark_self_repair_applied(result.commit_sha)
@@ -1049,14 +1217,53 @@ def _auto_repair_auto_agents_and_resume(
             f"{result.commit_sha[:12]}. Resuming run without a new repair...",
             file=sys.stderr,
         )
-        exit_code = _run_self_repair_resume_process(
-            _run_command_for_self_repair_resume(args),
-            cwd=auto_agents_repo_root(),
-            env=run_lock.inherited_environment(
-                append_self_repair_history(decision)
-            ),
-            pass_fd=run_lock.fileno,
+        if health_repair:
+            orchestrator.stop_health_supervision(status="handoff")
+        resume_command = _run_command_for_self_repair_resume(args)
+        inherited_env = run_lock.inherited_environment(
+            append_self_repair_history(decision)
         )
+        boundary_exit = 0
+        if health_repair:
+            boundary_exit = _run_self_repair_resume_process(
+                [
+                    *resume_command,
+                    "--repair-boundary-only",
+                    repair_case.case_id,
+                ],
+                cwd=auto_agents_repo_root(),
+                env=inherited_env,
+                pass_fd=run_lock.fileno,
+            )
+            if boundary_exit != 0:
+                _restore_failed_health_boundary(
+                    project_root,
+                    repair_case,
+                    checkpoint,
+                )
+        exit_code = (
+            boundary_exit
+            if boundary_exit != 0
+            else _run_self_repair_resume_process(
+                resume_command,
+                cwd=auto_agents_repo_root(),
+                env=inherited_env,
+                pass_fd=run_lock.fileno,
+            )
+        )
+        if health_repair and not _finalize_health_live_boundary(
+            project_root,
+            repair_case,
+            exit_code=exit_code,
+        ):
+            message = "approved self-repair did not cross the live health boundary"
+            orchestrator.record_self_repair_failure(
+                category=result.category,
+                reason=message,
+                summary=result.summary,
+                verification=result.verification,
+            )
+            exit_code = 3
     else:
         before = load_run_state(project_root)
         before_blocker = (
@@ -1072,16 +1279,42 @@ def _auto_repair_auto_agents_and_resume(
             file=sys.stderr,
         )
         try:
-            exit_code = _run_self_repair_resume_process(
-                _run_command_for_self_repair_resume(
-                    args,
-                    repo_root=runtime_root,
-                ),
-                cwd=runtime_root,
-                env=run_lock.inherited_environment(
-                    append_self_repair_history(decision)
-                ),
-                pass_fd=run_lock.fileno,
+            if health_repair:
+                orchestrator.stop_health_supervision(status="handoff")
+            resume_command = _run_command_for_self_repair_resume(
+                args,
+                repo_root=runtime_root,
+            )
+            inherited_env = run_lock.inherited_environment(
+                append_self_repair_history(decision)
+            )
+            boundary_exit = 0
+            if health_repair:
+                boundary_exit = _run_self_repair_resume_process(
+                    [
+                        *resume_command,
+                        "--repair-boundary-only",
+                        repair_case.case_id,
+                    ],
+                    cwd=runtime_root,
+                    env=inherited_env,
+                    pass_fd=run_lock.fileno,
+                )
+                if boundary_exit != 0:
+                    _restore_failed_health_boundary(
+                        project_root,
+                        repair_case,
+                        checkpoint,
+                    )
+            exit_code = (
+                boundary_exit
+                if boundary_exit != 0
+                else _run_self_repair_resume_process(
+                    resume_command,
+                    cwd=runtime_root,
+                    env=inherited_env,
+                    pass_fd=run_lock.fileno,
+                )
             )
             after = _try_load_run_state(project_root)
             after_blocker = (
@@ -1089,7 +1322,13 @@ def _auto_repair_auto_agents_and_resume(
                 if after is not None and isinstance(after.active_blocker, dict)
                 else {}
             )
-            if getattr(args, "command", "run") == "run":
+            if health_repair:
+                same_root = not _finalize_health_live_boundary(
+                    project_root,
+                    repair_case,
+                    exit_code=exit_code,
+                )
+            elif getattr(args, "command", "run") == "run":
                 same_root = bool(
                     after_blocker
                     and (
@@ -1127,6 +1366,21 @@ def _auto_repair_auto_agents_and_resume(
         finally:
             if hasattr(runner, "cleanup_runtime"):
                 runner.cleanup_runtime(result)
+
+    if health_repair:
+        final_state = _try_load_run_state(project_root)
+        if final_state is not None:
+            mark_watchdog_supervisor_parent(
+                project_root,
+                final_state.run_id,
+                active=False,
+            )
+            if exit_code != 0:
+                mark_watchdog_stop_intent(
+                    project_root,
+                    final_state.run_id,
+                    reason="health self-repair resume failed",
+                )
 
     _safe_notify(
         notify_self_repair_finished,
@@ -1470,6 +1724,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-dirty-tree",
         action="store_true",
         help="Allow implementation to start even when the project git tree already has local changes.",
+    )
+    run_parser.add_argument(
+        "--no-health-watch",
+        action="store_true",
+        help="Disable run-health supervision and its sidecar for this invocation.",
+    )
+    run_parser.add_argument(
+        "--repair-boundary-only",
+        default="",
+        help=argparse.SUPPRESS,
     )
     run_parser.add_argument(
         "--max-tasks",
@@ -1956,6 +2220,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workers_cleanup.add_argument("--max-age-seconds", type=float, default=86400.0)
 
+    watchdog_parser = subparsers.add_parser("_watchdog", help=argparse.SUPPRESS)
+    watchdog_parser.add_argument("--project", required=True)
+    watchdog_parser.add_argument("--run-id", required=True)
+
     worker_parser = subparsers.add_parser(
         "worker",
         help="Run this computer as a foreground LAN gate worker.",
@@ -1977,6 +2245,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _load_cli_dotenv()
+
+    if args.command == "_watchdog":
+        return run_watchdog(Path(args.project), str(args.run_id))
 
     self_repair_preflight_exit = _preflight_automatic_self_repair(args)
     if self_repair_preflight_exit is not None:
@@ -2335,6 +2606,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             spec_file = _apply_saved_run_context(args, project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            orchestrator._run_token = run_lock.run_token
+            if bool(getattr(args, "no_health_watch", False)):
+                orchestrator.config.execution.health_watch.enabled = False
+                orchestrator.config.execution.health_watch.sidecar_enabled = False
             configured_autonomy = getattr(
                 getattr(
                     getattr(orchestrator, "config", None),
@@ -2348,7 +2623,26 @@ def main(argv: list[str] | None = None) -> int:
                 getattr(args, "autonomy", None)
                 or getattr(configured_autonomy, "mode", "max")
             )
+            boundary_case_id = str(
+                getattr(args, "repair_boundary_only", "") or ""
+            ).strip()
+            if boundary_case_id:
+                receipt = orchestrator.verify_health_repair_boundary(
+                    boundary_case_id
+                )
+                print(json.dumps({"ok": True, "receipt": receipt}, indent=2, ensure_ascii=False))
+                return 0
             _promote_pending_self_repairs(project_root)
+            if hasattr(orchestrator, "_start_health_supervision"):
+                restart_command = _run_command_for_self_repair_resume(args)
+                orchestrator._watchdog_launcher = lambda watched_state: start_run_watchdog(
+                    project_root=project_root,
+                    run_id=watched_state.run_id,
+                    run_token=run_lock.run_token,
+                    restart_command=restart_command,
+                    auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
+                    autonomy_mode=orchestrator._autonomy_mode,
+                )
             if run_lock.interrupted_snapshot:
                 interrupted_state = orchestrator.reconcile_runtime_interruption(
                     run_lock.interrupted_snapshot
@@ -2446,8 +2740,29 @@ def main(argv: list[str] | None = None) -> int:
             _safe_notify(notify_run_finished, project_root, state_payload)
             print(_render_run_summary(project_root, state_payload))
             return 0
+        except HealthSelfRepairRequired as error:
+            triage = error.triage
+            return _auto_repair_auto_agents_and_resume(
+                project_root,
+                orchestrator,
+                error,
+                triage.decision,
+                args,
+                run_lock,
+                diagnosis=triage.root_cause,
+                repair_case=error.repair_case,
+            )
         except RunInterruptedError as error:
-            _mark_run_stopped(project_root, str(error))
+            if watchdog_recovery_requested(
+                project_root,
+                load_run_state(project_root).run_id,
+            ):
+                interrupted = load_run_state(project_root)
+                interrupted.repair_phase = "watchdog_restart"
+                interrupted.last_error = str(error)
+                save_run_state(project_root, interrupted)
+            else:
+                _mark_run_stopped(project_root, str(error))
             _notify_run_blocked(project_root, error)
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return error.exit_code
@@ -2494,6 +2809,15 @@ def main(argv: list[str] | None = None) -> int:
         project_root = Path(args.project)
         if args.grace_seconds < 0:
             parser.error("--grace-seconds must be >= 0")
+        try:
+            stopped_state = load_run_state(project_root)
+            mark_watchdog_stop_intent(
+                project_root,
+                stopped_state.run_id,
+                reason="run stopped by user",
+            )
+        except Exception:
+            pass
         payload, exit_code = stop_project_run(
             project_root,
             grace_seconds=float(args.grace_seconds),
@@ -2504,8 +2828,22 @@ def main(argv: list[str] | None = None) -> int:
         return exit_code
 
     if args.command == "status":
-        orchestrator = Orchestrator(Path(args.project))
-        print(json.dumps(orchestrator.status(), indent=2, ensure_ascii=False))
+        project_root = Path(args.project).expanduser().resolve()
+        orchestrator = Orchestrator(project_root)
+        payload = orchestrator.status()
+        state = load_run_state(project_root)
+        health = read_json(
+            run_path(project_root, state.run_id) / "health" / "summary.json",
+            default={},
+        )
+        watchdog = read_json(
+            run_path(project_root, state.run_id) / "health" / "watchdog.json",
+            default={},
+        )
+        payload["health"] = health if isinstance(health, dict) else {}
+        payload["watchdog"] = watchdog if isinstance(watchdog, dict) else {}
+        payload["runtime"] = runtime_status(project_root)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
     if args.command == "validate":

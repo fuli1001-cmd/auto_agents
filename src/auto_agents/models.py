@@ -1099,6 +1099,62 @@ class SmartTimeoutConfig:
 
 
 @dataclass
+class HealthWatchConfig:
+    enabled: bool = True
+    sidecar_enabled: bool = True
+    agent_triage_enabled: bool = True
+    poll_seconds: int = 30
+    heartbeat_timeout_seconds: int = 120
+    sidecar_grace_seconds: int = 60
+    goal_stall_lease_multiplier: float = 2.0
+    oscillation_repeat_limit: int = 3
+    recovery_churn_limit: int = 3
+    max_interventions_per_root: int = 3
+    max_sidecar_restarts_per_run: int = 2
+    quiesce_timeout_seconds: int = 600
+    boundary_replay_timeout_seconds: int = 1200
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "HealthWatchConfig":
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            sidecar_enabled=bool(data.get("sidecar_enabled", True)),
+            agent_triage_enabled=bool(data.get("agent_triage_enabled", True)),
+            poll_seconds=max(5, int(data.get("poll_seconds", 30))),
+            heartbeat_timeout_seconds=max(
+                15, int(data.get("heartbeat_timeout_seconds", 120))
+            ),
+            sidecar_grace_seconds=max(
+                0, int(data.get("sidecar_grace_seconds", 60))
+            ),
+            goal_stall_lease_multiplier=max(
+                1.0, float(data.get("goal_stall_lease_multiplier", 2.0))
+            ),
+            oscillation_repeat_limit=max(
+                2, int(data.get("oscillation_repeat_limit", 3))
+            ),
+            recovery_churn_limit=max(
+                2, int(data.get("recovery_churn_limit", 3))
+            ),
+            max_interventions_per_root=max(
+                1, int(data.get("max_interventions_per_root", 3))
+            ),
+            max_sidecar_restarts_per_run=max(
+                0, int(data.get("max_sidecar_restarts_per_run", 2))
+            ),
+            quiesce_timeout_seconds=max(
+                60, int(data.get("quiesce_timeout_seconds", 600))
+            ),
+            boundary_replay_timeout_seconds=max(
+                60, int(data.get("boundary_replay_timeout_seconds", 1200))
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class ProviderFailoverConfig:
     probe_enabled: bool = True
     probe_timeout_seconds: int = 60
@@ -1215,6 +1271,7 @@ class ExecutionConfig:
     requirements_audit: RequirementsAuditConfig = field(default_factory=RequirementsAuditConfig)
     evidence_preflight: EvidencePreflightConfig = field(default_factory=EvidencePreflightConfig)
     smart_timeout: SmartTimeoutConfig = field(default_factory=SmartTimeoutConfig)
+    health_watch: HealthWatchConfig = field(default_factory=HealthWatchConfig)
     provider_failover: ProviderFailoverConfig = field(
         default_factory=ProviderFailoverConfig
     )
@@ -1239,6 +1296,9 @@ class ExecutionConfig:
             smart_timeout=SmartTimeoutConfig.from_dict(
                 dict(data.get("smart_timeout", {}))
             ),
+            health_watch=HealthWatchConfig.from_dict(
+                dict(data.get("health_watch", {}))
+            ),
             provider_failover=ProviderFailoverConfig.from_dict(
                 dict(data.get("provider_failover", {}))
             ),
@@ -1261,6 +1321,7 @@ class ExecutionConfig:
             "requirements_audit": self.requirements_audit.to_dict(),
             "evidence_preflight": self.evidence_preflight.to_dict(),
             "smart_timeout": self.smart_timeout.to_dict(),
+            "health_watch": self.health_watch.to_dict(),
             "provider_failover": self.provider_failover.to_dict(),
             "self_repair_diagnosis": self.self_repair_diagnosis.to_dict(),
             "autonomy": self.autonomy.to_dict(),
@@ -1573,6 +1634,9 @@ class RunState:
     )
     active_blocker: Dict[str, object] = field(default_factory=dict)
     active_self_repair_experiment_id: str = ""
+    active_repair_case_id: str = ""
+    repair_phase: str = ""
+    repair_checkpoint_ref: str = ""
     localized_blockers: List[Dict[str, object]] = field(default_factory=list)
     pending_self_repair_promotions: List[Dict[str, object]] = field(
         default_factory=list
@@ -1654,6 +1718,9 @@ class RunState:
             active_self_repair_experiment_id=str(
                 data.get("active_self_repair_experiment_id", "")
             ),
+            active_repair_case_id=str(data.get("active_repair_case_id", "")),
+            repair_phase=str(data.get("repair_phase", "")),
+            repair_checkpoint_ref=str(data.get("repair_checkpoint_ref", "")),
             localized_blockers=[
                 dict(item)
                 for item in (data.get("localized_blockers", []) or [])
@@ -1725,6 +1792,9 @@ class RunState:
             "active_self_repair_experiment_id": (
                 self.active_self_repair_experiment_id
             ),
+            "active_repair_case_id": self.active_repair_case_id,
+            "repair_phase": self.repair_phase,
+            "repair_checkpoint_ref": self.repair_checkpoint_ref,
             "localized_blockers": [
                 dict(item) for item in self.localized_blockers
             ],
@@ -1872,6 +1942,7 @@ class AgentRequest:
     resume_session_id: str = ""
     sandbox_mode: str = ""
     timeout_seconds: int = 0
+    termination_probe: Optional[Callable[[], str]] = None
 
 
 @dataclass

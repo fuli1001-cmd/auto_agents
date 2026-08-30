@@ -18,6 +18,7 @@ from auto_agents.models import (
     SelfRepairDiagnosisConfig,
 )
 from auto_agents.root_cause import RootCauseCoordinator
+from auto_agents.repair_cases import RepairCase
 from auto_agents.self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
@@ -491,6 +492,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
         *,
         mutate=False,
         investigator_tool_count=0,
+        repair_case=None,
     ):
         auto_root = root / "auto"
         target_root = root / "target"
@@ -516,6 +518,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             heuristic={"eligible": False},
             runtime_evidence={},
             config=SelfRepairDiagnosisConfig(),
+            repair_case=repair_case,
         )
         return coordinator, fake, target_root
 
@@ -553,6 +556,41 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertTrue(artifact["repair_approved"])
+
+    def test_health_case_reuses_consensus_and_requires_boundary_commands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            health_case = RepairCase(
+                case_id="health-case",
+                run_id="run-123",
+                source="health_watch",
+                kind="goal_stalled",
+                severity="confirmed",
+                symptom="activity without goal progress",
+                expected_postconditions=["durable progress resumes"],
+            )
+            investigator = _report(role="investigator", verdict="ROOT_CAUSE")
+            reviewer = _report(role="reviewer", verdict="AGREE")
+            for report in (investigator, reviewer):
+                report["expected_postconditions"] = ["durable progress resumes"]
+            coordinator, _fake, _target = self._coordinator(
+                Path(tmp),
+                [investigator, reviewer],
+                repair_case=health_case,
+            )
+            self.assertTrue(coordinator.run().repair_approved)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            investigator = _report(role="investigator", verdict="ROOT_CAUSE")
+            reviewer = _report(role="reviewer", verdict="AGREE")
+            for report in (investigator, reviewer):
+                report["expected_postconditions"] = ["durable progress resumes"]
+                report["verification_commands"] = []
+            coordinator, _fake, _target = self._coordinator(
+                Path(tmp),
+                [investigator, reviewer],
+                repair_case=health_case,
+            )
+            self.assertFalse(coordinator.run().repair_approved)
 
     def test_max_autonomy_attempts_reversible_candidate_before_safety_is_proven(self):
         with tempfile.TemporaryDirectory() as tmp:

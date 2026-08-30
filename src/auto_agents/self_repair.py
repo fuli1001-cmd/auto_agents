@@ -44,6 +44,7 @@ from .requirements import (
     NonAmendableRequirementContractRecoveryError,
     forbidden_pattern_definition_reason,
 )
+from .repair_cases import RepairCase, RepairCaseStore, terminal_repair_case
 
 
 SELF_REPAIR_LAST_FINGERPRINT_ENV = "AUTO_AGENTS_SELF_REPAIR_LAST_FINGERPRINT"
@@ -852,22 +853,25 @@ def _looks_like_auto_agents_traceback(text: str) -> bool:
     return bool(re.search(r'File ".*(?:src/)?auto_agents/[^"]+\.py"', text))
 
 
-def adjudicate_auto_agents_error(
+def adjudicate_repair_case(
     orchestrator: object,
     *,
     target_project_root: Path,
-    error: object,
+    repair_case: RepairCase,
+    error: object = None,
     state: Optional[RunState] = None,
     traceback_text: str = "",
     env: Optional[dict[str, str]] = None,
 ) -> SelfRepairTriageResult:
-    """Run evidence-based investigator/reviewer diagnosis for a terminal error.
+    """Run evidence-based investigator/reviewer diagnosis for a repair case.
 
     Heuristics are hints only. Automatic repair fails closed unless the complete
     root-cause consensus pipeline proves a generic, safe auto_agents defect.
     """
 
     values = os.environ if env is None else env
+    if error is None:
+        error = RuntimeError(repair_case.symptom or repair_case.kind)
     heuristic = classify_auto_agents_error(error, state=state, env=values)
     if str(values.get(SELF_REPAIR_DISABLED_ENV, "")).strip().lower() in {"1", "true", "yes"}:
         return SelfRepairTriageResult(
@@ -885,7 +889,7 @@ def adjudicate_auto_agents_error(
         return SelfRepairTriageResult(
             decision=heuristic,
             source="diagnosis_disabled",
-            reason="terminal root-cause diagnosis is disabled by project configuration",
+            reason="repair-case root-cause diagnosis is disabled by project configuration",
         )
     try:
         diagnosis = RootCauseCoordinator(
@@ -898,6 +902,7 @@ def adjudicate_auto_agents_error(
             heuristic=heuristic.to_dict(),
             runtime_evidence=self_repair_runtime_evidence(),
             config=config,
+            repair_case=repair_case,
         ).run()
     except Exception as exc:
         provider_error = _compact_text(str(exc), limit=1200)
@@ -917,7 +922,7 @@ def adjudicate_auto_agents_error(
             ),
             source="root_cause_failed",
             reason=(
-                "terminal root-cause diagnosis failed closed"
+                "repair-case root-cause diagnosis failed closed"
             ),
             provider_error=provider_error,
         )
@@ -982,6 +987,47 @@ def adjudicate_auto_agents_error(
         ),
         judgment=judgment,
         root_cause=diagnosis,
+    )
+
+
+def adjudicate_auto_agents_error(
+    orchestrator: object,
+    *,
+    target_project_root: Path,
+    error: object,
+    state: Optional[RunState] = None,
+    traceback_text: str = "",
+    env: Optional[dict[str, str]] = None,
+) -> SelfRepairTriageResult:
+    """Compatibility wrapper for terminal-error self-repair triage."""
+
+    run_id = state.run_id if state is not None else "uninitialized"
+    stage = state.current_stage if state is not None else ""
+    incident_id = state.active_execution_incident_id if state is not None else ""
+    repair_case = terminal_repair_case(
+        run_id=run_id,
+        error=error,
+        stage=stage,
+        execution_incident_id=incident_id,
+        owner_hint=(
+            str(state.active_blocker.get("owner", "unknown"))
+            if state is not None and isinstance(state.active_blocker, dict)
+            else "unknown"
+        ),
+    )
+    if state is not None and state.run_id:
+        try:
+            RepairCaseStore(target_project_root, state.run_id).save(repair_case)
+        except OSError:
+            pass
+    return adjudicate_repair_case(
+        orchestrator,
+        target_project_root=target_project_root,
+        repair_case=repair_case,
+        error=error,
+        state=state,
+        traceback_text=traceback_text,
+        env=env,
     )
 
 
@@ -1288,6 +1334,7 @@ def self_repair_verify_commands(env: Optional[dict[str, str]] = None) -> list[st
     if configured:
         return [configured]
     return [
+        "python -m pytest -q tests/test_health_watch.py",
         "python -m pytest -q tests/test_root_cause.py",
         "python -m pytest -q tests/test_project_validation.py -k "
         "'self_repair or provider_judgment or provider_triage or legacy_efforts or provider_resolve'",
@@ -1464,6 +1511,7 @@ class AutoAgentsSelfRepairRunner:
         error: object,
         decision: SelfRepairDecision,
         diagnosis: Optional[RootCauseDiagnosis] = None,
+        repair_case: Optional[RepairCase] = None,
         print_agent_output: bool = False,
     ) -> None:
         self.target_orchestrator = target_orchestrator
@@ -1471,6 +1519,7 @@ class AutoAgentsSelfRepairRunner:
         self.error = error
         self.decision = decision
         self.diagnosis = diagnosis
+        self.repair_case = repair_case
         self.print_agent_output = print_agent_output
         self.repo_root = auto_agents_repo_root()
         self._remote_conflict_resolved = False
@@ -1611,6 +1660,7 @@ class AutoAgentsSelfRepairRunner:
                 experiment_id=experiment_id,
             )
         base_head = head_ref(self.repo_root)
+        self._candidate_base_ref = base_head
         target_before = repository_guard_fingerprint(
             self.target_project_root,
             ignore_run_artifacts=True,
@@ -1806,7 +1856,16 @@ class AutoAgentsSelfRepairRunner:
                 )
                 differential = self._diagnosis_differential(base_head, repair_root)
                 legacy_direct_attempt = self.diagnosis is None and self.decision.eligible
-                if not replay.ok and not differential.ok and not legacy_direct_attempt:
+                health_case = bool(
+                    self.repair_case is not None
+                    and self.repair_case.source == "health_watch"
+                )
+                boundary_failed = (
+                    (not replay.ok or not differential.ok)
+                    if health_case
+                    else (not replay.ok and not differential.ok)
+                )
+                if boundary_failed and not legacy_direct_attempt:
                     return SelfRepairResult(
                         ok=False,
                         status="candidate_replay_failed",
@@ -2109,6 +2168,12 @@ class AutoAgentsSelfRepairRunner:
         candidate_commit: str,
         candidate_id: str,
     ) -> "_VerificationResult":
+        if self.repair_case is not None and self.repair_case.source == "health_watch":
+            return self._replay_health_candidate(
+                candidate_root,
+                candidate_commit,
+                candidate_id,
+            )
         from .config import load_run_state, run_path
 
         try:
@@ -2189,6 +2254,111 @@ class AutoAgentsSelfRepairRunner:
                 ok,
                 f"replay candidate={candidate_id} commit={candidate_commit}\n{detail[-2000:]}",
             )
+
+    def _replay_health_candidate(
+        self,
+        candidate_root: Path,
+        candidate_commit: str,
+        candidate_id: str,
+    ) -> "_VerificationResult":
+        repair_case = self.repair_case
+        if repair_case is None or not repair_case.progress_history:
+            return _VerificationResult(False, "health repair case has no trajectory")
+        with tempfile.TemporaryDirectory(
+            prefix="auto-agents-health-boundary-base-"
+        ) as tmp:
+            base_root = Path(tmp) / "base"
+            created = False
+            try:
+                add_worktree(
+                    self.repo_root,
+                    base_root,
+                    ref=getattr(self, "_candidate_base_ref", "") or "HEAD",
+                )
+                created = True
+                base = self._health_boundary_at_root(
+                    base_root,
+                    repair_case,
+                    require_original_anomaly=True,
+                )
+                candidate = self._health_boundary_at_root(
+                    candidate_root,
+                    repair_case,
+                    require_original_anomaly=False,
+                )
+            finally:
+                if created:
+                    try:
+                        remove_worktree(self.repo_root, base_root, force=True)
+                    except RuntimeError:
+                        pass
+        expected = repair_case.kind
+        ok = base.ok and candidate.ok
+        return _VerificationResult(
+            ok,
+            "\n\n".join(
+                (
+                    f"health replay candidate={candidate_id} commit={candidate_commit}",
+                    f"expected_kind={expected}",
+                    "=== base health replay ===\n" + base.summary,
+                    "=== candidate health replay ===\n" + candidate.summary,
+                )
+            ),
+        )
+
+    def _health_boundary_at_root(
+        self,
+        source_root: Path,
+        repair_case: RepairCase,
+        *,
+        require_original_anomaly: bool,
+    ) -> "_VerificationResult":
+        payload = json.dumps(repair_case.progress_history, ensure_ascii=False)
+        runner = (
+            "import json,sys; "
+            f"sys.path.insert(0, {str((source_root / 'src').resolve())!r}); "
+            "from auto_agents.health_watch import replay_health_events; "
+            "events=json.loads(sys.stdin.read()); "
+            "items=replay_health_events(events,progress_lease_seconds=60); "
+            "print(json.dumps([item.to_dict() for item in items],sort_keys=True))"
+        )
+        try:
+            process = subprocess.run(
+                [self._verification_python(), "-c", runner],
+                input=payload,
+                cwd=str(source_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=max(
+                    60,
+                    int(
+                        getattr(
+                            self._autonomy_config(),
+                            "replay_timeout_seconds",
+                            1200,
+                        )
+                    ),
+                ),
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            return _VerificationResult(False, str(error))
+        detail = (process.stdout or process.stderr).strip()
+        if process.returncode != 0:
+            return _VerificationResult(False, detail[-4000:])
+        try:
+            anomalies = json.loads(process.stdout.splitlines()[-1])
+        except (IndexError, json.JSONDecodeError):
+            return _VerificationResult(False, detail[-4000:])
+        matched = any(
+            isinstance(item, dict)
+            and str(item.get("kind", "")) == repair_case.kind
+            for item in anomalies
+        )
+        return _VerificationResult(
+            matched if require_original_anomaly else True,
+            f"matched_original_anomaly={str(matched).lower()}\n{detail[-4000:]}",
+        )
 
     def _record_candidate_result(
         self,
@@ -2634,6 +2804,13 @@ class AutoAgentsSelfRepairRunner:
             "Root-cause diagnosis:",
             json.dumps(
                 diagnosis_payload,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            "",
+            "Repair case:",
+            json.dumps(
+                self.repair_case.to_dict() if self.repair_case is not None else {},
                 indent=2,
                 ensure_ascii=False,
             ),

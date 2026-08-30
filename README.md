@@ -1057,6 +1057,21 @@ worktrees. Example:
       "post_ceiling_finalize_seconds": 600,
       "fresh_continuation_limit": 1
     },
+    "health_watch": {
+      "enabled": true,
+      "sidecar_enabled": true,
+      "agent_triage_enabled": true,
+      "poll_seconds": 30,
+      "heartbeat_timeout_seconds": 120,
+      "sidecar_grace_seconds": 60,
+      "goal_stall_lease_multiplier": 2.0,
+      "oscillation_repeat_limit": 3,
+      "recovery_churn_limit": 3,
+      "max_interventions_per_root": 3,
+      "max_sidecar_restarts_per_run": 2,
+      "quiesce_timeout_seconds": 600,
+      "boundary_replay_timeout_seconds": 1200
+    },
     "provider_failover": {
       "probe_enabled": true,
       "probe_timeout_seconds": 60,
@@ -1165,6 +1180,29 @@ window; starting another tool after the ceiling ends the attempt. After the conf
 continuation limit, normal failover applies. Set
 `execution.smart_timeout.enabled` to `false` to restore the legacy `timeout_seconds` and
 `idle_timeout_seconds` hard-deadline behavior.
+
+Run-health supervision is also enabled by default. Smart timeout answers whether one provider
+attempt is active; health watch answers whether the whole workflow is making durable progress.
+Provider output, CPU use, tool calls, and workspace changes count as activity only. Completed
+stages, accepted task lineages, verified requirement proofs, resolved incident roots, and verified
+checkpoints form the durable progress vector.
+
+The in-process supervisor detects goal stalls, stage/recovery oscillation, repeated recovery without
+postcondition improvement, unexplained regression, and retry/resource degradation. A confirmed
+health incident is persisted as a repair case and uses the same read-only investigator/reviewer/
+arbiter consensus as terminal self-repair. Only a generic, evidence-backed `auto_agents` defect can
+enter isolated candidate repair; target-project, provider, infrastructure, requirements, and user
+input causes keep their existing recovery routes. If those routes exhaust their bounded health
+interventions, task-lineage incidents are localized when other independent tasks can continue.
+`health_watch.agent_triage_enabled` authorizes this health-case use of the shared diagnosis pipeline;
+`self_repair_diagnosis.mode=off` remains the global kill switch for provider diagnosis.
+
+Each CLI `run` also starts a small sidecar that does not own the project lock or modify project
+source. It monitors the orchestrator heartbeat and PID start identity, captures diagnostics for a
+stale owner, and can restart an unexpectedly dead run from its saved context within the configured
+budget. Completed, paused, blocked, waiting-user, and explicitly stopped runs are never restarted.
+Use `status` to inspect `health`, `watchdog`, and `runtime` details, or pass `--no-health-watch` to
+disable both layers for one invocation.
 
 **How it works**
 

@@ -222,11 +222,17 @@ def run_subprocess_with_optional_streaming(
 
         started_at = time.monotonic()
         while process.poll() is None:
-            if supervisor is not None:
+            if request.termination_probe is not None:
+                termination_reason = request.termination_probe() or ""
+            if not termination_reason and supervisor is not None:
                 termination_reason = supervisor.poll() or ""
-            elif stalled.is_set():
+            elif not termination_reason and stalled.is_set():
                 termination_reason = "provider_idle"
-            elif timeout and time.monotonic() - started_at >= timeout:
+            elif (
+                not termination_reason
+                and timeout
+                and time.monotonic() - started_at >= timeout
+            ):
                 termination_reason = "timed_out"
             if termination_reason:
                 cleanup_incomplete = _kill_process_group(process).cleanup_incomplete

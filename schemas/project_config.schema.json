@@ -644,6 +644,25 @@
             "fresh_continuation_limit": {"type": "integer", "minimum": 0}
           },
           "additionalProperties": false
+        },
+        "health_watch": {
+          "type": "object",
+          "properties": {
+            "enabled": {"type": "boolean", "default": true},
+            "sidecar_enabled": {"type": "boolean", "default": true},
+            "agent_triage_enabled": {"type": "boolean", "default": true},
+            "poll_seconds": {"type": "integer", "minimum": 5, "default": 30},
+            "heartbeat_timeout_seconds": {"type": "integer", "minimum": 15, "default": 120},
+            "sidecar_grace_seconds": {"type": "integer", "minimum": 0, "default": 60},
+            "goal_stall_lease_multiplier": {"type": "number", "minimum": 1.0, "default": 2.0},
+            "oscillation_repeat_limit": {"type": "integer", "minimum": 2, "default": 3},
+            "recovery_churn_limit": {"type": "integer", "minimum": 2, "default": 3},
+            "max_interventions_per_root": {"type": "integer", "minimum": 1, "default": 3},
+            "max_sidecar_restarts_per_run": {"type": "integer", "minimum": 0, "default": 2},
+            "quiesce_timeout_seconds": {"type": "integer", "minimum": 60, "default": 600},
+            "boundary_replay_timeout_seconds": {"type": "integer", "minimum": 60, "default": 1200}
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
