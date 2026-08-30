@@ -617,6 +617,121 @@ class ClarifyResumeTests(unittest.TestCase):
             trace,
         )
 
+    def test_clarify_allows_retained_ambiguous_quarantine_to_extend_through_superseded_replacement(
+        self,
+    ):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        trace_path = requirements_trace_path(project_root)
+
+        first_archived = self._requirement()
+        second_archived = self._requirement()
+        second_archived["text"] = "A different delivered output contract."
+        quarantined = self._requirement()
+        quarantined.update(
+            {"status": "superseded", "superseded_by": ["REQ-002"]}
+        )
+        replacement = self._requirement()
+        replacement.update(
+            {
+                "id": "REQ-002",
+                "text": "Provide the current replacement output.",
+                "supersedes": ["REQ-001"],
+            }
+        )
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [quarantined, replacement]}
+        )
+        candidate = json.loads(json.dumps(previous))
+        candidate["requirements"][1].update(
+            {"status": "superseded", "superseded_by": ["REQ-003"]}
+        )
+        descendant = self._requirement()
+        descendant.update(
+            {
+                "id": "REQ-003",
+                "text": "Provide the strengthened iteration output.",
+                "supersedes": ["REQ-002"],
+            }
+        )
+        candidate["requirements"].append(descendant)
+        candidate, _ = stamp_requirement_contract_hashes(candidate)
+        historical = [
+            {
+                "task_id": "ambiguous-archive",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    {
+                        "requirement_id": "REQ-001",
+                        "requirement_contract_sha256": (
+                            requirement_contract_sha256(first_archived)
+                        ),
+                        "status": "verified",
+                    },
+                    {
+                        "requirement_id": "REQ-001",
+                        "requirement_contract_sha256": (
+                            requirement_contract_sha256(second_archived)
+                        ),
+                        "status": "verified",
+                    },
+                ],
+            },
+            {
+                "task_id": "replacement-proof",
+                "status": "done",
+                "requirement_ids": ["REQ-002"],
+                "requirement_proofs": [
+                    {
+                        "requirement_id": "REQ-002",
+                        "requirement_contract_sha256": (
+                            requirement_contract_sha256(replacement)
+                        ),
+                        "status": "verified",
+                    }
+                ],
+            },
+        ]
+        write_json(trace_path, previous)
+        self._write_valid_brief(project_root)
+        orchestrator._active_spec_file = spec_file
+        orchestrator._clarify_pre_trace_payload = json.loads(json.dumps(previous))
+        orchestrator._clarify_historical_tasks = historical
+        calls = 0
+
+        def run_generate(request):
+            nonlocal calls
+            calls += 1
+            write_json(trace_path, candidate)
+            self._write_valid_brief(project_root)
+            write_text(request.output_path, "generated\n")
+            return AgentResult(
+                ok=True,
+                command=["fake"],
+                output_path=request.output_path,
+                summary="generated",
+                returncode=0,
+            )
+
+        orchestrator.adapter.run = run_generate
+
+        result = orchestrator._run_agent_with_retries(
+            state=state,
+            stage="clarify",
+            stage_key="clarify-generate",
+            prompt="Generate clarify artifacts.",
+            validation_feedback=orchestrator._clarify_validation_feedback,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(calls, 1)
+        self.assertEqual(
+            json.loads(trace_path.read_text(encoding="utf-8")),
+            candidate,
+        )
+
     def test_non_amendable_ambiguous_recovery_stops_retry_and_rolls_back(self):
         project_root, spec_file = self._setup_project()
         orchestrator = Orchestrator(project_root)

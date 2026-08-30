@@ -28964,6 +28964,7 @@ class Orchestrator:
                     "The existing requirements_trace.json is a CUMULATIVE contract across iterations; downstream task plans reference REQ IDs by value.",
                     "Do NOT delete existing REQ entries and do NOT renumber or reuse REQ IDs from the existing trace.",
                     "A requirement referenced by completed work is immutable. If its contract changes, preserve every contract field, mark the old entry status='superseded', set reciprocal superseded_by/supersedes links, and append the replacement under a new ID.",
+                    "Treat every existing supersession link as append-only lifecycle history. If a retained replacement must itself be superseded, keep the old reciprocal edge and extend the chain from that replacement to a new active or deferred descendant; never rewire an earlier edge directly to the newest descendant.",
                     "Mark requirements that are no longer in scope as status='superseded' (preserve id/text/source/acceptance_oracles) instead of removing them.",
                     (
                         "The engine computed the archive-aware next unused requirement ID as "

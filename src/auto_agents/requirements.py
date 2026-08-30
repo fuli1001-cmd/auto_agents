@@ -881,6 +881,108 @@ def _verified_contract_hashes_by_requirement(
     return hashes
 
 
+def _strict_requirement_links(
+    requirement: dict,
+    field: str,
+) -> Optional[Tuple[str, ...]]:
+    """Return normalized links only when the stored list is unambiguous."""
+    raw_links = requirement.get(field, [])
+    if not isinstance(raw_links, list):
+        return None
+    links = tuple(
+        str(value).strip()
+        for value in raw_links
+        if isinstance(value, str) and str(value).strip()
+    )
+    if len(links) != len(raw_links) or len(set(links)) != len(links):
+        return None
+    return links
+
+
+def _retained_replacement_chain_reaches_available_descendants(
+    req_id: str,
+    replacement_ids: Iterable[str],
+    previous: Dict[str, dict],
+    current: Dict[str, dict],
+    proven_ids: set[str],
+) -> bool:
+    """Validate a retained, append-only replacement graph to usable leaves.
+
+    Every existing downstream edge is historical lifecycle evidence.  A later
+    clarify pass may extend a terminal requirement with a fresh replacement,
+    but it may not remove or redirect an edge that was already present.
+    """
+
+    def edge_is_safe(parent_id: str, child_id: str) -> bool:
+        parent = current.get(parent_id)
+        child = current.get(child_id)
+        if parent is None or child is None:
+            return False
+        parent_links = _strict_requirement_links(parent, "superseded_by")
+        child_links = _strict_requirement_links(child, "supersedes")
+        if (
+            parent_links is None
+            or child_links is None
+            or child_id not in parent_links
+            or parent_id not in child_links
+        ):
+            return False
+
+        prior_parent = previous.get(parent_id)
+        prior_links = (
+            _strict_requirement_links(prior_parent, "superseded_by")
+            if prior_parent is not None
+            else ()
+        )
+        if prior_links is None or not set(prior_links).issubset(parent_links):
+            return False
+        if child_id not in prior_links and (
+            child_id in previous or child_id in proven_ids
+        ):
+            # New edges must introduce new requirement identities.  Otherwise
+            # clarify could repurpose an unrelated or archived requirement.
+            return False
+        return True
+
+    def branch_reaches_available_descendant(
+        parent_id: str,
+        replacement_id: str,
+        ancestors: frozenset[str],
+    ) -> bool:
+        if replacement_id in ancestors or not edge_is_safe(parent_id, replacement_id):
+            return False
+        replacement = current.get(replacement_id)
+        if replacement is None:
+            return False
+        status = str(replacement.get("status", "active")).strip()
+        downstream_ids = _strict_requirement_links(replacement, "superseded_by")
+        if downstream_ids is None:
+            return False
+        if status in {"active", "deferred"}:
+            return not downstream_ids
+        if status != "superseded" or not downstream_ids:
+            return False
+        next_ancestors = ancestors | {replacement_id}
+        return all(
+            branch_reaches_available_descendant(
+                replacement_id,
+                downstream_id,
+                next_ancestors,
+            )
+            for downstream_id in downstream_ids
+        )
+
+    retained_ids = tuple(replacement_ids)
+    return bool(retained_ids) and all(
+        branch_reaches_available_descendant(
+            req_id,
+            replacement_id,
+            frozenset({req_id}),
+        )
+        for replacement_id in retained_ids
+    )
+
+
 def _has_reciprocal_unused_replacements(
     req_id: str,
     before: dict,
@@ -892,23 +994,21 @@ def _has_reciprocal_unused_replacements(
     require_retained_links: bool = False,
 ) -> bool:
     """Validate the replacement topology required for delivered-ID recovery."""
-    raw_replacements = after.get("superseded_by", [])
-    if not isinstance(raw_replacements, list) or not raw_replacements:
+    replacement_ids = _strict_requirement_links(after, "superseded_by")
+    prior_replacement_ids = _strict_requirement_links(before, "superseded_by")
+    if not replacement_ids or prior_replacement_ids is None:
         return False
-    replacement_ids = [
-        str(value).strip()
-        for value in raw_replacements
-        if isinstance(value, str) and str(value).strip()
-    ]
-    if len(replacement_ids) != len(raw_replacements):
-        return False
-    prior_replacements = {
-        str(value).strip()
-        for value in before.get("superseded_by", []) or []
-        if isinstance(value, str) and str(value).strip()
-    }
-    if require_retained_links and set(replacement_ids) != prior_replacements:
-        return False
+    prior_replacements = set(prior_replacement_ids)
+    if require_retained_links:
+        if replacement_ids != prior_replacement_ids:
+            return False
+        return _retained_replacement_chain_reaches_available_descendants(
+            req_id,
+            replacement_ids,
+            previous,
+            current,
+            proven_ids,
+        )
     for replacement_id in replacement_ids:
         replacement = current.get(replacement_id)
         if (
@@ -1104,6 +1204,14 @@ def non_amendable_ambiguous_requirement_contract_ids(
                 and replacement_ids
                 and req_id not in replacement_ids
             ):
+                if _retained_replacement_chain_reaches_available_descendants(
+                    req_id,
+                    sorted(replacement_ids),
+                    current,
+                    current,
+                    proven_ids,
+                ):
+                    continue
                 can_complete_topology = True
                 for replacement_id in replacement_ids:
                     replacement = current.get(replacement_id)
@@ -1233,7 +1341,10 @@ def validate_requirement_contract_transitions(
                 "verified proofs disagree on the delivered contract hash. Preserve "
                 "the pre-clarify proof-bearing fields and contract_sha256 exactly, "
                 "keep or mark the record status='superseded', and retain reciprocal "
-                "replacement links; do not choose a historical hash automatically"
+                "replacement links. If a retained replacement is superseded, preserve "
+                "every existing downstream link and extend its reciprocal chain to "
+                "active or deferred descendants; do not choose a historical hash "
+                "automatically"
             )
             continue
         # Preserve the existing two-pass namespace recovery. The first pass may

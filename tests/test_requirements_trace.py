@@ -561,6 +561,325 @@ class RequirementsTraceTests(unittest.TestCase):
             [],
         )
 
+    def test_ambiguous_terminal_quarantine_allows_reciprocal_chain_to_active_descendant(
+        self,
+    ) -> None:
+        first_archived = _requirement(text="First archived behavior.")
+        second_archived = _requirement(text="Second archived behavior.")
+        quarantined_old = _requirement(
+            text="Current preserved behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        replacement = _requirement(
+            id="REQ-002",
+            text="Current replacement behavior.",
+            supersedes=["REQ-001"],
+        )
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [quarantined_old, replacement]}
+        )
+        superseded_replacement = json.loads(
+            json.dumps(previous["requirements"][1])
+        )
+        superseded_replacement.update(
+            {"status": "superseded", "superseded_by": ["REQ-003"]}
+        )
+        active_descendant = _requirement(
+            id="REQ-003",
+            text="Iteration replacement behavior.",
+            supersedes=["REQ-002"],
+        )
+        current, _ = stamp_requirement_contract_hashes(
+            {
+                "version": 1,
+                "requirements": [
+                    json.loads(json.dumps(previous["requirements"][0])),
+                    superseded_replacement,
+                    active_descendant,
+                ],
+            }
+        )
+        historical = [
+            {
+                "task_id": "task-ambiguous-archive",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            first_archived
+                        )
+                    ),
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            second_archived
+                        )
+                    ),
+                ],
+            },
+            {
+                "task_id": "task-replacement-proof",
+                "status": "done",
+                "requirement_ids": ["REQ-002"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_id="REQ-002",
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            replacement
+                        ),
+                    )
+                ],
+            },
+        ]
+
+        self.assertEqual(validate_requirements_trace_payload(current), [])
+        self.assertEqual(
+            validate_requirement_contract_transitions(
+                previous,
+                current,
+                historical_tasks=historical,
+            ),
+            [],
+        )
+        self.assertEqual(
+            non_amendable_ambiguous_requirement_contract_ids(current, historical),
+            [],
+        )
+        proof_transfer_errors = validate_requirement_contract_transitions(
+            previous,
+            current,
+            historical_tasks=[
+                *historical,
+                {
+                    "task_id": "task-reserved-descendant",
+                    "status": "done",
+                    "requirement_ids": ["REQ-003"],
+                },
+            ],
+        )
+        self.assertTrue(
+            any("ambiguous" in error for error in proof_transfer_errors),
+            proof_transfer_errors,
+        )
+
+    def test_ambiguous_terminal_quarantine_rejects_rewired_downstream_chain(
+        self,
+    ) -> None:
+        first_archived = _requirement(text="First archived behavior.")
+        second_archived = _requirement(text="Second archived behavior.")
+        quarantined_old = _requirement(
+            text="Current preserved behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        superseded_replacement = _requirement(
+            id="REQ-002",
+            text="Current replacement behavior.",
+            status="superseded",
+            supersedes=["REQ-001"],
+            superseded_by=["REQ-003"],
+        )
+        active_descendant = _requirement(
+            id="REQ-003",
+            text="Existing terminal behavior.",
+            supersedes=["REQ-002"],
+        )
+        previous, _ = stamp_requirement_contract_hashes(
+            {
+                "version": 1,
+                "requirements": [
+                    quarantined_old,
+                    superseded_replacement,
+                    active_descendant,
+                ],
+            }
+        )
+        rewired = json.loads(json.dumps(previous))
+        rewired["requirements"][1]["superseded_by"] = ["REQ-004"]
+        rewired["requirements"][2]["supersedes"] = []
+        rewired["requirements"].append(
+            _requirement(
+                id="REQ-004",
+                text="Substituted terminal behavior.",
+                supersedes=["REQ-002"],
+            )
+        )
+        rewired, _ = stamp_requirement_contract_hashes(rewired)
+        historical = [
+            {
+                "task_id": "task-ambiguous-archive",
+                "status": "done",
+                "requirement_ids": ["REQ-001", "REQ-002", "REQ-003"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            first_archived
+                        )
+                    ),
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            second_archived
+                        )
+                    ),
+                ],
+            }
+        ]
+
+        self.assertEqual(
+            validate_requirement_contract_transitions(
+                previous,
+                json.loads(json.dumps(previous)),
+                historical_tasks=historical,
+            ),
+            [],
+        )
+        extended = json.loads(json.dumps(previous))
+        extended["requirements"][2].update(
+            {"status": "superseded", "superseded_by": ["REQ-004"]}
+        )
+        extended["requirements"].append(
+            _requirement(
+                id="REQ-004",
+                text="Extended terminal behavior.",
+                supersedes=["REQ-003"],
+            )
+        )
+        extended, _ = stamp_requirement_contract_hashes(extended)
+        self.assertEqual(validate_requirements_trace_payload(extended), [])
+        self.assertEqual(
+            validate_requirement_contract_transitions(
+                previous,
+                extended,
+                historical_tasks=historical,
+            ),
+            [],
+        )
+
+        self.assertEqual(validate_requirements_trace_payload(rewired), [])
+        errors = validate_requirement_contract_transitions(
+            previous,
+            rewired,
+            historical_tasks=historical,
+        )
+        self.assertTrue(any("ambiguous" in error for error in errors), errors)
+
+    def test_ambiguous_terminal_quarantine_rejects_unsafe_downstream_topologies(
+        self,
+    ) -> None:
+        first_archived = _requirement(text="First archived behavior.")
+        second_archived = _requirement(text="Second archived behavior.")
+        quarantined_old = _requirement(
+            text="Current preserved behavior.",
+            status="superseded",
+            superseded_by=["REQ-002"],
+        )
+        replacement = _requirement(
+            id="REQ-002",
+            text="Current replacement behavior.",
+            supersedes=["REQ-001"],
+        )
+        previous, _ = stamp_requirement_contract_hashes(
+            {"version": 1, "requirements": [quarantined_old, replacement]}
+        )
+        historical = [
+            {
+                "task_id": "task-ambiguous-archive",
+                "status": "done",
+                "requirement_ids": ["REQ-001"],
+                "requirement_proofs": [
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            first_archived
+                        )
+                    ),
+                    _proof(
+                        requirement_contract_sha256=requirement_contract_sha256(
+                            second_archived
+                        )
+                    ),
+                ],
+            }
+        ]
+
+        dead_end = json.loads(json.dumps(previous))
+        dead_end["requirements"][1]["status"] = "superseded"
+
+        missing_descendant = json.loads(json.dumps(dead_end))
+        missing_descendant["requirements"][1]["superseded_by"] = ["REQ-003"]
+
+        missing_reciprocal = json.loads(json.dumps(missing_descendant))
+        missing_reciprocal["requirements"].append(
+            _requirement(
+                id="REQ-003",
+                text="Nonreciprocal terminal behavior.",
+            )
+        )
+
+        cycle = json.loads(json.dumps(previous))
+        cycle["requirements"][1].update(
+            {
+                "status": "superseded",
+                "supersedes": ["REQ-001", "REQ-003"],
+                "superseded_by": ["REQ-003"],
+            }
+        )
+        cycle["requirements"].append(
+            _requirement(
+                id="REQ-003",
+                text="Cyclic replacement behavior.",
+                status="superseded",
+                supersedes=["REQ-002"],
+                superseded_by=["REQ-002"],
+            )
+        )
+
+        incomplete_branch = json.loads(json.dumps(previous))
+        incomplete_branch["requirements"][1].update(
+            {
+                "status": "superseded",
+                "superseded_by": ["REQ-003", "REQ-004"],
+            }
+        )
+        incomplete_branch["requirements"].extend(
+            [
+                _requirement(
+                    id="REQ-003",
+                    text="Available branch behavior.",
+                    supersedes=["REQ-002"],
+                ),
+                _requirement(
+                    id="REQ-004",
+                    text="Dead branch behavior.",
+                    status="superseded",
+                    supersedes=["REQ-002"],
+                ),
+            ]
+        )
+
+        candidates = {
+            "superseded dead end": dead_end,
+            "missing descendant": missing_descendant,
+            "missing reciprocity": missing_reciprocal,
+            "cycle": cycle,
+            "incomplete branch": incomplete_branch,
+        }
+        for label, candidate in candidates.items():
+            with self.subTest(label=label):
+                candidate, _ = stamp_requirement_contract_hashes(candidate)
+                errors = validate_requirement_contract_transitions(
+                    previous,
+                    candidate,
+                    historical_tasks=historical,
+                )
+                self.assertTrue(
+                    any("ambiguous" in error for error in errors),
+                    errors,
+                )
+
+        cycle, _ = stamp_requirement_contract_hashes(cycle)
+        self.assertEqual(validate_requirements_trace_payload(cycle), [])
+
     def test_ambiguous_contract_can_enter_terminal_quarantine(self) -> None:
         first_archived = _requirement(text="First archived behavior.")
         second_archived = _requirement(text="Second archived behavior.")
