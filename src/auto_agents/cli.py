@@ -11,6 +11,7 @@ import signal
 import subprocess
 import shlex
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -54,7 +55,7 @@ from .prototype_variants import (
     registry_variants,
 )
 from .foreground_activity import ForegroundActivity
-from .git_ops import changed_paths
+from .git_ops import add_worktree, changed_paths, remove_worktree
 from .process_supervision import (
     ACTIVE_PROCESSES,
     RunInterruptedError,
@@ -81,7 +82,10 @@ from .self_repair import (
     append_self_repair_history,
     auto_agents_repo_root,
     classify_auto_agents_error,
+    self_repair_verification_command,
+    self_repair_verify_commands,
 )
+from .self_repair_playbooks import SelfRepairPlaybookRegistry
 from .validation import validate_persistence_config_payload, validation_report
 from .worker_cluster import (
     WORKER_API_PORT,
@@ -202,6 +206,20 @@ def _preflight_automatic_self_repair(args, *, env: Optional[dict[str, str]] = No
     values = os.environ if env is None else env
     if _truthy_environment_flag(values, SELF_REPAIR_DISABLED_ENV):
         return None
+    autonomy_mode = str(getattr(args, "autonomy", None) or "").strip()
+    allow_isolated_dirty = True
+    try:
+        project_config = load_project_config(
+            Path(getattr(args, "project", "")).expanduser().resolve()
+        )
+        autonomy_mode = autonomy_mode or project_config.execution.autonomy.mode
+        allow_isolated_dirty = bool(
+            project_config.execution.autonomy.allow_isolated_dirty_checkout
+        )
+    except Exception:
+        autonomy_mode = autonomy_mode or "max"
+    if autonomy_mode == "off":
+        return None
 
     repo_root = auto_agents_repo_root()
     try:
@@ -210,6 +228,8 @@ def _preflight_automatic_self_repair(args, *, env: Optional[dict[str, str]] = No
         detail = f"could not inspect {repo_root}: {error}"
     else:
         if not dirty:
+            return None
+        if allow_isolated_dirty:
             return None
         preview = ", ".join(dirty[:8])
         if len(dirty) > 8:
@@ -881,14 +901,35 @@ def _auto_resolve_provider_blocker(
     return 0
 
 
-def _run_command_for_self_repair_resume(args) -> list[str]:
+def _run_command_for_self_repair_resume(
+    args,
+    *,
+    repo_root: Optional[Path] = None,
+) -> list[str]:
+    runtime_root = (repo_root or auto_agents_repo_root()).resolve()
+    source_command = str(getattr(args, "command", "run") or "run")
+    resume_command = "run" if source_command == "answer" else source_command
     command = [
         sys.executable,
-        str(auto_agents_repo_root() / "auto_agents.py"),
-        "run",
+        str(runtime_root / "auto_agents.py"),
+        resume_command,
         "--project",
         str(args.project),
     ]
+    if getattr(args, "command", "run") in {"fix", "collab", "provider-resolve"}:
+        if getattr(args, "session", None):
+            command.extend(["--session", str(args.session)])
+        if getattr(args, "provider", None):
+            command.extend(["--provider", str(args.provider)])
+        if bool(getattr(args, "print_agent_output", False)):
+            command.append("--print-agent-output")
+        if bool(getattr(args, "auto_approve", False)):
+            command.append("--auto-approve")
+        if bool(getattr(args, "full_verify", False)):
+            command.append("--full-verify")
+        if getattr(args, "autonomy", None):
+            command.extend(["--autonomy", str(args.autonomy)])
+        return command
     if getattr(args, "spec_file", None):
         command.extend(["--spec-file", str(args.spec_file)])
     if bool(getattr(args, "auto_approve", False)):
@@ -909,6 +950,8 @@ def _run_command_for_self_repair_resume(args) -> list[str]:
         command.append("--no-repo-map")
     if bool(getattr(args, "strict_self_repair", False)):
         command.append("--strict-self-repair")
+    if getattr(args, "autonomy", None):
+        command.extend(["--autonomy", str(args.autonomy)])
     return command
 
 
@@ -984,20 +1027,6 @@ def _auto_repair_auto_agents_and_resume(
         print_agent_output=bool(getattr(args, "print_agent_output", False)),
     )
     result = runner.run()
-    _safe_notify(
-        notify_self_repair_finished,
-        project_root,
-        auto_agents_root=runner.repo_root,
-        status=(
-            "completed"
-            if result.status == "already_repaired"
-            else result.status
-        ),
-        reason=str(error),
-        commit_sha=result.commit_sha,
-        summary=result.summary or result.reason,
-        verification=result.verification,
-    )
     if not result.ok:
         message = f"automatic auto_agents self-repair failed: {result.reason}"
         orchestrator.record_self_repair_failure(
@@ -1013,25 +1042,281 @@ def _auto_repair_auto_agents_and_resume(
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 3
 
-    orchestrator.mark_self_repair_applied(result.commit_sha)
-    if result.status == "already_repaired":
+    if result.status == "already_repaired" or not result.candidate_commit:
+        orchestrator.mark_self_repair_applied(result.commit_sha)
         print(
-            "Latest remote auto_agents code already resolves this issue at "
+            "Verified auto_agents code resolves this issue at "
             f"{result.commit_sha[:12]}. Resuming run without a new repair...",
             file=sys.stderr,
         )
+        exit_code = _run_self_repair_resume_process(
+            _run_command_for_self_repair_resume(args),
+            cwd=auto_agents_repo_root(),
+            env=run_lock.inherited_environment(
+                append_self_repair_history(decision)
+            ),
+            pass_fd=run_lock.fileno,
+        )
     else:
+        before = load_run_state(project_root)
+        before_blocker = (
+            dict(before.active_blocker)
+            if isinstance(before.active_blocker, dict)
+            else {}
+        )
+        orchestrator.mark_self_repair_applied(result.candidate_commit)
+        runtime_root = Path(result.runtime_root).resolve()
         print(
-            f"auto_agents self-repair committed {result.commit_sha[:12]}. "
-            "Resuming run with repaired code...",
+            f"auto_agents approved isolated candidate "
+            f"{result.candidate_commit[:12]}. Resuming from its worktree...",
             file=sys.stderr,
         )
+        try:
+            exit_code = _run_self_repair_resume_process(
+                _run_command_for_self_repair_resume(
+                    args,
+                    repo_root=runtime_root,
+                ),
+                cwd=runtime_root,
+                env=run_lock.inherited_environment(
+                    append_self_repair_history(decision)
+                ),
+                pass_fd=run_lock.fileno,
+            )
+            after = _try_load_run_state(project_root)
+            after_blocker = (
+                dict(after.active_blocker)
+                if after is not None and isinstance(after.active_blocker, dict)
+                else {}
+            )
+            if getattr(args, "command", "run") == "run":
+                same_root = bool(
+                    after_blocker
+                    and (
+                        str(after_blocker.get("fingerprint", "")).strip()
+                        == str(before_blocker.get("fingerprint", "")).strip()
+                        or str(after_blocker.get("category", "")).strip()
+                        == str(before_blocker.get("category", "")).strip()
+                    )
+                )
+            else:
+                same_root = exit_code != 0
+                if not same_root and after is not None:
+                    after.active_blocker = {}
+                    if after.status == "blocked":
+                        after.status = "pending"
+                    after.last_error = ""
+                    save_run_state(project_root, after)
+            if same_root:
+                message = (
+                    "approved self-repair candidate did not cross the live "
+                    "blocked boundary"
+                )
+                orchestrator.record_self_repair_failure(
+                    category=result.category,
+                    reason=message,
+                    summary=result.summary,
+                    verification=result.verification,
+                )
+                result.status = "live_boundary_failed"
+                result.reason = message
+                exit_code = 3
+            else:
+                if hasattr(runner, "promote_after_live_boundary"):
+                    result = runner.promote_after_live_boundary(result)
+        finally:
+            if hasattr(runner, "cleanup_runtime"):
+                runner.cleanup_runtime(result)
+
+    _safe_notify(
+        notify_self_repair_finished,
+        project_root,
+        auto_agents_root=runner.repo_root,
+        status=(
+            "completed" if result.status == "already_repaired" else result.status
+        ),
+        reason=str(error),
+        commit_sha=result.commit_sha,
+        summary=result.summary or result.reason,
+        verification=result.verification,
+    )
+    return exit_code
+
+
+def _try_deterministic_self_repair_playbook(
+    project_root: Path,
+    orchestrator: Orchestrator,
+    args,
+    run_lock: ProjectRunLock,
+) -> Optional[int]:
+    autonomy_mode = str(
+        getattr(args, "autonomy", None)
+        or orchestrator.config.execution.autonomy.mode
+    ).strip()
+    if autonomy_mode == "off":
+        return None
+    state = load_run_state(project_root)
+    result = SelfRepairPlaybookRegistry().attempt(orchestrator, state)
+    if result is None:
+        return None
+    try:
+        write_json(
+            run_path(project_root, state.run_id)
+            / "outputs"
+            / "deterministic-self-repair.json",
+            result.to_dict(),
+        )
+    except OSError:
+        pass
+    if not result.ok or not result.changed:
+        return None
+    save_run_state(project_root, state)
+    print(
+        f"Deterministic self-repair playbook {result.name} succeeded. Resuming run...",
+        file=sys.stderr,
+    )
     return _run_self_repair_resume_process(
         _run_command_for_self_repair_resume(args),
         cwd=auto_agents_repo_root(),
-        env=run_lock.inherited_environment(append_self_repair_history(decision)),
+        env=run_lock.inherited_environment(),
         pass_fd=run_lock.fileno,
     )
+
+
+def _pending_candidate_verifies_on_head(
+    repo_root: Path,
+    candidate: str,
+    *,
+    project_root: Optional[Path] = None,
+) -> bool:
+    with tempfile.TemporaryDirectory(
+        prefix="auto-agents-pending-promotion-"
+    ) as tmp:
+        verification_root = Path(tmp) / "verification"
+        created = False
+        try:
+            add_worktree(repo_root, verification_root, ref="HEAD")
+            created = True
+            applied = subprocess.run(
+                ["git", "cherry-pick", candidate],
+                cwd=str(verification_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if applied.returncode != 0:
+                return False
+            for command in self_repair_verify_commands():
+                verification_python = (
+                    project_root / ".conda" / "bin" / "python"
+                    if project_root is not None
+                    and (project_root / ".conda" / "bin" / "python").is_file()
+                    else Path(sys.executable)
+                )
+                rendered = self_repair_verification_command(
+                    command,
+                    verification_root,
+                    repository_aliases={repo_root.name},
+                    python_executable=str(verification_python),
+                )
+                verified = subprocess.run(
+                    rendered,
+                    cwd=str(verification_root),
+                    shell=True,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    timeout=900,
+                )
+                if verified.returncode != 0:
+                    return False
+            return True
+        finally:
+            if created:
+                try:
+                    remove_worktree(repo_root, verification_root, force=True)
+                except RuntimeError:
+                    pass
+
+
+def _promote_pending_self_repairs(project_root: Path) -> None:
+    try:
+        state = load_run_state(project_root)
+    except Exception:
+        return
+    if not state.pending_self_repair_promotions:
+        return
+    repo_root = auto_agents_repo_root()
+    if changed_paths(repo_root):
+        return
+    current_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(repo_root),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+    ).stdout.strip()
+    remaining = []
+    changed = False
+    for item in state.pending_self_repair_promotions:
+        candidate = str(item.get("candidate_commit", "")).strip()
+        base = str(item.get("base_commit", "")).strip()
+        if not candidate or not base:
+            continue
+        contained = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", candidate, "HEAD"],
+            cwd=str(repo_root),
+            capture_output=True,
+        )
+        if contained.returncode == 0:
+            if str(item.get("publish_status", "")) == "publish_pending":
+                published = subprocess.run(
+                    ["git", "push"],
+                    cwd=str(repo_root),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                )
+                if published.returncode != 0:
+                    remaining.append(dict(item))
+                    continue
+            changed = True
+            continue
+        if current_head != base and not _pending_candidate_verifies_on_head(
+            repo_root,
+            candidate,
+            project_root=project_root,
+        ):
+            item = {**dict(item), "promotion_status": "pending_head_conflict"}
+            remaining.append(item)
+            continue
+        promoted = subprocess.run(
+            ["git", "cherry-pick", candidate],
+            cwd=str(repo_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if promoted.returncode != 0:
+            subprocess.run(
+                ["git", "cherry-pick", "--abort"],
+                cwd=str(repo_root),
+                capture_output=True,
+            )
+            item = {**dict(item), "promotion_status": "pending_conflict"}
+            remaining.append(item)
+            continue
+        current_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        ).stdout.strip()
+        changed = True
+    if changed or len(remaining) != len(state.pending_self_repair_promotions):
+        state.pending_self_repair_promotions = remaining
+        save_run_state(project_root, state)
 
 
 def _block_terminal_run_error(
@@ -1231,8 +1516,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--strict-self-repair",
         action="store_true",
         help=(
-            "Fail before starting when automatic self-repair is enabled but the "
-            "auto_agents repository is not clean."
+            "Fail before starting only when no isolated self-repair or "
+            "verification environment can be created."
+        ),
+    )
+    run_parser.add_argument(
+        "--autonomy",
+        choices=("off", "guarded", "max"),
+        help=(
+            "Override the autonomous repair mode for this workflow. "
+            "Defaults to execution.autonomy.mode."
         ),
     )
     run_parser.add_argument(
@@ -1261,6 +1554,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--echo", choices=("auto", "visible", "hidden"), default="auto"
     )
     answer_parser.add_argument("--no-resume", action="store_true")
+    answer_parser.add_argument(
+        "--autonomy",
+        choices=("off", "guarded", "max"),
+        help="Override autonomous repair mode for the resumed workflow.",
+    )
 
     inputs_parser = subparsers.add_parser(
         "inputs", help="Inspect or manage persisted project operator inputs."
@@ -1461,6 +1759,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Automatically approve a declared development/test persistence action.",
     )
+    fix_parser.add_argument(
+        "--autonomy",
+        choices=("off", "guarded", "max"),
+        help="Override autonomous repair mode for this session.",
+    )
 
     collab_parser = subparsers.add_parser("collab", help="User-agent collaborative debugging session.")
     collab_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -1490,6 +1793,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-approve",
         action="store_true",
         help="Automatically approve a declared development/test persistence action.",
+    )
+    collab_parser.add_argument(
+        "--autonomy",
+        choices=("off", "guarded", "max"),
+        help="Override autonomous repair mode for this session.",
     )
 
     persistence_parser = subparsers.add_parser(
@@ -1575,6 +1883,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--print-agent-output",
         action="store_true",
         help="Print each agent output to stderr as it completes.",
+    )
+    provider_resolve_parser.add_argument(
+        "--autonomy",
+        choices=("off", "guarded", "max"),
+        help="Override autonomous repair mode for this session.",
     )
 
     # ── sessions (list) ──────────────────────────────────────────
@@ -1871,6 +2184,7 @@ def main(argv: list[str] | None = None) -> int:
                 orchestrator = Orchestrator(
                     project_root, agent_output_stream=sys.stderr
                 )
+                _promote_pending_self_repairs(project_root)
                 request = _active_input_request(project_root, args.request_id)
                 value = _input_value_from_args(args, request, orchestrator)
                 payload = orchestrator.answer_input_request(
@@ -1899,6 +2213,26 @@ def main(argv: list[str] | None = None) -> int:
                         )
                         payload["resumed_run"] = resumed.to_dict()
         except (OSError, RuntimeError, ValueError, RunAlreadyActiveError) as error:
+            triage = (
+                _triage_terminal_run_error(project_root, orchestrator, error)
+                if "orchestrator" in locals()
+                else None
+            )
+            if triage is not None and triage.decision.eligible:
+                repair_lock = ProjectRunLock(project_root)
+                try:
+                    repair_lock.acquire()
+                    return _auto_repair_auto_agents_and_resume(
+                        project_root,
+                        orchestrator,
+                        error,
+                        triage.decision,
+                        args,
+                        repair_lock,
+                        diagnosis=triage.root_cause,
+                    )
+                finally:
+                    repair_lock.release()
             payload = {"ok": False, "error": str(error)}
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if bool(payload.get("ok")) else 1
@@ -2001,6 +2335,20 @@ def main(argv: list[str] | None = None) -> int:
         try:
             spec_file = _apply_saved_run_context(args, project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            configured_autonomy = getattr(
+                getattr(
+                    getattr(orchestrator, "config", None),
+                    "execution",
+                    None,
+                ),
+                "autonomy",
+                None,
+            )
+            orchestrator._autonomy_mode = str(
+                getattr(args, "autonomy", None)
+                or getattr(configured_autonomy, "mode", "max")
+            )
+            _promote_pending_self_repairs(project_root)
             if run_lock.interrupted_snapshot:
                 interrupted_state = orchestrator.reconcile_runtime_interruption(
                     run_lock.interrupted_snapshot
@@ -2027,6 +2375,7 @@ def main(argv: list[str] | None = None) -> int:
                 full_verify=bool(getattr(args, "full_verify", False)),
                 interaction_mode=getattr(args, "interaction_mode", None),
                 secret_echo=getattr(args, "secret_echo", None),
+                autonomy_mode=getattr(args, "autonomy", None),
             )
             state_payload = state.to_dict()
             state_status = str(state_payload.get("status", ""))
@@ -2040,6 +2389,14 @@ def main(argv: list[str] | None = None) -> int:
                 else {}
             )
             if state_status in {"blocked", "failed"}:
+                playbook_exit = _try_deterministic_self_repair_playbook(
+                    project_root,
+                    orchestrator,
+                    args,
+                    run_lock,
+                )
+                if playbook_exit is not None:
+                    return playbook_exit
                 blocked_error = RuntimeError(
                     str(
                         blocker.get("reason", "")
@@ -2344,6 +2701,7 @@ def main(argv: list[str] | None = None) -> int:
 
             project_root = Path(args.project)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            _promote_pending_self_repairs(project_root)
             orchestrator._ensure_agent_instructions_synced()
             if getattr(args, "provider", None):
                 orchestrator._set_active_provider(args.provider)
@@ -2384,6 +2742,27 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
             project_root = Path(args.project)
+            triage = (
+                _triage_terminal_run_error(project_root, orchestrator, error)
+                if "orchestrator" in locals()
+                else None
+            )
+            if triage is not None and triage.decision.eligible:
+                foreground.release()
+                repair_lock = ProjectRunLock(project_root)
+                try:
+                    repair_lock.acquire()
+                    return _auto_repair_auto_agents_and_resume(
+                        project_root,
+                        orchestrator,
+                        error,
+                        triage.decision,
+                        args,
+                        repair_lock,
+                        diagnosis=triage.root_cause,
+                    )
+                finally:
+                    repair_lock.release()
             _safe_notify(
                 notify_session_finished,
                 project_root,

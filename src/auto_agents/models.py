@@ -1171,6 +1171,44 @@ class SelfRepairDiagnosisConfig:
 
 
 @dataclass
+class AutonomyConfig:
+    mode: str = "max"
+    max_candidates_per_root: int = 3
+    total_timeout_seconds: int = 3600
+    replay_timeout_seconds: int = 1200
+    continue_independent_tasks: bool = True
+    allow_isolated_dirty_checkout: bool = True
+    require_remote_publish: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "AutonomyConfig":
+        return cls(
+            mode=str(data.get("mode", "max")).strip() or "max",
+            max_candidates_per_root=max(
+                1, int(data.get("max_candidates_per_root", 3) or 3)
+            ),
+            total_timeout_seconds=max(
+                60, int(data.get("total_timeout_seconds", 3600) or 3600)
+            ),
+            replay_timeout_seconds=max(
+                60, int(data.get("replay_timeout_seconds", 1200) or 1200)
+            ),
+            continue_independent_tasks=bool(
+                data.get("continue_independent_tasks", True)
+            ),
+            allow_isolated_dirty_checkout=bool(
+                data.get("allow_isolated_dirty_checkout", True)
+            ),
+            require_remote_publish=bool(
+                data.get("require_remote_publish", False)
+            ),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
 class ExecutionConfig:
     parallel_tasks: ParallelTasksConfig = field(default_factory=ParallelTasksConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
@@ -1183,6 +1221,7 @@ class ExecutionConfig:
     self_repair_diagnosis: SelfRepairDiagnosisConfig = field(
         default_factory=SelfRepairDiagnosisConfig
     )
+    autonomy: AutonomyConfig = field(default_factory=AutonomyConfig)
     user_input: UserInputConfig = field(default_factory=UserInputConfig)
     project_runtime: ProjectRuntimeConfig = field(default_factory=ProjectRuntimeConfig)
 
@@ -1206,6 +1245,7 @@ class ExecutionConfig:
             self_repair_diagnosis=SelfRepairDiagnosisConfig.from_dict(
                 dict(data.get("self_repair_diagnosis", {}))
             ),
+            autonomy=AutonomyConfig.from_dict(dict(data.get("autonomy", {}))),
             user_input=UserInputConfig.from_dict(
                 dict(data.get("user_input", {}))
             ),
@@ -1223,6 +1263,7 @@ class ExecutionConfig:
             "smart_timeout": self.smart_timeout.to_dict(),
             "provider_failover": self.provider_failover.to_dict(),
             "self_repair_diagnosis": self.self_repair_diagnosis.to_dict(),
+            "autonomy": self.autonomy.to_dict(),
             "user_input": self.user_input.to_dict(),
             "project_runtime": self.project_runtime.to_dict(),
         }
@@ -1531,6 +1572,11 @@ class RunState:
         default_factory=dict
     )
     active_blocker: Dict[str, object] = field(default_factory=dict)
+    active_self_repair_experiment_id: str = ""
+    localized_blockers: List[Dict[str, object]] = field(default_factory=list)
+    pending_self_repair_promotions: List[Dict[str, object]] = field(
+        default_factory=list
+    )
     task_failure_checkpoints: Dict[str, Dict[str, object]] = field(
         default_factory=dict
     )
@@ -1605,6 +1651,21 @@ class RunState:
                 if isinstance(data.get("active_blocker", {}), dict)
                 else {}
             ),
+            active_self_repair_experiment_id=str(
+                data.get("active_self_repair_experiment_id", "")
+            ),
+            localized_blockers=[
+                dict(item)
+                for item in (data.get("localized_blockers", []) or [])
+                if isinstance(item, dict)
+            ],
+            pending_self_repair_promotions=[
+                dict(item)
+                for item in (
+                    data.get("pending_self_repair_promotions", []) or []
+                )
+                if isinstance(item, dict)
+            ],
             task_failure_checkpoints={
                 str(key): dict(value)
                 for key, value in dict(
@@ -1661,6 +1722,15 @@ class RunState:
                 self.execution_incident_budget_checkpoint
             ),
             "active_blocker": dict(self.active_blocker),
+            "active_self_repair_experiment_id": (
+                self.active_self_repair_experiment_id
+            ),
+            "localized_blockers": [
+                dict(item) for item in self.localized_blockers
+            ],
+            "pending_self_repair_promotions": [
+                dict(item) for item in self.pending_self_repair_promotions
+            ],
             "task_failure_checkpoints": {
                 key: dict(value)
                 for key, value in self.task_failure_checkpoints.items()

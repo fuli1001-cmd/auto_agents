@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,9 +22,12 @@ from .git_ops import (
     head_ref,
     is_untracked_vim_swap,
     remove_worktree,
+    update_ref,
+    worktree_fingerprint,
 )
 from .gates import run_commands
-from .io_utils import read_json, read_text, write_text
+from .execution_recovery import redact_incident_text
+from .io_utils import read_json, read_text, write_json, write_text
 from .models import (
     AgentRequest,
     AgentResult,
@@ -71,6 +75,12 @@ class SelfRepairDecision:
     reason: str = ""
     fingerprint: str = ""
     repeat_count: int = 0
+    disposition: str = ""
+    requires_candidate_proof: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.disposition:
+            self.disposition = "attempt" if self.eligible else "block"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -85,6 +95,14 @@ class SelfRepairResult:
     commit_sha: str = ""
     summary: str = ""
     verification: str = ""
+    experiment_id: str = ""
+    candidate_id: str = ""
+    base_commit: str = ""
+    candidate_commit: str = ""
+    candidate_ref: str = ""
+    runtime_root: str = ""
+    promotion_status: str = ""
+    publish_status: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -100,6 +118,17 @@ class SelfRepairJudgment:
     category: str
     reason: str
     evidence: list[str]
+    safe_to_attempt: Optional[bool] = None
+    repair_risk: str = "reversible_code"
+    human_boundary: bool = False
+
+    @property
+    def effective_safe_to_attempt(self) -> bool:
+        return (
+            self.safe_to_self_repair
+            if self.safe_to_attempt is None
+            else bool(self.safe_to_attempt)
+        )
 
     @property
     def approved(self) -> bool:
@@ -107,7 +136,10 @@ class SelfRepairJudgment:
             self.decision == "SELF_REPAIR"
             and self.owner == "auto_agents"
             and self.generic
-            and self.safe_to_self_repair
+            and self.effective_safe_to_attempt
+            and not self.human_boundary
+            and self.repair_risk
+            not in {"irreversible", "semantic_choice", "credential_required"}
             and self.confidence >= SELF_REPAIR_PROVIDER_CONFIDENCE_THRESHOLD
             and bool(self.evidence)
         )
@@ -900,6 +932,9 @@ def adjudicate_auto_agents_error(
         owner=final.owner,
         generic=final.generic,
         safe_to_self_repair=final.safe_to_repair,
+        safe_to_attempt=final.effective_safe_to_attempt,
+        repair_risk=final.repair_risk,
+        human_boundary=final.human_boundary,
         confidence=final.confidence,
         category=final.category,
         reason=" -> ".join(final.causal_chain),
@@ -927,15 +962,15 @@ def adjudicate_auto_agents_error(
             True,
             category=judgment.category,
             reason=judgment.reason,
+            disposition="attempt",
+            requires_candidate_proof=True,
         ),
         str(error or ""),
         values,
         fingerprint_category="provider_judged_auto_agents",
-        max_attempts=(
-            1
-            if heuristic.category == "recovery_route_invariant"
-            else config.max_repair_cycles
-        ),
+        # One triage launches the complete bounded multi-candidate experiment.
+        # A live recurrence of the same root must not multiply that budget.
+        max_attempts=1,
     )
     return SelfRepairTriageResult(
         decision=decision,
@@ -1265,6 +1300,7 @@ def self_repair_verification_command(
     repo_root: Path,
     *,
     repository_aliases: Optional[set[str]] = None,
+    python_executable: Optional[str] = None,
 ) -> str:
     """Run pytest without letting the root auto_agents.py shadow src/auto_agents."""
     normalized = str(command).strip()
@@ -1316,7 +1352,9 @@ def self_repair_verification_command(
         "import pytest; "
         "raise SystemExit(pytest.main(sys.argv[1:]))"
     )
-    return shlex.join([sys.executable, "-c", runner, *pytest_args])
+    return shlex.join(
+        [python_executable or sys.executable, "-c", runner, *pytest_args]
+    )
 
 
 def _supplemental_verification_skip_reason(
@@ -1436,97 +1474,179 @@ class AutoAgentsSelfRepairRunner:
         self.print_agent_output = print_agent_output
         self.repo_root = auto_agents_repo_root()
         self._remote_conflict_resolved = False
+        self._base_full_verification: dict[str, _VerificationResult] = {}
+        self._verification_python_cache = ""
+
+    def _autonomy_config(self) -> object:
+        config = getattr(self.target_orchestrator, "config", None)
+        execution = getattr(config, "execution", None)
+        autonomy = getattr(execution, "autonomy", None)
+        if autonomy is not None:
+            return autonomy
+        return type(
+            "AutonomyDefaults",
+            (),
+            {
+                "mode": "max",
+                "max_candidates_per_root": 3,
+                "total_timeout_seconds": 3600,
+                "replay_timeout_seconds": 1200,
+                "allow_isolated_dirty_checkout": True,
+                "require_remote_publish": False,
+            },
+        )()
+
+    def _verification_python(self) -> str:
+        if self._verification_python_cache:
+            return self._verification_python_cache
+        candidates = [
+            self.repo_root / ".conda" / "bin" / "python",
+            self.target_project_root / ".conda" / "bin" / "python",
+            Path(sys.executable),
+        ]
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            probe = subprocess.run(
+                [
+                    str(candidate),
+                    "-c",
+                    "import pytest,regex; print('self-repair-runtime-ok')",
+                ],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if probe.returncode == 0:
+                self._verification_python_cache = str(candidate.resolve())
+                return self._verification_python_cache
+        self._verification_python_cache = str(Path(sys.executable).resolve())
+        return self._verification_python_cache
 
     def run(self) -> SelfRepairResult:
-        dirty_before = changed_paths(self.repo_root)
-        if dirty_before:
-            preview = ", ".join(dirty_before[:8])
-            return SelfRepairResult(
-                ok=False,
-                status="failed",
-                category=self.decision.category,
-                reason=(
-                    "auto_agents working tree is not clean before self-repair; "
-                    f"changed paths: {preview}"
-                ),
+        autonomy = self._autonomy_config()
+        mode = str(
+            getattr(
+                self.target_orchestrator,
+                "_autonomy_mode",
+                getattr(autonomy, "mode", "max"),
             )
-        head_before_sync = head_ref(self.repo_root)
-        try:
-            remote = _self_repair_remote(self.repo_root)
-            if remote is not None:
-                self._synchronize_from_remote(remote)
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            self._abort_remote_merge()
+        ).strip() or "max"
+        if mode == "off":
+            return SelfRepairResult(
+                ok=False,
+                status="disabled",
+                category=self.decision.category,
+                reason="autonomous self-repair is disabled",
+            )
+        max_candidates = max(
+            1, int(getattr(autonomy, "max_candidates_per_root", 3) or 3)
+        )
+        deadline = time.monotonic() + max(
+            60, int(getattr(autonomy, "total_timeout_seconds", 3600) or 3600)
+        )
+        experiment_id = uuid.uuid4().hex[:12]
+        prior_failures: list[str] = []
+        seen_fingerprints: set[str] = set()
+        last_result: Optional[SelfRepairResult] = None
+        for attempt in range(1, max_candidates + 1):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                candidate = self._run_candidate(
+                    experiment_id=experiment_id,
+                    attempt=attempt,
+                    deadline=deadline,
+                    prior_failures=prior_failures,
+                    seen_fingerprints=seen_fingerprints,
+                )
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                candidate = SelfRepairResult(
+                    ok=False,
+                    status="candidate_exception",
+                    category=self.decision.category,
+                    reason=str(error),
+                    experiment_id=experiment_id,
+                    candidate_id=f"c{attempt}-exception",
+                    base_commit=head_ref(self.repo_root),
+                )
+            last_result = candidate
+            self._record_candidate_result(candidate, attempt=attempt)
+            if candidate.ok:
+                return candidate
+            prior_failures.append(
+                f"candidate {attempt}: {candidate.reason}; "
+                f"verification={candidate.verification[-1200:]}"
+            )
+        if last_result is not None:
+            last_result.summary = "\n".join(
+                part for part in (last_result.summary, *prior_failures) if part
+            )
+            return last_result
+        return SelfRepairResult(
+            ok=False,
+            status="budget_exhausted",
+            category=self.decision.category,
+            reason="autonomous self-repair exhausted its candidate/time budget",
+            experiment_id=experiment_id,
+        )
+
+    def _run_candidate(
+        self,
+        *,
+        experiment_id: str,
+        attempt: int,
+        deadline: float,
+        prior_failures: list[str],
+        seen_fingerprints: set[str],
+    ) -> SelfRepairResult:
+        autonomy = self._autonomy_config()
+        dirty_before = changed_paths(self.repo_root)
+        if dirty_before and not autonomy.allow_isolated_dirty_checkout:
             return SelfRepairResult(
                 ok=False,
                 status="failed",
                 category=self.decision.category,
-                reason=f"could not synchronize auto_agents before self-repair: {error}",
+                reason="auto_agents checkout is dirty and isolated repair is disabled",
+                experiment_id=experiment_id,
             )
         base_head = head_ref(self.repo_root)
-        if self._remote_conflict_resolved:
-            conflict_verification = self._run_verification(self.repo_root)
-            if not conflict_verification.ok:
-                return SelfRepairResult(
-                    ok=False,
-                    status="failed",
-                    category=self.decision.category,
-                    reason="resolved remote merge conflicts failed verification",
-                    commit_sha=base_head,
-                    verification=conflict_verification.summary,
-                )
-        if remote is not None and base_head != head_before_sync:
-            resolved = self._verify_remote_already_repaired(head_before_sync)
-            if resolved is not None and resolved.ok:
-                return SelfRepairResult(
-                    ok=True,
-                    status="already_repaired",
-                    category=self.decision.category,
-                    reason=(
-                        "the synchronized remote code already passes the "
-                        "diagnosis-specific self-repair checks"
-                    ),
-                    commit_sha=base_head,
-                    summary="latest remote code already contains the required repair",
-                    verification=resolved.summary,
-                )
-
         target_before = repository_guard_fingerprint(
             self.target_project_root,
             ignore_run_artifacts=True,
         )
+        target_head_before = head_ref(self.target_project_root)
+        candidate_id = f"c{attempt}-{uuid.uuid4().hex[:8]}"
         with tempfile.TemporaryDirectory(
             prefix="auto-agents-self-repair-worktree-"
         ) as tmp:
             repair_root = Path(tmp) / "repair"
             created = False
             try:
-                add_worktree(
-                    self.repo_root,
-                    repair_root,
-                    ref=head_ref(self.repo_root) or "HEAD",
-                )
+                add_worktree(self.repo_root, repair_root, ref=base_head or "HEAD")
                 created = True
                 target_snapshot = Path(tmp) / "target-evidence"
                 RootCauseCoordinator._copy_diagnostic_tree(
                     self.target_project_root,
                     target_snapshot,
                 )
-                prompt = self._build_prompt(
-                    repair_root,
-                    target_snapshot,
-                )
+                self._candidate_attempt = attempt
+                self._candidate_prior_failures = list(prior_failures)
+                prompt = self._build_prompt(repair_root, target_snapshot)
                 prompt_path, output_path = self._artifact_paths()
                 write_text(prompt_path, prompt)
+                remaining = max(60, int(deadline - time.monotonic()))
                 request = AgentRequest(
                     stage="self_repair",
                     effort=self._effort(),
                     prompt=prompt,
                     cwd=repair_root,
                     output_path=output_path,
+                    timeout_seconds=remaining,
+                    attempt_id=f"self-repair-{candidate_id}",
                     stream_output=(
                         self.target_orchestrator._stream_agent_output_callback(
-                            "self-repair"
+                            f"self-repair-{candidate_id}"
                         )
                         if self.print_agent_output
                         and hasattr(
@@ -1536,178 +1656,247 @@ class AutoAgentsSelfRepairRunner:
                         else None
                     ),
                 )
-                result: AgentResult = (
-                    self.target_orchestrator._call_with_failover(request)
+                result: AgentResult = self.target_orchestrator._call_with_failover(
+                    request
                 )
                 if hasattr(self.target_orchestrator, "_emit_agent_output"):
                     self.target_orchestrator._emit_agent_output(
-                        "self-repair",
+                        f"self-repair-{candidate_id}",
                         result,
                     )
                 if not result.ok:
                     return SelfRepairResult(
                         ok=False,
-                        status="failed",
+                        status="candidate_failed",
                         category=self.decision.category,
                         reason=self._agent_failure_detail(result),
                         summary=result.summary or result.stdout,
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
                     )
-
                 summary = (result.summary or result.stdout).strip()
-                if not changed_paths(repair_root):
+                changed = changed_paths(repair_root)
+                if not changed:
                     return SelfRepairResult(
                         ok=False,
-                        status="failed",
+                        status="candidate_noop",
                         category=self.decision.category,
-                        reason=(
-                            "self-repair agent completed without changing "
-                            "auto_agents"
-                        ),
+                        reason="self-repair candidate completed without changes",
                         summary=summary,
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
                     )
-                if repository_guard_fingerprint(
+                fingerprint = worktree_fingerprint(
+                    repair_root, ignored_prefixes=()
+                )
+                if fingerprint in seen_fingerprints:
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_duplicate",
+                        category=self.decision.category,
+                        reason="self-repair candidate repeated an earlier diff",
+                        summary=summary,
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                    )
+                seen_fingerprints.add(fingerprint)
+                weakening = self._candidate_test_weakening_reason(
+                    repair_root,
+                    base_head,
+                )
+                if weakening:
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_rejected",
+                        category=self.decision.category,
+                        reason=weakening,
+                        summary=summary,
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                    )
+                review = self._review_candidate(
+                    repair_root,
+                    base_head,
+                    remaining_seconds=max(60, int(deadline - time.monotonic())),
+                )
+                if not review.ok:
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_review_rejected",
+                        category=self.decision.category,
+                        reason="adversarial candidate review rejected the repair",
+                        summary=summary,
+                        verification=review.summary,
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                    )
+                target_guard_changed = repository_guard_fingerprint(
                     self.target_project_root,
                     ignore_run_artifacts=True,
-                ) != target_before:
+                ) != target_before
+                target_paths = changed_paths(self.target_project_root)
+                if target_guard_changed and (
+                    target_paths
+                    or head_ref(self.target_project_root) != target_head_before
+                ):
                     return SelfRepairResult(
                         ok=False,
-                        status="failed",
+                        status="candidate_rejected",
                         category=self.decision.category,
                         reason=(
-                            "self-repair agent modified the target project "
-                            "outside diagnostic artifacts"
+                            "self-repair candidate modified the live target project; "
+                            f"changed_paths={target_paths[:12]}"
                         ),
                         summary=summary,
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
                     )
-
                 verification = self._run_verification(repair_root)
+                if not verification.ok:
+                    baseline_verification = self._run_verification_at_ref(
+                        self_repair_verify_commands(),
+                        base_head,
+                    )
+                    baseline_signature = self._verification_failure_signature(
+                        baseline_verification.summary
+                    )
+                    candidate_signature = self._verification_failure_signature(
+                        verification.summary
+                    )
+                    if (
+                        not baseline_verification.ok
+                        and baseline_signature
+                        and baseline_signature == candidate_signature
+                    ):
+                        verification = _VerificationResult(
+                            True,
+                            "\n\n".join(
+                                (
+                                    verification.summary,
+                                    "nonfatal=pre-existing verification failure set retained",
+                                )
+                            ),
+                        )
                 if not verification.ok:
                     return SelfRepairResult(
                         ok=False,
-                        status="failed",
+                        status="candidate_verification_failed",
                         category=self.decision.category,
-                        reason="self-repair verification failed",
+                        reason="self-repair candidate verification failed",
                         summary=summary,
                         verification=verification.summary,
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
                     )
                 candidate_commit = commit_all(
                     repair_root,
                     self._commit_message(summary),
                 )
-                if (
-                    changed_paths(self.repo_root)
-                    or head_ref(self.repo_root) != base_head
-                ):
-                    return SelfRepairResult(
-                        ok=False,
-                        status="failed",
-                        category=self.decision.category,
-                        reason=(
-                            "auto_agents main checkout changed while isolated "
-                            "self-repair was running"
-                        ),
-                        summary=summary,
-                        verification=verification.summary,
-                    )
-                integrated = subprocess.run(
-                    ["git", "cherry-pick", candidate_commit],
-                    cwd=str(self.repo_root),
-                    text=True,
-                    encoding="utf-8",
-                    capture_output=True,
-                    check=False,
+                replay = self._replay_candidate(
+                    repair_root,
+                    candidate_commit,
+                    candidate_id,
                 )
-                if integrated.returncode != 0:
-                    subprocess.run(
-                        ["git", "cherry-pick", "--abort"],
-                        cwd=str(self.repo_root),
-                        text=True,
-                        encoding="utf-8",
-                        capture_output=True,
-                        check=False,
-                    )
+                differential = self._diagnosis_differential(base_head, repair_root)
+                legacy_direct_attempt = self.diagnosis is None and self.decision.eligible
+                if not replay.ok and not differential.ok and not legacy_direct_attempt:
                     return SelfRepairResult(
                         ok=False,
-                        status="failed",
+                        status="candidate_replay_failed",
                         category=self.decision.category,
-                        reason=(
-                            integrated.stderr.strip()
-                            or "could not integrate isolated self-repair commit"
-                        ),
+                        reason="candidate did not cross the blocked boundary",
                         summary=summary,
-                        verification=verification.summary,
+                        verification="\n\n".join(
+                            part
+                            for part in (
+                                verification.summary,
+                                replay.summary,
+                                differential.summary,
+                            )
+                            if part
+                        ),
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                        candidate_commit=candidate_commit,
                     )
-                commit_sha = head_ref(self.repo_root)
-                if remote is not None:
-                    push_error = ""
-                    for attempt in range(2):
-                        try:
-                            _push_self_repair_to_remote(self.repo_root, remote)
-                            push_error = ""
-                            break
-                        except (
-                            OSError,
-                            RuntimeError,
-                            subprocess.SubprocessError,
-                        ) as error:
-                            push_error = str(error)
-                            if attempt > 0:
-                                break
-                            try:
-                                changed = self._synchronize_from_remote(remote)
-                                if not changed:
-                                    break
-                                merged_verification = self._run_verification(
-                                    self.repo_root
-                                )
-                                if not merged_verification.ok:
-                                    return SelfRepairResult(
-                                        ok=False,
-                                        status="failed",
-                                        category=self.decision.category,
-                                        reason=(
-                                            "remote changed while publishing self-repair, "
-                                            "and the integrated result failed verification"
-                                        ),
-                                        commit_sha=head_ref(self.repo_root),
-                                        summary=summary,
-                                        verification=merged_verification.summary,
-                                    )
-                                verification = merged_verification
-                                commit_sha = head_ref(self.repo_root)
-                            except (
-                                OSError,
-                                RuntimeError,
-                                subprocess.SubprocessError,
-                            ) as sync_error:
-                                self._abort_remote_merge()
-                                push_error = (
-                                    f"{push_error}; conflict synchronization failed: "
-                                    f"{sync_error}"
-                                )
-                                break
-                    if push_error:
-                        return SelfRepairResult(
-                            ok=False,
-                            status="failed",
-                            category=self.decision.category,
-                            reason=(
-                                "self-repair was committed locally but could not "
-                                f"synchronize to {remote.name}/{remote.branch}: "
-                                f"{push_error}"
-                            ),
-                            commit_sha=commit_sha,
-                            summary=summary,
-                            verification=verification.summary,
-                        )
+                full_suite = self._full_suite_differential(
+                    base_head,
+                    repair_root,
+                )
+                if not full_suite.ok:
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_full_suite_failed",
+                        category=self.decision.category,
+                        reason="candidate introduced a new full-suite failure set",
+                        summary=summary,
+                        verification="\n\n".join(
+                            part
+                            for part in (
+                                verification.summary,
+                                replay.summary,
+                                differential.summary,
+                                full_suite.summary,
+                            )
+                            if part
+                        ),
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                        candidate_commit=candidate_commit,
+                    )
+                safe_category = re.sub(
+                    r"[^A-Za-z0-9_.-]+",
+                    "-",
+                    self.decision.fingerprint or self.decision.category or "repair",
+                ).strip("-")
+                candidate_ref = (
+                    "refs/auto-agents/self-repair/approved/"
+                    f"{safe_category}/{candidate_id}"
+                )
+                update_ref(self.repo_root, candidate_ref, candidate_commit)
+                runtime_parent = Path(
+                    tempfile.mkdtemp(prefix="auto-agents-approved-runtime-")
+                )
+                runtime_root = runtime_parent / "runtime"
+                add_worktree(
+                    self.repo_root,
+                    runtime_root,
+                    ref=candidate_commit,
+                )
                 return SelfRepairResult(
                     ok=True,
-                    status="completed",
+                    status="approved_candidate",
                     category=self.decision.category,
                     reason=self.decision.reason,
-                    commit_sha=commit_sha,
+                    commit_sha=candidate_commit,
                     summary=summary,
-                    verification=verification.summary,
+                    verification="\n\n".join(
+                        part
+                        for part in (
+                            verification.summary,
+                            replay.summary,
+                            differential.summary,
+                            full_suite.summary,
+                        )
+                        if part
+                    ),
+                    experiment_id=experiment_id,
+                    candidate_id=candidate_id,
+                    base_commit=base_head,
+                    candidate_commit=candidate_commit,
+                    candidate_ref=candidate_ref,
+                    runtime_root=str(runtime_root),
+                    promotion_status="awaiting_live_boundary",
+                    publish_status="deferred",
                 )
             finally:
                 if created:
@@ -1715,6 +1904,410 @@ class AutoAgentsSelfRepairRunner:
                         remove_worktree(self.repo_root, repair_root, force=True)
                     except RuntimeError:
                         pass
+
+    def _candidate_test_weakening_reason(
+        self,
+        repair_root: Path,
+        base_head: str,
+    ) -> str:
+        names = subprocess.run(
+            ["git", "diff", "--name-status", base_head, "--"],
+            cwd=str(repair_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        for line in names.stdout.splitlines():
+            status, _, path = line.partition("\t")
+            if status.startswith("D") and (
+                path.startswith("tests/") or Path(path).name.startswith("test_")
+            ):
+                return f"candidate deletes an existing test: {path}"
+        diff = subprocess.run(
+            ["git", "diff", "--unified=0", base_head, "--", "tests"],
+            cwd=str(repair_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        added = "\n".join(
+            line[1:]
+            for line in diff.stdout.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        if re.search(r"(?i)(pytest\.mark\.(?:skip|xfail)|unittest\.skip)", added):
+            return "candidate weakens tests with skip/xfail"
+        return ""
+
+    def _review_candidate(
+        self,
+        repair_root: Path,
+        base_head: str,
+        *,
+        remaining_seconds: int,
+    ) -> "_VerificationResult":
+        execution = getattr(
+            getattr(self.target_orchestrator, "config", None),
+            "execution",
+            None,
+        )
+        if execution is None or self.diagnosis is None:
+            return _VerificationResult(True, "candidate review=legacy-compatible")
+        diff = subprocess.run(
+            ["git", "diff", "--no-ext-diff", base_head, "--"],
+            cwd=str(repair_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        ).stdout
+        prompt = "\n".join(
+            [
+                "Review this isolated auto_agents self-repair candidate.",
+                "Do not modify files or run mutating commands.",
+                "Reject test deletion, skip/xfail, weakened safety gates, hard-coded target data, "
+                "or changes that do not address the supplied root cause.",
+                "Return exactly JSON: {\"decision\":\"APPROVE|REJECT\",\"reason\":\"...\"}.",
+                "ROOT_CAUSE:",
+                json.dumps(self.diagnosis.to_dict(), ensure_ascii=False),
+                "CANDIDATE_DIFF:",
+                diff[:40_000],
+            ]
+        )
+        output_path = Path(tempfile.gettempdir()) / (
+            f"auto-agents-candidate-review-{uuid.uuid4().hex[:12]}.json"
+        )
+        request = AgentRequest(
+            stage="self_repair_candidate_review",
+            effort=self._effort(),
+            prompt=prompt,
+            cwd=repair_root,
+            output_path=output_path,
+            sandbox_mode="read-only",
+            timeout_seconds=remaining_seconds,
+        )
+        try:
+            result: AgentResult = self.target_orchestrator._call_with_failover(request)
+            if not result.ok:
+                return _VerificationResult(False, self._agent_failure_detail(result))
+            raw = (result.summary or result.stdout or read_text(output_path)).strip()
+        finally:
+            output_path.unlink(missing_ok=True)
+        try:
+            payload = _extract_json_object(raw)
+        except ValueError as error:
+            return _VerificationResult(False, str(error))
+        decision = str(payload.get("decision", "")).strip().upper()
+        reason = str(payload.get("reason", "")).strip()
+        return _VerificationResult(
+            decision == "APPROVE" and bool(reason),
+            f"candidate review={decision or 'INVALID'} reason={reason}",
+        )
+
+    @staticmethod
+    def _verification_failure_signature(summary: str) -> tuple[str, ...]:
+        identities: list[str] = []
+        for line in str(summary).splitlines():
+            normalized = " ".join(line.strip().split())
+            if not normalized:
+                continue
+            if (
+                normalized.startswith("FAILED ")
+                or normalized.startswith("ERROR ")
+                or re.search(r"\btests?/[^\s:]+(?:::[^\s]+)+", normalized)
+            ):
+                identities.append(normalized[:500])
+        if identities:
+            return tuple(sorted(set(identities)))
+        exits = [
+            line.strip()
+            for line in str(summary).splitlines()
+            if line.strip().startswith(("$ ", "exit="))
+        ]
+        return tuple(exits)
+
+    def _diagnosis_differential(
+        self,
+        base_head: str,
+        candidate_root: Path,
+    ) -> "_VerificationResult":
+        if self.diagnosis is None:
+            return _VerificationResult(False, "no diagnosis-specific differential")
+        commands = [
+            " ".join(str(command).split())
+            for command in self.diagnosis.final.verification_commands
+            if str(command).strip()
+            and not _supplemental_verification_skip_reason(
+                command,
+                repository_aliases={self.repo_root.name},
+            )
+        ]
+        if not commands:
+            return _VerificationResult(False, "no differential commands")
+        base = self._run_verification_at_ref(commands, base_head)
+        candidate = self._run_verification_commands(commands, candidate_root)
+        return _VerificationResult(
+            (not base.ok) and candidate.ok,
+            "\n\n".join(
+                (
+                    "=== base differential ===\n" + base.summary,
+                    "=== candidate differential ===\n" + candidate.summary,
+                )
+            ),
+        )
+
+    def _full_suite_differential(
+        self,
+        base_head: str,
+        candidate_root: Path,
+    ) -> "_VerificationResult":
+        execution = getattr(
+            getattr(self.target_orchestrator, "config", None),
+            "execution",
+            None,
+        )
+        if execution is None or not (candidate_root / "tests").is_dir():
+            return _VerificationResult(True, "full-suite differential=not-applicable")
+        command = "python -m pytest -q tests"
+        base = self._base_full_verification.get(base_head)
+        if base is None:
+            base = self._run_verification_at_ref([command], base_head)
+            self._base_full_verification[base_head] = base
+        candidate = self._run_verification_commands([command], candidate_root)
+        if candidate.ok:
+            return _VerificationResult(
+                True,
+                "\n\n".join(
+                    ("=== base full suite ===\n" + base.summary,
+                     "=== candidate full suite ===\n" + candidate.summary)
+                ),
+            )
+        base_signature = self._verification_failure_signature(base.summary)
+        candidate_signature = self._verification_failure_signature(candidate.summary)
+        ok = bool(
+            not base.ok
+            and base_signature
+            and base_signature == candidate_signature
+        )
+        return _VerificationResult(
+            ok,
+            "\n\n".join(
+                (
+                    "=== base full suite ===\n" + base.summary,
+                    "=== candidate full suite ===\n" + candidate.summary,
+                    (
+                        "nonfatal=pre-existing full-suite failure set retained"
+                        if ok
+                        else "fatal=candidate full-suite failure set changed"
+                    ),
+                )
+            ),
+        )
+
+    def _replay_candidate(
+        self,
+        candidate_root: Path,
+        candidate_commit: str,
+        candidate_id: str,
+    ) -> "_VerificationResult":
+        from .config import load_run_state, run_path
+
+        try:
+            original = load_run_state(self.target_project_root)
+        except Exception as error:
+            return _VerificationResult(False, f"could not load replay state: {error}")
+        before_blocker = (
+            dict(original.active_blocker)
+            if isinstance(original.active_blocker, dict)
+            else {}
+        )
+        if original.status not in {"blocked", "failed"}:
+            return _VerificationResult(False, "target state is not replayable as blocked")
+        with tempfile.TemporaryDirectory(
+            prefix="auto-agents-self-repair-replay-"
+        ) as tmp:
+            replay_root = Path(tmp) / "target"
+            RootCauseCoordinator._copy_diagnostic_tree(
+                self.target_project_root,
+                replay_root,
+                include_private=True,
+            )
+            source_run = run_path(self.target_project_root, original.run_id)
+            replay_run = run_path(replay_root, original.run_id)
+            if source_run.is_dir():
+                shutil.copytree(
+                    source_run,
+                    replay_run,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("root-cause"),
+                )
+            runner = (
+                "import json,sys; from pathlib import Path; "
+                f"sys.path.insert(0, {str((candidate_root / 'src').resolve())!r}); "
+                "from auto_agents.config import load_run_state,save_run_state; "
+                "from auto_agents.orchestrator import Orchestrator; "
+                "root=Path(sys.argv[1]); state=load_run_state(root); "
+                "changed=Orchestrator(root)._resume_blocked_run(state); "
+                "save_run_state(root,state); "
+                "print(json.dumps({'changed':changed,'status':state.status,"
+                "'blocker':state.active_blocker},sort_keys=True))"
+            )
+            process = subprocess.run(
+                [sys.executable, "-c", runner, str(replay_root)],
+                cwd=str(replay_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=max(
+                    60,
+                    int(
+                        getattr(self._autonomy_config(), "replay_timeout_seconds", 1200)
+                    ),
+                ),
+            )
+            detail = redact_incident_text(
+                (process.stdout or process.stderr).strip()
+            )
+            if process.returncode != 0:
+                return _VerificationResult(False, detail[-2000:])
+            try:
+                payload = json.loads(process.stdout.splitlines()[-1])
+            except (IndexError, json.JSONDecodeError):
+                return _VerificationResult(False, detail[-2000:])
+            after = payload.get("blocker", {})
+            same_root = bool(
+                isinstance(after, dict)
+                and after
+                and (
+                    str(after.get("fingerprint", "")).strip()
+                    == str(before_blocker.get("fingerprint", "")).strip()
+                    or str(after.get("category", "")).strip()
+                    == str(before_blocker.get("category", "")).strip()
+                )
+            )
+            ok = bool(payload.get("changed")) and not same_root
+            return _VerificationResult(
+                ok,
+                f"replay candidate={candidate_id} commit={candidate_commit}\n{detail[-2000:]}",
+            )
+
+    def _record_candidate_result(
+        self,
+        result: SelfRepairResult,
+        *,
+        attempt: int,
+    ) -> None:
+        from .config import load_run_state, run_path, save_run_state
+
+        try:
+            state = load_run_state(self.target_project_root)
+            state.active_self_repair_experiment_id = result.experiment_id
+            safe_root = re.sub(
+                r"[^A-Za-z0-9_.-]+",
+                "-",
+                self.decision.fingerprint or self.decision.category or "unknown",
+            ).strip("-") or "unknown"
+            root = (
+                run_path(self.target_project_root, state.run_id)
+                / "self-repair"
+                / safe_root
+                / (result.candidate_id or f"attempt-{attempt}")
+            )
+            write_json(root / "result.json", result.to_dict())
+            save_run_state(self.target_project_root, state)
+        except Exception:
+            pass
+
+    def promote_after_live_boundary(
+        self,
+        result: SelfRepairResult,
+    ) -> SelfRepairResult:
+        from .config import load_run_state, save_run_state
+
+        if not result.candidate_commit:
+            return result
+        dirty = changed_paths(self.repo_root)
+        current_head = head_ref(self.repo_root)
+        promoted = False
+        if not dirty and current_head == result.base_commit:
+            cherry_pick = subprocess.run(
+                ["git", "cherry-pick", result.candidate_commit],
+                cwd=str(self.repo_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if cherry_pick.returncode == 0:
+                result.commit_sha = head_ref(self.repo_root)
+                result.promotion_status = "promoted_local"
+                promoted = True
+            else:
+                subprocess.run(
+                    ["git", "cherry-pick", "--abort"],
+                    cwd=str(self.repo_root),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                )
+                result.promotion_status = "pending_conflict"
+        else:
+            result.promotion_status = "pending_dirty_checkout"
+
+        if promoted:
+            remote = _self_repair_remote(self.repo_root)
+            if remote is None:
+                result.publish_status = "not_configured"
+            else:
+                try:
+                    _push_self_repair_to_remote(self.repo_root, remote)
+                    result.publish_status = "published"
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    result.publish_status = "publish_pending"
+                    result.reason = (
+                        f"{result.reason}; remote publication deferred: {error}"
+                    )
+        else:
+            result.publish_status = "deferred_until_promotion"
+
+        try:
+            state = load_run_state(self.target_project_root)
+            if (
+                result.promotion_status.startswith("pending_")
+                or result.publish_status == "publish_pending"
+            ):
+                pending = [
+                    dict(item)
+                    for item in state.pending_self_repair_promotions
+                    if str(item.get("candidate_ref", "")) != result.candidate_ref
+                ]
+                pending.append(
+                    {
+                        "schema_version": 1,
+                        "experiment_id": result.experiment_id,
+                        "candidate_id": result.candidate_id,
+                        "candidate_ref": result.candidate_ref,
+                        "candidate_commit": result.candidate_commit,
+                        "base_commit": result.base_commit,
+                        "promotion_status": result.promotion_status,
+                        "publish_status": result.publish_status,
+                        "promoted_commit": result.commit_sha,
+                    }
+                )
+                state.pending_self_repair_promotions = pending
+            state.active_self_repair_experiment_id = ""
+            save_run_state(self.target_project_root, state)
+        except Exception:
+            pass
+        return result
+
+    def cleanup_runtime(self, result: SelfRepairResult) -> None:
+        runtime_root = Path(result.runtime_root) if result.runtime_root else None
+        if runtime_root is None:
+            return
+        try:
+            remove_worktree(self.repo_root, runtime_root, force=True)
+        except RuntimeError:
+            pass
+        shutil.rmtree(runtime_root.parent, ignore_errors=True)
 
     def _synchronize_from_remote(self, remote: _SelfRepairRemote) -> bool:
         head_before = head_ref(self.repo_root)
@@ -1995,9 +2588,19 @@ class AutoAgentsSelfRepairRunner:
                 str(repair_root),
             )
 
-        diagnosis_payload = (
-            self.diagnosis.to_dict() if self.diagnosis is not None else {}
-        )
+        if self.diagnosis is None:
+            diagnosis_payload = {}
+        elif hasattr(self.diagnosis, "to_dict"):
+            diagnosis_payload = self.diagnosis.to_dict()
+        else:
+            final = getattr(self.diagnosis, "final", None)
+            diagnosis_payload = {
+                "final": {
+                    "verification_commands": list(
+                        getattr(final, "verification_commands", []) or []
+                    )
+                }
+            }
         if target_evidence_root is not None:
             serialized = json.dumps(diagnosis_payload, ensure_ascii=False)
             diagnosis_payload = json.loads(
@@ -2017,6 +2620,13 @@ class AutoAgentsSelfRepairRunner:
             ),
             f"Self-repair category: {self.decision.category}",
             f"Classifier reason: {classifier_reason}",
+            f"Candidate attempt: {getattr(self, '_candidate_attempt', 1)}",
+            "Prior candidate failures:",
+            json.dumps(
+                getattr(self, "_candidate_prior_failures", []),
+                indent=2,
+                ensure_ascii=False,
+            ),
             "",
             "Original run error:",
             error_text,
@@ -2123,6 +2733,7 @@ class AutoAgentsSelfRepairRunner:
                 command,
                 verification_root,
                 repository_aliases={self.repo_root.name},
+                python_executable=self._verification_python(),
             )
             gate = run_commands(
                 [verification_command],

@@ -430,7 +430,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
                     raised.exception,
                 )
 
-            self.assertTrue(recovered)
+            self.assertFalse(recovered)
             incident = state.execution_incidents[-1]
             self.assertEqual(
                 incident["kind"],
@@ -438,21 +438,17 @@ class ExecutionRecoveryTests(unittest.TestCase):
             )
             self.assertEqual(
                 incident["diagnosis"]["owner"],
-                "verification_contract",
+                "auto_agents",
             )
             self.assertEqual(
                 incident["diagnosis"]["action"],
-                "RECOVER_TARGET",
+                "SELF_REPAIR",
             )
-            self.assertEqual(state.status, "pending")
-            self.assertEqual(
-                load_task_plan(root)["tasks"][0]["title"],
-                "Repair baseline verification identity",
-            )
-            self.assertEqual(
-                load_task_plan(root)["tasks"][0]["verification_refs"],
-                [f"cmd:{command}"],
-            )
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(state.active_blocker["owner"], "auto_agents")
+            tasks = load_task_plan(root)["tasks"]
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0]["title"], "replace-me")
 
     def test_workspace_conda_repair_resumes_before_repeat_route_guard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

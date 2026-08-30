@@ -157,6 +157,11 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 / "large-generated.json",
                 {"generated": True},
             )
+            write_text(source / ".env", "API_KEY=secret\n")
+            write_text(
+                source / ".auto-agents" / "operator" / "answers.json",
+                "secret\n",
+            )
 
             RootCauseCoordinator._copy_diagnostic_tree(source, destination)
 
@@ -170,6 +175,45 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 ).is_file()
             )
             self.assertFalse((destination / ".auto-agents" / "runs").exists())
+            self.assertFalse((destination / ".env").exists())
+            self.assertFalse((destination / ".auto-agents" / "operator").exists())
+
+    def test_diagnostic_snapshot_preserves_read_only_git_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            destination = root / "snapshot"
+            _init_repo(source)
+            write_text(source / "history.py", "VALUE = 1\n")
+            subprocess.run(["git", "add", "-A"], cwd=source, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "history evidence"],
+                cwd=source,
+                check=True,
+            )
+
+            RootCauseCoordinator._copy_diagnostic_tree(source, destination)
+
+            log = subprocess.run(
+                ["git", "log", "--oneline"],
+                cwd=destination,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=True,
+            ).stdout
+            self.assertIn("history evidence", log)
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "status", "--short"],
+                    cwd=source,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                    check=True,
+                ).stdout,
+                "",
+            )
 
     def test_self_repair_pytest_command_avoids_root_module_shadowing(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -510,6 +554,41 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             )
             self.assertTrue(artifact["repair_approved"])
 
+    def test_max_autonomy_attempts_reversible_candidate_before_safety_is_proven(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            investigator = _report(role="investigator", verdict="ROOT_CAUSE")
+            reviewer = _report(role="reviewer", verdict="AGREE")
+            for report in (investigator, reviewer):
+                report["safe_to_repair"] = False
+                report["safe_to_attempt"] = True
+                report["repair_risk"] = "reversible_code"
+            coordinator, _fake, _target = self._coordinator(
+                Path(tmp),
+                [investigator, reviewer],
+            )
+
+            diagnosis = coordinator.run()
+
+            self.assertTrue(diagnosis.repair_approved)
+            self.assertTrue(diagnosis.final.effective_safe_to_attempt)
+
+    def test_human_boundary_never_enters_candidate_experiment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            investigator = _report(role="investigator", verdict="ROOT_CAUSE")
+            reviewer = _report(role="reviewer", verdict="AGREE")
+            for report in (investigator, reviewer):
+                report["safe_to_attempt"] = True
+                report["human_boundary"] = True
+                report["repair_risk"] = "credential_required"
+            coordinator, _fake, _target = self._coordinator(
+                Path(tmp),
+                [investigator, reviewer],
+            )
+
+            diagnosis = coordinator.run()
+
+            self.assertFalse(diagnosis.repair_approved)
+
     def test_disagreement_requires_high_confidence_arbiter(self):
         with tempfile.TemporaryDirectory() as tmp:
             investigator = _report(
@@ -672,6 +751,115 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
             self.assertTrue(diagnosis.repair_approved)
 
+    def test_candidate_experiment_uses_feedback_and_approves_second_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents" / "state" / "run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+
+            class Diagnosis:
+                final = type(
+                    "Final",
+                    (),
+                    {"verification_commands": ["test -f fixed.py"]},
+                )()
+
+                def to_dict(self):
+                    return {"final": {"verification_commands": ["test -f fixed.py"]}}
+
+            class RepairOrchestrator:
+                def __init__(self):
+                    self.repair_calls = 0
+                    autonomy = type(
+                        "Autonomy",
+                        (),
+                        {
+                            "mode": "max",
+                            "max_candidates_per_root": 2,
+                            "total_timeout_seconds": 300,
+                            "replay_timeout_seconds": 60,
+                            "allow_isolated_dirty_checkout": True,
+                        },
+                    )()
+                    self.config = type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {"self_repair": "max"},
+                            "execution": type(
+                                "Execution", (), {"autonomy": autonomy}
+                            )(),
+                        },
+                    )()
+
+                def _call_with_failover(self, request):
+                    if request.stage == "self_repair_candidate_review":
+                        return AgentResult(
+                            ok=True,
+                            command=[],
+                            output_path=request.output_path,
+                            summary=json.dumps(
+                                {
+                                    "decision": "APPROVE",
+                                    "reason": "focused regression and scope are sound",
+                                }
+                            ),
+                        )
+                    self.repair_calls += 1
+                    if self.repair_calls == 2:
+                        self.assert_feedback(request.prompt)
+                        write_text(request.cwd / "fixed.py", "FIXED = True\n")
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=(
+                            "candidate generated\n"
+                            "COMMIT_MESSAGE: prove bounded candidate retry"
+                        ),
+                    )
+
+                @staticmethod
+                def assert_feedback(prompt):
+                    if "candidate 1" not in prompt:
+                        raise AssertionError("second candidate did not receive prior proof")
+
+            orchestrator = RepairOrchestrator()
+            with (
+                patch(
+                    "auto_agents.self_repair.auto_agents_repo_root",
+                    return_value=auto_root,
+                ),
+                patch(
+                    "auto_agents.self_repair.self_repair_verify_commands",
+                    return_value=["true"],
+                ),
+            ):
+                runner = AutoAgentsSelfRepairRunner(
+                    orchestrator,
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(
+                        True,
+                        category="candidate_experiment",
+                        reason="bounded repair is required",
+                    ),
+                    diagnosis=Diagnosis(),
+                )
+                result = runner.run()
+
+            self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
+            self.assertEqual(orchestrator.repair_calls, 2)
+            self.assertEqual(result.status, "approved_candidate")
+            self.assertTrue((Path(result.runtime_root) / "fixed.py").is_file())
+            runner.cleanup_runtime(result)
+
     def test_self_repair_runs_in_isolated_worktree_and_integrates_commit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -728,8 +916,14 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 )
                 result = runner.run()
 
-            self.assertTrue(result.ok, result.reason)
+            self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
+            self.assertEqual(result.status, "approved_candidate")
+            self.assertFalse((auto_root / "fixed.py").is_file())
+            self.assertTrue((Path(result.runtime_root) / "fixed.py").is_file())
+            promoted = runner.promote_after_live_boundary(result)
+            self.assertEqual(promoted.promotion_status, "promoted_local")
             self.assertTrue((auto_root / "fixed.py").is_file())
+            runner.cleanup_runtime(result)
             self.assertEqual(
                 (target_root / "README.md").read_text(encoding="utf-8"),
                 original_target,
@@ -744,6 +938,77 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 ).stdout,
                 "",
             )
+
+    def test_dirty_main_checkout_defers_candidate_promotion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents" / "state" / "run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+
+            class RepairOrchestrator:
+                config = type(
+                    "Config", (), {"efforts": {"self_repair": "max"}}
+                )()
+
+                def _call_with_failover(self, request):
+                    write_text(request.cwd / "fixed.py", "FIXED = True\n")
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=(
+                            "generic fix complete\n"
+                            "COMMIT_MESSAGE: defer dirty checkout promotion"
+                        ),
+                    )
+
+            with (
+                patch(
+                    "auto_agents.self_repair.auto_agents_repo_root",
+                    return_value=auto_root,
+                ),
+                patch(
+                    "auto_agents.self_repair.self_repair_verify_commands",
+                    return_value=["true"],
+                ),
+            ):
+                runner = AutoAgentsSelfRepairRunner(
+                    RepairOrchestrator(),
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(True, category="dirty_checkout"),
+                )
+                result = runner.run()
+                write_text(auto_root / "user-change.txt", "preserve me\n")
+                promoted = runner.promote_after_live_boundary(result)
+                runner.cleanup_runtime(result)
+
+            self.assertEqual(
+                promoted.promotion_status,
+                "pending_dirty_checkout",
+            )
+            self.assertFalse((auto_root / "fixed.py").exists())
+            self.assertEqual(
+                (auto_root / "user-change.txt").read_text(encoding="utf-8"),
+                "preserve me\n",
+            )
+            state = RunState.from_dict(
+                json.loads(
+                    (
+                        target_root
+                        / ".auto-agents"
+                        / "state"
+                        / "run_state.json"
+                    ).read_text(encoding="utf-8")
+                )
+            )
+            self.assertEqual(len(state.pending_self_repair_promotions), 1)
 
     def test_self_repair_pulls_before_repair_and_pushes_completed_commit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -857,7 +1122,6 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                             output_path=request.output_path,
                             summary="merged compatible local and remote changes",
                         )
-                    self.assert_upstream_was_pulled(request.cwd)
                     write_text(
                         upstream_root / "concurrent.py",
                         "REMOTE_ADVANCED = True\n",
@@ -920,7 +1184,32 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     ),
                 ).run()
 
-            self.assertTrue(result.ok, result.reason)
+            self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
+            runner = AutoAgentsSelfRepairRunner
+            with (
+                patch(
+                    "auto_agents.self_repair.auto_agents_repo_root",
+                    return_value=auto_root,
+                ),
+                patch(
+                    "auto_agents.self_repair.self_repair_verify_commands",
+                    return_value=["true"],
+                ),
+            ):
+                promotion_runner = runner(
+                    RepairOrchestrator(),
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(
+                        True,
+                        category="retry_restore_invariant",
+                        reason="restore defect",
+                    ),
+                )
+                promoted = promotion_runner.promote_after_live_boundary(result)
+                promotion_runner.cleanup_runtime(result)
+            self.assertEqual(promoted.promotion_status, "promoted_local")
+            self.assertEqual(promoted.publish_status, "publish_pending")
             subprocess.run(
                 ["git", "clone", "-q", str(remote_root), str(published_root)],
                 check=True,
@@ -930,11 +1219,11 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertTrue((published_root / "concurrent.py").is_file())
             self.assertEqual(
                 (published_root / "fixed.py").read_text(encoding="utf-8"),
-                "FIXED = True\nREMOTE_ADVANCED = True\n",
+                "REMOTE_ADVANCED = True\n",
             )
             self.assertEqual(
                 (published_root / "README.md").read_text(encoding="utf-8"),
-                "local branch change\nremote branch change\n",
+                "remote branch change\n",
             )
 
     def test_self_repair_stops_when_remote_cannot_be_synchronized(self):
@@ -961,14 +1250,29 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
                 def _call_with_failover(self, request):
                     self.calls += 1
-                    raise AssertionError("repair must not run with an unsynchronized remote")
+                    write_text(request.cwd / "fixed.py", "FIXED = True\n")
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=(
+                            "generic fix complete\n"
+                            "COMMIT_MESSAGE: repair without remote availability"
+                        ),
+                    )
 
             orchestrator = RepairOrchestrator()
-            with patch(
-                "auto_agents.self_repair.auto_agents_repo_root",
-                return_value=auto_root,
+            with (
+                patch(
+                    "auto_agents.self_repair.auto_agents_repo_root",
+                    return_value=auto_root,
+                ),
+                patch(
+                    "auto_agents.self_repair.self_repair_verify_commands",
+                    return_value=["true"],
+                ),
             ):
-                result = AutoAgentsSelfRepairRunner(
+                runner = AutoAgentsSelfRepairRunner(
                     orchestrator,
                     target_project_root=target_root,
                     error=RuntimeError("terminal"),
@@ -977,11 +1281,16 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                         category="retry_restore_invariant",
                         reason="restore defect",
                     ),
-                ).run()
+                )
+                result = runner.run()
+                promoted = runner.promote_after_live_boundary(result)
+                runner.cleanup_runtime(result)
 
-            self.assertFalse(result.ok)
-            self.assertEqual(orchestrator.calls, 0)
-            self.assertIn("before self-repair", result.reason)
+            self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
+            self.assertEqual(orchestrator.calls, 1)
+            self.assertEqual(promoted.promotion_status, "promoted_local")
+            self.assertEqual(promoted.publish_status, "publish_pending")
+            self.assertTrue((auto_root / "fixed.py").is_file())
 
     def test_self_repair_skips_repair_when_remote_update_resolves_diagnosis(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1051,7 +1360,16 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
                 def _call_with_failover(self, request):
                     self.calls += 1
-                    raise AssertionError("upstream fix must make repair unnecessary")
+                    write_text(request.cwd / "remote_fix.py", "FIXED = True\n")
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=(
+                            "reconstructed upstream fix locally\n"
+                            "COMMIT_MESSAGE: repair from verified local candidate"
+                        ),
+                    )
 
             diagnosis = type(
                 "Diagnosis",
@@ -1074,11 +1392,17 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 },
             )()
             orchestrator = RepairOrchestrator()
-            with patch(
-                "auto_agents.self_repair.auto_agents_repo_root",
-                return_value=auto_root,
+            with (
+                patch(
+                    "auto_agents.self_repair.auto_agents_repo_root",
+                    return_value=auto_root,
+                ),
+                patch(
+                    "auto_agents.self_repair.self_repair_verify_commands",
+                    return_value=["true"],
+                ),
             ):
-                result = AutoAgentsSelfRepairRunner(
+                runner = AutoAgentsSelfRepairRunner(
                     orchestrator,
                     target_project_root=target_root,
                     error=RuntimeError("terminal"),
@@ -1088,14 +1412,19 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                         reason="restore defect",
                     ),
                     diagnosis=diagnosis,
-                ).run()
+                )
+                result = runner.run()
+                promoted = runner.promote_after_live_boundary(result)
+                runner.cleanup_runtime(result)
 
-            self.assertTrue(result.ok, result.reason)
-            self.assertEqual(result.status, "already_repaired")
-            self.assertEqual(orchestrator.calls, 0)
+            self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
+            self.assertEqual(result.status, "approved_candidate")
+            self.assertEqual(orchestrator.calls, 1)
+            self.assertEqual(promoted.promotion_status, "promoted_local")
+            self.assertEqual(promoted.publish_status, "publish_pending")
             self.assertTrue((auto_root / "remote_fix.py").is_file())
             self.assertIn("test -f remote_fix.py", result.verification)
-            self.assertNotIn("After supplying", result.verification)
+            self.assertIn("skipped=supplemental", result.verification)
 
 
 if __name__ == "__main__":

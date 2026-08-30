@@ -592,6 +592,7 @@ class Orchestrator:
         self._project_runtime = ProjectRuntimeManager(self.project_root)
         self._interaction_mode = self.config.execution.user_input.mode
         self._secret_echo = self.config.execution.user_input.secret_echo
+        self._autonomy_mode = self.config.execution.autonomy.mode
         gate_environment = gate_environment_fingerprint(
             isolation_mode=(
                 self.config.gates.isolation.mode
@@ -2613,6 +2614,7 @@ class Orchestrator:
         full_verify: bool = False,
         interaction_mode: Optional[str] = None,
         secret_echo: Optional[str] = None,
+        autonomy_mode: Optional[str] = None,
     ) -> RunState:
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
         self._ensure_agent_instructions_synced()
@@ -2624,6 +2626,9 @@ class Orchestrator:
         )
         self._secret_echo = str(
             secret_echo or self.config.execution.user_input.secret_echo
+        )
+        self._autonomy_mode = str(
+            autonomy_mode or self.config.execution.autonomy.mode
         )
         try:
             self._cleanup_failed_verification_logs()
@@ -2696,6 +2701,7 @@ class Orchestrator:
                 doc_language=doc_language,
                 interaction_mode=self._interaction_mode,
                 secret_echo=self._secret_echo,
+                autonomy_mode=self._autonomy_mode,
             )
             if self._normalize_misrouted_provider_research_resume(state):
                 save_run_state(self.project_root, state)
@@ -7690,6 +7696,7 @@ class Orchestrator:
             reason=reason,
             incident_id=incident.incident_id,
             fingerprint=incident.evidence_fingerprint or incident.incident_fingerprint,
+            task_id=incident.task_id,
         )
         self._incident_store(state).save(incident, state)
         self.logger.error(state.last_error)
@@ -7704,6 +7711,7 @@ class Orchestrator:
         reason: str,
         incident_id: str = "",
         fingerprint: str = "",
+        task_id: str = "",
     ) -> None:
         previous = state.active_blocker if isinstance(state.active_blocker, dict) else {}
         same = bool(
@@ -7719,7 +7727,7 @@ class Orchestrator:
             checkpoint_worktree = worktree_fingerprint(self.project_root)
         except Exception:
             checkpoint_worktree = ""
-        state.active_blocker = {
+        blocker = {
             "owner": owner or "unknown",
             "category": category or "run_error",
             "reason": reason,
@@ -7737,6 +7745,57 @@ class Orchestrator:
             "status": "blocked",
             "updated_at": utc_now_iso(),
         }
+        normalized_task_id = str(task_id).strip()
+        can_localize = bool(
+            normalized_task_id
+            and self.config.execution.autonomy.continue_independent_tasks
+        )
+        if can_localize:
+            target_task = next(
+                (
+                    task
+                    for task in state.tasks
+                    if task.task_id == normalized_task_id
+                ),
+                None,
+            )
+            if target_task is not None:
+                target_task.status = "blocked"
+                blocker.update(
+                    {
+                        "scope": "task_lineage",
+                        "task_id": normalized_task_id,
+                        "lineage_id": (
+                            target_task.parent_task_id or target_task.task_id
+                        ),
+                        "status": "localized",
+                    }
+                )
+                state.localized_blockers = [
+                    dict(item)
+                    for item in state.localized_blockers
+                    if str(item.get("task_id", "")) != normalized_task_id
+                ]
+                state.localized_blockers.append(dict(blocker))
+                completed = {
+                    task.task_id for task in state.tasks if task.status == "done"
+                }
+                independent_ready = any(
+                    task.task_id != normalized_task_id
+                    and task.status not in {
+                        "done",
+                        "blocked",
+                        "waiting_user",
+                    }
+                    and all(dep in completed for dep in task.depends_on)
+                    for task in state.tasks
+                )
+                if independent_ready:
+                    state.active_blocker = blocker
+                    state.status = "pending"
+                    state.last_error = reason
+                    return
+        state.active_blocker = blocker
         state.status = "blocked"
         state.last_error = reason
 
@@ -11309,6 +11368,16 @@ class Orchestrator:
 
     @staticmethod
     def _clear_run_blocker(state: RunState) -> None:
+        task_id = str(state.active_blocker.get("task_id", "")).strip()
+        if task_id:
+            state.localized_blockers = [
+                dict(item)
+                for item in state.localized_blockers
+                if str(item.get("task_id", "")).strip() != task_id
+            ]
+            for task in state.tasks:
+                if task.task_id == task_id and task.status == "blocked":
+                    task.status = "pending"
         state.active_blocker = {}
         if state.status == "blocked":
             state.status = "pending"
@@ -11455,40 +11524,16 @@ class Orchestrator:
                     "with enough confidence",
                 )
             if diagnosis.owner in {"target_project", "verification_contract"}:
-                diagnosis = IncidentDiagnosis(
-                    owner=diagnosis.owner,
-                    action="RECOVER_TARGET",
-                    confidence=diagnosis.confidence,
-                    reason=diagnosis.reason,
-                    evidence=list(diagnosis.evidence),
-                    cause_status=diagnosis.cause_status,
-                    source=diagnosis.source,
-                )
+                diagnosis = replace(diagnosis, action="RECOVER_TARGET")
             elif diagnosis.owner == "auto_agents":
-                diagnosis = IncidentDiagnosis(
-                    owner=diagnosis.owner,
-                    action="SELF_REPAIR",
-                    confidence=diagnosis.confidence,
-                    reason=diagnosis.reason,
-                    evidence=list(diagnosis.evidence),
-                    cause_status=diagnosis.cause_status,
-                    source=diagnosis.source,
-                )
+                diagnosis = replace(diagnosis, action="SELF_REPAIR")
             elif diagnosis.owner in {
                 "verification_infrastructure",
                 "execution_environment",
                 "external_provider",
                 "unknown",
             }:
-                diagnosis = IncidentDiagnosis(
-                    owner=diagnosis.owner,
-                    action="REPAIR_INFRASTRUCTURE",
-                    confidence=diagnosis.confidence,
-                    reason=diagnosis.reason,
-                    evidence=list(diagnosis.evidence),
-                    cause_status=diagnosis.cause_status,
-                    source=diagnosis.source,
-                )
+                diagnosis = replace(diagnosis, action="REPAIR_INFRASTRUCTURE")
             else:
                 incident.diagnosis = diagnosis.to_dict()
                 incident.history.append(
@@ -11500,6 +11545,21 @@ class Orchestrator:
                     "reported infrastructure failure ownership is unknown or external; "
                     f"owner={diagnosis.owner}: {diagnosis.reason}",
                 )
+        if (
+            diagnosis.action == "RECOVER_TARGET"
+            and diagnosis.failure_domain
+            in {"baseline_snapshot", "auto_agents_engine", "run_state"}
+        ):
+            diagnosis = replace(
+                diagnosis,
+                owner="auto_agents",
+                action="SELF_REPAIR",
+                mutation_domain="auto_agents_engine",
+                reason=(
+                    f"{diagnosis.reason}; target recovery cannot mutate "
+                    f"failure_domain={diagnosis.failure_domain}"
+                ),
+            )
         incident.diagnosis = diagnosis.to_dict()
         incident.history.append(
             {"event": "diagnosed", "diagnosis": diagnosis.to_dict()}
@@ -11660,6 +11720,11 @@ class Orchestrator:
                 "action": diagnosis.action,
                 "owner": diagnosis.owner,
                 "evidence_fingerprint": incident.evidence_fingerprint,
+                "failure_domain": diagnosis.failure_domain,
+                "mutation_domain": diagnosis.mutation_domain,
+                "expected_postconditions": list(
+                    diagnosis.expected_postconditions
+                ),
             }
         )
         if diagnosis.action == "REWIND_CLARIFY":
@@ -14680,6 +14745,11 @@ class Orchestrator:
             # loop is running.  Keep only stable IDs in the ordering and resolve
             # them against the current canonical list on every iteration.
             tasks_by_id = {task.task_id: task for task in tasks}
+            localized_blocked_ids = {
+                str(item.get("task_id", "")).strip()
+                for item in state.localized_blockers
+                if str(item.get("task_id", "")).strip()
+            }
             retry_ids = self._parallel_sequential_retry_ids(state)
             retry_task_ids = {
                 task_id
@@ -14714,6 +14784,10 @@ class Orchestrator:
                     if task_id in tasks_by_id
                     for candidate in (tasks_by_id[task_id],)
                     if candidate.status not in {"done", "waiting_user"}
+                    and not (
+                        candidate.status == "blocked"
+                        and candidate.task_id in localized_blocked_ids
+                    )
                     and all(
                         dependency in completed
                         for dependency in candidate.depends_on
@@ -14739,6 +14813,31 @@ class Orchestrator:
                     if candidate.status != "done"
                 ]
                 if unfinished:
+                    blocked = [
+                        candidate
+                        for candidate in unfinished
+                        if candidate.status == "blocked"
+                        and candidate.task_id in localized_blocked_ids
+                    ]
+                    if blocked:
+                        state.status = "blocked"
+                        matching = next(
+                            (
+                                dict(item)
+                                for item in state.localized_blockers
+                                if str(item.get("task_id", ""))
+                                == blocked[0].task_id
+                            ),
+                            {},
+                        )
+                        if matching:
+                            matching["status"] = "blocked"
+                            state.active_blocker = matching
+                            state.last_error = str(
+                                matching.get("reason", state.last_error)
+                            )
+                        state.tasks = tasks
+                        return state
                     deferred = self._deferred_parallel_task_reasons(tasks)
                     raise RuntimeError(
                         "sequential task dependency scheduler has no runnable task; "
@@ -14752,11 +14851,25 @@ class Orchestrator:
                 return rewind_state
             if task.status == "waiting_user":
                 continue
+            if (
+                task.status == "blocked"
+                and task.task_id in localized_blocked_ids
+            ):
+                continue
             if task.status != "done":
                 raise RuntimeError(
                     "sequential task execution returned without completing or "
                     f"rerouting {task.task_id}; status={task.status}"
                 )
+            if task.task_id in localized_blocked_ids:
+                state.localized_blockers = [
+                    dict(item)
+                    for item in state.localized_blockers
+                    if str(item.get("task_id", "")) != task.task_id
+                ]
+                if str(state.active_blocker.get("task_id", "")) == task.task_id:
+                    state.active_blocker = {}
+                    state.last_error = ""
             processed += 1
             self._consume_task_budget()
 
@@ -14879,6 +14992,11 @@ class Orchestrator:
     ) -> RunState:
         processed = 0
         while True:
+            localized_blocked_ids = {
+                str(item.get("task_id", "")).strip()
+                for item in state.localized_blockers
+                if str(item.get("task_id", "")).strip()
+            }
             fallback_reason = self._parallel_execution_fallback_reason(tasks)
             if not fallback_reason:
                 break
@@ -14889,6 +15007,7 @@ class Orchestrator:
                 task
                 for task in tasks
                 if task.status not in {"pending", "waiting_user", "done"}
+                and task.task_id not in localized_blocked_ids
             ]
             if (
                 recovery_tasks
@@ -14987,6 +15106,34 @@ class Orchestrator:
                     if resumed:
                         tasks[:] = self._load_implementation_tasks(state)
                         continue
+                    return state
+                localized_blocked = next(
+                    (
+                        task
+                        for task in tasks
+                        if task.status == "blocked"
+                        and task.task_id in localized_blocked_ids
+                    ),
+                    None,
+                )
+                if localized_blocked is not None:
+                    state.status = "blocked"
+                    matching = next(
+                        (
+                            dict(item)
+                            for item in state.localized_blockers
+                            if str(item.get("task_id", ""))
+                            == localized_blocked.task_id
+                        ),
+                        {},
+                    )
+                    if matching:
+                        matching["status"] = "blocked"
+                        state.active_blocker = matching
+                        state.last_error = str(
+                            matching.get("reason", state.last_error)
+                        )
+                    state.tasks = tasks
                     return state
                 break
             remaining = self._remaining_task_budget(max_tasks, processed, len(ready))
@@ -15364,11 +15511,11 @@ class Orchestrator:
             )
             if baseline_changed:
                 self._persist_tasks(tasks)
-            if state.status == "blocked":
+            if state.status == "blocked" or task.status == "blocked":
                 state.tasks = tasks
                 self._persist_tasks(tasks)
                 save_run_state(self.project_root, state)
-                return state
+                return state if state.status == "blocked" else None
 
         restored_checkpoint_ref = self._restore_task_failure_checkpoint(
             state,
@@ -23290,6 +23437,7 @@ class Orchestrator:
             category=_RETAINED_VERIFY_BASELINE_LOST_CATEGORY,
             reason=reason,
             fingerprint=fingerprint,
+            task_id=task.task_id,
         )
         state.active_blocker["retained_verify_baseline_snapshot"] = detail
         state.last_recovery_route = {
@@ -25070,6 +25218,7 @@ class Orchestrator:
         doc_language: Optional[str],
         interaction_mode: str = "auto",
         secret_echo: str = "auto",
+        autonomy_mode: str = "max",
     ) -> None:
         previous_run_id = str(state.resume_context.get("previous_run_id", "")).strip()
         previous_task_plan_archive = str(
@@ -25105,6 +25254,7 @@ class Orchestrator:
             "doc_language": str(doc_language).strip() if doc_language else "",
             "interaction_mode": str(interaction_mode),
             "secret_echo": str(secret_echo),
+            "autonomy_mode": str(autonomy_mode),
         }
         if previous_run_id:
             state.resume_context["previous_run_id"] = previous_run_id
@@ -25131,6 +25281,7 @@ class Orchestrator:
             doc_language=doc_language,
             interaction_mode=(str(context.get("interaction_mode", "")) or None),
             secret_echo=(str(context.get("secret_echo", "")) or None),
+            autonomy_mode=(str(context.get("autonomy_mode", "")) or None),
         )
 
     def _run_task_review(

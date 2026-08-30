@@ -36,12 +36,60 @@ from auto_agents.orchestrator import (
     VERIFY_BASELINE_SCHEMA_VERSION,
     Orchestrator,
 )
+from auto_agents.self_repair_playbooks import SelfRepairPlaybookRegistry
 
 
 class RecoveryResilienceTests(unittest.TestCase):
     def _project(self, root: Path) -> Orchestrator:
         Orchestrator.init_project(root, "demo", "mock")
         return Orchestrator(root)
+
+    def test_task_scoped_blocker_keeps_independent_work_runnable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            blocked = TaskSpec(
+                task_id="task-blocked",
+                title="Blocked",
+                description="",
+                acceptance=[],
+            )
+            independent = TaskSpec(
+                task_id="task-independent",
+                title="Independent",
+                description="",
+                acceptance=[],
+            )
+            dependent = TaskSpec(
+                task_id="task-dependent",
+                title="Dependent",
+                description="",
+                acceptance=[],
+                depends_on=[blocked.task_id],
+            )
+            state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[blocked, independent, dependent],
+            )
+
+            orchestrator._block_run(
+                state,
+                owner="auto_agents",
+                category="task_scoped_engine_failure",
+                reason="one lineage cannot proceed",
+                fingerprint="root-1",
+                task_id=blocked.task_id,
+            )
+
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(blocked.status, "blocked")
+            self.assertEqual(independent.status, "pending")
+            self.assertEqual(state.active_blocker["scope"], "task_lineage")
+            self.assertEqual(
+                state.localized_blockers[0]["task_id"],
+                blocked.task_id,
+            )
 
     def test_failure_identity_diagnostic_uses_recovery_probe_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -623,7 +671,9 @@ class RecoveryResilienceTests(unittest.TestCase):
                 )
             ]
 
-            self.assertTrue(orchestrator._resume_blocked_run(state))
+            playbook = SelfRepairPlaybookRegistry().attempt(orchestrator, state)
+            self.assertIsNotNone(playbook)
+            self.assertTrue(playbook.ok, playbook.reason)
 
             self.assertEqual(state.status, "pending")
             self.assertEqual(state.active_blocker, {})

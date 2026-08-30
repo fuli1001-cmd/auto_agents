@@ -16,6 +16,7 @@ from auto_agents.cli import (
     SELF_REPAIR_STRICT_ENV,
     _auto_repair_auto_agents_and_resume,
     _preflight_automatic_self_repair,
+    _promote_pending_self_repairs,
     build_parser,
     main,
 )
@@ -425,6 +426,15 @@ class ProjectValidationTests(unittest.TestCase):
             "max_repair_cycles": 0,
             "network_enabled": "yes",
         }
+        payload["execution"]["autonomy"] = {
+            "mode": "unbounded",
+            "max_candidates_per_root": 0,
+            "total_timeout_seconds": 1,
+            "replay_timeout_seconds": 1,
+            "continue_independent_tasks": "yes",
+            "allow_isolated_dirty_checkout": True,
+            "require_remote_publish": False,
+        }
 
         errors = validate_project_config_payload(payload)
 
@@ -441,6 +451,16 @@ class ProjectValidationTests(unittest.TestCase):
                 "self_repair_diagnosis.investigator_timeout_seconds" in item
                 for item in errors
             )
+        )
+        self.assertTrue(any("execution.autonomy.mode" in item for item in errors))
+        self.assertTrue(
+            any("execution.autonomy.max_candidates_per_root" in item for item in errors)
+        )
+        self.assertTrue(
+            any("execution.autonomy.total_timeout_seconds" in item for item in errors)
+        )
+        self.assertTrue(
+            any("execution.autonomy.continue_independent_tasks" in item for item in errors)
         )
         self.assertTrue(
             any(
@@ -1402,7 +1422,7 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertFalse(payload["ok"])
             self.assertIn("Expecting property name enclosed in double quotes", payload["error"])
 
-    def test_dirty_auto_agents_checkout_warns_before_run_but_allows_normal_work(self) -> None:
+    def test_dirty_auto_agents_checkout_uses_isolated_self_repair(self) -> None:
         args = build_parser().parse_args(["run", "--project", "/tmp/demo"])
         stderr = io.StringIO()
 
@@ -1413,11 +1433,95 @@ class ProjectValidationTests(unittest.TestCase):
             exit_code = _preflight_automatic_self_repair(args, env={})
 
         self.assertIsNone(exit_code)
-        self.assertIn("Normal run can continue", stderr.getvalue())
-        self.assertIn("README.md", stderr.getvalue())
-        self.assertIn("automatic auto_agents self-repair is unavailable", stderr.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
 
-    def test_strict_self_repair_rejects_dirty_checkout_before_run(self) -> None:
+    def test_autonomy_cli_override_is_available_to_all_stateful_commands(self) -> None:
+        parser = build_parser()
+
+        for command in ("run", "fix", "collab", "provider-resolve", "answer"):
+            args = parser.parse_args(
+                [command, "--project", "/tmp/demo", "--autonomy", "guarded"]
+            )
+            self.assertEqual(args.autonomy, "guarded")
+
+    def test_pending_self_repair_promotion_is_retried_when_checkout_is_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            project_root = root / "project"
+            auto_root.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "test"],
+                cwd=auto_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=auto_root,
+                check=True,
+            )
+            write_text(auto_root / "README.md", "base\n")
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "base"],
+                cwd=auto_root,
+                check=True,
+            )
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=auto_root,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            write_text(auto_root / "fixed.py", "FIXED = True\n")
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "candidate"],
+                cwd=auto_root,
+                check=True,
+            )
+            candidate = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=auto_root,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "reset", "--hard", base],
+                cwd=auto_root,
+                capture_output=True,
+                check=True,
+            )
+            Orchestrator.init_project(project_root, "project", "mock")
+            state = load_run_state(project_root)
+            state.pending_self_repair_promotions = [
+                {
+                    "candidate_commit": candidate,
+                    "candidate_ref": "refs/auto-agents/self-repair/approved/test",
+                    "base_commit": base,
+                    "promotion_status": "pending_dirty_checkout",
+                }
+            ]
+            save_run_state(project_root, state)
+
+            with patch(
+                "auto_agents.cli.auto_agents_repo_root",
+                return_value=auto_root,
+            ):
+                _promote_pending_self_repairs(project_root)
+
+            self.assertTrue((auto_root / "fixed.py").is_file())
+            self.assertEqual(
+                load_run_state(project_root).pending_self_repair_promotions,
+                [],
+            )
+
+    def test_strict_self_repair_allows_dirty_checkout_with_isolated_mode(self) -> None:
         stdout = io.StringIO()
 
         with (
@@ -1425,7 +1529,7 @@ class ProjectValidationTests(unittest.TestCase):
             patch("auto_agents.cli.changed_paths", return_value=["src/change.py"]),
             patch(
                 "auto_agents.cli.Orchestrator",
-                side_effect=AssertionError("strict preflight must run before orchestration"),
+                side_effect=RuntimeError("orchestration reached after isolated preflight"),
             ),
             contextlib.redirect_stdout(stdout),
         ):
@@ -1433,11 +1537,10 @@ class ProjectValidationTests(unittest.TestCase):
                 ["run", "--project", "/tmp/demo", "--strict-self-repair"]
             )
 
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 3)
         payload = json.loads(stdout.getvalue())
         self.assertFalse(payload["ok"])
-        self.assertIn("self-repair preflight failed", payload["error"])
-        self.assertIn("src/change.py", payload["error"])
+        self.assertIn("orchestration reached", payload["error"])
 
     def test_self_repair_preflight_respects_disable_env_and_session_scope(self) -> None:
         parser = build_parser()
@@ -1925,8 +2028,9 @@ class ProjectValidationTests(unittest.TestCase):
                 SELF_REPAIR_REPEAT_COUNT_ENV: "1",
             },
         )
-        self.assertTrue(repeated.decision.eligible)
+        self.assertFalse(repeated.decision.eligible)
         self.assertEqual(repeated.decision.repeat_count, 2)
+        self.assertIn("same self-repair error repeated", repeated.decision.reason)
         self.assertEqual(repeated.decision.fingerprint, result.decision.fingerprint)
 
     def test_provider_triage_includes_referenced_requirements_audit_findings(self) -> None:

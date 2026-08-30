@@ -2345,6 +2345,38 @@ def validate_project_config_payload(payload: object) -> List[str]:
                     errors.append(
                         "execution.self_repair_diagnosis.network_enabled must be a boolean"
                     )
+            autonomy = execution.get("autonomy", {})
+            if not isinstance(autonomy, dict):
+                errors.append("execution.autonomy must be an object")
+            else:
+                if autonomy.get("mode", "max") not in {"off", "guarded", "max"}:
+                    errors.append(
+                        "execution.autonomy.mode must be one of: off, guarded, max"
+                    )
+                for key, default in {
+                    "max_candidates_per_root": 3,
+                    "total_timeout_seconds": 3600,
+                    "replay_timeout_seconds": 1200,
+                }.items():
+                    value = autonomy.get(key, default)
+                    minimum = 1 if key == "max_candidates_per_root" else 60
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < minimum
+                    ):
+                        errors.append(
+                            f"execution.autonomy.{key} must be an integer >= {minimum}"
+                        )
+                for key, default in {
+                    "continue_independent_tasks": True,
+                    "allow_isolated_dirty_checkout": True,
+                    "require_remote_publish": False,
+                }.items():
+                    if not isinstance(autonomy.get(key, default), bool):
+                        errors.append(
+                            f"execution.autonomy.{key} must be a boolean"
+                        )
             smart_timeout = execution.get("smart_timeout", {})
             if not isinstance(smart_timeout, dict):
                 errors.append("execution.smart_timeout must be an object")

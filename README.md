@@ -1029,6 +1029,15 @@ worktrees. Example:
       "max_repair_cycles": 2,
       "network_enabled": false
     },
+    "autonomy": {
+      "mode": "max",
+      "max_candidates_per_root": 3,
+      "total_timeout_seconds": 3600,
+      "replay_timeout_seconds": 1200,
+      "continue_independent_tasks": true,
+      "allow_isolated_dirty_checkout": true,
+      "require_remote_publish": false
+    },
     "smart_timeout": {
       "enabled": true,
       "provider_idle_seconds": 1800,
@@ -1492,35 +1501,39 @@ clarification blocker if active requirements and repository tests disagree in a 
 oracles cannot resolve. After the configured recovery budget is exhausted, auto_agents rewinds to
 `clarify` instead of looping indefinitely.
 
-When a `run` reaches a blocking terminal state, the CLI collects a versioned evidence bundle before
+When a stateful `run`, `fix`, `collab`, or answer-resume workflow reaches a blocking terminal state,
+the CLI collects a versioned evidence bundle before
 changing blocker ownership. It includes full relevant attempt timelines, run state, incident and
 audit evidence, staged and unstaged diffs, worker capabilities, and durable ownership checkpoints.
-The investigator and reviewer run in read-only mode; they may execute bounded non-mutating focused
-diagnostics. A high-confidence evidence consensus starts self-repair in an isolated auto_agents Git
-worktree. When the auto_agents checkout has a configured remote, its current branch is first merged
-from the tracked remote branch (falling back to `origin`, or the first configured remote, and the
-same branch name). Merge conflicts are routed to a focused conflict-resolution agent and the
-resolved merge is verified. After pulling new commits, diagnosis-specific verification commands run
-against the synchronized checkout; when they pass, auto_agents resumes with that code without
-creating a redundant repair. Otherwise the candidate fix is tested before its commit is integrated
-into the clean main checkout, then pushed back to the remote branch. If the remote advances during
-the repair, auto_agents merges and verifies it before retrying the push. Unresolved conflicts or
-failed verification stop synchronization explicitly, while a final push failure leaves the verified
-local commit intact for recovery.
+The investigator and reviewer run against a sanitized read-only shared Git clone, so bounded history
+and byte-level checkpoints remain inspectable without exposing operator inputs or `.env` files.
+High-confidence, reversible auto_agents defects may set `safe_to_attempt` even before integration is
+proven. In the default `max` mode, auto_agents generates at most three isolated candidates within
+one hour, rejects duplicate diffs and weakened tests, runs base/candidate differential checks, and
+replays
+the blocked state in a private target clone. An adversarial read-only candidate review is required
+before approval.
+
+An approved candidate is not immediately merged. The real workflow first resumes from the approved
+candidate worktree. Only after the original blocker fingerprint disappears is the candidate promoted
+to the local auto_agents branch. A dirty main checkout is preserved byte-for-byte and promotion is
+recorded as pending until it becomes clean. Remote publication happens after local recovery; push or
+network failure is recorded as `publish_pending` and never blocks the target workflow.
 The configured `max_dynamic_commands` is a soft investigation budget; a completed valid report is
 accepted within a small hard-ceiling grace of 25% (minimum two tools) so post-hoc accounting does not
 discard a useful diagnosis for a one-command overage.
 The repaired process then reconciles only protected paths named by a durable attempt checkpoint and
-restarts the original `run` command. A repeated root cause is bounded by
-`execution.self_repair_diagnosis.max_repair_cycles`. If evidence is insufficient, the CLI blocks
-with owner/category and a link to the root-cause artifacts instead of guessing.
+restarts the original stateful command. Task-scoped blockers remain localized while independent task
+lineages continue. If all three candidates or the one-hour budget are exhausted, only the affected
+lineage is blocked until no independent work remains. Irreversible production actions, missing
+credentials/authorization, and product semantics that cannot be derived from requirements always
+remain explicit human boundaries, including in `max` mode.
 
-At `run` startup, auto_agents checks whether its own repository is clean whenever automatic
-self-repair is enabled. A dirty auto_agents checkout produces an immediate warning: the normal target
-run continues, but automatic self-repair remains unavailable until the checkout is clean. Use
-`--strict-self-repair` (or `AUTO_AGENTS_SELF_REPAIR_STRICT=1`) to fail at startup instead of continuing.
-The `fix` and `collab` commands do not currently invoke automatic auto_agents self-repair, so this
-preflight applies only to `run`.
+Use `--autonomy off|guarded|max` to override the project setting for one workflow. `guarded` limits
+automatic work to deterministic playbooks or already-proven-safe repairs; `max` also permits bounded
+isolated code experiments. A dirty auto_agents checkout no longer disables repair: the approved
+candidate runs from an isolated worktree and integration is deferred. `--strict-self-repair` now
+fails only when no isolated repair or verification environment can be created.
 
 Implementation resume is task-aware rather than fully transactional:
 

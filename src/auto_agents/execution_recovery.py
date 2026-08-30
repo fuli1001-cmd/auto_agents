@@ -76,6 +76,9 @@ class IncidentDiagnosis:
     evidence: List[str] = field(default_factory=list)
     cause_status: str = "unknown"
     source: str = "deterministic"
+    failure_domain: str = "unknown"
+    mutation_domain: str = "unknown"
+    expected_postconditions: List[str] = field(default_factory=list)
 
     def valid(self) -> bool:
         return (
@@ -449,15 +452,22 @@ def deterministic_diagnosis(incident: ExecutionIncident) -> Optional[IncidentDia
             else ""
         )
         return IncidentDiagnosis(
-            owner="verification_contract",
-            action="RECOVER_TARGET",
+            owner="auto_agents",
+            action="SELF_REPAIR",
             confidence=1.0,
             reason=(
-                "the verification baseline failed without a stable semantic "
-                "failure identity"
+                "the immutable verification baseline failed without a stable "
+                "semantic identity; changing current target HEAD cannot affect "
+                "that baseline and must not be routed to target recovery"
             ),
             evidence=[f"contract={contract or 'unspecified'}"],
             cause_status="confirmed",
+            failure_domain="baseline_snapshot",
+            mutation_domain="auto_agents_engine",
+            expected_postconditions=[
+                "baseline execution yields stable identities or typed not-applicable",
+                "current target HEAD is not changed merely to repair an immutable baseline",
+            ],
         )
     marker = incident.process_snapshot.get("reported_infrastructure_marker", {})
     repair_scope = (

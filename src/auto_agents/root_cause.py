@@ -17,7 +17,16 @@ from .io_utils import read_json, read_text, write_json
 from .models import AgentRequest, AgentResult, RunState, SelfRepairDiagnosisConfig
 
 
-ROOT_CAUSE_SCHEMA_VERSION = 1
+ROOT_CAUSE_SCHEMA_VERSION = 2
+ROOT_CAUSE_REPAIR_RISKS = {
+    "reversible_code",
+    "reversible_state",
+    "external_side_effect",
+    "irreversible",
+    "semantic_choice",
+    "credential_required",
+}
+ROOT_CAUSE_FAILURE_SCOPES = {"task_lineage", "stage", "run"}
 ROOT_CAUSE_OWNERS = {
     "auto_agents",
     "execution_environment",
@@ -67,6 +76,10 @@ class RootCauseReport:
     safe_to_repair: bool
     causal_chain: List[str]
     evidence: List[RootCauseEvidence]
+    safe_to_attempt: Optional[bool] = None
+    repair_risk: str = "reversible_code"
+    failure_scope: str = "run"
+    human_boundary: bool = False
     rejected_hypotheses: List[str] = field(default_factory=list)
     reproduction_commands: List[str] = field(default_factory=list)
     reproduction_outcome: str = ""
@@ -76,8 +89,17 @@ class RootCauseReport:
 
     def to_dict(self) -> Dict[str, object]:
         payload = asdict(self)
+        payload["safe_to_attempt"] = self.effective_safe_to_attempt
         payload["schema_version"] = ROOT_CAUSE_SCHEMA_VERSION
         return payload
+
+    @property
+    def effective_safe_to_attempt(self) -> bool:
+        return (
+            self.safe_to_repair
+            if self.safe_to_attempt is None
+            else bool(self.safe_to_attempt)
+        )
 
     @classmethod
     def from_dict(
@@ -114,6 +136,7 @@ class RootCauseReport:
                 category=str(payload.get("category", "")).strip(),
                 generic=bool(payload.get("generic", False)),
                 safe_to_repair=bool(payload.get("safe_to_self_repair", False)),
+                safe_to_attempt=bool(payload.get("safe_to_self_repair", False)),
                 causal_chain=[str(payload.get("reason", "")).strip()],
                 evidence=legacy_evidence,
                 resume_strategy=(
@@ -148,6 +171,14 @@ class RootCauseReport:
         category = str(payload.get("category", "")).strip().lower()
         if not re.fullmatch(r"[a-z][a-z0-9_]{2,63}", category):
             raise ValueError("root-cause category must be stable snake_case")
+        repair_risk = str(
+            payload.get("repair_risk", "reversible_code")
+        ).strip()
+        if repair_risk not in ROOT_CAUSE_REPAIR_RISKS:
+            raise ValueError("root-cause repair_risk is invalid")
+        failure_scope = str(payload.get("failure_scope", "run")).strip()
+        if failure_scope not in ROOT_CAUSE_FAILURE_SCOPES:
+            raise ValueError("root-cause failure_scope is invalid")
         causal_chain = [
             str(item).strip()
             for item in payload.get("causal_chain", []) or []
@@ -167,6 +198,14 @@ class RootCauseReport:
             category=category,
             generic=bool(payload.get("generic", False)),
             safe_to_repair=bool(payload.get("safe_to_repair", False)),
+            safe_to_attempt=(
+                bool(payload.get("safe_to_attempt"))
+                if "safe_to_attempt" in payload
+                else None
+            ),
+            repair_risk=repair_risk,
+            failure_scope=failure_scope,
+            human_boundary=bool(payload.get("human_boundary", False)),
             causal_chain=causal_chain,
             evidence=evidence,
             rejected_hypotheses=[
@@ -217,6 +256,7 @@ class RootCauseDiagnosis:
             "arbiter": self.arbiter.to_dict() if self.arbiter else None,
             "final": self.final.to_dict(),
             "repair_approved": self.repair_approved,
+            "attempt_approved": self.repair_approved,
             "reason": self.reason,
         }
 
@@ -431,12 +471,112 @@ class TerminalEvidenceCollector:
             "auto_agents_repository": repository_diagnostic_state(
                 self.auto_agents_root
             ),
+            "git_history_evidence": self._git_history_evidence(),
         }
         evidence_path = root / "evidence.json"
         redacted = _redact_payload(payload)
         assert isinstance(redacted, dict)
         write_json(evidence_path, redacted)
         return diagnosis_id, root, redacted
+
+    def _git_history_evidence(self) -> Dict[str, object]:
+        if not (self.target_root / ".git").exists():
+            return {}
+        recent = _run_git(
+            self.target_root,
+            "log",
+            "--max-count=64",
+            "--format=%H%x09%P%x09%s",
+        )
+        evidence: Dict[str, object] = {
+            "recent_commits": recent.splitlines(),
+            "retained_records": [],
+        }
+        if self.state is None:
+            return evidence
+        raw_records = self.state.resume_context.get(
+            "retained_worktree_ownership",
+            {},
+        )
+        if not isinstance(raw_records, Mapping):
+            return evidence
+        retained_evidence: List[Dict[str, object]] = []
+        for owner_id, raw_record in list(raw_records.items())[:8]:
+            if not isinstance(raw_record, Mapping):
+                continue
+            base_ref = str(raw_record.get("head_ref", "")).strip()
+            raw_paths = raw_record.get("changed_paths", [])
+            raw_fingerprints = raw_record.get("path_fingerprints", {})
+            if (
+                not base_ref
+                or not isinstance(raw_paths, list)
+                or not isinstance(raw_fingerprints, Mapping)
+            ):
+                continue
+            paths = sorted(
+                {
+                    str(path).strip().replace("\\", "/")
+                    for path in raw_paths
+                    if str(path).strip()
+                }
+            )[:40]
+            if not paths:
+                continue
+            history = subprocess.run(
+                [
+                    "git",
+                    "log",
+                    "--format=%H",
+                    "--max-count=512",
+                    f"{base_ref}..HEAD",
+                    "--",
+                    *paths,
+                ],
+                cwd=str(self.target_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            candidates = (
+                [line.strip() for line in history.stdout.splitlines() if line.strip()]
+                if history.returncode == 0
+                else []
+            )
+            matching: List[str] = []
+            checked = 0
+            for commit_sha in candidates:
+                checked += 1
+                all_match = True
+                for path in paths:
+                    expected = str(raw_fingerprints.get(path, "")).strip()
+                    if not expected:
+                        all_match = False
+                        break
+                    blob = subprocess.run(
+                        ["git", "show", f"{commit_sha}:{path}"],
+                        cwd=str(self.target_root),
+                        capture_output=True,
+                    )
+                    content = blob.stdout if blob.returncode == 0 else b"[missing]"
+                    if hashlib.sha256(content).hexdigest() != expected:
+                        all_match = False
+                        break
+                if all_match:
+                    matching.append(commit_sha)
+                    if len(matching) >= 8:
+                        break
+            retained_evidence.append(
+                {
+                    "owner_task_id": str(owner_id),
+                    "base_ref": base_ref,
+                    "paths": paths,
+                    "candidate_count": len(candidates),
+                    "checked_count": checked,
+                    "matching_commits": matching,
+                }
+            )
+        evidence["retained_records"] = retained_evidence
+        return evidence
 
     def _attempt_timeline(self, run_id: str) -> List[Dict[str, object]]:
         attempts_root = (
@@ -628,9 +768,9 @@ class RootCauseCoordinator:
             arbitrated=arbiter is not None,
         )
         reason = (
-            "root-cause evidence consensus approved automatic auto_agents repair"
+            "root-cause evidence consensus approved an isolated auto_agents repair attempt"
             if repair_approved
-            else "root-cause investigation did not prove a safe generic auto_agents repair"
+            else "root-cause investigation did not approve a bounded auto_agents repair attempt"
         )
         diagnosis = RootCauseDiagnosis(
             diagnosis_id=diagnosis_id,
@@ -646,7 +786,12 @@ class RootCauseCoordinator:
         return diagnosis
 
     @staticmethod
-    def _copy_diagnostic_tree(source: Path, destination: Path) -> None:
+    def _copy_diagnostic_tree(
+        source: Path,
+        destination: Path,
+        *,
+        include_private: bool = False,
+    ) -> None:
         ignored_names = {
             ".git",
             ".conda",
@@ -671,12 +816,50 @@ class RootCauseCoordinator:
                         ignored.append(generated)
             return ignored
 
+        cloned = False
+        if (source / ".git").exists():
+            clone = subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "--shared",
+                    "--no-checkout",
+                    "--quiet",
+                    str(source),
+                    str(destination),
+                ],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if clone.returncode == 0:
+                checkout = subprocess.run(
+                    ["git", "checkout", "--force", "HEAD"],
+                    cwd=str(destination),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                )
+                cloned = checkout.returncode == 0
+            if not cloned and destination.exists():
+                shutil.rmtree(destination, ignore_errors=True)
         shutil.copytree(
             source,
             destination,
             ignore=ignore,
             symlinks=True,
+            dirs_exist_ok=cloned,
         )
+        if not include_private:
+            shutil.rmtree(
+                destination / ".auto-agents" / "operator",
+                ignore_errors=True,
+            )
+            for env_path in destination.glob(".env*"):
+                if env_path.name == ".env.example":
+                    continue
+                if env_path.is_file() or env_path.is_symlink():
+                    env_path.unlink(missing_ok=True)
         # Archived done-task payloads are part of the permanent requirement
         # namespace. Copy that bounded subset of history so diagnosis and
         # self-repair reproduce the same collision checks as the final audit.
@@ -822,7 +1005,7 @@ class RootCauseCoordinator:
             ),
         }[role]
         schema = {
-            "schema_version": 1,
+            "schema_version": ROOT_CAUSE_SCHEMA_VERSION,
             "role": role,
             "verdict": (
                 "ROOT_CAUSE"
@@ -836,6 +1019,10 @@ class RootCauseCoordinator:
             "category": "stable_snake_case",
             "generic": False,
             "safe_to_repair": False,
+            "safe_to_attempt": False,
+            "repair_risk": "reversible_code",
+            "failure_scope": "run",
+            "human_boundary": False,
             "causal_chain": ["cause -> mechanism -> terminal symptom"],
             "evidence": [
                 {
@@ -875,6 +1062,10 @@ class RootCauseCoordinator:
                 "behavior without hard-coding the current project/task, even if this is the "
                 "first observed occurrence. generic does not mean the symptom must already "
                 "have appeared in multiple projects.",
+                "Set safe_to_attempt=true when a reversible isolated candidate can be generated "
+                "and tested even if safe_to_repair remains false before candidate proof. "
+                "Set human_boundary=true for irreversible production actions, missing credentials "
+                "or authorization, or product semantics that cannot be derived from requirements.",
                 "verification_commands are optional pre-commit checks for the auto_agents "
                 "candidate snapshot. Use repository-relative pytest/unittest commands or "
                 "read-only git status/diff checks only. Do not include target-project "
@@ -917,6 +1108,11 @@ class RootCauseCoordinator:
             and reviewer.category == investigator.category
             and reviewer.generic == investigator.generic
             and reviewer.safe_to_repair == investigator.safe_to_repair
+            and reviewer.effective_safe_to_attempt
+            == investigator.effective_safe_to_attempt
+            and reviewer.repair_risk == investigator.repair_risk
+            and reviewer.failure_scope == investigator.failure_scope
+            and reviewer.human_boundary == investigator.human_boundary
         )
 
     @staticmethod
@@ -942,13 +1138,39 @@ class RootCauseCoordinator:
         threshold: float,
         arbitrated: bool,
     ) -> bool:
+        autonomy = getattr(
+            getattr(
+                getattr(self.orchestrator, "config", None),
+                "execution",
+                None,
+            ),
+            "autonomy",
+            None,
+        )
+        autonomy_mode = str(
+            getattr(
+                self.orchestrator,
+                "_autonomy_mode",
+                getattr(autonomy, "mode", "max"),
+            )
+        ).strip() or "max"
         if (
-            final.owner != "auto_agents"
+            autonomy_mode == "off"
+            or final.owner != "auto_agents"
             or final.confidence < threshold
             or not final.generic
-            or not final.safe_to_repair
+            or final.human_boundary
+            or final.repair_risk
+            in {"irreversible", "semantic_choice", "credential_required"}
             or not self._has_concrete_auto_agents_evidence(final)
         ):
+            return False
+        final_attemptable = bool(
+            final.safe_to_repair
+            if autonomy_mode == "guarded"
+            else final.effective_safe_to_attempt or final.proposed_fix_scope
+        )
+        if not final_attemptable:
             return False
         if arbitrated:
             return final.verdict == "FINAL"
@@ -957,7 +1179,13 @@ class RootCauseCoordinator:
             and reviewer.owner == "auto_agents"
             and reviewer.confidence >= self.config.confidence_threshold
             and reviewer.generic
-            and reviewer.safe_to_repair
+            and not reviewer.human_boundary
+            and (
+                reviewer.safe_to_repair
+                if autonomy_mode == "guarded"
+                else reviewer.effective_safe_to_attempt
+                or reviewer.proposed_fix_scope
+            )
             and self._has_concrete_auto_agents_evidence(reviewer)
         )
 

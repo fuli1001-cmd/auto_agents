@@ -370,6 +370,15 @@ DEFAULT_CONFIG = {
             "max_repair_cycles": 2,
             "network_enabled": False,
         },
+        "autonomy": {
+            "mode": "max",
+            "max_candidates_per_root": 3,
+            "total_timeout_seconds": 3600,
+            "replay_timeout_seconds": 1200,
+            "continue_independent_tasks": True,
+            "allow_isolated_dirty_checkout": True,
+            "require_remote_publish": False,
+        },
         "recovery": {
             "enabled": True,
             "max_rounds": 2,
