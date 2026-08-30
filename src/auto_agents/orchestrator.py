@@ -986,7 +986,7 @@ class Orchestrator:
         engine_root = Path(__file__).resolve().parents[2]
         revision = head_ref(engine_root)
         hasher = hashlib.sha256()
-        for name in ("orchestrator.py", "requirements.py"):
+        for name in ("orchestrator.py", "gates.py", "requirements.py"):
             path = Path(__file__).resolve().parent / name
             try:
                 hasher.update(path.read_bytes())
@@ -11352,6 +11352,116 @@ class Orchestrator:
         )
         return True
 
+    def _resume_reparsed_baseline_identity_incident(
+        self,
+        state: RunState,
+        incident: Optional[ExecutionIncident],
+        blocker: Mapping[str, object],
+    ) -> bool:
+        """Re-evaluate retained pytest output after an extractor repair."""
+
+        category = str(blocker.get("category", "")).strip()
+        blocker_incident_id = str(blocker.get("incident_id", "")).strip()
+        root_cause = blocker.get("root_cause_diagnosis")
+        if (
+            incident is None
+            or state.status not in {"blocked", "failed"}
+            or str(blocker.get("owner", "")).strip() != "auto_agents"
+            or str(blocker.get("status", "blocked")).strip() != "blocked"
+            or incident.kind != BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
+            or not incident.baseline
+            or incident.status != "self_repair"
+            or incident.termination_reason
+            or incident.cleanup_incomplete
+            or category == _RETAINED_VERIFY_BASELINE_LOST_CATEGORY
+            or (blocker_incident_id and blocker_incident_id != incident.incident_id)
+            or (
+                category != BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
+                and not isinstance(root_cause, dict)
+            )
+        ):
+            return False
+
+        command = (incident.command or incident.origin_command).strip()
+        if not command or not (incident.stdout_tail or incident.stderr_tail):
+            return False
+
+        revision = self._installed_engine_revision()
+        raw_revisions = state.resume_context.get(
+            self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
+            {},
+        )
+        revisions = (
+            dict(raw_revisions) if isinstance(raw_revisions, dict) else {}
+        )
+        recovery_key = (
+            f"{BASELINE_FAILURE_IDENTITY_INCIDENT_KIND}:{incident.incident_id}"
+        )
+        if str(revisions.get(recovery_key, "")) == revision:
+            return False
+
+        extraction = extract_failure_info(
+            GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=int(incident.returncode or 1),
+                        stdout=incident.stdout_tail,
+                        stderr=incident.stderr_tail,
+                    )
+                ],
+            )
+        )
+        failures = [
+            str(item).strip()
+            for item in extraction.failure_ids
+            if str(item).strip()
+        ]
+        if (
+            not extraction.comparable
+            or not failures
+            or not self._baseline_failure_ids_are_valid(failures)
+        ):
+            return False
+        failures = self._normalize_verify_failure_ids(failures, "")
+
+        revisions[recovery_key] = revision
+        state.resume_context[self.INSTALLED_ENGINE_RECOVERY_CONTEXT] = revisions
+        incident.status = "recovering"
+        incident.history.append(
+            {
+                "event": "baseline_failure_identity_reparsed",
+                "engine_revision": revision,
+                "failure_ids": failures,
+                "reason": (
+                    "the installed engine extracted stable semantic identities "
+                    "from the retained baseline output"
+                ),
+            }
+        )
+        self._incident_store(state).save(incident, state)
+        self._clear_run_blocker(state)
+        state.last_recovery_route = {
+            "outcome": "baseline_identity_reparsed",
+            "failure_kind": incident.kind,
+            "incident_id": incident.incident_id,
+            "task_id": incident.task_id,
+            "failure_ids": failures,
+            "reason": (
+                "the repaired engine recovered stable identities from the "
+                "immutable baseline result; retrying normal baseline comparison"
+            ),
+            "engine_invariant": "",
+        }
+        self.logger.info(
+            "[self-repair] reparsed baseline identity incident=%s failures=%s",
+            incident.incident_id,
+            ",".join(failures[:10]),
+        )
+        return True
+
     def _resume_blocked_run(self, state: RunState) -> bool:
         active_incident = self._incident_store(state).active(state)
         if (
@@ -11381,6 +11491,12 @@ class Orchestrator:
             if isinstance(state.active_blocker, dict)
             else {}
         )
+        if self._resume_reparsed_baseline_identity_incident(
+            state,
+            active_incident,
+            persisted_blocker,
+        ):
+            return True
         raw_retained_detail = persisted_blocker.get(
             "retained_verify_baseline_snapshot",
             {},

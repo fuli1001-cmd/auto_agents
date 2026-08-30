@@ -3108,6 +3108,133 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 state.resume_context,
             )
 
+    def test_repaired_parser_reopens_retained_baseline_identity_incident(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            node_id = "tests/test_contract.py::test_fixture"
+            baseline_ref = "refs/auto-agents/gate-snapshots/baseline-contract"
+            baseline_source_ref = "1" * 40
+            task = TaskSpec(
+                task_id="contract-task",
+                title="Verify fixture contract",
+                description="Retain the immutable verification baseline.",
+                acceptance=["The fixture contract is verified."],
+                status="in_progress",
+                verify_baseline_ref=baseline_ref,
+                verify_baseline_source_ref=baseline_source_ref,
+            )
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [task]
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "diagnosed_identity_parser_gap",
+                "fingerprint": "original-blocker",
+                "reason": "the baseline identity extractor needs repair",
+                "status": "blocked",
+                "root_cause_diagnosis": {
+                    "final": {"owner": "auto_agents"},
+                },
+            }
+            incident = ExecutionIncident(
+                incident_id="baseline-identity",
+                run_id=state.run_id,
+                source="gate",
+                kind=BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                stage="implement",
+                context="lazy task baseline verification (contract-task)",
+                command=f"python -m pytest -q {node_id}",
+                task_id=task.task_id,
+                baseline=True,
+                returncode=1,
+                stdout_tail=(
+                    "================ short test summary info ================\n"
+                    f"ERROR {node_id}\n"
+                ),
+                status="self_repair",
+            )
+            store = ExecutionIncidentStore(root, state.run_id)
+            store.save(incident, state)
+            target_head = head_ref(root)
+
+            with patch.object(
+                orchestrator,
+                "_installed_engine_revision",
+                return_value="engine-with-repaired-parser",
+            ):
+                changed = orchestrator._resume_blocked_run(state)
+
+            self.assertTrue(changed)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.active_blocker, {})
+            self.assertEqual(state.last_error, "")
+            self.assertEqual(
+                state.last_recovery_route["outcome"],
+                "baseline_identity_reparsed",
+            )
+            self.assertEqual(state.last_recovery_route["failure_ids"], [node_id])
+            self.assertEqual(task.verify_baseline_ref, baseline_ref)
+            self.assertEqual(task.verify_baseline_source_ref, baseline_source_ref)
+            self.assertEqual(task.verify_baseline_failures, [])
+            self.assertEqual(head_ref(root), target_head)
+            persisted = store.load(incident.incident_id)
+            self.assertIsNotNone(persisted)
+            self.assertEqual(persisted.status, "recovering")
+            self.assertEqual(
+                persisted.history[-1]["event"],
+                "baseline_failure_identity_reparsed",
+            )
+            self.assertEqual(persisted.history[-1]["failure_ids"], [node_id])
+
+    def test_reparsed_baseline_resume_rejects_non_identity_error_prose(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                "status": "blocked",
+            }
+            incident = ExecutionIncident(
+                incident_id="baseline-prose",
+                run_id=state.run_id,
+                source="gate",
+                kind=BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                stage="implement",
+                context="baseline verification",
+                command="python -m pytest -q tests",
+                baseline=True,
+                returncode=1,
+                stdout_tail="ERROR fixture service did not become ready",
+                status="self_repair",
+            )
+            ExecutionIncidentStore(root, state.run_id).save(incident, state)
+
+            with patch.object(
+                orchestrator,
+                "_installed_engine_revision",
+                return_value="engine-with-repaired-parser",
+            ):
+                changed = orchestrator._resume_blocked_run(state)
+
+            self.assertFalse(changed)
+            self.assertEqual(state.status, "blocked")
+            persisted = ExecutionIncidentStore(root, state.run_id).load(
+                incident.incident_id
+            )
+            self.assertIsNotNone(persisted)
+            self.assertEqual(persisted.status, "self_repair")
+
     def test_self_repair_commit_reopens_incident_for_new_engine(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"

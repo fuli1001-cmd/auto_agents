@@ -34,7 +34,10 @@ from .models import (
 from .process_supervision import run_supervised_shell_command
 
 
-_PYTEST_FAILED = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
+_PYTEST_SHORT_SUMMARY = re.compile(
+    r"^(?:FAILED|ERROR)\s+(\S+)",
+    re.MULTILINE,
+)
 _VITEST_FAILED = re.compile(
     r"^\s*FAIL\s+(?P<failure>(?P<file>\S+\.(?:test|spec)\.[cm]?[jt]sx?)"
     r"(?:\s+>\s+.+?)?)(?:\s+\[\s*(?P=file)\s*\])?$",
@@ -289,16 +292,17 @@ def classify_reported_infrastructure_failure(
 
 def _pytest_failure_ids(output: str) -> List[str]:
     ids: List[str] = []
-    for item in _PYTEST_FAILED.findall(output):
+    for item in _PYTEST_SHORT_SUMMARY.findall(output):
         candidate = item.strip()
         if candidate.startswith("("):
             continue
         if ".py" not in candidate and "::" not in candidate:
             continue
-        ids.append(candidate)
+        if candidate not in ids:
+            ids.append(candidate)
     for line in output.splitlines():
         candidate = line.strip()
-        if not candidate or candidate.startswith("FAILED "):
+        if not candidate or re.match(r"^(?:FAILED|ERROR)\s+", candidate):
             continue
         if not re.search(r"\s+(?:FAILED|ERROR)(?:\s+\[\s*\d+%\])?$", candidate):
             continue
@@ -1994,10 +1998,10 @@ def _run_phased_gate_plan(
 def extract_failure_info(gate_result: GateResult) -> FailureExtraction:
     """Extract a list of unique failure identifiers from gate results.
 
-    For pytest commands the function tries to pull individual ``FAILED``
-    test node IDs from the output.  If a command fails without test-level
-    failures, the result is intentionally marked non-comparable so retry
-    logic cannot treat a command-level failure as the same test failure.
+    For pytest commands the function tries to pull individual ``FAILED`` and
+    ``ERROR`` test node IDs from the output.  If a command fails without
+    test-level failures, the result is intentionally marked non-comparable so
+    retry logic cannot treat a command-level failure as the same test failure.
     """
     failures: List[str] = []
     non_comparable: List[str] = []

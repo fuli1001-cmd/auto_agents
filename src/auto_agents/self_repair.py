@@ -19,6 +19,7 @@ from .git_ops import (
     add_worktree,
     changed_paths,
     commit_all,
+    delete_ref,
     head_ref,
     is_untracked_vim_swap,
     remove_worktree,
@@ -56,6 +57,38 @@ SELF_REPAIR_PROVIDER_CONFIDENCE_THRESHOLD = 0.85
 SELF_REPAIR_TRIAGE_CONTEXT_LIMIT = 20_000
 SELF_REPAIR_TRIAGE_LOG_LIMIT = 24_000
 SELF_REPAIR_GIT_SYNC_TIMEOUT_SECONDS = 120
+SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS = 900
+SELF_REPAIR_EXTENDED_FULL_SUITE_TIMEOUT_SECONDS = 1800
+SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
+    "candidate_exception": 0,
+    "candidate_failed": 10,
+    "candidate_noop": 20,
+    "candidate_duplicate": 20,
+    "failed": 25,
+    "candidate_rejected": 30,
+    "candidate_review_rejected": 40,
+    "candidate_verification_failed": 50,
+    "candidate_replay_failed": 70,
+    "candidate_full_suite_failed": 80,
+    "candidate_full_suite_inconclusive": 90,
+    "approved_candidate": 100,
+    "already_repaired": 100,
+}
+SELF_REPAIR_CANDIDATE_VALIDATION_STAGES = {
+    "candidate_exception": "generation",
+    "candidate_failed": "generation",
+    "candidate_noop": "generation",
+    "candidate_duplicate": "generation",
+    "failed": "generation",
+    "candidate_rejected": "scope_guard",
+    "candidate_review_rejected": "adversarial_review",
+    "candidate_verification_failed": "focused_verification",
+    "candidate_replay_failed": "boundary_replay",
+    "candidate_full_suite_failed": "full_suite",
+    "candidate_full_suite_inconclusive": "full_suite",
+    "approved_candidate": "approved",
+    "already_repaired": "approved",
+}
 SELF_REPAIR_TRIAGE_OWNERS = {
     "auto_agents",
     "execution_environment",
@@ -104,6 +137,10 @@ class SelfRepairResult:
     runtime_root: str = ""
     promotion_status: str = ""
     publish_status: str = ""
+    validation_stage: str = ""
+    validation_rank: int = 0
+    recoverable_validation: bool = False
+    attempt: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -1572,6 +1609,272 @@ class AutoAgentsSelfRepairRunner:
         self._verification_python_cache = str(Path(sys.executable).resolve())
         return self._verification_python_cache
 
+    def _safe_repair_category(self) -> str:
+        return (
+            re.sub(
+                r"[^A-Za-z0-9_.-]+",
+                "-",
+                self.decision.fingerprint
+                or self.decision.category
+                or "repair",
+            ).strip("-")
+            or "repair"
+        )
+
+    def _latest_pending_validation_ref(self, base_head: str) -> str:
+        prefix = (
+            "refs/auto-agents/self-repair/pending-validation/"
+            f"{self._safe_repair_category()}/"
+        )
+        listed = subprocess.run(
+            [
+                "git",
+                "for-each-ref",
+                "--sort=-creatordate",
+                "--format=%(refname)",
+                prefix,
+            ],
+            cwd=str(self.repo_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if listed.returncode != 0:
+            return ""
+        for candidate_ref in listed.stdout.splitlines():
+            candidate_ref = candidate_ref.strip()
+            if not candidate_ref:
+                continue
+            parent = subprocess.run(
+                ["git", "rev-parse", f"{candidate_ref}^"],
+                cwd=str(self.repo_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if parent.returncode == 0 and parent.stdout.strip() == base_head:
+                return candidate_ref
+        return ""
+
+    def _reject_pending_validation_ref(
+        self,
+        candidate_ref: str,
+        candidate_commit: str,
+        candidate_id: str,
+    ) -> str:
+        rejected_ref = (
+            "refs/auto-agents/self-repair/rejected/"
+            f"{self._safe_repair_category()}/{candidate_id}"
+        )
+        update_ref(self.repo_root, rejected_ref, candidate_commit)
+        delete_ref(self.repo_root, candidate_ref)
+        return rejected_ref
+
+    def _approved_candidate_result(
+        self,
+        *,
+        experiment_id: str,
+        candidate_id: str,
+        base_head: str,
+        candidate_commit: str,
+        summary: str,
+        verification: str,
+    ) -> SelfRepairResult:
+        candidate_ref = (
+            "refs/auto-agents/self-repair/approved/"
+            f"{self._safe_repair_category()}/{candidate_id}"
+        )
+        update_ref(self.repo_root, candidate_ref, candidate_commit)
+        runtime_parent = Path(
+            tempfile.mkdtemp(prefix="auto-agents-approved-runtime-")
+        )
+        runtime_root = runtime_parent / "runtime"
+        add_worktree(
+            self.repo_root,
+            runtime_root,
+            ref=candidate_commit,
+        )
+        return SelfRepairResult(
+            ok=True,
+            status="approved_candidate",
+            category=self.decision.category,
+            reason=self.decision.reason,
+            commit_sha=candidate_commit,
+            summary=summary,
+            verification=verification,
+            experiment_id=experiment_id,
+            candidate_id=candidate_id,
+            base_commit=base_head,
+            candidate_commit=candidate_commit,
+            candidate_ref=candidate_ref,
+            runtime_root=str(runtime_root),
+            promotion_status="awaiting_live_boundary",
+            publish_status="deferred",
+        )
+
+    def _resume_pending_validation_candidate(
+        self,
+        *,
+        experiment_id: str,
+        deadline: float,
+    ) -> Optional[SelfRepairResult]:
+        base_head = head_ref(self.repo_root)
+        candidate_ref = self._latest_pending_validation_ref(base_head)
+        if not candidate_ref:
+            return None
+        self._candidate_base_ref = base_head
+        candidate_id = candidate_ref.rsplit("/", 1)[-1]
+        candidate_commit_process = subprocess.run(
+            ["git", "rev-parse", candidate_ref],
+            cwd=str(self.repo_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if candidate_commit_process.returncode != 0:
+            return None
+        candidate_commit = candidate_commit_process.stdout.strip()
+        with tempfile.TemporaryDirectory(
+            prefix="auto-agents-pending-validation-"
+        ) as tmp:
+            candidate_root = Path(tmp) / "candidate"
+            created = False
+            try:
+                add_worktree(
+                    self.repo_root,
+                    candidate_root,
+                    ref=candidate_commit,
+                )
+                created = True
+                target_before = repository_guard_fingerprint(
+                    self.target_project_root,
+                    ignore_run_artifacts=True,
+                )
+                replay = self._replay_candidate(
+                    candidate_root,
+                    candidate_commit,
+                    candidate_id,
+                )
+                differential = self._diagnosis_differential(
+                    base_head,
+                    candidate_root,
+                )
+                health_case = bool(
+                    self.repair_case is not None
+                    and self.repair_case.source == "health_watch"
+                )
+                boundary_ok = (
+                    replay.ok and differential.ok
+                    if health_case
+                    else replay.ok or differential.ok
+                )
+                if not boundary_ok:
+                    rejected_ref = self._reject_pending_validation_ref(
+                        candidate_ref,
+                        candidate_commit,
+                        candidate_id,
+                    )
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_replay_failed",
+                        category=self.decision.category,
+                        reason="pending candidate no longer crosses the repair boundary",
+                        summary="resumed pending-validation candidate",
+                        verification="\n\n".join(
+                            part
+                            for part in (replay.summary, differential.summary)
+                            if part
+                        ),
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                        candidate_commit=candidate_commit,
+                        candidate_ref=rejected_ref,
+                    )
+                if repository_guard_fingerprint(
+                    self.target_project_root,
+                    ignore_run_artifacts=True,
+                ) != target_before:
+                    rejected_ref = self._reject_pending_validation_ref(
+                        candidate_ref,
+                        candidate_commit,
+                        candidate_id,
+                    )
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_rejected",
+                        category=self.decision.category,
+                        reason="pending candidate validation modified the target project",
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                        candidate_commit=candidate_commit,
+                        candidate_ref=rejected_ref,
+                    )
+                full_suite = self._full_suite_differential(
+                    base_head,
+                    candidate_root,
+                    deadline=deadline,
+                )
+                verification = "\n\n".join(
+                    part
+                    for part in (
+                        replay.summary,
+                        differential.summary,
+                        full_suite.summary,
+                    )
+                    if part
+                )
+                if full_suite.ok:
+                    approved = self._approved_candidate_result(
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_head=base_head,
+                        candidate_commit=candidate_commit,
+                        summary="resumed and approved pending-validation candidate",
+                        verification=verification,
+                    )
+                    delete_ref(self.repo_root, candidate_ref)
+                    return approved
+                if not full_suite.recoverable:
+                    candidate_ref = self._reject_pending_validation_ref(
+                        candidate_ref,
+                        candidate_commit,
+                        candidate_id,
+                    )
+                return SelfRepairResult(
+                    ok=False,
+                    status=(
+                        "candidate_full_suite_inconclusive"
+                        if full_suite.recoverable
+                        else "candidate_full_suite_failed"
+                    ),
+                    category=self.decision.category,
+                    reason=(
+                        "pending candidate full-suite proof remains inconclusive"
+                        if full_suite.recoverable
+                        else "pending candidate introduced a full-suite failure"
+                    ),
+                    summary="resumed pending-validation candidate",
+                    verification=verification,
+                    experiment_id=experiment_id,
+                    candidate_id=candidate_id,
+                    base_commit=base_head,
+                    candidate_commit=candidate_commit,
+                    candidate_ref=candidate_ref,
+                    recoverable_validation=full_suite.recoverable,
+                )
+            finally:
+                if created:
+                    try:
+                        remove_worktree(
+                            self.repo_root,
+                            candidate_root,
+                            force=True,
+                        )
+                    except RuntimeError:
+                        pass
+
     def run(self) -> SelfRepairResult:
         autonomy = self._autonomy_config()
         mode = str(
@@ -1597,7 +1900,36 @@ class AutoAgentsSelfRepairRunner:
         experiment_id = uuid.uuid4().hex[:12]
         prior_failures: list[str] = []
         seen_fingerprints: set[str] = set()
-        last_result: Optional[SelfRepairResult] = None
+        best_result: Optional[SelfRepairResult] = None
+        outcomes: list[SelfRepairResult] = []
+        try:
+            pending = self._resume_pending_validation_candidate(
+                experiment_id=experiment_id,
+                deadline=deadline,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            pending = SelfRepairResult(
+                ok=False,
+                status="candidate_exception",
+                category=self.decision.category,
+                reason=f"pending candidate validation failed: {error}",
+                experiment_id=experiment_id,
+                candidate_id="pending-validation-exception",
+                base_commit=head_ref(self.repo_root),
+            )
+        if pending is not None:
+            self._decorate_candidate_result(pending, attempt=0)
+            outcomes.append(pending)
+            best_result = pending
+            self._record_candidate_result(pending, attempt=0)
+            if pending.ok:
+                return pending
+            prior_failures.append(
+                "pending-validation candidate: "
+                f"{pending.reason}; verification={pending.verification[-1200:]}"
+            )
+            if pending.recoverable_validation:
+                max_candidates = 0
         for attempt in range(1, max_candidates + 1):
             if time.monotonic() >= deadline:
                 break
@@ -1619,7 +1951,13 @@ class AutoAgentsSelfRepairRunner:
                     candidate_id=f"c{attempt}-exception",
                     base_commit=head_ref(self.repo_root),
                 )
-            last_result = candidate
+            self._decorate_candidate_result(candidate, attempt=attempt)
+            outcomes.append(candidate)
+            if (
+                best_result is None
+                or candidate.validation_rank > best_result.validation_rank
+            ):
+                best_result = candidate
             self._record_candidate_result(candidate, attempt=attempt)
             if candidate.ok:
                 return candidate
@@ -1627,11 +1965,41 @@ class AutoAgentsSelfRepairRunner:
                 f"candidate {attempt}: {candidate.reason}; "
                 f"verification={candidate.verification[-1200:]}"
             )
-        if last_result is not None:
-            last_result.summary = "\n".join(
-                part for part in (last_result.summary, *prior_failures) if part
+            if candidate.recoverable_validation:
+                break
+        if best_result is not None:
+            outcome_summary = [
+                "SELF_REPAIR_CANDIDATE_OUTCOMES:",
+                *(
+                    f"- attempt={item.attempt} candidate={item.candidate_id or 'unknown'} "
+                    f"stage={item.validation_stage or 'unknown'} rank={item.validation_rank} "
+                    f"status={item.status} recoverable={str(item.recoverable_validation).lower()} "
+                    f"reason={item.reason}"
+                    for item in outcomes
+                ),
+            ]
+            original_reason = best_result.reason
+            best_result.reason = (
+                "autonomous self-repair did not produce a fully approved candidate; "
+                f"best_candidate={best_result.candidate_id or 'unknown'} "
+                f"validation_stage={best_result.validation_stage or 'unknown'} "
+                f"validation_rank={best_result.validation_rank}; {original_reason}"
             )
-            return last_result
+            best_result.summary = "\n".join(
+                part
+                for part in (
+                    best_result.summary,
+                    *outcome_summary,
+                    *prior_failures,
+                )
+                if part
+            )
+            self._retain_best_failed_candidate(best_result)
+            self._record_candidate_result(
+                best_result,
+                attempt=max(1, best_result.attempt),
+            )
+            return best_result
         return SelfRepairResult(
             ok=False,
             status="budget_exhausted",
@@ -1639,6 +2007,34 @@ class AutoAgentsSelfRepairRunner:
             reason="autonomous self-repair exhausted its candidate/time budget",
             experiment_id=experiment_id,
         )
+
+    @staticmethod
+    def _decorate_candidate_result(
+        result: SelfRepairResult,
+        *,
+        attempt: int,
+    ) -> None:
+        result.attempt = int(attempt)
+        result.validation_rank = int(
+            SELF_REPAIR_CANDIDATE_VALIDATION_RANKS.get(result.status, 0)
+        )
+        result.validation_stage = str(
+            SELF_REPAIR_CANDIDATE_VALIDATION_STAGES.get(
+                result.status,
+                result.status or "unknown",
+            )
+        )
+
+    def _retain_best_failed_candidate(self, result: SelfRepairResult) -> None:
+        if not result.candidate_commit or result.candidate_ref:
+            return
+        safe_category = self._safe_repair_category()
+        candidate_id = result.candidate_id or f"attempt-{result.attempt}"
+        result.candidate_ref = (
+            "refs/auto-agents/self-repair/best-failed/"
+            f"{safe_category}/{candidate_id}"
+        )
+        update_ref(self.repo_root, result.candidate_ref, result.candidate_commit)
 
     def _run_candidate(
         self,
@@ -1889,13 +2285,34 @@ class AutoAgentsSelfRepairRunner:
                 full_suite = self._full_suite_differential(
                     base_head,
                     repair_root,
+                    deadline=deadline,
                 )
                 if not full_suite.ok:
+                    safe_category = self._safe_repair_category()
+                    candidate_ref = (
+                        "refs/auto-agents/self-repair/"
+                        + (
+                            "pending-validation"
+                            if full_suite.recoverable
+                            else "rejected"
+                        )
+                        + f"/{safe_category}/{candidate_id}"
+                    )
+                    update_ref(self.repo_root, candidate_ref, candidate_commit)
                     return SelfRepairResult(
                         ok=False,
-                        status="candidate_full_suite_failed",
+                        status=(
+                            "candidate_full_suite_inconclusive"
+                            if full_suite.recoverable
+                            else "candidate_full_suite_failed"
+                        ),
                         category=self.decision.category,
-                        reason="candidate introduced a new full-suite failure set",
+                        reason=(
+                            "candidate full-suite proof remained inconclusive after "
+                            "bounded timeout recovery"
+                            if full_suite.recoverable
+                            else "candidate introduced a new full-suite failure set"
+                        ),
                         summary=summary,
                         verification="\n\n".join(
                             part
@@ -1911,32 +2328,14 @@ class AutoAgentsSelfRepairRunner:
                         candidate_id=candidate_id,
                         base_commit=base_head,
                         candidate_commit=candidate_commit,
+                        candidate_ref=candidate_ref,
+                        recoverable_validation=full_suite.recoverable,
                     )
-                safe_category = re.sub(
-                    r"[^A-Za-z0-9_.-]+",
-                    "-",
-                    self.decision.fingerprint or self.decision.category or "repair",
-                ).strip("-")
-                candidate_ref = (
-                    "refs/auto-agents/self-repair/approved/"
-                    f"{safe_category}/{candidate_id}"
-                )
-                update_ref(self.repo_root, candidate_ref, candidate_commit)
-                runtime_parent = Path(
-                    tempfile.mkdtemp(prefix="auto-agents-approved-runtime-")
-                )
-                runtime_root = runtime_parent / "runtime"
-                add_worktree(
-                    self.repo_root,
-                    runtime_root,
-                    ref=candidate_commit,
-                )
-                return SelfRepairResult(
-                    ok=True,
-                    status="approved_candidate",
-                    category=self.decision.category,
-                    reason=self.decision.reason,
-                    commit_sha=candidate_commit,
+                return self._approved_candidate_result(
+                    experiment_id=experiment_id,
+                    candidate_id=candidate_id,
+                    base_head=base_head,
+                    candidate_commit=candidate_commit,
                     summary=summary,
                     verification="\n\n".join(
                         part
@@ -1948,14 +2347,6 @@ class AutoAgentsSelfRepairRunner:
                         )
                         if part
                     ),
-                    experiment_id=experiment_id,
-                    candidate_id=candidate_id,
-                    base_commit=base_head,
-                    candidate_commit=candidate_commit,
-                    candidate_ref=candidate_ref,
-                    runtime_root=str(runtime_root),
-                    promotion_status="awaiting_live_boundary",
-                    publish_status="deferred",
                 )
             finally:
                 if created:
@@ -2069,20 +2460,35 @@ class AutoAgentsSelfRepairRunner:
             normalized = " ".join(line.strip().split())
             if not normalized:
                 continue
-            if (
-                normalized.startswith("FAILED ")
-                or normalized.startswith("ERROR ")
-                or re.search(r"\btests?/[^\s:]+(?:::[^\s]+)+", normalized)
-            ):
+            if normalized.startswith("$ "):
+                continue
+            if normalized.startswith(("FAILED ", "ERROR ")):
                 identities.append(normalized[:500])
+                continue
+            node = re.search(r"\btests?/[^\s:]+(?:::[^\s]+)+", normalized)
+            if node is not None:
+                identities.append(node.group(0)[:500])
         if identities:
             return tuple(sorted(set(identities)))
-        exits = [
-            line.strip()
-            for line in str(summary).splitlines()
-            if line.strip().startswith(("$ ", "exit="))
-        ]
-        return tuple(exits)
+        fallback: list[str] = []
+        for raw_line in str(summary).splitlines():
+            line = " ".join(raw_line.strip().split())
+            if line.startswith("$ "):
+                line = re.sub(
+                    r"[^\s'\"]*[/\\]auto-agents-(?:remote-repair-check|"
+                    r"self-repair-worktree)-[^\s'\"/\\]+[/\\]"
+                    r"(?:verification|repair)",
+                    "<self-repair-worktree>",
+                    line,
+                )
+                fallback.append(line)
+            elif line.startswith("exit="):
+                fallback.append(line)
+            elif "timed out after" in line.lower():
+                fallback.append("termination=timeout")
+            elif "stalled" in line.lower():
+                fallback.append("termination=stalled")
+        return tuple(sorted(set(fallback)))
 
     def _diagnosis_differential(
         self,
@@ -2104,20 +2510,94 @@ class AutoAgentsSelfRepairRunner:
             return _VerificationResult(False, "no differential commands")
         base = self._run_verification_at_ref(commands, base_head)
         candidate = self._run_verification_commands(commands, candidate_root)
+        test_only_base: Optional[_VerificationResult] = None
+        if base.ok and candidate.ok:
+            test_only_base = self._run_test_only_base_differential(
+                commands,
+                base_head,
+                candidate_root,
+            )
+        crossed = bool(
+            candidate.ok
+            and (
+                not base.ok
+                or (
+                    test_only_base is not None
+                    and not test_only_base.ok
+                )
+            )
+        )
         return _VerificationResult(
-            (not base.ok) and candidate.ok,
+            crossed,
             "\n\n".join(
-                (
+                part
+                for part in (
                     "=== base differential ===\n" + base.summary,
+                    (
+                        "=== base with candidate tests differential ===\n"
+                        + test_only_base.summary
+                        if test_only_base is not None
+                        else ""
+                    ),
                     "=== candidate differential ===\n" + candidate.summary,
                 )
+                if part
             ),
         )
+
+    def _run_test_only_base_differential(
+        self,
+        commands: list[str],
+        base_head: str,
+        candidate_root: Path,
+    ) -> Optional["_VerificationResult"]:
+        patch_result = subprocess.run(
+            ["git", "diff", "--binary", base_head, "--", "tests"],
+            cwd=str(candidate_root),
+            capture_output=True,
+        )
+        if patch_result.returncode != 0 or not patch_result.stdout:
+            return None
+        with tempfile.TemporaryDirectory(
+            prefix="auto-agents-test-only-differential-"
+        ) as tmp:
+            hybrid_root = Path(tmp) / "base-with-candidate-tests"
+            created = False
+            try:
+                add_worktree(
+                    self.repo_root,
+                    hybrid_root,
+                    ref=base_head or "HEAD",
+                )
+                created = True
+                applied = subprocess.run(
+                    ["git", "apply", "--whitespace=nowarn", "-"],
+                    cwd=str(hybrid_root),
+                    input=patch_result.stdout,
+                    capture_output=True,
+                )
+                if applied.returncode != 0:
+                    detail = applied.stderr.decode(
+                        "utf-8", errors="replace"
+                    ).strip()
+                    return _VerificationResult(
+                        True,
+                        "candidate test-only patch could not be applied: " + detail,
+                    )
+                return self._run_verification_commands(commands, hybrid_root)
+            finally:
+                if created:
+                    try:
+                        remove_worktree(self.repo_root, hybrid_root, force=True)
+                    except RuntimeError:
+                        pass
 
     def _full_suite_differential(
         self,
         base_head: str,
         candidate_root: Path,
+        *,
+        deadline: Optional[float] = None,
     ) -> "_VerificationResult":
         execution = getattr(
             getattr(self.target_orchestrator, "config", None),
@@ -2142,10 +2622,75 @@ class AutoAgentsSelfRepairRunner:
             )
         base_signature = self._verification_failure_signature(base.summary)
         candidate_signature = self._verification_failure_signature(candidate.summary)
-        ok = bool(
-            not base.ok
+        equivalent_timeout = bool(
+            base.timed_out
+            and candidate.timed_out
             and base_signature
             and base_signature == candidate_signature
+        )
+        if candidate.timed_out:
+            remaining = (
+                max(0, int(deadline - time.monotonic()))
+                if deadline is not None
+                else SELF_REPAIR_EXTENDED_FULL_SUITE_TIMEOUT_SECONDS + 60
+            )
+            retry_timeout = min(
+                SELF_REPAIR_EXTENDED_FULL_SUITE_TIMEOUT_SECONDS,
+                max(0, remaining - 60),
+            )
+            if retry_timeout > SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS:
+                retried = self._run_verification_commands(
+                    [command],
+                    candidate_root,
+                    command_timeout_seconds=retry_timeout,
+                )
+                retry_summary = "\n\n".join(
+                    (
+                        "=== initial candidate full suite ===\n" + candidate.summary,
+                        (
+                            "=== extended candidate full suite "
+                            f"timeout={retry_timeout}s ===\n{retried.summary}"
+                        ),
+                    )
+                )
+                if retried.ok:
+                    return _VerificationResult(
+                        True,
+                        "\n\n".join(
+                            (
+                                "=== base full suite ===\n" + base.summary,
+                                retry_summary,
+                                "nonfatal=extended candidate full suite passed",
+                            )
+                        ),
+                        commands=retried.commands,
+                        returncodes=retried.returncodes,
+                        termination_reasons=retried.termination_reasons,
+                    )
+                candidate = _VerificationResult(
+                    retried.ok,
+                    retry_summary,
+                    commands=retried.commands,
+                    returncodes=retried.returncodes,
+                    termination_reasons=retried.termination_reasons,
+                )
+                candidate_signature = self._verification_failure_signature(
+                    retried.summary
+                )
+
+        ok = bool(
+            not base.ok
+            and not candidate.timed_out
+            and base_signature
+            and base_signature == candidate_signature
+        )
+        inconclusive_timeout = bool(
+            candidate.timed_out
+            and (
+                base.timed_out
+                or equivalent_timeout
+                or not base.ok
+            )
         )
         return _VerificationResult(
             ok,
@@ -2156,10 +2701,18 @@ class AutoAgentsSelfRepairRunner:
                     (
                         "nonfatal=pre-existing full-suite failure set retained"
                         if ok
-                        else "fatal=candidate full-suite failure set changed"
+                        else (
+                            "inconclusive=full-suite timeout requires continued validation"
+                            if inconclusive_timeout
+                            else "fatal=candidate full-suite failure set changed"
+                        )
                     ),
                 )
             ),
+            commands=candidate.commands,
+            returncodes=candidate.returncodes,
+            termination_reasons=candidate.termination_reasons,
+            recoverable=inconclusive_timeout,
         )
 
     def _replay_candidate(
@@ -2673,6 +3226,8 @@ class AutoAgentsSelfRepairRunner:
         self,
         commands: list[str],
         ref: str,
+        *,
+        command_timeout_seconds: int = SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS,
     ) -> "_VerificationResult":
         with tempfile.TemporaryDirectory(
             prefix="auto-agents-remote-repair-check-"
@@ -2689,6 +3244,7 @@ class AutoAgentsSelfRepairRunner:
                 return self._run_verification_commands(
                     commands,
                     verification_root,
+                    command_timeout_seconds=command_timeout_seconds,
                 )
             finally:
                 if created:
@@ -2831,6 +3387,7 @@ class AutoAgentsSelfRepairRunner:
             "",
             "Verification expectation:",
             "- Run focused pytest checks for auto_agents before declaring success.",
+            "- Add a focused regression that fails when applied to the base engine code and passes with the fix; broad suites that pass on both revisions are not differential proof.",
             "",
             "Final response:",
             "- Briefly summarize the root cause and generic fix.",
@@ -2884,7 +3441,14 @@ class AutoAgentsSelfRepairRunner:
                 for part in (required.summary, *skipped)
                 if part
             )
-            return _VerificationResult(required.ok, summary)
+            return _VerificationResult(
+                required.ok,
+                summary,
+                commands=required.commands,
+                returncodes=required.returncodes,
+                termination_reasons=required.termination_reasons,
+                recoverable=required.recoverable,
+            )
         additional = self._run_verification_commands(
             supplemental,
             root,
@@ -2895,7 +3459,16 @@ class AutoAgentsSelfRepairRunner:
             for part in (required.summary, *skipped, additional.summary)
             if part
         )
-        return _VerificationResult(additional.ok, summary)
+        return _VerificationResult(
+            additional.ok,
+            summary,
+            commands=required.commands + additional.commands,
+            returncodes=required.returncodes + additional.returncodes,
+            termination_reasons=(
+                required.termination_reasons + additional.termination_reasons
+            ),
+            recoverable=required.recoverable or additional.recoverable,
+        )
 
     def _run_verification_commands(
         self,
@@ -2903,8 +3476,12 @@ class AutoAgentsSelfRepairRunner:
         verification_root: Path,
         *,
         allow_pytest_no_tests: bool = False,
+        command_timeout_seconds: int = SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS,
     ) -> "_VerificationResult":
         summaries = []
+        rendered_commands: list[str] = []
+        returncodes: list[int] = []
+        termination_reasons: list[str] = []
         for command in commands:
             verification_command = self_repair_verification_command(
                 command,
@@ -2915,9 +3492,14 @@ class AutoAgentsSelfRepairRunner:
             gate = run_commands(
                 [verification_command],
                 verification_root,
-                command_timeout_seconds=900,
+                command_timeout_seconds=max(60, int(command_timeout_seconds)),
             )
             process = gate.commands[0]
+            rendered_commands.append(verification_command)
+            returncodes.append(int(process.returncode))
+            termination_reasons.append(
+                str(getattr(process, "termination_reason", "") or "")
+            )
             detail = (process.stderr or process.stdout or "").strip()
             summaries.append(
                 (
@@ -2935,8 +3517,20 @@ class AutoAgentsSelfRepairRunner:
                 )
                 continue
             if process.returncode != 0:
-                return _VerificationResult(False, "\n\n".join(summaries))
-        return _VerificationResult(True, "\n\n".join(summaries))
+                return _VerificationResult(
+                    False,
+                    "\n\n".join(summaries),
+                    commands=tuple(rendered_commands),
+                    returncodes=tuple(returncodes),
+                    termination_reasons=tuple(termination_reasons),
+                )
+        return _VerificationResult(
+            True,
+            "\n\n".join(summaries),
+            commands=tuple(rendered_commands),
+            returncodes=tuple(returncodes),
+            termination_reasons=tuple(termination_reasons),
+        )
 
     def _commit_message(self, summary: str) -> str:
         for match in re.finditer(r"^COMMIT_MESSAGE:\s*(.+)$", summary, flags=re.MULTILINE):
@@ -2950,6 +3544,17 @@ class AutoAgentsSelfRepairRunner:
 class _VerificationResult:
     ok: bool
     summary: str
+    commands: tuple[str, ...] = ()
+    returncodes: tuple[int, ...] = ()
+    termination_reasons: tuple[str, ...] = ()
+    recoverable: bool = False
+
+    @property
+    def timed_out(self) -> bool:
+        return any(
+            reason in {"timeout", "timed_out", "safety_ceiling"}
+            for reason in self.termination_reasons
+        ) or "timed out after" in self.summary.lower()
 
 
 def _is_pytest_verification_command(command: str) -> bool:

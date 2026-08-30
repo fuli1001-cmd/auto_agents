@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,8 @@ from auto_agents.repair_cases import RepairCase
 from auto_agents.self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
+    SelfRepairResult,
+    _VerificationResult,
     self_repair_verification_command,
 )
 
@@ -788,6 +791,495 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             diagnosis = coordinator.run()
 
             self.assertTrue(diagnosis.repair_approved)
+
+    def test_failure_signature_normalizes_isolated_worktree_paths(self):
+        base = (
+            "$ /env/python -c \"import sys; sys.path.insert(0, "
+            "'/tmp/auto-agents-remote-repair-check-aaa/verification/src')\" "
+            "-q tests\nexit=-15\ncommand timed out after 900s"
+        )
+        candidate = (
+            "$ /env/python -c \"import sys; sys.path.insert(0, "
+            "'/tmp/auto-agents-self-repair-worktree-bbb/repair/src')\" "
+            "-q tests\nexit=-15\ncommand timed out after 900s"
+        )
+
+        self.assertEqual(
+            AutoAgentsSelfRepairRunner._verification_failure_signature(base),
+            AutoAgentsSelfRepairRunner._verification_failure_signature(candidate),
+        )
+
+    def test_runner_returns_deepest_candidate_not_last_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+
+            autonomy = type(
+                "Autonomy",
+                (),
+                {
+                    "mode": "max",
+                    "max_candidates_per_root": 3,
+                    "total_timeout_seconds": 300,
+                    "replay_timeout_seconds": 60,
+                    "allow_isolated_dirty_checkout": True,
+                },
+            )()
+            orchestrator = type(
+                "Orchestrator",
+                (),
+                {
+                    "config": type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {"self_repair": "max"},
+                            "execution": type(
+                                "Execution", (), {"autonomy": autonomy}
+                            )(),
+                        },
+                    )()
+                },
+            )()
+            runner = AutoAgentsSelfRepairRunner(
+                orchestrator,
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True, category="candidate-ranking"),
+            )
+            outcomes = [
+                SelfRepairResult(
+                    False,
+                    "candidate_replay_failed",
+                    "did not cross replay",
+                    candidate_id="c1",
+                ),
+                SelfRepairResult(
+                    False,
+                    "candidate_full_suite_failed",
+                    "full suite changed",
+                    candidate_id="c2",
+                    candidate_commit=subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=auto_root,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip(),
+                ),
+                SelfRepairResult(
+                    False,
+                    "candidate_replay_failed",
+                    "later replay failed",
+                    candidate_id="c3",
+                ),
+            ]
+            with (
+                patch(
+                    "auto_agents.self_repair.auto_agents_repo_root",
+                    return_value=auto_root,
+                ),
+                patch.object(runner, "_run_candidate", side_effect=outcomes),
+                patch.object(runner, "_record_candidate_result"),
+            ):
+                runner.repo_root = auto_root
+                result = runner.run()
+
+            self.assertEqual(result.candidate_id, "c2")
+            self.assertEqual(result.validation_stage, "full_suite")
+            self.assertEqual(result.validation_rank, 80)
+            self.assertIn("best_candidate=c2", result.reason)
+            self.assertIn("candidate=c3", result.summary)
+            self.assertIn("/best-failed/", result.candidate_ref)
+            retained = subprocess.run(
+                ["git", "rev-parse", result.candidate_ref],
+                cwd=auto_root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            self.assertEqual(retained, result.candidate_commit)
+
+    def test_recoverable_candidate_stops_new_generation_and_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            autonomy = type(
+                "Autonomy",
+                (),
+                {
+                    "mode": "max",
+                    "max_candidates_per_root": 3,
+                    "total_timeout_seconds": 300,
+                    "replay_timeout_seconds": 60,
+                    "allow_isolated_dirty_checkout": True,
+                },
+            )()
+            orchestrator = type(
+                "Orchestrator",
+                (),
+                {
+                    "config": type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {"self_repair": "max"},
+                            "execution": type(
+                                "Execution", (), {"autonomy": autonomy}
+                            )(),
+                        },
+                    )()
+                },
+            )()
+            runner = AutoAgentsSelfRepairRunner(
+                orchestrator,
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True, category="candidate-ranking"),
+            )
+            recoverable = SelfRepairResult(
+                False,
+                "candidate_full_suite_inconclusive",
+                "needs extended validation",
+                candidate_id="c1",
+                recoverable_validation=True,
+            )
+            with (
+                patch.object(runner, "_run_candidate", return_value=recoverable) as run,
+                patch.object(runner, "_record_candidate_result"),
+            ):
+                result = runner.run()
+
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(result.candidate_id, "c1")
+            self.assertEqual(result.validation_rank, 90)
+            self.assertTrue(result.recoverable_validation)
+
+    def test_full_suite_timeout_retries_candidate_with_remaining_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            candidate_root = root / "candidate"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            (candidate_root / "tests").mkdir(parents=True)
+            orchestrator = type(
+                "Orchestrator",
+                (),
+                {
+                    "config": type(
+                        "Config",
+                        (),
+                        {"execution": object()},
+                    )()
+                },
+            )()
+            runner = AutoAgentsSelfRepairRunner(
+                orchestrator,
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+            runner.repo_root = auto_root
+            base_timeout = _VerificationResult(
+                False,
+                "$ <self-repair-worktree>/python -q tests\n"
+                "exit=-15\ncommand timed out after 900s",
+                returncodes=(-15,),
+                termination_reasons=("timeout",),
+            )
+            candidate_timeout = _VerificationResult(
+                False,
+                "$ <self-repair-worktree>/python -q tests\n"
+                "exit=-15\ncommand timed out after 900s",
+                returncodes=(-15,),
+                termination_reasons=("timeout",),
+            )
+            candidate_passed = _VerificationResult(
+                True,
+                "$ <self-repair-worktree>/python -q tests\nexit=0\npassed",
+                returncodes=(0,),
+                termination_reasons=("",),
+            )
+            with (
+                patch.object(
+                    runner,
+                    "_run_verification_at_ref",
+                    return_value=base_timeout,
+                ),
+                patch.object(
+                    runner,
+                    "_run_verification_commands",
+                    side_effect=[candidate_timeout, candidate_passed],
+                ) as verify,
+            ):
+                result = runner._full_suite_differential(
+                    "base",
+                    candidate_root,
+                    deadline=time.monotonic() + 1500,
+                )
+
+            self.assertTrue(result.ok, result.summary)
+            self.assertEqual(verify.call_count, 2)
+            self.assertGreater(
+                verify.call_args_list[1].kwargs["command_timeout_seconds"],
+                900,
+            )
+            self.assertIn("extended candidate full suite passed", result.summary)
+
+    def test_equivalent_full_suite_timeouts_are_inconclusive_not_regressions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            candidate_root = root / "candidate"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            (candidate_root / "tests").mkdir(parents=True)
+            orchestrator = type(
+                "Orchestrator",
+                (),
+                {
+                    "config": type(
+                        "Config",
+                        (),
+                        {"execution": object()},
+                    )()
+                },
+            )()
+            runner = AutoAgentsSelfRepairRunner(
+                orchestrator,
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+            runner.repo_root = auto_root
+            timeout = _VerificationResult(
+                False,
+                "$ /tmp/auto-agents-self-repair-worktree-x/repair/python -q tests\n"
+                "exit=-15\ncommand timed out after 900s",
+                returncodes=(-15,),
+                termination_reasons=("timeout",),
+            )
+            base_timeout = _VerificationResult(
+                False,
+                "$ /tmp/auto-agents-remote-repair-check-y/verification/python -q tests\n"
+                "exit=-15\ncommand timed out after 900s",
+                returncodes=(-15,),
+                termination_reasons=("timeout",),
+            )
+            with (
+                patch.object(
+                    runner,
+                    "_run_verification_at_ref",
+                    return_value=base_timeout,
+                ),
+                patch.object(
+                    runner,
+                    "_run_verification_commands",
+                    return_value=timeout,
+                ) as verify,
+            ):
+                result = runner._full_suite_differential(
+                    "base",
+                    candidate_root,
+                    deadline=time.monotonic() + 100,
+                )
+
+            self.assertFalse(result.ok)
+            self.assertTrue(result.recoverable)
+            self.assertEqual(verify.call_count, 1)
+            self.assertIn("inconclusive=full-suite timeout", result.summary)
+
+    def test_differential_applies_candidate_tests_to_base_engine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            candidate_root = root / "candidate"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_text(auto_root / "engine.py", "VALUE = 0\n")
+            write_text(
+                auto_root / "tests" / "test_existing.py",
+                "def test_existing():\n    assert True\n",
+            )
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "add engine baseline"],
+                cwd=auto_root,
+                check=True,
+            )
+            base_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=auto_root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "worktree", "add", "-q", str(candidate_root), base_head],
+                cwd=auto_root,
+                check=True,
+            )
+            try:
+                write_text(candidate_root / "engine.py", "VALUE = 1\n")
+                write_text(
+                    candidate_root / "tests" / "test_repair.py",
+                    "from engine import VALUE\n\ndef test_repair():\n    assert VALUE == 1\n",
+                )
+                subprocess.run(
+                    ["git", "add", "-A"],
+                    cwd=candidate_root,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "commit", "-qm", "candidate repair"],
+                    cwd=candidate_root,
+                    check=True,
+                )
+                diagnosis = type(
+                    "Diagnosis",
+                    (),
+                    {
+                        "final": type(
+                            "Final",
+                            (),
+                            {
+                                "verification_commands": [
+                                    "python -m pytest -q tests"
+                                ]
+                            },
+                        )()
+                    },
+                )()
+                runner = AutoAgentsSelfRepairRunner(
+                    object(),
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(True),
+                    diagnosis=diagnosis,
+                )
+                runner.repo_root = auto_root
+
+                result = runner._diagnosis_differential(
+                    base_head,
+                    candidate_root,
+                )
+
+                self.assertTrue(result.ok, result.summary)
+                self.assertIn("base with candidate tests differential", result.summary)
+                self.assertIn("1 failed", result.summary)
+            finally:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(candidate_root)],
+                    cwd=auto_root,
+                    check=True,
+                )
+
+    def test_pending_validation_candidate_is_resumed_before_new_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            candidate_root = root / "pending-candidate"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            base_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=auto_root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "worktree", "add", "-q", str(candidate_root), base_head],
+                cwd=auto_root,
+                check=True,
+            )
+            try:
+                write_text(candidate_root / "fixed.py", "FIXED = True\n")
+                subprocess.run(
+                    ["git", "add", "-A"], cwd=candidate_root, check=True
+                )
+                subprocess.run(
+                    ["git", "commit", "-qm", "pending repair"],
+                    cwd=candidate_root,
+                    check=True,
+                )
+                candidate_commit = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=candidate_root,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+            finally:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(candidate_root)],
+                    cwd=auto_root,
+                    check=True,
+                )
+            pending_ref = (
+                "refs/auto-agents/self-repair/pending-validation/"
+                "resume-pending/c1"
+            )
+            subprocess.run(
+                ["git", "update-ref", pending_ref, candidate_commit],
+                cwd=auto_root,
+                check=True,
+            )
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(
+                    True,
+                    category="resume-pending",
+                    reason="resume retained validation",
+                ),
+            )
+            runner.repo_root = auto_root
+            with (
+                patch.object(
+                    runner,
+                    "_replay_candidate",
+                    return_value=_VerificationResult(True, "replay crossed"),
+                ),
+                patch.object(
+                    runner,
+                    "_diagnosis_differential",
+                    return_value=_VerificationResult(True, "differential crossed"),
+                ),
+                patch.object(
+                    runner,
+                    "_full_suite_differential",
+                    return_value=_VerificationResult(True, "full suite passed"),
+                ),
+            ):
+                result = runner._resume_pending_validation_candidate(
+                    experiment_id="experiment",
+                    deadline=time.monotonic() + 300,
+                )
+
+            self.assertIsNotNone(result)
+            self.assertTrue(result.ok)
+            self.assertEqual(result.candidate_commit, candidate_commit)
+            self.assertEqual(result.status, "approved_candidate")
+            self.assertTrue((Path(result.runtime_root) / "fixed.py").is_file())
+            pending_probe = subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", pending_ref],
+                cwd=auto_root,
+            )
+            self.assertNotEqual(pending_probe.returncode, 0)
+            runner.cleanup_runtime(result)
 
     def test_candidate_experiment_uses_feedback_and_approves_second_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:

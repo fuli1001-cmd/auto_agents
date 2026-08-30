@@ -1092,6 +1092,11 @@ class RootCauseCoordinator:
                 "validation, absolute target paths, example paths such as /path/to/target, "
                 "or unresolved placeholders; put target recovery checks in "
                 "reproduction_commands instead.",
+                "Whenever practical, include at least one focused verification command whose "
+                "assertion fails against the base engine and passes against the proposed fix. "
+                "A broad suite that exits zero on both revisions is regression coverage, not "
+                "a diagnosis differential. Candidate-added tests are replayed against base "
+                "engine code by the runner, so name the focused test file or node explicitly.",
                 "For a health_watch repair case, expected_postconditions must state the "
                 "observable run-health boundary that a candidate must cross. Empty or "
                 "activity-only postconditions cannot approve self-repair.",

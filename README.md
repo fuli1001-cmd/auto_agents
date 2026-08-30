@@ -1548,9 +1548,17 @@ and byte-level checkpoints remain inspectable without exposing operator inputs o
 High-confidence, reversible auto_agents defects may set `safe_to_attempt` even before integration is
 proven. In the default `max` mode, auto_agents generates at most three isolated candidates within
 one hour, rejects duplicate diffs and weakened tests, runs base/candidate differential checks, and
-replays
-the blocked state in a private target clone. An adversarial read-only candidate review is required
-before approval.
+replays the blocked state in a private target clone. Candidate-added tests are also applied to base
+engine code so a newly added regression must actually fail without the implementation fix. An
+adversarial read-only candidate review is required before approval.
+
+Candidates are attempted sequentially and the first candidate that crosses every absolute proof gate
+wins; this is not a relative majority vote. If none is approved, auto_agents reports and retains the
+candidate that reached the deepest verification stage instead of merely returning the last attempt.
+Equivalent base/candidate full-suite timeouts are normalized independently of temporary worktree
+paths and treated as inconclusive: the same candidate receives one longer bounded retry, is retained
+under `pending-validation` if proof is still incomplete, and is resumed before generating new code on
+the next self-repair run.
 
 An approved candidate is not immediately merged. The real workflow first resumes from the approved
 candidate worktree. Only after the original blocker fingerprint disappears is the candidate promoted

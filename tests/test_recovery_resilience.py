@@ -896,6 +896,37 @@ class RecoveryResilienceTests(unittest.TestCase):
 
             self.assertEqual(failures, [test_file])
 
+    def test_pytest_setup_error_baseline_has_stable_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            node_id = "tests/test_demo.py::test_fixture"
+            gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=f"python -m pytest -q {node_id}",
+                        ok=False,
+                        returncode=1,
+                        stdout=f"ERROR {node_id} - RuntimeError: fixture failed\n",
+                    )
+                ],
+                summary="one setup error",
+            )
+            orchestrator._run_verify_failure_identity_diagnostic = Mock(
+                side_effect=AssertionError(
+                    "a stable setup-error identity must not require a diagnostic rerun"
+                )
+            )
+
+            failures = orchestrator._validated_baseline_failures(
+                gate,
+                context="task baseline verification commands",
+            )
+
+            self.assertEqual(failures, [node_id])
+            orchestrator._run_verify_failure_identity_diagnostic.assert_not_called()
+
     def test_stable_test_baseline_is_versioned_after_capture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"

@@ -452,6 +452,72 @@ class GateTests(unittest.TestCase):
         self.assertTrue(info.comparable)
         self.assertEqual(info.failure_ids, ["tests/test_demo.py::test_example"])
 
+    def test_pytest_setup_error_is_comparable(self) -> None:
+        node_id = "tests/test_demo.py::test_fixture"
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command=f"python -m pytest -q {node_id}",
+                    ok=False,
+                    returncode=1,
+                    stdout=f"ERROR {node_id} - RuntimeError: fixture failed\n",
+                    stderr="",
+                )
+            ],
+        )
+
+        info = extract_failure_info(gate)
+
+        self.assertTrue(info.comparable)
+        self.assertEqual(info.failure_ids, [node_id])
+
+    def test_extract_pytest_failures_deduplicates_mixed_summary_forms(self) -> None:
+        failed_node = "tests/test_demo.py::test_assertion"
+        error_node = "tests/test_demo.py::test_fixture"
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command="python -m pytest -q tests/test_demo.py",
+                    ok=False,
+                    returncode=1,
+                    stdout=(
+                        f"FAILED {failed_node} - AssertionError\n"
+                        f"ERROR {error_node} - RuntimeError\n"
+                        f"{error_node} ERROR [100%]\n"
+                        f"ERROR {error_node} - RuntimeError\n"
+                    ),
+                    stderr="",
+                )
+            ],
+        )
+
+        info = extract_failure_info(gate)
+
+        self.assertTrue(info.comparable)
+        self.assertEqual(info.failure_ids, [failed_node, error_node])
+
+    def test_pytest_error_prose_is_not_a_test_identity(self) -> None:
+        command = "python -m pytest -q tests/test_demo.py"
+        gate = GateResult(
+            ok=False,
+            commands=[
+                CommandResult(
+                    command=command,
+                    ok=False,
+                    returncode=1,
+                    stdout="ERROR fixture service did not become ready\n",
+                    stderr="",
+                )
+            ],
+        )
+
+        info = extract_failure_info(gate)
+
+        self.assertFalse(info.comparable)
+        self.assertEqual(info.failure_ids, [f"cmd:{command}"])
+
     def test_standard_reported_infrastructure_failure_is_non_comparable(self) -> None:
         result = CommandResult(
             command="npm test",
