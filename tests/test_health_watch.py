@@ -302,6 +302,32 @@ class HealthWatchTests(unittest.TestCase):
             )
             self.assertEqual(run_watchdog(project, state.run_id), 0)
 
+    def test_late_health_tick_cannot_overwrite_terminal_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = load_run_state(project)
+            supervisor = RunHealthSupervisor(
+                project,
+                state.run_id,
+                config=HealthWatchConfig(),
+                smart_timeout=SmartTimeoutConfig(),
+                autonomy_mode="max",
+            )
+            supervisor._terminal_status = "blocked"
+            supervisor._terminal_reason = "run entered root-cause diagnosis"
+
+            supervisor._write_heartbeat(status="healthy")
+
+            heartbeat = json.loads(
+                (supervisor.root / "heartbeat.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(heartbeat["status"], "blocked")
+            self.assertEqual(
+                heartbeat["reason"],
+                "run entered root-cause diagnosis",
+            )
+
     def test_watchdog_request_is_recognized(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "project"

@@ -607,11 +607,14 @@ class RunHealthSupervisor:
     def stop(self, status: str = "stopped", reason: str = "") -> None:
         self._terminal_status = str(status)
         self._terminal_reason = str(reason)
-        self._write_heartbeat(status=status, reason=reason)
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self.config.poll_seconds + 1.0))
         self._thread = None
+        # Persist terminal state only after the worker has stopped. A final
+        # in-flight tick must never overwrite blocked/completed with healthy and
+        # make the sidecar kill a live root-cause or self-repair process as stale.
+        self._write_heartbeat(status=status, reason=reason)
 
     def record_control_event(
         self,
@@ -835,6 +838,9 @@ class RunHealthSupervisor:
                 pass
 
     def _write_heartbeat(self, *, status: str, reason: str = "") -> None:
+        if self._terminal_status:
+            status = self._terminal_status
+            reason = self._terminal_reason or reason
         payload = {
             "schema_version": HEALTH_SCHEMA_VERSION,
             "run_id": self.run_id,
