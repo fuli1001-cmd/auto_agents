@@ -2349,17 +2349,44 @@ def validate_project_config_payload(payload: object) -> List[str]:
             if not isinstance(autonomy, dict):
                 errors.append("execution.autonomy must be an object")
             else:
+                removed_autonomy_keys = {
+                    "max_candidates_per_root": (
+                        "max_consecutive_non_improving_candidates"
+                    ),
+                    "total_timeout_seconds": None,
+                }
+                for removed_key, replacement in removed_autonomy_keys.items():
+                    if removed_key not in autonomy:
+                        continue
+                    detail = (
+                        f"; use execution.autonomy.{replacement}"
+                        if replacement
+                        else "; root-level self-repair timeouts were removed"
+                    )
+                    errors.append(
+                        f"execution.autonomy.{removed_key} was removed{detail}"
+                    )
                 if autonomy.get("mode", "max") not in {"off", "guarded", "max"}:
                     errors.append(
                         "execution.autonomy.mode must be one of: off, guarded, max"
                     )
                 for key, default in {
-                    "max_candidates_per_root": 3,
-                    "total_timeout_seconds": 3600,
+                    "max_consecutive_non_improving_candidates": 3,
+                    "max_frontier_candidates": 8,
+                    "candidate_timeout_seconds": 3600,
+                    "candidate_review_timeout_seconds": 600,
                     "replay_timeout_seconds": 1200,
                 }.items():
                     value = autonomy.get(key, default)
-                    minimum = 1 if key == "max_candidates_per_root" else 60
+                    minimum = (
+                        1
+                        if key
+                        in {
+                            "max_consecutive_non_improving_candidates",
+                            "max_frontier_candidates",
+                        }
+                        else 60
+                    )
                     if (
                         not isinstance(value, int)
                         or isinstance(value, bool)

@@ -1031,8 +1031,10 @@ worktrees. Example:
     },
     "autonomy": {
       "mode": "max",
-      "max_candidates_per_root": 3,
-      "total_timeout_seconds": 3600,
+      "max_consecutive_non_improving_candidates": 3,
+      "max_frontier_candidates": 8,
+      "candidate_timeout_seconds": 3600,
+      "candidate_review_timeout_seconds": 600,
       "replay_timeout_seconds": 1200,
       "continue_independent_tasks": true,
       "allow_isolated_dirty_checkout": true,
@@ -1570,8 +1572,12 @@ accepted within a small hard-ceiling grace of 25% (minimum two tools) so post-ho
 discard a useful diagnosis for a one-command overage.
 The repaired process then reconciles only protected paths named by a durable attempt checkpoint and
 restarts the original stateful command. Task-scoped blockers remain localized while independent task
-lineages continue. If all three candidates or the one-hour budget are exhausted, only the affected
-lineage is blocked until no independent work remains. Irreversible production actions, missing
+lineages continue. Self-repair has no root-level candidate or wall-clock ceiling: it persists a
+Pareto frontier, resumes each round from the strongest search candidate, and stops only after
+`max_consecutive_non_improving_candidates` consecutive candidates close no obligation, add no new
+confirmed in-scope finding, and advance no validation boundary. Candidate, review, replay, and test
+operations retain their own hard liveness timeouts. On patience exhaustion the complete experiment is
+retained for operator diagnosis. Irreversible production actions, missing
 credentials/authorization, and product semantics that cannot be derived from requirements always
 remain explicit human boundaries, including in `max` mode.
 

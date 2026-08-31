@@ -43,6 +43,7 @@ from auto_agents.models import (
     AgentRequest,
     AgentResult,
     AgentUsage,
+    AutonomyConfig,
     CommandResult,
     GateResult,
     ProjectConfig,
@@ -258,6 +259,12 @@ class ProjectRunLockTests(unittest.TestCase):
 
 
 class ProjectValidationTests(unittest.TestCase):
+    def test_removed_self_repair_budget_fields_fail_during_config_load(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_candidates_per_root was removed"):
+            AutonomyConfig.from_dict({"max_candidates_per_root": 3})
+        with self.assertRaisesRegex(ValueError, "total_timeout_seconds was removed"):
+            AutonomyConfig.from_dict({"total_timeout_seconds": 3600})
+
     def test_cli_recover_command_is_removed(self) -> None:
         with (
             self.assertRaises(SystemExit) as raised,
@@ -430,6 +437,10 @@ class ProjectValidationTests(unittest.TestCase):
             "mode": "unbounded",
             "max_candidates_per_root": 0,
             "total_timeout_seconds": 1,
+            "max_consecutive_non_improving_candidates": 0,
+            "max_frontier_candidates": 0,
+            "candidate_timeout_seconds": 1,
+            "candidate_review_timeout_seconds": 1,
             "replay_timeout_seconds": 1,
             "continue_independent_tasks": "yes",
             "allow_isolated_dirty_checkout": True,
@@ -458,6 +469,19 @@ class ProjectValidationTests(unittest.TestCase):
         )
         self.assertTrue(
             any("execution.autonomy.total_timeout_seconds" in item for item in errors)
+        )
+        self.assertTrue(
+            any(
+                "execution.autonomy.max_consecutive_non_improving_candidates"
+                in item
+                for item in errors
+            )
+        )
+        self.assertTrue(
+            any("execution.autonomy.max_frontier_candidates" in item for item in errors)
+        )
+        self.assertTrue(
+            any("execution.autonomy.candidate_timeout_seconds" in item for item in errors)
         )
         self.assertTrue(
             any("execution.autonomy.continue_independent_tasks" in item for item in errors)

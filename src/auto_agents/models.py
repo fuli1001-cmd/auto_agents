@@ -1229,8 +1229,10 @@ class SelfRepairDiagnosisConfig:
 @dataclass
 class AutonomyConfig:
     mode: str = "max"
-    max_candidates_per_root: int = 3
-    total_timeout_seconds: int = 3600
+    max_consecutive_non_improving_candidates: int = 3
+    max_frontier_candidates: int = 8
+    candidate_timeout_seconds: int = 3600
+    candidate_review_timeout_seconds: int = 600
     replay_timeout_seconds: int = 1200
     continue_independent_tasks: bool = True
     allow_isolated_dirty_checkout: bool = True
@@ -1238,13 +1240,34 @@ class AutonomyConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "AutonomyConfig":
+        if "max_candidates_per_root" in data:
+            raise ValueError(
+                "execution.autonomy.max_candidates_per_root was removed; use "
+                "max_consecutive_non_improving_candidates"
+            )
+        if "total_timeout_seconds" in data:
+            raise ValueError(
+                "execution.autonomy.total_timeout_seconds was removed; "
+                "root-level self-repair timeouts are no longer supported"
+            )
         return cls(
             mode=str(data.get("mode", "max")).strip() or "max",
-            max_candidates_per_root=max(
-                1, int(data.get("max_candidates_per_root", 3) or 3)
+            max_consecutive_non_improving_candidates=max(
+                1,
+                int(
+                    data.get("max_consecutive_non_improving_candidates", 3)
+                    or 3
+                ),
             ),
-            total_timeout_seconds=max(
-                60, int(data.get("total_timeout_seconds", 3600) or 3600)
+            max_frontier_candidates=max(
+                1, int(data.get("max_frontier_candidates", 8) or 8)
+            ),
+            candidate_timeout_seconds=max(
+                60, int(data.get("candidate_timeout_seconds", 3600) or 3600)
+            ),
+            candidate_review_timeout_seconds=max(
+                60,
+                int(data.get("candidate_review_timeout_seconds", 600) or 600),
             ),
             replay_timeout_seconds=max(
                 60, int(data.get("replay_timeout_seconds", 1200) or 1200)

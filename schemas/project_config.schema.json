@@ -599,6 +599,21 @@
           },
           "additionalProperties": false
         },
+        "autonomy": {
+          "type": "object",
+          "properties": {
+            "mode": {"type": "string", "enum": ["off", "guarded", "max"]},
+            "max_consecutive_non_improving_candidates": {"type": "integer", "minimum": 1, "default": 3},
+            "max_frontier_candidates": {"type": "integer", "minimum": 1, "default": 8},
+            "candidate_timeout_seconds": {"type": "integer", "minimum": 60, "default": 3600},
+            "candidate_review_timeout_seconds": {"type": "integer", "minimum": 60, "default": 600},
+            "replay_timeout_seconds": {"type": "integer", "minimum": 60, "default": 1200},
+            "continue_independent_tasks": {"type": "boolean"},
+            "allow_isolated_dirty_checkout": {"type": "boolean"},
+            "require_remote_publish": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
         "user_input": {
           "type": "object",
           "properties": {

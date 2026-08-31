@@ -363,6 +363,29 @@ def test_smart_runner_terminates_process_group_and_writes_report(tmp_path):
     assert payload["reason"] == "provider_idle"
 
 
+def test_request_hard_timeout_remains_absolute_with_smart_supervision(tmp_path):
+    request = _request(tmp_path)
+
+    result = run_subprocess_with_optional_streaming(
+        ["/bin/sh", "-c", "sleep 10"],
+        request,
+        dict(os.environ),
+        timeout=1,
+        smart_timeout=SmartTimeoutConfig(
+            provider_idle_seconds=600,
+            tool_idle_seconds=600,
+            semantic_stall_seconds=600,
+            safety_ceiling_seconds=600,
+        ),
+        provider="shell-test",
+    )
+
+    assert result.returncode == -1
+    assert result.termination is not None
+    assert result.termination.reason == "timed_out"
+    assert "smart timeout: timed out" in result.stderr
+
+
 def test_external_health_probe_can_quiesce_provider_without_provider_incident(tmp_path):
     request = _request(tmp_path)
     request.termination_probe = lambda: "health_quiesce"

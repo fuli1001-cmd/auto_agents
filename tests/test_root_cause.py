@@ -822,8 +822,10 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 (),
                 {
                     "mode": "max",
-                    "max_candidates_per_root": 3,
-                    "total_timeout_seconds": 300,
+                    "max_consecutive_non_improving_candidates": 3,
+                    "max_frontier_candidates": 8,
+                    "candidate_timeout_seconds": 300,
+                    "candidate_review_timeout_seconds": 60,
                     "replay_timeout_seconds": 60,
                     "allow_isolated_dirty_checkout": True,
                 },
@@ -856,6 +858,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     "candidate_replay_failed",
                     "did not cross replay",
                     candidate_id="c1",
+                    candidate_ref="HEAD",
                 ),
                 SelfRepairResult(
                     False,
@@ -869,12 +872,28 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                         text=True,
                         capture_output=True,
                     ).stdout.strip(),
+                    candidate_ref="HEAD",
                 ),
                 SelfRepairResult(
                     False,
                     "candidate_replay_failed",
                     "later replay failed",
                     candidate_id="c3",
+                    candidate_ref="HEAD",
+                ),
+                SelfRepairResult(
+                    False,
+                    "candidate_replay_failed",
+                    "another replay failed",
+                    candidate_id="c4",
+                    candidate_ref="HEAD",
+                ),
+                SelfRepairResult(
+                    False,
+                    "candidate_replay_failed",
+                    "final replay failed",
+                    candidate_id="c5",
+                    candidate_ref="HEAD",
                 ),
             ]
             with (
@@ -891,17 +910,9 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(result.candidate_id, "c2")
             self.assertEqual(result.validation_stage, "full_suite")
             self.assertEqual(result.validation_rank, 80)
-            self.assertIn("best_candidate=c2", result.reason)
-            self.assertIn("candidate=c3", result.summary)
-            self.assertIn("/best-failed/", result.candidate_ref)
-            retained = subprocess.run(
-                ["git", "rev-parse", result.candidate_ref],
-                cwd=auto_root,
-                check=True,
-                text=True,
-                capture_output=True,
-            ).stdout.strip()
-            self.assertEqual(retained, result.candidate_commit)
+            self.assertEqual(result.status, "patience_exhausted")
+            self.assertIn("3 consecutive", result.reason)
+            self.assertIn("candidate=c5", result.summary)
 
     def test_recoverable_candidate_stops_new_generation_and_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -915,8 +926,10 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 (),
                 {
                     "mode": "max",
-                    "max_candidates_per_root": 3,
-                    "total_timeout_seconds": 300,
+                    "max_consecutive_non_improving_candidates": 3,
+                    "max_frontier_candidates": 8,
+                    "candidate_timeout_seconds": 300,
+                    "candidate_review_timeout_seconds": 60,
                     "replay_timeout_seconds": 60,
                     "allow_isolated_dirty_checkout": True,
                 },
@@ -960,6 +973,122 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(result.candidate_id, "c1")
             self.assertEqual(result.validation_rank, 90)
             self.assertTrue(result.recoverable_validation)
+
+    def test_candidate_search_uses_best_history_and_reaches_third_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents" / "state" / "run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+            autonomy = type(
+                "Autonomy",
+                (),
+                {
+                    "mode": "max",
+                    "max_consecutive_non_improving_candidates": 3,
+                    "max_frontier_candidates": 8,
+                    "candidate_timeout_seconds": 300,
+                    "candidate_review_timeout_seconds": 60,
+                    "replay_timeout_seconds": 60,
+                    "allow_isolated_dirty_checkout": True,
+                },
+            )()
+            orchestrator = type(
+                "Orchestrator",
+                (),
+                {
+                    "config": type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {"self_repair": "max"},
+                            "execution": type(
+                                "Execution", (), {"autonomy": autonomy}
+                            )(),
+                        },
+                    )()
+                },
+            )()
+            finding_one = {
+                "finding_id": "malformed-fail-open",
+                "status": "confirmed",
+                "reason": "malformed state disarms the guard",
+                "counterexample": "ownership context is a list",
+                "required_test": "malformed context remains blocked",
+                "evidence": ["candidate review"],
+            }
+            finding_two = {
+                "finding_id": "prepared-resume",
+                "status": "confirmed",
+                "reason": "prepared marker is restored during merge",
+                "counterexample": "prepared commit equals the old repair",
+                "required_test": "run the public resume entrypoint",
+                "evidence": ["sealed replay"],
+            }
+            outcomes = [
+                SelfRepairResult(
+                    False,
+                    "candidate_review_rejected",
+                    "first partial repair",
+                    candidate_id="c1",
+                    candidate_ref="HEAD",
+                    candidate_commit="HEAD",
+                    review_findings=[finding_one],
+                    finding_ids=["malformed-fail-open"],
+                ),
+                SelfRepairResult(
+                    False,
+                    "candidate_review_rejected",
+                    "second partial repair",
+                    candidate_id="c2",
+                    candidate_ref="HEAD",
+                    candidate_commit="HEAD",
+                    review_findings=[finding_two],
+                    finding_ids=["prepared-resume"],
+                    resolved_finding_ids=["malformed-fail-open"],
+                ),
+                SelfRepairResult(
+                    True,
+                    "approved_candidate",
+                    "third candidate closes the root",
+                    candidate_id="c3",
+                    candidate_ref="HEAD",
+                    candidate_commit="HEAD",
+                    resolved_finding_ids=["prepared-resume"],
+                ),
+            ]
+            runner = AutoAgentsSelfRepairRunner(
+                orchestrator,
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True, category="progress-search"),
+            )
+            seen_parents = []
+
+            def next_candidate(**_kwargs):
+                seen_parents.append(runner._experiment.best_search_candidate_id)
+                return outcomes.pop(0)
+
+            with (
+                patch(
+                    "auto_agents.self_repair.auto_agents_repo_root",
+                    return_value=auto_root,
+                ),
+                patch.object(runner, "_run_candidate", side_effect=next_candidate),
+                patch.object(runner, "_record_candidate_result"),
+            ):
+                runner.repo_root = auto_root
+                result = runner.run()
+
+            self.assertTrue(result.ok)
+            self.assertEqual(seen_parents, ["base", "c1", "c2"])
+            self.assertEqual(runner._experiment.consecutive_non_improvements, 0)
+            self.assertEqual(runner._experiment.status, "approved")
 
     def test_full_suite_timeout_retries_candidate_with_remaining_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1311,8 +1440,10 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                         (),
                         {
                             "mode": "max",
-                            "max_candidates_per_root": 2,
-                            "total_timeout_seconds": 300,
+                            "max_consecutive_non_improving_candidates": 3,
+                            "max_frontier_candidates": 8,
+                            "candidate_timeout_seconds": 300,
+                            "candidate_review_timeout_seconds": 60,
                             "replay_timeout_seconds": 60,
                             "allow_isolated_dirty_checkout": True,
                         },

@@ -226,9 +226,9 @@ def run_subprocess_with_optional_streaming(
                 termination_reason = request.termination_probe() or ""
             if not termination_reason and supervisor is not None:
                 termination_reason = supervisor.poll() or ""
-            elif not termination_reason and stalled.is_set():
+            if not termination_reason and stalled.is_set():
                 termination_reason = "provider_idle"
-            elif (
+            if (
                 not termination_reason
                 and timeout
                 and time.monotonic() - started_at >= timeout

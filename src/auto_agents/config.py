@@ -387,8 +387,10 @@ DEFAULT_CONFIG = {
         },
         "autonomy": {
             "mode": "max",
-            "max_candidates_per_root": 3,
-            "total_timeout_seconds": 3600,
+            "max_consecutive_non_improving_candidates": 3,
+            "max_frontier_candidates": 8,
+            "candidate_timeout_seconds": 3600,
+            "candidate_review_timeout_seconds": 600,
             "replay_timeout_seconds": 1200,
             "continue_independent_tasks": True,
             "allow_isolated_dirty_checkout": True,

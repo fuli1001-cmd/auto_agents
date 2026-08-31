@@ -11,9 +11,9 @@ import sys
 import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .git_ops import (
     add_worktree,
@@ -46,6 +46,13 @@ from .requirements import (
     forbidden_pattern_definition_reason,
 )
 from .repair_cases import RepairCase, RepairCaseStore, terminal_repair_case
+from .self_repair_search import (
+    SelfRepairCandidateRecord,
+    SelfRepairExperiment,
+    SelfRepairExperimentStore,
+    SelfRepairFinding,
+    _stable_hash as _search_stable_hash,
+)
 
 
 SELF_REPAIR_LAST_FINGERPRINT_ENV = "AUTO_AGENTS_SELF_REPAIR_LAST_FINGERPRINT"
@@ -141,6 +148,25 @@ class SelfRepairResult:
     validation_rank: int = 0
     recoverable_validation: bool = False
     attempt: int = 0
+    parent_candidate_id: str = "base"
+    patch_fingerprint: str = ""
+    strategy_fingerprint: str = ""
+    passed_obligations: list[str] = field(default_factory=list)
+    failed_obligations: list[str] = field(default_factory=list)
+    finding_ids: list[str] = field(default_factory=list)
+    resolved_finding_ids: list[str] = field(default_factory=list)
+    review_findings: list[dict[str, object]] = field(default_factory=list)
+    fatal_candidate: bool = False
+    infrastructure_failure: bool = False
+    diff_line_count: int = 0
+    progress_kind: str = ""
+
+    def __post_init__(self) -> None:
+        self.passed_obligations = list(self.passed_obligations or [])
+        self.failed_obligations = list(self.failed_obligations or [])
+        self.finding_ids = list(self.finding_ids or [])
+        self.resolved_finding_ids = list(self.resolved_finding_ids or [])
+        self.review_findings = [dict(item) for item in self.review_findings or []]
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -1010,9 +1036,16 @@ def adjudicate_repair_case(
         str(error or ""),
         values,
         fingerprint_category="provider_judged_auto_agents",
-        # One triage launches the complete bounded multi-candidate experiment.
-        # A live recurrence of the same root must not multiply that budget.
-        max_attempts=1,
+        # The durable experiment owns semantic patience. Re-entering the same
+        # root resumes that experiment instead of allocating a fresh candidate
+        # budget, so the legacy process-environment repetition cap must not stop
+        # a resumable search.
+        max_attempts=(
+            2**31 - 1
+            if state is not None
+            and bool(state.active_self_repair_experiment_id)
+            else 1
+        ),
     )
     return SelfRepairTriageResult(
         decision=decision,
@@ -1371,6 +1404,7 @@ def self_repair_verify_commands(env: Optional[dict[str, str]] = None) -> list[st
     if configured:
         return [configured]
     return [
+        "python -m pytest -q tests/test_self_repair_search.py",
         "python -m pytest -q tests/test_health_watch.py",
         "python -m pytest -q tests/test_root_cause.py",
         "python -m pytest -q tests/test_project_validation.py -k "
@@ -1574,8 +1608,10 @@ class AutoAgentsSelfRepairRunner:
             (),
             {
                 "mode": "max",
-                "max_candidates_per_root": 3,
-                "total_timeout_seconds": 3600,
+                "max_consecutive_non_improving_candidates": 3,
+                "max_frontier_candidates": 8,
+                "candidate_timeout_seconds": 3600,
+                "candidate_review_timeout_seconds": 600,
                 "replay_timeout_seconds": 1200,
                 "allow_isolated_dirty_checkout": True,
                 "require_remote_publish": False,
@@ -1620,6 +1656,157 @@ class AutoAgentsSelfRepairRunner:
             ).strip("-")
             or "repair"
         )
+
+    def _load_or_create_experiment(
+        self,
+    ) -> tuple[SelfRepairExperimentStore, SelfRepairExperiment]:
+        from .config import load_run_state, save_run_state
+
+        state = load_run_state(self.target_project_root)
+        root_fingerprint = (
+            self.decision.fingerprint
+            or self.decision.category
+            or _search_stable_hash(str(self.error))
+        )
+        store = SelfRepairExperimentStore(
+            self.target_project_root,
+            state.run_id,
+            root_fingerprint,
+        )
+        experiment = store.load()
+        autonomy = self._autonomy_config()
+        evidence_payload: object = {}
+        if self.diagnosis is not None and hasattr(self.diagnosis, "to_dict"):
+            evidence_payload = self.diagnosis.to_dict()
+        elif self.repair_case is not None:
+            evidence_payload = self.repair_case.to_dict()
+        evidence_fingerprint = _search_stable_hash(evidence_payload)
+        if experiment is None:
+            expected_postconditions: list[str] = []
+            if self.diagnosis is not None:
+                expected_postconditions = list(
+                    getattr(self.diagnosis.final, "expected_postconditions", [])
+                    or []
+                )
+            if self.repair_case is not None:
+                expected_postconditions.extend(
+                    str(item)
+                    for item in self.repair_case.expected_postconditions
+                    if str(item).strip()
+                )
+            experiment = SelfRepairExperiment.create(
+                run_id=state.run_id,
+                root_fingerprint=root_fingerprint,
+                category=self.decision.category,
+                base_commit=head_ref(self.repo_root),
+                evidence_fingerprint=evidence_fingerprint,
+                expected_postconditions=expected_postconditions,
+                max_consecutive_non_improvements=int(
+                    getattr(
+                        autonomy,
+                        "max_consecutive_non_improving_candidates",
+                        3,
+                    )
+                    or 3
+                ),
+                max_frontier_candidates=int(
+                    getattr(autonomy, "max_frontier_candidates", 8) or 8
+                ),
+            )
+            store.save(experiment)
+        elif experiment.status == "needs_human" and (
+            evidence_fingerprint != experiment.evidence_fingerprint
+            or head_ref(self.repo_root) != experiment.base_commit
+        ):
+            experiment.status = "active"
+            experiment.consecutive_non_improvements = 0
+            experiment.evidence_fingerprint = evidence_fingerprint
+            experiment.health_history.append(
+                {
+                    "anomaly": "operator_or_external_evidence_changed",
+                    "at": utc_now_iso(),
+                }
+            )
+            store.save(experiment)
+        state.active_self_repair_experiment_id = experiment.experiment_id
+        save_run_state(self.target_project_root, state)
+        self._experiment_store = store
+        self._experiment = experiment
+        return store, experiment
+
+    @staticmethod
+    def _milestone_obligations(result: SelfRepairResult) -> tuple[list[str], list[str]]:
+        passed: list[str] = []
+        failed: list[str] = []
+        if result.validation_rank >= 40:
+            passed.extend(
+                (
+                    "safety:tests_not_weakened",
+                    "safety:scope_guard",
+                )
+            )
+        if result.validation_rank >= 50:
+            passed.append("validation:adversarial_review")
+        elif result.status == "candidate_review_rejected":
+            failed.append("validation:adversarial_review")
+        if result.validation_rank >= 70:
+            passed.append("validation:focused")
+        elif result.status == "candidate_verification_failed":
+            failed.append("validation:focused")
+        if result.validation_rank >= 80:
+            passed.append("validation:boundary_replay")
+        elif result.status == "candidate_replay_failed":
+            failed.append("validation:boundary_replay")
+        if result.validation_rank >= 100:
+            passed.append("validation:full_suite")
+        elif result.status in {
+            "candidate_full_suite_failed",
+            "candidate_full_suite_inconclusive",
+        }:
+            failed.append("validation:full_suite")
+        passed.extend(result.passed_obligations)
+        failed.extend(result.failed_obligations)
+        return sorted(set(passed)), sorted(set(failed))
+
+    def _register_search_result(
+        self,
+        result: SelfRepairResult,
+    ) -> str:
+        experiment = self._experiment
+        findings = [
+            SelfRepairFinding.from_dict(item)
+            for item in result.review_findings
+            if isinstance(item, Mapping)
+        ]
+        passed, failed = self._milestone_obligations(result)
+        result.passed_obligations = passed
+        result.failed_obligations = failed
+        record = SelfRepairCandidateRecord(
+            candidate_id=result.candidate_id or f"attempt-{result.attempt}",
+            parent_candidate_id=result.parent_candidate_id,
+            parent_ref=result.base_commit,
+            candidate_ref=result.candidate_ref,
+            candidate_commit=result.candidate_commit,
+            patch_fingerprint=result.patch_fingerprint,
+            strategy_fingerprint=result.strategy_fingerprint,
+            status=result.status,
+            validation_stage=result.validation_stage,
+            validation_rank=result.validation_rank,
+            passed_obligations=passed,
+            failed_obligations=failed,
+            finding_ids=result.finding_ids,
+            resolved_finding_ids=result.resolved_finding_ids,
+            fatal=result.fatal_candidate,
+            infrastructure_failure=result.infrastructure_failure,
+            diff_line_count=result.diff_line_count,
+            summary=result.summary,
+            verification=result.verification,
+        )
+        progress_kind = experiment.register_candidate(record, findings=findings)
+        result.progress_kind = progress_kind
+        self._experiment_store.save(experiment)
+        self._record_candidate_result(result, attempt=result.attempt)
+        return progress_kind
 
     def _latest_pending_validation_ref(self, base_head: str) -> str:
         prefix = (
@@ -1711,6 +1898,40 @@ class AutoAgentsSelfRepairRunner:
             promotion_status="awaiting_live_boundary",
             publish_status="deferred",
         )
+
+    def _squash_candidate_commit(
+        self,
+        candidate_root: Path,
+        base_commit: str,
+        message: str,
+    ) -> str:
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=str(candidate_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if tree.returncode != 0 or not tree.stdout.strip():
+            raise RuntimeError(tree.stderr.strip() or "candidate tree is unavailable")
+        commit = subprocess.run(
+            [
+                "git",
+                "commit-tree",
+                tree.stdout.strip(),
+                "-p",
+                base_commit,
+                "-m",
+                message,
+            ],
+            cwd=str(candidate_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if commit.returncode != 0 or not commit.stdout.strip():
+            raise RuntimeError(commit.stderr.strip() or "candidate squash failed")
+        return commit.stdout.strip()
 
     def _resume_pending_validation_candidate(
         self,
@@ -1891,53 +2112,87 @@ class AutoAgentsSelfRepairRunner:
                 category=self.decision.category,
                 reason="autonomous self-repair is disabled",
             )
-        max_candidates = max(
-            1, int(getattr(autonomy, "max_candidates_per_root", 3) or 3)
-        )
-        deadline = time.monotonic() + max(
-            60, int(getattr(autonomy, "total_timeout_seconds", 3600) or 3600)
-        )
-        experiment_id = uuid.uuid4().hex[:12]
-        prior_failures: list[str] = []
-        seen_fingerprints: set[str] = set()
-        best_result: Optional[SelfRepairResult] = None
-        outcomes: list[SelfRepairResult] = []
-        try:
-            pending = self._resume_pending_validation_candidate(
-                experiment_id=experiment_id,
-                deadline=deadline,
-            )
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            pending = SelfRepairResult(
+        store, experiment = self._load_or_create_experiment()
+        if experiment.status == "needs_human":
+            return SelfRepairResult(
                 ok=False,
-                status="candidate_exception",
+                status="patience_exhausted",
                 category=self.decision.category,
-                reason=f"pending candidate validation failed: {error}",
-                experiment_id=experiment_id,
-                candidate_id="pending-validation-exception",
-                base_commit=head_ref(self.repo_root),
+                reason=(
+                    "self-repair experiment already exhausted consecutive "
+                    "non-improving candidates and requires new operator evidence"
+                ),
+                experiment_id=experiment.experiment_id,
+                candidate_id=experiment.best_search_candidate_id,
+                candidate_ref=experiment.best_search_ref,
+                base_commit=experiment.base_commit,
             )
-        if pending is not None:
-            self._decorate_candidate_result(pending, attempt=0)
-            outcomes.append(pending)
-            best_result = pending
-            self._record_candidate_result(pending, attempt=0)
-            if pending.ok:
-                return pending
-            prior_failures.append(
-                "pending-validation candidate: "
-                f"{pending.reason}; verification={pending.verification[-1200:]}"
+        experiment_id = experiment.experiment_id
+        seen_fingerprints = {
+            item.patch_fingerprint
+            for item in experiment.candidates.values()
+            if item.patch_fingerprint
+        }
+        outcomes: list[SelfRepairResult] = []
+        while not experiment.patience_exhausted:
+            live_head = head_ref(self.repo_root)
+            if live_head and live_head != experiment.base_commit:
+                previous_base = experiment.base_commit
+                experiment.base_commit = live_head
+                experiment.best_safe_candidate_id = "base"
+                experiment.best_safe_ref = live_head
+                experiment.best_search_candidate_id = "base"
+                experiment.best_search_ref = live_head
+                experiment.frontier = []
+                for historical_id, historical in experiment.candidates.items():
+                    if historical_id != "base":
+                        historical.fatal = True
+                experiment.candidates["base"] = SelfRepairCandidateRecord(
+                    candidate_id="base",
+                    candidate_ref=live_head,
+                    candidate_commit=live_head,
+                    parent_ref=previous_base,
+                    status="base_refresh",
+                    validation_stage="base",
+                    passed_obligations=[
+                        "safety:target_untouched",
+                        "safety:tests_not_weakened",
+                        "safety:scope_guard",
+                    ],
+                )
+                experiment.health_history.append(
+                    {
+                        "anomaly": "base_revision_changed",
+                        "from": previous_base,
+                        "to": live_head,
+                        "at": utc_now_iso(),
+                    }
+                )
+                store.save(experiment)
+            attempt = experiment.attempt_count + 1
+            prior_failures = [
+                f"candidate {index}: {record.status}; "
+                f"reason={record.summary[-600:]}; "
+                f"verification={record.verification[-1200:]}"
+                for index, record in enumerate(
+                    (
+                        item
+                        for candidate_id, item in experiment.candidates.items()
+                        if candidate_id != "base"
+                    ),
+                    start=1,
+                )
+            ]
+            store.record_health(
+                experiment,
+                status="self_repairing",
+                detail=f"starting candidate attempt {attempt}",
             )
-            if pending.recoverable_validation:
-                max_candidates = 0
-        for attempt in range(1, max_candidates + 1):
-            if time.monotonic() >= deadline:
-                break
             try:
                 candidate = self._run_candidate(
                     experiment_id=experiment_id,
                     attempt=attempt,
-                    deadline=deadline,
+                    deadline=None,
                     prior_failures=prior_failures,
                     seen_fingerprints=seen_fingerprints,
                 )
@@ -1949,63 +2204,115 @@ class AutoAgentsSelfRepairRunner:
                     reason=str(error),
                     experiment_id=experiment_id,
                     candidate_id=f"c{attempt}-exception",
-                    base_commit=head_ref(self.repo_root),
+                    base_commit=experiment.best_search_ref,
+                    parent_candidate_id=experiment.best_search_candidate_id,
+                    infrastructure_failure=self._is_infrastructure_candidate_error(error),
                 )
+            candidate.parent_candidate_id = experiment.best_search_candidate_id
+            if not candidate.base_commit:
+                candidate.base_commit = experiment.best_search_ref
             self._decorate_candidate_result(candidate, attempt=attempt)
             outcomes.append(candidate)
-            if (
-                best_result is None
-                or candidate.validation_rank > best_result.validation_rank
-            ):
-                best_result = candidate
-            self._record_candidate_result(candidate, attempt=attempt)
-            if candidate.ok:
-                return candidate
-            prior_failures.append(
-                f"candidate {attempt}: {candidate.reason}; "
-                f"verification={candidate.verification[-1200:]}"
-            )
-            if candidate.recoverable_validation:
-                break
-        if best_result is not None:
-            outcome_summary = [
-                "SELF_REPAIR_CANDIDATE_OUTCOMES:",
-                *(
-                    f"- attempt={item.attempt} candidate={item.candidate_id or 'unknown'} "
-                    f"stage={item.validation_stage or 'unknown'} rank={item.validation_rank} "
-                    f"status={item.status} recoverable={str(item.recoverable_validation).lower()} "
-                    f"reason={item.reason}"
-                    for item in outcomes
+            self._register_search_result(candidate)
+            health = store.record_health(
+                experiment,
+                status=(
+                    "approved"
+                    if candidate.ok
+                    else "evaluating_search_progress"
                 ),
-            ]
-            original_reason = best_result.reason
-            best_result.reason = (
-                "autonomous self-repair did not produce a fully approved candidate; "
-                f"best_candidate={best_result.candidate_id or 'unknown'} "
-                f"validation_stage={best_result.validation_stage or 'unknown'} "
-                f"validation_rank={best_result.validation_rank}; {original_reason}"
+                detail=(
+                    f"candidate={candidate.candidate_id} "
+                    f"progress={candidate.progress_kind} status={candidate.status}"
+                ),
             )
-            best_result.summary = "\n".join(
-                part
-                for part in (
-                    best_result.summary,
-                    *outcome_summary,
-                    *prior_failures,
+            if health.get("anomaly") == "strategy_oscillation":
+                alternate_ids = [
+                    candidate_id
+                    for candidate_id in experiment.frontier
+                    if candidate_id != experiment.best_search_candidate_id
+                ]
+                if alternate_ids:
+                    alternate = experiment.candidates[alternate_ids[0]]
+                    experiment.best_search_candidate_id = alternate.candidate_id
+                    experiment.best_search_ref = alternate.candidate_ref
+                    store.save(experiment)
+            if candidate.ok:
+                experiment.status = "approved"
+                experiment.current_candidate_id = ""
+                store.save(experiment)
+                return candidate
+            if candidate.infrastructure_failure:
+                candidate.status = "infrastructure_blocked"
+                candidate.reason = (
+                    "self-repair search was interrupted by provider or infrastructure "
+                    f"failure; experiment {experiment.experiment_id} remains resumable"
                 )
-                if part
-            )
-            self._retain_best_failed_candidate(best_result)
-            self._record_candidate_result(
-                best_result,
-                attempt=max(1, best_result.attempt),
-            )
-            return best_result
-        return SelfRepairResult(
+                stored_candidate = experiment.candidates.get(candidate.candidate_id)
+                if stored_candidate is not None:
+                    stored_candidate.status = candidate.status
+                    stored_candidate.summary = candidate.reason
+                store.save(experiment)
+                self._record_candidate_result(candidate, attempt=candidate.attempt)
+                return candidate
+            if candidate.recoverable_validation:
+                candidate.infrastructure_failure = True
+                store.save(experiment)
+                return candidate
+        experiment.status = "needs_human"
+        store.save(experiment)
+        store.record_health(
+            experiment,
+            status="needs_human",
+            detail="consecutive non-improving candidate patience exhausted",
+        )
+        best = experiment.candidates.get(experiment.best_search_candidate_id)
+        outcome_summary = [
+            "SELF_REPAIR_CANDIDATE_OUTCOMES:",
+            *(
+                f"- attempt={item.attempt} candidate={item.candidate_id or 'unknown'} "
+                f"stage={item.validation_stage or 'unknown'} rank={item.validation_rank} "
+                f"progress={item.progress_kind or 'none'} status={item.status} "
+                f"reason={item.reason}"
+                for item in outcomes
+            ),
+        ]
+        result = SelfRepairResult(
             ok=False,
-            status="budget_exhausted",
+            status="patience_exhausted",
             category=self.decision.category,
-            reason="autonomous self-repair exhausted its candidate/time budget",
+            reason=(
+                "autonomous self-repair stopped after "
+                f"{experiment.consecutive_non_improvements} consecutive "
+                "non-improving candidates; operator evidence is required"
+            ),
             experiment_id=experiment_id,
+            candidate_id=experiment.best_search_candidate_id,
+            candidate_ref=experiment.best_search_ref,
+            candidate_commit=(best.candidate_commit if best is not None else ""),
+            base_commit=experiment.base_commit,
+            validation_stage=(best.validation_stage if best is not None else "generation"),
+            validation_rank=(best.validation_rank if best is not None else 0),
+            summary="\n".join(outcome_summary),
+        )
+        self._record_candidate_result(result, attempt=experiment.attempt_count)
+        return result
+
+    @staticmethod
+    def _is_infrastructure_candidate_error(error: object) -> bool:
+        text = str(error).lower()
+        return any(
+            token in text
+            for token in (
+                "timeout",
+                "timed out",
+                "provider",
+                "connection",
+                "quota",
+                "rate limit",
+                "stalled",
+                "unavailable",
+            )
         )
 
     @staticmethod
@@ -2041,7 +2348,7 @@ class AutoAgentsSelfRepairRunner:
         *,
         experiment_id: str,
         attempt: int,
-        deadline: float,
+        deadline: Optional[float],
         prior_failures: list[str],
         seen_fingerprints: set[str],
     ) -> SelfRepairResult:
@@ -2055,7 +2362,12 @@ class AutoAgentsSelfRepairRunner:
                 reason="auto_agents checkout is dirty and isolated repair is disabled",
                 experiment_id=experiment_id,
             )
-        base_head = head_ref(self.repo_root)
+        experiment = getattr(self, "_experiment", None)
+        base_head = (
+            str(experiment.best_search_ref).strip()
+            if isinstance(experiment, SelfRepairExperiment)
+            else ""
+        ) or head_ref(self.repo_root)
         self._candidate_base_ref = base_head
         target_before = repository_guard_fingerprint(
             self.target_project_root,
@@ -2063,6 +2375,10 @@ class AutoAgentsSelfRepairRunner:
         )
         target_head_before = head_ref(self.target_project_root)
         candidate_id = f"c{attempt}-{uuid.uuid4().hex[:8]}"
+        self._candidate_id = candidate_id
+        if isinstance(experiment, SelfRepairExperiment):
+            experiment.current_candidate_id = candidate_id
+            self._experiment_store.save(experiment)
         with tempfile.TemporaryDirectory(
             prefix="auto-agents-self-repair-worktree-"
         ) as tmp:
@@ -2081,14 +2397,30 @@ class AutoAgentsSelfRepairRunner:
                 prompt = self._build_prompt(repair_root, target_snapshot)
                 prompt_path, output_path = self._artifact_paths()
                 write_text(prompt_path, prompt)
-                remaining = max(60, int(deadline - time.monotonic()))
+                candidate_timeout = max(
+                    60,
+                    int(
+                        getattr(
+                            autonomy,
+                            "candidate_timeout_seconds",
+                            3600,
+                        )
+                        or 3600
+                    ),
+                )
                 request = AgentRequest(
                     stage="self_repair",
                     effort=self._effort(),
                     prompt=prompt,
                     cwd=repair_root,
                     output_path=output_path,
-                    timeout_seconds=remaining,
+                    timeout_seconds=candidate_timeout,
+                    progress_report_path=(
+                        self._experiment_store.candidate_root(candidate_id)
+                        / "provider-progress.json"
+                        if hasattr(self, "_experiment_store")
+                        else None
+                    ),
                     attempt_id=f"self-repair-{candidate_id}",
                     stream_output=(
                         self.target_orchestrator._stream_agent_output_callback(
@@ -2111,15 +2443,41 @@ class AutoAgentsSelfRepairRunner:
                         result,
                     )
                 if not result.ok:
+                    detail = self._agent_failure_detail(result)
+                    partial_paths = changed_paths(repair_root)
+                    partial_fingerprint = ""
+                    if partial_paths:
+                        partial_fingerprint = worktree_fingerprint(
+                            repair_root,
+                            ignored_prefixes=(),
+                        )
+                        partial_diff = subprocess.run(
+                            ["git", "diff", "--binary", base_head, "--"],
+                            cwd=str(repair_root),
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            capture_output=True,
+                        ).stdout
+                        if hasattr(self, "_experiment_store"):
+                            write_text(
+                                self._experiment_store.candidate_root(candidate_id)
+                                / "partial-candidate.diff",
+                                partial_diff,
+                            )
                     return SelfRepairResult(
                         ok=False,
                         status="candidate_failed",
                         category=self.decision.category,
-                        reason=self._agent_failure_detail(result),
+                        reason=detail,
                         summary=result.summary or result.stdout,
                         experiment_id=experiment_id,
                         candidate_id=candidate_id,
                         base_commit=base_head,
+                        patch_fingerprint=partial_fingerprint,
+                        infrastructure_failure=self._is_infrastructure_candidate_error(
+                            detail
+                        ),
                     )
                 summary = (result.summary or result.stdout).strip()
                 changed = changed_paths(repair_root)
@@ -2137,6 +2495,35 @@ class AutoAgentsSelfRepairRunner:
                 fingerprint = worktree_fingerprint(
                     repair_root, ignored_prefixes=()
                 )
+                diff_snapshot = subprocess.run(
+                    ["git", "diff", "--binary", base_head, "--"],
+                    cwd=str(repair_root),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                ).stdout
+                if hasattr(self, "_experiment_store"):
+                    write_text(
+                        self._experiment_store.candidate_root(candidate_id)
+                        / "candidate.diff",
+                        diff_snapshot,
+                    )
+                diff_process = subprocess.run(
+                    ["git", "diff", "--numstat", base_head, "--"],
+                    cwd=str(repair_root),
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                )
+                diff_line_count = 0
+                for line in diff_process.stdout.splitlines():
+                    added, _, remainder = line.partition("\t")
+                    removed, _, _path = remainder.partition("\t")
+                    try:
+                        diff_line_count += int(added) + int(removed)
+                    except ValueError:
+                        diff_line_count += 1
                 if fingerprint in seen_fingerprints:
                     return SelfRepairResult(
                         ok=False,
@@ -2147,6 +2534,8 @@ class AutoAgentsSelfRepairRunner:
                         experiment_id=experiment_id,
                         candidate_id=candidate_id,
                         base_commit=base_head,
+                        patch_fingerprint=fingerprint,
+                        diff_line_count=diff_line_count,
                     )
                 seen_fingerprints.add(fingerprint)
                 weakening = self._candidate_test_weakening_reason(
@@ -2163,23 +2552,9 @@ class AutoAgentsSelfRepairRunner:
                         experiment_id=experiment_id,
                         candidate_id=candidate_id,
                         base_commit=base_head,
-                    )
-                review = self._review_candidate(
-                    repair_root,
-                    base_head,
-                    remaining_seconds=max(60, int(deadline - time.monotonic())),
-                )
-                if not review.ok:
-                    return SelfRepairResult(
-                        ok=False,
-                        status="candidate_review_rejected",
-                        category=self.decision.category,
-                        reason="adversarial candidate review rejected the repair",
-                        summary=summary,
-                        verification=review.summary,
-                        experiment_id=experiment_id,
-                        candidate_id=candidate_id,
-                        base_commit=base_head,
+                        patch_fingerprint=fingerprint,
+                        fatal_candidate=True,
+                        diff_line_count=diff_line_count,
                     )
                 target_guard_changed = repository_guard_fingerprint(
                     self.target_project_root,
@@ -2202,6 +2577,133 @@ class AutoAgentsSelfRepairRunner:
                         experiment_id=experiment_id,
                         candidate_id=candidate_id,
                         base_commit=base_head,
+                        patch_fingerprint=fingerprint,
+                        fatal_candidate=True,
+                        diff_line_count=diff_line_count,
+                    )
+                candidate_commit = commit_all(
+                    repair_root,
+                    self._commit_message(summary),
+                )
+                candidate_ref = (
+                    "refs/auto-agents/self-repair/candidates/"
+                    f"{self._safe_repair_category()}/{experiment_id}/{candidate_id}"
+                )
+                update_ref(self.repo_root, candidate_ref, candidate_commit)
+                strategy_fingerprint = _search_stable_hash(
+                    sorted(changed),
+                    summary[-2000:],
+                )
+                replay = self._replay_candidate(
+                    repair_root,
+                    candidate_commit,
+                    candidate_id,
+                )
+                differential = self._diagnosis_differential(
+                    self._experiment.base_commit,
+                    repair_root,
+                )
+                boundary_passed_obligations = [
+                    "safety:target_untouched",
+                    *[
+                        obligation_id
+                        for obligation_id, ok in (
+                            ("validation:boundary_replay", replay.ok),
+                            (
+                                "validation:diagnosis_differential",
+                                differential.ok,
+                            ),
+                        )
+                        if ok
+                    ],
+                ]
+                boundary_failed_obligations = [
+                    obligation_id
+                    for obligation_id, ok in (
+                        ("validation:boundary_replay", replay.ok),
+                        ("validation:diagnosis_differential", differential.ok),
+                    )
+                    if not ok
+                ]
+                review_timeout = max(
+                    60,
+                    int(
+                        getattr(
+                            autonomy,
+                            "candidate_review_timeout_seconds",
+                            600,
+                        )
+                        or 600
+                    ),
+                )
+                review = self._review_candidate(
+                    repair_root,
+                    self._experiment.base_commit,
+                    remaining_seconds=review_timeout,
+                    replay_summary="\n\n".join(
+                        (replay.summary, differential.summary)
+                    ),
+                )
+                review_findings = [
+                    dict(item)
+                    for item in review.payload.get("findings", [])
+                    if isinstance(item, Mapping)
+                ]
+                finding_ids = [
+                    str(item.get("finding_id", ""))
+                    for item in review_findings
+                    if str(item.get("finding_id", "")).strip()
+                ]
+                resolved_finding_ids = [
+                    str(item)
+                    for item in review.payload.get("resolved_finding_ids", []) or []
+                    if str(item).strip()
+                ]
+                unresolved_prior_findings = sorted(
+                    finding_id
+                    for finding_id, finding in self._experiment.findings.items()
+                    if finding.status in {"confirmed", "reopened"}
+                    and finding_id not in resolved_finding_ids
+                )
+                if review.ok and unresolved_prior_findings:
+                    review = _VerificationResult(
+                        False,
+                        (
+                            "candidate review=REJECT reason=approved response did not "
+                            "prove all prior findings resolved: "
+                            + ", ".join(unresolved_prior_findings)
+                        ),
+                        payload=review.payload,
+                    )
+                if not review.ok:
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_review_rejected",
+                        category=self.decision.category,
+                        reason="adversarial candidate review rejected the repair",
+                        summary=summary,
+                        verification="\n\n".join(
+                            part
+                            for part in (
+                                replay.summary,
+                                differential.summary,
+                                review.summary,
+                            )
+                            if part
+                        ),
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                        candidate_commit=candidate_commit,
+                        candidate_ref=candidate_ref,
+                        patch_fingerprint=fingerprint,
+                        strategy_fingerprint=strategy_fingerprint,
+                        finding_ids=finding_ids,
+                        resolved_finding_ids=resolved_finding_ids,
+                        review_findings=review_findings,
+                        diff_line_count=diff_line_count,
+                        passed_obligations=boundary_passed_obligations,
+                        failed_obligations=boundary_failed_obligations,
                     )
                 verification = self._run_verification(repair_root)
                 if not verification.ok:
@@ -2240,17 +2742,17 @@ class AutoAgentsSelfRepairRunner:
                         experiment_id=experiment_id,
                         candidate_id=candidate_id,
                         base_commit=base_head,
+                        candidate_commit=candidate_commit,
+                        candidate_ref=candidate_ref,
+                        patch_fingerprint=fingerprint,
+                        strategy_fingerprint=strategy_fingerprint,
+                        finding_ids=finding_ids,
+                        resolved_finding_ids=resolved_finding_ids,
+                        review_findings=review_findings,
+                        diff_line_count=diff_line_count,
+                        passed_obligations=boundary_passed_obligations,
+                        failed_obligations=boundary_failed_obligations,
                     )
-                candidate_commit = commit_all(
-                    repair_root,
-                    self._commit_message(summary),
-                )
-                replay = self._replay_candidate(
-                    repair_root,
-                    candidate_commit,
-                    candidate_id,
-                )
-                differential = self._diagnosis_differential(base_head, repair_root)
                 legacy_direct_attempt = self.diagnosis is None and self.decision.eligible
                 health_case = bool(
                     self.repair_case is not None
@@ -2281,24 +2783,22 @@ class AutoAgentsSelfRepairRunner:
                         candidate_id=candidate_id,
                         base_commit=base_head,
                         candidate_commit=candidate_commit,
+                        candidate_ref=candidate_ref,
+                        patch_fingerprint=fingerprint,
+                        strategy_fingerprint=strategy_fingerprint,
+                        finding_ids=finding_ids,
+                        resolved_finding_ids=resolved_finding_ids,
+                        review_findings=review_findings,
+                        diff_line_count=diff_line_count,
+                        passed_obligations=boundary_passed_obligations,
+                        failed_obligations=boundary_failed_obligations,
                     )
                 full_suite = self._full_suite_differential(
-                    base_head,
+                    self._experiment.base_commit,
                     repair_root,
-                    deadline=deadline,
+                    deadline=None,
                 )
                 if not full_suite.ok:
-                    safe_category = self._safe_repair_category()
-                    candidate_ref = (
-                        "refs/auto-agents/self-repair/"
-                        + (
-                            "pending-validation"
-                            if full_suite.recoverable
-                            else "rejected"
-                        )
-                        + f"/{safe_category}/{candidate_id}"
-                    )
-                    update_ref(self.repo_root, candidate_ref, candidate_commit)
                     return SelfRepairResult(
                         ok=False,
                         status=(
@@ -2330,12 +2830,26 @@ class AutoAgentsSelfRepairRunner:
                         candidate_commit=candidate_commit,
                         candidate_ref=candidate_ref,
                         recoverable_validation=full_suite.recoverable,
+                        infrastructure_failure=full_suite.recoverable,
+                        patch_fingerprint=fingerprint,
+                        strategy_fingerprint=strategy_fingerprint,
+                        finding_ids=finding_ids,
+                        resolved_finding_ids=resolved_finding_ids,
+                        review_findings=review_findings,
+                        diff_line_count=diff_line_count,
+                        passed_obligations=boundary_passed_obligations,
+                        failed_obligations=boundary_failed_obligations,
                     )
-                return self._approved_candidate_result(
+                approved_commit = self._squash_candidate_commit(
+                    repair_root,
+                    self._experiment.base_commit,
+                    self._commit_message(summary),
+                )
+                approved = self._approved_candidate_result(
                     experiment_id=experiment_id,
                     candidate_id=candidate_id,
-                    base_head=base_head,
-                    candidate_commit=candidate_commit,
+                    base_head=self._experiment.base_commit,
+                    candidate_commit=approved_commit,
                     summary=summary,
                     verification="\n\n".join(
                         part
@@ -2348,6 +2862,15 @@ class AutoAgentsSelfRepairRunner:
                         if part
                     ),
                 )
+                approved.patch_fingerprint = fingerprint
+                approved.strategy_fingerprint = strategy_fingerprint
+                approved.finding_ids = finding_ids
+                approved.resolved_finding_ids = resolved_finding_ids
+                approved.review_findings = review_findings
+                approved.diff_line_count = diff_line_count
+                approved.passed_obligations = list(self._experiment.obligations)
+                delete_ref(self.repo_root, candidate_ref)
+                return approved
             finally:
                 if created:
                     try:
@@ -2395,6 +2918,7 @@ class AutoAgentsSelfRepairRunner:
         base_head: str,
         *,
         remaining_seconds: int,
+        replay_summary: str = "",
     ) -> "_VerificationResult":
         execution = getattr(
             getattr(self.target_orchestrator, "config", None),
@@ -2416,9 +2940,26 @@ class AutoAgentsSelfRepairRunner:
                 "Do not modify files or run mutating commands.",
                 "Reject test deletion, skip/xfail, weakened safety gates, hard-coded target data, "
                 "or changes that do not address the supplied root cause.",
-                "Return exactly JSON: {\"decision\":\"APPROVE|REJECT\",\"reason\":\"...\"}.",
+                "Return exactly JSON with decision, reason, findings, and resolved_finding_ids. "
+                "Each finding must contain finding_id, severity=fatal|hard|repairable, "
+                "obligation_id, reason, counterexample, required_test, and evidence. "
+                "Use stable semantic finding IDs and list prior finding IDs proven resolved.",
+                "Schema: {\"decision\":\"APPROVE|REJECT\",\"reason\":\"...\","
+                "\"findings\":[{\"finding_id\":\"...\",\"severity\":\"hard\","
+                "\"obligation_id\":\"...\",\"reason\":\"...\","
+                "\"counterexample\":\"...\",\"required_test\":\"...\","
+                "\"evidence\":[\"...\"]}],\"resolved_finding_ids\":[\"...\"]}.",
                 "ROOT_CAUSE:",
                 json.dumps(self.diagnosis.to_dict(), ensure_ascii=False),
+                "SEARCH_CONTEXT:",
+                json.dumps(
+                    self._experiment.prompt_context()
+                    if hasattr(self, "_experiment")
+                    else {},
+                    ensure_ascii=False,
+                ),
+                "SEALED_REPLAY:",
+                replay_summary[-12_000:],
                 "CANDIDATE_DIFF:",
                 diff[:40_000],
             ]
@@ -2448,9 +2989,41 @@ class AutoAgentsSelfRepairRunner:
             return _VerificationResult(False, str(error))
         decision = str(payload.get("decision", "")).strip().upper()
         reason = str(payload.get("reason", "")).strip()
+        raw_findings = payload.get("findings", [])
+        findings = [
+            dict(item)
+            for item in raw_findings
+            if isinstance(raw_findings, list) and isinstance(item, Mapping)
+        ]
+        if decision == "REJECT" and reason and not findings:
+            finding_id = "review:" + _search_stable_hash(reason, length=16)
+            findings = [
+                {
+                    "finding_id": finding_id,
+                    "status": "confirmed",
+                    "severity": "repairable",
+                    "obligation_id": "validation:adversarial_review",
+                    "reason": reason,
+                    "counterexample": reason,
+                    "required_test": "add a focused regression for the reviewer counterexample",
+                    "evidence": ["adversarial_candidate_review"],
+                }
+            ]
+        raw_resolved = payload.get("resolved_finding_ids", [])
+        normalized_payload = {
+            **payload,
+            "findings": findings,
+            "resolved_finding_ids": [
+                str(item)
+                for item in raw_resolved
+                if isinstance(raw_resolved, list)
+                if str(item).strip()
+            ],
+        }
         return _VerificationResult(
-            decision == "APPROVE" and bool(reason),
+            decision == "APPROVE" and bool(reason) and not findings,
             f"candidate review={decision or 'INVALID'} reason={reason}",
+            payload=normalized_payload,
         )
 
     @staticmethod
@@ -2763,14 +3336,15 @@ class AutoAgentsSelfRepairRunner:
                 f"sys.path.insert(0, {str((candidate_root / 'src').resolve())!r}); "
                 "from auto_agents.config import load_run_state,save_run_state; "
                 "from auto_agents.orchestrator import Orchestrator; "
-                "root=Path(sys.argv[1]); state=load_run_state(root); "
-                "changed=Orchestrator(root)._resume_blocked_run(state); "
+                "root=Path(sys.argv[1]); orchestrator=Orchestrator(root); "
+                "state=orchestrator.mark_self_repair_applied(sys.argv[2]); "
+                "changed=orchestrator._resume_blocked_run(state); "
                 "save_run_state(root,state); "
                 "print(json.dumps({'changed':changed,'status':state.status,"
                 "'blocker':state.active_blocker},sort_keys=True))"
             )
             process = subprocess.run(
-                [sys.executable, "-c", runner, str(replay_root)],
+                [sys.executable, "-c", runner, str(replay_root), candidate_commit],
                 cwd=str(replay_root),
                 text=True,
                 encoding="utf-8",
@@ -3020,6 +3594,23 @@ class AutoAgentsSelfRepairRunner:
             save_run_state(self.target_project_root, state)
         except Exception:
             pass
+        if result.ok and hasattr(self, "_experiment_store"):
+            try:
+                self._experiment.status = "completed"
+                self._experiment_store.save(self._experiment)
+                self._experiment_store.compact_success(self._experiment)
+                for record in self._experiment.candidates.values():
+                    candidate_ref = str(record.candidate_ref).strip()
+                    if (
+                        candidate_ref
+                        and candidate_ref != result.candidate_ref
+                        and candidate_ref.startswith(
+                            "refs/auto-agents/self-repair/candidates/"
+                        )
+                    ):
+                        delete_ref(self.repo_root, candidate_ref)
+            except (OSError, RuntimeError):
+                pass
         return result
 
     def cleanup_runtime(self, result: SelfRepairResult) -> None:
@@ -3263,7 +3854,15 @@ class AutoAgentsSelfRepairRunner:
         return str(efforts.get("self_repair", "max")).strip() or "max"
 
     def _artifact_paths(self) -> tuple[Path, Path]:
-        root = Path(tempfile.gettempdir()) / "auto-agents-self-repair" / uuid.uuid4().hex[:12]
+        candidate_id = str(getattr(self, "_candidate_id", "")).strip()
+        if candidate_id and hasattr(self, "_experiment_store"):
+            root = self._experiment_store.candidate_root(candidate_id) / "provider"
+        else:
+            root = (
+                Path(tempfile.gettempdir())
+                / "auto-agents-self-repair"
+                / uuid.uuid4().hex[:12]
+            )
         prompt_path = root / "prompt.txt"
         output_path = root / "output.md"
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3350,6 +3949,17 @@ class AutoAgentsSelfRepairRunner:
             "Prior candidate failures:",
             json.dumps(
                 getattr(self, "_candidate_prior_failures", []),
+                indent=2,
+                ensure_ascii=False,
+            ),
+            "",
+            "Persistent self-repair search context:",
+            json.dumps(
+                (
+                    self._experiment.prompt_context()
+                    if hasattr(self, "_experiment")
+                    else {}
+                ),
                 indent=2,
                 ensure_ascii=False,
             ),
@@ -3548,6 +4158,7 @@ class _VerificationResult:
     returncodes: tuple[int, ...] = ()
     termination_reasons: tuple[str, ...] = ()
     recoverable: bool = False
+    payload: dict[str, object] = field(default_factory=dict)
 
     @property
     def timed_out(self) -> bool:
