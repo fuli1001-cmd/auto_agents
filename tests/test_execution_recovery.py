@@ -19,6 +19,7 @@ from auto_agents.execution_recovery import (
     recovery_task_marker,
 )
 from auto_agents.models import (
+    AgentRequest,
     AgentResult,
     AgentTermination,
     CommandResult,
@@ -2849,6 +2850,64 @@ class ExecutionRecoveryTests(unittest.TestCase):
             self.assertEqual(incident.source, "provider")
             state = orchestrator.status()
             self.assertEqual(state["active_execution_incident_id"], incident.incident_id)
+
+    def test_diagnostic_provider_success_does_not_resolve_target_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            incident = ExecutionIncident(
+                incident_id="target-provider-incident",
+                run_id=state.run_id,
+                source="provider",
+                kind="provider_timed_out",
+                stage="implement",
+                context="provider:mock",
+                status="open",
+            )
+            ExecutionIncidentStore(root, state.run_id).save(incident, state)
+            save_run_state(root, state)
+            before = (root / ".auto-agents" / "state" / "run_state.json").read_bytes()
+
+            class SuccessfulAdapter:
+                def run(self, request):
+                    return AgentResult(
+                        ok=True,
+                        command=["mock"],
+                        output_path=request.output_path,
+                        summary="diagnosis complete",
+                    )
+
+            result = orchestrator._run_provider_with_smart_recovery(
+                SuccessfulAdapter(),
+                AgentRequest(
+                    stage="self_repair_investigator",
+                    effort="max",
+                    prompt="diagnose",
+                    cwd=root,
+                    output_path=(
+                        root
+                        / ".auto-agents"
+                        / "runs"
+                        / state.run_id
+                        / "investigator.json"
+                    ),
+                    record_execution_incidents=False,
+                ),
+                "mock",
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                (root / ".auto-agents" / "state" / "run_state.json").read_bytes(),
+                before,
+            )
+            persisted = ExecutionIncidentStore(root, state.run_id).load(
+                incident.incident_id
+            )
+            self.assertIsNotNone(persisted)
+            self.assertEqual(persisted.status, "open")
 
     def test_run_reopens_legacy_blocked_incident_without_dialogue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

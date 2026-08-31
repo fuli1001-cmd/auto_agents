@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,7 @@ from auto_agents.config import (
 )
 from auto_agents.git_ops import working_tree_clean
 from auto_agents.gates import GateCommandTimeoutError
+from auto_agents.health_watch import HealthSelfRepairRequired
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import (
     AgentRequest,
@@ -67,6 +69,8 @@ from auto_agents.run_lock import (
     runtime_status,
     stop_project_run,
 )
+from auto_agents.process_supervision import RunInterruptedError
+from auto_agents.repair_cases import RepairCase
 from auto_agents.self_repair import (
     SELF_REPAIR_DISABLED_ENV,
     SELF_REPAIR_LAST_FINGERPRINT_ENV,
@@ -3003,6 +3007,99 @@ class ProjectValidationTests(unittest.TestCase):
                 json.loads(triage_artifact.read_text(encoding="utf-8"))["source"],
                 "provider",
             )
+
+    def test_cli_interrupt_during_terminal_triage_stops_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+
+            with (
+                patch.object(
+                    Orchestrator,
+                    "run",
+                    side_effect=TypeError("unexpected state shape"),
+                ),
+                patch(
+                    "auto_agents.cli._triage_terminal_run_error",
+                    side_effect=RunInterruptedError(signal.SIGINT),
+                ),
+                patch("auto_agents.cli._notify_run_blocked"),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main(
+                    [
+                        "run",
+                        "--project",
+                        str(project_root),
+                        "--spec-file",
+                        str(spec_file),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 130)
+            self.assertEqual(
+                json.loads(stdout.getvalue())["error"],
+                "run interrupted by SIGINT",
+            )
+            state = load_run_state(project_root)
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(state.active_blocker["category"], "run_interrupted")
+
+    def test_cli_interrupt_during_health_self_repair_stops_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            spec_file = project_root / "spec.md"
+            write_text(spec_file, "# Spec\n")
+            repair_case = RepairCase(
+                case_id="interrupt-health-repair",
+                run_id=load_run_state(project_root).run_id,
+                source="health_watch",
+                kind="goal_stalled",
+                severity="confirmed",
+                symptom="health repair requested",
+            )
+            triage = SelfRepairTriageResult(
+                decision=SelfRepairDecision(True, category="goal_stalled"),
+                source="root_cause_consensus",
+                reason="repair approved",
+            )
+
+            with (
+                patch.object(
+                    Orchestrator,
+                    "run",
+                    side_effect=HealthSelfRepairRequired(repair_case, triage),
+                ),
+                patch(
+                    "auto_agents.cli._auto_repair_auto_agents_and_resume",
+                    side_effect=RunInterruptedError(signal.SIGINT),
+                ),
+                patch("auto_agents.cli._notify_run_blocked"),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main(
+                    [
+                        "run",
+                        "--project",
+                        str(project_root),
+                        "--spec-file",
+                        str(spec_file),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 130)
+            self.assertEqual(
+                json.loads(stdout.getvalue())["error"],
+                "run interrupted by SIGINT",
+            )
+            state = load_run_state(project_root)
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(state.active_blocker["category"], "run_interrupted")
 
     def test_cli_session_commands_notify_completed_state(self) -> None:
         for command, mode in (

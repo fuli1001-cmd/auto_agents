@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,11 +22,13 @@ from auto_agents.models import (
 )
 from auto_agents.root_cause import RootCauseCoordinator
 from auto_agents.repair_cases import RepairCase
+from auto_agents.process_supervision import RunInterruptedError
 from auto_agents.self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
     SelfRepairResult,
     _VerificationResult,
+    adjudicate_repair_case,
     self_repair_verification_command,
 )
 from auto_agents.self_repair_search import (
@@ -557,6 +560,12 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertTrue(
                 all(item.sandbox_mode == "read-only" for item in fake.requests)
             )
+            self.assertTrue(
+                all(
+                    not item.record_execution_incidents
+                    for item in fake.requests
+                )
+            )
             self.assertTrue(Path(diagnosis.evidence_path).is_file())
             artifact = json.loads(
                 (
@@ -570,6 +579,48 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertTrue(artifact["repair_approved"])
+
+    def test_run_interruption_bypasses_root_cause_failure_conversion(self):
+        repair_case = RepairCase(
+            case_id="interrupt-case",
+            run_id="run-123",
+            source="health_watch",
+            kind="goal_stalled",
+            severity="confirmed",
+            symptom="run was interrupted",
+        )
+        state = RunState(run_id="run-123", status="pending")
+        diagnosis_config = SelfRepairDiagnosisConfig()
+        orchestrator = type(
+            "Orchestrator",
+            (),
+            {
+                "config": type(
+                    "Config",
+                    (),
+                    {
+                        "execution": type(
+                            "Execution",
+                            (),
+                            {"self_repair_diagnosis": diagnosis_config},
+                        )()
+                    },
+                )()
+            },
+        )()
+
+        with patch.object(
+            RootCauseCoordinator,
+            "run",
+            side_effect=RunInterruptedError(signal.SIGINT),
+        ):
+            with self.assertRaises(RunInterruptedError):
+                adjudicate_repair_case(
+                    orchestrator,
+                    target_project_root=Path("/tmp/target"),
+                    repair_case=repair_case,
+                    state=state,
+                )
 
     def test_health_case_reuses_consensus_and_requires_boundary_commands(self):
         with tempfile.TemporaryDirectory() as tmp:

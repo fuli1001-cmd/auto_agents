@@ -932,6 +932,11 @@ class RootCauseCoordinator:
             attempt_id=f"root-cause-{role}",
             sandbox_mode="read-only",
             timeout_seconds=timeout,
+            # Root-cause roles diagnose an existing failure. Their provider
+            # success or failure must not resolve, replace, or advance an
+            # unrelated target-run execution incident while the repository
+            # mutation guard is active.
+            record_execution_incidents=False,
             stream_output=(
                 self.orchestrator._stream_agent_output_callback(
                     f"root-cause-{role}"

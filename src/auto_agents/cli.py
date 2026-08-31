@@ -677,6 +677,19 @@ def _mark_run_stopped(project_root: Path, reason: str) -> None:
         pass
 
 
+def _handle_run_interrupted(
+    project_root: Path,
+    error: RunInterruptedError,
+) -> int:
+    ACTIVE_PROCESSES.terminate_all()
+    _mark_run_stopped(project_root, str(error))
+    _notify_run_blocked(project_root, error)
+    print(
+        json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False)
+    )
+    return error.exit_code
+
+
 def _saved_run_context(project_root: Path) -> dict[str, object]:
     try:
         state = load_run_state(project_root)
@@ -2791,21 +2804,21 @@ def main(argv: list[str] | None = None) -> int:
             if health_runtime is not None:
                 health_runtime.set_phase("self_repair")
             triage = error.triage
-            return _auto_repair_auto_agents_and_resume(
-                project_root,
-                orchestrator,
-                error,
-                triage.decision,
-                args,
-                run_lock,
-                diagnosis=triage.root_cause,
-                repair_case=error.repair_case,
-            )
+            try:
+                return _auto_repair_auto_agents_and_resume(
+                    project_root,
+                    orchestrator,
+                    error,
+                    triage.decision,
+                    args,
+                    run_lock,
+                    diagnosis=triage.root_cause,
+                    repair_case=error.repair_case,
+                )
+            except RunInterruptedError as interrupted:
+                return _handle_run_interrupted(project_root, interrupted)
         except RunInterruptedError as error:
-            _mark_run_stopped(project_root, str(error))
-            _notify_run_blocked(project_root, error)
-            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
-            return error.exit_code
+            return _handle_run_interrupted(project_root, error)
         except KeyboardInterrupt:
             reason = "run interrupted by SIGINT"
             ACTIVE_PROCESSES.terminate_all()
@@ -2817,32 +2830,41 @@ def main(argv: list[str] | None = None) -> int:
             project_root = Path(args.project)
             if health_runtime is not None:
                 health_runtime.set_phase("triage")
-            triage = _triage_terminal_run_error(project_root, orchestrator, error)
-            decision = triage.decision
-            if orchestrator is not None and decision.eligible:
-                return _auto_repair_auto_agents_and_resume(
-                    project_root,
-                    orchestrator,
-                    error,
-                    decision,
-                    args,
-                    run_lock,
-                    diagnosis=triage.root_cause,
+            try:
+                triage = _triage_terminal_run_error(project_root, orchestrator, error)
+                decision = triage.decision
+                if orchestrator is not None and decision.eligible:
+                    return _auto_repair_auto_agents_and_resume(
+                        project_root,
+                        orchestrator,
+                        error,
+                        decision,
+                        args,
+                        run_lock,
+                        diagnosis=triage.root_cause,
+                    )
+                if (
+                    orchestrator is not None
+                    and hasattr(orchestrator, "is_provider_research_blocked_error")
+                    and orchestrator.is_provider_research_blocked_error(str(error))
+                ):
+                    return _auto_resolve_provider_blocker(
+                        project_root,
+                        orchestrator,
+                        print_agent_output=bool(args.print_agent_output),
+                    )
+                _block_terminal_run_error(project_root, orchestrator, error, triage)
+                _notify_run_blocked(project_root, error)
+                print(
+                    json.dumps(
+                        {"ok": False, "error": str(error)},
+                        indent=2,
+                        ensure_ascii=False,
+                    )
                 )
-            if (
-                orchestrator is not None
-                and hasattr(orchestrator, "is_provider_research_blocked_error")
-                and orchestrator.is_provider_research_blocked_error(str(error))
-            ):
-                return _auto_resolve_provider_blocker(
-                    project_root,
-                    orchestrator,
-                    print_agent_output=bool(args.print_agent_output),
-                )
-            _block_terminal_run_error(project_root, orchestrator, error, triage)
-            _notify_run_blocked(project_root, error)
-            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
-            return 3
+                return 3
+            except RunInterruptedError as interrupted:
+                return _handle_run_interrupted(project_root, interrupted)
         finally:
             if health_runtime is not None:
                 health_runtime.close(reason="foreground run command exited")

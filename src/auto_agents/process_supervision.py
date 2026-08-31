@@ -19,8 +19,12 @@ DEFAULT_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024
 PROCESS_CONTROL_VERSION = 1
 
 
-class RunInterruptedError(RuntimeError):
-    """Raised when an active auto_agents run receives SIGINT or SIGTERM."""
+class RunInterruptedError(BaseException):
+    """Control-flow exception raised when a run receives SIGINT or SIGTERM.
+
+    Inheriting from ``BaseException`` keeps shutdown requests out of broad
+    application-error and self-repair handlers, matching ``KeyboardInterrupt``.
+    """
 
     def __init__(self, signum: int) -> None:
         self.signum = int(signum)

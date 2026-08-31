@@ -1987,6 +1987,7 @@ class AgentRequest:
     sandbox_mode: str = ""
     timeout_seconds: int = 0
     termination_probe: Optional[Callable[[], str]] = None
+    record_execution_incidents: bool = True
 
 
 @dataclass

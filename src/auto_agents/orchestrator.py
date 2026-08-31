@@ -32090,8 +32090,12 @@ class Orchestrator:
                     session_id or "fresh",
                 )
                 continue
-            incident = self._record_provider_execution_incident(
-                request.stage, provider, result
+            incident = (
+                self._record_provider_execution_incident(
+                    request.stage, provider, result
+                )
+                if request.record_execution_incidents
+                else None
             )
             resumable = reason in {
                 "tool_stalled",
@@ -32150,7 +32154,7 @@ class Orchestrator:
                     self._incident_store(state).save(incident, state)
                     save_run_state(self.project_root, state)
                 continue
-            if result.ok:
+            if result.ok and request.record_execution_incidents:
                 self._resolve_active_provider_incident()
             return result
 
