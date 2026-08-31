@@ -206,6 +206,41 @@ def build_progress_vector(state: RunState) -> ProgressVector:
     )
 
 
+def advance_run_health_control(
+    state: RunState,
+    *,
+    kind: str,
+    rewind: bool = False,
+    resume: bool = False,
+    intervention_active: Optional[bool] = None,
+) -> None:
+    """Persist monotonic health lifecycle epochs with the run state.
+
+    The independent sidecar cannot observe the foreground supervisor's in-memory
+    control queue.  Keeping these epochs in RunState makes a rewind atomic with
+    the progress-vector mutation that it authorizes and gives resumed work a
+    durable, process-independent lease boundary.
+    """
+
+    payload = dict(state.health_control)
+    payload["control_epoch"] = max(
+        0, int(payload.get("control_epoch", 0) or 0)
+    ) + 1
+    if rewind:
+        payload["rewind_epoch"] = max(
+            0, int(payload.get("rewind_epoch", 0) or 0)
+        ) + 1
+    if resume:
+        payload["resume_epoch"] = max(
+            0, int(payload.get("resume_epoch", 0) or 0)
+        ) + 1
+    if intervention_active is not None:
+        payload["intervention_active"] = bool(intervention_active)
+    payload["last_event"] = str(kind)
+    payload["updated_at"] = utc_now()
+    state.health_control = payload
+
+
 def _latest_provider_report(run_root: Path) -> Dict[str, object]:
     matches: list[tuple[float, Path]] = []
     for path in run_root.glob("outputs/provider-attempts/*.json"):
@@ -317,6 +352,24 @@ class RunHealthEvaluator:
             self.control_history.append(normalized)
         if rewind:
             self.rewind_epoch += 1
+
+    def renew_progress_lease(self, observed_epoch: float) -> None:
+        """Start a fresh goal-progress lease without weakening durable progress."""
+
+        self.last_progress_at = float(observed_epoch)
+        self.activity_since_progress = False
+        self.retry_pressure_without_progress = 0
+
+    def rebase(self, snapshot: HealthSnapshot) -> None:
+        """Adopt a supervised intervention snapshot as the next stable baseline."""
+
+        if snapshot.control_history:
+            self.control_history = deque(snapshot.control_history, maxlen=64)
+        if snapshot.rewind_epoch > self.rewind_epoch:
+            self.rewind_epoch = snapshot.rewind_epoch
+        self.previous = snapshot
+        self._last_rewind_seen = self.rewind_epoch
+        self.renew_progress_lease(snapshot.observed_epoch)
 
     def evaluate(
         self,
@@ -667,13 +720,21 @@ class RunHealthSupervisor:
         except queue.Empty:
             return None
 
-    def complete_action(self, request: HealthActionRequest, *, detail: str = "") -> None:
+    def complete_action(
+        self,
+        request: HealthActionRequest,
+        *,
+        detail: str = "",
+        resume: bool = False,
+    ) -> None:
         if request.durable_request_id:
             self.action_store.transition(
                 request.durable_request_id,
                 "completed",
                 detail=detail or "foreground health action completed",
             )
+        if resume:
+            self.evaluator.renew_progress_lease(time.time())
 
     def _materialize_durable_action(
         self, payload: Mapping[str, object]

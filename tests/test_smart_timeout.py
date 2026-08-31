@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import signal
 import sqlite3
 import sys
 from pathlib import Path
@@ -29,6 +30,7 @@ from auto_agents.models import (
     SmartTimeoutConfig,
 )
 from auto_agents.supervision import ProgressDecoder, ProgressSupervisor
+from auto_agents.process_supervision import RunInterruptedError
 from auto_agents.validation import (
     project_config_warnings,
     validate_project_config_payload,
@@ -45,6 +47,16 @@ def _request(tmp_path: Path) -> AgentRequest:
         attempt_id="task-1",
         progress_report_path=tmp_path / "attempt.json",
     )
+
+
+def test_run_interrupted_error_bypasses_provider_recovery_handlers():
+    caught_as_recoverable = False
+    with pytest.raises(RunInterruptedError):
+        try:
+            raise RunInterruptedError(signal.SIGINT)
+        except Exception:
+            caught_as_recoverable = True
+    assert not caught_as_recoverable
 
 
 def _supervisor(

@@ -1691,6 +1691,7 @@ class RunState:
     persistence_actions: Dict[str, Dict[str, object]] = field(default_factory=dict)
     pending_input_requests: List[Dict[str, object]] = field(default_factory=list)
     active_input_request_id: str = ""
+    health_control: Dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "RunState":
@@ -1797,6 +1798,11 @@ class RunState:
             active_input_request_id=str(
                 data.get("active_input_request_id", "")
             ),
+            health_control=(
+                dict(data.get("health_control", {}))
+                if isinstance(data.get("health_control", {}), dict)
+                else {}
+            ),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -1856,6 +1862,7 @@ class RunState:
                 dict(item) for item in self.pending_input_requests
             ],
             "active_input_request_id": self.active_input_request_id,
+            "health_control": dict(self.health_control),
         }
 
 

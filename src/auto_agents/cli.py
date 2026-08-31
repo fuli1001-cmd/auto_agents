@@ -57,7 +57,11 @@ from .prototype_variants import (
 )
 from .foreground_activity import ForegroundActivity
 from .git_ops import add_worktree, changed_paths, remove_worktree
-from .health_watch import HealthSelfRepairRequired, build_progress_vector
+from .health_watch import (
+    HealthSelfRepairRequired,
+    advance_run_health_control,
+    build_progress_vector,
+)
 from .health_control import health_watch_status, request_health_state
 from .health_watchdog import (
     mark_watchdog_stop_intent,
@@ -1060,6 +1064,12 @@ def _finalize_health_live_boundary(
             after.active_repair_case_id = ""
             after.repair_phase = ""
             after.repair_checkpoint_ref = ""
+            advance_run_health_control(
+                after,
+                kind="health_self_repair_resumed",
+                intervention_active=False,
+                resume=True,
+            )
             save_run_state(project_root, after)
     return crossed
 

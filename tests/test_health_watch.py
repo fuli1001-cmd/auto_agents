@@ -25,12 +25,14 @@ from auto_agents.health_watch import (
     ProgressVector,
     RunHealthEvaluator,
     RunHealthSupervisor,
+    advance_run_health_control,
     build_progress_vector,
     replay_health_events,
 )
 from auto_agents.models import HealthWatchConfig, SmartTimeoutConfig, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.health_watchdog import (
+    IndependentHealthAuditor,
     run_health_sidecar,
     start_health_sidecar,
 )
@@ -78,6 +80,7 @@ def _snapshot(
     retry_pressure=0,
     root_occurrences=(),
     control_history=(),
+    rewind_epoch=0,
 ) -> HealthSnapshot:
     progress = _vector(*atoms)
     progress = ProgressVector(
@@ -105,7 +108,7 @@ def _snapshot(
         retry_pressure=retry_pressure,
         control_fingerprint="",
         control_history=tuple(control_history),
-        rewind_epoch=0,
+        rewind_epoch=rewind_epoch,
     )
 
 
@@ -231,6 +234,88 @@ class HealthWatchTests(unittest.TestCase):
         self.assertIsNone(
             evaluator.evaluate(_snapshot(2, 1), progress_lease_seconds=60)
         )
+
+    def test_independent_auditor_honors_durable_stage_rewind(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = load_run_state(project)
+            state.stage_summaries = {
+                "clarify": "done",
+                "design": "done",
+                "plan": "done",
+            }
+            state.current_stage = "plan"
+            save_run_state(project, state)
+            manifest = {
+                "run_token": "token",
+                "workflow_kind": "run",
+                "subject_id": state.run_id,
+                "process_phase": "run",
+            }
+            auditor = IndependentHealthAuditor(project, manifest)
+            auditor.observe_once(manifest)
+
+            rewound = load_run_state(project)
+            Orchestrator(project)._rewind_state_from_stage(rewound, "clarify")
+            save_run_state(project, rewound)
+            auditor.observe_once(manifest)
+
+            self.assertEqual(rewound.health_control["rewind_epoch"], 1)
+            self.assertEqual(auditor.evaluator.rewind_epoch, 1)
+            self.assertIsNone(
+                auditor.actions.next_pending(run_token="token")
+            )
+
+    def test_health_intervention_completion_starts_fresh_goal_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = load_run_state(project)
+            manifest = {
+                "run_token": "token",
+                "workflow_kind": "run",
+                "subject_id": state.run_id,
+                "process_phase": "run",
+            }
+            auditor = IndependentHealthAuditor(project, manifest)
+            auditor.observe_once(manifest)
+
+            active = load_run_state(project)
+            active.active_repair_case_id = "case-1"
+            active.repair_phase = "diagnosing"
+            advance_run_health_control(
+                active,
+                kind="health_intervention_started:test",
+                intervention_active=True,
+            )
+            save_run_state(project, active)
+            auditor.evaluator.last_progress_at = time.time() - 10_000
+            auditor.evaluator.activity_since_progress = True
+            auditor.observe_once(manifest)
+            self.assertIsNone(
+                auditor.actions.next_pending(run_token="token")
+            )
+
+            resumed = load_run_state(project)
+            resumed.active_repair_case_id = ""
+            resumed.repair_phase = ""
+            advance_run_health_control(
+                resumed,
+                kind="health_intervention_resumed:test",
+                intervention_active=False,
+                resume=True,
+            )
+            save_run_state(project, resumed)
+            auditor.evaluator.last_progress_at = time.time() - 10_000
+            auditor.evaluator.activity_since_progress = True
+            auditor.observe_once(manifest)
+
+            self.assertEqual(auditor.last_resume_epoch, 1)
+            self.assertGreater(auditor.evaluator.last_progress_at, time.time() - 2)
+            self.assertIsNone(
+                auditor.actions.next_pending(run_token="token")
+            )
 
     def test_control_cycle_is_detected(self) -> None:
         evaluator = RunHealthEvaluator(
@@ -853,6 +938,8 @@ class HealthWatchTests(unittest.TestCase):
             self.assertEqual(updated.tasks[1].status, "pending")
             self.assertEqual(updated.repair_phase, "")
             self.assertEqual(len(updated.localized_blockers), 1)
+            self.assertFalse(updated.health_control["intervention_active"])
+            self.assertEqual(updated.health_control["resume_epoch"], 1)
 
 
 if __name__ == "__main__":

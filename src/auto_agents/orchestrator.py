@@ -167,6 +167,7 @@ from .health_watch import (
     HealthActionRequest,
     HealthSelfRepairRequired,
     RunHealthSupervisor,
+    advance_run_health_control,
     build_progress_vector,
 )
 from .logging_utils import attach_run_file_logger, build_run_logger, log_timing
@@ -979,6 +980,11 @@ class Orchestrator:
             state.implement_verify_baseline_ref = ""
         if target_index < STAGE_ORDER.index("implement"):
             self._clear_stale_implementation_resume_markers(state)
+        advance_run_health_control(
+            state,
+            kind=f"stage_rewind:{target_stage}",
+            rewind=True,
+        )
 
     @staticmethod
     def _installed_engine_revision() -> str:
@@ -7978,10 +7984,17 @@ class Orchestrator:
             repair_case.root_fingerprint,
         )
         self._health_action_in_progress = True
+        action_resolved = False
+        resume_after_action = False
         try:
             state = load_run_state(self.project_root)
             state.active_repair_case_id = repair_case.case_id
             state.repair_phase = "diagnosing"
+            advance_run_health_control(
+                state,
+                kind=f"health_intervention_started:{repair_case.kind}",
+                intervention_active=True,
+            )
             save_run_state(self.project_root, state)
             if request.action == "exhausted":
                 repair_case.status = "needs_human"
@@ -8009,6 +8022,8 @@ class Orchestrator:
                 else:
                     state.repair_phase = "needs_human"
                 save_run_state(self.project_root, state)
+                action_resolved = True
+                resume_after_action = state.status == "pending"
                 return repair_case
             if not self.config.execution.health_watch.agent_triage_enabled:
                 repair_case.status = "observed"
@@ -8023,6 +8038,8 @@ class Orchestrator:
                 state.active_repair_case_id = ""
                 state.repair_phase = ""
                 save_run_state(self.project_root, state)
+                action_resolved = True
+                resume_after_action = True
                 return repair_case
             triage = adjudicate_repair_case(
                 self,
@@ -8075,12 +8092,30 @@ class Orchestrator:
             state.repair_phase = ""
             state.repair_checkpoint_ref = ""
             save_run_state(self.project_root, state)
+            action_resolved = True
+            resume_after_action = state.status == "pending"
             return triage
         finally:
             self._health_action_in_progress = False
+            if action_resolved:
+                state = load_run_state(self.project_root)
+                advance_run_health_control(
+                    state,
+                    kind=(
+                        f"health_intervention_resumed:{repair_case.kind}"
+                        if resume_after_action
+                        else f"health_intervention_completed:{repair_case.kind}"
+                    ),
+                    intervention_active=False,
+                    resume=resume_after_action,
+                )
+                save_run_state(self.project_root, state)
             supervisor = self._health_supervisor
             if supervisor is not None:
-                supervisor.complete_action(request)
+                supervisor.complete_action(
+                    request,
+                    resume=action_resolved and resume_after_action,
+                )
 
     def verify_health_repair_boundary(self, case_id: str) -> Dict[str, object]:
         state = load_run_state(self.project_root)

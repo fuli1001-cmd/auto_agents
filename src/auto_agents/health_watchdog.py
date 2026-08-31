@@ -125,6 +125,7 @@ class IndependentHealthAuditor:
         self.session_retry_pressure = 0
         self.self_repair_progress_digest = ""
         self.self_repair_progress_at = time.time()
+        self.last_resume_epoch = 0
 
     def observe_once(self, manifest: Dict[str, object]) -> None:
         if self.workflow_kind == "run":
@@ -141,26 +142,57 @@ class IndependentHealthAuditor:
                 {"manifest_subject": self.subject_id, "raw_subject": state.run_id},
             )
             return
+        health_control = (
+            dict(state.health_control)
+            if isinstance(state.health_control, dict)
+            else {}
+        )
+        rewind_epoch = max(
+            0, int(health_control.get("rewind_epoch", 0) or 0)
+        )
+        resume_epoch = max(
+            0, int(health_control.get("resume_epoch", 0) or 0)
+        )
+        intervention_active = bool(
+            health_control.get("intervention_active", False)
+            or (state.active_repair_case_id and state.repair_phase)
+        )
         self.sequence += 1
         snapshot = capture_health_snapshot(
             self.project_root,
             state,
             sequence=self.sequence,
+            rewind_epoch=rewind_epoch,
         )
         lease = self.config.poll_seconds * 4
         smart = load_project_config(self.project_root).execution.smart_timeout
         lease = smart.stage_progress_lease_seconds.get(
             state.current_stage, smart.semantic_stall_seconds
         )
-        anomaly = self.evaluator.evaluate(
-            snapshot, progress_lease_seconds=max(60, int(lease))
-        ) if self.evaluator is not None else None
+        anomaly = None
+        if self.evaluator is not None:
+            if resume_epoch > self.last_resume_epoch:
+                self.evaluator.renew_progress_lease(snapshot.observed_epoch)
+                self.last_resume_epoch = resume_epoch
+            if intervention_active:
+                # Diagnosis/quiescence is an explicit lifecycle, not ordinary
+                # run progress.  Rebase while it is active so its elapsed time
+                # cannot consume the resumed stage's goal lease or enqueue a
+                # second run-level stall intervention.
+                self.evaluator.rebase(snapshot)
+            else:
+                anomaly = self.evaluator.evaluate(
+                    snapshot,
+                    progress_lease_seconds=max(60, int(lease)),
+                )
         audit = {
             "schema_version": SIDECAR_SCHEMA_VERSION,
             "source": "independent_health_auditor",
             "run_token": self.run_token,
             "process_phase": str(manifest.get("process_phase", "")),
             "snapshot": snapshot.to_dict(),
+            "intervention_active": intervention_active,
+            "resume_epoch": resume_epoch,
             "updated_at": utc_now(),
         }
         _atomic_json(self.root / "auditor-snapshot.json", audit)
