@@ -12,6 +12,7 @@ import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -107,6 +108,10 @@ SELF_REPAIR_TRIAGE_OWNERS = {
     "verification_infrastructure",
     "unknown",
 }
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass
@@ -1724,7 +1729,7 @@ class AutoAgentsSelfRepairRunner:
             experiment.health_history.append(
                 {
                     "anomaly": "operator_or_external_evidence_changed",
-                    "at": utc_now_iso(),
+                    "at": _utc_now_iso(),
                 }
             )
             store.save(experiment)
@@ -2165,7 +2170,7 @@ class AutoAgentsSelfRepairRunner:
                         "anomaly": "base_revision_changed",
                         "from": previous_base,
                         "to": live_head,
-                        "at": utc_now_iso(),
+                        "at": _utc_now_iso(),
                     }
                 )
                 store.save(experiment)

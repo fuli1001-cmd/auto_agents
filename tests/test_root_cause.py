@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
@@ -26,6 +27,11 @@ from auto_agents.self_repair import (
     SelfRepairResult,
     _VerificationResult,
     self_repair_verification_command,
+)
+from auto_agents.self_repair_search import (
+    SelfRepairCandidateRecord,
+    SelfRepairExperiment,
+    SelfRepairExperimentStore,
 )
 
 
@@ -140,6 +146,11 @@ class _FakeOrchestrator:
 
 
 class RootCauseCoordinatorTests(unittest.TestCase):
+    def assert_parseable_utc(self, value: object) -> None:
+        timestamp = datetime.fromisoformat(str(value))
+        self.assertIsNotNone(timestamp.tzinfo)
+        self.assertEqual(timestamp.utcoffset(), timedelta(0))
+
     def test_diagnostic_snapshot_keeps_archived_requirement_namespace(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -808,6 +819,202 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             AutoAgentsSelfRepairRunner._verification_failure_signature(base),
             AutoAgentsSelfRepairRunner._verification_failure_signature(candidate),
         )
+
+    def test_self_repair_refreshes_changed_engine_base_before_candidate_generation(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            old_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=auto_root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            write_text(auto_root / "engine.py", "REVISION = 2\n")
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "advance engine"],
+                cwd=auto_root,
+                check=True,
+            )
+            live_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=auto_root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            write_json(
+                target_root / ".auto-agents" / "state" / "run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+            store = SelfRepairExperimentStore(
+                target_root,
+                "target-run",
+                "revision-refresh",
+            )
+            experiment = SelfRepairExperiment.create(
+                run_id="target-run",
+                root_fingerprint="revision-refresh",
+                category="revision-refresh",
+                base_commit=old_head,
+            )
+            experiment.attempt_count = 2
+            experiment.consecutive_non_improvements = 2
+            experiment.candidates["stale"] = SelfRepairCandidateRecord(
+                candidate_id="stale",
+                candidate_ref="refs/stale",
+                candidate_commit=old_head,
+            )
+            experiment.frontier = ["stale"]
+            experiment.best_safe_candidate_id = "stale"
+            experiment.best_safe_ref = "refs/stale"
+            experiment.best_search_candidate_id = "stale"
+            experiment.best_search_ref = "refs/stale"
+            store.save(experiment)
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(
+                    True,
+                    category="revision-refresh",
+                ),
+            )
+            runner.repo_root = auto_root
+            observed = {}
+
+            def generate_candidate(**_kwargs):
+                persisted = store.load()
+                self.assertIsNotNone(persisted)
+                observed["experiment"] = persisted
+                return SelfRepairResult(
+                    ok=True,
+                    status="approved_candidate",
+                    reason="candidate lifecycle reached",
+                    candidate_id="refreshed-candidate",
+                    candidate_ref=live_head,
+                    candidate_commit=live_head,
+                )
+
+            with (
+                patch.object(
+                    runner,
+                    "_run_candidate",
+                    side_effect=generate_candidate,
+                ) as run_candidate,
+                patch.object(runner, "_record_candidate_result"),
+            ):
+                result = runner.run()
+
+            self.assertTrue(result.ok)
+            run_candidate.assert_called_once()
+            self.assertEqual(run_candidate.call_args.kwargs["attempt"], 3)
+            refreshed = observed["experiment"]
+            self.assertEqual(refreshed.base_commit, live_head)
+            self.assertEqual(refreshed.best_safe_candidate_id, "base")
+            self.assertEqual(refreshed.best_search_candidate_id, "base")
+            self.assertEqual(refreshed.frontier, [])
+            self.assertEqual(refreshed.attempt_count, 2)
+            self.assertTrue(refreshed.candidates["stale"].fatal)
+            self.assertEqual(refreshed.candidates["base"].status, "base_refresh")
+            revision_change = refreshed.health_history[-1]
+            self.assertEqual(revision_change["anomaly"], "base_revision_changed")
+            self.assertEqual(revision_change["from"], old_head)
+            self.assertEqual(revision_change["to"], live_head)
+            self.assert_parseable_utc(revision_change["at"])
+
+    def test_self_repair_reopens_needs_human_experiment_when_evidence_changes(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            live_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=auto_root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            write_json(
+                target_root / ".auto-agents" / "state" / "run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+            store = SelfRepairExperimentStore(
+                target_root,
+                "target-run",
+                "evidence-refresh",
+            )
+            experiment = SelfRepairExperiment.create(
+                run_id="target-run",
+                root_fingerprint="evidence-refresh",
+                category="evidence-refresh",
+                base_commit=live_head,
+                evidence_fingerprint="stale-evidence",
+            )
+            experiment.status = "needs_human"
+            experiment.attempt_count = 4
+            experiment.consecutive_non_improvements = 3
+            store.save(experiment)
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(
+                    True,
+                    category="evidence-refresh",
+                ),
+            )
+            runner.repo_root = auto_root
+            observed = {}
+
+            def generate_candidate(**_kwargs):
+                persisted = store.load()
+                self.assertIsNotNone(persisted)
+                observed["experiment"] = persisted
+                return SelfRepairResult(
+                    ok=True,
+                    status="approved_candidate",
+                    reason="candidate lifecycle reached",
+                    candidate_id="reopened-candidate",
+                    candidate_ref=live_head,
+                    candidate_commit=live_head,
+                )
+
+            with (
+                patch.object(
+                    runner,
+                    "_run_candidate",
+                    side_effect=generate_candidate,
+                ) as run_candidate,
+                patch.object(runner, "_record_candidate_result"),
+            ):
+                result = runner.run()
+
+            self.assertTrue(result.ok)
+            run_candidate.assert_called_once()
+            self.assertEqual(run_candidate.call_args.kwargs["attempt"], 5)
+            reopened = observed["experiment"]
+            self.assertEqual(reopened.status, "active")
+            self.assertEqual(reopened.consecutive_non_improvements, 0)
+            self.assertEqual(reopened.attempt_count, 4)
+            self.assertNotEqual(reopened.evidence_fingerprint, "stale-evidence")
+            evidence_change = reopened.health_history[-1]
+            self.assertEqual(
+                evidence_change["anomaly"],
+                "operator_or_external_evidence_changed",
+            )
+            self.assert_parseable_utc(evidence_change["at"])
 
     def test_runner_returns_deepest_candidate_not_last_candidate(self):
         with tempfile.TemporaryDirectory() as tmp:
