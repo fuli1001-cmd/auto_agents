@@ -59,10 +59,8 @@ from .git_ops import add_worktree, changed_paths, remove_worktree
 from .health_watch import HealthSelfRepairRequired, build_progress_vector
 from .health_watchdog import (
     mark_watchdog_stop_intent,
-    mark_watchdog_supervisor_parent,
     run_watchdog,
     start_run_watchdog,
-    watchdog_recovery_requested,
 )
 from .process_supervision import (
     ACTIVE_PROCESSES,
@@ -1203,13 +1201,6 @@ def _auto_repair_auto_agents_and_resume(
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 3
 
-    if health_repair:
-        mark_watchdog_supervisor_parent(
-            project_root,
-            load_run_state(project_root).run_id,
-            active=True,
-        )
-
     if result.status == "already_repaired" or not result.candidate_commit:
         orchestrator.mark_self_repair_applied(result.commit_sha)
         print(
@@ -1370,11 +1361,6 @@ def _auto_repair_auto_agents_and_resume(
     if health_repair:
         final_state = _try_load_run_state(project_root)
         if final_state is not None:
-            mark_watchdog_supervisor_parent(
-                project_root,
-                final_state.run_id,
-                active=False,
-            )
             if exit_code != 0:
                 mark_watchdog_stop_intent(
                     project_root,
@@ -2634,14 +2620,11 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             _promote_pending_self_repairs(project_root)
             if hasattr(orchestrator, "_start_health_supervision"):
-                restart_command = _run_command_for_self_repair_resume(args)
                 orchestrator._watchdog_launcher = lambda watched_state: start_run_watchdog(
                     project_root=project_root,
                     run_id=watched_state.run_id,
                     run_token=run_lock.run_token,
-                    restart_command=restart_command,
                     auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
-                    autonomy_mode=orchestrator._autonomy_mode,
                 )
             if run_lock.interrupted_snapshot:
                 interrupted_state = orchestrator.reconcile_runtime_interruption(
@@ -2753,16 +2736,7 @@ def main(argv: list[str] | None = None) -> int:
                 repair_case=error.repair_case,
             )
         except RunInterruptedError as error:
-            if watchdog_recovery_requested(
-                project_root,
-                load_run_state(project_root).run_id,
-            ):
-                interrupted = load_run_state(project_root)
-                interrupted.repair_phase = "watchdog_restart"
-                interrupted.last_error = str(error)
-                save_run_state(project_root, interrupted)
-            else:
-                _mark_run_stopped(project_root, str(error))
+            _mark_run_stopped(project_root, str(error))
             _notify_run_blocked(project_root, error)
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return error.exit_code

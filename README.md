@@ -1201,8 +1201,11 @@ interventions, task-lineage incidents are localized when other independent tasks
 
 Each CLI `run` also starts a small sidecar that does not own the project lock or modify project
 source. It monitors the orchestrator heartbeat and PID start identity, captures diagnostics for a
-stale owner, and can restart an unexpectedly dead run from its saved context within the configured
-budget. Completed, paused, blocked, waiting-user, and explicitly stopped runs are never restarted.
+stale owner, and records when the owner exits. The sidecar is observation-only: it never signals the
+main process, cleans child processes, creates a restart request, or reruns the original command. When
+the main process exits, the sidecar records the final observation and exits as well. The legacy
+`sidecar_grace_seconds` and `max_sidecar_restarts_per_run` settings remain accepted for existing
+project configs but have no operational effect.
 Use `status` to inspect `health`, `watchdog`, and `runtime` details, or pass `--no-health-watch` to
 disable both layers for one invocation.
 

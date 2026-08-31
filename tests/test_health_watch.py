@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
-import time
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +14,7 @@ from auto_agents.config import (
     bootstrap_project,
     load_project_config,
     load_run_state,
+    save_project_config,
     save_run_state,
 )
 from auto_agents.health_watch import (
@@ -31,14 +32,12 @@ from auto_agents.models import HealthWatchConfig, SmartTimeoutConfig, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.health_watchdog import (
     mark_watchdog_stop_intent,
-    mark_watchdog_supervisor_parent,
     run_watchdog,
     start_run_watchdog,
     watchdog_control_path,
-    watchdog_recovery_requested,
-    watchdog_request_path,
 )
 from auto_agents.repair_cases import RepairCase, RepairCaseStore
+from auto_agents.process_supervision import process_start_ticks
 from auto_agents.repair_checkpoint import (
     create_repair_checkpoint,
     restore_repair_control_checkpoint,
@@ -328,25 +327,11 @@ class HealthWatchTests(unittest.TestCase):
                 "run entered root-cause diagnosis",
             )
 
-    def test_watchdog_request_is_recognized(self) -> None:
+    def test_watchdog_records_dead_owner_and_exits_without_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "project"
             bootstrap_project(project, "demo")
             state = load_run_state(project)
-            path = watchdog_request_path(project, state.run_id)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps({"action": "restart", "handled": False}),
-                encoding="utf-8",
-            )
-            self.assertTrue(watchdog_recovery_requested(project, state.run_id))
-
-    def test_watchdog_restarts_dead_owner_once(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "project"
-            bootstrap_project(project, "demo")
-            state = load_run_state(project)
-            marker = project / "restarted.marker"
             control = watchdog_control_path(project, state.run_id)
             control.parent.mkdir(parents=True, exist_ok=True)
             control.write_text(
@@ -354,12 +339,7 @@ class HealthWatchTests(unittest.TestCase):
                     {
                         "run_id": state.run_id,
                         "run_token": "token",
-                        "restart_command": [
-                            sys.executable,
-                            "-c",
-                            "from pathlib import Path; Path('restarted.marker').write_text('ok')",
-                        ],
-                        "restart_count": 0,
+                        "mode": "observe_only",
                         "planned_stop": False,
                     }
                 ),
@@ -379,16 +359,73 @@ class HealthWatchTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(run_watchdog(project, state.run_id), 0)
-            deadline = time.monotonic() + 5
-            while not marker.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            self.assertEqual(marker.read_text(encoding="utf-8"), "ok")
             updated = json.loads(control.read_text(encoding="utf-8"))
-            self.assertEqual(updated["restart_count"], 1)
+            self.assertEqual(updated["status"], "owner_exited")
+            self.assertNotIn("restart_command", updated)
             diagnostics = list(
                 (control.parent / "watchdog-diagnostics").glob("*.json")
             )
             self.assertEqual(len(diagnostics), 1)
+            diagnostic = json.loads(diagnostics[0].read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["reason"], "owner_exited")
+
+    def test_watchdog_observes_stale_live_owner_without_signaling_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            config = load_project_config(project)
+            config.execution.health_watch.poll_seconds = 5
+            save_project_config(project, config)
+            state = load_run_state(project)
+            control = watchdog_control_path(project, state.run_id)
+            control.parent.mkdir(parents=True, exist_ok=True)
+            control.write_text(
+                json.dumps(
+                    {
+                        "run_id": state.run_id,
+                        "run_token": "token",
+                        "mode": "observe_only",
+                        "planned_stop": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            heartbeat = control.parent / "heartbeat.json"
+            heartbeat.write_text(
+                json.dumps(
+                    {
+                        "run_id": state.run_id,
+                        "run_token": "token",
+                        "owner_pid": os.getpid(),
+                        "owner_start_ticks": process_start_ticks(os.getpid()),
+                        "updated_epoch": 1,
+                        "status": "healthy",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            thread = threading.Thread(
+                target=run_watchdog,
+                args=(project, state.run_id),
+            )
+            thread.start()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                observed = json.loads(control.read_text(encoding="utf-8"))
+                if observed.get("status") == "heartbeat_stale_observed":
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("watchdog did not record the stale heartbeat")
+
+            heartbeat.write_text(
+                json.dumps({"status": "stopped"}),
+                encoding="utf-8",
+            )
+            thread.join(timeout=6)
+
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(Path(f"/proc/{os.getpid()}").exists())
 
     def test_watchdog_bootstrap_replaces_terminal_heartbeat_for_new_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -411,7 +448,6 @@ class HealthWatchTests(unittest.TestCase):
                     project_root=project,
                     run_id=state.run_id,
                     run_token="new-token",
-                    restart_command=[sys.executable, "-c", "pass"],
                     auto_agents_entry=Path(__file__),
                 )
 
@@ -422,32 +458,6 @@ class HealthWatchTests(unittest.TestCase):
             self.assertEqual(heartbeat["status"], "starting")
             self.assertEqual(heartbeat["previous_status"], "stopped")
             self.assertEqual(heartbeat["run_token"], "new-token")
-
-    def test_watchdog_records_live_supervisor_parent_during_runtime_handoff(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project = Path(temporary) / "project"
-            bootstrap_project(project, "demo")
-            state = load_run_state(project)
-            control = watchdog_control_path(project, state.run_id)
-            control.parent.mkdir(parents=True, exist_ok=True)
-            control.write_text(json.dumps({"run_id": state.run_id}), encoding="utf-8")
-
-            mark_watchdog_supervisor_parent(
-                project,
-                state.run_id,
-                active=True,
-            )
-            active = json.loads(control.read_text(encoding="utf-8"))
-            self.assertEqual(active["supervisor_parent_pid"], os.getpid())
-            self.assertGreater(active["supervisor_parent_start_ticks"], 0)
-
-            mark_watchdog_supervisor_parent(
-                project,
-                state.run_id,
-                active=False,
-            )
-            cleared = json.loads(control.read_text(encoding="utf-8"))
-            self.assertEqual(cleared["supervisor_parent_pid"], 0)
 
     def test_repair_checkpoint_preserves_binary_untracked_and_deleted_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
