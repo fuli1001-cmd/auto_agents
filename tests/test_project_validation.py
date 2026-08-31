@@ -149,6 +149,39 @@ class ProjectRunLockTests(unittest.TestCase):
                 snapshot["control"]["project"], str(project_root.resolve())
             )
 
+    def test_acquire_reports_unexpected_health_owner_exit_without_child_control(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            project_root.mkdir()
+            health_control = (
+                project_root
+                / ".auto-agents"
+                / "state"
+                / "health-watch-control.json"
+            )
+            write_json(
+                health_control,
+                {
+                    "schema_version": 1,
+                    "project": str(project_root.resolve()),
+                    "workflow_kind": "run",
+                    "subject_id": "run-1",
+                    "run_token": "old-token",
+                    "owner_pid": 999999,
+                    "owner_start_ticks": 1,
+                    "process_phase": "self_repair",
+                    "updated_at": "2026-08-31T00:00:00+00:00",
+                },
+            )
+            lock = ProjectRunLock(project_root, environ={})
+            try:
+                lock.acquire()
+                snapshot = lock.interrupted_snapshot
+            finally:
+                lock.release()
+            self.assertEqual(snapshot["health"]["run_token"], "old-token")
+            self.assertEqual(snapshot["control"]["processes"], [])
+
     def test_cli_rejects_duplicate_before_constructing_orchestrator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

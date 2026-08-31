@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -57,11 +58,12 @@ from .prototype_variants import (
 from .foreground_activity import ForegroundActivity
 from .git_ops import add_worktree, changed_paths, remove_worktree
 from .health_watch import HealthSelfRepairRequired, build_progress_vector
+from .health_control import health_watch_status, request_health_state
 from .health_watchdog import (
     mark_watchdog_stop_intent,
-    run_watchdog,
-    start_run_watchdog,
+    run_health_sidecar,
 )
+from .workflow_health import WorkflowHealthRuntime
 from .process_supervision import (
     ACTIVE_PROCESSES,
     RunInterruptedError,
@@ -1082,6 +1084,9 @@ def _auto_repair_auto_agents_and_resume(
     diagnosis=None,
     repair_case: Optional[RepairCase] = None,
 ) -> int:
+    health_runtime = getattr(orchestrator, "_workflow_health_runtime", None)
+    if health_runtime is not None:
+        health_runtime.set_phase("self_repair")
     health_repair = bool(repair_case is not None and repair_case.source == "health_watch")
     if health_repair:
         state = load_run_state(project_root)
@@ -2014,6 +2019,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("off", "guarded", "max"),
         help="Override autonomous repair mode for this session.",
     )
+    fix_parser.add_argument(
+        "--no-health-watch",
+        action="store_true",
+        help="Disable proactive health supervision for this invocation.",
+    )
 
     collab_parser = subparsers.add_parser("collab", help="User-agent collaborative debugging session.")
     collab_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -2049,6 +2059,23 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("off", "guarded", "max"),
         help="Override autonomous repair mode for this session.",
     )
+    collab_parser.add_argument(
+        "--no-health-watch",
+        action="store_true",
+        help="Disable proactive health supervision for this invocation.",
+    )
+
+    health_watch_parser = subparsers.add_parser(
+        "health-watch",
+        help="Dynamically control health supervision for the active workflow.",
+    )
+    health_watch_subparsers = health_watch_parser.add_subparsers(
+        dest="health_watch_command",
+        required=True,
+    )
+    for health_command in ("start", "stop", "status"):
+        health_command_parser = health_watch_subparsers.add_parser(health_command)
+        health_command_parser.add_argument("--project", required=True)
 
     persistence_parser = subparsers.add_parser(
         "persistence-configure",
@@ -2206,9 +2233,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workers_cleanup.add_argument("--max-age-seconds", type=float, default=86400.0)
 
-    watchdog_parser = subparsers.add_parser("_watchdog", help=argparse.SUPPRESS)
+    watchdog_parser = subparsers.add_parser("_health-sidecar", help=argparse.SUPPRESS)
     watchdog_parser.add_argument("--project", required=True)
-    watchdog_parser.add_argument("--run-id", required=True)
 
     worker_parser = subparsers.add_parser(
         "worker",
@@ -2232,8 +2258,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _load_cli_dotenv()
 
-    if args.command == "_watchdog":
-        return run_watchdog(Path(args.project), str(args.run_id))
+    if args.command == "_health-sidecar":
+        return run_health_sidecar(Path(args.project))
+
+    if args.command == "health-watch":
+        try:
+            if args.health_watch_command == "status":
+                payload = health_watch_status(Path(args.project))
+            else:
+                payload = request_health_state(
+                    Path(args.project),
+                    enabled=args.health_watch_command == "start",
+                )
+        except (OSError, RuntimeError, ValueError) as error:
+            payload = {"ok": False, "error": str(error)}
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if bool(payload.get("ok")) else 1
 
     self_repair_preflight_exit = _preflight_automatic_self_repair(args)
     if self_repair_preflight_exit is not None:
@@ -2580,6 +2620,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         orchestrator = None
+        health_runtime = None
         project_root = Path(args.project)
         run_lock = ProjectRunLock(project_root)
         try:
@@ -2593,9 +2634,24 @@ def main(argv: list[str] | None = None) -> int:
             spec_file = _apply_saved_run_context(args, project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
             orchestrator._run_token = run_lock.run_token
-            if bool(getattr(args, "no_health_watch", False)):
-                orchestrator.config.execution.health_watch.enabled = False
-                orchestrator.config.execution.health_watch.sidecar_enabled = False
+            health_config = getattr(
+                getattr(getattr(orchestrator, "config", None), "execution", None),
+                "health_watch",
+                None,
+            )
+            if health_config is not None:
+                if bool(getattr(args, "no_health_watch", False)):
+                    health_config.enabled = False
+                health_runtime = WorkflowHealthRuntime(
+                    project_root,
+                    workflow_kind="run",
+                    run_token=run_lock.run_token,
+                    enabled=bool(health_config.enabled),
+                    auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
+                    orchestrator=orchestrator,
+                )
+                orchestrator._workflow_health_runtime = health_runtime
+                health_runtime.start()
             configured_autonomy = getattr(
                 getattr(
                     getattr(orchestrator, "config", None),
@@ -2619,17 +2675,21 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"ok": True, "receipt": receipt}, indent=2, ensure_ascii=False))
                 return 0
             _promote_pending_self_repairs(project_root)
-            if hasattr(orchestrator, "_start_health_supervision"):
-                orchestrator._watchdog_launcher = lambda watched_state: start_run_watchdog(
-                    project_root=project_root,
-                    run_id=watched_state.run_id,
-                    run_token=run_lock.run_token,
-                    auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
+            if health_runtime is not None and hasattr(orchestrator, "_start_health_supervision"):
+                orchestrator._watchdog_launcher = (
+                    lambda watched_state: (
+                        run_lock.bind_subject("run", watched_state.run_id),
+                        health_runtime.bind_subject(watched_state.run_id),
+                    )
                 )
             if run_lock.interrupted_snapshot:
+                if health_runtime is not None:
+                    health_runtime.set_phase("resuming")
                 interrupted_state = orchestrator.reconcile_runtime_interruption(
                     run_lock.interrupted_snapshot
                 )
+                if health_runtime is not None:
+                    health_runtime.set_phase("run")
                 if (
                     interrupted_state.status == "paused"
                     and interrupted_state.pending_approval
@@ -2656,6 +2716,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             state_payload = state.to_dict()
             state_status = str(state_payload.get("status", ""))
+            if state_status == "completed" and health_runtime is not None:
+                health_runtime.set_phase("finalizing")
             if state_status == "waiting_user":
                 _safe_notify(notify_run_waiting, project_root, state_payload)
                 print(_render_run_summary(project_root, state_payload))
@@ -2666,6 +2728,8 @@ def main(argv: list[str] | None = None) -> int:
                 else {}
             )
             if state_status in {"blocked", "failed"}:
+                if health_runtime is not None:
+                    health_runtime.set_phase("triage")
                 playbook_exit = _try_deterministic_self_repair_playbook(
                     project_root,
                     orchestrator,
@@ -2724,6 +2788,8 @@ def main(argv: list[str] | None = None) -> int:
             print(_render_run_summary(project_root, state_payload))
             return 0
         except HealthSelfRepairRequired as error:
+            if health_runtime is not None:
+                health_runtime.set_phase("self_repair")
             triage = error.triage
             return _auto_repair_auto_agents_and_resume(
                 project_root,
@@ -2749,6 +2815,8 @@ def main(argv: list[str] | None = None) -> int:
             return 130
         except Exception as error:
             project_root = Path(args.project)
+            if health_runtime is not None:
+                health_runtime.set_phase("triage")
             triage = _triage_terminal_run_error(project_root, orchestrator, error)
             decision = triage.decision
             if orchestrator is not None and decision.eligible:
@@ -2776,6 +2844,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 3
         finally:
+            if health_runtime is not None:
+                health_runtime.close(reason="foreground run command exited")
             signal_scope.__exit__(None, None, None)
             run_lock.release()
 
@@ -2810,12 +2880,8 @@ def main(argv: list[str] | None = None) -> int:
             run_path(project_root, state.run_id) / "health" / "summary.json",
             default={},
         )
-        watchdog = read_json(
-            run_path(project_root, state.run_id) / "health" / "watchdog.json",
-            default={},
-        )
         payload["health"] = health if isinstance(health, dict) else {}
-        payload["watchdog"] = watchdog if isinstance(watchdog, dict) else {}
+        payload["health_watch"] = health_watch_status(project_root)
         payload["runtime"] = runtime_status(project_root)
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
@@ -3007,12 +3073,33 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command in ("fix", "collab", "provider-resolve"):
         foreground = ForegroundActivity(Path(args.project))
+        health_runtime = None
         try:
             foreground.acquire()
             from .session import Session
 
             project_root = Path(args.project)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            health_config = getattr(
+                getattr(getattr(orchestrator, "config", None), "execution", None),
+                "health_watch",
+                None,
+            )
+            if health_config is not None:
+                if bool(getattr(args, "no_health_watch", False)):
+                    health_config.enabled = False
+                health_runtime = WorkflowHealthRuntime(
+                    project_root,
+                    workflow_kind=(
+                        args.command if args.command in {"fix", "collab"} else "fix"
+                    ),
+                    run_token=uuid.uuid4().hex,
+                    enabled=bool(health_config.enabled),
+                    auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
+                    orchestrator=orchestrator,
+                )
+                orchestrator._workflow_health_runtime = health_runtime
+                health_runtime.start()
             _promote_pending_self_repairs(project_root)
             orchestrator._ensure_agent_instructions_synced()
             if getattr(args, "provider", None):
@@ -3030,6 +3117,8 @@ def main(argv: list[str] | None = None) -> int:
                 "mode": mode,
                 "print_agent_output": bool(args.print_agent_output),
             }
+            if health_runtime is not None:
+                session_kwargs["health_runtime"] = health_runtime
             if bool(getattr(args, "auto_approve", False)):
                 session_kwargs["auto_approve"] = True
             if bool(getattr(args, "full_verify", False)):
@@ -3039,6 +3128,8 @@ def main(argv: list[str] | None = None) -> int:
                 state = session.resume(args.session)
             else:
                 state = session.offer_resume_or_new()
+            if state.status == "completed" and health_runtime is not None:
+                health_runtime.set_phase("finalizing")
             _safe_notify(
                 notify_session_finished,
                 project_root,
@@ -3054,6 +3145,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         except (RuntimeError, FileNotFoundError, ValueError) as error:
             project_root = Path(args.project)
+            if health_runtime is not None:
+                health_runtime.set_phase("triage")
             triage = (
                 _triage_terminal_run_error(project_root, orchestrator, error)
                 if "orchestrator" in locals()
@@ -3089,6 +3182,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
         finally:
+            if health_runtime is not None:
+                health_runtime.close(reason="foreground session command exited")
             foreground.release()
 
     parser.error(f"Unsupported command: {args.command}")

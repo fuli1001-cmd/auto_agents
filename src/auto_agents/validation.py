@@ -2408,7 +2408,7 @@ def validate_project_config_payload(payload: object) -> List[str]:
             if not isinstance(health_watch, dict):
                 errors.append("execution.health_watch must be an object")
             else:
-                for key in ("enabled", "sidecar_enabled", "agent_triage_enabled"):
+                for key in ("enabled", "agent_triage_enabled"):
                     if not isinstance(health_watch.get(key, True), bool):
                         errors.append(
                             f"execution.health_watch.{key} must be a boolean"
@@ -2416,11 +2416,9 @@ def validate_project_config_payload(payload: object) -> List[str]:
                 integer_minimums = {
                     "poll_seconds": 5,
                     "heartbeat_timeout_seconds": 15,
-                    "sidecar_grace_seconds": 0,
                     "oscillation_repeat_limit": 2,
                     "recovery_churn_limit": 2,
                     "max_interventions_per_root": 1,
-                    "max_sidecar_restarts_per_run": 0,
                     "quiesce_timeout_seconds": 60,
                     "boundary_replay_timeout_seconds": 60,
                 }
@@ -2430,11 +2428,9 @@ def validate_project_config_payload(payload: object) -> List[str]:
                         {
                             "poll_seconds": 30,
                             "heartbeat_timeout_seconds": 120,
-                            "sidecar_grace_seconds": 60,
                             "oscillation_repeat_limit": 3,
                             "recovery_churn_limit": 3,
                             "max_interventions_per_root": 3,
-                            "max_sidecar_restarts_per_run": 2,
                             "quiesce_timeout_seconds": 600,
                             "boundary_replay_timeout_seconds": 1200,
                         }[key],

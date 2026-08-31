@@ -7885,6 +7885,14 @@ class Orchestrator:
 
     def _start_health_supervision(self, state: RunState) -> None:
         config = self.config.execution.health_watch
+        if self._watchdog_launcher is not None:
+            try:
+                self._watchdog_launcher(state)
+            except Exception as error:
+                self.logger.warning(
+                    "[health-watch] sidecar launch failed: %s",
+                    error,
+                )
         if not config.enabled or self._health_supervisor is not None:
             return
         supervisor = RunHealthSupervisor(
@@ -7897,14 +7905,6 @@ class Orchestrator:
         )
         self._health_supervisor = supervisor
         supervisor.start()
-        if self._watchdog_launcher is not None:
-            try:
-                self._watchdog_launcher(state)
-            except Exception as error:
-                self.logger.warning(
-                    "[health-watch] sidecar launch failed: %s",
-                    error,
-                )
 
     def stop_health_supervision(self, status: str = "stopped", reason: str = "") -> None:
         supervisor, self._health_supervisor = self._health_supervisor, None
@@ -8078,6 +8078,9 @@ class Orchestrator:
             return triage
         finally:
             self._health_action_in_progress = False
+            supervisor = self._health_supervisor
+            if supervisor is not None:
+                supervisor.complete_action(request)
 
     def verify_health_repair_boundary(self, case_id: str) -> Dict[str, object]:
         state = load_run_state(self.project_root)

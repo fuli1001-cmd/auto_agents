@@ -15,6 +15,11 @@ from typing import Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .config import load_run_state, run_path
 from .git_ops import head_ref, worktree_fingerprint
+from .health_control import (
+    HealthActionStore,
+    evidence_digest as durable_evidence_digest,
+    load_active_manifest,
+)
 from .io_utils import read_json
 from .models import HealthWatchConfig, RunState, STAGE_ORDER, SmartTimeoutConfig, TaskSpec
 from .process_supervision import ACTIVE_PROCESSES, process_start_ticks
@@ -141,6 +146,7 @@ class HealthActionRequest:
     action: str
     anomaly: HealthAnomaly
     repair_case_id: str
+    durable_request_id: str = ""
     created_at: str = field(default_factory=utc_now)
 
 
@@ -525,6 +531,7 @@ class RunHealthSupervisor:
         self.autonomy_mode = str(autonomy_mode or "max")
         self.run_token = str(run_token)
         self.root = run_path(self.project_root, self.run_id) / "health"
+        self.action_store = HealthActionStore(self.project_root, "run", self.run_id)
         self.evaluator = RunHealthEvaluator(config)
         self._control_events: "queue.Queue[Tuple[str, bool]]" = queue.Queue()
         self._actions: "queue.Queue[HealthActionRequest]" = queue.Queue()
@@ -638,13 +645,139 @@ class RunHealthSupervisor:
         self._control_events.put((value, bool(rewind)))
 
     def pop_action(self) -> Optional[HealthActionRequest]:
+        durable = self.action_store.next_pending(run_token=self.run_token)
+        if durable is not None:
+            request = self._materialize_durable_action(durable)
+            if request is not None:
+                self.action_store.transition(
+                    request.durable_request_id,
+                    "claimed",
+                    detail="claimed by the foreground health coordinator",
+                )
+                return request
+            request_id = str(durable.get("request_id", ""))
+            if request_id:
+                self.action_store.transition(
+                    request_id,
+                    "rejected",
+                    detail="request identity did not match the active run/token",
+                )
         try:
             return self._actions.get_nowait()
         except queue.Empty:
             return None
 
+    def complete_action(self, request: HealthActionRequest, *, detail: str = "") -> None:
+        if request.durable_request_id:
+            self.action_store.transition(
+                request.durable_request_id,
+                "completed",
+                detail=detail or "foreground health action completed",
+            )
+
+    def _materialize_durable_action(
+        self, payload: Mapping[str, object]
+    ) -> Optional[HealthActionRequest]:
+        if str(payload.get("source", "")) != "health_sidecar":
+            return None
+        if str(payload.get("action", "")) not in {"diagnose", "exhausted"}:
+            return None
+        if not str(payload.get("request_id", "")).strip():
+            return None
+        if str(payload.get("subject_id", "")) != self.run_id:
+            return None
+        if str(payload.get("run_token", "")) != self.run_token:
+            return None
+        evidence = payload.get("evidence", {})
+        evidence_map = dict(evidence) if isinstance(evidence, Mapping) else {}
+        supplied_digest = str(payload.get("evidence_digest", ""))
+        if (
+            not evidence_map
+            or not supplied_digest
+            or durable_evidence_digest(evidence_map) != supplied_digest
+        ):
+            return None
+        try:
+            observation_sequence = int(payload.get("observation_sequence", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if observation_sequence < 0:
+            return None
+        raw_anomaly = evidence_map.get("anomaly", {})
+        anomaly_map = dict(raw_anomaly) if isinstance(raw_anomaly, Mapping) else {}
+        reason = str(payload.get("reason", "health anomaly"))
+        kind = str(anomaly_map.get("kind", "")) or reason.split(":", 1)[-1]
+        stage = str(anomaly_map.get("stage", ""))
+        root = str(anomaly_map.get("root_fingerprint", "")) or stable_repair_fingerprint(
+            kind, stage, str(payload.get("evidence_digest", ""))
+        )
+        expected = anomaly_map.get("expected_postconditions", [])
+        expected_postconditions = (
+            tuple(str(item) for item in expected if str(item).strip())
+            if isinstance(expected, (list, tuple))
+            else ()
+        ) or (
+            "independent and in-process observations agree",
+            "durable workflow progress resumes without regression",
+        )
+        anomaly = HealthAnomaly(
+            kind=kind,
+            severity=str(anomaly_map.get("severity", "confirmed")),
+            stage=stage,
+            root_fingerprint=root,
+            reason=str(anomaly_map.get("reason", reason)),
+            expected_postconditions=expected_postconditions,
+            failure_scope=str(anomaly_map.get("failure_scope", "run")),
+            task_id=str(anomaly_map.get("task_id", "")),
+        )
+        raw_snapshot = evidence_map.get("snapshot", {})
+        snapshot_map = dict(raw_snapshot) if isinstance(raw_snapshot, Mapping) else {}
+        raw_progress = snapshot_map.get("progress", {})
+        progress_before = (
+            dict(raw_progress) if isinstance(raw_progress, Mapping) else {}
+        )
+        repair_case = RepairCase(
+            case_id=uuid.uuid4().hex[:12],
+            run_id=self.run_id,
+            source="health_watch",
+            kind=anomaly.kind,
+            severity=anomaly.severity,
+            stage=anomaly.stage,
+            task_id=anomaly.task_id,
+            failure_scope=anomaly.failure_scope,
+            symptom=anomaly.reason,
+            fingerprint=root,
+            root_fingerprint=root,
+            progress_before=progress_before,
+            progress_history=([snapshot_map] if snapshot_map else []),
+            evidence_refs=[
+                str(self.root / "auditor-snapshot.json"),
+                str(self.action_store.path),
+            ],
+            expected_postconditions=list(anomaly.expected_postconditions),
+            status="open",
+        )
+        RepairCaseStore(self.project_root, self.run_id).save(repair_case)
+        count = self._interventions.get(root, 0)
+        exhausted = count >= self.config.max_interventions_per_root
+        if not exhausted:
+            self._interventions[root] = count + 1
+        return HealthActionRequest(
+            action=(
+                "exhausted"
+                if exhausted or str(payload.get("action", "")) == "exhausted"
+                else "diagnose"
+            ),
+            anomaly=anomaly,
+            repair_case_id=repair_case.case_id,
+            durable_request_id=str(payload.get("request_id", "")),
+        )
+
     def quiesce_requested(self) -> bool:
-        return not self._actions.empty()
+        return bool(
+            not self._actions.empty()
+            or self.action_store.next_pending(run_token=self.run_token) is not None
+        )
 
     @property
     def summary(self) -> Dict[str, object]:
@@ -732,6 +865,7 @@ class RunHealthSupervisor:
                 else ""
             ),
             "progress_digest": snapshot.progress.digest,
+            "state_digest": _json_hash(state.to_dict()),
             "activity_digest": snapshot.activity_digest,
             "active_tool_count": snapshot.active_tool_count,
             "active_repair_root": self._last_anomaly_root,
@@ -747,72 +881,13 @@ class RunHealthSupervisor:
         anomaly: HealthAnomaly,
         snapshot: HealthSnapshot,
     ) -> None:
+        # The in-process evaluator remains a fast advisory probe. Only the
+        # independent sidecar may request a semantic intervention.
         root = anomaly.root_fingerprint
-        count = self._interventions.get(root, 0)
-        exhausted = count >= self.config.max_interventions_per_root
-        active_case = RepairCaseStore(
-            self.project_root, self.run_id
-        ).latest_open()
-        if (
-            active_case is not None
-            and active_case.root_fingerprint == root
-            and active_case.status
-            in {
-                "open",
-                "self_repair",
-                "self_repairing",
-                "resuming",
-                "boundary_verified",
-            }
-        ):
-            return
-        cooldown = max(60.0, float(self.config.poll_seconds) * 4.0)
-        if (
-            root == self._last_anomaly_root
-            and time.time() - self._last_anomaly_at < cooldown
-        ) or count > self.config.max_interventions_per_root:
-            return
         self._last_anomaly_root = root
         self._last_anomaly_at = time.time()
-        self._append_event({"kind": "anomaly", "anomaly": anomaly.to_dict()})
-        repair_case = RepairCase(
-            case_id=uuid.uuid4().hex[:12],
-            run_id=self.run_id,
-            source="health_watch",
-            kind=anomaly.kind,
-            severity=anomaly.severity,
-            stage=anomaly.stage,
-            task_id=anomaly.task_id,
-            failure_scope=anomaly.failure_scope,
-            symptom=anomaly.reason,
-            fingerprint=root,
-            root_fingerprint=root,
-            progress_before=snapshot.progress.to_dict(),
-            progress_history=list(self._recent_snapshots),
-            activity_history=[
-                {
-                    "observed_at": snapshot.observed_at,
-                    "activity_digest": snapshot.activity_digest,
-                }
-            ],
-            evidence_refs=[
-                str(self.root / "summary.json"),
-                str(self.root / "events.jsonl"),
-                str(self.root / "snapshots" / f"{snapshot.sequence:08d}.json"),
-            ],
-            expected_postconditions=list(anomaly.expected_postconditions),
-            status=("needs_human" if exhausted else "open"),
-        )
-        RepairCaseStore(self.project_root, self.run_id).save(repair_case)
-        if self.autonomy_mode == "off":
-            return
-        self._interventions[root] = count + 1
-        self._actions.put(
-            HealthActionRequest(
-                action=("exhausted" if exhausted else "diagnose"),
-                anomaly=anomaly,
-                repair_case_id=repair_case.case_id,
-            )
+        self._append_event(
+            {"kind": "local_advisory_anomaly", "anomaly": anomaly.to_dict()}
         )
 
     def _write_snapshot(self, snapshot: HealthSnapshot) -> None:
@@ -841,6 +916,7 @@ class RunHealthSupervisor:
         if self._terminal_status:
             status = self._terminal_status
             reason = self._terminal_reason or reason
+        manifest = load_active_manifest(self.project_root, require_owner=False)
         payload = {
             "schema_version": HEALTH_SCHEMA_VERSION,
             "run_id": self.run_id,
@@ -848,6 +924,7 @@ class RunHealthSupervisor:
             "owner_pid": os.getpid(),
             "owner_start_ticks": process_start_ticks(os.getpid()),
             "status": status,
+            "process_phase": str(manifest.get("process_phase", "run")),
             "reason": reason,
             "updated_at": utc_now(),
             "updated_epoch": time.time(),

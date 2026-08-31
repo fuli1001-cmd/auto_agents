@@ -26,6 +26,13 @@ RUN_LOCK_KEY_ENV = "AUTO_AGENTS_RUN_LOCK_KEY"
 RUN_LOCK_TOKEN_ENV = "AUTO_AGENTS_RUN_TOKEN"
 
 
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 class RunAlreadyActiveError(RuntimeError):
     """Raised when another process already owns the target project's run lock."""
 
@@ -42,6 +49,9 @@ class ProjectRunLock:
         self._fd: Optional[int] = None
         self._interrupted_snapshot: dict[str, object] = {}
         self.run_token = str(self._environ.get(RUN_LOCK_TOKEN_ENV, "")).strip() or uuid.uuid4().hex
+        self.workflow_kind = "run"
+        self.subject_id = ""
+        self._started_at = datetime.now(timezone.utc).isoformat()
 
     @property
     def fileno(self) -> int:
@@ -75,6 +85,12 @@ class ProjectRunLock:
         self._fd = fd
         previous_owner = _read_json_path(self.path)
         previous_control = read_process_control(self.control_path)
+        previous_health = _read_json_path(
+            self.project_root
+            / ".auto-agents"
+            / "state"
+            / "health-watch-control.json"
+        )
         orphaned = _live_control_processes(self.control_path, expected_project=str(self.project_root))
         if orphaned:
             self.release()
@@ -83,14 +99,33 @@ class ProjectRunLock:
                 f"orphaned auto_agents subprocesses are still active for {self.project_root} "
                 f"({details}); run `python auto_agents.py stop --project {self.project_root}`"
             )
+        prior_health_unexpected = bool(
+            str(previous_health.get("project", "")) == str(self.project_root)
+            and str(previous_health.get("run_token", "")).strip()
+            and str(previous_health.get("process_phase", "")) != "terminal"
+            and not process_identity_matches(
+                _safe_int(previous_health.get("owner_pid", 0)),
+                _safe_int(previous_health.get("owner_start_ticks", 0)),
+            )
+        )
         if (
             previous_control
             and str(previous_control.get("project", "")) == str(self.project_root)
-        ):
+        ) or prior_health_unexpected:
             self._interrupted_snapshot = {
                 "detected_at": datetime.now(timezone.utc).isoformat(),
                 "owner": previous_owner,
-                "control": previous_control,
+                "control": (
+                    previous_control
+                    if previous_control
+                    else {
+                        "project": str(self.project_root),
+                        "run_token": str(previous_health.get("run_token", "")),
+                        "updated_at": str(previous_health.get("updated_at", "")),
+                        "processes": [],
+                    }
+                ),
+                "health": previous_health if prior_health_unexpected else {},
             }
         self._write_owner(fd)
         ACTIVE_PROCESSES.configure(self.project_root, self.run_token, self.control_path)
@@ -102,18 +137,31 @@ class ProjectRunLock:
 
     def _write_owner(self, fd: int) -> None:
         payload = {
-            "version": 2,
+            "version": 3,
             "pid": os.getpid(),
             "pid_start_ticks": process_start_ticks(os.getpid()),
             "project": str(self.project_root),
             "run_token": self.run_token,
-            "started_at": datetime.now(timezone.utc).isoformat(),
+            "workflow_kind": self.workflow_kind,
+            "subject_id": self.subject_id,
+            "started_at": self._started_at,
         }
         encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, encoded)
         os.fsync(fd)
+
+    def bind_subject(self, workflow_kind: str, subject_id: str) -> None:
+        if self._fd is None:
+            raise RuntimeError("project run lock is not acquired")
+        normalized_kind = str(workflow_kind).strip()
+        normalized_subject = str(subject_id).strip()
+        if normalized_kind:
+            self.workflow_kind = normalized_kind
+        if normalized_subject:
+            self.subject_id = normalized_subject
+        self._write_owner(self._fd)
 
     def _inherited_fd(self) -> Optional[int]:
         if self._environ.get(RUN_LOCK_KEY_ENV) != self.key:

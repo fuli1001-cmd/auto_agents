@@ -98,6 +98,7 @@ class Session:
         print_agent_output: bool = False,
         full_verify: bool = False,
         auto_approve: bool = False,
+        health_runtime: object = None,
     ) -> None:
         self.orch = orchestrator
         self.project_root = orchestrator.project_root
@@ -106,6 +107,7 @@ class Session:
         self._print_agent_output = print_agent_output
         self._full_verify = bool(full_verify)
         self._auto_approve = bool(auto_approve)
+        self._health_runtime = health_runtime
         # ``fix --full-verify`` keeps its existing session-wide semantics.
         # Collab only bypasses certificates for the final attestation; progress
         # checks must remain incremental so the interactive loop stays fast.
@@ -336,6 +338,7 @@ class Session:
     def _drive(self, state: SessionState) -> SessionState:
         """Drive the session through its phases until completion or pause."""
         try:
+            self._check_health_action()
             if state.status == "conversing":
                 state = self._phase_converse(state)
 
@@ -346,6 +349,7 @@ class Session:
                     state = self._phase_provider_resolve_execute(state)
                 else:
                     state = self._phase_collab_loop(state)
+            self._check_health_action()
         except KeyboardInterrupt:
             self._print("\nSession interrupted by user. Progress saved.")
             self._save(state)
@@ -402,6 +406,7 @@ class Session:
         rounds = 0
 
         while rounds < max_converse_rounds:
+            self._check_health_action()
             rounds += 1
             prompt = self._build_converse_prompt(state)
             try:
@@ -537,6 +542,7 @@ class Session:
         self._ensure_baseline(state)
         feedback = ""
         while True:
+            self._check_health_action()
             state.current_attempt += 1
             self._print(f"\n--- Fix attempt {state.current_attempt} ---")
 
@@ -672,6 +678,7 @@ class Session:
             self._ensure_baseline(state)
         feedback = ""
         while True:
+            self._check_health_action()
             stop = self._should_stop(state, "attempt limit reached")
             if stop:
                 self._print(stop)
@@ -878,6 +885,7 @@ class Session:
         self._current_state = state
         feedback = ""
         while True:
+            self._check_health_action()
             if state.current_attempt >= state.max_attempts:
                 self._print(
                     f"Provider recovery attempt limit ({state.max_attempts}) "
@@ -2570,6 +2578,25 @@ class Session:
     def _save(self, state: SessionState) -> None:
         state.updated_at = self._now()
         save_session_state(self.project_root, state)
+        publish = getattr(self._health_runtime, "publish_session", None)
+        if callable(publish):
+            publish(state)
+
+    def _check_health_action(self) -> None:
+        pending = getattr(self._health_runtime, "pending_session_action", None)
+        if not callable(pending):
+            return
+        request = pending()
+        if not isinstance(request, dict):
+            return
+        request_id = str(request.get("request_id", ""))
+        complete = getattr(self._health_runtime, "complete_session_action", None)
+        if callable(complete) and request_id:
+            complete(request_id, detail="routed to foreground terminal triage")
+        raise RuntimeError(
+            "health sidecar requested foreground diagnosis: "
+            + str(request.get("reason", "unknown health anomaly"))
+        )
 
     def _print(self, msg: str, flush: bool = False) -> None:
         print(msg, file=sys.stderr, flush=flush)

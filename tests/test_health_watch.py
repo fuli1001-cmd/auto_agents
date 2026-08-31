@@ -31,10 +31,19 @@ from auto_agents.health_watch import (
 from auto_agents.models import HealthWatchConfig, SmartTimeoutConfig, TaskSpec
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.health_watchdog import (
-    mark_watchdog_stop_intent,
-    run_watchdog,
-    start_run_watchdog,
-    watchdog_control_path,
+    run_health_sidecar,
+    start_health_sidecar,
+)
+from auto_agents.health_control import (
+    HealthActionRecord,
+    HealthActionStore,
+    HealthControlChannel,
+    action_store_path,
+    control_path,
+    evidence_digest,
+    load_active_manifest,
+    request_health_state,
+    subject_health_root,
 )
 from auto_agents.repair_cases import RepairCase, RepairCaseStore
 from auto_agents.process_supervision import process_start_ticks
@@ -109,6 +118,12 @@ class HealthWatchTests(unittest.TestCase):
             self.assertTrue(config.execution.health_watch.enabled)
             self.assertTrue(config.execution.health_watch.sidecar_enabled)
             self.assertEqual(config.execution.health_watch.poll_seconds, 30)
+            serialized = json.loads(
+                (project / ".auto-agents" / "config.json").read_text(encoding="utf-8")
+            )["execution"]["health_watch"]
+            self.assertNotIn("sidecar_enabled", serialized)
+            self.assertNotIn("sidecar_grace_seconds", serialized)
+            self.assertNotIn("max_sidecar_restarts_per_run", serialized)
 
     def test_health_config_validation_rejects_short_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -123,6 +138,22 @@ class HealthWatchTests(unittest.TestCase):
             self.assertTrue(
                 any("heartbeat_timeout_seconds" in error for error in errors)
             )
+
+    def test_legacy_sidecar_config_is_ignored_warned_and_not_serialized(self) -> None:
+        with self.assertWarns(FutureWarning):
+            config = HealthWatchConfig.from_dict(
+                {
+                    "enabled": True,
+                    "sidecar_enabled": False,
+                    "sidecar_grace_seconds": 999,
+                    "max_sidecar_restarts_per_run": 99,
+                }
+            )
+        payload = config.to_dict()
+        self.assertTrue(payload["enabled"])
+        self.assertNotIn("sidecar_enabled", payload)
+        self.assertNotIn("sidecar_grace_seconds", payload)
+        self.assertNotIn("max_sidecar_restarts_per_run", payload)
 
     def test_progress_vector_counts_only_durable_task_and_proof_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -289,17 +320,46 @@ class HealthWatchTests(unittest.TestCase):
         )
         self.assertEqual([item.kind for item in anomalies], ["oscillating"])
 
-    def test_watchdog_planned_stop_never_restarts(self) -> None:
+    def test_control_channel_applies_dynamic_stop_without_stopping_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "project"
             bootstrap_project(project, "demo")
             state = load_run_state(project)
-            mark_watchdog_stop_intent(
+            events = []
+            channel = HealthControlChannel(
                 project,
-                state.run_id,
-                reason="unit test",
+                workflow_kind="run",
+                run_token="token",
+                enabled=True,
+                on_enable=lambda payload: events.append("enabled"),
+                on_disable=lambda payload: events.append("disabled"),
             )
-            self.assertEqual(run_watchdog(project, state.run_id), 0)
+            channel.start(state.run_id)
+            result = request_health_state(project, enabled=False, timeout_seconds=3)
+            self.assertEqual(result["applied_state"], "disabled")
+            self.assertEqual(events, ["disabled"])
+            self.assertTrue(Path(f"/proc/{os.getpid()}").exists())
+            channel.close(reason="test complete")
+
+    def test_control_channel_can_enable_a_command_started_without_health_watch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = load_run_state(project)
+            events = []
+            channel = HealthControlChannel(
+                project,
+                workflow_kind="run",
+                run_token="token",
+                enabled=False,
+                on_enable=lambda payload: events.append("enabled"),
+                on_disable=lambda payload: events.append("disabled"),
+            )
+            channel.start(state.run_id)
+            result = request_health_state(project, enabled=True, timeout_seconds=3)
+            self.assertEqual(result["applied_state"], "enabled")
+            self.assertEqual(events, ["enabled"])
+            channel.close(reason="test complete")
 
     def test_late_health_tick_cannot_overwrite_terminal_heartbeat(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -327,137 +387,112 @@ class HealthWatchTests(unittest.TestCase):
                 "run entered root-cause diagnosis",
             )
 
-    def test_watchdog_records_dead_owner_and_exits_without_restart(self) -> None:
+    def test_sidecar_records_dead_owner_and_exits_without_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "project"
             bootstrap_project(project, "demo")
             state = load_run_state(project)
-            control = watchdog_control_path(project, state.run_id)
+            control = control_path(project)
             control.parent.mkdir(parents=True, exist_ok=True)
             control.write_text(
                 json.dumps(
                     {
-                        "run_id": state.run_id,
+                        "schema_version": 1,
+                        "project": str(project.resolve()),
+                        "workflow_kind": "run",
+                        "subject_id": state.run_id,
                         "run_token": "token",
-                        "mode": "observe_only",
-                        "planned_stop": False,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            heartbeat = control.parent / "heartbeat.json"
-            heartbeat.write_text(
-                json.dumps(
-                    {
-                        "run_id": state.run_id,
                         "owner_pid": 999999,
                         "owner_start_ticks": 1,
-                        "updated_epoch": 1,
-                        "status": "healthy",
+                        "process_phase": "run",
+                        "desired_state": "enabled",
                     }
                 ),
                 encoding="utf-8",
             )
-            self.assertEqual(run_watchdog(project, state.run_id), 0)
-            updated = json.loads(control.read_text(encoding="utf-8"))
-            self.assertEqual(updated["status"], "owner_exited")
-            self.assertNotIn("restart_command", updated)
-            diagnostics = list(
-                (control.parent / "watchdog-diagnostics").glob("*.json")
+            with patch(
+                "auto_agents.health_watchdog.UNEXPECTED_EXIT_GRACE_SECONDS", 0
+            ):
+                self.assertEqual(run_health_sidecar(project), 0)
+            health_root = subject_health_root(project, "run", state.run_id)
+            diagnostic = json.loads(
+                (health_root / "unexpected-owner-exit.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(len(diagnostics), 1)
-            diagnostic = json.loads(diagnostics[0].read_text(encoding="utf-8"))
-            self.assertEqual(diagnostic["reason"], "owner_exited")
+            self.assertEqual(diagnostic["kind"], "unexpected_owner_exit")
+            actions = json.loads(
+                action_store_path(project, "run", state.run_id).read_text(encoding="utf-8")
+            )["requests"]
+            self.assertEqual(actions[0]["action"], "pending_manual_resume")
+            self.assertNotIn("restart_command", diagnostic)
 
-    def test_watchdog_observes_stale_live_owner_without_signaling_it(self) -> None:
+    def test_sidecar_follows_terminal_owner_without_signaling_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "project"
             bootstrap_project(project, "demo")
-            config = load_project_config(project)
-            config.execution.health_watch.poll_seconds = 5
-            save_project_config(project, config)
             state = load_run_state(project)
-            control = watchdog_control_path(project, state.run_id)
+            control = control_path(project)
             control.parent.mkdir(parents=True, exist_ok=True)
             control.write_text(
                 json.dumps(
                     {
-                        "run_id": state.run_id,
-                        "run_token": "token",
-                        "mode": "observe_only",
-                        "planned_stop": False,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            heartbeat = control.parent / "heartbeat.json"
-            heartbeat.write_text(
-                json.dumps(
-                    {
-                        "run_id": state.run_id,
+                        "schema_version": 1,
+                        "project": str(project.resolve()),
+                        "workflow_kind": "run",
+                        "subject_id": state.run_id,
                         "run_token": "token",
                         "owner_pid": os.getpid(),
                         "owner_start_ticks": process_start_ticks(os.getpid()),
-                        "updated_epoch": 1,
-                        "status": "healthy",
+                        "process_phase": "run",
+                        "desired_state": "enabled",
                     }
                 ),
                 encoding="utf-8",
             )
             thread = threading.Thread(
-                target=run_watchdog,
-                args=(project, state.run_id),
+                target=run_health_sidecar,
+                args=(project,),
             )
             thread.start()
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                observed = json.loads(control.read_text(encoding="utf-8"))
-                if observed.get("status") == "heartbeat_stale_observed":
-                    break
-                time.sleep(0.05)
-            else:
-                self.fail("watchdog did not record the stale heartbeat")
-
-            heartbeat.write_text(
-                json.dumps({"status": "stopped"}),
-                encoding="utf-8",
-            )
-            thread.join(timeout=6)
+            time.sleep(0.2)
+            terminal = json.loads(control.read_text(encoding="utf-8"))
+            terminal["process_phase"] = "terminal"
+            control.write_text(json.dumps(terminal), encoding="utf-8")
+            thread.join(timeout=3)
 
             self.assertFalse(thread.is_alive())
             self.assertTrue(Path(f"/proc/{os.getpid()}").exists())
 
-    def test_watchdog_bootstrap_replaces_terminal_heartbeat_for_new_owner(self) -> None:
+    def test_sidecar_launch_requires_and_uses_active_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "project"
             bootstrap_project(project, "demo")
             state = load_run_state(project)
-            health_root = watchdog_control_path(project, state.run_id).parent
-            health_root.mkdir(parents=True, exist_ok=True)
-            (health_root / "heartbeat.json").write_text(
-                json.dumps({"status": "stopped", "updated_epoch": 1}),
-                encoding="utf-8",
+            channel = HealthControlChannel(
+                project,
+                workflow_kind="run",
+                run_token="new-token",
+                enabled=True,
+                on_enable=lambda payload: None,
+                on_disable=lambda payload: None,
             )
+            channel.start(state.run_id)
 
             fake_process = type("FakeProcess", (), {"pid": 424242})()
             with patch(
                 "auto_agents.health_watchdog.subprocess.Popen",
                 return_value=fake_process,
             ):
-                started = start_run_watchdog(
+                started = start_health_sidecar(
                     project_root=project,
-                    run_id=state.run_id,
                     run_token="new-token",
                     auto_agents_entry=Path(__file__),
                 )
 
             self.assertIs(started, fake_process)
-            heartbeat = json.loads(
-                (health_root / "heartbeat.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(heartbeat["status"], "starting")
-            self.assertEqual(heartbeat["previous_status"], "stopped")
-            self.assertEqual(heartbeat["run_token"], "new-token")
+            manifest = load_active_manifest(project)
+            self.assertEqual(manifest["sidecar_pid"], 424242)
+            self.assertEqual(manifest["run_token"], "new-token")
+            channel.close(reason="test complete")
 
     def test_repair_checkpoint_preserves_binary_untracked_and_deleted_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -654,7 +689,7 @@ class HealthWatchTests(unittest.TestCase):
             self.assertEqual(updated.status, "boundary_verified")
             self.assertEqual(load_run_state(project).repair_phase, "boundary_verified")
 
-    def test_health_intervention_budget_emits_exhausted_action_once(self) -> None:
+    def test_in_process_anomaly_is_advisory_and_emits_no_action(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "project"
             bootstrap_project(project, "demo")
@@ -677,16 +712,89 @@ class HealthWatchTests(unittest.TestCase):
             snapshot = _snapshot(1, 1000)
             supervisor._recent_snapshots.append(snapshot.to_dict())
             supervisor._handle_anomaly(anomaly, snapshot)
-            self.assertEqual(supervisor.pop_action().action, "diagnose")
-            first_case = RepairCaseStore(project, state.run_id).latest_open()
-            first_case.status = "routed"
-            RepairCaseStore(project, state.run_id).save(first_case)
-            supervisor._last_anomaly_at = 0
-            supervisor._handle_anomaly(anomaly, snapshot)
-            self.assertEqual(supervisor.pop_action().action, "exhausted")
-            supervisor._last_anomaly_at = 0
-            supervisor._handle_anomaly(anomaly, snapshot)
             self.assertIsNone(supervisor.pop_action())
+            self.assertIsNone(RepairCaseStore(project, state.run_id).latest_open())
+
+    def test_foreground_materializes_only_token_bound_sidecar_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = load_run_state(project)
+            store = HealthActionStore(project, "run", state.run_id)
+            evidence = {
+                "anomaly": {
+                    "kind": "goal_stalled",
+                    "severity": "confirmed",
+                    "stage": "implement",
+                    "root_fingerprint": "root-1",
+                    "reason": "no durable progress",
+                    "expected_postconditions": ["progress resumes"],
+                }
+            }
+            store.append(
+                HealthActionRecord(
+                    request_id="request-1",
+                    action="diagnose",
+                    reason="health_anomaly:goal_stalled",
+                    source="health_sidecar",
+                    run_token="token",
+                    subject_id=state.run_id,
+                    evidence_digest=evidence_digest(evidence),
+                    evidence=evidence,
+                )
+            )
+            wrong = RunHealthSupervisor(
+                project,
+                state.run_id,
+                config=HealthWatchConfig(),
+                smart_timeout=SmartTimeoutConfig(),
+                autonomy_mode="max",
+                run_token="other-token",
+            )
+            self.assertIsNone(wrong.pop_action())
+            supervisor = RunHealthSupervisor(
+                project,
+                state.run_id,
+                config=HealthWatchConfig(),
+                smart_timeout=SmartTimeoutConfig(),
+                autonomy_mode="max",
+                run_token="token",
+            )
+            request = supervisor.pop_action()
+            self.assertEqual(request.durable_request_id, "request-1")
+            case = RepairCaseStore(project, state.run_id).load(request.repair_case_id)
+            self.assertEqual(case.root_fingerprint, "root-1")
+
+    def test_foreground_rejects_tampered_sidecar_evidence_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = load_run_state(project)
+            store = HealthActionStore(project, "run", state.run_id)
+            store.append(
+                HealthActionRecord(
+                    request_id="tampered",
+                    action="diagnose",
+                    reason="health_observer_disagreement",
+                    source="health_sidecar",
+                    run_token="token",
+                    subject_id=state.run_id,
+                    evidence_digest="not-the-evidence-digest",
+                    evidence={"independent_progress_digest": "actual"},
+                )
+            )
+            supervisor = RunHealthSupervisor(
+                project,
+                state.run_id,
+                config=HealthWatchConfig(),
+                smart_timeout=SmartTimeoutConfig(),
+                autonomy_mode="max",
+                run_token="token",
+            )
+            self.assertIsNone(supervisor.pop_action())
+            requests = json.loads(store.path.read_text(encoding="utf-8"))["requests"]
+            self.assertEqual(requests[0]["state"], "rejected")
+            self.assertIsNone(RepairCaseStore(project, state.run_id).latest_open())
 
     def test_exhausted_task_health_budget_localizes_and_continues_independent_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

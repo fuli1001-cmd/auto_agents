@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -1101,31 +1102,54 @@ class SmartTimeoutConfig:
 @dataclass
 class HealthWatchConfig:
     enabled: bool = True
-    sidecar_enabled: bool = True
     agent_triage_enabled: bool = True
     poll_seconds: int = 30
     heartbeat_timeout_seconds: int = 120
-    sidecar_grace_seconds: int = 60
     goal_stall_lease_multiplier: float = 2.0
     oscillation_repeat_limit: int = 3
     recovery_churn_limit: int = 3
     max_interventions_per_root: int = 3
-    max_sidecar_restarts_per_run: int = 2
     quiesce_timeout_seconds: int = 600
     boundary_replay_timeout_seconds: int = 1200
 
+    # Read-only compatibility attributes. Legacy input keys are ignored and
+    # these values are deliberately absent from ``to_dict``.
+    @property
+    def sidecar_enabled(self) -> bool:
+        return self.enabled
+
+    @property
+    def sidecar_grace_seconds(self) -> int:
+        return 0
+
+    @property
+    def max_sidecar_restarts_per_run(self) -> int:
+        return 0
+
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "HealthWatchConfig":
+        legacy = sorted(
+            key
+            for key in (
+                "sidecar_enabled",
+                "sidecar_grace_seconds",
+                "max_sidecar_restarts_per_run",
+            )
+            if key in data
+        )
+        if legacy:
+            warnings.warn(
+                "health_watch legacy settings are ignored and will not be saved: "
+                + ", ".join(legacy),
+                FutureWarning,
+                stacklevel=2,
+            )
         return cls(
             enabled=bool(data.get("enabled", True)),
-            sidecar_enabled=bool(data.get("sidecar_enabled", True)),
             agent_triage_enabled=bool(data.get("agent_triage_enabled", True)),
             poll_seconds=max(5, int(data.get("poll_seconds", 30))),
             heartbeat_timeout_seconds=max(
                 15, int(data.get("heartbeat_timeout_seconds", 120))
-            ),
-            sidecar_grace_seconds=max(
-                0, int(data.get("sidecar_grace_seconds", 60))
             ),
             goal_stall_lease_multiplier=max(
                 1.0, float(data.get("goal_stall_lease_multiplier", 2.0))
@@ -1138,9 +1162,6 @@ class HealthWatchConfig:
             ),
             max_interventions_per_root=max(
                 1, int(data.get("max_interventions_per_root", 3))
-            ),
-            max_sidecar_restarts_per_run=max(
-                0, int(data.get("max_sidecar_restarts_per_run", 2))
             ),
             quiesce_timeout_seconds=max(
                 60, int(data.get("quiesce_timeout_seconds", 600))

@@ -1189,25 +1189,32 @@ Provider output, CPU use, tool calls, and workspace changes count as activity on
 stages, accepted task lineages, verified requirement proofs, resolved incident roots, and verified
 checkpoints form the durable progress vector.
 
-The in-process supervisor detects goal stalls, stage/recovery oscillation, repeated recovery without
-postcondition improvement, unexplained regression, and retry/resource degradation. A confirmed
-health incident is persisted as a repair case and uses the same read-only investigator/reviewer/
-arbiter consensus as terminal self-repair. Only a generic, evidence-backed `auto_agents` defect can
-enter isolated candidate repair; target-project, provider, infrastructure, requirements, and user
-input causes keep their existing recovery routes. If those routes exhaust their bounded health
-interventions, task-lineage incidents are localized when other independent tasks can continue.
+The in-process coordinator publishes telemetry, performs a fast advisory check, and consumes
+durable action requests. An independent sidecar reconstructs semantic progress from raw persisted
+run or session state and compares it with the in-process report. It detects goal stalls,
+stage/recovery oscillation, repeated recovery without postcondition improvement, unexplained
+regression, retry pressure, self-repair stagnation, and observer disagreement. A confirmed incident
+is routed back to the foreground process and uses the same read-only investigator/reviewer/arbiter
+consensus as terminal self-repair. Only a generic, evidence-backed `auto_agents` defect can enter
+isolated candidate repair; target-project, provider, infrastructure, requirements, and user input
+causes keep their existing recovery routes.
 `health_watch.agent_triage_enabled` authorizes this health-case use of the shared diagnosis pipeline;
 `self_repair_diagnosis.mode=off` remains the global kill switch for provider diagnosis.
 
-Each CLI `run` also starts a small sidecar that does not own the project lock or modify project
-source. It monitors the orchestrator heartbeat and PID start identity, captures diagnostics for a
-stale owner, and records when the owner exits. The sidecar is observation-only: it never signals the
-main process, cleans child processes, creates a restart request, or reruns the original command. When
-the main process exits, the sidecar records the final observation and exits as well. The legacy
-`sidecar_grace_seconds` and `max_sidecar_restarts_per_run` settings remain accepted for existing
-project configs but have no operational effect.
-Use `status` to inspect `health`, `watchdog`, and `runtime` details, or pass `--no-health-watch` to
-disable both layers for one invocation.
+`run`, `fix`, and `collab` start the sidecar by default. It never signals, cleans, or restarts the
+main process. A normal exit or Ctrl+C moves the manifest to `terminal`, after which the sidecar drains
+one final observation and exits. If the owner disappears unexpectedly, the sidecar waits three
+seconds, revalidates the PID identity, records `unexpected_owner_exit` plus a
+`pending_manual_resume` request, sends at most one notification, and exits. Recovery begins only with
+the next user-started foreground command.
+
+Use `auto-agents health-watch start --project PATH`, `stop`, or `status` to control the complete
+health subsystem for the currently active workflow; no run ID is needed. `start` and `stop` are
+runtime-only and do not rewrite project configuration. Pass `--no-health-watch` to `run`, `fix`, or
+`collab` to begin without proactive semantic monitoring. A tiny control channel remains available so
+monitoring can be enabled later without interrupting the active provider or tool. Legacy
+`sidecar_enabled`, `sidecar_grace_seconds`, and `max_sidecar_restarts_per_run` input keys are ignored
+and omitted when configuration is saved.
 
 **How it works**
 
