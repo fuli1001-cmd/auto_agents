@@ -115,6 +115,47 @@ class SelfRepairSearchTests(unittest.TestCase):
         experiment.register_candidate(infrastructure)
         self.assertEqual(experiment.consecutive_non_improvements, 3)
 
+    def test_legacy_full_suite_finding_is_migrated_to_post_proof_review(self) -> None:
+        finding = SelfRepairFinding.from_dict(
+            {
+                "finding_id": "candidate-regression-proof-inconclusive",
+                "obligation_id": "conclusive_candidate_regression_validation",
+                "reason": "The full-suite comparison has not run yet.",
+                "required_test": "Complete equivalent base and candidate full suites.",
+            }
+        )
+
+        self.assertEqual(finding.defer_until, "post_full_suite")
+
+    def test_final_review_rank_counts_as_validation_progress(self) -> None:
+        experiment = self._experiment()
+        experiment.consecutive_non_improvements = 2
+        experiment.candidates["full-suite"] = SelfRepairCandidateRecord(
+            candidate_id="full-suite",
+            candidate_ref="refs/full-suite",
+            candidate_commit="commit-full-suite",
+            status="candidate_full_suite_inconclusive",
+            validation_stage="full_suite",
+            validation_rank=90,
+        )
+
+        progress = experiment.register_candidate(
+            SelfRepairCandidateRecord(
+                candidate_id="final-review",
+                parent_candidate_id="full-suite",
+                candidate_ref="refs/final-review",
+                candidate_commit="commit-final-review",
+                status="candidate_final_review_rejected",
+                validation_stage="final_review",
+                validation_rank=95,
+                passed_obligations=["validation:full_suite"],
+                failed_obligations=["validation:final_review"],
+            )
+        )
+
+        self.assertEqual(progress, "validation_progress")
+        self.assertEqual(experiment.consecutive_non_improvements, 0)
+
     def test_store_restores_frontier_patience_and_health_oscillation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary) / "project"

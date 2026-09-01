@@ -2465,16 +2465,40 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 def _call_with_failover(self, request):
                     if request.stage == "self_repair_candidate_review":
                         self.review_requests.append(request)
+                        if len(self.review_requests) == 1:
+                            payload = {
+                                "decision": "REJECT",
+                                "reason": (
+                                    "full-suite differential is intentionally pending"
+                                ),
+                                "findings": [
+                                    {
+                                        "finding_id": "candidate-regression-proof-inconclusive",
+                                        "severity": "hard",
+                                        "obligation_id": "validation:full_suite",
+                                        "reason": "full-suite proof is pending",
+                                        "counterexample": "focused checks cannot exclude regressions",
+                                        "required_test": "run the full-suite differential",
+                                        "evidence": ["pre-validation review"],
+                                        "defer_until": "post_full_suite",
+                                    }
+                                ],
+                                "resolved_finding_ids": [],
+                            }
+                        else:
+                            payload = {
+                                "decision": "APPROVE",
+                                "reason": "full-suite proof and candidate scope are sound",
+                                "findings": [],
+                                "resolved_finding_ids": [
+                                    "candidate-regression-proof-inconclusive"
+                                ],
+                            }
                         return AgentResult(
                             ok=True,
                             command=[],
                             output_path=request.output_path,
-                            summary=json.dumps(
-                                {
-                                    "decision": "APPROVE",
-                                    "reason": "focused regression and scope are sound",
-                                }
-                            ),
+                            summary=json.dumps(payload),
                         )
                     self.repair_calls += 1
                     if self.repair_calls == 2:
@@ -2521,14 +2545,97 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
             self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
             self.assertEqual(orchestrator.repair_calls, 2)
-            self.assertEqual(len(orchestrator.review_requests), 1)
+            self.assertEqual(len(orchestrator.review_requests), 2)
             review_request = orchestrator.review_requests[0]
             self.assertEqual(review_request.timeout_seconds, 60)
             self.assertEqual(review_request.progress_lease_seconds, 60)
             self.assertTrue(review_request.progress_managed_timeout)
+            self.assertIn(
+                "REVIEW_PHASE: pre_validation",
+                orchestrator.review_requests[0].prompt,
+            )
+            self.assertIn(
+                "REVIEW_PHASE: post_full_suite",
+                orchestrator.review_requests[1].prompt,
+            )
             self.assertEqual(result.status, "approved_candidate")
             self.assertTrue((Path(result.runtime_root) / "fixed.py").is_file())
             runner.cleanup_runtime(result)
+
+    def test_deferred_proof_finding_blocks_only_post_full_suite_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+
+            class Diagnosis:
+                def to_dict(self):
+                    return {"final": {"expected_postconditions": ["full suite passes"]}}
+
+            class ReviewOrchestrator:
+                config = type(
+                    "Config",
+                    (),
+                    {
+                        "efforts": {"self_repair": "max"},
+                        "execution": type("Execution", (), {})(),
+                    },
+                )()
+
+                def _call_with_failover(self, request):
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=json.dumps(
+                            {
+                                "decision": "REJECT",
+                                "reason": "the downstream full suite is pending",
+                                "findings": [
+                                    {
+                                        "finding_id": "full-suite-pending",
+                                        "severity": "hard",
+                                        "obligation_id": "validation:full_suite",
+                                        "reason": "full-suite proof is pending",
+                                        "counterexample": "focused checks are incomplete",
+                                        "required_test": "run both full suites",
+                                        "evidence": ["review phase"],
+                                        "defer_until": "post_full_suite",
+                                    }
+                                ],
+                                "resolved_finding_ids": [],
+                            }
+                        ),
+                    )
+
+            runner = AutoAgentsSelfRepairRunner(
+                ReviewOrchestrator(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True, category="review-phase"),
+                diagnosis=Diagnosis(),
+            )
+            runner.repo_root = auto_root
+
+            pre = runner._review_candidate(
+                auto_root,
+                "HEAD",
+                progress_lease_seconds=60,
+                phase="pre_validation",
+            )
+            final = runner._review_candidate(
+                auto_root,
+                "HEAD",
+                progress_lease_seconds=60,
+                replay_summary="full suite passed",
+                phase="post_full_suite",
+            )
+
+            self.assertTrue(pre.ok)
+            self.assertIn("DEFERRED_TO_POST_FULL_SUITE", pre.summary)
+            self.assertFalse(final.ok)
 
     def test_self_repair_runs_in_isolated_worktree_and_integrates_commit(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1594,8 +1594,10 @@ proven. In the default `max` mode, auto_agents generates at most three isolated 
 one hour, rejects duplicate diffs and weakened tests, runs base/candidate differential checks, and
 replays the blocked state in a private target clone. Candidate-added tests are also applied to base
 engine code so a newly added regression must actually fail without the implementation fix. An
-adversarial read-only candidate review is required before approval. The candidate agent runs only
-focused checks; the orchestrator owns the single authoritative broad-suite execution.
+adversarial read-only code review is required before expensive validation. Missing proof that is
+owned by a downstream gate is deferred rather than treated as a code failure. The candidate agent
+runs only focused checks; the orchestrator owns the single authoritative broad-suite execution and
+then performs a proof-aware final adversarial review before approval.
 
 Candidates are attempted sequentially and the first candidate that crosses every proof gate wins;
 this is not a relative majority vote. If none is approved, auto_agents reports and retains the

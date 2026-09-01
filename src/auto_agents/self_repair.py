@@ -88,6 +88,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
     "candidate_replay_failed": 70,
     "candidate_full_suite_failed": 80,
     "candidate_full_suite_inconclusive": 90,
+    "candidate_final_review_rejected": 95,
     "approved_candidate": 100,
     "already_repaired": 100,
 }
@@ -103,6 +104,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_STAGES = {
     "candidate_replay_failed": "boundary_replay",
     "candidate_full_suite_failed": "full_suite",
     "candidate_full_suite_inconclusive": "full_suite",
+    "candidate_final_review_rejected": "final_review",
     "approved_candidate": "approved",
     "already_repaired": "approved",
 }
@@ -1793,6 +1795,10 @@ class AutoAgentsSelfRepairRunner:
             "candidate_full_suite_inconclusive",
         }:
             failed.append("validation:full_suite")
+        if result.validation_rank >= 100:
+            passed.append("validation:final_review")
+        elif result.status == "candidate_final_review_rejected":
+            failed.append("validation:final_review")
         passed.extend(result.passed_obligations)
         failed.extend(result.failed_obligations)
         return sorted(set(passed)), sorted(set(failed))
@@ -2221,14 +2227,106 @@ class AutoAgentsSelfRepairRunner:
                     if part
                 )
                 if full_suite.ok:
+                    autonomy = self._autonomy_config()
+                    final_review = self._review_candidate(
+                        candidate_root,
+                        base_head,
+                        progress_lease_seconds=max(
+                            60,
+                            int(
+                                getattr(
+                                    autonomy,
+                                    "candidate_review_timeout_seconds",
+                                    600,
+                                )
+                                or 600
+                            ),
+                        ),
+                        replay_summary=verification,
+                        phase="post_full_suite",
+                    )
+                    review_findings = [
+                        dict(item)
+                        for item in final_review.payload.get("findings", [])
+                        if isinstance(item, Mapping)
+                    ]
+                    finding_ids = sorted(
+                        str(item.get("finding_id", ""))
+                        for item in review_findings
+                        if str(item.get("finding_id", "")).strip()
+                    )
+                    resolved_finding_ids = sorted(
+                        str(item)
+                        for item in final_review.payload.get(
+                            "resolved_finding_ids", []
+                        )
+                        or []
+                        if str(item).strip()
+                    )
+                    experiment_findings = getattr(
+                        getattr(self, "_experiment", None),
+                        "findings",
+                        {},
+                    )
+                    unresolved_findings = sorted(
+                        finding_id
+                        for finding_id, finding in experiment_findings.items()
+                        if finding.status in {"confirmed", "reopened"}
+                        and finding_id not in resolved_finding_ids
+                    )
+                    if final_review.ok and unresolved_findings:
+                        final_review = _VerificationResult(
+                            False,
+                            (
+                                "candidate final review=REJECT reason=approved response "
+                                "did not prove all findings resolved after full-suite "
+                                "validation: "
+                                + ", ".join(unresolved_findings)
+                            ),
+                            payload=final_review.payload,
+                        )
+                    if not final_review.ok:
+                        rejected_ref = self._reject_pending_validation_ref(
+                            candidate_ref,
+                            candidate_commit,
+                            candidate_id,
+                        )
+                        return SelfRepairResult(
+                            ok=False,
+                            status="candidate_final_review_rejected",
+                            category=self.decision.category,
+                            reason=(
+                                "proof-aware adversarial review rejected the fully "
+                                "validated pending candidate"
+                            ),
+                            summary="resumed pending-validation candidate",
+                            verification="\n\n".join(
+                                (verification, final_review.summary)
+                            ),
+                            experiment_id=experiment_id,
+                            candidate_id=candidate_id,
+                            base_commit=base_head,
+                            candidate_commit=candidate_commit,
+                            candidate_ref=rejected_ref,
+                            finding_ids=finding_ids,
+                            resolved_finding_ids=resolved_finding_ids,
+                            review_findings=review_findings,
+                            passed_obligations=["validation:full_suite"],
+                            failed_obligations=["validation:final_review"],
+                        )
                     approved = self._approved_candidate_result(
                         experiment_id=experiment_id,
                         candidate_id=candidate_id,
                         base_head=base_head,
                         candidate_commit=candidate_commit,
                         summary="resumed and approved pending-validation candidate",
-                        verification=verification,
+                        verification="\n\n".join(
+                            (verification, final_review.summary)
+                        ),
                     )
+                    approved.finding_ids = finding_ids
+                    approved.resolved_finding_ids = resolved_finding_ids
+                    approved.review_findings = review_findings
                     delete_ref(self.repo_root, candidate_ref)
                     return approved
                 if not full_suite.recoverable:
@@ -2289,7 +2387,62 @@ class AutoAgentsSelfRepairRunner:
         stored.infrastructure_failure = False
         stored.summary = result.summary
         stored.verification = result.verification
-        if not result.recoverable_validation:
+        stored.finding_ids = sorted(
+            set(stored.finding_ids).union(result.finding_ids)
+        )
+        stored.resolved_finding_ids = sorted(
+            set(stored.resolved_finding_ids).union(
+                result.resolved_finding_ids
+            )
+        )
+        for payload in result.review_findings:
+            if not isinstance(payload, Mapping):
+                continue
+            finding = SelfRepairFinding.from_dict(payload)
+            if not finding.finding_id:
+                continue
+            existing = experiment.findings.get(finding.finding_id)
+            if existing is None:
+                finding.status = "confirmed"
+                finding.introduced_by = result.candidate_id
+                experiment.findings[finding.finding_id] = finding
+            else:
+                existing.status = "reopened"
+                existing.reason = finding.reason or existing.reason
+                existing.counterexample = (
+                    finding.counterexample or existing.counterexample
+                )
+                existing.required_test = (
+                    finding.required_test or existing.required_test
+                )
+                existing.evidence = finding.evidence or existing.evidence
+                existing.defer_until = (
+                    finding.defer_until or existing.defer_until
+                )
+            experiment.obligations.setdefault(
+                f"finding:{finding.finding_id}",
+                {
+                    "kind": "review_finding",
+                    "description": finding.reason,
+                    "source": result.candidate_id,
+                },
+            )["status"] = "open"
+        for finding_id in result.resolved_finding_ids:
+            finding = experiment.findings.get(finding_id)
+            if finding is not None:
+                finding.status = "resolved"
+                finding.resolved_by = result.candidate_id
+            obligation = experiment.obligations.get(f"finding:{finding_id}")
+            if obligation is not None:
+                obligation["status"] = "resolved"
+                obligation["resolved_by"] = result.candidate_id
+            failure_id = f"finding:{finding_id}"
+            stored.failed_obligations = [
+                item for item in stored.failed_obligations if item != failure_id
+            ]
+            if failure_id not in stored.passed_obligations:
+                stored.passed_obligations.append(failure_id)
+        if not result.recoverable_validation and not result.ok:
             stored.fatal = True
         experiment._recompute_frontier()
         self._experiment_store.save(experiment)
@@ -2474,21 +2627,32 @@ class AutoAgentsSelfRepairRunner:
                     pending.strategy_fingerprint = (
                         stored_pending.strategy_fingerprint
                     )
-                    pending.finding_ids = list(stored_pending.finding_ids)
-                    pending.resolved_finding_ids = list(
-                        stored_pending.resolved_finding_ids
+                    pending.finding_ids = sorted(
+                        set(stored_pending.finding_ids).union(
+                            pending.finding_ids
+                        )
                     )
-                    pending.passed_obligations = list(
-                        stored_pending.passed_obligations
+                    pending.resolved_finding_ids = sorted(
+                        set(stored_pending.resolved_finding_ids).union(
+                            pending.resolved_finding_ids
+                        )
                     )
-                    pending.failed_obligations = list(
-                        stored_pending.failed_obligations
+                    pending.passed_obligations = sorted(
+                        set(stored_pending.passed_obligations).union(
+                            pending.passed_obligations
+                        )
+                    )
+                    pending.failed_obligations = sorted(
+                        set(stored_pending.failed_obligations).union(
+                            pending.failed_obligations
+                        )
                     )
                 self._decorate_candidate_result(
                     pending,
                     attempt=experiment.attempt_count,
                 )
                 if pending.ok:
+                    self._update_pending_validation_record(pending)
                     experiment.status = "approved"
                     experiment.current_candidate_id = ""
                     store.save(experiment)
@@ -2972,6 +3136,7 @@ class AutoAgentsSelfRepairRunner:
                     replay_summary="\n\n".join(
                         (replay.summary, differential.summary)
                     ),
+                    phase="pre_validation",
                 )
                 review_findings = [
                     dict(item)
@@ -2992,6 +3157,7 @@ class AutoAgentsSelfRepairRunner:
                     finding_id
                     for finding_id, finding in self._experiment.findings.items()
                     if finding.status in {"confirmed", "reopened"}
+                    and finding.defer_until != "post_full_suite"
                     and finding_id not in resolved_finding_ids
                 )
                 if review.ok and unresolved_prior_findings:
@@ -3177,6 +3343,105 @@ class AutoAgentsSelfRepairRunner:
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
                     )
+                proof_summary = "\n\n".join(
+                    part
+                    for part in (
+                        verification.summary,
+                        replay.summary,
+                        differential.summary,
+                        full_suite.summary,
+                        "PRE_VALIDATION_REVIEW:\n"
+                        + json.dumps(review.payload, ensure_ascii=False),
+                    )
+                    if part
+                )
+                final_review = self._review_candidate(
+                    repair_root,
+                    self._experiment.base_commit,
+                    progress_lease_seconds=review_progress_lease,
+                    replay_summary=proof_summary,
+                    phase="post_full_suite",
+                )
+                final_review_findings = [
+                    dict(item)
+                    for item in final_review.payload.get("findings", [])
+                    if isinstance(item, Mapping)
+                ]
+                combined_findings = {
+                    str(item.get("finding_id", "")): dict(item)
+                    for item in [*review_findings, *final_review_findings]
+                    if str(item.get("finding_id", "")).strip()
+                }
+                review_findings = list(combined_findings.values())
+                finding_ids = sorted(combined_findings)
+                resolved_finding_ids = sorted(
+                    set(resolved_finding_ids).union(
+                        str(item)
+                        for item in final_review.payload.get(
+                            "resolved_finding_ids", []
+                        )
+                        or []
+                        if str(item).strip()
+                    )
+                )
+                unresolved_final_findings = sorted(
+                    {
+                        finding_id
+                        for finding_id, finding in self._experiment.findings.items()
+                        if finding.status in {"confirmed", "reopened"}
+                        and finding_id not in resolved_finding_ids
+                    }.union(
+                        finding_id
+                        for finding_id in finding_ids
+                        if finding_id not in resolved_finding_ids
+                    )
+                )
+                if final_review.ok and unresolved_final_findings:
+                    final_review = _VerificationResult(
+                        False,
+                        (
+                            "candidate final review=REJECT reason=approved response did not "
+                            "prove all findings resolved after full-suite validation: "
+                            + ", ".join(unresolved_final_findings)
+                        ),
+                        payload=final_review.payload,
+                    )
+                if not final_review.ok:
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_final_review_rejected",
+                        category=self.decision.category,
+                        reason=(
+                            "proof-aware adversarial review rejected the fully "
+                            "validated repair"
+                        ),
+                        summary=summary,
+                        verification="\n\n".join(
+                            part
+                            for part in (proof_summary, final_review.summary)
+                            if part
+                        ),
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                        candidate_commit=candidate_commit,
+                        candidate_ref=candidate_ref,
+                        patch_fingerprint=fingerprint,
+                        strategy_fingerprint=strategy_fingerprint,
+                        finding_ids=finding_ids,
+                        resolved_finding_ids=resolved_finding_ids,
+                        review_findings=review_findings,
+                        diff_line_count=diff_line_count,
+                        passed_obligations=[
+                            *boundary_passed_obligations,
+                            "validation:focused",
+                            "validation:full_suite",
+                        ],
+                        failed_obligations=[
+                            *boundary_failed_obligations,
+                            "validation:final_review",
+                        ],
+                    )
                 approved_commit = self._squash_candidate_commit(
                     repair_root,
                     self._experiment.base_commit,
@@ -3190,12 +3455,7 @@ class AutoAgentsSelfRepairRunner:
                     summary=summary,
                     verification="\n\n".join(
                         part
-                        for part in (
-                            verification.summary,
-                            replay.summary,
-                            differential.summary,
-                            full_suite.summary,
-                        )
+                        for part in (proof_summary, final_review.summary)
                         if part
                     ),
                 )
@@ -3256,6 +3516,7 @@ class AutoAgentsSelfRepairRunner:
         *,
         progress_lease_seconds: int,
         replay_summary: str = "",
+        phase: str = "pre_validation",
     ) -> "_VerificationResult":
         execution = getattr(
             getattr(self.target_orchestrator, "config", None),
@@ -3271,21 +3532,37 @@ class AutoAgentsSelfRepairRunner:
             encoding="utf-8",
             capture_output=True,
         ).stdout
+        final_phase = phase == "post_full_suite"
         prompt = "\n".join(
             [
                 "Review this isolated auto_agents self-repair candidate.",
                 "Do not modify files or run mutating commands.",
                 "Reject test deletion, skip/xfail, weakened safety gates, hard-coded target data, "
                 "or changes that do not address the supplied root cause.",
+                (
+                    "This is the post-full-suite final review. All supplied validation proof is "
+                    "authoritative for this candidate; reject any unresolved code or proof gap."
+                    if final_phase
+                    else
+                    "This is the pre-validation code review. The orchestrator deliberately runs "
+                    "focused verification and the authoritative base/candidate full-suite "
+                    "differential only after this review passes. Do not reject merely because "
+                    "that downstream proof is not present yet. Mark such a finding with "
+                    "defer_until='post_full_suite'; only concrete code, scope, safety, or test "
+                    "defects block this phase."
+                ),
                 "Return exactly JSON with decision, reason, findings, and resolved_finding_ids. "
                 "Each finding must contain finding_id, severity=fatal|hard|repairable, "
-                "obligation_id, reason, counterexample, required_test, and evidence. "
+                "obligation_id, reason, counterexample, required_test, evidence, and "
+                "defer_until=''|'post_full_suite'. "
                 "Use stable semantic finding IDs and list prior finding IDs proven resolved.",
                 "Schema: {\"decision\":\"APPROVE|REJECT\",\"reason\":\"...\","
                 "\"findings\":[{\"finding_id\":\"...\",\"severity\":\"hard\","
                 "\"obligation_id\":\"...\",\"reason\":\"...\","
                 "\"counterexample\":\"...\",\"required_test\":\"...\","
-                "\"evidence\":[\"...\"]}],\"resolved_finding_ids\":[\"...\"]}.",
+                "\"evidence\":[\"...\"],\"defer_until\":\"\"}],"
+                "\"resolved_finding_ids\":[\"...\"]}.",
+                f"REVIEW_PHASE: {phase}",
                 "ROOT_CAUSE:",
                 json.dumps(self.diagnosis.to_dict(), ensure_ascii=False),
                 "SEARCH_CONTEXT:",
@@ -3349,8 +3626,19 @@ class AutoAgentsSelfRepairRunner:
                     "counterexample": reason,
                     "required_test": "add a focused regression for the reviewer counterexample",
                     "evidence": ["adversarial_candidate_review"],
+                    "defer_until": "",
                 }
             ]
+        for finding in findings:
+            defer_until = str(finding.get("defer_until", "")).strip()
+            if defer_until not in {"", "post_full_suite"}:
+                finding["defer_until"] = ""
+            elif defer_until:
+                finding["defer_until"] = defer_until
+            elif SelfRepairFinding._looks_like_post_full_suite_finding(finding):
+                finding["defer_until"] = "post_full_suite"
+            else:
+                finding["defer_until"] = ""
         raw_resolved = payload.get("resolved_finding_ids", [])
         normalized_payload = {
             **payload,
@@ -3362,9 +3650,27 @@ class AutoAgentsSelfRepairRunner:
                 if str(item).strip()
             ],
         }
+        blocking_findings = (
+            findings
+            if final_phase
+            else [
+                finding
+                for finding in findings
+                if finding.get("defer_until") != "post_full_suite"
+            ]
+        )
+        deferred_only = bool(findings) and not blocking_findings
+        review_ok = bool(reason) and not blocking_findings and (
+            decision == "APPROVE" or (not final_phase and deferred_only)
+        )
+        rendered_decision = (
+            "DEFERRED_TO_POST_FULL_SUITE"
+            if review_ok and deferred_only
+            else decision or "INVALID"
+        )
         return _VerificationResult(
-            decision == "APPROVE" and bool(reason) and not findings,
-            f"candidate review={decision or 'INVALID'} reason={reason}",
+            review_ok,
+            f"candidate review={rendered_decision} reason={reason}",
             payload=normalized_payload,
         )
 

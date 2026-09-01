@@ -59,6 +59,7 @@ class SelfRepairFinding:
     reason: str = ""
     counterexample: str = ""
     required_test: str = ""
+    defer_until: str = ""
     evidence: list[str] = field(default_factory=list)
     introduced_by: str = ""
     resolved_by: str = ""
@@ -70,6 +71,11 @@ class SelfRepairFinding:
     def from_dict(cls, payload: Mapping[str, object]) -> "SelfRepairFinding":
         raw_evidence = payload.get("evidence", [])
         raw_reopened = payload.get("reopened_by", [])
+        defer_until = str(payload.get("defer_until", "")).strip()
+        if not defer_until and cls._looks_like_post_full_suite_finding(payload):
+            # Migration for findings produced before the review protocol
+            # explicitly distinguished code blockers from downstream proof.
+            defer_until = "post_full_suite"
         return cls(
             finding_id=str(payload.get("finding_id", "")),
             status=str(payload.get("status", "observed")),
@@ -78,6 +84,7 @@ class SelfRepairFinding:
             reason=str(payload.get("reason", "")),
             counterexample=str(payload.get("counterexample", "")),
             required_test=str(payload.get("required_test", "")),
+            defer_until=defer_until,
             evidence=[
                 str(item)
                 for item in (raw_evidence if isinstance(raw_evidence, list) else [])
@@ -90,6 +97,31 @@ class SelfRepairFinding:
             ],
             created_at=str(payload.get("created_at", "")) or _utc_now(),
             updated_at=str(payload.get("updated_at", "")) or _utc_now(),
+        )
+
+    @staticmethod
+    def _looks_like_post_full_suite_finding(
+        payload: Mapping[str, object],
+    ) -> bool:
+        text = " ".join(
+            str(payload.get(key, ""))
+            for key in (
+                "obligation_id",
+                "reason",
+                "counterexample",
+                "required_test",
+            )
+        ).casefold()
+        return any(
+            marker in text
+            for marker in (
+                "full-suite",
+                "full suite",
+                "full_suite",
+                "candidate regression validation",
+                "candidate-regression-proof",
+                "candidate-only failure signature",
+            )
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -217,6 +249,9 @@ class SelfRepairExperiment:
                 "diagnosis-specific base/candidate differential crosses the root boundary"
             ),
             "validation:full_suite": "full-suite differential introduces no new failure",
+            "validation:final_review": (
+                "proof-aware adversarial review approves the fully validated candidate"
+            ),
         }.items():
             obligations.setdefault(
                 obligation_id,
