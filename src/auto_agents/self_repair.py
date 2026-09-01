@@ -2630,7 +2630,7 @@ class AutoAgentsSelfRepairRunner:
                     )
                     if not ok
                 ]
-                review_timeout = max(
+                review_progress_lease = max(
                     60,
                     int(
                         getattr(
@@ -2644,7 +2644,7 @@ class AutoAgentsSelfRepairRunner:
                 review = self._review_candidate(
                     repair_root,
                     self._experiment.base_commit,
-                    remaining_seconds=review_timeout,
+                    progress_lease_seconds=review_progress_lease,
                     replay_summary="\n\n".join(
                         (replay.summary, differential.summary)
                     ),
@@ -2922,7 +2922,7 @@ class AutoAgentsSelfRepairRunner:
         repair_root: Path,
         base_head: str,
         *,
-        remaining_seconds: int,
+        progress_lease_seconds: int,
         replay_summary: str = "",
     ) -> "_VerificationResult":
         execution = getattr(
@@ -2979,7 +2979,12 @@ class AutoAgentsSelfRepairRunner:
             cwd=repair_root,
             output_path=output_path,
             sandbox_mode="read-only",
-            timeout_seconds=remaining_seconds,
+            # This remains the hard-timeout fallback when smart supervision is
+            # disabled. With smart supervision it is a no-progress lease, while
+            # the configured safety ceiling remains the final bound.
+            timeout_seconds=progress_lease_seconds,
+            progress_lease_seconds=progress_lease_seconds,
+            progress_managed_timeout=True,
         )
         try:
             result: AgentResult = self.target_orchestrator._call_with_failover(request)

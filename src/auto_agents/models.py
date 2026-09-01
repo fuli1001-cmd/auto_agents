@@ -1993,6 +1993,8 @@ class AgentRequest:
     resume_session_id: str = ""
     sandbox_mode: str = ""
     timeout_seconds: int = 0
+    progress_lease_seconds: int = 0
+    progress_managed_timeout: bool = False
     termination_probe: Optional[Callable[[], str]] = None
     record_execution_incidents: bool = True
 

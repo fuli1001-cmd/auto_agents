@@ -255,6 +255,9 @@ class ProgressSupervisor:
                 for tool_id, detail in sorted(self.active_tools.items())
             ],
             "effective_progress_lease_seconds": self._effective_progress_lease_seconds(),
+            "progress_managed_timeout": bool(
+                self.request.progress_managed_timeout
+            ),
             "safety_ceiling_reached": self.safety_ceiling_reached_at is not None,
             "post_ceiling_finalize_seconds_remaining": self._finalize_seconds_remaining(now),
             "repeat_count": self.repeat_count,
@@ -331,6 +334,9 @@ class ProgressSupervisor:
         self._record("safety_ceiling_reached")
 
     def _effective_progress_lease_seconds(self) -> int:
+        request_lease = int(self.request.progress_lease_seconds or 0)
+        if request_lease > 0:
+            return max(60, request_lease)
         return max(
             60,
             int(

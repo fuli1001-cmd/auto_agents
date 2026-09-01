@@ -1693,6 +1693,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             class RepairOrchestrator:
                 def __init__(self):
                     self.repair_calls = 0
+                    self.review_requests = []
                     autonomy = type(
                         "Autonomy",
                         (),
@@ -1719,6 +1720,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
                 def _call_with_failover(self, request):
                     if request.stage == "self_repair_candidate_review":
+                        self.review_requests.append(request)
                         return AgentResult(
                             ok=True,
                             command=[],
@@ -1775,6 +1777,11 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
             self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
             self.assertEqual(orchestrator.repair_calls, 2)
+            self.assertEqual(len(orchestrator.review_requests), 1)
+            review_request = orchestrator.review_requests[0]
+            self.assertEqual(review_request.timeout_seconds, 60)
+            self.assertEqual(review_request.progress_lease_seconds, 60)
+            self.assertTrue(review_request.progress_managed_timeout)
             self.assertEqual(result.status, "approved_candidate")
             self.assertTrue((Path(result.runtime_root) / "fixed.py").is_file())
             runner.cleanup_runtime(result)

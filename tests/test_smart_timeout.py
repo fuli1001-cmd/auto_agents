@@ -145,6 +145,46 @@ def test_stage_progress_lease_renews_only_on_semantic_progress(tmp_path):
         assert supervisor.poll() == "semantic_stall"
 
 
+def test_request_progress_lease_overrides_stage_default(tmp_path):
+    clock = [0.0]
+    request = _request(tmp_path)
+    request.progress_lease_seconds = 90
+    request.progress_managed_timeout = True
+    with patch("auto_agents.supervision.time.monotonic", side_effect=lambda: clock[0]):
+        supervisor = ProgressSupervisor(
+            config=SmartTimeoutConfig(
+                provider_idle_seconds=600,
+                tool_idle_seconds=600,
+                semantic_stall_seconds=600,
+                safety_ceiling_seconds=600,
+                stage_progress_lease_seconds={"implement": 300},
+            ),
+            request=request,
+            provider="test",
+            process_pid=99999999,
+            decoder=ProgressDecoder(),
+        )
+        clock[0] = 80.0
+        supervisor.observe_events(
+            [
+                AgentProgressEvent(
+                    kind="milestone",
+                    fingerprint="review-evidence-1",
+                    detail="new review evidence",
+                    semantic=True,
+                )
+            ]
+        )
+        clock[0] = 169.0
+        assert supervisor.poll() is None
+        clock[0] = 171.0
+        assert supervisor.poll() == "semantic_stall"
+
+    payload = json.loads((tmp_path / "attempt.json").read_text(encoding="utf-8"))
+    assert payload["effective_progress_lease_seconds"] == 90
+    assert payload["progress_managed_timeout"] is True
+
+
 def test_parallel_active_tools_defer_semantic_stall_until_all_complete(tmp_path):
     clock = [0.0]
     supervisor = _supervisor(
@@ -396,6 +436,54 @@ def test_request_hard_timeout_remains_absolute_with_smart_supervision(tmp_path):
     assert result.termination is not None
     assert result.termination.reason == "timed_out"
     assert "smart timeout: timed out" in result.stderr
+
+
+def test_progress_managed_request_is_not_cut_off_by_absolute_timeout(tmp_path):
+    request = _request(tmp_path)
+    request.progress_lease_seconds = 60
+    request.progress_managed_timeout = True
+
+    result = run_subprocess_with_optional_streaming(
+        ["/bin/sh", "-c", "sleep 2"],
+        request,
+        dict(os.environ),
+        timeout=1,
+        smart_timeout=SmartTimeoutConfig(
+            provider_idle_seconds=60,
+            tool_idle_seconds=60,
+            semantic_stall_seconds=60,
+            safety_ceiling_seconds=60,
+        ),
+        provider="shell-test",
+    )
+
+    assert result.returncode == 0
+    assert result.termination is None
+    payload = json.loads((tmp_path / "attempt.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "completed"
+    assert payload["effective_progress_lease_seconds"] == 60
+    assert payload["progress_managed_timeout"] is True
+
+
+def test_progress_managed_request_keeps_hard_timeout_without_smart_supervision(
+    tmp_path,
+):
+    request = _request(tmp_path)
+    request.progress_lease_seconds = 60
+    request.progress_managed_timeout = True
+
+    result = run_subprocess_with_optional_streaming(
+        ["/bin/sh", "-c", "sleep 10"],
+        request,
+        dict(os.environ),
+        timeout=1,
+        smart_timeout=SmartTimeoutConfig(enabled=False),
+        provider="shell-test",
+    )
+
+    assert result.returncode == -1
+    assert result.termination is None
+    assert "timed out after 1s" in result.stderr
 
 
 def test_external_health_probe_can_quiesce_provider_without_provider_incident(tmp_path):

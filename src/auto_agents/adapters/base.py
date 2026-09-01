@@ -110,6 +110,11 @@ def run_subprocess_with_optional_streaming(
     ACTIVE_PROCESSES.register(process, kind=f"provider:{provider or 'agent'}")
 
     smart_enabled = bool(smart_timeout and smart_timeout.enabled)
+    if smart_enabled and request.progress_managed_timeout:
+        # Progress-managed requests are bounded by provider/tool/semantic leases,
+        # loop detection, and the smart-timeout safety ceiling. Keep the supplied
+        # timeout as the legacy fallback when smart supervision is disabled.
+        timeout = None
     if request.stream_output is None and not smart_enabled:
         # Non-streaming: collect all output at once.
         try:
