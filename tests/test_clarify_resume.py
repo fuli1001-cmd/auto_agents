@@ -1061,6 +1061,75 @@ class ClarifyResumeTests(unittest.TestCase):
         saved_history = json.loads(history_path.read_text(encoding="utf-8"))
         self.assertEqual(len(saved_history), 4)
 
+    def test_crash_resume_auto_approve_confirms_generation_without_prompt(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        history_path = conversation_history_path(project_root, state.run_id)
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text(
+            history_path,
+            json.dumps(
+                [
+                    {"role": "user", "content": "Build feature X."},
+                    {"role": "agent", "content": "Ready.\nREADY_TO_GENERATE"},
+                ],
+                ensure_ascii=False,
+            ),
+        )
+        orchestrator._user_input_fn = lambda prompt: self.fail(
+            f"auto-approve unexpectedly prompted: {prompt}"
+        )
+
+        with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+            mock_run.return_value = AgentResult(
+                ok=True,
+                command=[],
+                output_path=Path("."),
+                summary="Generated brief.",
+                stdout="",
+            )
+            result = orchestrator._run_interactive_clarify(
+                state, spec_file, auto_approve=True
+            )
+
+        self.assertEqual(result.stage_summaries["clarify"], "Generated brief.")
+        self.assertEqual(mock_run.call_args.kwargs["stage_key"], "clarify-generate")
+
+    def test_ready_to_generate_auto_approve_confirms_without_prompt(self):
+        project_root, spec_file = self._setup_project()
+        orchestrator = Orchestrator(project_root)
+        state = load_run_state(project_root)
+        orchestrator._user_input_fn = lambda prompt: self.fail(
+            f"auto-approve unexpectedly prompted: {prompt}"
+        )
+        ready_result = AgentResult(
+            ok=True,
+            command=[],
+            output_path=Path("."),
+            summary="Requirements are clear.\nREADY_TO_GENERATE",
+            stdout="",
+        )
+        generate_result = AgentResult(
+            ok=True,
+            command=[],
+            output_path=Path("."),
+            summary="Generated brief.",
+            stdout="",
+        )
+
+        with patch.object(orchestrator, "_run_agent_with_retries") as mock_run:
+            mock_run.side_effect = [ready_result, generate_result]
+            result = orchestrator._run_interactive_clarify(
+                state, spec_file, auto_approve=True
+            )
+
+        self.assertEqual(result.stage_summaries["clarify"], "Generated brief.")
+        self.assertEqual(
+            [call.kwargs["stage_key"] for call in mock_run.call_args_list],
+            ["clarify-conv-0", "clarify-generate"],
+        )
+
     def test_crash_resume_with_ready_to_generate_user_rejects(self):
         """When user rejects at resumed confirmation, the conversation
         loop should start with the user's feedback appended."""

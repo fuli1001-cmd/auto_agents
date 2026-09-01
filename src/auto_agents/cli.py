@@ -2069,7 +2069,10 @@ def build_parser() -> argparse.ArgumentParser:
     fix_parser.add_argument(
         "--auto-approve",
         action="store_true",
-        help="Automatically approve a declared development/test persistence action.",
+        help=(
+            "Automatically approve this fix's eligible actions and inherit the "
+            "same policy into routed workflows."
+        ),
     )
     fix_parser.add_argument(
         "--autonomy",
@@ -2109,7 +2112,10 @@ def build_parser() -> argparse.ArgumentParser:
     collab_parser.add_argument(
         "--auto-approve",
         action="store_true",
-        help="Automatically approve a declared development/test persistence action.",
+        help=(
+            "Inherit automatic approval into routed fix/run workflows, where it "
+            "keeps each target mode's normal meaning."
+        ),
     )
     collab_parser.add_argument(
         "--autonomy",

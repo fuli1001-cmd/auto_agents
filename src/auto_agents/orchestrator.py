@@ -3778,7 +3778,9 @@ class Orchestrator:
 
     def _run_agent_stage(self, stage: str, state: RunState, spec_file: Path, auto_approve: bool = False) -> RunState:
         if stage == "clarify":
-            return self._run_interactive_clarify(state, spec_file)
+            return self._run_interactive_clarify(
+                state, spec_file, auto_approve=auto_approve
+            )
         if stage == "design" and self._route_forbidden_pattern_definition_recovery(state):
             return state
         if stage == "plan" and self._block_for_persistence_configuration(state):
@@ -4108,7 +4110,13 @@ class Orchestrator:
             and "recovery route: rerun from clarify" in lowered
         )
 
-    def _run_interactive_clarify(self, state: RunState, spec_file: Path) -> RunState:
+    def _run_interactive_clarify(
+        self,
+        state: RunState,
+        spec_file: Path,
+        *,
+        auto_approve: bool = False,
+    ) -> RunState:
         history_path = conversation_history_path(self.project_root, state.run_id)
         history = []
         if history_path.exists():
@@ -4187,12 +4195,16 @@ class Orchestrator:
                 self.logger.info("\nAgent:")
                 self.logger.info(display)
             self.logger.info("\nAgent is ready to generate project_brief.md.")
-            user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
-            if user_conf.strip().lower() not in ("n", "no"):
+            if auto_approve:
                 confirmed_generation = True
+                self.logger.info("Generation automatically confirmed by --auto-approve.")
             else:
-                user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
-                _record_clarify_feedback(user_reply)
+                user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
+                if user_conf.strip().lower() not in ("n", "no"):
+                    confirmed_generation = True
+                else:
+                    user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
+                    _record_clarify_feedback(user_reply)
         else:
             # Resume interrupted conversation: if trailing history entries
             # are from the agent (e.g. process crashed before user reply was
@@ -4292,15 +4304,19 @@ class Orchestrator:
                         post_rejection = False
                         break
                     self.logger.info("\nAgent is ready to generate project_brief.md.")
-                    user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
-
-                    if user_conf.strip().lower() not in ("n", "no"):
+                    if auto_approve:
                         confirmed_generation = True
+                        self.logger.info("Generation automatically confirmed by --auto-approve.")
                         break
                     else:
-                        user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
-                        _record_clarify_feedback(user_reply)
-                        continue
+                        user_conf = self._prompt_user("Confirm generation? (y/n) [y]: ", default="y")
+                        if user_conf.strip().lower() not in ("n", "no"):
+                            confirmed_generation = True
+                            break
+                        else:
+                            user_reply = self._prompt_user("Please provide your thoughts: ", multiline=True)
+                            _record_clarify_feedback(user_reply)
+                            continue
 
                 # After rejection, show the agent's response (stripping the
                 # READY_TO_GENERATE marker) and force user interaction so the

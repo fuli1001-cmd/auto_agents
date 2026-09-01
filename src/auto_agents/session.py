@@ -807,6 +807,7 @@ class Session:
             self.orch._apply_generated_verification_config()
             self._ensure_baseline(state)
         handoff_payload = dict(payload)
+        handoff_payload.setdefault("auto_approve", bool(state.auto_approve))
         handoff_payload.setdefault("head_before", head_ref(self.project_root))
         handoff_payload.setdefault(
             "protected_preexisting_paths", list(state.protected_preexisting_paths)

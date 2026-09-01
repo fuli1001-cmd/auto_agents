@@ -9,7 +9,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from auto_agents.cli import build_parser, main
-from auto_agents.config import load_run_state, save_run_state
+from auto_agents.config import (
+    list_sessions,
+    load_run_state,
+    save_run_state,
+    save_session_state,
+)
 from auto_agents.git_ops import commit_only_paths
 from auto_agents.io_utils import write_text
 from auto_agents.models import AgentResult, SessionState
@@ -223,6 +228,68 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             resume.assert_called_once_with(snapshot.workflow_id)
 
+    def test_resume_restores_workflow_auto_approve_from_root_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator)
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", "session-a")
+            )
+            state = SessionState(
+                session_id="session-a",
+                mode="collab",
+                status="paused",
+                workflow_id=snapshot.workflow_id,
+                auto_approve=True,
+            )
+            save_session_state(root, state)
+
+            with patch.object(
+                coordinator, "_drive_session", return_value=state
+            ) as drive:
+                coordinator.resume_workflow(snapshot.workflow_id)
+
+            self.assertTrue(coordinator.auto_approve)
+            self.assertTrue(drive.call_args.args[0]._auto_approve)
+
+    def test_resume_with_auto_approve_upgrades_saved_root_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator, auto_approve=True)
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("fix", "session-a")
+            )
+            state = SessionState(
+                session_id="session-a",
+                mode="fix",
+                status="paused",
+                workflow_id=snapshot.workflow_id,
+                auto_approve=False,
+            )
+            save_session_state(root, state)
+            session = Session(
+                orchestrator,
+                mode="fix",
+                auto_approve=True,
+                coordinator=coordinator,
+            )
+
+            with patch.object(
+                coordinator, "_drive_session", return_value=state
+            ):
+                coordinator.resume_session(session, state.session_id)
+
+            saved = next(
+                item
+                for item in list_sessions(root)
+                if item.session_id == state.session_id
+            )
+            self.assertTrue(saved.auto_approve)
+
 
 class RoutedWorkflowTests(unittest.TestCase):
     def test_collab_routes_bug_through_fix_and_returns_for_goal_verification(self) -> None:
@@ -273,12 +340,81 @@ class RoutedWorkflowTests(unittest.TestCase):
                 )
 
             orchestrator.adapter.run = mock_run
-            state = Session(orchestrator, mode="collab").start()
+            state = Session(
+                orchestrator, mode="collab", auto_approve=True
+            ).start()
 
             self.assertEqual(state.status, "completed")
             self.assertEqual(state.lineage_changed_paths, ["app.py"])
             self.assertEqual((root / "app.py").read_text(), "fixed = True\n")
             self.assertTrue(any(item.get("action") == "child_returned" for item in state.execution_log))
+            fix_state = next(
+                item for item in list_sessions(root) if item.mode == "fix"
+            )
+            self.assertTrue(fix_state.auto_approve)
+            handoff_id = next(
+                item["handoff_id"]
+                for item in state.execution_log
+                if item.get("action") == "workflow_routed"
+            )
+            handoff = WorkflowStore(root).load_handoff(handoff_id)
+            self.assertTrue(handoff.payload["auto_approve"])
+
+    def test_collab_auto_approve_propagates_to_routed_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            inputs = iter(["Add export support", "y"])
+            orchestrator = Orchestrator(
+                root, user_input_fn=lambda _prompt: next(inputs, "")
+            )
+
+            def mock_agent(request):
+                if "read-only diagnostic and routing" in request.prompt:
+                    if "Child workflow run returned" in request.prompt:
+                        content = "GOAL_ACHIEVED: export support is available\n"
+                    else:
+                        content = (
+                            "ROUTE_WORKFLOW v1: "
+                            '{"target":"run","reason":"new capability",'
+                            '"spec_seed":{"title":"Export support",'
+                            '"goal":"Add export support","gap":"No export",'
+                            '"capability":"Export results",'
+                            '"acceptance":["Export succeeds"],'
+                            '"non_goals":[],"evidence":[],"open_decisions":[]}}\n'
+                        )
+                else:
+                    content = "Goal understood.\nGOAL_CLEAR\n"
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content.strip(),
+                    stdout=content,
+                    returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_agent
+
+            def fake_run(**kwargs):
+                self.assertTrue(kwargs["auto_approve"])
+                run_state = load_run_state(root)
+                self.assertTrue(run_state.resume_context["auto_approve"])
+                write_text(root / "export.py", "enabled = True\n")
+                commit_only_paths(root, "feat: add export support", ["export.py"])
+                run_state.status = "completed"
+                run_state.current_stage = "readme"
+                save_run_state(root, run_state)
+                return run_state
+
+            orchestrator.run = fake_run
+            state = Session(
+                orchestrator, mode="collab", auto_approve=True
+            ).start()
+
+            self.assertEqual(state.status, "completed")
+            self.assertIn("export.py", state.lineage_changed_paths)
 
     def test_standalone_fix_can_upgrade_to_run_and_verify_original_issue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -314,7 +450,8 @@ class RoutedWorkflowTests(unittest.TestCase):
 
             orchestrator.adapter.run = mock_agent
 
-            def fake_run(**_kwargs):
+            def fake_run(**kwargs):
+                self.assertTrue(kwargs["auto_approve"])
                 write_text(root / "export.py", "enabled = True\n")
                 commit_only_paths(root, "feat: add export support", ["export.py"])
                 run_state = load_run_state(root)
@@ -324,7 +461,9 @@ class RoutedWorkflowTests(unittest.TestCase):
                 return run_state
 
             orchestrator.run = fake_run
-            state = Session(orchestrator, mode="fix").start()
+            state = Session(
+                orchestrator, mode="fix", auto_approve=True
+            ).start()
 
             self.assertEqual(state.status, "completed")
             self.assertEqual(state.resolution, "resolved_by_iteration")

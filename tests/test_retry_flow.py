@@ -14582,8 +14582,9 @@ class IterationFlowTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root)
             interactive_calls: list[str] = []
 
-            def fake_interactive(state, clarify_spec_file):
+            def fake_interactive(state, clarify_spec_file, *, auto_approve=False):
                 interactive_calls.append(str(clarify_spec_file))
+                self.assertTrue(auto_approve)
                 state.current_stage = "clarify"
                 state.stage_summaries["clarify"] = "clarified"
                 state.last_error = ""

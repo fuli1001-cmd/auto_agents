@@ -175,8 +175,9 @@ Manual approvals are supported at four high-value gates:
 - `release`
 
 `run --auto-approve` auto-passes the requirements, architecture, and release gates. It never passes
-the generated frontend prototype gate, and it does not disable interactive clarify or README
-conversations.
+the generated frontend prototype gate. Clarify still asks any questions needed to establish the
+requirements, but once the agent is ready, project-brief generation is confirmed automatically.
+README conversations remain interactive.
 
 ## Repo map (token saver)
 
@@ -1733,6 +1734,12 @@ python3 -m auto_agents collab --project /tmp/demo
 # Force physical execution only for the final completion attestation
 python3 -m auto_agents collab --project /tmp/demo --full-verify
 ```
+
+`collab --auto-approve` is a workflow-wide policy: routed `fix` and `run` children inherit it, as
+does a `run` reached through `collab -> fix -> run`. Each child applies its own existing
+`--auto-approve` semantics. The policy is recorded in durable session and handoff state so workflow
+resume does not silently downgrade it. Mandatory exceptions such as frontend prototype selection
+and production persistence protections remain manual or prohibited.
 
 Each verification entry in the saved session log records its `progress` or `final` scope, logical
 command count, physically executed command count, certificate hits, and wall-clock duration.

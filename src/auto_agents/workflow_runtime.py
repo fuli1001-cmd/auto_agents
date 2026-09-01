@@ -169,6 +169,10 @@ class WorkflowCoordinator:
             state = create_session(self.project_root, session.mode)
             handoff.payload["child_session_id"] = state.session_id
             self.store.save_handoff(handoff)
+        self.auto_approve = bool(
+            self.auto_approve or handoff.payload.get("auto_approve", False)
+        )
+        session._auto_approve = self.auto_approve
         state.workflow_id = snapshot.workflow_id
         state.parent_handoff_id = handoff.handoff_id
         state.goal = handoff.goal
@@ -198,6 +202,11 @@ class WorkflowCoordinator:
 
     def resume_session(self, session: object, session_id: str):
         state = load_session_state(self.project_root, session_id)
+        self.auto_approve = bool(self.auto_approve or state.auto_approve)
+        session._auto_approve = self.auto_approve
+        if state.auto_approve != self.auto_approve:
+            state.auto_approve = self.auto_approve
+            save_session_state(self.project_root, state)
         if not state.workflow_id:
             snapshot = self.store.create_root(WorkflowRef(state.mode, state.session_id))
             state.workflow_id = snapshot.workflow_id
@@ -224,6 +233,7 @@ class WorkflowCoordinator:
             snapshot = candidates[0]
             self.store.activate(snapshot.workflow_id)
         root = snapshot.root
+        self._inherit_root_auto_approve(snapshot)
         if root.kind in {"collab", "fix", "provider_resolve"}:
             from .session import Session
 
@@ -332,6 +342,7 @@ class WorkflowCoordinator:
         self._reconcile_open_operations(snapshot)
         self.store.begin_resume(snapshot)
         root = snapshot.root
+        self._inherit_root_auto_approve(snapshot)
         if root.kind in {"collab", "fix", "provider_resolve"}:
             from .session import Session
 
@@ -351,6 +362,30 @@ class WorkflowCoordinator:
                 root=True,
             )
         return self._resume_run_root(snapshot)
+
+    def _inherit_root_auto_approve(self, snapshot: WorkflowSnapshot) -> None:
+        """Restore the workflow-wide approval policy from its durable root state."""
+
+        inherited = False
+        if snapshot.root.kind in {"collab", "fix", "provider_resolve"}:
+            try:
+                inherited = bool(
+                    load_session_state(
+                        self.project_root, snapshot.root.native_id
+                    ).auto_approve
+                )
+            except FileNotFoundError:
+                inherited = False
+        elif snapshot.root.kind == "run":
+            try:
+                inherited = bool(
+                    load_run_state(self.project_root).resume_context.get(
+                        "auto_approve", False
+                    )
+                )
+            except FileNotFoundError:
+                inherited = False
+        self.auto_approve = bool(self.auto_approve or inherited)
 
     def _reconcile_open_operations(self, snapshot: WorkflowSnapshot) -> None:
         intents: Dict[str, Dict[str, object]] = {}
@@ -646,6 +681,9 @@ class WorkflowCoordinator:
         return self._session_result(state, handoff)
 
     def _drive_run_child(self, handoff: WorkflowHandoff, snapshot: WorkflowSnapshot) -> Dict[str, object]:
+        self.auto_approve = bool(
+            self.auto_approve or handoff.payload.get("auto_approve", False)
+        )
         current = load_run_state(self.project_root)
         existing_same_handoff = (
             str(current.resume_context.get("parent_handoff_id", ""))
@@ -696,7 +734,7 @@ class WorkflowCoordinator:
                     "parent_handoff_id": handoff.handoff_id,
                     "iteration_spec_sha256": spec["sha256"],
                     "iteration_spec_commit": spec["commit_sha"],
-                    "auto_approve": False,
+                    "auto_approve": self.auto_approve,
                     "print_agent_output": self.print_agent_output,
                 }
             )
@@ -725,7 +763,7 @@ class WorkflowCoordinator:
         try:
             result_state = self.orch.run(
                 spec_file=spec_file,
-                auto_approve=False,
+                auto_approve=self.auto_approve,
                 print_agent_output=self.print_agent_output,
                 provider_kind=None,
                 autonomy_mode=getattr(self.orch, "_autonomy_mode", None),
