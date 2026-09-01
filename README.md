@@ -1562,15 +1562,21 @@ proven. In the default `max` mode, auto_agents generates at most three isolated 
 one hour, rejects duplicate diffs and weakened tests, runs base/candidate differential checks, and
 replays the blocked state in a private target clone. Candidate-added tests are also applied to base
 engine code so a newly added regression must actually fail without the implementation fix. An
-adversarial read-only candidate review is required before approval.
+adversarial read-only candidate review is required before approval. The candidate agent runs only
+focused checks; the orchestrator owns the single authoritative broad-suite execution.
 
-Candidates are attempted sequentially and the first candidate that crosses every absolute proof gate
-wins; this is not a relative majority vote. If none is approved, auto_agents reports and retains the
+Candidates are attempted sequentially and the first candidate that crosses every proof gate wins;
+this is not a relative majority vote. If none is approved, auto_agents reports and retains the
 candidate that reached the deepest verification stage instead of merely returning the last attempt.
-Equivalent base/candidate full-suite timeouts are normalized independently of temporary worktree
-paths and treated as inconclusive: the same candidate receives one longer bounded retry, is retained
-under `pending-validation` if proof is still incomplete, and is resumed before generating new code on
-the next self-repair run.
+Base and candidate full suites use the same progress lease and final safety ceiling. Test files are
+checkpointed independently; historically slow files are split into stable node batches, related and
+high-risk shards run first, and only shards with no detected shared-process/environment risk may run
+in parallel. Completed shard plans and results are content-addressed by the source tree and Python /
+pytest environment. A successful shard may cross candidate trees only when a conservative static
+dependency closure proves every local input unchanged; unknown or dynamic inputs force a real run.
+The baseline suite starts in the background once a viable candidate exists, overlapping candidate
+review and focused verification. Incomplete proof retains the same candidate under
+`pending-validation`, and the next self-repair run resumes unfinished shards before generating code.
 
 An approved candidate is not immediately merged. The real workflow first resumes from the approved
 candidate worktree. Only after the original blocker fingerprint disappears is the candidate promoted
@@ -1586,7 +1592,8 @@ lineages continue. Self-repair has no root-level candidate or wall-clock ceiling
 Pareto frontier, resumes each round from the strongest search candidate, and stops only after
 `max_consecutive_non_improving_candidates` consecutive candidates close no obligation, add no new
 confirmed in-scope finding, and advance no validation boundary. Candidate, review, replay, and test
-operations retain their own hard liveness timeouts. On patience exhaustion the complete experiment is
+operations retain provider/tool/no-progress leases plus final safety ceilings; ordinary activity no
+longer loses work at a short absolute deadline. On patience exhaustion the complete experiment is
 retained for operator diagnosis. Irreversible production actions, missing
 credentials/authorization, and product semantics that cannot be derived from requirements always
 remain explicit human boundaries, including in `max` mode.

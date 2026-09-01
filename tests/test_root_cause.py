@@ -1412,6 +1412,75 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             candidate_verify.assert_called_once_with(candidate_root)
             self.assertIn("candidate full suite", result.summary)
 
+    def test_self_repair_prompt_delegates_broad_suite_to_orchestrator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+            runner.repo_root = auto_root
+
+            prompt = runner._build_prompt()
+
+            self.assertIn("Do not run the broad auto_agents suite", prompt)
+            self.assertIn("orchestrator owns authoritative full-suite", prompt)
+
+    def test_base_full_suite_prewarm_is_reused_by_differential(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            candidate_root = root / "candidate"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            (auto_root / "tests").mkdir()
+            (candidate_root / "tests").mkdir(parents=True)
+            runner = AutoAgentsSelfRepairRunner(
+                type(
+                    "Orchestrator",
+                    (),
+                    {
+                        "config": type(
+                            "Config",
+                            (),
+                            {"execution": object()},
+                        )()
+                    },
+                )(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+            runner.repo_root = auto_root
+            passed = _VerificationResult(True, "passed")
+            with (
+                patch.object(
+                    runner,
+                    "_run_full_suite_at_ref",
+                    return_value=passed,
+                ) as base_verify,
+                patch.object(
+                    runner,
+                    "_run_full_suite_shards",
+                    return_value=passed,
+                ),
+            ):
+                runner._start_base_full_suite_prewarm("base")
+                result = runner._full_suite_differential(
+                    "base",
+                    candidate_root,
+                )
+
+            self.assertTrue(result.ok)
+            base_verify.assert_called_once_with("base")
+
     def test_equivalent_full_suite_timeouts_are_inconclusive_not_regressions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1489,10 +1558,12 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             _init_repo(candidate_root)
             write_text(
                 candidate_root / "tests" / "test_a.py",
+                "# subprocess-sensitive: keep this fixture serial\n"
                 "def test_a():\n    assert True\n",
             )
             write_text(
                 candidate_root / "tests" / "test_b.py",
+                "# subprocess-sensitive: keep this fixture serial\n"
                 "def test_b():\n    assert True\n",
             )
             subprocess.run(["git", "add", "-A"], cwd=candidate_root, check=True)
@@ -1566,6 +1637,188 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             resumed_verify.assert_called_once()
             self.assertIn("test_a.py cached=true", resumed.summary)
             self.assertIn("completed=2/2", resumed.summary)
+
+    def test_full_suite_collection_batches_nodes_and_fails_closed_for_parallelism(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            tests = "\n\n".join(
+                f"def test_{index:02d}():\n    assert True"
+                for index in range(25)
+            )
+            write_text(auto_root / "tests" / "test_pure.py", tests + "\n")
+            write_text(
+                auto_root / "tests" / "test_recovery_process.py",
+                "import subprocess\n\n"
+                "def test_process_contract():\n    assert subprocess is not None\n",
+            )
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "add shard fixtures"],
+                cwd=auto_root,
+                check=True,
+            )
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+            runner.repo_root = auto_root
+            runner._experiment_store = SelfRepairExperimentStore(
+                target_root,
+                "run",
+                "batching",
+            )
+            write_json(
+                runner._full_suite_timing_path(),
+                {
+                    "schema_version": 1,
+                    "samples": {"tests/test_pure.py": [180.0]},
+                },
+            )
+
+            shards = runner._collect_full_suite_shards(auto_root)
+
+            pure = [item for item in shards if item.test_file == "tests/test_pure.py"]
+            unsafe = [
+                item
+                for item in shards
+                if item.test_file == "tests/test_recovery_process.py"
+            ]
+            self.assertEqual(len(pure), 2)
+            self.assertTrue(all(item.parallel_safe for item in pure))
+            self.assertEqual(len(unsafe), 1)
+            self.assertFalse(unsafe[0].parallel_safe)
+            self.assertLess(unsafe[0].priority, pure[0].priority)
+
+    def test_full_suite_shard_plan_is_stable_for_same_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            tests = "\n\n".join(
+                f"def test_{index:02d}():\n    assert True"
+                for index in range(25)
+            )
+            write_text(auto_root / "tests" / "test_pure.py", tests + "\n")
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "add tests"],
+                cwd=auto_root,
+                check=True,
+            )
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+            runner.repo_root = auto_root
+            runner._experiment_store = SelfRepairExperimentStore(
+                target_root,
+                "run",
+                "stable-plan",
+            )
+            initial = runner._collect_full_suite_shards(auto_root)
+            write_json(
+                runner._full_suite_timing_path(),
+                {
+                    "schema_version": 1,
+                    "samples": {"tests/test_pure.py": [180.0]},
+                },
+            )
+
+            restored = runner._collect_full_suite_shards(auto_root)
+
+            self.assertEqual(len(initial), 1)
+            self.assertEqual(restored, initial)
+            write_text(auto_root / "README.md", "next candidate tree\n")
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "advance tree"],
+                cwd=auto_root,
+                check=True,
+            )
+
+            replanned = runner._collect_full_suite_shards(auto_root)
+
+            self.assertEqual(len(replanned), 2)
+
+    def test_full_suite_proof_cache_reuses_only_unchanged_dependency_closure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_text(
+                auto_root / "src" / "auto_agents" / "value.py",
+                "VALUE = 1\n",
+            )
+            write_text(
+                auto_root / "tests" / "test_value.py",
+                "from auto_agents.value import VALUE\n\n"
+                "def test_value():\n    assert VALUE == 1\n",
+            )
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "add pure proof"],
+                cwd=auto_root,
+                check=True,
+            )
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+            runner.repo_root = auto_root
+            runner._experiment_store = SelfRepairExperimentStore(
+                target_root,
+                "run",
+                "proof-cache",
+            )
+            shard = runner._collect_full_suite_shards(auto_root)[0]
+            passed = _VerificationResult(
+                True,
+                "passed",
+                commands=("pytest proof",),
+                returncodes=(0,),
+                termination_reasons=("",),
+            )
+            runner._full_suite_proof_cache_store(auto_root, shard, passed)
+            write_text(auto_root / "README.md", "unrelated documentation\n")
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "change unrelated docs"],
+                cwd=auto_root,
+                check=True,
+            )
+
+            reused = runner._full_suite_proof_cache_lookup(auto_root, shard)
+
+            self.assertIsNotNone(reused)
+            self.assertTrue(reused.ok)
+            write_text(
+                auto_root / "src" / "auto_agents" / "value.py",
+                "VALUE = 2\n",
+            )
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "change proof dependency"],
+                cwd=auto_root,
+                check=True,
+            )
+
+            invalidated = runner._full_suite_proof_cache_lookup(auto_root, shard)
+
+            self.assertIsNone(invalidated)
 
     def test_differential_applies_candidate_tests_to_base_engine(self):
         with tempfile.TemporaryDirectory() as tmp:

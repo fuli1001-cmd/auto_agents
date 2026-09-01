@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -9,11 +10,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any, Mapping, Optional
 
 from .git_ops import (
@@ -69,6 +73,9 @@ SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS = 900
 SELF_REPAIR_FULL_SUITE_PROGRESS_LEASE_SECONDS = 900
 SELF_REPAIR_FULL_SUITE_SAFETY_CEILING_SECONDS = 14_400
 SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION = 1
+SELF_REPAIR_FULL_SUITE_NODE_BATCH_SIZE = 24
+SELF_REPAIR_FULL_SUITE_NODE_BATCH_THRESHOLD_SECONDS = 120
+SELF_REPAIR_FULL_SUITE_MAX_PARALLEL_WORKERS = 4
 SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
     "candidate_exception": 0,
     "candidate_failed": 10,
@@ -177,6 +184,16 @@ class SelfRepairResult:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class _FullSuiteShard:
+    shard_id: str
+    test_file: str
+    targets: tuple[str, ...]
+    parallel_safe: bool = False
+    priority: int = 100
+    estimated_seconds: float = 0.0
 
 
 @dataclass
@@ -1603,6 +1620,11 @@ class AutoAgentsSelfRepairRunner:
         self._remote_conflict_resolved = False
         self._base_full_verification: dict[str, _VerificationResult] = {}
         self._verification_python_cache = ""
+        self._base_prewarm_lock = threading.Lock()
+        self._base_prewarm_thread: Optional[threading.Thread] = None
+        self._base_prewarm_ref = ""
+        self._base_prewarm_result: Optional[_VerificationResult] = None
+        self._base_prewarm_error: Optional[BaseException] = None
 
     def _autonomy_config(self) -> object:
         config = getattr(self.target_orchestrator, "config", None)
@@ -2273,7 +2295,66 @@ class AutoAgentsSelfRepairRunner:
         self._experiment_store.save(experiment)
         self._record_candidate_result(result, attempt=result.attempt)
 
+    def _start_base_full_suite_prewarm(self, base_ref: str) -> None:
+        if (
+            not base_ref
+            or not (self.repo_root / "tests").is_dir()
+            or self._base_full_verification.get(base_ref) is not None
+        ):
+            return
+        with self._base_prewarm_lock:
+            if self._base_prewarm_thread is not None:
+                return
+            self._base_prewarm_ref = base_ref
+
+            def prewarm() -> None:
+                try:
+                    result = self._run_full_suite_at_ref(base_ref)
+                    with self._base_prewarm_lock:
+                        self._base_prewarm_result = result
+                        self._base_full_verification[base_ref] = result
+                except BaseException as error:
+                    with self._base_prewarm_lock:
+                        self._base_prewarm_error = error
+
+            self._base_prewarm_thread = threading.Thread(
+                target=prewarm,
+                name="auto-agents-self-repair-base-prewarm",
+                daemon=False,
+            )
+            self._base_prewarm_thread.start()
+
+    def _await_base_full_suite_prewarm(
+        self,
+        base_ref: str,
+    ) -> Optional["_VerificationResult"]:
+        with self._base_prewarm_lock:
+            thread = (
+                self._base_prewarm_thread
+                if self._base_prewarm_ref == base_ref
+                else None
+            )
+        if thread is None:
+            return None
+        thread.join()
+        with self._base_prewarm_lock:
+            if self._base_prewarm_error is not None:
+                return None
+            return self._base_prewarm_result
+
+    def _finish_base_full_suite_prewarm(self) -> None:
+        with self._base_prewarm_lock:
+            thread = self._base_prewarm_thread
+        if thread is not None:
+            thread.join()
+
     def run(self) -> SelfRepairResult:
+        try:
+            return self._run_search()
+        finally:
+            self._finish_base_full_suite_prewarm()
+
+    def _run_search(self) -> SelfRepairResult:
         autonomy = self._autonomy_config()
         mode = str(
             getattr(
@@ -2371,6 +2452,8 @@ class AutoAgentsSelfRepairRunner:
                     experiment._recompute_frontier()
                 store.save(experiment)
             self._migrate_recoverable_candidate_to_pending(experiment)
+            if self._latest_pending_validation_ref(experiment.base_commit):
+                self._start_base_full_suite_prewarm(experiment.base_commit)
             pending = self._resume_pending_validation_candidate(
                 experiment_id=experiment_id,
                 deadline=(
@@ -2833,6 +2916,9 @@ class AutoAgentsSelfRepairRunner:
                     f"{self._safe_repair_category()}/{experiment_id}/{candidate_id}"
                 )
                 update_ref(self.repo_root, candidate_ref, candidate_commit)
+                self._start_base_full_suite_prewarm(
+                    self._experiment.base_commit
+                )
                 strategy_fingerprint = _search_stable_hash(
                     sorted(changed),
                     summary[-2000:],
@@ -3438,6 +3524,8 @@ class AutoAgentsSelfRepairRunner:
             return _VerificationResult(True, "full-suite differential=not-applicable")
         base = self._base_full_verification.get(base_head)
         if base is None:
+            base = self._await_base_full_suite_prewarm(base_head)
+        if base is None:
             base = self._run_full_suite_at_ref(base_head)
             self._base_full_verification[base_head] = base
         candidate = self._run_full_suite_shards(candidate_root)
@@ -3518,18 +3606,13 @@ class AutoAgentsSelfRepairRunner:
         self,
         verification_root: Path,
     ) -> "_VerificationResult":
-        shards = sorted(
-            path.relative_to(verification_root).as_posix()
-            for path in (verification_root / "tests").rglob("*.py")
-            if path.is_file()
-            and (
-                path.name.startswith("test_")
-                or path.name.endswith("_test.py")
-            )
-        )
+        shards = self._collect_full_suite_shards(verification_root)
         if not shards:
             return _VerificationResult(True, "full-suite shards=not-applicable")
-        suite_key = self._full_suite_checkpoint_key(verification_root, shards)
+        suite_key = self._full_suite_checkpoint_key(
+            verification_root,
+            [target for shard in shards for target in shard.targets],
+        )
         checkpoint_path = self._full_suite_checkpoint_path(suite_key)
         try:
             checkpoint = (
@@ -3549,52 +3632,687 @@ class AutoAgentsSelfRepairRunner:
             else {}
         )
         results: list[tuple[str, _VerificationResult, bool]] = []
+        pending: list[_FullSuiteShard] = []
         for shard in shards:
-            cached = completed.get(shard)
+            cached = completed.get(shard.shard_id)
             if isinstance(cached, Mapping):
                 shard_result = _VerificationResult.from_dict(cached)
-                results.append((shard, shard_result, True))
+                results.append((shard.shard_id, shard_result, True))
                 continue
-            command = f"python -m pytest -q {shlex.quote(shard)}"
-            shard_result = self._run_verification_commands(
-                [command],
+            proof = self._full_suite_proof_cache_lookup(
                 verification_root,
-                command_timeout_seconds=(
-                    SELF_REPAIR_FULL_SUITE_SAFETY_CEILING_SECONDS
-                ),
-                adaptive_timeout_enabled=True,
-                command_idle_timeout_seconds=(
-                    SELF_REPAIR_FULL_SUITE_PROGRESS_LEASE_SECONDS
-                ),
+                shard,
             )
-            results.append((shard, shard_result, False))
+            if proof is not None:
+                completed[shard.shard_id] = proof.to_dict()
+                results.append((shard.shard_id, proof, True))
+                continue
+            pending.append(shard)
+
+        checkpoint_lock = threading.Lock()
+
+        def record(
+            shard: _FullSuiteShard,
+            shard_result: _VerificationResult,
+        ) -> bool:
             interrupted = shard_result.timed_out or any(
                 reason == "stalled"
                 for reason in shard_result.termination_reasons
             )
-            if interrupted:
-                return self._aggregate_full_suite_shards(
-                    results,
-                    recoverable=True,
-                    total_shards=len(shards),
+            with checkpoint_lock:
+                results.append((shard.shard_id, shard_result, False))
+                if interrupted:
+                    return False
+                completed[shard.shard_id] = shard_result.to_dict()
+                if checkpoint_path is not None:
+                    write_json(
+                        checkpoint_path,
+                        {
+                            "schema_version": (
+                                SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION
+                            ),
+                            "suite_key": suite_key,
+                            "completed": completed,
+                            "updated_at": _utc_now_iso(),
+                        },
+                    )
+                if shard_result.ok:
+                    self._full_suite_proof_cache_store(
+                        verification_root,
+                        shard,
+                        shard_result,
+                    )
+                self._record_full_suite_timing(shard, shard_result)
+            return True
+
+        for priority in sorted({shard.priority for shard in pending}):
+            phase = [shard for shard in pending if shard.priority == priority]
+            serial = [shard for shard in phase if not shard.parallel_safe]
+            parallel = [shard for shard in phase if shard.parallel_safe]
+            for shard in serial:
+                shard_result = self._execute_full_suite_shard(
+                    verification_root,
+                    shard,
                 )
-            completed[shard] = shard_result.to_dict()
-            if checkpoint_path is not None:
-                write_json(
-                    checkpoint_path,
-                    {
-                        "schema_version": (
-                            SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION
-                        ),
-                        "suite_key": suite_key,
-                        "completed": completed,
-                        "updated_at": _utc_now_iso(),
-                    },
+                if not record(shard, shard_result):
+                    return self._aggregate_full_suite_shards(
+                        results,
+                        recoverable=True,
+                        total_shards=len(shards),
+                    )
+            if parallel:
+                workers = min(
+                    SELF_REPAIR_FULL_SUITE_MAX_PARALLEL_WORKERS,
+                    len(parallel),
+                    max(1, (os.cpu_count() or 2) // 2),
                 )
+                interrupted = False
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(
+                            self._execute_full_suite_shard,
+                            verification_root,
+                            shard,
+                        ): shard
+                        for shard in parallel
+                    }
+                    for future in as_completed(futures):
+                        shard = futures[future]
+                        shard_result = future.result()
+                        if not record(shard, shard_result):
+                            interrupted = True
+                if interrupted:
+                    return self._aggregate_full_suite_shards(
+                        results,
+                        recoverable=True,
+                        total_shards=len(shards),
+                    )
         return self._aggregate_full_suite_shards(
             results,
             recoverable=False,
             total_shards=len(shards),
+        )
+
+    def _execute_full_suite_shard(
+        self,
+        verification_root: Path,
+        shard: _FullSuiteShard,
+    ) -> "_VerificationResult":
+        command = "python -m pytest -q -p no:cacheprovider " + " ".join(
+            shlex.quote(target) for target in shard.targets
+        )
+        return self._run_verification_commands(
+            [command],
+            verification_root,
+            command_timeout_seconds=(
+                SELF_REPAIR_FULL_SUITE_SAFETY_CEILING_SECONDS
+            ),
+            adaptive_timeout_enabled=True,
+            command_idle_timeout_seconds=(
+                SELF_REPAIR_FULL_SUITE_PROGRESS_LEASE_SECONDS
+            ),
+        )
+
+    def _collect_full_suite_shards(
+        self,
+        verification_root: Path,
+    ) -> list[_FullSuiteShard]:
+        test_files = sorted(
+            path.relative_to(verification_root).as_posix()
+            for path in (verification_root / "tests").rglob("*.py")
+            if path.is_file()
+            and (
+                path.name.startswith("test_")
+                or path.name.endswith("_test.py")
+            )
+        )
+        if not test_files:
+            return []
+        plan_key = self._full_suite_shard_plan_key(
+            verification_root,
+            test_files,
+        )
+        plan_path = self._full_suite_shard_plan_path(plan_key)
+        if plan_path is not None:
+            try:
+                payload = read_json(plan_path, default={})
+            except (OSError, ValueError):
+                payload = {}
+            raw_shards = payload.get("shards", []) if isinstance(payload, Mapping) else []
+            if (
+                isinstance(payload, Mapping)
+                and payload.get("schema_version")
+                == SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION
+                and payload.get("plan_key") == plan_key
+                and isinstance(raw_shards, list)
+                and raw_shards
+            ):
+                restored = [
+                    _FullSuiteShard(
+                        shard_id=str(item.get("shard_id", "")),
+                        test_file=str(item.get("test_file", "")),
+                        targets=tuple(
+                            str(target) for target in item.get("targets", []) or []
+                        ),
+                        parallel_safe=bool(item.get("parallel_safe", False)),
+                        priority=int(item.get("priority", 100)),
+                        estimated_seconds=float(
+                            item.get("estimated_seconds", 0.0) or 0.0
+                        ),
+                    )
+                    for item in raw_shards
+                    if isinstance(item, Mapping)
+                    and str(item.get("shard_id", "")).strip()
+                    and str(item.get("test_file", "")) in test_files
+                    and item.get("targets")
+                ]
+                if len(restored) == len(raw_shards):
+                    return restored
+        collect_command = self_repair_verification_command(
+            "python -m pytest --collect-only -q -p no:cacheprovider tests",
+            verification_root,
+            repository_aliases={self.repo_root.name},
+            python_executable=self._verification_python(),
+        )
+        try:
+            collected = subprocess.run(
+                collect_command,
+                cwd=str(verification_root),
+                shell=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.SubprocessError):
+            collected = None
+        nodes_by_file: dict[str, list[str]] = {path: [] for path in test_files}
+        if collected is not None and collected.returncode == 0:
+            for raw_line in collected.stdout.splitlines():
+                node = raw_line.strip()
+                if "::" not in node:
+                    continue
+                test_file = node.split("::", 1)[0]
+                if test_file in nodes_by_file:
+                    nodes_by_file[test_file].append(node)
+        priority_paths = self._full_suite_priority_paths(verification_root)
+        shards: list[_FullSuiteShard] = []
+        for test_file in test_files:
+            nodes = nodes_by_file[test_file]
+            estimated_seconds = self._full_suite_timing_estimate(test_file)
+            split_nodes = bool(
+                nodes
+                and estimated_seconds
+                >= SELF_REPAIR_FULL_SUITE_NODE_BATCH_THRESHOLD_SECONDS
+            )
+            batches = (
+                [
+                    nodes[index : index + SELF_REPAIR_FULL_SUITE_NODE_BATCH_SIZE]
+                    for index in range(
+                        0,
+                        len(nodes),
+                        SELF_REPAIR_FULL_SUITE_NODE_BATCH_SIZE,
+                    )
+                ]
+                if split_nodes
+                else [nodes or [test_file]]
+            )
+            parallel_safe = self._full_suite_shard_parallel_safe(
+                verification_root,
+                test_file,
+            )
+            priority = self._full_suite_shard_priority(
+                test_file,
+                priority_paths,
+            )
+            for index, targets in enumerate(batches, start=1):
+                shard_id = (
+                    test_file
+                    if len(batches) == 1
+                    else (
+                        f"{test_file}#batch-{index:03d}-"
+                        + _search_stable_hash(targets, length=8)
+                    )
+                )
+                shards.append(
+                    _FullSuiteShard(
+                        shard_id=shard_id,
+                        test_file=test_file,
+                        targets=tuple(targets),
+                        parallel_safe=parallel_safe,
+                        priority=priority,
+                        estimated_seconds=estimated_seconds,
+                    )
+                )
+        ordered = sorted(
+            shards,
+            key=lambda item: (
+                item.priority,
+                0 if not item.parallel_safe else 1,
+                -item.estimated_seconds,
+                item.shard_id,
+            ),
+        )
+        if plan_path is not None:
+            write_json(
+                plan_path,
+                {
+                    "schema_version": (
+                        SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION
+                    ),
+                    "plan_key": plan_key,
+                    "shards": [
+                        {
+                            "shard_id": item.shard_id,
+                            "test_file": item.test_file,
+                            "targets": list(item.targets),
+                            "parallel_safe": item.parallel_safe,
+                            "priority": item.priority,
+                            "estimated_seconds": item.estimated_seconds,
+                        }
+                        for item in ordered
+                    ],
+                    "updated_at": _utc_now_iso(),
+                },
+            )
+        return ordered
+
+    def _full_suite_shard_plan_key(
+        self,
+        verification_root: Path,
+        test_files: list[str],
+    ) -> str:
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=str(verification_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        tree_ref = tree.stdout.strip() if tree.returncode == 0 else ""
+        return _search_stable_hash(
+            "full-suite-shard-plan-v1",
+            tree_ref,
+            test_files,
+            SELF_REPAIR_FULL_SUITE_NODE_BATCH_SIZE,
+            SELF_REPAIR_FULL_SUITE_NODE_BATCH_THRESHOLD_SECONDS,
+            self._full_suite_environment_fingerprint(),
+        )
+
+    def _full_suite_shard_plan_path(self, plan_key: str) -> Optional[Path]:
+        store = getattr(self, "_experiment_store", None)
+        if not isinstance(store, SelfRepairExperimentStore):
+            return None
+        return store.root / "full-suite-shard-plans" / f"{plan_key}.json"
+
+    def _full_suite_priority_paths(self, verification_root: Path) -> set[str]:
+        paths: set[str] = set()
+        experiment = getattr(self, "_experiment", None)
+        base_ref = str(getattr(experiment, "base_commit", "") or "")
+        if base_ref:
+            changed = subprocess.run(
+                ["git", "diff", "--name-only", base_ref, "HEAD", "--"],
+                cwd=str(verification_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if changed.returncode == 0:
+                paths.update(
+                    line.strip()
+                    for line in changed.stdout.splitlines()
+                    if line.strip().startswith("tests/")
+                )
+        if self.diagnosis is not None:
+            for command in self.diagnosis.final.verification_commands:
+                paths.update(
+                    match.group(0).split("::", 1)[0]
+                    for match in re.finditer(r"tests?/[A-Za-z0-9_./-]+\.py", command)
+                )
+        return paths
+
+    @staticmethod
+    def _full_suite_shard_priority(
+        test_file: str,
+        priority_paths: set[str],
+    ) -> int:
+        if test_file in priority_paths:
+            return 0
+        lowered = test_file.lower()
+        if any(
+            token in lowered
+            for token in (
+                "self_repair",
+                "recovery",
+                "retry",
+                "root_cause",
+                "failover",
+                "smart_timeout",
+                "gates",
+            )
+        ):
+            return 20
+        return 100
+
+    @staticmethod
+    def _full_suite_shard_parallel_safe(
+        verification_root: Path,
+        test_file: str,
+    ) -> bool:
+        paths = [verification_root / test_file]
+        paths.extend(
+            path
+            for path in (
+                verification_root / "conftest.py",
+                verification_root / "tests" / "conftest.py",
+            )
+            if path.is_file()
+        )
+        try:
+            source = "\n".join(path.read_text("utf-8") for path in paths).lower()
+        except OSError:
+            return False
+        unsafe_tokens = (
+            "subprocess",
+            "multiprocessing",
+            "threading",
+            "socket",
+            "signal.",
+            "os.environ",
+            "patch.dict",
+            "chdir(",
+            "worktree",
+            "docker",
+            "localhost",
+            "127.0.0.1",
+            "background",
+            "start_new_session",
+        )
+        return not any(token in source for token in unsafe_tokens)
+
+    def _full_suite_proof_cache_lookup(
+        self,
+        verification_root: Path,
+        shard: _FullSuiteShard,
+    ) -> Optional["_VerificationResult"]:
+        proof_key = self._full_suite_proof_key(verification_root, shard)
+        path = self._full_suite_proof_cache_path(proof_key)
+        if path is None:
+            return None
+        try:
+            payload = read_json(path, default={})
+        except (OSError, ValueError):
+            return None
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("schema_version")
+            != SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION
+            or payload.get("proof_key") != proof_key
+            or not isinstance(payload.get("result"), Mapping)
+        ):
+            return None
+        result = _VerificationResult.from_dict(payload["result"])
+        return result if result.ok and not result.recoverable else None
+
+    def _full_suite_proof_cache_store(
+        self,
+        verification_root: Path,
+        shard: _FullSuiteShard,
+        result: "_VerificationResult",
+    ) -> None:
+        if not result.ok or result.recoverable:
+            return
+        proof_key = self._full_suite_proof_key(verification_root, shard)
+        path = self._full_suite_proof_cache_path(proof_key)
+        if path is None:
+            return
+        write_json(
+            path,
+            {
+                "schema_version": SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION,
+                "proof_key": proof_key,
+                "test_file": shard.test_file,
+                "targets": list(shard.targets),
+                "result": result.to_dict(),
+                "updated_at": _utc_now_iso(),
+            },
+        )
+
+    def _full_suite_proof_key(
+        self,
+        verification_root: Path,
+        shard: _FullSuiteShard,
+    ) -> str:
+        dependency_fingerprint, complete = (
+            self._full_suite_dependency_fingerprint(
+                verification_root,
+                shard.test_file,
+            )
+        )
+        tree_ref = ""
+        if not complete:
+            tree = subprocess.run(
+                ["git", "rev-parse", "HEAD^{tree}"],
+                cwd=str(verification_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            tree_ref = tree.stdout.strip() if tree.returncode == 0 else ""
+        return _search_stable_hash(
+            "full-suite-proof-v1",
+            shard.targets,
+            dependency_fingerprint,
+            tree_ref,
+            self._full_suite_environment_fingerprint(),
+        )
+
+    def _full_suite_dependency_fingerprint(
+        self,
+        verification_root: Path,
+        test_file: str,
+    ) -> tuple[str, bool]:
+        root = verification_root.resolve()
+        initial = [root / test_file]
+        initial.extend(
+            path
+            for path in (
+                root / "conftest.py",
+                root / "tests" / "conftest.py",
+                root / "pyproject.toml",
+            )
+            if path.is_file()
+        )
+        queue = list(initial)
+        seen: set[Path] = set()
+        content: list[tuple[str, str]] = []
+        complete = True
+        dynamic_markers = (
+            "importlib.",
+            "__import__(",
+            "pkgutil.",
+            "subprocess",
+            "os.environ",
+            "getenv(",
+            "monkeypatch",
+            "path.cwd(",
+            "sys.argv",
+            "time.",
+            "datetime.",
+            "random.",
+            "uuid.",
+            "socket",
+            ".read_text(",
+            ".read_bytes(",
+            ".write_text(",
+            ".write_bytes(",
+            ".glob(",
+            ".rglob(",
+            "open(",
+        )
+        while queue:
+            path = queue.pop()
+            try:
+                resolved = path.resolve()
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                complete = False
+                continue
+            if resolved in seen or not resolved.is_file():
+                continue
+            seen.add(resolved)
+            try:
+                raw = resolved.read_bytes()
+            except OSError:
+                complete = False
+                continue
+            relative = resolved.relative_to(root).as_posix()
+            content.append((relative, hashlib.sha256(raw).hexdigest()))
+            if resolved.suffix != ".py":
+                continue
+            source = raw.decode("utf-8", errors="replace")
+            lowered = source.lower()
+            if any(marker in lowered for marker in dynamic_markers):
+                return _search_stable_hash(test_file, "dynamic-inputs"), False
+            try:
+                tree = ast.parse(source, filename=relative)
+            except SyntaxError:
+                return _search_stable_hash(test_file, "unparsed-source"), False
+            current_module = self._module_name_for_path(root, resolved)
+            for node in ast.walk(tree):
+                modules: list[str] = []
+                if isinstance(node, ast.Import):
+                    modules.extend(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    imported = self._resolve_import_from(
+                        current_module,
+                        node.module or "",
+                        node.level,
+                    )
+                    if imported:
+                        modules.append(imported)
+                        modules.extend(
+                            f"{imported}.{alias.name}"
+                            for alias in node.names
+                            if alias.name != "*"
+                        )
+                for module in modules:
+                    dependency = self._module_path(root, module)
+                    if dependency is not None and dependency not in seen:
+                        queue.append(dependency)
+        return _search_stable_hash(sorted(content)), complete
+
+    @staticmethod
+    def _module_name_for_path(root: Path, path: Path) -> str:
+        relative = path.relative_to(root)
+        parts = list(relative.with_suffix("").parts)
+        if parts[:2] == ["src", "auto_agents"]:
+            parts = parts[1:]
+        if parts and parts[-1] == "__init__":
+            parts.pop()
+        return ".".join(parts)
+
+    @staticmethod
+    def _resolve_import_from(
+        current_module: str,
+        imported_module: str,
+        level: int,
+    ) -> str:
+        if level <= 0:
+            return imported_module
+        package = current_module.split(".")[:-1]
+        keep = max(0, len(package) - (level - 1))
+        parts = package[:keep]
+        if imported_module:
+            parts.extend(imported_module.split("."))
+        return ".".join(parts)
+
+    @staticmethod
+    def _module_path(root: Path, module: str) -> Optional[Path]:
+        if not module:
+            return None
+        parts = module.split(".")
+        candidates = [
+            root.joinpath(*parts).with_suffix(".py"),
+            root.joinpath(*parts, "__init__.py"),
+        ]
+        if parts[0] == "auto_agents":
+            candidates.extend(
+                (
+                    root.joinpath("src", *parts).with_suffix(".py"),
+                    root.joinpath("src", *parts, "__init__.py"),
+                )
+            )
+        return next((path for path in candidates if path.is_file()), None)
+
+    def _full_suite_proof_cache_path(self, proof_key: str) -> Optional[Path]:
+        store = getattr(self, "_experiment_store", None)
+        if not isinstance(store, SelfRepairExperimentStore):
+            return None
+        return store.root / "full-suite-proof-cache" / f"{proof_key}.json"
+
+    def _full_suite_timing_path(self) -> Optional[Path]:
+        store = getattr(self, "_experiment_store", None)
+        if not isinstance(store, SelfRepairExperimentStore):
+            return None
+        return store.root / "full-suite-timings.json"
+
+    def _full_suite_timing_estimate(self, test_file: str) -> float:
+        path = self._full_suite_timing_path()
+        if path is None:
+            return 0.0
+        try:
+            payload = read_json(path, default={})
+            if not isinstance(payload, Mapping):
+                return 0.0
+            sample_map = payload.get("samples", {})
+            if not isinstance(sample_map, Mapping):
+                return 0.0
+            samples = sample_map.get(test_file, [])
+            durations = [
+                float(item)
+                for item in samples
+                if isinstance(item, (int, float)) and float(item) >= 0
+            ]
+            return float(median(durations)) if durations else 0.0
+        except (OSError, TypeError, ValueError):
+            return 0.0
+
+    def _record_full_suite_timing(
+        self,
+        shard: _FullSuiteShard,
+        result: "_VerificationResult",
+    ) -> None:
+        if result.duration_seconds <= 0 or "#batch-" in shard.shard_id:
+            return
+        path = self._full_suite_timing_path()
+        if path is None:
+            return
+        try:
+            payload = read_json(path, default={})
+        except (OSError, ValueError):
+            payload = {}
+        samples = (
+            dict(payload.get("samples", {}))
+            if isinstance(payload, Mapping)
+            and isinstance(payload.get("samples", {}), Mapping)
+            else {}
+        )
+        history = [
+            float(item)
+            for item in samples.get(shard.test_file, [])
+            if isinstance(item, (int, float)) and float(item) >= 0
+        ]
+        history.append(float(result.duration_seconds))
+        samples[shard.test_file] = history[-7:]
+        write_json(
+            path,
+            {
+                "schema_version": 1,
+                "samples": samples,
+                "updated_at": _utc_now_iso(),
+            },
         )
 
     def _aggregate_full_suite_shards(
@@ -3609,7 +4327,7 @@ class AutoAgentsSelfRepairRunner:
         returncodes: list[int] = []
         termination_reasons: list[str] = []
         ok = not recoverable
-        for shard, result, cached in results:
+        for shard, result, cached in sorted(results, key=lambda item: item[0]):
             summaries.append(
                 f"=== full-suite shard {shard} cached={str(cached).lower()} ===\n"
                 + result.summary
@@ -3653,6 +4371,16 @@ class AutoAgentsSelfRepairRunner:
             capture_output=True,
         )
         tree_ref = tree.stdout.strip() if tree.returncode == 0 else ""
+        return _search_stable_hash(
+            tree_ref,
+            shards,
+            self._full_suite_environment_fingerprint(),
+        )
+
+    def _full_suite_environment_fingerprint(self) -> tuple[object, ...]:
+        cached = getattr(self, "_full_suite_environment_cache", None)
+        if isinstance(cached, tuple):
+            return cached
         python = Path(self._verification_python())
         environment_version = ""
         try:
@@ -3684,7 +4412,8 @@ class AutoAgentsSelfRepairRunner:
             )
         except OSError:
             environment = (str(python), 0, 0, environment_version)
-        return _search_stable_hash(tree_ref, shards, environment)
+        self._full_suite_environment_cache = environment
+        return environment
 
     def _full_suite_checkpoint_path(self, suite_key: str) -> Optional[Path]:
         store = getattr(self, "_experiment_store", None)
@@ -4401,6 +5130,9 @@ class AutoAgentsSelfRepairRunner:
             "",
             "Verification expectation:",
             "- Run focused pytest checks for auto_agents before declaring success.",
+            "- Do not run the broad auto_agents suite or entire large test modules; "
+            "the orchestrator owns authoritative full-suite execution, checkpointing, "
+            "and differential comparison after the candidate is ready.",
             "- Add a focused regression that fails when applied to the base engine code and passes with the fix; broad suites that pass on both revisions are not differential proof.",
             "",
             "Final response:",
@@ -4498,6 +5230,7 @@ class AutoAgentsSelfRepairRunner:
         rendered_commands: list[str] = []
         returncodes: list[int] = []
         termination_reasons: list[str] = []
+        duration_seconds = 0.0
         for command in commands:
             verification_command = self_repair_verification_command(
                 command,
@@ -4515,6 +5248,7 @@ class AutoAgentsSelfRepairRunner:
                 ),
             )
             process = gate.commands[0]
+            duration_seconds += float(process.duration_seconds)
             rendered_commands.append(verification_command)
             returncodes.append(int(process.returncode))
             termination_reasons.append(
@@ -4543,6 +5277,7 @@ class AutoAgentsSelfRepairRunner:
                     commands=tuple(rendered_commands),
                     returncodes=tuple(returncodes),
                     termination_reasons=tuple(termination_reasons),
+                    duration_seconds=duration_seconds,
                 )
         return _VerificationResult(
             True,
@@ -4550,6 +5285,7 @@ class AutoAgentsSelfRepairRunner:
             commands=tuple(rendered_commands),
             returncodes=tuple(returncodes),
             termination_reasons=tuple(termination_reasons),
+            duration_seconds=duration_seconds,
         )
 
     def _commit_message(self, summary: str) -> str:
@@ -4568,6 +5304,7 @@ class _VerificationResult:
     returncodes: tuple[int, ...] = ()
     termination_reasons: tuple[str, ...] = ()
     recoverable: bool = False
+    duration_seconds: float = 0.0
     payload: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
@@ -4578,6 +5315,7 @@ class _VerificationResult:
             "returncodes": list(self.returncodes),
             "termination_reasons": list(self.termination_reasons),
             "recoverable": self.recoverable,
+            "duration_seconds": self.duration_seconds,
         }
 
     @classmethod
@@ -4594,6 +5332,7 @@ class _VerificationResult:
                 for item in payload.get("termination_reasons", []) or []
             ),
             recoverable=bool(payload.get("recoverable", False)),
+            duration_seconds=float(payload.get("duration_seconds", 0.0) or 0.0),
         )
 
     @property
