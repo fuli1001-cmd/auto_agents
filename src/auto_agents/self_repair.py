@@ -66,7 +66,9 @@ SELF_REPAIR_TRIAGE_CONTEXT_LIMIT = 20_000
 SELF_REPAIR_TRIAGE_LOG_LIMIT = 24_000
 SELF_REPAIR_GIT_SYNC_TIMEOUT_SECONDS = 120
 SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS = 900
-SELF_REPAIR_EXTENDED_FULL_SUITE_TIMEOUT_SECONDS = 1800
+SELF_REPAIR_FULL_SUITE_PROGRESS_LEASE_SECONDS = 900
+SELF_REPAIR_FULL_SUITE_SAFETY_CEILING_SECONDS = 14_400
+SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION = 1
 SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
     "candidate_exception": 0,
     "candidate_failed": 10,
@@ -1848,6 +1850,151 @@ class AutoAgentsSelfRepairRunner:
                 return candidate_ref
         return ""
 
+    def _retain_pending_validation_candidate(
+        self,
+        candidate_root: Path,
+        *,
+        candidate_id: str,
+        candidate_ref: str,
+        summary: str,
+    ) -> tuple[str, str]:
+        pending_commit = self._squash_candidate_commit(
+            candidate_root,
+            self._experiment.base_commit,
+            self._commit_message(summary),
+        )
+        pending_ref = (
+            "refs/auto-agents/self-repair/pending-validation/"
+            f"{self._safe_repair_category()}/{candidate_id}"
+        )
+        update_ref(self.repo_root, pending_ref, pending_commit)
+        if candidate_ref and candidate_ref != pending_ref:
+            delete_ref(self.repo_root, candidate_ref)
+        return pending_commit, pending_ref
+
+    def _migrate_recoverable_candidate_to_pending(
+        self,
+        experiment: SelfRepairExperiment,
+    ) -> None:
+        if self._latest_pending_validation_ref(experiment.base_commit):
+            return
+        record = experiment.candidates.get(experiment.best_search_candidate_id)
+        if (
+            record is None
+            or record.candidate_id == "base"
+            or record.fatal
+            or record.validation_stage != "full_suite"
+            or record.validation_rank < 90
+            or not record.candidate_commit
+        ):
+            return
+        with tempfile.TemporaryDirectory(
+            prefix="auto-agents-pending-migration-"
+        ) as tmp:
+            candidate_root = Path(tmp) / "candidate"
+            created = False
+            try:
+                add_worktree(
+                    self.repo_root,
+                    candidate_root,
+                    ref=record.candidate_commit,
+                )
+                created = True
+                pending_commit, pending_ref = (
+                    self._retain_pending_validation_candidate(
+                        candidate_root,
+                        candidate_id=record.candidate_id,
+                        candidate_ref=record.candidate_ref,
+                        summary="retain strongest candidate for full-suite validation",
+                    )
+                )
+            finally:
+                if created:
+                    try:
+                        remove_worktree(
+                            self.repo_root,
+                            candidate_root,
+                            force=True,
+                        )
+                    except RuntimeError:
+                        pass
+        record.candidate_commit = pending_commit
+        record.candidate_ref = pending_ref
+        record.status = "candidate_full_suite_inconclusive"
+        record.infrastructure_failure = False
+        record.fatal = False
+        record.summary = "pending full-suite validation"
+        experiment.infrastructure_failures = max(
+            0, experiment.infrastructure_failures - 1
+        )
+        experiment._recompute_frontier()
+        self._experiment_store.save(experiment)
+
+    def _rebase_recoverable_candidate(
+        self,
+        record: SelfRepairCandidateRecord,
+        *,
+        old_base: str,
+        new_base: str,
+    ) -> bool:
+        patch = subprocess.run(
+            ["git", "diff", "--binary", old_base, record.candidate_commit, "--"],
+            cwd=str(self.repo_root),
+            capture_output=True,
+        )
+        if patch.returncode != 0 or not patch.stdout:
+            return False
+        with tempfile.TemporaryDirectory(
+            prefix="auto-agents-pending-rebase-"
+        ) as tmp:
+            candidate_root = Path(tmp) / "candidate"
+            created = False
+            try:
+                add_worktree(
+                    self.repo_root,
+                    candidate_root,
+                    ref=new_base,
+                )
+                created = True
+                applied = subprocess.run(
+                    ["git", "apply", "--3way", "--whitespace=nowarn", "-"],
+                    cwd=str(candidate_root),
+                    input=patch.stdout,
+                    capture_output=True,
+                )
+                if applied.returncode != 0:
+                    return False
+                pending_commit = commit_all(
+                    candidate_root,
+                    "fix: rebase pending self-repair validation",
+                )
+            finally:
+                if created:
+                    try:
+                        remove_worktree(
+                            self.repo_root,
+                            candidate_root,
+                            force=True,
+                        )
+                    except RuntimeError:
+                        pass
+        pending_ref = (
+            "refs/auto-agents/self-repair/pending-validation/"
+            f"{self._safe_repair_category()}/{record.candidate_id}"
+        )
+        update_ref(self.repo_root, pending_ref, pending_commit)
+        if record.candidate_ref and record.candidate_ref != pending_ref:
+            delete_ref(self.repo_root, record.candidate_ref)
+        record.candidate_commit = pending_commit
+        record.candidate_ref = pending_ref
+        record.parent_candidate_id = "base"
+        record.parent_ref = new_base
+        record.status = "candidate_full_suite_inconclusive"
+        record.infrastructure_failure = False
+        record.fatal = False
+        record.summary = "rebased pending full-suite validation"
+        return True
+
     def _reject_pending_validation_ref(
         self,
         candidate_ref: str,
@@ -2101,6 +2248,31 @@ class AutoAgentsSelfRepairRunner:
                     except RuntimeError:
                         pass
 
+    def _update_pending_validation_record(
+        self,
+        result: SelfRepairResult,
+    ) -> None:
+        experiment = self._experiment
+        stored = experiment.candidates.get(result.candidate_id)
+        if stored is None:
+            return
+        passed, failed = self._milestone_obligations(result)
+        stored.candidate_ref = result.candidate_ref
+        stored.candidate_commit = result.candidate_commit
+        stored.status = result.status
+        stored.validation_stage = result.validation_stage
+        stored.validation_rank = result.validation_rank
+        stored.passed_obligations = passed
+        stored.failed_obligations = failed
+        stored.infrastructure_failure = False
+        stored.summary = result.summary
+        stored.verification = result.verification
+        if not result.recoverable_validation:
+            stored.fatal = True
+        experiment._recompute_frontier()
+        self._experiment_store.save(experiment)
+        self._record_candidate_result(result, attempt=result.attempt)
+
     def run(self) -> SelfRepairResult:
         autonomy = self._autonomy_config()
         mode = str(
@@ -2143,6 +2315,24 @@ class AutoAgentsSelfRepairRunner:
             live_head = head_ref(self.repo_root)
             if live_head and live_head != experiment.base_commit:
                 previous_base = experiment.base_commit
+                strongest = experiment.candidates.get(
+                    experiment.best_search_candidate_id
+                )
+                retained_candidate_id = ""
+                if (
+                    strongest is not None
+                    and strongest.candidate_id != "base"
+                    and not strongest.fatal
+                    and strongest.validation_stage == "full_suite"
+                    and strongest.validation_rank >= 90
+                    and strongest.candidate_commit
+                    and self._rebase_recoverable_candidate(
+                        strongest,
+                        old_base=previous_base,
+                        new_base=live_head,
+                    )
+                ):
+                    retained_candidate_id = strongest.candidate_id
                 experiment.base_commit = live_head
                 experiment.best_safe_candidate_id = "base"
                 experiment.best_safe_ref = live_head
@@ -2151,7 +2341,7 @@ class AutoAgentsSelfRepairRunner:
                 experiment.frontier = []
                 for historical_id, historical in experiment.candidates.items():
                     if historical_id != "base":
-                        historical.fatal = True
+                        historical.fatal = historical_id != retained_candidate_id
                 experiment.candidates["base"] = SelfRepairCandidateRecord(
                     candidate_id="base",
                     candidate_ref=live_head,
@@ -2170,10 +2360,59 @@ class AutoAgentsSelfRepairRunner:
                         "anomaly": "base_revision_changed",
                         "from": previous_base,
                         "to": live_head,
+                        "retained_candidate_id": retained_candidate_id,
                         "at": _utc_now_iso(),
                     }
                 )
+                if retained_candidate_id:
+                    experiment.infrastructure_failures = max(
+                        0, experiment.infrastructure_failures - 1
+                    )
+                    experiment._recompute_frontier()
                 store.save(experiment)
+            self._migrate_recoverable_candidate_to_pending(experiment)
+            pending = self._resume_pending_validation_candidate(
+                experiment_id=experiment_id,
+                deadline=(
+                    time.monotonic()
+                    + SELF_REPAIR_FULL_SUITE_SAFETY_CEILING_SECONDS
+                ),
+            )
+            if pending is not None:
+                pending.attempt = experiment.attempt_count
+                stored_pending = experiment.candidates.get(pending.candidate_id)
+                if stored_pending is not None:
+                    pending.parent_candidate_id = (
+                        stored_pending.parent_candidate_id
+                    )
+                    pending.patch_fingerprint = (
+                        stored_pending.patch_fingerprint
+                    )
+                    pending.strategy_fingerprint = (
+                        stored_pending.strategy_fingerprint
+                    )
+                    pending.finding_ids = list(stored_pending.finding_ids)
+                    pending.resolved_finding_ids = list(
+                        stored_pending.resolved_finding_ids
+                    )
+                    pending.passed_obligations = list(
+                        stored_pending.passed_obligations
+                    )
+                    pending.failed_obligations = list(
+                        stored_pending.failed_obligations
+                    )
+                self._decorate_candidate_result(
+                    pending,
+                    attempt=experiment.attempt_count,
+                )
+                if pending.ok:
+                    experiment.status = "approved"
+                    experiment.current_candidate_id = ""
+                    store.save(experiment)
+                    return pending
+                self._update_pending_validation_record(pending)
+                if pending.recoverable_validation:
+                    return pending
             attempt = experiment.attempt_count + 1
             prior_failures = [
                 f"candidate {index}: {record.status}; "
@@ -2261,7 +2500,6 @@ class AutoAgentsSelfRepairRunner:
                 self._record_candidate_result(candidate, attempt=candidate.attempt)
                 return candidate
             if candidate.recoverable_validation:
-                candidate.infrastructure_failure = True
                 store.save(experiment)
                 return candidate
         experiment.status = "needs_human"
@@ -2804,6 +3042,15 @@ class AutoAgentsSelfRepairRunner:
                     deadline=None,
                 )
                 if not full_suite.ok:
+                    if full_suite.recoverable:
+                        candidate_commit, candidate_ref = (
+                            self._retain_pending_validation_candidate(
+                                repair_root,
+                                candidate_id=candidate_id,
+                                candidate_ref=candidate_ref,
+                                summary=summary,
+                            )
+                        )
                     return SelfRepairResult(
                         ok=False,
                         status=(
@@ -2835,7 +3082,6 @@ class AutoAgentsSelfRepairRunner:
                         candidate_commit=candidate_commit,
                         candidate_ref=candidate_ref,
                         recoverable_validation=full_suite.recoverable,
-                        infrastructure_failure=full_suite.recoverable,
                         patch_fingerprint=fingerprint,
                         strategy_fingerprint=strategy_fingerprint,
                         finding_ids=finding_ids,
@@ -3182,6 +3428,7 @@ class AutoAgentsSelfRepairRunner:
         *,
         deadline: Optional[float] = None,
     ) -> "_VerificationResult":
+        del deadline
         execution = getattr(
             getattr(self.target_orchestrator, "config", None),
             "execution",
@@ -3189,12 +3436,26 @@ class AutoAgentsSelfRepairRunner:
         )
         if execution is None or not (candidate_root / "tests").is_dir():
             return _VerificationResult(True, "full-suite differential=not-applicable")
-        command = "python -m pytest -q tests"
         base = self._base_full_verification.get(base_head)
         if base is None:
-            base = self._run_verification_at_ref([command], base_head)
+            base = self._run_full_suite_at_ref(base_head)
             self._base_full_verification[base_head] = base
-        candidate = self._run_verification_commands([command], candidate_root)
+        candidate = self._run_full_suite_shards(candidate_root)
+        if base.recoverable or candidate.recoverable:
+            return _VerificationResult(
+                False,
+                "\n\n".join(
+                    (
+                        "=== base full suite ===\n" + base.summary,
+                        "=== candidate full suite ===\n" + candidate.summary,
+                        "inconclusive=full-suite progress checkpoint remains resumable",
+                    )
+                ),
+                commands=candidate.commands,
+                returncodes=candidate.returncodes,
+                termination_reasons=candidate.termination_reasons,
+                recoverable=True,
+            )
         if candidate.ok:
             return _VerificationResult(
                 True,
@@ -3205,75 +3466,10 @@ class AutoAgentsSelfRepairRunner:
             )
         base_signature = self._verification_failure_signature(base.summary)
         candidate_signature = self._verification_failure_signature(candidate.summary)
-        equivalent_timeout = bool(
-            base.timed_out
-            and candidate.timed_out
-            and base_signature
-            and base_signature == candidate_signature
-        )
-        if candidate.timed_out:
-            remaining = (
-                max(0, int(deadline - time.monotonic()))
-                if deadline is not None
-                else SELF_REPAIR_EXTENDED_FULL_SUITE_TIMEOUT_SECONDS + 60
-            )
-            retry_timeout = min(
-                SELF_REPAIR_EXTENDED_FULL_SUITE_TIMEOUT_SECONDS,
-                max(0, remaining - 60),
-            )
-            if retry_timeout > SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS:
-                retried = self._run_verification_commands(
-                    [command],
-                    candidate_root,
-                    command_timeout_seconds=retry_timeout,
-                )
-                retry_summary = "\n\n".join(
-                    (
-                        "=== initial candidate full suite ===\n" + candidate.summary,
-                        (
-                            "=== extended candidate full suite "
-                            f"timeout={retry_timeout}s ===\n{retried.summary}"
-                        ),
-                    )
-                )
-                if retried.ok:
-                    return _VerificationResult(
-                        True,
-                        "\n\n".join(
-                            (
-                                "=== base full suite ===\n" + base.summary,
-                                retry_summary,
-                                "nonfatal=extended candidate full suite passed",
-                            )
-                        ),
-                        commands=retried.commands,
-                        returncodes=retried.returncodes,
-                        termination_reasons=retried.termination_reasons,
-                    )
-                candidate = _VerificationResult(
-                    retried.ok,
-                    retry_summary,
-                    commands=retried.commands,
-                    returncodes=retried.returncodes,
-                    termination_reasons=retried.termination_reasons,
-                )
-                candidate_signature = self._verification_failure_signature(
-                    retried.summary
-                )
-
         ok = bool(
             not base.ok
-            and not candidate.timed_out
             and base_signature
             and base_signature == candidate_signature
-        )
-        inconclusive_timeout = bool(
-            candidate.timed_out
-            and (
-                base.timed_out
-                or equivalent_timeout
-                or not base.ok
-            )
         )
         return _VerificationResult(
             ok,
@@ -3284,19 +3480,217 @@ class AutoAgentsSelfRepairRunner:
                     (
                         "nonfatal=pre-existing full-suite failure set retained"
                         if ok
-                        else (
-                            "inconclusive=full-suite timeout requires continued validation"
-                            if inconclusive_timeout
-                            else "fatal=candidate full-suite failure set changed"
-                        )
+                        else "fatal=candidate full-suite failure set changed"
                     ),
                 )
             ),
             commands=candidate.commands,
             returncodes=candidate.returncodes,
             termination_reasons=candidate.termination_reasons,
-            recoverable=inconclusive_timeout,
         )
+
+    def _run_full_suite_at_ref(self, ref: str) -> "_VerificationResult":
+        with tempfile.TemporaryDirectory(
+            prefix="auto-agents-full-suite-base-"
+        ) as tmp:
+            verification_root = Path(tmp) / "verification"
+            created = False
+            try:
+                add_worktree(
+                    self.repo_root,
+                    verification_root,
+                    ref=ref,
+                )
+                created = True
+                return self._run_full_suite_shards(verification_root)
+            finally:
+                if created:
+                    try:
+                        remove_worktree(
+                            self.repo_root,
+                            verification_root,
+                            force=True,
+                        )
+                    except RuntimeError:
+                        pass
+
+    def _run_full_suite_shards(
+        self,
+        verification_root: Path,
+    ) -> "_VerificationResult":
+        shards = sorted(
+            path.relative_to(verification_root).as_posix()
+            for path in (verification_root / "tests").rglob("*.py")
+            if path.is_file()
+            and (
+                path.name.startswith("test_")
+                or path.name.endswith("_test.py")
+            )
+        )
+        if not shards:
+            return _VerificationResult(True, "full-suite shards=not-applicable")
+        suite_key = self._full_suite_checkpoint_key(verification_root, shards)
+        checkpoint_path = self._full_suite_checkpoint_path(suite_key)
+        try:
+            checkpoint = (
+                read_json(checkpoint_path, default={})
+                if checkpoint_path is not None
+                else {}
+            )
+        except (OSError, ValueError):
+            checkpoint = {}
+        completed = (
+            dict(checkpoint.get("completed", {}))
+            if isinstance(checkpoint, Mapping)
+            and checkpoint.get("schema_version")
+            == SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION
+            and checkpoint.get("suite_key") == suite_key
+            and isinstance(checkpoint.get("completed", {}), Mapping)
+            else {}
+        )
+        results: list[tuple[str, _VerificationResult, bool]] = []
+        for shard in shards:
+            cached = completed.get(shard)
+            if isinstance(cached, Mapping):
+                shard_result = _VerificationResult.from_dict(cached)
+                results.append((shard, shard_result, True))
+                continue
+            command = f"python -m pytest -q {shlex.quote(shard)}"
+            shard_result = self._run_verification_commands(
+                [command],
+                verification_root,
+                command_timeout_seconds=(
+                    SELF_REPAIR_FULL_SUITE_SAFETY_CEILING_SECONDS
+                ),
+                adaptive_timeout_enabled=True,
+                command_idle_timeout_seconds=(
+                    SELF_REPAIR_FULL_SUITE_PROGRESS_LEASE_SECONDS
+                ),
+            )
+            results.append((shard, shard_result, False))
+            interrupted = shard_result.timed_out or any(
+                reason == "stalled"
+                for reason in shard_result.termination_reasons
+            )
+            if interrupted:
+                return self._aggregate_full_suite_shards(
+                    results,
+                    recoverable=True,
+                    total_shards=len(shards),
+                )
+            completed[shard] = shard_result.to_dict()
+            if checkpoint_path is not None:
+                write_json(
+                    checkpoint_path,
+                    {
+                        "schema_version": (
+                            SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION
+                        ),
+                        "suite_key": suite_key,
+                        "completed": completed,
+                        "updated_at": _utc_now_iso(),
+                    },
+                )
+        return self._aggregate_full_suite_shards(
+            results,
+            recoverable=False,
+            total_shards=len(shards),
+        )
+
+    def _aggregate_full_suite_shards(
+        self,
+        results: list[tuple[str, "_VerificationResult", bool]],
+        *,
+        recoverable: bool,
+        total_shards: int,
+    ) -> "_VerificationResult":
+        summaries: list[str] = []
+        commands: list[str] = []
+        returncodes: list[int] = []
+        termination_reasons: list[str] = []
+        ok = not recoverable
+        for shard, result, cached in results:
+            summaries.append(
+                f"=== full-suite shard {shard} cached={str(cached).lower()} ===\n"
+                + result.summary
+            )
+            commands.extend(result.commands)
+            returncodes.extend(result.returncodes)
+            termination_reasons.extend(result.termination_reasons)
+            ok = ok and result.ok
+        completed_shards = sum(
+            1
+            for _, result, _ in results
+            if not result.timed_out
+            and not any(
+                reason == "stalled" for reason in result.termination_reasons
+            )
+        )
+        summaries.append(
+            "full-suite checkpoint "
+            f"completed={completed_shards}/{total_shards} "
+            f"recoverable={str(recoverable).lower()}"
+        )
+        return _VerificationResult(
+            ok,
+            "\n\n".join(summaries),
+            commands=tuple(commands),
+            returncodes=tuple(returncodes),
+            termination_reasons=tuple(termination_reasons),
+            recoverable=recoverable,
+        )
+
+    def _full_suite_checkpoint_key(
+        self,
+        verification_root: Path,
+        shards: list[str],
+    ) -> str:
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=str(verification_root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        tree_ref = tree.stdout.strip() if tree.returncode == 0 else ""
+        python = Path(self._verification_python())
+        environment_version = ""
+        try:
+            probe = subprocess.run(
+                [
+                    str(python),
+                    "-c",
+                    (
+                        "import pytest,sys; "
+                        "print(sys.version); print(pytest.__version__)"
+                    ),
+                ],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=15,
+            )
+            if probe.returncode == 0:
+                environment_version = probe.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            python_stat = python.stat()
+            environment = (
+                str(python.resolve()),
+                int(python_stat.st_mtime_ns),
+                int(python_stat.st_size),
+                environment_version,
+            )
+        except OSError:
+            environment = (str(python), 0, 0, environment_version)
+        return _search_stable_hash(tree_ref, shards, environment)
+
+    def _full_suite_checkpoint_path(self, suite_key: str) -> Optional[Path]:
+        store = getattr(self, "_experiment_store", None)
+        if not isinstance(store, SelfRepairExperimentStore):
+            return None
+        return store.root / "full-suite-checkpoints" / f"{suite_key}.json"
 
     def _replay_candidate(
         self,
@@ -4097,6 +4491,8 @@ class AutoAgentsSelfRepairRunner:
         *,
         allow_pytest_no_tests: bool = False,
         command_timeout_seconds: int = SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS,
+        adaptive_timeout_enabled: bool = False,
+        command_idle_timeout_seconds: int = SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS,
     ) -> "_VerificationResult":
         summaries = []
         rendered_commands: list[str] = []
@@ -4113,6 +4509,10 @@ class AutoAgentsSelfRepairRunner:
                 [verification_command],
                 verification_root,
                 command_timeout_seconds=max(60, int(command_timeout_seconds)),
+                adaptive_timeout_enabled=adaptive_timeout_enabled,
+                command_idle_timeout_seconds=max(
+                    60, int(command_idle_timeout_seconds)
+                ),
             )
             process = gate.commands[0]
             rendered_commands.append(verification_command)
@@ -4169,6 +4569,32 @@ class _VerificationResult:
     termination_reasons: tuple[str, ...] = ()
     recoverable: bool = False
     payload: dict[str, object] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "ok": self.ok,
+            "summary": self.summary,
+            "commands": list(self.commands),
+            "returncodes": list(self.returncodes),
+            "termination_reasons": list(self.termination_reasons),
+            "recoverable": self.recoverable,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "_VerificationResult":
+        return cls(
+            ok=bool(payload.get("ok", False)),
+            summary=str(payload.get("summary", "")),
+            commands=tuple(str(item) for item in payload.get("commands", []) or []),
+            returncodes=tuple(
+                int(item) for item in payload.get("returncodes", []) or []
+            ),
+            termination_reasons=tuple(
+                str(item)
+                for item in payload.get("termination_reasons", []) or []
+            ),
+            recoverable=bool(payload.get("recoverable", False)),
+        )
 
     @property
     def timed_out(self) -> bool:
