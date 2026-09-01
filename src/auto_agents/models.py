@@ -563,8 +563,8 @@ class InfrastructureFailureMarker:
 
 @dataclass
 class ReleaseWorkerConfig:
-    enabled: bool = False
-    auto_start: bool = False
+    enabled: bool = True
+    auto_start: bool = True
     idle_delay_seconds: int = 60
     max_recovery_attempts: int = 2
     max_infrastructure_retries: int = 2
@@ -573,8 +573,8 @@ class ReleaseWorkerConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ReleaseWorkerConfig":
         return cls(
-            enabled=bool(data.get("enabled", False)),
-            auto_start=bool(data.get("auto_start", False)),
+            enabled=bool(data.get("enabled", True)),
+            auto_start=bool(data.get("auto_start", True)),
             idle_delay_seconds=max(0, int(data.get("idle_delay_seconds", 60) or 0)),
             max_recovery_attempts=max(0, int(data.get("max_recovery_attempts", 2) or 0)),
             max_infrastructure_retries=max(
@@ -894,7 +894,7 @@ class FrontendDesignConfig:
 
 @dataclass
 class ParallelTasksConfig:
-    enabled: bool = False
+    enabled: bool = True
     workers: Union[int, str] = "auto"
     max_auto_workers: int = 4
     adaptive: bool = True
@@ -912,7 +912,7 @@ class ParallelTasksConfig:
         else:
             workers = str(raw_workers)
         return cls(
-            enabled=bool(data.get("enabled", False)),
+            enabled=bool(data.get("enabled", True)),
             workers=workers,
             max_auto_workers=int(data.get("max_auto_workers", 4)),
             adaptive=bool(data.get("adaptive", True)),
@@ -997,6 +997,54 @@ class EvidencePreflightConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "EvidencePreflightConfig":
         return cls(mode=str(data.get("mode", "high_risk")))
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class AccelerationConfig:
+    mode: str = "on"
+    diagnosis_cache_enabled: bool = True
+    parallel_diagnosis_enabled: bool = True
+    delta_context_enabled: bool = True
+    session_continuation_enabled: bool = True
+    collab_read_only_enabled: bool = True
+    release_prewarm_enabled: bool = True
+    proof_audit_sample_rate: float = 0.05
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "AccelerationConfig":
+        return cls(
+            mode=str(data.get("mode", "on")).strip() or "on",
+            diagnosis_cache_enabled=bool(
+                data.get("diagnosis_cache_enabled", True)
+            ),
+            parallel_diagnosis_enabled=bool(
+                data.get("parallel_diagnosis_enabled", True)
+            ),
+            delta_context_enabled=bool(data.get("delta_context_enabled", True)),
+            session_continuation_enabled=bool(
+                data.get("session_continuation_enabled", True)
+            ),
+            collab_read_only_enabled=bool(
+                data.get("collab_read_only_enabled", True)
+            ),
+            release_prewarm_enabled=bool(
+                data.get("release_prewarm_enabled", True)
+            ),
+            proof_audit_sample_rate=float(
+                data.get("proof_audit_sample_rate", 0.05) or 0.0
+            ),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode == "on"
+
+    @property
+    def observing(self) -> bool:
+        return self.mode == "observe"
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -1310,6 +1358,7 @@ class AutonomyConfig:
 
 @dataclass
 class ExecutionConfig:
+    acceleration: AccelerationConfig = field(default_factory=AccelerationConfig)
     parallel_tasks: ParallelTasksConfig = field(default_factory=ParallelTasksConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     requirements_audit: RequirementsAuditConfig = field(default_factory=RequirementsAuditConfig)
@@ -1329,6 +1378,9 @@ class ExecutionConfig:
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "ExecutionConfig":
         return cls(
+            acceleration=AccelerationConfig.from_dict(
+                dict(data.get("acceleration", {}))
+            ),
             parallel_tasks=ParallelTasksConfig.from_dict(dict(data.get("parallel_tasks", {}))),
             recovery=RecoveryConfig.from_dict(dict(data.get("recovery", {}))),
             requirements_audit=RequirementsAuditConfig.from_dict(
@@ -1360,6 +1412,7 @@ class ExecutionConfig:
 
     def to_dict(self) -> Dict[str, object]:
         return {
+            "acceleration": self.acceleration.to_dict(),
             "parallel_tasks": self.parallel_tasks.to_dict(),
             "recovery": self.recovery.to_dict(),
             "requirements_audit": self.requirements_audit.to_dict(),
@@ -1905,6 +1958,7 @@ class SessionState:
         }
     )
     persistence_actions: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    provider_continuations: Dict[str, Dict[str, object]] = field(default_factory=dict)
     auto_approve: bool = False
 
     @classmethod
@@ -1967,6 +2021,13 @@ class SessionState:
                 for key, value in dict(data.get("persistence_actions", {})).items()
                 if isinstance(value, dict)
             },
+            provider_continuations={
+                str(key): dict(value)
+                for key, value in dict(
+                    data.get("provider_continuations", {})
+                ).items()
+                if isinstance(value, dict)
+            },
             auto_approve=bool(data.get("auto_approve", False)),
         )
 
@@ -2006,6 +2067,10 @@ class SessionState:
             "persistence_actions": {
                 key: dict(value) for key, value in self.persistence_actions.items()
             },
+            "provider_continuations": {
+                key: dict(value)
+                for key, value in self.provider_continuations.items()
+            },
             "auto_approve": self.auto_approve,
         }
 
@@ -2022,6 +2087,7 @@ class AgentRequest:
     attempt_id: str = ""
     progress_report_path: Optional[Path] = None
     resume_session_id: str = ""
+    resume_provider: str = ""
     sandbox_mode: str = ""
     timeout_seconds: int = 0
     progress_lease_seconds: int = 0
@@ -2121,6 +2187,7 @@ class CommandResult:
     mutation_paths: List[str] = field(default_factory=list)
     artifacts: Dict[str, str] = field(default_factory=dict)
     cached: bool = False
+    cache_miss_reason: str = ""
     observed_inputs: Dict[str, str] = field(default_factory=dict)
     input_trace_complete: bool = False
     network_observed: bool = False

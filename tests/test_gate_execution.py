@@ -142,6 +142,47 @@ def test_candidate_result_cache_reuses_identical_snapshot_across_executors(
     assert second.ok and second.cached
 
 
+def test_proof_audit_sample_reexecutes_a_valid_cache_hit(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    command = f"{sys.executable} -c \"print('checked')\""
+    metadata = {
+        command: GateCommandMetadata(
+            cache_scope="source",
+            result_cache_scope="candidate",
+        )
+    }
+    config = _config(tmp_path)
+    config.verification_policy_version = 2
+    cache_path = tmp_path / "proof-cache.sqlite3"
+
+    with LocalGatePlanExecutor(
+        project, config, metadata, cache_path=cache_path
+    ) as executor:
+        first = executor.run(
+            command,
+            timeout_seconds=60,
+            adaptive_timeout_enabled=False,
+            idle_timeout_seconds=60,
+        )
+    with LocalGatePlanExecutor(
+        project,
+        config,
+        metadata,
+        cache_path=cache_path,
+        proof_audit_sample_rate=1.0,
+    ) as executor:
+        second = executor.run(
+            command,
+            timeout_seconds=60,
+            adaptive_timeout_enabled=False,
+            idle_timeout_seconds=60,
+        )
+
+    assert first.ok and not first.cached
+    assert second.ok and not second.cached
+    assert second.cache_miss_reason == "proof_audit_sample"
+
+
 def test_auto_result_cache_reuses_when_only_unobserved_source_changes(
     tmp_path: Path,
 ) -> None:

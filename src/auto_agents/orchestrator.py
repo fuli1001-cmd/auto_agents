@@ -100,6 +100,7 @@ from .gates import (
 )
 from .gate_baseline_cache import GateBaselineCache
 from .gate_timing import GateTimingStore
+from .performance_trace import PerformanceTrace
 from .gate_execution import (
     GateSnapshotManager,
     LocalGatePlanExecutor,
@@ -509,6 +510,10 @@ class _ProviderHealth:
 class Orchestrator:
     MAX_SPLIT_DEPTH = 2
     SPLIT_TASK_MARKER = "SPLIT_TASK:"
+    PLAN_PATCH_PATTERN = re.compile(
+        r"^PLAN_PATCH\s+v1:\s*(\{.*\})\s*$",
+        re.MULTILINE,
+    )
     ARBITER_MIN_REVIEW_FAILS = 2
     MAX_RECOVERY_LOOP_EVENTS = 20
     MAX_CHANGED_FAILURE_RECOVERY_EPOCHS = 1
@@ -594,6 +599,7 @@ class Orchestrator:
         self._active_run_log_path: Optional[Path] = None
         self._performance_stages: Dict[str, float] = {}
         self._performance_commands: Dict[str, Dict[str, object]] = {}
+        self._performance_traces: Dict[str, PerformanceTrace] = {}
         self._shared_gate_cache_path = gate_cache_path
         self._gate_preempt_requested = gate_preempt_requested
         self._operator_inputs = OperatorInputStore(self.project_root)
@@ -2849,9 +2855,19 @@ class Orchestrator:
                     save_run_state(self.project_root, state)
                     raise
 
+                stage_duration = max(0.0, time.monotonic() - stage_started_at)
                 self._performance_stages[stage] = (
                     self._performance_stages.get(stage, 0.0)
-                    + max(0.0, time.monotonic() - stage_started_at)
+                    + stage_duration
+                )
+                self._performance_trace(state.run_id).event(
+                    "stage",
+                    stage,
+                    duration_seconds=stage_duration,
+                    metadata={
+                        "head": head_ref(self.project_root),
+                        "status": state.status,
+                    },
                 )
                 self._persist_performance_report(state.run_id)
 
@@ -3832,10 +3848,46 @@ class Orchestrator:
             prior_tasks,
             state.tasks,
         )
-        if origins_changed or ownership_changed:
+        dependencies_changed = self._reduce_transitive_task_dependencies(
+            state.tasks
+        )
+        if origins_changed or ownership_changed or dependencies_changed:
             self._persist_tasks(state.tasks)
         self._complete_artifact_publication_metadata_repair(state)
         self._emit_plan_task_count(state.tasks)
+
+    @staticmethod
+    def _reduce_transitive_task_dependencies(tasks: List[TaskSpec]) -> bool:
+        by_id = {task.task_id: task for task in tasks}
+
+        def reaches(start: str, target: str, seen: Set[str]) -> bool:
+            if start == target:
+                return True
+            if start in seen or start not in by_id:
+                return False
+            seen.add(start)
+            return any(
+                reaches(dependency, target, seen)
+                for dependency in by_id[start].depends_on
+            )
+
+        changed = False
+        for task in tasks:
+            dependencies = list(dict.fromkeys(task.depends_on))
+            reduced: List[str] = []
+            for dependency in dependencies:
+                if any(
+                    other != dependency
+                    and reaches(other, dependency, set())
+                    for other in dependencies
+                ):
+                    changed = True
+                    continue
+                reduced.append(dependency)
+            if reduced != task.depends_on:
+                task.depends_on = reduced
+                changed = True
+        return changed
 
     def _block_for_persistence_configuration(self, state: RunState) -> bool:
         trace = load_requirements_trace(self.project_root)
@@ -7067,7 +7119,15 @@ class Orchestrator:
                 ]
 
     def _log_gate_command_results(self, context: str, results: Iterable[object]) -> None:
-        for index, result in enumerate(results, start=1):
+        result_list = list(results)
+        run_payload = read_json(run_state_path(self.project_root), default={})
+        run_id = (
+            str(run_payload.get("run_id", ""))
+            if isinstance(run_payload, dict)
+            else ""
+        )
+        trace = self._performance_trace(run_id) if run_id else None
+        for index, result in enumerate(result_list, start=1):
             self.logger.info(
                 "[gate-command] context=%s index=%s ok=%s returncode=%s duration_seconds=%.3f cached=%s termination=%s infrastructure_failure=%s infrastructure_attempts=%s cleanup_incomplete=%s worker=%s backend=%s job_id=%s command=%s",
                 context,
@@ -7133,17 +7193,39 @@ class Orchestrator:
                 workers = dict(entry["workers"])
                 workers[worker] = int(workers.get(worker, 0)) + 1
                 entry["workers"] = workers
-        run_payload = read_json(run_state_path(self.project_root), default={})
-        run_id = (
-            str(run_payload.get("run_id", ""))
-            if isinstance(run_payload, dict)
-            else ""
-        )
+            if trace is not None:
+                trace.event(
+                    "gate",
+                    command or "unknown",
+                    duration_seconds=float(
+                        getattr(result, "duration_seconds", 0.0) or 0.0
+                    ),
+                    metadata={
+                        "context": context,
+                        "ok": bool(getattr(result, "ok", False)),
+                        "cached": bool(getattr(result, "cached", False)),
+                        "cache_miss_reason": (
+                            "hit"
+                            if bool(getattr(result, "cached", False))
+                            else str(
+                                getattr(result, "cache_miss_reason", "not_hit")
+                                or "not_hit"
+                            )
+                        ),
+                        "termination_reason": str(
+                            getattr(result, "termination_reason", "") or ""
+                        ),
+                        "backend": str(
+                            getattr(result, "backend", "") or "local"
+                        ),
+                    },
+                )
         self._persist_performance_report(run_id)
 
     def _persist_performance_report(self, run_id: str) -> None:
         if not str(run_id).strip():
             return
+        trace = self._performance_trace(run_id)
         commands = sorted(
             self._performance_commands.values(),
             key=lambda item: float(item.get("duration_seconds", 0.0)),
@@ -7196,8 +7278,21 @@ class Orchestrator:
                 ),
                 "top_commands": commands[:20],
             },
+            "trace": trace.summary(),
         }
         write_json(run_path(self.project_root, run_id) / "performance.json", report)
+
+    def _performance_trace(self, run_id: str) -> PerformanceTrace:
+        identifier = str(run_id).strip()
+        trace = self._performance_traces.get(identifier)
+        if trace is None:
+            trace = PerformanceTrace(
+                self.project_root,
+                workflow_kind="run",
+                subject_id=identifier,
+            )
+            self._performance_traces[identifier] = trace
+        return trace
 
     def _gate_progress_callback(
         self,
@@ -14570,6 +14665,12 @@ class Orchestrator:
         use_result_cache = bool(use_result_cache and not self._force_full_verify)
         result_context_fingerprint = self._gate_result_context_fingerprint()
         operator_environment = self._operator_gate_environment()
+        acceleration = self.config.execution.acceleration
+        proof_audit_sample_rate = (
+            acceleration.proof_audit_sample_rate
+            if acceleration.enabled
+            else 0.0
+        )
         if not self.config.gates.isolation.enabled:
             return contextlib.nullcontext(None)
         if self.config.gates.distributed.enabled and not source_ref:
@@ -14582,6 +14683,7 @@ class Orchestrator:
                 ),
                 result_context_fingerprint=result_context_fingerprint,
                 environment_overrides=operator_environment,
+                proof_audit_sample_rate=proof_audit_sample_rate,
             )
         return LocalGatePlanExecutor(
             self.project_root,
@@ -14596,6 +14698,7 @@ class Orchestrator:
             cache_path=self._shared_gate_cache_path,
             preempt_requested=self._gate_preempt_probe,
             environment_overrides=operator_environment,
+            proof_audit_sample_rate=proof_audit_sample_rate,
         )
 
     def _operator_gate_environment(self) -> Dict[str, str]:
@@ -14974,6 +15077,15 @@ class Orchestrator:
             "  11. Preserve the parent's mutable_artifacts on the replacement children. Do not",
             "     add new artifact authority; every parent-owned artifact must remain owned by",
             "     at least one child after the split.",
+            "",
+            "LOCAL PATCH FAST PATH — prefer this when verification_steps do not need changes:",
+            "  - Leave task_plan.json unchanged and return exactly one single-line marker:",
+            "    PLAN_PATCH v1: {\"replace_task_id\":\"...\",\"replacement_tasks\":[...]}",
+            "  - Include complete task objects satisfying every rule above. The orchestrator",
+            "    applies the replacement atomically, rewrites downstream dependencies, and runs",
+            "    the same full plan and requirement validation used for a rewritten plan.",
+            "  - If verification_steps or unrelated plan metadata must change, update the full",
+            "    task_plan.json instead and do not emit PLAN_PATCH v1.",
             "",
             "Repeating review blockers that forced this rollback:",
             last_review.strip() or "(no review summary captured)",
@@ -15527,7 +15639,13 @@ class Orchestrator:
                     if not self._has_task_budget(max_tasks, processed):
                         self._task_budget_exhausted = True
                         return self._run_sequential_implementation_loop(
-                            state, tasks, max_tasks
+                            state,
+                            tasks,
+                            (
+                                None
+                                if max_tasks is None
+                                else max(0, max_tasks - processed)
+                            ),
                         )
                     rewind_state = self._execute_task_in_main_worktree(
                         state, tasks, task
@@ -15541,7 +15659,15 @@ class Orchestrator:
             self.logger.info(
                 f"[parallel-tasks] fallback to sequential: {fallback_reason}"
             )
-            return self._run_sequential_implementation_loop(state, tasks, max_tasks)
+            return self._run_sequential_implementation_loop(
+                state,
+                tasks,
+                (
+                    None
+                    if max_tasks is None
+                    else max(0, max_tasks - processed)
+                ),
+            )
 
         current_workers = self._parallel_worker_count()
         self._log_parallel_worker_resolution(current_workers)
@@ -25929,6 +26055,24 @@ class Orchestrator:
                 cached.get("decision", "READY"),
             )
             return cached if str(cached.get("decision", "READY")) != "READY" else None
+        shared_cache = state.resume_context.get("evidence_preflight_cache", {})
+        if isinstance(shared_cache, dict):
+            shared = shared_cache.get(fingerprint)
+            if isinstance(shared, dict) and not self._evidence_preflight_protocol_issue(
+                shared
+            ):
+                task.evidence_preflight = dict(shared)
+                self._persist_tasks(state.tasks if state.tasks else [task])
+                self.logger.info(
+                    "[evidence-preflight] task=%s cache=shared decision=%s",
+                    task.task_id,
+                    shared.get("decision", "READY"),
+                )
+                return (
+                    dict(shared)
+                    if str(shared.get("decision", "READY")) != "READY"
+                    else None
+                )
 
         prompt = self._build_evidence_preflight_prompt(task)
         stage_key = f"evidence-preflight-{task.task_id}"
@@ -26120,6 +26264,14 @@ class Orchestrator:
 
         parsed["fingerprint"] = fingerprint
         task.evidence_preflight = parsed
+        shared_cache = state.resume_context.get("evidence_preflight_cache", {})
+        if not isinstance(shared_cache, dict):
+            shared_cache = {}
+        shared_cache[fingerprint] = dict(parsed)
+        if len(shared_cache) > 128:
+            shared_cache = dict(list(shared_cache.items())[-128:])
+        state.resume_context["evidence_preflight_cache"] = shared_cache
+        save_run_state(self.project_root, state)
         if parsed["decision"] == "READY":
             route_history = state.resume_context.get("evidence_preflight_routes", {})
             if isinstance(route_history, dict) and task.task_id in route_history:
@@ -31973,6 +32125,8 @@ class Orchestrator:
         health = self._provider_health_map()
         if interrupted_provider:
             first = interrupted_provider
+        elif request.resume_session_id and request.resume_provider in base_order:
+            first = request.resume_provider
         elif (
             self.config.active_provider in health
             and self._probe_active_provider(request)
@@ -32008,7 +32162,20 @@ class Orchestrator:
                 continue
 
             self._current_provider = kind
-            result = self._run_provider_with_smart_recovery(adapter, request, kind)
+            provider_request = (
+                request
+                if not request.resume_provider or kind == request.resume_provider
+                else replace(
+                    request,
+                    resume_session_id="",
+                    resume_provider="",
+                )
+            )
+            result = self._run_provider_with_smart_recovery(
+                adapter,
+                provider_request,
+                kind,
+            )
             tried.append(kind)
 
             if result.ok:
@@ -32561,6 +32728,15 @@ class Orchestrator:
 
     def _plan_validation_feedback(self, result: AgentResult) -> Optional[str]:
         payload = load_task_plan(self.project_root)
+        original_payload = copy.deepcopy(payload)
+        payload, patch_error, patch_applied = self._apply_local_plan_patch(
+            payload,
+            result.summary or result.stdout,
+        )
+        if patch_error:
+            return f"PLAN_PATCH v1 is invalid: {patch_error}"
+        if patch_applied:
+            save_task_plan(self.project_root, payload)
         trace = load_requirements_trace(self.project_root)
         prior_done_tasks = [
             item
@@ -32654,11 +32830,132 @@ class Orchestrator:
                     "If not, append new tasks for the uncovered scope."
                 )
             return None
+        if patch_applied:
+            save_task_plan(self.project_root, original_payload)
         bullets = "\n".join(f"- {item}" for item in errors)
         return (
             "The task plan JSON is invalid. Rewrite the file and fix all issues exactly.\n"
             f"{bullets}"
         )
+
+    def _apply_local_plan_patch(
+        self,
+        payload: object,
+        response: str,
+    ) -> Tuple[dict, str, bool]:
+        matches = self.PLAN_PATCH_PATTERN.findall(str(response or ""))
+        if not matches:
+            return (dict(payload) if isinstance(payload, dict) else {}, "", False)
+        if len(matches) != 1:
+            return {}, "return exactly one PLAN_PATCH v1 marker", False
+        if not isinstance(payload, dict):
+            return {}, "the current task plan is not an object", False
+        try:
+            patch_payload = json.loads(matches[0])
+        except json.JSONDecodeError as error:
+            return {}, f"JSON could not be parsed: {error}", False
+        if not isinstance(patch_payload, dict):
+            return {}, "payload must be an object", False
+        allowed_keys = {"replace_task_id", "replacement_tasks"}
+        extra_keys = sorted(set(patch_payload) - allowed_keys)
+        if extra_keys:
+            return {}, "unsupported keys: " + ", ".join(extra_keys), False
+        replace_task_id = str(patch_payload.get("replace_task_id", "")).strip()
+        replacements = patch_payload.get("replacement_tasks", [])
+        if not replace_task_id:
+            return {}, "replace_task_id must not be empty", False
+        if not isinstance(replacements, list) or not 2 <= len(replacements) <= 4:
+            return {}, "replacement_tasks must contain 2 to 4 task objects", False
+        if not all(isinstance(item, dict) for item in replacements):
+            return {}, "every replacement task must be an object", False
+        tasks = payload.get("tasks", [])
+        if not isinstance(tasks, list) or not all(isinstance(item, dict) for item in tasks):
+            return {}, "the current task plan tasks must be objects", False
+        replacement_ids = [
+            str(item.get("task_id", "")).strip() for item in replacements
+        ]
+        if any(not item for item in replacement_ids):
+            return {}, "every replacement task needs a task_id", False
+        if len(set(replacement_ids)) != len(replacement_ids):
+            return {}, "replacement task IDs must be unique", False
+        parent_index = next(
+            (
+                index
+                for index, item in enumerate(tasks)
+                if str(item.get("task_id", "")).strip() == replace_task_id
+            ),
+            -1,
+        )
+        if parent_index < 0:
+            current_ids = {
+                str(item.get("task_id", "")).strip() for item in tasks
+            }
+            if all(item in current_ids for item in replacement_ids):
+                return dict(payload), "", False
+            return {}, f"task {replace_task_id!r} does not exist", False
+        parent = dict(tasks[parent_index])
+        if str(parent.get("status", "pending")) == "done":
+            return {}, "a done task cannot be replaced", False
+        current_ids = {
+            str(item.get("task_id", "")).strip()
+            for index, item in enumerate(tasks)
+            if index != parent_index
+        }
+        collisions = sorted(current_ids.intersection(replacement_ids))
+        if collisions:
+            return {}, "replacement task IDs already exist: " + ", ".join(collisions), False
+        try:
+            expected_depth = int(parent.get("split_depth", 0) or 0) + 1
+        except (TypeError, ValueError):
+            return {}, "the replaced task has an invalid split_depth", False
+        parent_requirements = {
+            str(item).strip()
+            for item in parent.get("requirement_ids", []) or []
+            if str(item).strip()
+        }
+        normalized_replacements: List[dict] = []
+        for item in replacements:
+            replacement = copy.deepcopy(item)
+            if str(replacement.get("parent_task_id", "")).strip() != replace_task_id:
+                return {}, "each replacement parent_task_id must match replace_task_id", False
+            try:
+                replacement_depth = int(
+                    replacement.get("split_depth", -1) or 0
+                )
+            except (TypeError, ValueError):
+                return {}, "replacement split_depth must be an integer", False
+            if replacement_depth != expected_depth:
+                return {}, f"each replacement split_depth must be {expected_depth}", False
+            if str(replacement.get("task_origin", "")).strip() != "scope_split":
+                return {}, "each replacement task_origin must be scope_split", False
+            if str(replacement.get("status", "pending")).strip() != "pending":
+                return {}, "each replacement status must be pending", False
+            replacement_requirements = {
+                str(value).strip()
+                for value in replacement.get("requirement_ids", []) or []
+                if str(value).strip()
+            }
+            if not parent_requirements.issubset(replacement_requirements):
+                return {}, "each replacement must preserve all parent requirement_ids", False
+            normalized_replacements.append(replacement)
+        candidate = copy.deepcopy(payload)
+        candidate_tasks = list(candidate["tasks"])
+        candidate_tasks[parent_index : parent_index + 1] = normalized_replacements
+        for item in candidate_tasks:
+            dependencies = item.get("depends_on", [])
+            if not isinstance(dependencies, list) or replace_task_id not in dependencies:
+                continue
+            if str(item.get("status", "pending")) == "done":
+                return {}, "patch would modify dependencies of a done task", False
+            expanded: List[str] = []
+            for dependency in dependencies:
+                values = replacement_ids if dependency == replace_task_id else [dependency]
+                for value in values:
+                    if value not in expanded:
+                        expanded.append(value)
+            item["depends_on"] = expanded
+        candidate["tasks"] = candidate_tasks
+        return candidate, "", True
 
     def _provider_research_validation_feedback(
         self,

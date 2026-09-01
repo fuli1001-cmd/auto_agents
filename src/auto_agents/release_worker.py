@@ -34,7 +34,16 @@ def ensure_release_worker(project_root: Path) -> bool:
     root = Path(project_root).expanduser().resolve()
     orchestrator = Orchestrator(root)
     policy = orchestrator.config.gates.release_worker
+    acceleration = getattr(
+        getattr(orchestrator.config, "execution", None),
+        "acceleration",
+        None,
+    )
     if not (policy.enabled and policy.auto_start):
+        return False
+    if acceleration is not None and not (
+        acceleration.enabled and acceleration.release_prewarm_enabled
+    ):
         return False
     if os.environ.get(WORKER_ENV) == "1":
         return False

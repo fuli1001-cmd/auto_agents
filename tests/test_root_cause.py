@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -16,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import (
+    AccelerationConfig,
     AgentResult,
     RunState,
     SelfRepairDiagnosisConfig,
@@ -109,6 +111,7 @@ class _FakeOrchestrator:
         *,
         mutate_target: Optional[Path] = None,
         investigator_tool_count: int = 0,
+        acceleration: Optional[AccelerationConfig] = None,
     ) -> None:
         self.responses = list(responses)
         self.requests = []
@@ -117,7 +120,14 @@ class _FakeOrchestrator:
         self.config = type(
             "Config",
             (),
-            {"efforts": {"self_repair": "max"}},
+            {
+                "efforts": {"self_repair": "max"},
+                "execution": type(
+                    "Execution",
+                    (),
+                    {"acceleration": acceleration},
+                )(),
+            },
         )()
 
     def _call_with_failover(self, request):
@@ -579,6 +589,114 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertTrue(artifact["repair_approved"])
+
+    def test_exact_diagnosis_certificate_skips_repeated_agent_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            state = RunState(run_id="run-123", status="blocked")
+            write_json(
+                target_root / ".auto-agents" / "state" / "run_state.json",
+                state.to_dict(),
+            )
+            fake = _FakeOrchestrator(
+                [
+                    _report(role="investigator", verdict="ROOT_CAUSE"),
+                    _report(role="reviewer", verdict="AGREE"),
+                ],
+                acceleration=AccelerationConfig(
+                    parallel_diagnosis_enabled=False,
+                ),
+            )
+
+            def coordinator() -> RootCauseCoordinator:
+                return RootCauseCoordinator(
+                    fake,
+                    auto_agents_root=auto_root,
+                    target_root=target_root,
+                    error=RuntimeError("terminal failure"),
+                    state=state,
+                    traceback_text="traceback",
+                    heuristic={"eligible": False},
+                    runtime_evidence={},
+                    config=SelfRepairDiagnosisConfig(),
+                )
+
+            first = coordinator().run()
+            second = coordinator().run()
+
+            self.assertTrue(first.repair_approved)
+            self.assertTrue(second.repair_approved)
+            self.assertEqual(second.reason, "reused root-cause diagnosis certificate")
+            self.assertEqual(len(fake.requests), 2)
+
+    def test_independent_diagnoses_run_in_parallel_and_require_consensus(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            state = RunState(run_id="run-123", status="blocked")
+            write_json(
+                target_root / ".auto-agents" / "state" / "run_state.json",
+                state.to_dict(),
+            )
+            arrived = {
+                "self_repair_investigator": threading.Event(),
+                "self_repair_reviewer": threading.Event(),
+            }
+            responses = {
+                "self_repair_investigator": _report(
+                    role="investigator", verdict="ROOT_CAUSE"
+                ),
+                "self_repair_reviewer": _report(
+                    role="reviewer", verdict="ROOT_CAUSE"
+                ),
+            }
+
+            class ParallelFake(_FakeOrchestrator):
+                def _call_with_failover(self, request):
+                    self.requests.append(request)
+                    arrived[request.stage].set()
+                    peer = (
+                        "self_repair_reviewer"
+                        if request.stage == "self_repair_investigator"
+                        else "self_repair_investigator"
+                    )
+                    if not arrived[peer].wait(timeout=2):
+                        raise RuntimeError("diagnosis roles did not overlap")
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=json.dumps(responses[request.stage]),
+                    )
+
+            fake = ParallelFake(
+                [],
+                acceleration=AccelerationConfig(
+                    diagnosis_cache_enabled=False,
+                    parallel_diagnosis_enabled=True,
+                ),
+            )
+            diagnosis = RootCauseCoordinator(
+                fake,
+                auto_agents_root=auto_root,
+                target_root=target_root,
+                error=RuntimeError("terminal failure"),
+                state=state,
+                traceback_text="traceback",
+                heuristic={"eligible": False},
+                runtime_evidence={},
+                config=SelfRepairDiagnosisConfig(),
+            ).run()
+
+            self.assertTrue(diagnosis.repair_approved)
+            self.assertEqual(len(fake.requests), 2)
 
     def test_run_interruption_bypasses_root_cause_failure_conversion(self):
         repair_case = RepairCase(

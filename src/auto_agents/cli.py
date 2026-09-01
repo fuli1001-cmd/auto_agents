@@ -1972,6 +1972,17 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="Show the current orchestrator state.")
     status_parser.add_argument("--project", required=True, help="Target project directory.")
 
+    performance_parser = subparsers.add_parser(
+        "performance",
+        help="Summarize persisted run or session performance spans.",
+    )
+    performance_parser.add_argument("--project", required=True, help="Target project directory.")
+    performance_parser.add_argument(
+        "--session",
+        default="",
+        help="Optional fix, collab, or provider-resolve session ID. Defaults to the current run.",
+    )
+
     validate_parser = subparsers.add_parser("validate", help="Validate config, plan, and required docs.")
     validate_parser.add_argument("--project", required=True, help="Target project directory.")
 
@@ -3083,6 +3094,33 @@ def main(argv: list[str] | None = None) -> int:
         payload["health"] = health if isinstance(health, dict) else {}
         payload["health_watch"] = health_watch_status(project_root)
         payload["runtime"] = runtime_status(project_root)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.command == "performance":
+        from .performance_trace import PerformanceTrace
+
+        project_root = Path(args.project).expanduser().resolve()
+        if args.session:
+            from .config import load_session_state
+
+            state = load_session_state(project_root, str(args.session))
+            trace = PerformanceTrace(
+                project_root,
+                workflow_kind=state.mode,
+                subject_id=state.session_id,
+                workflow_id=state.workflow_id,
+            )
+        else:
+            state = load_run_state(project_root)
+            trace = PerformanceTrace(
+                project_root,
+                workflow_kind="run",
+                subject_id=state.run_id,
+                workflow_id=str(state.resume_context.get("workflow_id", "")),
+            )
+        payload = trace.summary()
+        payload["trace_path"] = str(trace.path)
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 

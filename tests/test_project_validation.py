@@ -40,7 +40,7 @@ from auto_agents.config import (
 from auto_agents.git_ops import working_tree_clean
 from auto_agents.gates import GateCommandTimeoutError
 from auto_agents.health_watch import HealthSelfRepairRequired
-from auto_agents.io_utils import write_json, write_text
+from auto_agents.io_utils import read_json, write_json, write_text
 from auto_agents.models import (
     AgentRequest,
     AgentResult,
@@ -833,6 +833,31 @@ class ProjectValidationTests(unittest.TestCase):
         }
 
         self.assertEqual(validate_project_config_payload(payload), [])
+
+    def test_acceleration_defaults_enable_safe_parallel_execution_and_release_prewarm(self) -> None:
+        config = ProjectConfig.from_dict(copy.deepcopy(DEFAULT_CONFIG))
+
+        self.assertTrue(config.execution.acceleration.enabled)
+        self.assertTrue(config.execution.parallel_tasks.enabled)
+        self.assertTrue(config.gates.release_worker.enabled)
+        self.assertTrue(config.gates.release_worker.auto_start)
+
+    def test_existing_config_is_migrated_to_acceleration_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            config_file = project_root / ".auto-agents" / "config.json"
+            payload = read_json(config_file, default={})
+            payload["execution"].pop("acceleration", None)
+            payload["execution"]["parallel_tasks"]["enabled"] = False
+            write_json(config_file, payload)
+
+            config = load_project_config(project_root)
+            persisted = read_json(config_file, default={})
+
+            self.assertTrue(config.execution.acceleration.enabled)
+            self.assertTrue(config.execution.parallel_tasks.enabled)
+            self.assertIn("acceleration", persisted["execution"])
 
     def test_validate_project_config_payload_rejects_unquoted_pytest_marker_expression(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
@@ -5040,7 +5065,11 @@ class ProjectValidationTests(unittest.TestCase):
                 "state/parallel_tuning.json\nstate/release_jobs.sqlite3\n"
                 "state/release_jobs.sqlite3-shm\nstate/release_jobs.sqlite3-wal\n"
                 "state/release-worker.log\nstate/release-worker.lock\n"
-                "state/workflows/*/checkpoints/\n",
+                "state/checkpoint_blobs/\nstate/root_cause_certificates/\n"
+                "state/sessions/*/performance_trace.jsonl\n"
+                "state/workflows/*/checkpoints/\n"
+                "state/workflows/*/event_index.sqlite3\n"
+                "state/workflows/*/event_index.sqlite3-*\n",
             )
 
     def test_clarify_prompt_uses_selected_document_language(self) -> None:

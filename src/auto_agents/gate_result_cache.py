@@ -104,8 +104,26 @@ class GateResultCache:
         result_cache_scope: str,
         metadata_signature: str,
     ) -> Optional[CommandResult]:
+        result, _reason = self.lookup_with_reason(
+            command,
+            source_fingerprint=source_fingerprint,
+            cache_scope=cache_scope,
+            result_cache_scope=result_cache_scope,
+            metadata_signature=metadata_signature,
+        )
+        return result
+
+    def lookup_with_reason(
+        self,
+        command: str,
+        *,
+        source_fingerprint: str,
+        cache_scope: str,
+        result_cache_scope: str,
+        metadata_signature: str,
+    ) -> tuple[Optional[CommandResult], str]:
         if self.disabled or result_cache_scope == "off":
-            return None
+            return None, "cache_disabled" if self.disabled else "scope_off"
         identity = _identity(
             command,
             self.environment_fingerprint,
@@ -129,7 +147,7 @@ class GateResultCache:
                     (key, now - self.max_age_seconds),
                 ).fetchone()
                 if certificate is not None:
-                    return self._certificate_result(command, certificate[0])
+                    return self._certificate_result(command, certificate[0]), "hit"
                 row = connection.execute(
                     """
                     SELECT observed_inputs
@@ -139,9 +157,9 @@ class GateResultCache:
                     (key, now - self.max_age_seconds),
                 ).fetchone()
                 if row is not None:
-                    return self._cached_result(command, "result-cache-candidate")
+                    return self._cached_result(command, "result-cache-candidate"), "hit"
                 if result_cache_scope not in {"observed_inputs", "auto"}:
-                    return None
+                    return None, "candidate_key_miss"
                 rows = connection.execute(
                     """
                     SELECT observed_inputs
@@ -157,13 +175,19 @@ class GateResultCache:
                 for candidate in rows:
                     manifest = json.loads(candidate[0] or "{}")
                     if self._manifest_matches(manifest):
-                        return self._cached_result(
-                            command,
-                            "result-cache-observed-inputs",
+                        return (
+                            self._cached_result(
+                                command,
+                                "result-cache-observed-inputs",
+                            ),
+                            "hit",
                         )
+                if rows:
+                    return None, "observed_inputs_changed"
         except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
             self.disabled = True
-        return None
+            return None, "cache_error"
+        return None, "not_found"
 
     def record(
         self,

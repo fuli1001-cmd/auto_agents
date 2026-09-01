@@ -805,6 +805,7 @@ class LocalGatePlanExecutor:
         cache_path: Optional[Path] = None,
         preempt_requested: Optional[Callable[[], bool]] = None,
         environment_overrides: Optional[Mapping[str, str]] = None,
+        proof_audit_sample_rate: float = 0.0,
     ) -> None:
         self.project_root = project_root.resolve()
         self.gate_config = gate_config
@@ -831,6 +832,10 @@ class LocalGatePlanExecutor:
         self.use_result_cache = bool(use_result_cache)
         self.preempt_requested = preempt_requested
         self.environment_overrides = dict(environment_overrides or {})
+        self.proof_audit_sample_rate = min(
+            1.0,
+            max(0.0, float(proof_audit_sample_rate)),
+        )
         self.timing_store = GateTimingStore(
             self.project_root,
             cache_path=cache_path,
@@ -845,6 +850,7 @@ class LocalGatePlanExecutor:
         )
         self._shared_sandboxes: dict[str, Path] = {}
         self._published_hashes: dict[str, str] = {}
+        self._cache_miss_reasons: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def __enter__(self) -> "LocalGatePlanExecutor":
@@ -893,9 +899,10 @@ class LocalGatePlanExecutor:
             or self.gate_config.verification_policy_version < 2
             or self.snapshot is None
         ):
+            self._cache_miss_reasons[command] = "cache_not_eligible"
             return None
         metadata = self.metadata.get(command)
-        return self.result_cache.lookup(
+        result, reason = self.result_cache.lookup_with_reason(
             command,
             source_fingerprint=self.snapshot.tree_sha,
             cache_scope=str(
@@ -904,6 +911,18 @@ class LocalGatePlanExecutor:
             result_cache_scope=_effective_result_cache_scope(metadata),
             metadata_signature=_metadata_signature(metadata),
         )
+        self._cache_miss_reasons[command] = reason
+        if result is not None and self.proof_audit_sample_rate > 0:
+            audit_bucket = int(
+                hashlib.sha256(
+                    f"{self.snapshot.tree_sha}\0{command}".encode("utf-8")
+                ).hexdigest()[:16],
+                16,
+            ) / float(0xFFFFFFFFFFFFFFFF)
+            if audit_bucket < self.proof_audit_sample_rate:
+                self._cache_miss_reasons[command] = "proof_audit_sample"
+                return None
+        return result
 
     def record_cached_result(
         self,
@@ -1221,6 +1240,10 @@ class LocalGatePlanExecutor:
                 backend="local-isolated",
                 mutation_paths=mutations,
                 artifacts=artifacts,
+                cache_miss_reason=self._cache_miss_reasons.get(
+                    command,
+                    "not_checked",
+                ),
             )
             if trace_path is not None and result.ok:
                 observed_inputs, network_observed = _observed_input_manifest(

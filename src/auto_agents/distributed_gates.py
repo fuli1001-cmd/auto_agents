@@ -60,6 +60,7 @@ class DistributedGatePlanExecutor:
         environment_fingerprint: str = "",
         result_context_fingerprint: str = "",
         environment_overrides: Optional[Mapping[str, str]] = None,
+        proof_audit_sample_rate: float = 0.0,
     ) -> None:
         self.project_root = project_root.resolve()
         self.run_id = str(run_id)
@@ -75,6 +76,7 @@ class DistributedGatePlanExecutor:
             environment_fingerprint=environment_fingerprint,
             result_context_fingerprint=result_context_fingerprint,
             environment_overrides=self.environment_overrides,
+            proof_audit_sample_rate=proof_audit_sample_rate,
         )
         self.key = project_key(self.project_root)
         self.environment_manifest = build_environment_manifest(self.project_root)

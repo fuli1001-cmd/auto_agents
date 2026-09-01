@@ -57,7 +57,11 @@ class BootstrapTests(unittest.TestCase):
                 "state/parallel_tuning.json\nstate/release_jobs.sqlite3\n"
                 "state/release_jobs.sqlite3-shm\nstate/release_jobs.sqlite3-wal\n"
                 "state/release-worker.log\nstate/release-worker.lock\n"
-                "state/workflows/*/checkpoints/\n",
+                "state/checkpoint_blobs/\nstate/root_cause_certificates/\n"
+                "state/sessions/*/performance_trace.jsonl\n"
+                "state/workflows/*/checkpoints/\n"
+                "state/workflows/*/event_index.sqlite3\n"
+                "state/workflows/*/event_index.sqlite3-*\n",
             )
             task_archive_ignore = subprocess.run(
                 ["git", "check-ignore", "-q", ".auto-agents/history/task_plans/run-001.json"],

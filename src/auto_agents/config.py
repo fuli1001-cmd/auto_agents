@@ -57,7 +57,12 @@ AUTO_GITIGNORE_ENTRIES = (
     "state/release_jobs.sqlite3-wal",
     "state/release-worker.log",
     "state/release-worker.lock",
+    "state/checkpoint_blobs/",
+    "state/root_cause_certificates/",
+    "state/sessions/*/performance_trace.jsonl",
     "state/workflows/*/checkpoints/",
+    "state/workflows/*/event_index.sqlite3",
+    "state/workflows/*/event_index.sqlite3-*",
 )
 LEGACY_AUTO_GITIGNORE_ENTRIES = {"state/run_state.json"}
 
@@ -254,8 +259,8 @@ DEFAULT_CONFIG = {
         "fallback_proof_ids": [],
         "release_blocking_paths": [],
         "release_worker": {
-            "enabled": False,
-            "auto_start": False,
+            "enabled": True,
+            "auto_start": True,
             "idle_delay_seconds": 60,
             "max_recovery_attempts": 2,
             "max_infrastructure_retries": 2,
@@ -299,8 +304,18 @@ DEFAULT_CONFIG = {
         "commit_message_template": "feat({task_id}): {title}",
     },
     "execution": {
+        "acceleration": {
+            "mode": "on",
+            "diagnosis_cache_enabled": True,
+            "parallel_diagnosis_enabled": True,
+            "delta_context_enabled": True,
+            "session_continuation_enabled": True,
+            "collab_read_only_enabled": True,
+            "release_prewarm_enabled": True,
+            "proof_audit_sample_rate": 0.05,
+        },
         "parallel_tasks": {
-            "enabled": False,
+            "enabled": True,
             "workers": "auto",
             "max_auto_workers": 4,
             "adaptive": True,
@@ -674,6 +689,15 @@ def load_project_config(project_root: Path) -> ProjectConfig:
         raise FileNotFoundError(f"Missing config: {config_path(project_root)}")
     gates = data.get("gates") if isinstance(data, dict) else None
     migrated = False
+    execution = data.get("execution") if isinstance(data, dict) else None
+    if isinstance(execution, dict) and "acceleration" not in execution:
+        execution["acceleration"] = copy.deepcopy(
+            DEFAULT_CONFIG["execution"]["acceleration"]
+        )
+        parallel_tasks = execution.get("parallel_tasks")
+        if isinstance(parallel_tasks, dict):
+            parallel_tasks["enabled"] = True
+        migrated = True
     if isinstance(gates, dict):
         version = int(gates.get("verification_policy_version", 1) or 1)
         if version == 2 and "incremental" not in gates:

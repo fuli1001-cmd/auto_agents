@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import time
@@ -110,6 +111,91 @@ class RequirementsAuditPerformanceTests(unittest.TestCase):
 
 
 class ParallelTuningTests(unittest.TestCase):
+    def test_local_plan_patch_replaces_only_split_task_and_rewrites_dependencies(self) -> None:
+        orchestrator = object.__new__(Orchestrator)
+        payload = {
+            "tasks": [
+                {
+                    "task_id": "parent",
+                    "status": "pending",
+                    "split_depth": 0,
+                    "requirement_ids": ["REQ-001"],
+                },
+                {
+                    "task_id": "consumer",
+                    "status": "pending",
+                    "depends_on": ["parent"],
+                },
+            ]
+        }
+        replacements = [
+            {
+                "task_id": task_id,
+                "title": task_id,
+                "description": task_id,
+                "acceptance": ["done"],
+                "status": "pending",
+                "parent_task_id": "parent",
+                "split_depth": 1,
+                "task_origin": "scope_split",
+                "requirement_ids": ["REQ-001"],
+            }
+            for task_id in ("child-a", "child-b")
+        ]
+        response = "PLAN_PATCH v1: " + json.dumps(
+            {
+                "replace_task_id": "parent",
+                "replacement_tasks": replacements,
+            },
+            separators=(",", ":"),
+        )
+
+        candidate, error, applied = orchestrator._apply_local_plan_patch(
+            payload,
+            response,
+        )
+
+        self.assertEqual(error, "")
+        self.assertTrue(applied)
+        self.assertEqual(
+            [item["task_id"] for item in candidate["tasks"]],
+            ["child-a", "child-b", "consumer"],
+        )
+        self.assertEqual(
+            candidate["tasks"][2]["depends_on"],
+            ["child-a", "child-b"],
+        )
+        self.assertEqual(payload["tasks"][0]["task_id"], "parent")
+
+    def test_transitive_dependency_reduction_exposes_safe_parallel_work(self) -> None:
+        tasks = [
+            TaskSpec(
+                task_id="base",
+                title="Base",
+                description="base",
+                acceptance=["done"],
+            ),
+            TaskSpec(
+                task_id="middle",
+                title="Middle",
+                description="middle",
+                acceptance=["done"],
+                depends_on=["base"],
+            ),
+            TaskSpec(
+                task_id="leaf",
+                title="Leaf",
+                description="leaf",
+                acceptance=["done"],
+                depends_on=["base", "middle"],
+            ),
+        ]
+
+        changed = Orchestrator._reduce_transitive_task_dependencies(tasks)
+
+        self.assertTrue(changed)
+        self.assertEqual(tasks[2].depends_on, ["middle"])
+
     def test_parallel_worker_failure_preserves_scope_rewind_metadata(self) -> None:
         task = TaskSpec(
             task_id="task-split",
@@ -1793,6 +1879,39 @@ class EvidencePreflightTests(unittest.TestCase):
                 with patch.object(orchestrator, "_call_with_failover") as provider:
                     result = orchestrator._ensure_evidence_preflight(state, task)
             self.assertIsNone(result)
+            provider.assert_not_called()
+
+    def test_shared_preflight_certificate_survives_task_object_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            from auto_agents.config import load_run_state
+
+            state = load_run_state(root)
+            task = orchestrator._load_tasks_from_plan()[0]
+            state.tasks = [task]
+            orchestrator._commit_planning_baseline_if_needed([task])
+            with patch.object(
+                orchestrator, "_task_needs_evidence_preflight", return_value=True
+            ):
+                fingerprint = orchestrator._evidence_preflight_fingerprint(task)
+                state.resume_context["evidence_preflight_cache"] = {
+                    fingerprint: {
+                        "fingerprint": fingerprint,
+                        "decision": "READY",
+                        "reason": "shared exact certificate",
+                        "checklist": ["boundary test"],
+                    }
+                }
+                with patch.object(orchestrator, "_call_with_failover") as provider:
+                    result = orchestrator._ensure_evidence_preflight(state, task)
+
+            self.assertIsNone(result)
+            self.assertEqual(
+                task.evidence_preflight["reason"],
+                "shared exact certificate",
+            )
             provider.assert_not_called()
 
     def test_preflight_provider_setup_failure_is_fail_open(self) -> None:

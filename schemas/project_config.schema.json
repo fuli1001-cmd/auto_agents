@@ -494,6 +494,37 @@
     "execution": {
       "type": "object",
       "properties": {
+        "acceleration": {
+          "type": "object",
+          "required": [
+            "mode",
+            "diagnosis_cache_enabled",
+            "parallel_diagnosis_enabled",
+            "delta_context_enabled",
+            "session_continuation_enabled",
+            "collab_read_only_enabled",
+            "release_prewarm_enabled",
+            "proof_audit_sample_rate"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["off", "observe", "on"]
+            },
+            "diagnosis_cache_enabled": {"type": "boolean"},
+            "parallel_diagnosis_enabled": {"type": "boolean"},
+            "delta_context_enabled": {"type": "boolean"},
+            "session_continuation_enabled": {"type": "boolean"},
+            "collab_read_only_enabled": {"type": "boolean"},
+            "release_prewarm_enabled": {"type": "boolean"},
+            "proof_audit_sample_rate": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          },
+          "additionalProperties": false
+        },
         "parallel_tasks": {
           "type": "object",
           "required": ["enabled", "workers", "max_auto_workers", "adaptive", "strict", "worktree_root"],

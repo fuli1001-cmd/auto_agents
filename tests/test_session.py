@@ -2303,6 +2303,65 @@ class CollabAlwaysStreamTests(unittest.TestCase):
             self.assertTrue(stream_was_set["value"], "stream_output should be set in collab mode even without print_agent_output flag")
 
 
+class SessionContinuationTests(unittest.TestCase):
+    def test_provider_session_resumes_only_for_identical_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            orchestrator = Orchestrator(root)
+            session = Session(orchestrator, mode="collab")
+            state = SessionState(
+                session_id="continuation-session",
+                mode="collab",
+                status="executing",
+            )
+            requests = []
+
+            def run(request):
+                requests.append(request)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary="diagnosed",
+                    provider_session_id="provider-session-1",
+                )
+
+            orchestrator._call_with_failover = run
+
+            session._call_agent(state, "collab-1", "first")
+            session._call_agent(state, "collab-2", "second")
+            write_text(root / "product.py", "changed = True\n")
+            session._call_agent(state, "collab-3", "third")
+
+            self.assertEqual(requests[0].resume_session_id, "")
+            self.assertEqual(requests[1].resume_session_id, "provider-session-1")
+            self.assertEqual(requests[2].resume_session_id, "")
+            self.assertTrue(
+                all(item.sandbox_mode == "read-only" for item in requests)
+            )
+
+    def test_checkpoint_content_is_deduplicated_by_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            orchestrator = Orchestrator(root)
+            session = Session(orchestrator, mode="collab")
+            source = root / "source.txt"
+            source.write_text("same checkpoint bytes\n", encoding="utf-8")
+            first = root / ".auto-agents" / "state" / "restore-a" / "source.txt"
+            second = root / ".auto-agents" / "state" / "restore-b" / "source.txt"
+
+            session._copy_checkpoint_file(source, first)
+            session._copy_checkpoint_file(source, second)
+
+            blobs = list(
+                (root / ".auto-agents" / "state" / "checkpoint_blobs").glob("*/*")
+            )
+            self.assertEqual(len(blobs), 1)
+            self.assertEqual(first.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+            self.assertEqual(second.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+            self.assertEqual(first.stat().st_ino, second.stat().st_ino)
+
+
 class CollabStallRetryTests(unittest.TestCase):
     """Test that a stalled agent triggers retry with diagnostic feedback."""
 

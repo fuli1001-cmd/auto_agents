@@ -89,20 +89,20 @@ becomes the execution contract for the rest of the run.
 There is no hard task-count cap now. Instead, validation warns when a plan looks over-fragmented so
 you can inspect whether the work was sliced too finely.
 
-Task execution is sequential by default:
+Task execution enables conservative dependency-aware parallelism by default:
 
-- the orchestrator walks `task_plan.json` in order
+- independent tasks may run in isolated Git worktrees while dependency-linked or
+  likely-conflicting tasks remain ordered
 - each task moves `pending -> in_progress -> done` or `blocked`
-- only one task is implemented at a time
 - after one task passes `implement -> verify -> review`, the orchestrator automatically starts the
   next unfinished task in the same `run`
 - `--max-tasks N` stops the current invocation after `N` successful tasks, which is useful for demos
   or controlled rollout
 
-An experimental opt-in path can parallelize independent tasks in separate git worktrees. That mode
-stays conservative:
+The parallel path stays conservative and automatically falls back to sequential execution when its
+safety metadata is incomplete:
 
-- `execution.parallel_tasks.enabled` must be true
+- `execution.parallel_tasks.enabled=false` explicitly disables it
 - every non-done task must carry planner-generated `depends_on`
 - malformed or missing dependency metadata falls back to sequential mode, or fails fast when
   `execution.parallel_tasks.strict=true`
@@ -119,6 +119,11 @@ stays conservative:
   it can return a proof checklist or route an infeasible slice back to plan/clarify
 - batch logs include ready/deferred counts, dependency reasons for deferred tasks, and all failed
   workers in the batch instead of only the first failure
+
+When scope recovery only needs to split one task, the planner may return `PLAN_PATCH v1` with two to
+four complete replacement tasks. auto_agents applies that bounded replacement atomically, rewrites
+downstream dependencies, preserves done tasks, and runs the same full task-plan and requirement
+validation. Any verification-graph or unrelated metadata change still uses a full plan rewrite.
 
 For each task, the effective loop is:
 
@@ -328,10 +333,24 @@ Inspect persisted progress:
 python3 -m auto_agents status --project /tmp/demo
 ```
 
+Inspect accumulated stage, provider, and gate timing spans for the current run or a session:
+
+```bash
+python3 -m auto_agents performance --project /tmp/demo
+python3 -m auto_agents performance --project /tmp/demo --session <session-id>
+```
+
 Each run also writes `.auto-agents/runs/<run-id>/performance.json`, containing stage wall time,
 per-command gate duration, invocation and cache-hit counts, and the slowest commands. Set
 `gates.target_final_seconds` to a non-zero project target when final verification has a known
 latency budget; zero leaves the target informationally disabled.
+
+Acceleration is controlled by `execution.acceleration.mode`: `on` applies the optimizations,
+`observe` records timing without changing execution, and `off` retains the compatibility path.
+Exact root-cause certificates, evidence-preflight certificates, provider-session continuation, and
+gate result certificates all bind to their relevant source, worktree, policy, environment, and
+context fingerprints. A deterministic sample of successful proof-cache hits is rerun to audit cache
+soundness. Final release proofs are never removed or weakened.
 
 The `runtime` section reports whether a validated run owner is active, how many supervised process
 groups are running, the last process-control heartbeat, and whether cleanup is incomplete. To stop
@@ -978,8 +997,11 @@ continue after the host has removed the process.
 Incidents are persisted under `.auto-agents/runs/<run-id>/recovery_incidents/`. Every terminal
 exception and controlled `blocked` or `failed` result receives a full read-only root-cause
 investigation before the CLI exits. One investigator checks logs, state, staged/unstaged Git data,
-attempt history, checkpoints, and source; an independent reviewer tries to falsify that conclusion.
-Disagreement invokes an arbiter. Automatic repair requires evidence consensus that the mechanism is
+attempt history, checkpoints, and source; a second investigator independently derives and tries to
+falsify the same causal chain in parallel. Disagreement invokes an arbiter. Exact diagnoses are
+certificate-cached only while code, candidate, policy, and failure evidence remain identical, and
+large evidence is referenced through a content-hashed diagnostic manifest rather than duplicated in
+both prompts. Automatic repair requires evidence consensus that the mechanism is
 a generic, safely testable auto_agents defect. Approved defects enter isolated verified self-repair,
 restore only checkpoint-backed protected target paths, and resume the same run in a new process.
 Target-project failures keep bounded task recovery, while credentials, destructive production
@@ -993,12 +1015,22 @@ audit limits. Broad DOTALL wildcards and nested unbounded quantifiers fail close
 use bounded spans such as `[\s\S]{0,500}?`. File match results are cached incrementally in
 `.auto-agents/state/requirements_audit_cache.sqlite3` by pattern set and file-content hash.
 
-Experimental parallel task execution uses planner-generated dependencies plus isolated git
-worktrees. Example:
+Parallel task execution uses planner-generated dependencies plus isolated git worktrees. The
+acceleration switches provide one rollback boundary for the additional fast paths. Example:
 
 ```json
 {
   "execution": {
+    "acceleration": {
+      "mode": "on",
+      "diagnosis_cache_enabled": true,
+      "parallel_diagnosis_enabled": true,
+      "delta_context_enabled": true,
+      "session_continuation_enabled": true,
+      "collab_read_only_enabled": true,
+      "release_prewarm_enabled": true,
+      "proof_audit_sample_rate": 0.05
+    },
     "parallel_tasks": {
       "enabled": true,
       "workers": "auto",
@@ -1685,7 +1717,8 @@ the browser"):
 2. **Diagnose and route** — collab is read-only for target-project code. It may inspect the project,
    run bounded diagnostics, or pause with `NEED_USER_ASSIST`, but every product write is routed to a
    child `fix` or a new `run` iteration. If a diagnostic agent edits product files anyway, the attempt
-   is restored from its durable read-only checkpoint.
+   is restored from its durable read-only checkpoint. Supporting providers receive an actual
+   read-only sandbox request, while the restore guard remains as defense in depth.
 3. **Return** — completed children return to collab with their commit range, changed paths, proof
    summary, and failure evidence. A fix may itself route to run and returns through fix before collab
    continues.
@@ -1709,6 +1742,9 @@ processes. Handoffs and their append-only transition journal live under
 `.auto-agents/state/handoffs/` and `.auto-agents/state/workflows/`. A routed run receives an immutable,
 Git-tracked input at `specs/iterations/<timestamp>-<handoff-id>-<slug>.md`; a fix keeps its machine
 issue brief and readable rendering beside its session state as `issue.json` and `issue.md`.
+The JSON transition journal remains authoritative and hash-chained; a disposable SQLite index speeds
+repeated reads and is rebuilt after any mismatch. Repeated checkpoint file content is stored once in
+a content-addressed blob pool and hard-linked into restore points when the filesystem supports it.
 
 If the foreground owner exits unexpectedly, health-watch records and notifies
 `pending_manual_resume` but does not restart the process. Resume the deepest durable checkpoint with:

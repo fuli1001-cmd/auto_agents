@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import contextlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -12,6 +13,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 from .config import (
     create_session,
@@ -34,7 +36,12 @@ from .gates import (
     run_gate_plan,
 )
 from .gate_execution import GateSnapshotManager
-from .git_ops import changed_paths, commit_only_paths, head_ref
+from .git_ops import (
+    changed_paths,
+    commit_only_paths,
+    head_ref,
+    worktree_fingerprint,
+)
 from .io_utils import read_json, read_text, write_json, write_text
 from .models import (
     AgentRequest,
@@ -52,6 +59,7 @@ from .persistence import (
     persistence_candidate_fingerprint,
     persistence_change_strategy,
 )
+from .performance_trace import PerformanceTrace
 from .provider_contract import provider_policy_prompt_lines
 from .requirements import (
     load_requirements_trace,
@@ -2174,19 +2182,74 @@ class Session:
         # Always stream in collab/fix mode so the user sees real-time progress.
         # The --print-agent-output flag is not required.
         should_stream = self._print_agent_output or self.mode in ("collab", "fix", "provider_resolve")
+        acceleration = self.config.execution.acceleration
+        continuation_key = (
+            "converse" if label.startswith("converse-") else self.mode
+        )
+        current_head = head_ref(self.project_root)
+        current_workspace = worktree_fingerprint(self.project_root)
+        continuation = state.provider_continuations.get(continuation_key, {})
+        resume_session_id = ""
+        resume_provider = ""
+        if (
+            acceleration.enabled
+            and acceleration.session_continuation_enabled
+            and continuation.get("head") == current_head
+            and continuation.get("workspace_fingerprint") == current_workspace
+            and int(continuation.get("policy_version", 0) or 0) == 1
+        ):
+            resume_session_id = str(
+                continuation.get("provider_session_id", "")
+            ).strip()
+            resume_provider = str(continuation.get("provider", "")).strip()
+            if not resume_provider:
+                resume_session_id = ""
         request = AgentRequest(
             stage=effort_stage,
             effort=effort,
             prompt=prompt,
             cwd=self.project_root,
             output_path=output_path,
+            resume_session_id=resume_session_id,
+            resume_provider=resume_provider,
+            sandbox_mode=(
+                "read-only"
+                if self.mode == "collab"
+                and acceleration.enabled
+                and acceleration.collab_read_only_enabled
+                else "workspace-write"
+            ),
             stream_output=(
                 self.orch._stream_agent_output_callback(label)
                 if should_stream
                 else None
             ),
         )
+        started = time.monotonic()
         result: AgentResult = self.orch._call_with_failover(request)
+        usage = result.usage
+        PerformanceTrace(
+            self.project_root,
+            workflow_kind=self.mode,
+            subject_id=state.session_id,
+            workflow_id=state.workflow_id,
+        ).event(
+            "agent",
+            label,
+            duration_seconds=time.monotonic() - started,
+            metadata={
+                "provider_session_resumed": bool(resume_session_id),
+                "provider_session_id": result.provider_session_id,
+                "provider": self.orch._current_provider,
+                "head": head_ref(self.project_root),
+                "ok": result.ok,
+                "input_tokens": int(usage.input_tokens) if usage else 0,
+                "cached_input_tokens": (
+                    int(usage.cached_input_tokens) if usage else 0
+                ),
+                "output_tokens": int(usage.output_tokens) if usage else 0,
+            },
+        )
         self.orch._emit_agent_output(label, result)
         if not result.ok:
             parts = []
@@ -2198,6 +2261,16 @@ class Session:
                 parts.append(f"summary={result.summary[:500]}")
             detail = "; ".join(parts) if parts else "no output"
             raise RuntimeError(f"Agent call failed ({label}): {detail}")
+        if result.provider_session_id:
+            state.provider_continuations[continuation_key] = {
+                "provider_session_id": result.provider_session_id,
+                "provider": self.orch._current_provider,
+                "head": head_ref(self.project_root),
+                "workspace_fingerprint": worktree_fingerprint(self.project_root),
+                "policy_version": 1,
+                "updated_at": self._now(),
+            }
+            self._save(state)
         return (result.summary or result.stdout).strip()
 
     def _run_verify(self, scope: str = "final") -> Dict[str, object]:
@@ -2764,10 +2837,14 @@ class Session:
             source = self.project_root / relative
             target = files_root / relative
             if source.is_dir():
-                shutil.copytree(source, target, dirs_exist_ok=True)
+                for item in source.rglob("*"):
+                    if item.is_file() and not item.is_symlink():
+                        self._copy_checkpoint_file(
+                            item,
+                            target / item.relative_to(source),
+                        )
             elif source.exists() or source.is_symlink():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target, follow_symlinks=False)
+                self._copy_checkpoint_file(source, target)
         index = subprocess.run(
             ["git", "rev-parse", "--git-path", "index"],
             cwd=self.project_root,
@@ -2780,7 +2857,10 @@ class Session:
             if not index_path.is_absolute():
                 index_path = self.project_root / index_path
             if index_path.is_file():
-                shutil.copy2(index_path, restore_root / ".git-index.snapshot")
+                self._copy_checkpoint_file(
+                    index_path,
+                    restore_root / ".git-index.snapshot",
+                )
         write_json(
             restore_root / "manifest.json",
             {
@@ -2790,6 +2870,36 @@ class Session:
                 "created_at": self._now(),
             },
         )
+
+    def _copy_checkpoint_file(self, source: Path, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            shutil.copy2(source, target, follow_symlinks=False)
+            return
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        blob = (
+            self.project_root
+            / ".auto-agents"
+            / "state"
+            / "checkpoint_blobs"
+            / digest[:2]
+            / digest
+        )
+        if not blob.is_file():
+            blob.parent.mkdir(parents=True, exist_ok=True)
+            temporary = blob.with_suffix(
+                f".{os.getpid()}.{uuid4().hex[:8]}.tmp"
+            )
+            shutil.copy2(source, temporary)
+            try:
+                os.replace(temporary, blob)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+        try:
+            os.link(blob, target)
+        except OSError:
+            shutil.copy2(blob, target)
 
     def _reconcile_interrupted_collab_checkpoints(
         self,
@@ -2853,6 +2963,7 @@ class Session:
             for path in delta
             if not path.startswith(session_prefix)
             and not (checkpoint_prefix and path.startswith(checkpoint_prefix))
+            and not path.startswith(".auto-agents/state/checkpoint_blobs/")
             and path != ".auto-agents/.gitignore"
         ]
         if not offending:

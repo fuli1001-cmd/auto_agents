@@ -369,6 +369,32 @@ class TestCallWithFailover(unittest.TestCase):
         self.assertEqual(codex.calls, 1)
         self.assertEqual(copilot.calls, 1)
 
+    def test_persisted_session_is_affined_to_its_provider_and_not_forwarded(self):
+        codex = _SequenceAdapter([_make_result(ok=True, summary="fallback")])
+        copilot = _SequenceAdapter(
+            [
+                _make_result(
+                    ok=False,
+                    returncode=1,
+                    stderr="rate limit exceeded",
+                )
+            ]
+        )
+        stub = _stub_orchestrator(
+            {"codex": {}, "copilot-cli": {}},
+            "codex",
+            {"codex": codex, "copilot-cli": copilot},
+        )
+        request = _make_request()
+        request.resume_session_id = "copilot-session"
+        request.resume_provider = "copilot-cli"
+
+        result = stub._call_with_failover(request)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(copilot.requests[0].resume_session_id, "copilot-session")
+        self.assertEqual(codex.requests[0].resume_session_id, "")
+
     def test_interrupted_resume_uses_latest_running_checkpoint(self):
         adapter = _FakeAdapter(_make_result(ok=True))
         stub = _stub_orchestrator({"codex": {}}, "codex", {"codex": adapter})

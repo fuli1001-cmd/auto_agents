@@ -7,11 +7,12 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional
 
-from .config import run_path
+from .config import run_path, state_dir
 from .git_ops import is_untracked_vim_swap
 from .io_utils import read_json, read_text, write_json
 from .models import AgentRequest, AgentResult, RunState, SelfRepairDiagnosisConfig
@@ -152,7 +153,7 @@ class RootCauseReport:
         verdict = str(payload.get("verdict", "")).strip().upper()
         allowed_verdicts = {
             "investigator": {"ROOT_CAUSE"},
-            "reviewer": {"AGREE", "DISAGREE", "UNKNOWN"},
+            "reviewer": {"ROOT_CAUSE", "AGREE", "DISAGREE", "UNKNOWN"},
             "arbiter": {"FINAL", "UNKNOWN"},
         }[role]
         if verdict not in allowed_verdicts:
@@ -266,6 +267,31 @@ class RootCauseDiagnosis:
             "attempt_approved": self.repair_approved,
             "reason": self.reason,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "RootCauseDiagnosis":
+        arbiter_payload = payload.get("arbiter")
+        return cls(
+            diagnosis_id=str(payload.get("diagnosis_id", "")),
+            evidence_path=str(payload.get("evidence_path", "")),
+            investigator=RootCauseReport.from_dict(
+                payload.get("investigator", {}), role="investigator"
+            ),
+            reviewer=RootCauseReport.from_dict(
+                payload.get("reviewer", {}), role="reviewer"
+            ),
+            arbiter=(
+                RootCauseReport.from_dict(arbiter_payload, role="arbiter")
+                if isinstance(arbiter_payload, Mapping)
+                else None
+            ),
+            final=RootCauseReport.from_dict(
+                payload.get("final", {}),
+                role=("arbiter" if isinstance(arbiter_payload, Mapping) else "investigator"),
+            ),
+            repair_approved=bool(payload.get("repair_approved", False)),
+            reason=str(payload.get("reason", "")),
+        )
 
 
 def _compact(value: str, limit: int) -> str:
@@ -744,26 +770,77 @@ class RootCauseCoordinator:
                 self.target_root,
                 self.diagnostic_target_root,
             )
+            # The certificate identity is derived from canonical original
+            # evidence. Diagnostic snapshot paths and diagnosis IDs are
+            # intentionally ephemeral and must never defeat an exact replay.
+            certificate_key = self._certificate_key(evidence)
             diagnostic_evidence = self._replace_repository_roots(evidence)
-            investigator = self._invoke(
-                role="investigator",
-                evidence=diagnostic_evidence,
-                artifacts=artifacts,
-                prior=None,
-                timeout=self.config.investigator_timeout_seconds,
+            cached = self._load_certificate(certificate_key)
+            if cached is not None:
+                diagnosis = RootCauseDiagnosis(
+                    diagnosis_id=diagnosis_id,
+                    evidence_path=str(artifacts / "evidence.json"),
+                    investigator=cached.investigator,
+                    reviewer=cached.reviewer,
+                    arbiter=cached.arbiter,
+                    final=cached.final,
+                    repair_approved=cached.repair_approved,
+                    reason="reused root-cause diagnosis certificate",
+                )
+                write_json(artifacts / "diagnosis.json", diagnosis.to_dict())
+                self._assert_originals_unchanged(before_auto, before_target)
+                return diagnosis
+            acceleration = self._acceleration_config()
+            prompt_evidence = self._prompt_evidence(
+                diagnostic_evidence,
+                enabled=bool(
+                    acceleration is not None
+                    and acceleration.enabled
+                    and acceleration.delta_context_enabled
+                ),
             )
-            reviewer = self._invoke(
-                role="reviewer",
-                evidence=diagnostic_evidence,
-                artifacts=artifacts,
-                prior=investigator,
-                timeout=self.config.reviewer_timeout_seconds,
-            )
+            if acceleration is not None and acceleration.enabled and (
+                acceleration.parallel_diagnosis_enabled
+            ):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    investigator_future = pool.submit(
+                        self._invoke,
+                        role="investigator",
+                        evidence=prompt_evidence,
+                        artifacts=artifacts,
+                        prior=None,
+                        timeout=self.config.investigator_timeout_seconds,
+                    )
+                    reviewer_future = pool.submit(
+                        self._invoke,
+                        role="reviewer",
+                        evidence=prompt_evidence,
+                        artifacts=artifacts,
+                        prior=None,
+                        timeout=self.config.reviewer_timeout_seconds,
+                    )
+                    investigator = investigator_future.result()
+                    reviewer = reviewer_future.result()
+            else:
+                investigator = self._invoke(
+                    role="investigator",
+                    evidence=prompt_evidence,
+                    artifacts=artifacts,
+                    prior=None,
+                    timeout=self.config.investigator_timeout_seconds,
+                )
+                reviewer = self._invoke(
+                    role="reviewer",
+                    evidence=prompt_evidence,
+                    artifacts=artifacts,
+                    prior=investigator,
+                    timeout=self.config.reviewer_timeout_seconds,
+                )
             arbiter: Optional[RootCauseReport] = None
             if not self._reports_agree(investigator, reviewer):
                 arbiter = self._invoke(
                     role="arbiter",
-                    evidence=diagnostic_evidence,
+                    evidence=prompt_evidence,
                     artifacts=artifacts,
                     prior={
                         "investigator": investigator,
@@ -800,7 +877,165 @@ class RootCauseCoordinator:
             reason=reason,
         )
         write_json(artifacts / "diagnosis.json", diagnosis.to_dict())
+        self._save_certificate(certificate_key, diagnosis)
         return diagnosis
+
+    def _prompt_evidence(
+        self,
+        evidence: Mapping[str, object],
+        *,
+        enabled: bool,
+    ) -> Mapping[str, object]:
+        if not enabled:
+            return evidence
+        evidence_path = self.diagnostic_auto_root / ".root-cause-evidence.json"
+        write_json(evidence_path, evidence)
+        compacted: Dict[str, object] = {
+            "evidence_manifest": {
+                "path": str(evidence_path),
+                "sha256": hashlib.sha256(
+                    json.dumps(
+                        evidence,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "top_level_keys": sorted(str(key) for key in evidence),
+            }
+        }
+        preferred = {
+            "error",
+            "traceback",
+            "heuristic",
+            "runtime_evidence",
+            "repair_case",
+        }
+        for key, value in evidence.items():
+            encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            if key in preferred or len(encoded) <= 4_000:
+                compacted[str(key)] = value
+                continue
+            if isinstance(value, Mapping):
+                compacted[str(key)] = {
+                    "kind": "mapping_ref",
+                    "keys": sorted(str(item) for item in value)[:80],
+                    "count": len(value),
+                }
+            elif isinstance(value, list):
+                compacted[str(key)] = {
+                    "kind": "list_ref",
+                    "count": len(value),
+                    "tail": value[-3:],
+                }
+            else:
+                compacted[str(key)] = {
+                    "kind": "value_ref",
+                    "length": len(encoded),
+                }
+        return compacted
+
+    def _acceleration_config(self):
+        config = getattr(self.orchestrator, "config", None)
+        execution = getattr(config, "execution", None)
+        return getattr(execution, "acceleration", None)
+
+    def _certificate_key(self, evidence: Mapping[str, object]) -> str:
+        payload = {
+            "schema_version": ROOT_CAUSE_SCHEMA_VERSION,
+            "auto_agents_head": self._git_head(self.auto_agents_root),
+            "target_head": self._git_head(self.target_root),
+            "evidence": self._canonical_certificate_evidence(evidence),
+            "policy": self.config.to_dict(),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _canonical_certificate_evidence(self, value: object) -> object:
+        if isinstance(value, str):
+            return (
+                value.replace(str(self.auto_agents_root), "$AUTO_AGENTS_ROOT")
+                .replace(str(self.target_root), "$TARGET_ROOT")
+                .replace(str(self.diagnostic_auto_root), "$AUTO_AGENTS_ROOT")
+                .replace(str(self.diagnostic_target_root), "$TARGET_ROOT")
+            )
+        if isinstance(value, list):
+            return [self._canonical_certificate_evidence(item) for item in value]
+        if isinstance(value, Mapping):
+            canonical = {
+                str(key): self._canonical_certificate_evidence(item)
+                for key, item in value.items()
+                if str(key) != "diagnosis_id"
+            }
+            if {
+                "root",
+                "head",
+                "status",
+                "unstaged_diff",
+                "staged_diff",
+            }.issubset(canonical):
+                canonical["status"] = "\n".join(
+                    line
+                    for line in str(canonical.get("status", "")).splitlines()
+                    if ".auto-agents/runs/" not in line
+                    and ".auto-agents/state/root_cause_certificates/" not in line
+                )
+            return canonical
+        return value
+
+    @staticmethod
+    def _git_head(root: Path) -> str:
+        process = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(root),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        return process.stdout.strip() if process.returncode == 0 else ""
+
+    def _certificate_path(self, key: str) -> Path:
+        return state_dir(self.target_root) / "root_cause_certificates" / f"{key}.json"
+
+    def _load_certificate(self, key: str) -> Optional[RootCauseDiagnosis]:
+        acceleration = self._acceleration_config()
+        if (
+            acceleration is None
+            or not acceleration.enabled
+            or not acceleration.diagnosis_cache_enabled
+        ):
+            return None
+        payload = read_json(self._certificate_path(key), default={})
+        if not isinstance(payload, Mapping) or payload.get("certificate_key") != key:
+            return None
+        diagnosis_payload = payload.get("diagnosis")
+        if not isinstance(diagnosis_payload, Mapping):
+            return None
+        try:
+            return RootCauseDiagnosis.from_dict(diagnosis_payload)
+        except (TypeError, ValueError):
+            return None
+
+    def _save_certificate(
+        self,
+        key: str,
+        diagnosis: RootCauseDiagnosis,
+    ) -> None:
+        acceleration = self._acceleration_config()
+        if (
+            acceleration is None
+            or not acceleration.enabled
+            or not acceleration.diagnosis_cache_enabled
+        ):
+            return
+        write_json(
+            self._certificate_path(key),
+            {
+                "schema_version": 1,
+                "certificate_key": key,
+                "diagnosis": diagnosis.to_dict(),
+            },
+        )
 
     @staticmethod
     def _copy_diagnostic_tree(
@@ -1016,9 +1251,10 @@ class RootCauseCoordinator:
                 "Run bounded non-mutating focused diagnostics when useful."
             ),
             "reviewer": (
-                "Act as an independent adversarial reviewer. Recheck evidence and source, "
-                "try to falsify the investigator's ownership and causal chain, and report "
-                "AGREE, DISAGREE, or UNKNOWN."
+                "Act as an independent adversarial investigator. Recheck evidence and source, "
+                "derive ownership and causal chain without relying on another report, and try "
+                "to falsify every plausible alternative. Return ROOT_CAUSE when proven or "
+                "UNKNOWN when the evidence is insufficient."
             ),
             "arbiter": (
                 "Resolve the investigator/reviewer disagreement using concrete source or "
@@ -1032,7 +1268,7 @@ class RootCauseCoordinator:
             "verdict": (
                 "ROOT_CAUSE"
                 if role == "investigator"
-                else "AGREE|DISAGREE|UNKNOWN"
+                else "ROOT_CAUSE|UNKNOWN"
                 if role == "reviewer"
                 else "FINAL|UNKNOWN"
             ),
@@ -1136,7 +1372,7 @@ class RootCauseCoordinator:
         reviewer: RootCauseReport,
     ) -> bool:
         return (
-            reviewer.verdict == "AGREE"
+            reviewer.verdict in {"AGREE", "ROOT_CAUSE"}
             and reviewer.owner == investigator.owner
             and reviewer.category == investigator.category
             and reviewer.generic == investigator.generic
@@ -1218,7 +1454,7 @@ class RootCauseCoordinator:
         if arbitrated:
             return final.verdict == "FINAL"
         return (
-            reviewer.verdict == "AGREE"
+            reviewer.verdict in {"AGREE", "ROOT_CAUSE"}
             and reviewer.owner == "auto_agents"
             and reviewer.confidence >= self.config.confidence_threshold
             and reviewer.generic

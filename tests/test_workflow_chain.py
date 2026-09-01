@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -65,6 +66,44 @@ class WorkflowStoreTests(unittest.TestCase):
             sequences = [json.loads(path.read_text())["sequence"] for path in events]
             self.assertEqual(sequences, [1, 2, 3])
             self.assertEqual(store.load(created.workflow_id).event_sequence, 3)
+
+    def test_event_index_is_rebuilt_from_authoritative_hash_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            store = WorkflowStore(root)
+            snapshot = store.create_root(WorkflowRef("collab", "session-a"))
+            store.append_event(snapshot, "diagnostic_progress", details={"step": 1})
+            index = store.event_index_path(snapshot.workflow_id)
+            self.assertTrue(index.is_file())
+            with sqlite3.connect(index) as connection:
+                connection.execute(
+                    "UPDATE workflow_events SET payload = ? WHERE sequence = 1",
+                    ("{}",),
+                )
+
+            events = store.events(snapshot.workflow_id)
+
+            self.assertEqual([item["sequence"] for item in events], [1, 2])
+            with sqlite3.connect(index) as connection:
+                restored = connection.execute(
+                    "SELECT payload FROM workflow_events WHERE sequence = 1"
+                ).fetchone()
+            self.assertIn("workflow_started", str(restored[0]))
+
+    def test_event_index_never_hides_authoritative_journal_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            store = WorkflowStore(root)
+            snapshot = store.create_root(WorkflowRef("collab", "session-a"))
+            event_path = sorted(
+                (store.workflow_root(snapshot.workflow_id) / "events").glob("*.json")
+            )[0]
+            payload = json.loads(event_path.read_text(encoding="utf-8"))
+            payload["kind"] = "tampered"
+            event_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "hash chain is invalid"):
+                store.events(snapshot.workflow_id)
 
     def test_iteration_spec_is_immutable_idempotent_and_has_commit_trailer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

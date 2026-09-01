@@ -2223,6 +2223,35 @@ def validate_project_config_payload(payload: object) -> List[str]:
         if not isinstance(execution, dict):
             errors.append("execution must be an object")
         else:
+            acceleration = execution.get("acceleration", {})
+            if not isinstance(acceleration, dict):
+                errors.append("execution.acceleration must be an object")
+            else:
+                if acceleration.get("mode", "on") not in {"off", "observe", "on"}:
+                    errors.append(
+                        "execution.acceleration.mode must be one of: off, observe, on"
+                    )
+                for key in (
+                    "diagnosis_cache_enabled",
+                    "parallel_diagnosis_enabled",
+                    "delta_context_enabled",
+                    "session_continuation_enabled",
+                    "collab_read_only_enabled",
+                    "release_prewarm_enabled",
+                ):
+                    if not isinstance(acceleration.get(key, True), bool):
+                        errors.append(
+                            f"execution.acceleration.{key} must be a boolean"
+                        )
+                audit_rate = acceleration.get("proof_audit_sample_rate", 0.05)
+                if (
+                    isinstance(audit_rate, bool)
+                    or not isinstance(audit_rate, (int, float))
+                    or not 0 <= float(audit_rate) <= 1
+                ):
+                    errors.append(
+                        "execution.acceleration.proof_audit_sample_rate must be between 0 and 1"
+                    )
             parallel_tasks = execution.get("parallel_tasks", {})
             if not isinstance(parallel_tasks, dict):
                 errors.append("execution.parallel_tasks must be an object")
