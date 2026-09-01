@@ -56,7 +56,8 @@ class BootstrapTests(unittest.TestCase):
                 "state/requirements_audit_cache.sqlite3-*\nstate/repomap_cache.json\n"
                 "state/parallel_tuning.json\nstate/release_jobs.sqlite3\n"
                 "state/release_jobs.sqlite3-shm\nstate/release_jobs.sqlite3-wal\n"
-                "state/release-worker.log\nstate/release-worker.lock\n",
+                "state/release-worker.log\nstate/release-worker.lock\n"
+                "state/workflows/*/checkpoints/\n",
             )
             task_archive_ignore = subprocess.run(
                 ["git", "check-ignore", "-q", ".auto-agents/history/task_plans/run-001.json"],

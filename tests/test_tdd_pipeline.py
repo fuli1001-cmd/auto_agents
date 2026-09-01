@@ -156,7 +156,8 @@ class ImplementPipelineTests(unittest.TestCase):
             self.assertIn("Do not search for alternate docs", prompt)
             self.assertIn("requirement_proofs", prompt)
             self.assertIn("evidence_refs", prompt)
-            self.assertIn("status='verified'", prompt)
+            self.assertIn("This task has no local requirement_proofs", prompt)
+            self.assertNotIn("set status='verified'", prompt)
 
     def test_implement_prompt_includes_task_status_migration_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1644,9 +1644,9 @@ headings.
 
 ## Lightweight session workflows
 
-For completed projects, `auto-agents` provides two conversational session modes that bypass the full
-seven-stage pipeline. These are designed for quick, iterative work where the full orchestration flow
-would be too heavyweight.
+For completed projects, `auto-agents` provides two conversational session modes. Their diagnostic
+frames stay lightweight, while work that changes product scope is handed to the existing full
+pipeline instead of being reimplemented inside the session loop.
 
 ### Bug fix (`fix`)
 
@@ -1656,9 +1656,14 @@ Interactive bug-fix loop:
    questions until the problem is clear. If the agent determines the reported issue is
    **not actually a bug** (e.g., expected behavior, configuration issue), it will explain
    its reasoning and ask for your confirmation before closing the session
-2. **Execute** — the agent applies a targeted fix with convergence-based retry (see below)
-3. **Verify** — the targeted command and changed-path `affected` proofs attest the candidate
-4. **Commit** — changes are committed on success
+2. **Classify** — fix writes a structured issue brief and decides whether the work is a bounded
+   defect or a product iteration. A missing capability, changed public contract, architecture
+   expansion, or persistence-model change is routed automatically into `run`
+3. **Execute** — for a bounded defect, the agent applies a targeted fix with convergence-based retry
+   (see below). A late scope expansion rolls back that attempt before routing to `run`
+4. **Verify** — the targeted command and changed-path `affected` proofs attest the candidate. When a
+   routed run returns, fix reruns the original defect proof before completing
+5. **Commit** — changes are committed on success
 
 ```bash
 python3 -m auto_agents fix --project /tmp/demo
@@ -1670,13 +1675,16 @@ Interactive debug loop for goals that need user–agent collaboration (e.g. "tes
 the browser"):
 
 1. **Converse** — describe the goal; the agent clarifies
-2. **Iterate** — the agent works toward the goal autonomously; when it needs user action (e.g. "open
-   the browser and check the result"), it pauses with `NEED_USER_ASSIST`. Ordinary progress and
-   `BUG_FOUND` iterations run only affected proofs, using the shared session-start lazy
-   baseline and successful shard certificates. Verified bug fixes are committed as they happen.
-3. **Complete** — `GOAL_ACHIEVED`, or your confirmation after ordinary progress, reuses the same
-   affected-proof certificates. The candidate is committed immediately; exhaustive release proofs
-   are deferred unless policy or risk requires them synchronously.
+2. **Diagnose and route** — collab is read-only for target-project code. It may inspect the project,
+   run bounded diagnostics, or pause with `NEED_USER_ASSIST`, but every product write is routed to a
+   child `fix` or a new `run` iteration. If a diagnostic agent edits product files anyway, the attempt
+   is restored from its durable read-only checkpoint.
+3. **Return** — completed children return to collab with their commit range, changed paths, proof
+   summary, and failure evidence. A fix may itself route to run and returns through fix before collab
+   continues.
+4. **Complete** — `GOAL_ACHIEVED` verifies the entire workflow lineage, including already-committed
+   child paths, and still asks for user confirmation. Collab never implements or commits a product
+   fix itself.
 
 ```bash
 python3 -m auto_agents collab --project /tmp/demo
@@ -1686,6 +1694,32 @@ python3 -m auto_agents collab --project /tmp/demo --full-verify
 
 Each verification entry in the saved session log records its `progress` or `final` scope, logical
 command count, physically executed command count, certificate hits, and wall-clock duration.
+
+### Nested workflow handoffs and recovery
+
+`collab`, `fix`, and `run` form a durable workflow chain rather than recursively invoking CLI
+processes. Handoffs and their append-only transition journal live under
+`.auto-agents/state/handoffs/` and `.auto-agents/state/workflows/`. A routed run receives an immutable,
+Git-tracked input at `specs/iterations/<timestamp>-<handoff-id>-<slug>.md`; a fix keeps its machine
+issue brief and readable rendering beside its session state as `issue.json` and `issue.md`.
+
+If the foreground owner exits unexpectedly, health-watch records and notifies
+`pending_manual_resume` but does not restart the process. Resume the deepest durable checkpoint with:
+
+```bash
+python3 -m auto_agents resume --project /tmp/demo
+# Select a non-active retained root explicitly
+python3 -m auto_agents resume --project /tmp/demo --workflow <workflow-id>
+```
+
+The original `run` command and `fix/collab --session` remain compatible recovery entrypoints. Resume
+first reconciles incomplete operations: a commit found by its `Auto-Agents-Operation` trailer receives
+the missing receipt, an interrupted read-only collab turn restores its preimage, completed proof
+certificates are reused, and native provider sessions resume only when their workspace fingerprint
+still matches. `paused` and `waiting_user` remain in the child; a failed or blocked child preserves
+verified commits, checkpoints its failed candidate, restores only its uncommitted owned delta, and
+returns evidence to its parent. Repeated interruption of the identical checkpoint is bounded by the
+normal recovery limit instead of creating a crash loop.
 
 ### Recoverable operator input
 

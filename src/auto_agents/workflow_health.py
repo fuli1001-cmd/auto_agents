@@ -122,6 +122,9 @@ class WorkflowHealthRuntime:
             "status": str(payload.get("status", "")),
             "diff": str(payload.get("last_diff_hash", "")),
             "verify": str(payload.get("last_verify_sig", "")),
+            "workflow_id": str(payload.get("workflow_id", "")),
+            "active_handoff_id": str(payload.get("active_handoff_id", "")),
+            "return_phase": str(payload.get("return_phase", "")),
         }
         try:
             _atomic_json(

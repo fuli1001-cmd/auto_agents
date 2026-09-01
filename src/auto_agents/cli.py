@@ -56,7 +56,7 @@ from .prototype_variants import (
     registry_variants,
 )
 from .foreground_activity import ForegroundActivity
-from .git_ops import add_worktree, changed_paths, remove_worktree
+from .git_ops import add_worktree, changed_paths, head_ref, remove_worktree
 from .health_watch import (
     HealthSelfRepairRequired,
     advance_run_health_control,
@@ -835,6 +835,29 @@ def _resume_run_after_answer(
         interaction_mode=(str(context.get("interaction_mode", "")) or None),
         secret_echo=(str(context.get("secret_echo", "")) or None),
     )
+
+
+def _resume_parent_workflow_after_run(
+    project_root: Path,
+    orchestrator: Orchestrator,
+    run_lock: ProjectRunLock,
+    *,
+    print_agent_output: bool = False,
+) -> Optional[object]:
+    state = load_run_state(project_root)
+    context = dict(state.resume_context)
+    workflow_id = str(context.get("workflow_id", "")).strip()
+    parent_handoff_id = str(context.get("parent_handoff_id", "")).strip()
+    if not workflow_id or not parent_handoff_id:
+        return None
+    from .workflow_runtime import WorkflowCoordinator
+
+    coordinator = WorkflowCoordinator(
+        orchestrator,
+        print_agent_output=print_agent_output,
+        run_lock=run_lock,
+    )
+    return coordinator.resume_workflow(workflow_id)
 
 
 def _session_mode_for_command(command: str) -> str:
@@ -2190,6 +2213,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override autonomous repair mode for this session.",
     )
 
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="Resume the active nested workflow from its deepest durable checkpoint.",
+    )
+    resume_parser.add_argument("--project", required=True, help="Target project directory.")
+    resume_parser.add_argument(
+        "--workflow",
+        default="",
+        help="Explicit workflow ID when more than one resumable root exists.",
+    )
+    resume_parser.add_argument(
+        "--print-agent-output",
+        action="store_true",
+        help="Stream resumed agent output to stderr.",
+    )
+    resume_parser.add_argument(
+        "--full-verify",
+        action="store_true",
+        help="Force the resumed root session's final attestation.",
+    )
+    resume_parser.add_argument(
+        "--no-health-watch",
+        action="store_true",
+        help="Disable proactive health supervision for this invocation.",
+    )
+
     # ── sessions (list) ──────────────────────────────────────────
     sessions_parser = subparsers.add_parser("sessions", help="List sessions for a completed project.")
     sessions_parser.add_argument("--project", required=True, help="Target project directory.")
@@ -2500,7 +2549,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "answer":
         project_root = Path(args.project).expanduser().resolve()
         try:
-            with ProjectRunLock(project_root):
+            with ProjectRunLock(project_root) as answer_lock:
                 orchestrator = Orchestrator(
                     project_root, agent_output_stream=sys.stderr
                 )
@@ -2532,6 +2581,14 @@ def main(argv: list[str] | None = None) -> int:
                             project_root, orchestrator
                         )
                         payload["resumed_run"] = resumed.to_dict()
+                        parent_result = _resume_parent_workflow_after_run(
+                            project_root,
+                            orchestrator,
+                            answer_lock,
+                            print_agent_output=True,
+                        )
+                        if parent_result is not None:
+                            payload["resumed_workflow"] = parent_result.to_dict()
         except (OSError, RuntimeError, ValueError, RunAlreadyActiveError) as error:
             triage = (
                 _triage_terminal_run_error(project_root, orchestrator, error)
@@ -2558,24 +2615,44 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if bool(payload.get("ok")) else 1
 
     if args.command == "approve":
-        orchestrator = Orchestrator(Path(args.project))
-        gate = args.gate or load_run_state(Path(args.project)).pending_approval
-        variant_id = str(args.variant).strip()
-        if gate == "prototype" and not variant_id:
-            variants = candidate_variants(
-                load_registry(Path(args.project), include_virtual_legacy=True)
-            )
-            variant_id = _interactive_variant_id(
-                orchestrator,
-                variants,
-                action="approve",
-            )
-        state = orchestrator.approve(
-            args.gate,
-            prototype_variant_id=variant_id,
-        )
-        print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
-        return 0
+        project_root = Path(args.project)
+        try:
+            with ProjectRunLock(project_root) as approve_lock:
+                orchestrator = Orchestrator(project_root)
+                orchestrator._run_token = approve_lock.run_token
+                gate = args.gate or load_run_state(project_root).pending_approval
+                variant_id = str(args.variant).strip()
+                if gate == "prototype" and not variant_id:
+                    variants = candidate_variants(
+                        load_registry(project_root, include_virtual_legacy=True)
+                    )
+                    variant_id = _interactive_variant_id(
+                        orchestrator,
+                        variants,
+                        action="approve",
+                    )
+                state = orchestrator.approve(
+                    args.gate,
+                    prototype_variant_id=variant_id,
+                )
+                payload = state.to_dict()
+                context = dict(state.resume_context)
+                if context.get("parent_handoff_id"):
+                    resumed = orchestrator.resume_saved_run()
+                    payload = resumed.to_dict()
+                    parent_result = _resume_parent_workflow_after_run(
+                        project_root,
+                        orchestrator,
+                        approve_lock,
+                        print_agent_output=True,
+                    )
+                    if parent_result is not None:
+                        payload["resumed_workflow"] = parent_result.to_dict()
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+                return 0
+        except (OSError, RuntimeError, ValueError, RunAlreadyActiveError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
 
     if args.command == "reject":
         orchestrator = Orchestrator(Path(args.project))
@@ -2644,6 +2721,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         orchestrator = None
         health_runtime = None
+        workflow_store = None
+        workflow_snapshot = None
         project_root = Path(args.project)
         run_lock = ProjectRunLock(project_root)
         try:
@@ -2657,6 +2736,34 @@ def main(argv: list[str] | None = None) -> int:
             spec_file = _apply_saved_run_context(args, project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
             orchestrator._run_token = run_lock.run_token
+            from .workflow_chain import WorkflowRef, WorkflowStore
+
+            workflow_store = WorkflowStore(project_root)
+            existing_root = workflow_store.active()
+            if (
+                existing_root is not None
+                and existing_root.root.kind != "run"
+                and existing_root.status not in {"completed", "suspended"}
+            ):
+                raise RuntimeError(
+                    f"workflow {existing_root.workflow_id} is already active; use auto-agents resume"
+                )
+            try:
+                initial_run_state = load_run_state(project_root)
+            except (FileNotFoundError, RuntimeError, ValueError):
+                initial_run_state = None
+                workflow_store = None
+            if initial_run_state is not None and workflow_store is not None:
+                workflow_id = str(
+                    initial_run_state.resume_context.get("workflow_id", "")
+                ).strip()
+                workflow_snapshot = workflow_store.create_root(
+                    WorkflowRef("run", initial_run_state.run_id),
+                    workflow_id=workflow_id,
+                )
+                initial_run_state.resume_context["workflow_id"] = workflow_snapshot.workflow_id
+                save_run_state(project_root, initial_run_state)
+                run_lock.bind_subject("run", initial_run_state.run_id)
             health_config = getattr(
                 getattr(getattr(orchestrator, "config", None), "execution", None),
                 "health_watch",
@@ -2674,7 +2781,9 @@ def main(argv: list[str] | None = None) -> int:
                     orchestrator=orchestrator,
                 )
                 orchestrator._workflow_health_runtime = health_runtime
-                health_runtime.start()
+                health_runtime.start(
+                    initial_run_state.run_id if initial_run_state is not None else ""
+                )
             configured_autonomy = getattr(
                 getattr(
                     getattr(orchestrator, "config", None),
@@ -2699,13 +2808,23 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             _promote_pending_self_repairs(project_root)
             if health_runtime is not None and hasattr(orchestrator, "_start_health_supervision"):
-                orchestrator._watchdog_launcher = (
-                    lambda watched_state: (
-                        run_lock.bind_subject("run", watched_state.run_id),
-                        health_runtime.bind_subject(watched_state.run_id),
-                    )
-                )
+                def _bind_run_workflow_subject(watched_state):
+                    run_lock.bind_subject("run", watched_state.run_id)
+                    health_runtime.bind_subject(watched_state.run_id)
+                    if workflow_snapshot is not None and workflow_store is not None:
+                        workflow_snapshot.active_frame = WorkflowRef(
+                            "run", watched_state.run_id
+                        )
+                        workflow_store.save(workflow_snapshot)
+
+                orchestrator._watchdog_launcher = _bind_run_workflow_subject
             if run_lock.interrupted_snapshot:
+                if workflow_store is not None and workflow_snapshot is not None:
+                    workflow_store.mark_recovery_required(
+                        workflow_snapshot,
+                        reason="previous run owner disappeared before a terminal receipt",
+                        details={"snapshot": run_lock.interrupted_snapshot},
+                    )
                 if health_runtime is not None:
                     health_runtime.set_phase("resuming")
                 interrupted_state = orchestrator.reconcile_runtime_interruption(
@@ -2739,6 +2858,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             state_payload = state.to_dict()
             state_status = str(state_payload.get("status", ""))
+            if workflow_snapshot is not None and workflow_store is not None:
+                workflow_snapshot.active_frame = WorkflowRef(
+                    "run",
+                    str(state_payload.get("run_id", ""))
+                    or workflow_snapshot.active_frame.native_id,
+                )
+                workflow_store.save(workflow_snapshot)
             if state_status == "completed" and health_runtime is not None:
                 health_runtime.set_phase("finalizing")
             if state_status == "waiting_user":
@@ -2808,6 +2934,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 ensure_release_worker(project_root)
             _safe_notify(notify_run_finished, project_root, state_payload)
+            if workflow_store is not None and workflow_snapshot is not None:
+                workflow_store.complete(workflow_snapshot, status="completed")
+                from .git_ops import amend_only_paths
+
+                if head_ref(project_root):
+                    amend_only_paths(
+                        project_root,
+                        [
+                            f".auto-agents/state/workflows/{workflow_snapshot.workflow_id}",
+                            ".auto-agents/state/workflows/active.json",
+                        ],
+                    )
             print(_render_run_summary(project_root, state_payload))
             return 0
         except HealthSelfRepairRequired as error:
@@ -2826,13 +2964,31 @@ def main(argv: list[str] | None = None) -> int:
                     repair_case=error.repair_case,
                 )
             except RunInterruptedError as interrupted:
+                if workflow_store is not None and workflow_snapshot is not None:
+                    workflow_store.mark_recovery_required(
+                        workflow_snapshot,
+                        reason=str(interrupted),
+                        details={"head": head_ref(project_root)},
+                    )
                 return _handle_run_interrupted(project_root, interrupted)
         except RunInterruptedError as error:
+            if workflow_store is not None and workflow_snapshot is not None:
+                workflow_store.mark_recovery_required(
+                    workflow_snapshot,
+                    reason=str(error),
+                    details={"head": head_ref(project_root)},
+                )
             return _handle_run_interrupted(project_root, error)
         except KeyboardInterrupt:
             reason = "run interrupted by SIGINT"
             ACTIVE_PROCESSES.terminate_all()
             _mark_run_stopped(project_root, reason)
+            if workflow_store is not None and workflow_snapshot is not None:
+                workflow_store.mark_recovery_required(
+                    workflow_snapshot,
+                    reason=reason,
+                    details={"head": head_ref(project_root)},
+                )
             _notify_run_blocked(project_root, reason)
             print(json.dumps({"ok": False, "error": reason}, indent=2, ensure_ascii=False))
             return 130
@@ -2874,6 +3030,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 3
             except RunInterruptedError as interrupted:
+                if workflow_store is not None and workflow_snapshot is not None:
+                    workflow_store.mark_recovery_required(
+                        workflow_snapshot,
+                        reason=str(interrupted),
+                        details={"head": head_ref(project_root)},
+                    )
                 return _handle_run_interrupted(project_root, interrupted)
         finally:
             if health_runtime is not None:
@@ -2907,6 +3069,12 @@ def main(argv: list[str] | None = None) -> int:
         project_root = Path(args.project).expanduser().resolve()
         orchestrator = Orchestrator(project_root)
         payload = orchestrator.status()
+        from .workflow_chain import WorkflowStore
+
+        active_workflow = WorkflowStore(project_root).active()
+        payload["workflow"] = (
+            active_workflow.to_dict() if active_workflow is not None else {}
+        )
         state = load_run_state(project_root)
         health = read_json(
             run_path(project_root, state.run_id) / "health" / "summary.json",
@@ -3030,6 +3198,72 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
 
+    if args.command == "resume":
+        from .workflow_chain import WorkflowStore
+        from .workflow_runtime import WorkflowCoordinator
+
+        project_root = Path(args.project).expanduser().resolve()
+        foreground = ForegroundActivity(project_root)
+        workflow_lock = ProjectRunLock(project_root)
+        health_runtime = None
+        try:
+            foreground.acquire()
+            workflow_lock.acquire()
+            orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            orchestrator._run_token = workflow_lock.run_token
+            store = WorkflowStore(project_root)
+            selected = (
+                store.load(str(args.workflow))
+                if str(args.workflow).strip()
+                else store.active()
+            )
+            if selected is not None:
+                health_config = orchestrator.config.execution.health_watch
+                if bool(args.no_health_watch):
+                    health_config.enabled = False
+                health_runtime = WorkflowHealthRuntime(
+                    project_root,
+                    workflow_kind=selected.root.kind,
+                    run_token=workflow_lock.run_token,
+                    enabled=bool(health_config.enabled),
+                    auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
+                    orchestrator=orchestrator,
+                )
+                health_runtime.start(selected.workflow_id)
+            coordinator = WorkflowCoordinator(
+                orchestrator,
+                print_agent_output=bool(args.print_agent_output),
+                full_verify=bool(args.full_verify),
+                health_runtime=health_runtime,
+                run_lock=workflow_lock,
+            )
+            if workflow_lock.interrupted_snapshot:
+                coordinator.reconcile_interruption(workflow_lock.interrupted_snapshot)
+            result = (
+                coordinator.resume_workflow(str(args.workflow))
+                if str(args.workflow).strip()
+                else coordinator.resume_active()
+            )
+            payload = result.to_dict()
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            status = str(payload.get("status", ""))
+            if status == "completed":
+                return 0
+            if status in {"waiting_child", "waiting_user", "paused", "blocked"}:
+                return 3
+            return 1 if status == "failed" else 3
+        except RunAlreadyActiveError as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 2
+        except (OSError, RuntimeError, FileNotFoundError, ValueError) as error:
+            print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
+            return 1
+        finally:
+            if health_runtime is not None:
+                health_runtime.close(reason="workflow resume command exited")
+            workflow_lock.release()
+            foreground.release()
+
     if args.command == "sessions":
         try:
             from .config import list_sessions
@@ -3060,8 +3294,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sessions-delete":
         try:
             from .config import delete_session
+            from .workflow_chain import WorkflowStore
 
             project_root = Path(args.project)
+            active_workflow = WorkflowStore(project_root).active()
+            if active_workflow is not None and (
+                (
+                    active_workflow.root.kind in {"fix", "collab", "provider_resolve"}
+                    and active_workflow.root.native_id == args.session
+                )
+                or (
+                    active_workflow.active_frame is not None
+                    and active_workflow.active_frame.kind
+                    in {"fix", "collab", "provider_resolve"}
+                    and active_workflow.active_frame.native_id == args.session
+                )
+            ):
+                raise RuntimeError(
+                    "cannot delete a session owned by the active workflow; resume or complete it first"
+                )
             answer = _confirm_prompt(
                 project_root,
                 (
@@ -3083,8 +3334,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "sessions-clear":
         try:
             from .config import clear_sessions
+            from .workflow_chain import WorkflowStore
 
             project_root = Path(args.project)
+            active_workflow = WorkflowStore(project_root).active()
+            if active_workflow is not None and (
+                active_workflow.root.kind in {"fix", "collab", "provider_resolve"}
+                or (
+                    active_workflow.active_frame is not None
+                    and active_workflow.active_frame.kind
+                    in {"fix", "collab", "provider_resolve"}
+                )
+            ):
+                raise RuntimeError(
+                    "cannot clear sessions while a workflow owns an active session"
+                )
             answer = _confirm_prompt(
                 project_root,
                 (
@@ -3105,13 +3369,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command in ("fix", "collab", "provider-resolve"):
         foreground = ForegroundActivity(Path(args.project))
+        workflow_lock = ProjectRunLock(Path(args.project))
         health_runtime = None
         try:
             foreground.acquire()
+            workflow_lock.acquire()
             from .session import Session
+            from .workflow_runtime import WorkflowCoordinator
 
             project_root = Path(args.project)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
+            orchestrator._run_token = workflow_lock.run_token
             health_config = getattr(
                 getattr(getattr(orchestrator, "config", None), "execution", None),
                 "health_watch",
@@ -3125,7 +3393,7 @@ def main(argv: list[str] | None = None) -> int:
                     workflow_kind=(
                         args.command if args.command in {"fix", "collab"} else "fix"
                     ),
-                    run_token=uuid.uuid4().hex,
+                    run_token=workflow_lock.run_token,
                     enabled=bool(health_config.enabled),
                     auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
                     orchestrator=orchestrator,
@@ -3156,6 +3424,18 @@ def main(argv: list[str] | None = None) -> int:
             if bool(getattr(args, "full_verify", False)):
                 session_kwargs["full_verify"] = True
             session = Session(orchestrator, **session_kwargs)
+            coordinator = WorkflowCoordinator(
+                orchestrator,
+                print_agent_output=bool(args.print_agent_output),
+                full_verify=bool(getattr(args, "full_verify", False)),
+                auto_approve=bool(getattr(args, "auto_approve", False)),
+                health_runtime=health_runtime,
+                run_lock=workflow_lock,
+            )
+            session._coordinator = coordinator
+            session._coordinator_managed = True
+            if workflow_lock.interrupted_snapshot:
+                coordinator.reconcile_interruption(workflow_lock.interrupted_snapshot)
             if args.session:
                 state = session.resume(args.session)
             else:
@@ -3174,7 +3454,11 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 ensure_release_worker(project_root)
             print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
-            return 0
+            if state.status == "completed":
+                return 0
+            if state.status in {"waiting_child", "waiting_user", "paused", "blocked"}:
+                return 3
+            return 1 if state.status == "failed" else 3
         except (RuntimeError, FileNotFoundError, ValueError) as error:
             project_root = Path(args.project)
             if health_runtime is not None:
@@ -3186,6 +3470,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if triage is not None and triage.decision.eligible:
                 foreground.release()
+                workflow_lock.release()
                 repair_lock = ProjectRunLock(project_root)
                 try:
                     repair_lock.acquire()
@@ -3216,6 +3501,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             if health_runtime is not None:
                 health_runtime.close(reason="foreground session command exited")
+            workflow_lock.release()
             foreground.release()
 
     parser.error(f"Unsupported command: {args.command}")

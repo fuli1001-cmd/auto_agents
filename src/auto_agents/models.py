@@ -1869,6 +1869,15 @@ class RunState:
 @dataclass
 class SessionState:
     session_id: str
+    workflow_schema_version: int = 1
+    workflow_id: str = ""
+    parent_handoff_id: str = ""
+    active_handoff_id: str = ""
+    return_phase: str = ""
+    lineage_changed_paths: List[str] = field(default_factory=list)
+    lineage_head_ref: str = ""
+    last_child_result_ref: str = ""
+    protected_preexisting_paths: List[str] = field(default_factory=list)
     mode: str = "fix"
     status: str = "conversing"
     goal: str = ""
@@ -1902,6 +1911,19 @@ class SessionState:
     def from_dict(cls, data: Dict[str, object]) -> "SessionState":
         return cls(
             session_id=str(data["session_id"]),
+            workflow_schema_version=int(data.get("workflow_schema_version", 1) or 1),
+            workflow_id=str(data.get("workflow_id", "")),
+            parent_handoff_id=str(data.get("parent_handoff_id", "")),
+            active_handoff_id=str(data.get("active_handoff_id", "")),
+            return_phase=str(data.get("return_phase", "")),
+            lineage_changed_paths=[
+                str(item) for item in data.get("lineage_changed_paths", [])
+            ],
+            lineage_head_ref=str(data.get("lineage_head_ref", "")),
+            last_child_result_ref=str(data.get("last_child_result_ref", "")),
+            protected_preexisting_paths=[
+                str(item) for item in data.get("protected_preexisting_paths", [])
+            ],
             mode=str(data.get("mode", "fix")),
             status=str(data.get("status", "conversing")),
             goal=str(data.get("goal", "")),
@@ -1951,6 +1973,15 @@ class SessionState:
     def to_dict(self) -> Dict[str, object]:
         return {
             "session_id": self.session_id,
+            "workflow_schema_version": self.workflow_schema_version,
+            "workflow_id": self.workflow_id,
+            "parent_handoff_id": self.parent_handoff_id,
+            "active_handoff_id": self.active_handoff_id,
+            "return_phase": self.return_phase,
+            "lineage_changed_paths": list(self.lineage_changed_paths),
+            "lineage_head_ref": self.lineage_head_ref,
+            "last_child_result_ref": self.last_child_result_ref,
+            "protected_preexisting_paths": list(self.protected_preexisting_paths),
             "mode": self.mode,
             "status": self.status,
             "goal": self.goal,

@@ -57,6 +57,7 @@ AUTO_GITIGNORE_ENTRIES = (
     "state/release_jobs.sqlite3-wal",
     "state/release-worker.log",
     "state/release-worker.lock",
+    "state/workflows/*/checkpoints/",
 )
 LEGACY_AUTO_GITIGNORE_ENTRIES = {"state/run_state.json"}
 

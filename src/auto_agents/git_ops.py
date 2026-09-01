@@ -122,13 +122,21 @@ def commit_only_paths(
     project_root: Path,
     message: str,
     paths: Iterable[str],
+    *,
+    trailers: Iterable[str] = (),
 ) -> str:
-    normalized_paths = tuple(
+    requested_paths = tuple(
         dict.fromkeys(
             path.replace("\\", "/").strip().rstrip("/")
             for path in paths
             if path.replace("\\", "/").strip().rstrip("/")
         )
+    )
+    normalized_paths = tuple(
+        path
+        for path in requested_paths
+        if (project_root / path).exists()
+        or bool(_git(project_root, "ls-files", "--", path).stdout.strip())
     )
     if not normalized_paths:
         return ""
@@ -154,15 +162,12 @@ def commit_only_paths(
             diff_process.stderr.strip() or "git diff paths failed"
         )
 
-    commit_process = _git(
-        project_root,
-        "commit",
-        "--only",
-        "-m",
-        message,
-        "--",
-        *pathspecs,
-    )
+    commit_args = ["commit", "--only", "-m", message]
+    trailer_lines = [str(item).strip() for item in trailers if str(item).strip()]
+    if trailer_lines:
+        commit_args.extend(["-m", "\n".join(trailer_lines)])
+    commit_args.extend(["--", *pathspecs])
+    commit_process = _git(project_root, *commit_args)
     if commit_process.returncode != 0:
         raise RuntimeError(
             commit_process.stderr.strip() or "git commit paths failed"
@@ -172,6 +177,47 @@ def commit_only_paths(
     if rev_process.returncode != 0:
         raise RuntimeError(rev_process.stderr.strip() or "git rev-parse failed")
     return rev_process.stdout.strip()
+
+
+def amend_only_paths(project_root: Path, paths: Iterable[str]) -> str:
+    """Amend HEAD with exact paths while preserving unrelated staged changes."""
+
+    requested = tuple(
+        dict.fromkeys(
+            path.replace("\\", "/").strip().rstrip("/")
+            for path in paths
+            if path.replace("\\", "/").strip().rstrip("/")
+        )
+    )
+    normalized = tuple(
+        path
+        for path in requested
+        if (project_root / path).exists()
+        or bool(_git(project_root, "ls-files", "--", path).stdout.strip())
+    )
+    if not normalized:
+        return head_ref(project_root)
+    pathspecs = tuple(f":(top,literal){path}" for path in normalized)
+    add = _git(project_root, "add", "-A", "--", *pathspecs)
+    if add.returncode != 0:
+        raise RuntimeError(add.stderr.strip() or "git add amend paths failed")
+    diff = _git(project_root, "diff", "--cached", "--quiet", "--", *pathspecs)
+    if diff.returncode == 0:
+        return head_ref(project_root)
+    if diff.returncode != 1:
+        raise RuntimeError(diff.stderr.strip() or "git diff amend paths failed")
+    amend = _git(
+        project_root,
+        "commit",
+        "--amend",
+        "--no-edit",
+        "--only",
+        "--",
+        *pathspecs,
+    )
+    if amend.returncode != 0:
+        raise RuntimeError(amend.stderr.strip() or "git amend paths failed")
+    return head_ref(project_root)
 
 
 def changed_files(project_root: Path) -> str:

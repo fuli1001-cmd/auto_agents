@@ -586,6 +586,7 @@ class SessionFixFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             _configure_git_identity(project_root)
+            commit_all(project_root, "chore: baseline")
             user_inputs = [
                 "The submit button crashes the app",
             ]
@@ -922,9 +923,14 @@ class SessionCollabFlowTests(unittest.TestCase):
                 ):
                     result = session._phase_collab_loop(state)
 
-                self.assertEqual(result.status, "failed")
-                self.assertEqual(result.current_attempt, 2)
-                self.assertEqual(call_agent.call_count, 2)
+                if marker.startswith("BUG_FOUND"):
+                    self.assertEqual(result.status, "waiting_child")
+                    self.assertEqual(result.current_attempt, 1)
+                    self.assertEqual(call_agent.call_count, 1)
+                else:
+                    self.assertEqual(result.status, "failed")
+                    self.assertEqual(result.current_attempt, 2)
+                    self.assertEqual(call_agent.call_count, 2)
 
     def test_collab_verification_uses_preexisting_failure_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1025,7 +1031,7 @@ class SessionCollabFlowTests(unittest.TestCase):
             self.assertEqual(result.status, "completed")
             self.assertEqual(events[:3], ["apply", "plan", "baseline"])
 
-    def test_collab_general_progress_runs_final_only_after_user_confirmation(self) -> None:
+    def test_collab_general_output_is_diagnostic_not_implementation_progress(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "y")
@@ -1048,14 +1054,14 @@ class SessionCollabFlowTests(unittest.TestCase):
             ):
                 result = session._phase_collab_loop(state)
 
-            self.assertEqual(result.status, "completed")
-            self.assertEqual(
-                [call.kwargs["scope"] for call in verify.call_args_list],
-                ["progress", "final"],
-            )
-            self.assertEqual(
-                [entry["verification_scope"] for entry in state.execution_log if entry["action"].endswith("verify")],
-                ["progress", "final"],
+            self.assertEqual(result.status, "failed")
+            verify.assert_not_called()
+            self.assertFalse(
+                [
+                    entry
+                    for entry in state.execution_log
+                    if entry["action"].endswith("verify")
+                ]
             )
 
     def test_collab_final_failure_after_confirmation_does_not_complete(self) -> None:
@@ -1087,7 +1093,7 @@ class SessionCollabFlowTests(unittest.TestCase):
             self.assertEqual(result.status, "failed")
             git_commit.assert_not_called()
 
-    def test_collab_marker_scopes_bug_as_progress_and_goal_as_final(self) -> None:
+    def test_collab_legacy_bug_marker_routes_to_fix_without_verifying_inline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "y")
@@ -1118,11 +1124,9 @@ class SessionCollabFlowTests(unittest.TestCase):
             ):
                 result = session._phase_collab_loop(state)
 
-            self.assertEqual(result.status, "completed")
-            self.assertEqual(
-                [call.kwargs["scope"] for call in verify.call_args_list],
-                ["progress", "final"],
-            )
+            self.assertEqual(result.status, "waiting_child")
+            self.assertTrue(result.active_handoff_id)
+            verify.assert_not_called()
 
     def test_collab_need_user_assist(self) -> None:
         """Agent requests user assistance, then achieves goal."""
@@ -1212,6 +1216,7 @@ class SessionCollabFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             _configure_git_identity(project_root)
+            commit_all(project_root, "chore: baseline")
 
             user_inputs = [
                 "Generate a test video using the frontend",
@@ -1252,7 +1257,7 @@ class SessionCollabFlowTests(unittest.TestCase):
             committed = json.loads(show.stdout)
             self.assertEqual(committed["status"], "completed")
 
-    def test_collab_commits_verified_progress_before_final_confirmation(self) -> None:
+    def test_collab_restores_inline_edits_and_only_coordinates_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             _configure_git_identity(project_root)
@@ -1280,9 +1285,10 @@ class SessionCollabFlowTests(unittest.TestCase):
                 elif call_count["n"] == 2:
                     app_file.write_text("value = 1\n", encoding="utf-8")
                     content = "Applied the first browser fix.\nGOAL_ACHIEVED: The main flow now works\n"
+                elif call_count["n"] == 3:
+                    content = "Diagnostic check complete.\nGOAL_ACHIEVED: The main flow now works\n"
                 else:
-                    app_file.write_text("value = 2\n", encoding="utf-8")
-                    content = "Applied the final follow-up fix.\nGOAL_ACHIEVED: The browser flow is fully working\n"
+                    content = "Final diagnostic check complete.\nGOAL_ACHIEVED: The browser flow is fully working\n"
                 write_text(request.output_path, content)
                 return AgentResult(
                     ok=True, command=["mock"], output_path=request.output_path,
@@ -1295,6 +1301,7 @@ class SessionCollabFlowTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
             self.assertTrue(working_tree_clean(project_root))
+            self.assertEqual(app_file.read_text(encoding="utf-8"), "value = 0\n")
 
             rev_list = subprocess.run(
                 ["git", "rev-list", "--count", "HEAD"],
@@ -1303,7 +1310,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
             )
-            self.assertEqual(rev_list.stdout.strip(), "4")
+            self.assertEqual(rev_list.stdout.strip(), "3")
 
 
 class SessionResumeTests(unittest.TestCase):
@@ -3607,7 +3614,10 @@ class BaselineDiffVerifyTests(unittest.TestCase):
 
             prompt = session._build_converse_prompt(state)
 
-            self.assertIn("every Python-oriented FIX_VERIFY command must run inside it", prompt)
+            self.assertIn(
+                "every Python-oriented verification_command must run inside it",
+                prompt,
+            )
             self.assertIn("conda run -p ./.conda python -m unittest discover -s tests", prompt)
 
     def test_fix_converse_prompt_derives_gate_commands_from_structured_steps(self) -> None:

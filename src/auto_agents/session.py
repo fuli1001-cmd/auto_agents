@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import json
 import re
 import shutil
@@ -33,8 +34,8 @@ from .gates import (
     run_gate_plan,
 )
 from .gate_execution import GateSnapshotManager
-from .git_ops import changed_paths, commit_all, head_ref
-from .io_utils import read_text, write_text
+from .git_ops import changed_paths, commit_only_paths, head_ref
+from .io_utils import read_json, read_text, write_json, write_text
 from .models import (
     AgentRequest,
     AgentResult,
@@ -78,6 +79,8 @@ _REQUIRES_CLARIFY = re.compile(r"^REQUIRES_CLARIFY:\s*(.+)$", re.MULTILINE)
 _REQUIREMENT_ID = re.compile(r"\bREQ-[A-Za-z0-9_-]+\b")
 _BUG_FOUND = re.compile(r"^BUG_FOUND:\s*(.+)$", re.MULTILINE)
 _GOAL_ACHIEVED = re.compile(r"^GOAL_ACHIEVED:\s*(.+)$", re.MULTILINE)
+_ROUTE_WORKFLOW = re.compile(r"^ROUTE_WORKFLOW\s+v1:\s*(\{.*\})\s*$", re.MULTILINE)
+_FIX_DISPOSITION = re.compile(r"^FIX_DISPOSITION\s+v1:\s*(\{.*\})\s*$", re.MULTILINE)
 _FIX_VERIFY = re.compile(r"^FIX_VERIFY:\s*(.+)$", re.MULTILINE)
 _COMMIT_MESSAGE = re.compile(r"^COMMIT_MESSAGE:\s*(.+)$", re.MULTILINE)
 _PERSISTENCE_CHANGE = re.compile(r"^PERSISTENCE_CHANGE:\s*(\{.*\})\s*$", re.MULTILINE)
@@ -99,6 +102,7 @@ class Session:
         full_verify: bool = False,
         auto_approve: bool = False,
         health_runtime: object = None,
+        coordinator: object = None,
     ) -> None:
         self.orch = orchestrator
         self.project_root = orchestrator.project_root
@@ -108,6 +112,9 @@ class Session:
         self._full_verify = bool(full_verify)
         self._auto_approve = bool(auto_approve)
         self._health_runtime = health_runtime
+        self._coordinator = coordinator
+        self._coordinator_managed = coordinator is not None
+        self._replace_active_workflow = False
         # ``fix --full-verify`` keeps its existing session-wide semantics.
         # Collab only bypasses certificates for the final attestation; progress
         # checks must remain incremental so the interactive loop stays fast.
@@ -133,10 +140,13 @@ class Session:
             )
         ):
             return self.orch._resolved_gate_plan("final", level="release")
+        changed_path_set = set(changed_paths(self.project_root))
+        if self._current_state is not None:
+            changed_path_set.update(self._current_state.lineage_changed_paths)
         return self.orch._resolved_gate_plan(
             "implement",
             level="affected",
-            changed_path_set=changed_paths(self.project_root),
+            changed_path_set=sorted(changed_path_set),
         )
 
     def _release_gate_plan(self):
@@ -288,11 +298,17 @@ class Session:
 
     def start(self) -> SessionState:
         """Create a new session and drive it to completion (or interruption)."""
-        state = create_session(self.project_root, self.mode)
-        state.auto_approve = self._auto_approve
-        self._save(state)
-        self._print(f"Session {state.session_id} started in {state.mode} mode.")
-        return self._drive(state)
+        if self._coordinator is None:
+            from .workflow_runtime import WorkflowCoordinator
+
+            self._coordinator = WorkflowCoordinator(
+                self.orch,
+                print_agent_output=self._print_agent_output,
+                full_verify=self._full_verify,
+                auto_approve=self._auto_approve,
+                health_runtime=self._health_runtime,
+            )
+        return self._coordinator.start_session(self)
 
     def resume(self, session_id: str) -> SessionState:
         """Resume an existing session.
@@ -301,25 +317,21 @@ class Session:
         ``executing`` with a fresh attempt counter so the user can continue
         where the previous run left off while preserving all prior context.
         """
-        state = load_session_state(self.project_root, session_id)
-        state.auto_approve = bool(state.auto_approve or self._auto_approve)
-        self._save(state)
-        if state.status == "completed":
+        existing = load_session_state(self.project_root, session_id)
+        if existing.status == "completed":
             self._print(f"Session {session_id} is already completed.")
-            return state
-        if state.status == "failed":
-            self._print(
-                f"Resuming failed session {session_id} — resetting attempt counter "
-                f"and continuing from execution phase."
+            return existing
+        if self._coordinator is None:
+            from .workflow_runtime import WorkflowCoordinator
+
+            self._coordinator = WorkflowCoordinator(
+                self.orch,
+                print_agent_output=self._print_agent_output,
+                full_verify=self._full_verify,
+                auto_approve=self._auto_approve,
+                health_runtime=self._health_runtime,
             )
-            state.status = "executing"
-            state.current_attempt = 0
-            state.stall_count = 0
-            state.consecutive_agent_errors = 0
-            self._save(state)
-            return self._drive(state)
-        self._print(f"Resuming session {session_id} ({state.mode} mode, status={state.status}).")
-        return self._drive(state)
+        return self._coordinator.resume_session(self, session_id)
 
     def offer_resume_or_new(self) -> SessionState:
         """If there are active or failed sessions for this mode, offer to resume; else start new."""
@@ -331,11 +343,12 @@ class Session:
             selected = self._select_resumable_session(resumable)
             if selected is not None:
                 return self.resume(selected.session_id)
+            self._replace_active_workflow = True
         return self.start()
 
     # ── Main driver ──────────────────────────────────────────────
 
-    def _drive(self, state: SessionState) -> SessionState:
+    def _drive_local(self, state: SessionState) -> SessionState:
         """Drive the session through its phases until completion or pause."""
         try:
             self._check_health_action()
@@ -344,7 +357,10 @@ class Session:
 
             if state.status == "executing":
                 if self.mode == "fix":
-                    state = self._phase_fix_execute(state)
+                    if state.return_phase == "after_child":
+                        state = self._phase_fix_after_child(state)
+                    else:
+                        state = self._phase_fix_execute(state)
                 elif self.mode == "provider_resolve":
                     state = self._phase_provider_resolve_execute(state)
                 else:
@@ -352,6 +368,8 @@ class Session:
             self._check_health_action()
         except KeyboardInterrupt:
             self._print("\nSession interrupted by user. Progress saved.")
+            state.status = "paused"
+            state.resolution = "interrupted_by_user"
             self._save(state)
         except RuntimeError as exc:
             state.status = "failed"
@@ -364,6 +382,10 @@ class Session:
             self._save(state)
             raise
         return state
+
+    def _drive(self, state: SessionState) -> SessionState:
+        """Backward-compatible local driver used by older integrations."""
+        return self._drive_local(state)
 
     # ── Phase 1: Conversational clarification ────────────────────
 
@@ -396,6 +418,9 @@ class Session:
                 user_input = self._prompt_user("", multiline=True)
                 if not user_input.strip():
                     self._print("No input provided. Exiting.")
+                    state.status = "failed"
+                    state.resolution = "no_input"
+                    self._save(state)
                     return state
                 state.goal = user_input.strip()
             state.conversation.append({"role": "user", "content": state.goal})
@@ -427,6 +452,134 @@ class Session:
             state.conversation.append({"role": "agent", "content": reply})
             self._save(state)
 
+            if self.mode == "fix":
+                disposition, disposition_error = self._parse_protocol_json(
+                    _FIX_DISPOSITION,
+                    reply,
+                    label="FIX_DISPOSITION v1",
+                )
+                if disposition_error:
+                    state.conversation.append(
+                        {"role": "user", "content": disposition_error}
+                    )
+                    self._save(state)
+                    continue
+                if disposition is not None:
+                    decision = str(disposition.get("decision", "")).strip()
+                    if decision not in {
+                        "fix",
+                        "run_iteration",
+                        "not_bug",
+                        "need_user",
+                        "resume_child",
+                    }:
+                        state.conversation.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "FIX_DISPOSITION v1 decision must be fix, "
+                                    "run_iteration, not_bug, need_user, or resume_child."
+                                ),
+                            }
+                        )
+                        self._save(state)
+                        continue
+                    issue_ref = self._materialize_fix_issue(state, disposition)
+                    if decision == "fix":
+                        verify_command = str(
+                            disposition.get("verification_command", "")
+                        ).strip()
+                        if verify_command:
+                            state.fix_verify_command = verify_command
+                        persistence_payload = disposition.get("persistence_change")
+                        if isinstance(persistence_payload, dict):
+                            errors = validate_persistence_change(
+                                persistence_payload,
+                                "session.persistence_change",
+                                required=True,
+                            )
+                            if errors:
+                                state.conversation.append(
+                                    {
+                                        "role": "user",
+                                        "content": "Invalid persistence contract: "
+                                        + "; ".join(errors),
+                                    }
+                                )
+                                self._save(state)
+                                continue
+                            state.persistence_change = dict(persistence_payload)
+                        state.status = "executing"
+                        state.return_phase = ""
+                        state.execution_log.append(
+                            {
+                                "attempt": 0,
+                                "action": "fix_disposition",
+                                "result": "fix",
+                                "issue_ref": issue_ref,
+                                "timestamp": self._now(),
+                            }
+                        )
+                        self._save(state)
+                        return state
+                    if decision == "run_iteration":
+                        payload = dict(disposition)
+                        payload["issue_ref"] = issue_ref
+                        return self._prepare_workflow_handoff(
+                            state,
+                            target="run",
+                            reason=str(disposition.get("reason", "")),
+                            payload={"spec_seed": dict(disposition.get("spec_seed", {})), "fix_disposition": payload},
+                        )
+                    if decision == "resume_child":
+                        return self._prepare_workflow_handoff(
+                            state,
+                            target="resume",
+                            reason=str(disposition.get("reason", "resume child")),
+                            payload={
+                                "resume_handoff_id": str(
+                                    disposition.get("resume_handoff_id", "")
+                                )
+                            },
+                        )
+                    if decision == "not_bug":
+                        reason = str(disposition.get("reason", "")).strip()
+                        self._print(f"\nAgent believes this is NOT a bug: {reason}")
+                        answer = self._prompt_user(
+                            "Do you agree this is not a bug? (y/n) [y]: ",
+                            default="y",
+                        )
+                        if answer.strip().lower() not in ("n", "no"):
+                            state.status = "completed"
+                            state.resolution = "not_a_bug"
+                            self._save(state)
+                            return state
+                        user_reply = self._prompt_user(
+                            "\nPlease explain why you believe this is a bug: ",
+                            multiline=True,
+                        )
+                        state.conversation.append(
+                            {
+                                "role": "user",
+                                "content": user_reply.strip()
+                                or "I still believe this is a bug. Please look again.",
+                            }
+                        )
+                        self._save(state)
+                        continue
+                    question = str(
+                        disposition.get("question")
+                        or disposition.get("reason")
+                        or "What additional information is needed?"
+                    )
+                    self._print(f"\nAgent:\n{reply.strip()}")
+                    user_reply = self._prompt_user(f"\n{question}\nYour reply: ", multiline=True)
+                    state.conversation.append(
+                        {"role": "user", "content": user_reply.strip() or "No additional information."}
+                    )
+                    self._save(state)
+                    continue
+
             # Check for NOT_A_BUG (fix mode only) before GOAL_CLEAR
             if self.mode == "fix":
                 not_bug_match = _NOT_A_BUG.search(reply)
@@ -440,6 +593,14 @@ class Session:
                         "Do you agree this is not a bug? (y/n) [y]: ", default="y",
                     )
                     if answer.strip().lower() not in ("n", "no"):
+                        self._materialize_fix_issue(
+                            state,
+                            {
+                                "decision": "not_bug",
+                                "summary": state.goal,
+                                "reason": reason,
+                            },
+                        )
                         state.status = "completed"
                         state.resolution = "not_a_bug"
                         state.execution_log.append({
@@ -510,6 +671,16 @@ class Session:
                 fv_match = _FIX_VERIFY.search(reply)
                 if fv_match and self.mode == "fix":
                     state.fix_verify_command = fv_match.group(1).strip()
+                if self.mode == "fix":
+                    self._materialize_fix_issue(
+                        state,
+                        {
+                            "decision": "fix",
+                            "summary": state.goal,
+                            "reason": "Legacy GOAL_CLEAR response accepted for compatibility.",
+                            "verification_command": state.fix_verify_command,
+                        },
+                    )
                 display = _GOAL_CLEAR.sub("", reply)
                 display = _FIX_VERIFY.sub("", display)
                 display = _PERSISTENCE_CHANGE.sub("", display).strip()
@@ -534,6 +705,127 @@ class Session:
         self._save(state)
         return state
 
+    @staticmethod
+    def _parse_protocol_json(
+        pattern: re.Pattern,
+        reply: str,
+        *,
+        label: str,
+    ) -> Tuple[Optional[Dict[str, object]], str]:
+        matches = list(pattern.finditer(reply))
+        if not matches:
+            return None, ""
+        if len(matches) != 1:
+            return None, f"Output exactly one {label} marker."
+        try:
+            payload = json.loads(matches[0].group(1))
+        except json.JSONDecodeError as error:
+            return None, f"{label} JSON is invalid: {error}"
+        if not isinstance(payload, dict):
+            return None, f"{label} must contain one JSON object."
+        unsafe_refs = Session._unsafe_protocol_refs(payload)
+        if unsafe_refs:
+            return None, (
+                f"{label} contains unsafe evidence references: "
+                + ", ".join(unsafe_refs[:5])
+            )
+        return dict(payload), ""
+
+    @staticmethod
+    def _unsafe_protocol_refs(payload: Dict[str, object]) -> List[str]:
+        unsafe: List[str] = []
+
+        def visit(value: object, key: str = "") -> None:
+            if isinstance(value, dict):
+                for inner_key, inner_value in value.items():
+                    visit(inner_value, str(inner_key))
+                return
+            if isinstance(value, list):
+                for item in value:
+                    visit(item, key)
+                return
+            if key not in {"evidence_refs", "artifact_refs", "contract_refs"}:
+                return
+            raw = str(value).strip().replace("\\", "/")
+            parts = raw.split("/")
+            if (
+                not raw
+                or raw.startswith("/")
+                or re.match(r"^[A-Za-z]:/", raw)
+                or ".." in parts
+                or raw == ".env"
+                or raw.startswith(".auto-agents/operator/")
+            ):
+                unsafe.append(raw or "(empty)")
+
+        visit(payload)
+        return unsafe
+
+    def _materialize_fix_issue(
+        self,
+        state: SessionState,
+        disposition: Dict[str, object],
+    ) -> str:
+        from .workflow_chain import IssueBriefBuilder
+
+        payload = dict(disposition)
+        payload.setdefault("reported_goal", state.goal)
+        payload.setdefault("source_handoff_id", state.parent_handoff_id)
+        refs = IssueBriefBuilder(self.project_root, state.session_id).materialize(payload)
+        return str(refs["json"])
+
+    def _prepare_workflow_handoff(
+        self,
+        state: SessionState,
+        *,
+        target: str,
+        reason: str,
+        payload: Dict[str, object],
+    ) -> SessionState:
+        from .workflow_chain import WorkflowRef, WorkflowStore
+
+        if not state.workflow_id:
+            store = WorkflowStore(self.project_root)
+            snapshot = store.create_root(WorkflowRef(state.mode, state.session_id))
+            state.workflow_id = snapshot.workflow_id
+        else:
+            store = (
+                self._coordinator.store
+                if self._coordinator is not None
+                else WorkflowStore(self.project_root)
+            )
+            snapshot = store.load(state.workflow_id)
+        if self.mode in {"fix", "collab"} and not state.baseline_git_ref:
+            self.orch._apply_generated_verification_config()
+            self._ensure_baseline(state)
+        handoff_payload = dict(payload)
+        handoff_payload.setdefault("head_before", head_ref(self.project_root))
+        handoff_payload.setdefault(
+            "protected_preexisting_paths", list(state.protected_preexisting_paths)
+        )
+        handoff = store.prepare_handoff(
+            snapshot,
+            parent=WorkflowRef(state.mode, state.session_id),
+            target=target,
+            goal=state.goal,
+            reason=reason,
+            payload=handoff_payload,
+        )
+        state.active_handoff_id = handoff.handoff_id
+        state.status = "waiting_child"
+        state.return_phase = ""
+        state.execution_log.append(
+            {
+                "attempt": state.current_attempt,
+                "action": "workflow_routed",
+                "result": f"{target}: {reason}"[:500],
+                "handoff_id": handoff.handoff_id,
+                "timestamp": self._now(),
+            }
+        )
+        self._save(state)
+        return state
+
     # ── Phase 2a: Fix mode execution ─────────────────────────────
 
     def _phase_fix_execute(self, state: SessionState) -> SessionState:
@@ -542,14 +834,22 @@ class Session:
         self._ensure_baseline(state)
         feedback = ""
         while True:
+            self._reconcile_interrupted_collab_checkpoints(state)
             self._check_health_action()
             state.current_attempt += 1
             self._print(f"\n--- Fix attempt {state.current_attempt} ---")
 
             prompt = self._build_fix_prompt(state, feedback)
+            before_snapshot = self.orch._worktree_change_snapshot()
+            restore_guard = tempfile.TemporaryDirectory(
+                prefix="auto-agents-fix-route-"
+            )
+            restore_root = Path(restore_guard.name)
+            self._capture_collab_restore_point(restore_root, before_snapshot)
             try:
                 reply = self._call_agent(state, f"fix-{state.current_attempt}", prompt)
             except RuntimeError as exc:
+                restore_guard.cleanup()
                 err_msg = str(exc)
                 state.consecutive_agent_errors += 1
                 state.execution_log.append({
@@ -577,6 +877,38 @@ class Session:
                 "timestamp": self._now(),
             })
             self._save(state)
+
+            disposition, disposition_error = self._parse_protocol_json(
+                _FIX_DISPOSITION,
+                reply,
+                label="FIX_DISPOSITION v1",
+            )
+            if disposition_error:
+                restore_guard.cleanup()
+                feedback = disposition_error
+                continue
+            if disposition is not None and str(
+                disposition.get("decision", "")
+            ).strip() == "run_iteration":
+                restored = self._restore_collab_mutations(
+                    state,
+                    before_snapshot,
+                    restore_root,
+                )
+                restore_guard.cleanup()
+                issue_ref = self._materialize_fix_issue(state, disposition)
+                return self._prepare_workflow_handoff(
+                    state,
+                    target="run",
+                    reason=str(disposition.get("reason", "fix scope expanded")),
+                    payload={
+                        "spec_seed": dict(disposition.get("spec_seed", {})),
+                        "fix_disposition": dict(disposition),
+                        "issue_ref": issue_ref,
+                        "rolled_back_paths": restored,
+                    },
+                )
+            restore_guard.cleanup()
 
             marker_error = self._apply_session_persistence_marker(state, reply)
             if marker_error:
@@ -665,6 +997,89 @@ class Session:
         self._print("Fix session stopped (no further progress). Session marked as failed.")
         return state
 
+    def _phase_fix_after_child(self, state: SessionState) -> SessionState:
+        """Re-check the original defect after a routed child returns."""
+
+        from .io_utils import read_json
+
+        state.return_phase = ""
+        handoff_payload = read_json(Path(state.last_child_result_ref), default={})
+        result = (
+            dict(handoff_payload.get("result", {}))
+            if isinstance(handoff_payload, dict)
+            and isinstance(handoff_payload.get("result"), dict)
+            else {}
+        )
+        child_status = str(result.get("status", ""))
+        if child_status != "completed":
+            feedback = str(
+                result.get("summary")
+                or result.get("resolution")
+                or f"child returned status={child_status or 'unknown'}"
+            )
+            state.conversation.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The routed child did not complete successfully. Reassess the "
+                        f"original issue and decide whether to resume or choose another route.\n{feedback}"
+                    ),
+                }
+            )
+            self._update_stall_state(
+                state,
+                self._compute_diff_hash(),
+                self._compute_verify_sig(feedback),
+            )
+            stop = self._should_stop(state, feedback)
+            if stop:
+                state.status = "failed"
+                state.resolution = "child_route_stalled"
+                self._save(state)
+                self._print(stop)
+                return state
+            state.status = "conversing"
+            self._save(state)
+            return state
+
+        self._current_state = state
+        verify = self._run_verify(scope="final")
+        self._append_verification_log(state, "post_child_fix_verify", verify)
+        self._save(state)
+        if verify["ok"]:
+            state.status = "completed"
+            state.resolution = "resolved_by_iteration"
+            state.stall_count = 0
+            self._record_release_attestation(state, verify)
+            self._release_baseline(state)
+            self._save(state)
+            self._print("The routed iteration resolved the original issue.")
+            return state
+
+        reason = str(verify.get("reason", "post-child verification failed"))
+        state.conversation.append(
+            {
+                "role": "user",
+                "content": (
+                    "The routed child completed, but the original defect verification "
+                    f"still fails. Reassess the disposition.\n{reason}"
+                ),
+            }
+        )
+        diff_hash = self._compute_diff_hash()
+        verify_sig = self._compute_verify_sig(reason)
+        self._update_stall_state(state, diff_hash, verify_sig)
+        stop = self._should_stop(state, reason)
+        if stop:
+            state.status = "failed"
+            state.resolution = "post_iteration_verification_failed"
+            self._save(state)
+            self._print(stop)
+            return state
+        state.status = "conversing"
+        self._save(state)
+        return state
+
     # ── Phase 2b: Collab mode loop ───────────────────────────────
 
     def _phase_collab_loop(self, state: SessionState) -> SessionState:
@@ -687,25 +1102,79 @@ class Session:
             self._print(f"\n--- Collab iteration {state.current_attempt} ---")
 
             prompt = self._build_collab_prompt(state, feedback)
-            try:
-                reply = self._call_agent(state, f"collab-{state.current_attempt}", prompt)
-            except RuntimeError as exc:
-                err_msg = str(exc)
-                state.consecutive_agent_errors += 1
-                state.execution_log.append({
-                    "attempt": state.current_attempt,
-                    "action": "agent_error",
-                    "result": err_msg[:500],
-                    "timestamp": self._now(),
-                })
-                self._save(state)
-                stop = self._should_stop(state, "agent_error")
-                if stop:
-                    self._print(stop)
-                    break
-                feedback = self._build_error_feedback(err_msg)
-                self._print("Will retry on next iteration.")
-                continue
+            before_snapshot = self.orch._worktree_change_snapshot()
+            if state.workflow_id:
+                durable_restore = (
+                    self.project_root
+                    / ".auto-agents"
+                    / "state"
+                    / "workflows"
+                    / state.workflow_id
+                    / "checkpoints"
+                    / f"collab-{state.session_id}-{state.current_attempt}"
+                )
+                restore_context = contextlib.nullcontext(str(durable_restore))
+            else:
+                durable_restore = None
+                restore_context = tempfile.TemporaryDirectory(
+                    prefix="auto-agents-collab-readonly-"
+                )
+            with restore_context as restore_tmp:
+                restore_root = Path(restore_tmp)
+                self._capture_collab_restore_point(restore_root, before_snapshot)
+                try:
+                    reply = self._call_agent(
+                        state, f"collab-{state.current_attempt}", prompt
+                    )
+                except RuntimeError as exc:
+                    self._restore_collab_mutations(
+                        state,
+                        before_snapshot,
+                        restore_root,
+                    )
+                    if durable_restore is not None:
+                        shutil.rmtree(durable_restore, ignore_errors=True)
+                    err_msg = str(exc)
+                    state.consecutive_agent_errors += 1
+                    state.execution_log.append({
+                        "attempt": state.current_attempt,
+                        "action": "agent_error",
+                        "result": err_msg[:500],
+                        "timestamp": self._now(),
+                    })
+                    self._save(state)
+                    stop = self._should_stop(state, "agent_error")
+                    if stop:
+                        self._print(stop)
+                        break
+                    feedback = self._build_error_feedback(err_msg)
+                    self._print("Will retry on next iteration.")
+                    continue
+                offending = self._restore_collab_mutations(
+                    state,
+                    before_snapshot,
+                    restore_root,
+                )
+                if offending:
+                    reason = (
+                        "Collab is diagnostic-only and restored product mutations from "
+                        "the agent attempt. Changed paths: " + ", ".join(offending[:10])
+                    )
+                    state.execution_log.append(
+                        {
+                            "attempt": state.current_attempt,
+                            "action": "collab_mutation_restored",
+                            "result": reason[:500],
+                            "timestamp": self._now(),
+                        }
+                    )
+                    self._save(state)
+                    if durable_restore is not None:
+                        shutil.rmtree(durable_restore, ignore_errors=True)
+                    feedback = reason + ". Diagnose and emit ROUTE_WORKFLOW v1 instead of editing."
+                    continue
+                if durable_restore is not None:
+                    shutil.rmtree(durable_restore, ignore_errors=True)
 
             # Successful agent call resets transient error counter
             state.consecutive_agent_errors = 0
@@ -719,27 +1188,36 @@ class Session:
             })
             self._save(state)
 
-            marker_error = self._apply_session_persistence_marker(state, reply)
-            if marker_error:
-                feedback = marker_error
-                self._print(marker_error)
+            route, route_error = self._parse_protocol_json(
+                _ROUTE_WORKFLOW,
+                reply,
+                label="ROUTE_WORKFLOW v1",
+            )
+            if route_error:
+                feedback = route_error
                 continue
-            persistence_issue = self._session_persistence_issue(state)
-            if persistence_issue:
-                self._print(persistence_issue)
-                state.status = "waiting_user"
-                self._save(state)
-                user_reply = self._prompt_user(
-                    "Choose startup_compatible, clean_break, or external_operator and identify the registered target(s): ",
-                    multiline=True,
+            if route is not None:
+                target = str(route.get("target", "")).strip()
+                if target not in {"fix", "run", "resume"}:
+                    feedback = "ROUTE_WORKFLOW v1 target must be fix, run, or resume."
+                    continue
+                if target == "resume":
+                    payload = {
+                        "resume_handoff_id": str(route.get("resume_handoff_id", ""))
+                    }
+                elif target == "fix":
+                    issue_seed = dict(route.get("issue_seed", {}))
+                    issue_seed.setdefault("summary", str(route.get("summary", "")))
+                    issue_seed.setdefault("reason", str(route.get("reason", "")))
+                    payload = {"issue_seed": issue_seed}
+                else:
+                    payload = {"spec_seed": dict(route.get("spec_seed", {}))}
+                return self._prepare_workflow_handoff(
+                    state,
+                    target=target,
+                    reason=str(route.get("reason") or route.get("summary") or target),
+                    payload=payload,
                 )
-                state.conversation.append(
-                    {"role": "user", "content": user_reply.strip() or persistence_issue}
-                )
-                state.status = "executing"
-                self._save(state)
-                feedback = persistence_issue
-                continue
 
             # Check for NEED_USER_ASSIST — counts as progress
             assist_match = _NEED_USER_ASSIST.search(reply)
@@ -803,78 +1281,40 @@ class Session:
                 feedback = ""
                 continue
 
-            # Check for BUG_FOUND – agent found & fixed a bug inline — counts as progress
+            # Legacy marker: route the diagnosed defect through fix; collab never
+            # owns or commits the product change itself.
             bug_match = _BUG_FOUND.search(reply)
             if bug_match:
                 self._print(f"\nAgent found a bug: {bug_match.group(1)}")
-                self._print(f"\nAgent:\n{reply.strip()}")
+                return self._prepare_workflow_handoff(
+                    state,
+                    target="fix",
+                    reason=bug_match.group(1).strip(),
+                    payload={
+                        "issue_seed": {
+                            "summary": bug_match.group(1).strip(),
+                            "reported_goal": state.goal,
+                            "reason": "Legacy BUG_FOUND marker routed through fix.",
+                        }
+                    },
+                )
 
-                # Try to verify after the fix
-                verify = self._run_verify(scope="progress")
-                self._append_verification_log(state, "bug_fix_verify", verify)
-                self._save(state)
-
-                if verify["ok"]:
-                    state.stall_count = 0
-                    committed = self._commit_verified_progress(state, "collab", reply=reply)
-                    if committed:
-                        self._print("Bug fix verified and committed.")
-                    else:
-                        self._print("Bug fix verified.")
-                else:
-                    verify_reason = str(verify["reason"])
-                    self._print(f"Bug fix verification failed: {verify_reason}")
-                    feedback, stop = self._collab_verify_failure(state, verify_reason)
-                    if stop:
-                        self._print(stop)
-                        break
-                continue
-
-            # General agent output (no special marker)
+            # General diagnostic output (no special marker). It is not treated
+            # as implementation progress and never commits project files.
             self._print(f"\nAgent:\n{reply.strip()}")
-            # Run verify to check progress
-            verify = self._run_verify(scope="progress")
-            self._append_verification_log(state, "progress_verify", verify)
+            diff_hash = self._compute_diff_hash()
+            verify_sig = self._compute_verify_sig(reply)
+            self._update_stall_state(state, diff_hash, verify_sig)
             self._save(state)
-            if verify["ok"]:
-                state.stall_count = 0
-                self._print("Progress verification passed after agent's changes!")
-                answer = self._prompt_user("Goal achieved? (y/n) [y]: ", default="y")
-                if answer.strip().lower() not in ("n", "no"):
-                    final_verify = self._run_verify(scope="final")
-                    self._append_verification_log(state, "final_verify", final_verify)
-                    self._save(state)
-                    if not final_verify["ok"]:
-                        final_reason = str(final_verify["reason"])
-                        self._print(f"Final verification failed: {final_reason}")
-                        self._print("Continuing the loop to fix final verification issues.")
-                        feedback, stop = self._collab_verify_failure(state, final_reason)
-                        if stop:
-                            self._print(stop)
-                            break
-                        continue
-                    self._print("Final verification passed!")
-                    self._run_session_persistence_action(state)
-                    state.status = "completed"
-                    self._git_commit(state, "collab", reply=reply)
-                    self._record_release_attestation(state, final_verify)
-                    self._release_baseline(state)
-                    self._print(f"Collaborative session {state.session_id} completed successfully.")
-                    return state
-                committed = self._commit_verified_progress(state, "collab", reply=reply)
-                if committed:
-                    self._print("Verified progress committed before continuing.")
-                user_feedback = self._prompt_user("What still needs to be done? ", multiline=True)
-                state.conversation.append({"role": "user", "content": user_feedback.strip() or "Not yet done."})
-                self._save(state)
-                self._print_agent_thinking()
-                feedback = ""
-            else:
-                verify_reason = str(verify["reason"])
-                feedback, stop = self._collab_verify_failure(state, verify_reason)
-                if stop:
-                    self._print(stop)
-                    break
+            stop = self._should_stop(state, "collab produced no actionable marker")
+            if stop:
+                self._print(stop)
+                break
+            feedback = (
+                "Continue diagnosis. When the next action is clear, emit exactly one "
+                "ROUTE_WORKFLOW v1 marker; use GOAL_ACHIEVED only after the user's "
+                "overall goal is actually satisfied."
+            )
 
         state.status = "failed"
         self._save(state)
@@ -1333,23 +1773,17 @@ class Session:
             "",
             f"Analyze the codebase and the {label} description.",
             "- If you need more information, ask specific questions.",
-            "- If the problem is clear enough to proceed, output 'GOAL_CLEAR' on a line by itself at the end.",
         ])
         if self.mode == "fix":
             lines.extend([
-                "- If after analyzing the codebase you determine this is NOT actually a bug "
-                "(e.g., the behavior is by design, a configuration issue, or a user "
-                "misunderstanding), explain your reasoning clearly and output "
-                "'NOT_A_BUG: <one-line explanation>' on a line by itself.",
-                "- When you output GOAL_CLEAR, also output on a separate line "
-                "'FIX_VERIFY: <shell command>' — a single shell command that will "
-                "return exit code 0 if the bug is fixed and non-zero if the bug still "
-                "exists. This should target the specific bug described, not the whole test suite. "
-                "Examples: a pytest invocation with -k filter, a curl command, a grep check, etc.",
-                "- Match the repository's existing verification conventions when choosing FIX_VERIFY.",
-                "- Before GOAL_CLEAR, determine whether the fix affects persistent schema, data, required seed data, or a serialized contract. Output one single-line PERSISTENCE_CHANGE v2 JSON object. Use {'storage_transition':'none','compatibility_policy':'not_applicable'} when it will not. Otherwise copy an explicit user-approved decision and include decision_id, target_ids, to_version, migration_artifacts, contract_artifacts, and legacy_fixture_refs.",
+                "- Before modifying files, classify the work and output exactly one single-line FIX_DISPOSITION v1 JSON object.",
+                "- decision='fix' only for a bounded defect against existing behavior; include summary, reason, reproduction, expected, actual, evidence_refs, affected_contracts, verification_command, and persistence_change.",
+                "- decision='run_iteration' when resolution needs new public capability, changed requirements, architecture expansion, or a persistence-model change; include reason and spec_seed with title, goal, gap, capability, acceptance, non_goals, evidence, and open_decisions.",
+                "- decision='not_bug' for expected/configuration/user-misunderstanding cases, decision='need_user' with question when evidence is insufficient, or decision='resume_child' with resume_handoff_id for a prior routed child.",
+                "- FIX_DISPOSITION v1 must be valid JSON on one line and must be the only disposition marker.",
+                "- Match repository verification conventions when choosing verification_command.",
                 "- If the project uses a local conda env at ./.conda, every Python-oriented "
-                "FIX_VERIFY command must run inside it via 'conda run -p ./.conda ...'.",
+                "verification_command must run inside it via 'conda run -p ./.conda ...'.",
             ])
             gate_commands = self._gate_commands()
             if gate_commands:
@@ -1357,9 +1791,13 @@ class Session:
                     "- Current repository gate commands (reuse them as guidance for FIX_VERIFY when relevant):"
                 )
                 lines.extend(f"  - {command}" for command in gate_commands)
+        else:
+            lines.append(
+                "- If the goal is clear enough to proceed, output 'GOAL_CLEAR' on a line by itself at the end."
+            )
         lines.extend([
             "- Always explain your understanding before asking questions or declaring ready.",
-            "- Never infer permission to discard or migrate persistent data. If a schema strategy is missing, ask the user before declaring GOAL_CLEAR.",
+            "- Never infer permission to discard or migrate persistent data. Ask the user when an explicit decision is missing.",
             self.orch._document_language_instruction(),
         ])
         return "\n".join(lines)
@@ -1472,6 +1910,7 @@ class Session:
             ])
         lines.extend([
             "Fix this bug:",
+            "0. Re-check the scope before editing. If the correct resolution requires new public capability, changed requirements, architecture expansion, or a persistence-model change, do not edit files; output one single-line FIX_DISPOSITION v1 JSON object with decision='run_iteration', reason, and spec_seed.",
             "1. Identify the root cause",
             "2. Apply the minimal fix",
             "3. Update or add tests to cover the fix",
@@ -1610,15 +2049,17 @@ class Session:
 
         lines.extend([
             "",
-            "You are collaboratively debugging with the user. Your task:",
-            "1. Analyze the current state of the code and any previous execution results",
-            "2. Try to achieve the user's goal",
+            "You are the read-only diagnostic and routing frame for a collaborative workflow. Your task:",
+            "1. Analyze the current state of the code and previous execution results without editing product files",
+            "2. Determine the next workflow needed to achieve the user's overall goal",
             "3. If you need the user to do something (e.g., test in browser, provide input),",
             "   output 'NEED_USER_ASSIST: <what you need>' on a line by itself",
-            "4. If you discover a bug, output 'BUG_FOUND: <description>' and fix it",
-            "5. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",
-            "6. Provide a brief status update of what you did",
-            "7. Before any persistent change, output a single-line PERSISTENCE_CHANGE v2 JSON contract based on explicit user-approved storage_transition and compatibility_policy values. Use {'storage_transition':'none','compatibility_policy':'not_applicable'} when persistence is unaffected.",
+            "4. For an existing-behavior defect, output one single-line ROUTE_WORKFLOW v1 JSON marker with target='fix', reason, summary, and issue_seed",
+            "5. For missing/new capability or a requirements, architecture, or persistence change, output one single-line ROUTE_WORKFLOW v1 JSON marker with target='run', reason, summary, and spec_seed",
+            "6. To retry a previously returned child after its blocker changed, use target='resume' and resume_handoff_id",
+            "7. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",
+            "8. Provide a brief diagnostic status update",
+            "9. Never implement, fix, commit, or edit target-project code in collab; route every write to fix or run",
             "",
             "EXECUTION SAFETY RULES (critical — follow strictly):",
             "- Set a timeout for EVERY HTTP request or polling loop (max 60s per request, 5 min total for repeated polling).",
@@ -1628,18 +2069,13 @@ class Session:
             "- Prefer small incremental steps: start a service, verify it works, then proceed to the next step.",
             "- If you start background servers, verify they are healthy (e.g., curl health-check) before using them.",
             "- Report progress after each significant action so progress is visible.",
-            "- If an operation is taking too long or keeps failing, stop and output BUG_FOUND with the error details.",
+            "- If an operation is taking too long or keeps failing, stop and report bounded diagnostic evidence; do not edit code.",
             *provider_policy_prompt_lines("collab"),
             "",
             "If this is a Python project, use the project-local conda env at ./.conda and install packages only inside it.",
             "Do not modify .auto-agents state files.",
             "",
-            "IMPORTANT: If you made code changes in this turn, also output exactly one line in the form:",
-            "  COMMIT_MESSAGE: <one-sentence description of what you changed and why>",
-            "Rules for this line:",
-            "- Imperative mood, plain prose, same language as the user's goal.",
-            "- NO file paths, NO markdown links, NO code, NO shell commands, NO backticks, NO brackets.",
-            "- Keep it under 72 characters; it is used verbatim as the git commit subject.",
+            "ROUTE_WORKFLOW v1 must be valid JSON on one line and must be the only route marker in the response.",
         ])
         return "\n".join(lines)
 
@@ -1879,6 +2315,14 @@ class Session:
         current_head = head_ref(self.project_root)
         if state.baseline_git_ref and state.baseline_git_ref == current_head:
             return  # baseline is still valid
+        if (
+            state.baseline_git_ref
+            and state.lineage_changed_paths
+            and state.lineage_head_ref == current_head
+        ):
+            # A routed child advanced HEAD. Keep the parent's original failure
+            # baseline and attest the registered child path set against it.
+            return
         if state.baseline_git_ref and state.baseline_git_ref != current_head:
             self._print(
                 "Git HEAD changed since last baseline — re-capturing baseline snapshot."
@@ -2310,6 +2754,171 @@ class Session:
         )
         return feedback, self._should_stop(state, verify_reason)
 
+    def _capture_collab_restore_point(
+        self,
+        restore_root: Path,
+        before_snapshot: Dict[str, str],
+    ) -> None:
+        files_root = restore_root / "files"
+        for relative in before_snapshot:
+            source = self.project_root / relative
+            target = files_root / relative
+            if source.is_dir():
+                shutil.copytree(source, target, dirs_exist_ok=True)
+            elif source.exists() or source.is_symlink():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target, follow_symlinks=False)
+        index = subprocess.run(
+            ["git", "rev-parse", "--git-path", "index"],
+            cwd=self.project_root,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        )
+        if index.returncode == 0:
+            index_path = Path(index.stdout.strip())
+            if not index_path.is_absolute():
+                index_path = self.project_root / index_path
+            if index_path.is_file():
+                shutil.copy2(index_path, restore_root / ".git-index.snapshot")
+        write_json(
+            restore_root / "manifest.json",
+            {
+                "schema_version": 1,
+                "before_snapshot": dict(before_snapshot),
+                "head": head_ref(self.project_root),
+                "created_at": self._now(),
+            },
+        )
+
+    def _reconcile_interrupted_collab_checkpoints(
+        self,
+        state: SessionState,
+    ) -> None:
+        if not state.workflow_id:
+            return
+        checkpoint_root = (
+            self.project_root
+            / ".auto-agents"
+            / "state"
+            / "workflows"
+            / state.workflow_id
+            / "checkpoints"
+        )
+        if not checkpoint_root.is_dir():
+            return
+        for path in sorted(checkpoint_root.glob(f"collab-{state.session_id}-*")):
+            manifest = read_json(path / "manifest.json", default={})
+            before = (
+                {
+                    str(key): str(value)
+                    for key, value in manifest.get("before_snapshot", {}).items()
+                }
+                if isinstance(manifest, dict)
+                and isinstance(manifest.get("before_snapshot"), dict)
+                else {}
+            )
+            if not before and not (path / ".git-index.snapshot").exists():
+                raise RuntimeError(
+                    f"collab checkpoint is incomplete and cannot be reconciled: {path}"
+                )
+            restored = self._restore_collab_mutations(state, before, path)
+            state.execution_log.append(
+                {
+                    "attempt": state.current_attempt,
+                    "action": "collab_interruption_reconciled",
+                    "result": ", ".join(restored)[:500],
+                    "timestamp": self._now(),
+                }
+            )
+            self._save(state)
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _restore_collab_mutations(
+        self,
+        state: SessionState,
+        before_snapshot: Dict[str, str],
+        restore_root: Path,
+    ) -> List[str]:
+        after_snapshot = self.orch._worktree_change_snapshot()
+        delta = self.orch._snapshot_delta_paths(before_snapshot, after_snapshot)
+        session_prefix = f".auto-agents/state/sessions/{state.session_id}/"
+        checkpoint_prefix = (
+            f".auto-agents/state/workflows/{state.workflow_id}/checkpoints/"
+            if state.workflow_id
+            else ""
+        )
+        offending = [
+            path
+            for path in delta
+            if not path.startswith(session_prefix)
+            and not (checkpoint_prefix and path.startswith(checkpoint_prefix))
+            and path != ".auto-agents/.gitignore"
+        ]
+        if not offending:
+            return []
+        files_root = restore_root / "files"
+        for relative in offending:
+            target = self.project_root / relative
+            source = files_root / relative
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+            if relative in before_snapshot:
+                if source.is_dir():
+                    shutil.copytree(source, target, dirs_exist_ok=True)
+                elif source.exists() or source.is_symlink():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, target, follow_symlinks=False)
+                continue
+            tracked = subprocess.run(
+                ["git", "cat-file", "-e", f"HEAD:{relative}"],
+                cwd=self.project_root,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if tracked.returncode == 0:
+                restore = subprocess.run(
+                    [
+                        "git",
+                        "restore",
+                        "--source=HEAD",
+                        "--staged",
+                        "--worktree",
+                        "--",
+                        relative,
+                    ],
+                    cwd=self.project_root,
+                    text=True,
+                    encoding="utf-8",
+                    capture_output=True,
+                )
+                if restore.returncode != 0:
+                    raise RuntimeError(
+                        restore.stderr.strip()
+                        or f"could not restore collab mutation: {relative}"
+                    )
+        saved_index = restore_root / ".git-index.snapshot"
+        if saved_index.is_file():
+            self.orch._restore_index_paths_from_restore_point(
+                offending,
+                restore_root,
+            )
+        restored = self.orch._worktree_change_snapshot()
+        unrestored = [
+            path
+            for path in offending
+            if before_snapshot.get(path) != restored.get(path)
+        ]
+        if unrestored:
+            raise RuntimeError(
+                "collab read-only rollback could not restore: "
+                + ", ".join(unrestored[:10])
+            )
+        return offending
+
     def _should_stop(self, state: SessionState, reason: str) -> Optional[str]:
         """Return a stop-reason string if the session should stop, else None."""
         if state.stall_count >= SESSION_STALL_THRESHOLD:
@@ -2530,9 +3139,51 @@ class Session:
             "timestamp": self._now(),
         })
         self._save(state)
+        operation_id = f"session-{state.session_id}-{state.current_attempt}"
+        workflow_snapshot = None
+        if state.workflow_id and self._coordinator is not None:
+            workflow_snapshot = self._coordinator.store.load(state.workflow_id)
+            self._coordinator.store.append_event(
+                workflow_snapshot,
+                "operation_intent",
+                operation_id=operation_id,
+                details={"kind": "session_commit", "message": message},
+            )
         try:
-            commit_all(self.project_root, message)
-            return True
+            protected = {
+                str(path) for path in state.protected_preexisting_paths if str(path).strip()
+            }
+            owned_product = [
+                path for path in changed_paths(self.project_root) if path not in protected
+            ]
+            owned_state = [
+                f".auto-agents/state/sessions/{state.session_id}",
+                ".auto-agents/state/handoffs",
+                f".auto-agents/state/workflows/{state.workflow_id}",
+                ".auto-agents/state/workflows/active.json",
+                ".auto-agents/.gitignore",
+            ]
+            commit_sha = commit_only_paths(
+                self.project_root,
+                message,
+                [*owned_product, *owned_state],
+                trailers=(
+                    [
+                        f"Auto-Agents-Operation: session-{state.session_id}-{state.current_attempt}",
+                        f"Auto-Agents-Workflow: {state.workflow_id}",
+                    ]
+                    if state.workflow_id
+                    else []
+                ),
+            )
+            if workflow_snapshot is not None:
+                self._coordinator.store.append_event(
+                    workflow_snapshot,
+                    "operation_completed",
+                    operation_id=operation_id,
+                    details={"kind": "session_commit", "commit_sha": commit_sha},
+                )
+            return bool(commit_sha)
         except RuntimeError as exc:
             self._print(f"Git commit failed: {exc}")
             state.execution_log.append({
