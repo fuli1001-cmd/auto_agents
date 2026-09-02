@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -10,12 +13,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from auto_agents.cli import main
 from auto_agents.config import (
     bootstrap_project,
+    create_session,
     load_project_config,
     load_run_state,
+    load_session_state,
     save_project_config,
     save_run_state,
+    save_session_state,
 )
 from auto_agents.health_watch import (
     HealthSnapshot,
@@ -48,13 +55,27 @@ from auto_agents.health_control import (
     subject_health_root,
 )
 from auto_agents.repair_cases import RepairCase, RepairCaseStore
-from auto_agents.process_supervision import process_start_ticks
+from auto_agents.process_supervision import (
+    process_identity_matches,
+    process_start_ticks,
+)
 from auto_agents.repair_checkpoint import (
     create_repair_checkpoint,
     restore_repair_control_checkpoint,
 )
 from auto_agents.validation import validate_project_config_payload
 from auto_agents.self_repair import SelfRepairDecision, SelfRepairTriageResult
+from auto_agents.run_lock import (
+    RUN_LOCK_FD_ENV,
+    RUN_LOCK_KEY_ENV,
+    RUN_LOCK_TOKEN_ENV,
+    SELF_REPAIR_HANDOFF_ENV,
+    ProjectRunLock,
+)
+from auto_agents.session import Session
+from auto_agents.workflow_chain import WorkflowHandoff, WorkflowRef
+from auto_agents.workflow_health import WorkflowHealthRuntime
+from auto_agents.workflow_runtime import WorkflowCoordinator
 
 
 def _vector(*atoms: str) -> ProgressVector:
@@ -578,6 +599,501 @@ class HealthWatchTests(unittest.TestCase):
             self.assertEqual(manifest["sidecar_pid"], 424242)
             self.assertEqual(manifest["run_token"], "new-token")
             channel.close(reason="test complete")
+
+    def test_session_observer_progress_projection_matches_publisher_with_workflow_metadata(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = create_session(project, "collab")
+            state.goal = "continue a composed workflow"
+            state.workflow_id = "workflow-1"
+            state.active_handoff_id = "handoff-1"
+            state.return_phase = "after_child"
+            state.updated_at = "2026-09-01T00:00:00+00:00"
+            save_session_state(project, state)
+            runtime = WorkflowHealthRuntime(
+                project,
+                workflow_kind="collab",
+                run_token="token",
+                enabled=True,
+                auto_agents_entry=Path(__file__),
+            )
+
+            with patch(
+                "auto_agents.workflow_health.start_health_sidecar",
+                return_value=None,
+            ):
+                runtime.start(state.session_id)
+            try:
+                runtime.publish_session(state)
+                manifest = load_active_manifest(project)
+                auditor = IndependentHealthAuditor(project, manifest)
+
+                auditor.observe_once(manifest)
+                auditor.observe_once(manifest)
+
+                summary = json.loads(
+                    (auditor.root / "summary.json").read_text(encoding="utf-8")
+                )
+                snapshot = json.loads(
+                    (auditor.root / "auditor-snapshot.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    summary["progress_schema_version"],
+                    snapshot["progress_schema_version"],
+                )
+                self.assertEqual(summary["progress_schema_version"], 1)
+                self.assertEqual(summary["progress"], snapshot["progress"])
+                self.assertEqual(
+                    {
+                        key: snapshot["progress"][key]
+                        for key in (
+                            "workflow_id",
+                            "active_handoff_id",
+                            "return_phase",
+                        )
+                    },
+                    {
+                        "workflow_id": "workflow-1",
+                        "active_handoff_id": "handoff-1",
+                        "return_phase": "after_child",
+                    },
+                )
+                self.assertEqual(
+                    summary["progress_digest"], snapshot["progress_digest"]
+                )
+                self.assertEqual(summary["run_token"], snapshot["run_token"])
+                self.assertEqual(summary["state_digest"], snapshot["state_digest"])
+                self.assertIsNone(auditor.actions.next_pending(run_token="token"))
+
+                summary["progress"]["status"] = "tampered"
+                summary["progress_digest"] = evidence_digest(summary["progress"])
+                (auditor.root / "summary.json").write_text(
+                    json.dumps(summary), encoding="utf-8"
+                )
+
+                auditor.observe_once(manifest)
+
+                request = auditor.actions.next_pending(run_token="token")
+                self.assertIsNotNone(request)
+                self.assertEqual(request["reason"], "health_observer_disagreement")
+                self.assertEqual(
+                    request["evidence_digest"], evidence_digest(request["evidence"])
+                )
+                self.assertNotEqual(
+                    request["evidence"]["main_progress_digest"],
+                    request["evidence"]["independent_progress_digest"],
+                )
+            finally:
+                runtime.close(reason="test complete")
+
+    def test_resumed_handoff_compares_only_compatible_session_boundaries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = create_session(project, "collab")
+            state.goal = "continue after a returned child"
+            state.workflow_id = "workflow-1"
+            state.active_handoff_id = "handoff-1"
+            state.return_phase = "waiting_child"
+            state.status = "waiting_child"
+            state.updated_at = "2026-09-01T00:00:00+00:00"
+            save_session_state(project, state)
+            runtime = WorkflowHealthRuntime(
+                project,
+                workflow_kind="collab",
+                run_token="current-token",
+                enabled=True,
+                auto_agents_entry=Path(__file__),
+                fresh_health_boundary=True,
+            )
+            coordinator = WorkflowCoordinator(
+                type("OrchestratorStub", (), {"project_root": project})(),
+                health_runtime=runtime,
+            )
+            handoff = WorkflowHandoff(
+                handoff_id=state.active_handoff_id,
+                workflow_id=state.workflow_id,
+                parent=WorkflowRef("collab", state.session_id),
+                target="fix",
+                goal="repair the child issue",
+                reason="child repair required",
+                status="returned",
+                result={"status": "completed", "resolution": "child repaired"},
+            )
+
+            with patch(
+                "auto_agents.workflow_health.start_health_sidecar",
+                return_value=None,
+            ):
+                runtime.start(state.session_id)
+                runtime.publish_session(state)
+            try:
+                manifest = load_active_manifest(project)
+                auditor = IndependentHealthAuditor(project, manifest)
+                summary_path = auditor.root / "summary.json"
+                baseline = json.loads(summary_path.read_text(encoding="utf-8"))
+
+                # _apply_child_result persists canonical progress changes without
+                # refreshing updated_at or publishing session telemetry. A poll in
+                # that window must recognize a different raw durable-state boundary.
+                coordinator._apply_child_result(state, handoff)
+                returned = load_session_state(project, state.session_id)
+                returned_raw = returned.to_dict()
+                returned_state_digest = evidence_digest(returned_raw)
+                self.assertEqual(returned.updated_at, baseline["state_updated_at"])
+                self.assertNotEqual(
+                    returned_state_digest,
+                    str(baseline.get("state_digest", "")),
+                )
+
+                auditor.observe_once(manifest)
+                self.assertIsNone(
+                    auditor.actions.next_pending(run_token="current-token")
+                )
+                self.assertTrue(str(baseline.get("state_digest", "")))
+
+                # Republish the returned state, then make the publisher projection
+                # disagree while varying each compatibility key independently.
+                runtime.publish_session(returned)
+                compatible = json.loads(summary_path.read_text(encoding="utf-8"))
+                tampered_progress = dict(compatible["progress"])
+                tampered_progress["return_phase"] = "tampered"
+                tampered_digest = evidence_digest(tampered_progress)
+
+                incompatible = dict(compatible)
+                incompatible.update(
+                    run_token="previous-token",
+                    progress=tampered_progress,
+                    progress_digest=tampered_digest,
+                )
+                summary_path.write_text(json.dumps(incompatible), encoding="utf-8")
+                auditor.observe_once(manifest)
+                self.assertIsNone(
+                    auditor.actions.next_pending(run_token="current-token")
+                )
+
+                incompatible = dict(compatible)
+                incompatible.update(
+                    progress_schema_version=(
+                        int(compatible["progress_schema_version"]) + 1
+                    ),
+                    progress=tampered_progress,
+                    progress_digest=tampered_digest,
+                )
+                summary_path.write_text(json.dumps(incompatible), encoding="utf-8")
+                auditor.observe_once(manifest)
+                self.assertIsNone(
+                    auditor.actions.next_pending(run_token="current-token")
+                )
+
+                compatible.update(
+                    progress=tampered_progress,
+                    progress_digest=tampered_digest,
+                )
+                summary_path.write_text(json.dumps(compatible), encoding="utf-8")
+                auditor.observe_once(manifest)
+
+                request = auditor.actions.next_pending(run_token="current-token")
+                self.assertIsNotNone(request)
+                self.assertEqual(request["reason"], "health_observer_disagreement")
+                self.assertEqual(
+                    request["evidence_digest"], evidence_digest(request["evidence"])
+                )
+                self.assertEqual(
+                    request["evidence"]["run_token"], "current-token"
+                )
+                self.assertEqual(
+                    request["evidence"]["progress_schema_version"],
+                    compatible["progress_schema_version"],
+                )
+                self.assertEqual(
+                    request["evidence"]["state_digest"], returned_state_digest
+                )
+                self.assertEqual(
+                    compatible["state_digest"], returned_state_digest
+                )
+            finally:
+                runtime.close(reason="test complete")
+
+    def test_fresh_health_generation_never_relaunches_dead_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = create_session(project, "collab")
+            state.goal = "resume across a repaired health boundary"
+            save_session_state(project, state)
+            launched_tokens: list[str] = []
+            replacement = type("Replacement", (), {"pid": os.getpid()})()
+
+            def record_launch(**kwargs):
+                launched_tokens.append(str(kwargs["run_token"]))
+                return replacement
+
+            with patch(
+                "auto_agents.workflow_health.start_health_sidecar",
+                side_effect=record_launch,
+            ):
+                first = WorkflowHealthRuntime(
+                    project,
+                    workflow_kind="collab",
+                    run_token="health-generation-1",
+                    enabled=True,
+                    auto_agents_entry=Path(__file__),
+                    fresh_health_boundary=True,
+                )
+                first.start(state.session_id)
+                try:
+                    self.assertEqual(launched_tokens, [])
+                    first.publish_session(state)
+                    self.assertEqual(launched_tokens, ["health-generation-1"])
+
+                    # Model an observer that exited after its one permitted launch.
+                    first.channel.set_sidecar(2_147_483_647, 1)
+                    manifest = load_active_manifest(project)
+                    self.assertFalse(
+                        process_identity_matches(
+                            int(manifest["sidecar_pid"]),
+                            int(manifest["sidecar_start_ticks"]),
+                        )
+                    )
+                    first.publish_session(state)
+                    self.assertEqual(launched_tokens, ["health-generation-1"])
+                finally:
+                    first.close(reason="generation replaced")
+
+                second = WorkflowHealthRuntime(
+                    project,
+                    workflow_kind="collab",
+                    run_token="health-generation-2",
+                    enabled=True,
+                    auto_agents_entry=Path(__file__),
+                    fresh_health_boundary=True,
+                )
+                second.start(state.session_id)
+                try:
+                    second.publish_session(state)
+                    second.channel.set_sidecar(2_147_483_647, 1)
+                    second.publish_session(state)
+                    self.assertEqual(
+                        launched_tokens,
+                        ["health-generation-1", "health-generation-2"],
+                    )
+                finally:
+                    second.close(reason="test complete")
+
+    def test_inherited_self_repair_rebases_legacy_session_health_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = create_session(project, "collab")
+            state.goal = "resume after repairing the health observer"
+            state.workflow_id = ""
+            state.active_handoff_id = ""
+            state.return_phase = "after_child"
+            state.status = "failed"
+            state.updated_at = "2026-09-01T00:00:00+00:00"
+            save_session_state(project, state)
+            legacy_sidecar = None
+
+            with ProjectRunLock(project, environ={}) as parent_lock:
+                legacy_sidecar = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import json, pathlib, sys, time\n"
+                            "path = pathlib.Path(sys.argv[1])\n"
+                            "token = sys.argv[2]\n"
+                            "while True:\n"
+                            "    try:\n"
+                            "        payload = json.loads(path.read_text())\n"
+                            "    except (FileNotFoundError, json.JSONDecodeError):\n"
+                            "        time.sleep(0.02)\n"
+                            "        continue\n"
+                            "    if str(payload.get('run_token', '')) != token:\n"
+                            "        break\n"
+                            "    time.sleep(0.02)\n"
+                        ),
+                        str(control_path(project)),
+                        parent_lock.run_token,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                control_path(project).parent.mkdir(parents=True, exist_ok=True)
+                control_path(project).write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "project": str(project.resolve()),
+                            "workflow_kind": "collab",
+                            "subject_id": state.session_id,
+                            "run_token": parent_lock.run_token,
+                            "owner_pid": os.getpid(),
+                            "owner_start_ticks": process_start_ticks(os.getpid()),
+                            "process_phase": "triage",
+                            "desired_state": "enabled",
+                            "applied_state": "enabled",
+                            "generation": 1,
+                            "applied_generation": 1,
+                            "sidecar_pid": legacy_sidecar.pid,
+                            "sidecar_start_ticks": process_start_ticks(
+                                legacy_sidecar.pid
+                            ),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                actions = HealthActionStore(project, "collab", state.session_id)
+                actions.append(
+                    HealthActionRecord(
+                        request_id="pre-boundary",
+                        action="diagnose",
+                        reason="health_anomaly:goal_stalled",
+                        source="health_sidecar",
+                        run_token=parent_lock.run_token,
+                        subject_id=state.session_id,
+                        observation_sequence=2,
+                        evidence_digest=evidence_digest({"legacy": True}),
+                        evidence={"legacy": True},
+                    )
+                )
+
+                inherited_fd = os.dup(parent_lock.fileno)
+                resume_env = {
+                    RUN_LOCK_FD_ENV: str(inherited_fd),
+                    RUN_LOCK_KEY_ENV: parent_lock.key,
+                    RUN_LOCK_TOKEN_ENV: parent_lock.run_token,
+                    SELF_REPAIR_HANDOFF_ENV: "repair-fingerprint",
+                }
+                observed: dict[str, object] = {}
+
+                def cross_first_collab_boundary(
+                    session: Session, resumed_state
+                ):
+                    self.assertEqual(resumed_state.session_id, state.session_id)
+                    runtime = session._health_runtime
+                    self.assertIsNotNone(runtime)
+                    self.assertTrue(runtime.fresh_health_boundary)
+                    self.assertNotEqual(runtime.run_token, parent_lock.run_token)
+                    observed["health_token"] = runtime.run_token
+
+                    self.assertEqual(legacy_sidecar.wait(timeout=3), 0)
+                    manifest = load_active_manifest(project)
+                    self.assertEqual(manifest["run_token"], runtime.run_token)
+                    self.assertEqual(
+                        manifest["health_generation"], runtime.run_token
+                    )
+
+                    stored = json.loads(actions.path.read_text(encoding="utf-8"))
+                    pre_boundary = next(
+                        item
+                        for item in stored["requests"]
+                        if item["request_id"] == "pre-boundary"
+                    )
+                    self.assertEqual(pre_boundary["state"], "superseded")
+
+                    auditor = IndependentHealthAuditor(project, manifest)
+                    auditor.observe_once(manifest)
+                    auditor.observe_once(manifest)
+                    self.assertEqual(resumed_state.current_attempt, 0)
+                    self.assertTrue(resumed_state.workflow_id)
+                    self.assertIsNone(runtime.pending_session_action())
+                    session._check_health_action()
+
+                    summary = json.loads(
+                        (auditor.root / "summary.json").read_text(encoding="utf-8")
+                    )
+                    summary["progress"]["return_phase"] = "tampered"
+                    summary["progress_digest"] = evidence_digest(
+                        summary["progress"]
+                    )
+                    (auditor.root / "summary.json").write_text(
+                        json.dumps(summary), encoding="utf-8"
+                    )
+                    auditor.observe_once(manifest)
+
+                    with self.assertRaisesRegex(
+                        RuntimeError, "health_observer_disagreement"
+                    ):
+                        session._check_health_action()
+                    resumed_state.status = "completed"
+                    resumed_state.resolution = "health_boundary_crossed"
+                    return resumed_state
+
+                replacement = type("Replacement", (), {"pid": os.getpid()})()
+                try:
+                    with (
+                        patch.dict(os.environ, resume_env, clear=False),
+                        patch.object(
+                            Orchestrator,
+                            "_ensure_agent_instructions_synced",
+                            return_value=None,
+                        ),
+                        patch.object(
+                            Session,
+                            "_phase_collab_loop",
+                            cross_first_collab_boundary,
+                        ),
+                        patch(
+                            "auto_agents.workflow_runtime.commit_only_paths",
+                            return_value="",
+                        ),
+                        patch(
+                            "auto_agents.workflow_runtime.amend_only_paths",
+                            return_value="",
+                        ),
+                        patch(
+                            "auto_agents.workflow_health.start_health_sidecar",
+                            return_value=replacement,
+                        ) as start_replacement,
+                        patch("auto_agents.cli._safe_notify"),
+                        contextlib.redirect_stdout(io.StringIO()),
+                        contextlib.redirect_stderr(io.StringIO()),
+                    ):
+                        exit_code = main(
+                            [
+                                "collab",
+                                "--project",
+                                str(project),
+                                "--session",
+                                state.session_id,
+                            ]
+                        )
+
+                    self.assertEqual(exit_code, 0)
+                    self.assertNotEqual(
+                        observed["health_token"], parent_lock.run_token
+                    )
+                    start_replacement.assert_called_once()
+                    stored = json.loads(actions.path.read_text(encoding="utf-8"))
+                    disagreement = next(
+                        item
+                        for item in stored["requests"]
+                        if item["reason"] == "health_observer_disagreement"
+                    )
+                    self.assertEqual(disagreement["state"], "completed")
+                    self.assertEqual(
+                        disagreement["run_token"], observed["health_token"]
+                    )
+                finally:
+                    try:
+                        os.close(inherited_fd)
+                    except OSError:
+                        pass
+                    if legacy_sidecar.poll() is None:
+                        legacy_sidecar.terminate()
+                        legacy_sidecar.wait(timeout=3)
 
     def test_repair_checkpoint_preserves_binary_untracked_and_deleted_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -2812,7 +2812,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             spec_file = _apply_saved_run_context(args, project_root)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
-            orchestrator._run_token = run_lock.run_token
+            orchestrator._run_token = run_lock.health_lease_token
             from .workflow_chain import WorkflowRef, WorkflowStore
 
             workflow_store = WorkflowStore(project_root)
@@ -2852,10 +2852,11 @@ def main(argv: list[str] | None = None) -> int:
                 health_runtime = WorkflowHealthRuntime(
                     project_root,
                     workflow_kind="run",
-                    run_token=run_lock.run_token,
+                    run_token=run_lock.health_lease_token,
                     enabled=bool(health_config.enabled),
                     auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
                     orchestrator=orchestrator,
+                    fresh_health_boundary=run_lock.health_boundary_rebased,
                 )
                 orchestrator._workflow_health_runtime = health_runtime
                 health_runtime.start(
@@ -3314,7 +3315,7 @@ def main(argv: list[str] | None = None) -> int:
             foreground.acquire()
             workflow_lock.acquire()
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
-            orchestrator._run_token = workflow_lock.run_token
+            orchestrator._run_token = workflow_lock.health_lease_token
             store = WorkflowStore(project_root)
             selected = (
                 store.load(str(args.workflow))
@@ -3328,10 +3329,11 @@ def main(argv: list[str] | None = None) -> int:
                 health_runtime = WorkflowHealthRuntime(
                     project_root,
                     workflow_kind=selected.root.kind,
-                    run_token=workflow_lock.run_token,
+                    run_token=workflow_lock.health_lease_token,
                     enabled=bool(health_config.enabled),
                     auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
                     orchestrator=orchestrator,
+                    fresh_health_boundary=workflow_lock.health_boundary_rebased,
                 )
                 health_runtime.start(selected.workflow_id)
             coordinator = WorkflowCoordinator(
@@ -3483,7 +3485,7 @@ def main(argv: list[str] | None = None) -> int:
 
             project_root = Path(args.project)
             orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
-            orchestrator._run_token = workflow_lock.run_token
+            orchestrator._run_token = workflow_lock.health_lease_token
             health_config = getattr(
                 getattr(getattr(orchestrator, "config", None), "execution", None),
                 "health_watch",
@@ -3497,10 +3499,11 @@ def main(argv: list[str] | None = None) -> int:
                     workflow_kind=(
                         args.command if args.command in {"fix", "collab"} else "fix"
                     ),
-                    run_token=workflow_lock.run_token,
+                    run_token=workflow_lock.health_lease_token,
                     enabled=bool(health_config.enabled),
                     auto_agents_entry=auto_agents_repo_root() / "auto_agents.py",
                     orchestrator=orchestrator,
+                    fresh_health_boundary=workflow_lock.health_boundary_rebased,
                 )
                 orchestrator._workflow_health_runtime = health_runtime
                 health_runtime.start()
@@ -3574,21 +3577,20 @@ def main(argv: list[str] | None = None) -> int:
             )
             if triage is not None and triage.decision.eligible:
                 foreground.release()
-                workflow_lock.release()
-                repair_lock = ProjectRunLock(project_root)
-                try:
-                    repair_lock.acquire()
-                    return _auto_repair_auto_agents_and_resume(
-                        project_root,
-                        orchestrator,
-                        error,
-                        triage.decision,
-                        args,
-                        repair_lock,
-                        diagnosis=triage.root_cause,
-                    )
-                finally:
-                    repair_lock.release()
+                # A self-repair runtime may itself have inherited this descriptor
+                # from its waiting parent. Closing our copy does not release the
+                # parent's flock, so reacquiring through a new descriptor deadlocks
+                # against the same logical run. Preserve and hand off the existing
+                # lock ownership instead.
+                return _auto_repair_auto_agents_and_resume(
+                    project_root,
+                    orchestrator,
+                    error,
+                    triage.decision,
+                    args,
+                    workflow_lock,
+                    diagnosis=triage.root_cause,
+                )
             _safe_notify(
                 notify_session_finished,
                 project_root,

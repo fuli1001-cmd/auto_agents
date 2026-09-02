@@ -4,9 +4,9 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional
 
-from .config import load_run_state
+from .config import load_run_state, load_session_state
 from .health_control import (
     HealthActionStore,
     HealthControlChannel,
@@ -18,6 +18,10 @@ from .health_control import (
 from .health_watchdog import start_health_sidecar
 from .io_utils import read_json
 from .process_supervision import process_start_ticks
+from .session_health import (
+    SESSION_PROGRESS_SCHEMA_VERSION,
+    build_session_progress,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -35,15 +39,20 @@ class WorkflowHealthRuntime:
         enabled: bool,
         auto_agents_entry: Path,
         orchestrator: object = None,
+        fresh_health_boundary: bool = False,
     ) -> None:
         self.project_root = project_root.expanduser().resolve()
         self.workflow_kind = workflow_kind
         self.run_token = str(run_token)
         self.auto_agents_entry = auto_agents_entry
         self.orchestrator = orchestrator
+        self.fresh_health_boundary = bool(fresh_health_boundary)
         self._subject_id = ""
         self._enabling = False
         self._available = True
+        self._published_subjects: set[str] = set()
+        self._rebased_subjects: set[str] = set()
+        self._sidecar_launch_attempted_generation: Optional[str] = None
         self.channel = HealthControlChannel(
             self.project_root,
             workflow_kind=workflow_kind,
@@ -60,8 +69,12 @@ class WorkflowHealthRuntime:
     def start(self, subject_id: str = "") -> None:
         self._subject_id = str(subject_id).strip()
         try:
+            self._rebase_subject_actions(self._subject_id)
             self.channel.start(self._subject_id)
-            if self.channel.enabled and self._subject_id:
+            baseline_ready = bool(
+                self.workflow_kind == "run" or not self.fresh_health_boundary
+            )
+            if self.channel.enabled and self._subject_id and baseline_ready:
                 self._enable({})
         except Exception as error:
             self._available = False
@@ -74,12 +87,38 @@ class WorkflowHealthRuntime:
         changed = normalized != self._subject_id
         self._subject_id = normalized
         try:
+            self._rebase_subject_actions(normalized)
             self.channel.bind_subject(normalized)
             self._publish_phase(self.channel.process_phase)
-            if changed and self.channel.enabled and not self._enabling:
+            baseline_ready = bool(
+                self.workflow_kind == "run"
+                or not self.fresh_health_boundary
+                or normalized in self._published_subjects
+            )
+            if (
+                changed
+                and baseline_ready
+                and self.channel.enabled
+                and not self._enabling
+            ):
                 self._enable({})
         except Exception as error:
             logger.warning("health subject/sidecar could not be bound: %s", error)
+
+    def _rebase_subject_actions(self, subject_id: str) -> None:
+        if (
+            not self.fresh_health_boundary
+            or not subject_id
+            or subject_id in self._rebased_subjects
+        ):
+            return
+        HealthActionStore(
+            self.project_root, self.workflow_kind, subject_id
+        ).supersede_obsolete(
+            run_token=self.run_token,
+            detail="superseded at the self-repair health boundary",
+        )
+        self._rebased_subjects.add(subject_id)
 
     def set_phase(self, phase: str) -> None:
         if not self._available:
@@ -89,6 +128,24 @@ class WorkflowHealthRuntime:
             self._publish_phase(phase)
         except Exception as error:
             logger.warning("health process phase could not be published: %s", error)
+
+    def set_active_operation(self, kind: str = "", label: str = "") -> None:
+        if not self._available:
+            return
+        try:
+            self.channel.set_active_operation(kind, label)
+        except Exception as error:
+            logger.warning("health active operation could not be published: %s", error)
+
+    def _session_progress_identity(self, payload: Mapping[str, object]) -> Dict[str, object]:
+        progress = build_session_progress(payload)
+        return {
+            "run_token": self.run_token,
+            "progress_schema_version": SESSION_PROGRESS_SCHEMA_VERSION,
+            "state_digest": evidence_digest(payload),
+            "progress_digest": evidence_digest(progress),
+            "progress": progress,
+        }
 
     def close(self, *, reason: str = "") -> None:
         try:
@@ -113,19 +170,8 @@ class WorkflowHealthRuntime:
         root = subject_health_root(
             self.project_root, self.workflow_kind, subject_id
         )
-        progress = {
-            "goal_set": bool(str(payload.get("goal", "")).strip()),
-            "conversation_entries": len(payload.get("conversation", []) or []),
-            "execution_entries": len(payload.get("execution_log", []) or []),
-            "attempt": int(payload.get("current_attempt", 0) or 0),
-            "resolution_set": bool(str(payload.get("resolution", "")).strip()),
-            "status": str(payload.get("status", "")),
-            "diff": str(payload.get("last_diff_hash", "")),
-            "verify": str(payload.get("last_verify_sig", "")),
-            "workflow_id": str(payload.get("workflow_id", "")),
-            "active_handoff_id": str(payload.get("active_handoff_id", "")),
-            "return_phase": str(payload.get("return_phase", "")),
-        }
+        identity = self._session_progress_identity(payload)
+        progress = dict(identity["progress"])
         try:
             _atomic_json(
                 root / "summary.json",
@@ -134,7 +180,9 @@ class WorkflowHealthRuntime:
                     "source": "in_process_telemetry",
                     "subject_id": subject_id,
                     "run_token": self.run_token,
-                    "progress_digest": evidence_digest(progress),
+                    "progress_schema_version": SESSION_PROGRESS_SCHEMA_VERSION,
+                    "progress_digest": identity["progress_digest"],
+                    "state_digest": identity["state_digest"],
                     "state_updated_at": str(payload.get("updated_at", "")),
                     "progress": progress,
                     "owner_pid": os.getpid(),
@@ -145,6 +193,24 @@ class WorkflowHealthRuntime:
             )
         except OSError as error:
             logger.warning("session health telemetry could not be published: %s", error)
+            return
+        self._published_subjects.add(subject_id)
+        HealthActionStore(
+            self.project_root, self.workflow_kind, subject_id
+        ).supersede_stale_progress(
+            run_token=self.run_token,
+            progress_identity=identity,
+        )
+        if (
+            self.fresh_health_boundary
+            and self.channel.enabled
+            and not self._enabling
+            and self._sidecar_launch_attempted_generation is None
+        ):
+            try:
+                self._enable({})
+            except Exception as error:
+                logger.warning("health sidecar could not start after rebase: %s", error)
 
     def pending_session_action(self) -> Optional[Dict[str, object]]:
         if not self._available or not self.channel.enabled or not self._subject_id:
@@ -152,7 +218,20 @@ class WorkflowHealthRuntime:
         store = HealthActionStore(
             self.project_root, self.workflow_kind, self._subject_id
         )
-        return store.next_pending(run_token=self.run_token)
+        if self.fresh_health_boundary:
+            store.supersede_obsolete(
+                run_token=self.run_token,
+                detail="superseded at the self-repair health boundary",
+            )
+        try:
+            state = load_session_state(self.project_root, self._subject_id)
+        except (OSError, RuntimeError, FileNotFoundError, ValueError):
+            return None
+        identity = self._session_progress_identity(state.to_dict())
+        return store.next_pending(
+            run_token=self.run_token,
+            progress_identity=identity,
+        )
 
     def _publish_phase(self, phase: str, *, reason: str = "") -> None:
         if not self._subject_id:
@@ -212,6 +291,18 @@ class WorkflowHealthRuntime:
                 except (FileNotFoundError, RuntimeError, ValueError):
                     pass
         if self._subject_id:
+            if self.fresh_health_boundary:
+                if (
+                    self.workflow_kind != "run"
+                    and self._subject_id not in self._published_subjects
+                ):
+                    return
+                if self._sidecar_launch_attempted_generation is not None:
+                    return
+                # A health generation owns at most one observer launch attempt.
+                # Record it before spawning so an exception or dead replacement
+                # cannot be hidden by a later publication starting another one.
+                self._sidecar_launch_attempted_generation = self.run_token
             process = start_health_sidecar(
                 project_root=self.project_root,
                 run_token=self.run_token,

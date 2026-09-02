@@ -29,6 +29,7 @@ from auto_agents.self_repair import (
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
     SelfRepairResult,
+    _FullSuiteShard,
     _VerificationResult,
     adjudicate_repair_case,
     self_repair_verification_command,
@@ -1756,7 +1757,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertIn("test_a.py cached=true", resumed.summary)
             self.assertIn("completed=2/2", resumed.summary)
 
-    def test_full_suite_collection_batches_nodes_and_fails_closed_for_parallelism(self):
+    def test_full_suite_collection_classifies_resources_per_node_batch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             auto_root = root / "auto"
@@ -1810,8 +1811,129 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(len(pure), 2)
             self.assertTrue(all(item.parallel_safe for item in pure))
             self.assertEqual(len(unsafe), 1)
-            self.assertFalse(unsafe[0].parallel_safe)
+            self.assertTrue(unsafe[0].parallel_safe)
+            self.assertTrue(unsafe[0].isolated)
+            self.assertEqual(unsafe[0].resource_locks, ())
             self.assertLess(unsafe[0].priority, pure[0].priority)
+
+    def test_full_suite_scheduler_serializes_only_conflicting_resources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_root = root / "target"
+            _init_repo(target_root)
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+            shards = [
+                _FullSuiteShard(
+                    "docker-a",
+                    "tests/test_a.py",
+                    ("tests/test_a.py",),
+                    parallel_safe=True,
+                    resource_locks=("service:docker",),
+                    priority=0,
+                ),
+                _FullSuiteShard(
+                    "docker-b",
+                    "tests/test_b.py",
+                    ("tests/test_b.py",),
+                    parallel_safe=True,
+                    resource_locks=("service:docker",),
+                    priority=0,
+                ),
+                _FullSuiteShard(
+                    "pure",
+                    "tests/test_c.py",
+                    ("tests/test_c.py",),
+                    parallel_safe=True,
+                    priority=0,
+                ),
+            ]
+            state_lock = threading.Lock()
+            active = {"docker": 0, "all": 0, "max": 0}
+            conflicts = []
+
+            def execute(_root, shard):
+                with state_lock:
+                    active["all"] += 1
+                    active["max"] = max(active["max"], active["all"])
+                    if "service:docker" in shard.resource_locks:
+                        active["docker"] += 1
+                        if active["docker"] > 1:
+                            conflicts.append(shard.shard_id)
+                time.sleep(0.05)
+                with state_lock:
+                    active["all"] -= 1
+                    if "service:docker" in shard.resource_locks:
+                        active["docker"] -= 1
+                return _VerificationResult(True, shard.shard_id)
+
+            with (
+                patch.object(runner, "_collect_full_suite_shards", return_value=shards),
+                patch.object(runner, "_execute_full_suite_shard", side_effect=execute),
+            ):
+                result = runner._run_full_suite_shards(root)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(conflicts, [])
+            self.assertGreater(active["max"], 1)
+
+    def test_full_suite_isolates_repository_mutating_shard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            runner = AutoAgentsSelfRepairRunner(
+                object(),
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+            runner.repo_root = auto_root
+            shard = _FullSuiteShard(
+                "git-mutating",
+                "tests/test_git.py",
+                ("tests/test_git.py",),
+                parallel_safe=True,
+                isolated=True,
+            )
+            observed = {}
+
+            def execute(verification_root, _shard):
+                observed["root"] = verification_root
+                self.assertNotEqual(verification_root, auto_root)
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=verification_root,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip(),
+                    subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=auto_root,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip(),
+                )
+                return _VerificationResult(True, "isolated")
+
+            with patch.object(
+                runner,
+                "_execute_full_suite_shard_command",
+                side_effect=execute,
+            ):
+                result = runner._execute_full_suite_shard(auto_root, shard)
+
+            self.assertTrue(result.ok)
+            self.assertFalse(observed["root"].exists())
 
     def test_full_suite_shard_plan_is_stable_for_same_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2102,6 +2224,25 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     runner,
                     "_full_suite_differential",
                     return_value=_VerificationResult(True, "full suite passed"),
+                ),
+                patch.object(
+                    runner,
+                    "_run_verification",
+                    return_value=_VerificationResult(True, "focused passed"),
+                ),
+                patch.object(
+                    runner,
+                    "_review_candidate",
+                    return_value=_VerificationResult(
+                        True,
+                        "semantic review approved",
+                        payload={"findings": [], "resolved_finding_ids": []},
+                    ),
+                ),
+                patch.object(
+                    runner,
+                    "_deterministic_proof_seal",
+                    return_value=_VerificationResult(True, "proof sealed"),
                 ),
             ):
                 result = runner._resume_pending_validation_candidate(
@@ -2465,35 +2606,12 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 def _call_with_failover(self, request):
                     if request.stage == "self_repair_candidate_review":
                         self.review_requests.append(request)
-                        if len(self.review_requests) == 1:
-                            payload = {
-                                "decision": "REJECT",
-                                "reason": (
-                                    "full-suite differential is intentionally pending"
-                                ),
-                                "findings": [
-                                    {
-                                        "finding_id": "candidate-regression-proof-inconclusive",
-                                        "severity": "hard",
-                                        "obligation_id": "validation:full_suite",
-                                        "reason": "full-suite proof is pending",
-                                        "counterexample": "focused checks cannot exclude regressions",
-                                        "required_test": "run the full-suite differential",
-                                        "evidence": ["pre-validation review"],
-                                        "defer_until": "post_full_suite",
-                                    }
-                                ],
-                                "resolved_finding_ids": [],
-                            }
-                        else:
-                            payload = {
-                                "decision": "APPROVE",
-                                "reason": "full-suite proof and candidate scope are sound",
-                                "findings": [],
-                                "resolved_finding_ids": [
-                                    "candidate-regression-proof-inconclusive"
-                                ],
-                            }
+                        payload = {
+                            "decision": "APPROVE",
+                            "reason": "candidate code and scope are sound",
+                            "findings": [],
+                            "resolved_finding_ids": [],
+                        }
                         return AgentResult(
                             ok=True,
                             command=[],
@@ -2545,7 +2663,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
             self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
             self.assertEqual(orchestrator.repair_calls, 2)
-            self.assertEqual(len(orchestrator.review_requests), 2)
+            self.assertEqual(len(orchestrator.review_requests), 1)
             review_request = orchestrator.review_requests[0]
             self.assertEqual(review_request.timeout_seconds, 60)
             self.assertEqual(review_request.progress_lease_seconds, 60)
@@ -2554,15 +2672,19 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 "REVIEW_PHASE: pre_validation",
                 orchestrator.review_requests[0].prompt,
             )
-            self.assertIn(
-                "REVIEW_PHASE: post_full_suite",
-                orchestrator.review_requests[1].prompt,
+            self.assertTrue(
+                all(
+                    "REVIEW_PHASE: post_full_suite" not in request.prompt
+                    for request in orchestrator.review_requests
+                )
             )
+            self.assertIn("final model review", orchestrator.review_requests[0].prompt)
+            self.assertIn("PROOF_SEAL:", result.verification)
             self.assertEqual(result.status, "approved_candidate")
             self.assertTrue((Path(result.runtime_root) / "fixed.py").is_file())
             runner.cleanup_runtime(result)
 
-    def test_deferred_proof_finding_blocks_only_post_full_suite_review(self):
+    def test_semantic_review_cannot_defer_code_finding_until_post_full_suite(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             auto_root = root / "auto"
@@ -2625,17 +2747,9 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 progress_lease_seconds=60,
                 phase="pre_validation",
             )
-            final = runner._review_candidate(
-                auto_root,
-                "HEAD",
-                progress_lease_seconds=60,
-                replay_summary="full suite passed",
-                phase="post_full_suite",
-            )
-
-            self.assertTrue(pre.ok)
-            self.assertIn("DEFERRED_TO_POST_FULL_SUITE", pre.summary)
-            self.assertFalse(final.ok)
+            self.assertFalse(pre.ok)
+            self.assertIn("candidate review=REJECT", pre.summary)
+            self.assertEqual(pre.payload["findings"][0]["defer_until"], "")
 
     def test_self_repair_runs_in_isolated_worktree_and_integrates_commit(self):
         with tempfile.TemporaryDirectory() as tmp:

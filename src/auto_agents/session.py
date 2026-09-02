@@ -1396,6 +1396,7 @@ class Session:
             self._reconcile_interrupted_collab_checkpoints(state)
             self._check_health_action()
             state.current_attempt += 1
+            self._save(state)
             self._print(f"\n--- Fix attempt {state.current_attempt} ---")
 
             prompt = self._build_fix_prompt(state, feedback)
@@ -1688,6 +1689,7 @@ class Session:
                 self._print(stop)
                 break
             state.current_attempt += 1
+            self._save(state)
             self._print(f"\n--- Collab iteration {state.current_attempt} ---")
 
             prompt = self._build_collab_prompt(state, feedback)
@@ -1973,6 +1975,7 @@ class Session:
                 )
                 break
             state.current_attempt += 1
+            self._save(state)
             self._print(f"\n--- Provider recovery iteration {state.current_attempt} ---")
 
             try:
@@ -2863,7 +2866,14 @@ class Session:
             ),
         )
         started = time.monotonic()
-        result: AgentResult = self.orch._call_with_failover(request)
+        publish_operation = getattr(self._health_runtime, "set_active_operation", None)
+        if callable(publish_operation):
+            publish_operation("provider", label)
+        try:
+            result: AgentResult = self.orch._call_with_failover(request)
+        finally:
+            if callable(publish_operation):
+                publish_operation()
         usage = result.usage
         PerformanceTrace(
             self.project_root,
@@ -2911,6 +2921,18 @@ class Session:
         return (result.summary or result.stdout).strip()
 
     def _run_verify(self, scope: str = "final") -> Dict[str, object]:
+        publish_operation = getattr(
+            self._health_runtime, "set_active_operation", None
+        )
+        if callable(publish_operation):
+            publish_operation("verification", scope)
+        try:
+            return self._run_verify_inner(scope)
+        finally:
+            if callable(publish_operation):
+                publish_operation()
+
+    def _run_verify_inner(self, scope: str = "final") -> Dict[str, object]:
         """Run verification appropriate for the session mode.
 
         Fix and collab both use affected-proof attestation. A release plan is

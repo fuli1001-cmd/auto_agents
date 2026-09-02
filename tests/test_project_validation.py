@@ -65,6 +65,7 @@ from auto_agents.run_lock import (
     RUN_LOCK_FD_ENV,
     RUN_LOCK_KEY_ENV,
     RUN_LOCK_TOKEN_ENV,
+    SELF_REPAIR_HEALTH_REBASE_ENV,
     ProjectRunLock,
     RunAlreadyActiveError,
     runtime_status,
@@ -2727,6 +2728,7 @@ class ProjectValidationTests(unittest.TestCase):
             resume_env = resume_run.call_args.kwargs["env"]
             self.assertIn(SELF_REPAIR_LAST_FINGERPRINT_ENV, resume_env)
             self.assertEqual(resume_env[SELF_REPAIR_REPEAT_COUNT_ENV], "1")
+            self.assertEqual(resume_env[SELF_REPAIR_HEALTH_REBASE_ENV], "1")
             self.assertIn(RUN_LOCK_FD_ENV, resume_env)
             self.assertIn(RUN_LOCK_KEY_ENV, resume_env)
             self.assertEqual(
@@ -3322,6 +3324,107 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(notify.call_args.args[0], project_root)
             self.assertEqual(notify.call_args.kwargs["status"], "failed")
             self.assertEqual(notify.call_args.kwargs["error"], "session boom")
+
+    def test_cli_session_self_repair_reuses_inherited_project_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            locks = []
+
+            class FakeLock:
+                interrupted_snapshot = {}
+                run_token = "run-token"
+                health_lease_token = "run-token"
+                health_boundary_rebased = False
+
+                def __init__(self, project):
+                    self.project = Path(project)
+                    self.acquired = False
+                    locks.append(self)
+
+                def acquire(self):
+                    self.acquired = True
+                    return self
+
+                def release(self):
+                    self.acquired = False
+
+            class FakeForeground:
+                def __init__(self, project):
+                    self.project = Path(project)
+
+                def acquire(self):
+                    return None
+
+                def release(self):
+                    return None
+
+            class FakeOrchestrator:
+                config = type("Config", (), {"execution": object()})()
+
+                def __init__(self, project_root, agent_output_stream=None):
+                    self.project_root = project_root
+                    self._print_agent_output = False
+
+                def _ensure_agent_instructions_synced(self):
+                    return None
+
+            class FakeSession:
+                def __init__(self, orchestrator, **kwargs):
+                    self._coordinator = None
+                    self._coordinator_managed = False
+
+                def resume(self, session_id):
+                    raise RuntimeError("stale goal stall")
+
+            class FakeCoordinator:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def reconcile_interruption(self, snapshot):
+                    raise AssertionError("no interruption expected")
+
+            triage = SelfRepairTriageResult(
+                decision=SelfRepairDecision(
+                    True,
+                    category="stale_session_goal_stall_terminalization",
+                    reason="stale health action",
+                ),
+                source="root_cause_consensus",
+                reason="approved",
+            )
+            received = {}
+
+            def repair(project, orchestrator, error, decision, args, run_lock, **kwargs):
+                received["lock"] = run_lock
+                self.assertTrue(run_lock.acquired)
+                return 3
+
+            with (
+                patch("auto_agents.cli.ProjectRunLock", FakeLock),
+                patch("auto_agents.cli.ForegroundActivity", FakeForeground),
+                patch("auto_agents.cli.Orchestrator", FakeOrchestrator),
+                patch("auto_agents.session.Session", FakeSession),
+                patch("auto_agents.workflow_runtime.WorkflowCoordinator", FakeCoordinator),
+                patch("auto_agents.cli._promote_pending_self_repairs"),
+                patch("auto_agents.cli._triage_terminal_run_error", return_value=triage),
+                patch("auto_agents.cli._auto_repair_auto_agents_and_resume", side_effect=repair),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = main(
+                    [
+                        "collab",
+                        "--project",
+                        str(project_root),
+                        "--session",
+                        "session-id",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 3)
+            self.assertEqual(len(locks), 1)
+            self.assertIs(received["lock"], locks[0])
 
     def test_cli_init_defaults_name_from_project_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

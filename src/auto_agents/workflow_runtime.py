@@ -143,7 +143,10 @@ class WorkflowCoordinator:
         )
         if self.run_lock is not None:
             self.run_lock.bind_subject(session.mode, state.session_id)
-            self.orch._run_token = self.run_lock.run_token
+            self.orch._run_token = str(
+                getattr(self.health_runtime, "run_token", "")
+                or self.run_lock.run_token
+            )
         if self.health_runtime is not None:
             self.health_runtime.bind_subject(state.session_id)
             self.health_runtime.set_phase(session.mode)
@@ -250,6 +253,17 @@ class WorkflowCoordinator:
         self.store.activate(snapshot.workflow_id)
         self._reconcile_open_operations(snapshot)
         self.store.begin_resume(snapshot)
+        fresh_health_boundary = bool(
+            getattr(self.health_runtime, "fresh_health_boundary", False)
+        )
+        if fresh_health_boundary and self.run_lock is not None:
+            self.run_lock.bind_subject(state.mode, state.session_id)
+            self.orch._run_token = str(
+                getattr(self.health_runtime, "run_token", "")
+                or self.run_lock.run_token
+            )
+        if fresh_health_boundary:
+            self.health_runtime.set_phase(state.mode)
         self._ensure_completed_session_commit(session, state)
         snapshot = self.store.load(snapshot.workflow_id)
         return self._drive_session(session, state, snapshot, root=True)
@@ -540,6 +554,8 @@ class WorkflowCoordinator:
             state.resume_phase = ""
             state.resolution = ""
             save_session_state(self.project_root, state)
+        if bool(getattr(self.health_runtime, "fresh_health_boundary", False)):
+            self.health_runtime.publish_session(state)
         while True:
             if state.status == "waiting_child" and state.active_handoff_id:
                 returned = self._drive_handoff(session, state, snapshot)
@@ -853,7 +869,10 @@ class WorkflowCoordinator:
 
         if self.run_lock is not None:
             self.run_lock.bind_subject("run", state.run_id)
-            self.orch._run_token = self.run_lock.run_token
+            self.orch._run_token = str(
+                getattr(self.health_runtime, "run_token", "")
+                or self.run_lock.run_token
+            )
         if self.health_runtime is not None:
             self.health_runtime.bind_subject(state.run_id)
             self.health_runtime.set_phase("run")

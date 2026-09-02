@@ -25,6 +25,10 @@ from .health_watch import RunHealthEvaluator, capture_health_snapshot
 from .io_utils import read_json
 from .notifications import notify_flow_finished
 from .process_supervision import process_identity_matches, process_start_ticks
+from .session_health import (
+    SESSION_PROGRESS_SCHEMA_VERSION,
+    build_session_progress,
+)
 
 
 SIDECAR_SCHEMA_VERSION = 2
@@ -255,17 +259,9 @@ class IndependentHealthAuditor:
     def _observe_session(self, manifest: Dict[str, object]) -> None:
         state = load_session_state(self.project_root, self.subject_id)
         raw = state.to_dict()
-        durable = {
-            "goal_set": bool(state.goal.strip()),
-            "conversation_entries": len(state.conversation),
-            "execution_entries": len(state.execution_log),
-            "attempt": state.current_attempt,
-            "resolution_set": bool(state.resolution.strip()),
-            "status": state.status,
-            "diff": state.last_diff_hash,
-            "verify": state.last_verify_sig,
-        }
+        durable = build_session_progress(raw)
         digest = evidence_digest(durable)
+        state_digest = evidence_digest(raw)
         session_dir = self.root.parent
         file_activity = []
         for path in sorted(session_dir.glob("**/*")):
@@ -288,6 +284,8 @@ class IndependentHealthAuditor:
         progressed = bool(
             not prior
             or int(durable["conversation_entries"]) > int(prior.get("conversation_entries", 0))
+            or int(durable["execution_entries"]) > int(prior.get("execution_entries", 0))
+            or int(durable["attempt"]) > int(prior.get("attempt", 0))
             or bool(durable["resolution_set"]) and not bool(prior.get("resolution_set", False))
             or str(durable["status"]) != str(prior.get("status", ""))
             or bool(durable["diff"]) and str(durable["diff"]) != str(prior.get("diff", ""))
@@ -309,6 +307,22 @@ class IndependentHealthAuditor:
             self.session_retry_pressure += max(0, state.current_attempt - prior_attempt)
         self.previous_session_activity = activity_digest
         self.previous_session = durable
+        active_operation = manifest.get("active_operation", {})
+        active_operation = (
+            dict(active_operation) if isinstance(active_operation, dict) else {}
+        )
+        operation_heartbeat = float(
+            active_operation.get("heartbeat_epoch", 0.0) or 0.0
+        )
+        active_operation_live = bool(
+            str(active_operation.get("kind", "")).strip()
+            and operation_heartbeat
+            and time.time() - operation_heartbeat
+            <= max(5.0, float(self.config.heartbeat_timeout_seconds))
+        )
+        if active_operation_live:
+            self.last_session_progress_at = time.time()
+            self.session_activity_since_progress = False
         self.sequence += 1
         audit = {
             "schema_version": SIDECAR_SCHEMA_VERSION,
@@ -316,18 +330,25 @@ class IndependentHealthAuditor:
             "run_token": self.run_token,
             "process_phase": str(manifest.get("process_phase", "")),
             "sequence": self.sequence,
-            "state_digest": evidence_digest(raw),
+            "state_digest": state_digest,
+            "progress_schema_version": SESSION_PROGRESS_SCHEMA_VERSION,
             "progress_digest": digest,
             "progress": durable,
             "activity_digest": activity_digest,
+            "active_operation": active_operation,
+            "active_operation_live": active_operation_live,
             "updated_at": utc_now(),
         }
         _atomic_json(self.root / "auditor-snapshot.json", audit)
         main = read_json(self.root / "summary.json", default={})
         if (
             isinstance(main, dict)
+            and str(main.get("run_token", "")) == self.run_token
+            and str(main.get("progress_schema_version", ""))
+            == str(SESSION_PROGRESS_SCHEMA_VERSION)
+            and state_digest
+            and str(main.get("state_digest", "")) == state_digest
             and str(main.get("progress_digest", ""))
-            and str(main.get("state_updated_at", "")) == state.updated_at
             and str(main.get("progress_digest", "")) != digest
         ):
             self._request(
@@ -336,6 +357,9 @@ class IndependentHealthAuditor:
                 {
                     "main_progress_digest": str(main.get("progress_digest", "")),
                     "independent_progress_digest": digest,
+                    "run_token": self.run_token,
+                    "progress_schema_version": SESSION_PROGRESS_SCHEMA_VERSION,
+                    "state_digest": state_digest,
                     "sequence": self.sequence,
                 },
                 sequence=self.sequence,
@@ -388,6 +412,7 @@ class IndependentHealthAuditor:
             )
         elif (
             self.session_activity_since_progress
+            and not active_operation_live
             and time.time() - self.last_session_progress_at >= stall_lease
         ):
             self._request(

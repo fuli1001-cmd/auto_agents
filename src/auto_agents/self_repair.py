@@ -51,6 +51,7 @@ from .requirements import (
     forbidden_pattern_definition_reason,
 )
 from .repair_cases import RepairCase, RepairCaseStore, terminal_repair_case
+from .run_lock import SELF_REPAIR_HEALTH_REBASE_ENV
 from .self_repair_search import (
     SelfRepairCandidateRecord,
     SelfRepairExperiment,
@@ -89,6 +90,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
     "candidate_full_suite_failed": 80,
     "candidate_full_suite_inconclusive": 90,
     "candidate_final_review_rejected": 95,
+    "candidate_proof_seal_failed": 95,
     "approved_candidate": 100,
     "already_repaired": 100,
 }
@@ -105,6 +107,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_STAGES = {
     "candidate_full_suite_failed": "full_suite",
     "candidate_full_suite_inconclusive": "full_suite",
     "candidate_final_review_rejected": "final_review",
+    "candidate_proof_seal_failed": "proof_seal",
     "approved_candidate": "approved",
     "already_repaired": "approved",
 }
@@ -194,6 +197,8 @@ class _FullSuiteShard:
     test_file: str
     targets: tuple[str, ...]
     parallel_safe: bool = False
+    resource_locks: tuple[str, ...] = ()
+    isolated: bool = False
     priority: int = 100
     estimated_seconds: float = 0.0
 
@@ -1627,6 +1632,8 @@ class AutoAgentsSelfRepairRunner:
         self._base_prewarm_ref = ""
         self._base_prewarm_result: Optional[_VerificationResult] = None
         self._base_prewarm_error: Optional[BaseException] = None
+        self._shard_worktree_lock = threading.Lock()
+        self._full_suite_progress_lock = threading.Lock()
 
     def _autonomy_config(self) -> object:
         config = getattr(self.target_orchestrator, "config", None)
@@ -1796,9 +1803,12 @@ class AutoAgentsSelfRepairRunner:
         }:
             failed.append("validation:full_suite")
         if result.validation_rank >= 100:
-            passed.append("validation:final_review")
-        elif result.status == "candidate_final_review_rejected":
-            failed.append("validation:final_review")
+            passed.append("validation:proof_seal")
+        elif result.status in {
+            "candidate_final_review_rejected",
+            "candidate_proof_seal_failed",
+        }:
+            failed.append("validation:proof_seal")
         passed.extend(result.passed_obligations)
         failed.extend(result.failed_obligations)
         return sorted(set(passed)), sorted(set(failed))
@@ -2212,6 +2222,83 @@ class AutoAgentsSelfRepairRunner:
                         candidate_commit=candidate_commit,
                         candidate_ref=rejected_ref,
                     )
+                focused = self._run_verification(candidate_root)
+                autonomy = self._autonomy_config()
+                review = self._review_candidate(
+                    candidate_root,
+                    base_head,
+                    progress_lease_seconds=max(
+                        60,
+                        int(
+                            getattr(
+                                autonomy,
+                                "candidate_review_timeout_seconds",
+                                600,
+                            )
+                            or 600
+                        ),
+                    ),
+                    replay_summary="\n\n".join(
+                        (replay.summary, differential.summary, focused.summary)
+                    ),
+                    phase="pre_validation",
+                )
+                review_findings = [
+                    dict(item)
+                    for item in review.payload.get("findings", [])
+                    if isinstance(item, Mapping)
+                ]
+                finding_ids = sorted(
+                    str(item.get("finding_id", ""))
+                    for item in review_findings
+                    if str(item.get("finding_id", "")).strip()
+                )
+                resolved_finding_ids = sorted(
+                    str(item)
+                    for item in review.payload.get("resolved_finding_ids", []) or []
+                    if str(item).strip()
+                )
+                experiment_findings = getattr(
+                    getattr(self, "_experiment", None), "findings", {}
+                )
+                unresolved = sorted(
+                    finding_id
+                    for finding_id, finding in experiment_findings.items()
+                    if finding.status in {"confirmed", "reopened"}
+                    and finding_id not in resolved_finding_ids
+                )
+                if not focused.ok or not review.ok or unresolved:
+                    rejected_ref = self._reject_pending_validation_ref(
+                        candidate_ref,
+                        candidate_commit,
+                        candidate_id,
+                    )
+                    return SelfRepairResult(
+                        ok=False,
+                        status=(
+                            "candidate_verification_failed"
+                            if not focused.ok
+                            else "candidate_review_rejected"
+                        ),
+                        category=self.decision.category,
+                        reason=(
+                            "pending candidate focused verification failed"
+                            if not focused.ok
+                            else "complete semantic review rejected pending candidate"
+                        ),
+                        summary="resumed pending-validation candidate",
+                        verification="\n\n".join(
+                            (replay.summary, differential.summary, focused.summary, review.summary)
+                        ),
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                        candidate_commit=candidate_commit,
+                        candidate_ref=rejected_ref,
+                        finding_ids=finding_ids,
+                        resolved_finding_ids=resolved_finding_ids,
+                        review_findings=review_findings,
+                    )
                 full_suite = self._full_suite_differential(
                     base_head,
                     candidate_root,
@@ -2227,65 +2314,17 @@ class AutoAgentsSelfRepairRunner:
                     if part
                 )
                 if full_suite.ok:
-                    autonomy = self._autonomy_config()
-                    final_review = self._review_candidate(
+                    proof_seal = self._deterministic_proof_seal(
                         candidate_root,
-                        base_head,
-                        progress_lease_seconds=max(
-                            60,
-                            int(
-                                getattr(
-                                    autonomy,
-                                    "candidate_review_timeout_seconds",
-                                    600,
-                                )
-                                or 600
-                            ),
-                        ),
-                        replay_summary=verification,
-                        phase="post_full_suite",
+                        candidate_commit=candidate_commit,
+                        review=review,
+                        replay=replay,
+                        differential=differential,
+                        focused=focused,
+                        full_suite=full_suite,
+                        resolved_finding_ids=resolved_finding_ids,
                     )
-                    review_findings = [
-                        dict(item)
-                        for item in final_review.payload.get("findings", [])
-                        if isinstance(item, Mapping)
-                    ]
-                    finding_ids = sorted(
-                        str(item.get("finding_id", ""))
-                        for item in review_findings
-                        if str(item.get("finding_id", "")).strip()
-                    )
-                    resolved_finding_ids = sorted(
-                        str(item)
-                        for item in final_review.payload.get(
-                            "resolved_finding_ids", []
-                        )
-                        or []
-                        if str(item).strip()
-                    )
-                    experiment_findings = getattr(
-                        getattr(self, "_experiment", None),
-                        "findings",
-                        {},
-                    )
-                    unresolved_findings = sorted(
-                        finding_id
-                        for finding_id, finding in experiment_findings.items()
-                        if finding.status in {"confirmed", "reopened"}
-                        and finding_id not in resolved_finding_ids
-                    )
-                    if final_review.ok and unresolved_findings:
-                        final_review = _VerificationResult(
-                            False,
-                            (
-                                "candidate final review=REJECT reason=approved response "
-                                "did not prove all findings resolved after full-suite "
-                                "validation: "
-                                + ", ".join(unresolved_findings)
-                            ),
-                            payload=final_review.payload,
-                        )
-                    if not final_review.ok:
+                    if not proof_seal.ok:
                         rejected_ref = self._reject_pending_validation_ref(
                             candidate_ref,
                             candidate_commit,
@@ -2293,15 +2332,12 @@ class AutoAgentsSelfRepairRunner:
                         )
                         return SelfRepairResult(
                             ok=False,
-                            status="candidate_final_review_rejected",
+                            status="candidate_proof_seal_failed",
                             category=self.decision.category,
-                            reason=(
-                                "proof-aware adversarial review rejected the fully "
-                                "validated pending candidate"
-                            ),
+                            reason="deterministic proof sealing rejected pending candidate",
                             summary="resumed pending-validation candidate",
                             verification="\n\n".join(
-                                (verification, final_review.summary)
+                                (verification, proof_seal.summary)
                             ),
                             experiment_id=experiment_id,
                             candidate_id=candidate_id,
@@ -2312,7 +2348,7 @@ class AutoAgentsSelfRepairRunner:
                             resolved_finding_ids=resolved_finding_ids,
                             review_findings=review_findings,
                             passed_obligations=["validation:full_suite"],
-                            failed_obligations=["validation:final_review"],
+                            failed_obligations=["validation:proof_seal"],
                         )
                     approved = self._approved_candidate_result(
                         experiment_id=experiment_id,
@@ -2321,7 +2357,7 @@ class AutoAgentsSelfRepairRunner:
                         candidate_commit=candidate_commit,
                         summary="resumed and approved pending-validation candidate",
                         verification="\n\n".join(
-                            (verification, final_review.summary)
+                            (verification, proof_seal.summary)
                         ),
                     )
                     approved.finding_ids = finding_ids
@@ -3157,7 +3193,6 @@ class AutoAgentsSelfRepairRunner:
                     finding_id
                     for finding_id, finding in self._experiment.findings.items()
                     if finding.status in {"confirmed", "reopened"}
-                    and finding.defer_until != "post_full_suite"
                     and finding_id not in resolved_finding_ids
                 )
                 if review.ok and unresolved_prior_findings:
@@ -3355,70 +3390,26 @@ class AutoAgentsSelfRepairRunner:
                     )
                     if part
                 )
-                final_review = self._review_candidate(
+                proof_seal = self._deterministic_proof_seal(
                     repair_root,
-                    self._experiment.base_commit,
-                    progress_lease_seconds=review_progress_lease,
-                    replay_summary=proof_summary,
-                    phase="post_full_suite",
+                    candidate_commit=candidate_commit,
+                    review=review,
+                    replay=replay,
+                    differential=differential,
+                    focused=verification,
+                    full_suite=full_suite,
+                    resolved_finding_ids=resolved_finding_ids,
                 )
-                final_review_findings = [
-                    dict(item)
-                    for item in final_review.payload.get("findings", [])
-                    if isinstance(item, Mapping)
-                ]
-                combined_findings = {
-                    str(item.get("finding_id", "")): dict(item)
-                    for item in [*review_findings, *final_review_findings]
-                    if str(item.get("finding_id", "")).strip()
-                }
-                review_findings = list(combined_findings.values())
-                finding_ids = sorted(combined_findings)
-                resolved_finding_ids = sorted(
-                    set(resolved_finding_ids).union(
-                        str(item)
-                        for item in final_review.payload.get(
-                            "resolved_finding_ids", []
-                        )
-                        or []
-                        if str(item).strip()
-                    )
-                )
-                unresolved_final_findings = sorted(
-                    {
-                        finding_id
-                        for finding_id, finding in self._experiment.findings.items()
-                        if finding.status in {"confirmed", "reopened"}
-                        and finding_id not in resolved_finding_ids
-                    }.union(
-                        finding_id
-                        for finding_id in finding_ids
-                        if finding_id not in resolved_finding_ids
-                    )
-                )
-                if final_review.ok and unresolved_final_findings:
-                    final_review = _VerificationResult(
-                        False,
-                        (
-                            "candidate final review=REJECT reason=approved response did not "
-                            "prove all findings resolved after full-suite validation: "
-                            + ", ".join(unresolved_final_findings)
-                        ),
-                        payload=final_review.payload,
-                    )
-                if not final_review.ok:
+                if not proof_seal.ok:
                     return SelfRepairResult(
                         ok=False,
-                        status="candidate_final_review_rejected",
+                        status="candidate_proof_seal_failed",
                         category=self.decision.category,
-                        reason=(
-                            "proof-aware adversarial review rejected the fully "
-                            "validated repair"
-                        ),
+                        reason="deterministic proof sealing rejected the candidate",
                         summary=summary,
                         verification="\n\n".join(
                             part
-                            for part in (proof_summary, final_review.summary)
+                            for part in (proof_summary, proof_seal.summary)
                             if part
                         ),
                         experiment_id=experiment_id,
@@ -3439,7 +3430,7 @@ class AutoAgentsSelfRepairRunner:
                         ],
                         failed_obligations=[
                             *boundary_failed_obligations,
-                            "validation:final_review",
+                            "validation:proof_seal",
                         ],
                     )
                 approved_commit = self._squash_candidate_commit(
@@ -3455,7 +3446,7 @@ class AutoAgentsSelfRepairRunner:
                     summary=summary,
                     verification="\n\n".join(
                         part
-                        for part in (proof_summary, final_review.summary)
+                        for part in (proof_summary, proof_seal.summary)
                         if part
                     ),
                 )
@@ -3532,29 +3523,21 @@ class AutoAgentsSelfRepairRunner:
             encoding="utf-8",
             capture_output=True,
         ).stdout
-        final_phase = phase == "post_full_suite"
         prompt = "\n".join(
             [
                 "Review this isolated auto_agents self-repair candidate.",
                 "Do not modify files or run mutating commands.",
                 "Reject test deletion, skip/xfail, weakened safety gates, hard-coded target data, "
                 "or changes that do not address the supplied root cause.",
-                (
-                    "This is the post-full-suite final review. All supplied validation proof is "
-                    "authoritative for this candidate; reject any unresolved code or proof gap."
-                    if final_phase
-                    else
-                    "This is the pre-validation code review. The orchestrator deliberately runs "
-                    "focused verification and the authoritative base/candidate full-suite "
-                    "differential only after this review passes. Do not reject merely because "
-                    "that downstream proof is not present yet. Mark such a finding with "
-                    "defer_until='post_full_suite'; only concrete code, scope, safety, or test "
-                    "defects block this phase."
-                ),
+                "This is the complete semantic code review and the final model review. "
+                "Reject every unresolved code, lifecycle, scope, safety, or test-coverage "
+                "gap now, before expensive full-suite validation. The orchestrator will run "
+                "focused and base/candidate full-suite proof only after this review passes; "
+                "absence of those future execution results is not itself a finding.",
                 "Return exactly JSON with decision, reason, findings, and resolved_finding_ids. "
                 "Each finding must contain finding_id, severity=fatal|hard|repairable, "
                 "obligation_id, reason, counterexample, required_test, evidence, and "
-                "defer_until=''|'post_full_suite'. "
+                "defer_until='' (post-full-suite deferral is forbidden). "
                 "Use stable semantic finding IDs and list prior finding IDs proven resolved.",
                 "Schema: {\"decision\":\"APPROVE|REJECT\",\"reason\":\"...\","
                 "\"findings\":[{\"finding_id\":\"...\",\"severity\":\"hard\","
@@ -3631,14 +3614,7 @@ class AutoAgentsSelfRepairRunner:
             ]
         for finding in findings:
             defer_until = str(finding.get("defer_until", "")).strip()
-            if defer_until not in {"", "post_full_suite"}:
-                finding["defer_until"] = ""
-            elif defer_until:
-                finding["defer_until"] = defer_until
-            elif SelfRepairFinding._looks_like_post_full_suite_finding(finding):
-                finding["defer_until"] = "post_full_suite"
-            else:
-                finding["defer_until"] = ""
+            finding["defer_until"] = ""
         raw_resolved = payload.get("resolved_finding_ids", [])
         normalized_payload = {
             **payload,
@@ -3650,28 +3626,74 @@ class AutoAgentsSelfRepairRunner:
                 if str(item).strip()
             ],
         }
-        blocking_findings = (
-            findings
-            if final_phase
-            else [
-                finding
-                for finding in findings
-                if finding.get("defer_until") != "post_full_suite"
-            ]
-        )
-        deferred_only = bool(findings) and not blocking_findings
-        review_ok = bool(reason) and not blocking_findings and (
-            decision == "APPROVE" or (not final_phase and deferred_only)
-        )
-        rendered_decision = (
-            "DEFERRED_TO_POST_FULL_SUITE"
-            if review_ok and deferred_only
-            else decision or "INVALID"
-        )
+        review_ok = bool(reason) and not findings and decision == "APPROVE"
+        rendered_decision = decision or "INVALID"
         return _VerificationResult(
             review_ok,
             f"candidate review={rendered_decision} reason={reason}",
             payload=normalized_payload,
+        )
+
+    def _deterministic_proof_seal(
+        self,
+        candidate_root: Path,
+        *,
+        candidate_commit: str,
+        review: "_VerificationResult",
+        replay: "_VerificationResult",
+        differential: "_VerificationResult",
+        focused: "_VerificationResult",
+        full_suite: "_VerificationResult",
+        resolved_finding_ids: list[str],
+    ) -> "_VerificationResult":
+        """Seal immutable evidence without a second, post-suite model review."""
+
+        head = head_ref(candidate_root)
+        dirty = changed_paths(candidate_root)
+        experiment_findings = getattr(
+            getattr(self, "_experiment", None), "findings", {}
+        )
+        unresolved = sorted(
+            finding_id
+            for finding_id, finding in experiment_findings.items()
+            if finding.status in {"confirmed", "reopened"}
+            and finding_id not in resolved_finding_ids
+        )
+        health_case = bool(
+            self.repair_case is not None
+            and self.repair_case.source == "health_watch"
+        )
+        legacy_direct = self.diagnosis is None and self.decision.eligible
+        boundary_proof = bool(
+            legacy_direct
+            or (
+                replay.ok and differential.ok
+                if health_case
+                else replay.ok or differential.ok
+            )
+        )
+        checks = {
+            "candidate_sha_matches": bool(head and head == candidate_commit),
+            "candidate_tree_clean": not dirty,
+            "semantic_review_approved": review.ok,
+            "required_boundary_proof_passed": boundary_proof,
+            "focused_verification_passed": focused.ok,
+            "full_suite_passed": full_suite.ok and not full_suite.recoverable,
+            "all_findings_closed": not unresolved,
+        }
+        payload = {
+            "schema_version": 1,
+            "candidate_commit": candidate_commit,
+            "head": head,
+            "dirty_paths": dirty,
+            "unresolved_findings": unresolved,
+            "checks": checks,
+        }
+        return _VerificationResult(
+            all(checks.values()),
+            "PROOF_SEAL:\n"
+            + json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            payload=payload,
         )
 
     @staticmethod
@@ -3896,7 +3918,10 @@ class AutoAgentsSelfRepairRunner:
                     ref=ref,
                 )
                 created = True
-                return self._run_full_suite_shards(verification_root)
+                return self._run_full_suite_shards(
+                    verification_root,
+                    suite_kind="base",
+                )
             finally:
                 if created:
                     try:
@@ -3911,6 +3936,8 @@ class AutoAgentsSelfRepairRunner:
     def _run_full_suite_shards(
         self,
         verification_root: Path,
+        *,
+        suite_kind: str = "candidate",
     ) -> "_VerificationResult":
         shards = self._collect_full_suite_shards(verification_root)
         if not shards:
@@ -3955,6 +3982,13 @@ class AutoAgentsSelfRepairRunner:
                 continue
             pending.append(shard)
 
+        self._report_full_suite_progress(
+            suite_kind,
+            completed=len(results),
+            total=len(shards),
+            shard="cache",
+        )
+
         checkpoint_lock = threading.Lock()
 
         def record(
@@ -3989,50 +4023,81 @@ class AutoAgentsSelfRepairRunner:
                         shard_result,
                     )
                 self._record_full_suite_timing(shard, shard_result)
+                self._report_full_suite_progress(
+                    suite_kind,
+                    completed=len(results),
+                    total=len(shards),
+                    shard=shard.shard_id,
+                )
             return True
+
+        resource_mutexes = {
+            resource: threading.Lock()
+            for shard in pending
+            for resource in shard.resource_locks
+            if resource != "global:exclusive"
+        }
+        resource_mutexes.setdefault("legacy:exclusive", threading.Lock())
+        global_condition = threading.Condition()
+        global_state = {"active": 0, "exclusive": False}
+
+        def execute(shard: _FullSuiteShard) -> _VerificationResult:
+            resources = list(shard.resource_locks)
+            if not shard.parallel_safe and not resources:
+                resources = ["legacy:exclusive"]
+            locks = [
+                resource_mutexes[resource]
+                for resource in sorted(set(resources))
+                if resource != "global:exclusive"
+            ]
+            exclusive = "global:exclusive" in resources
+            with global_condition:
+                if exclusive:
+                    global_condition.wait_for(
+                        lambda: not global_state["exclusive"]
+                        and global_state["active"] == 0
+                    )
+                    global_state["exclusive"] = True
+                else:
+                    global_condition.wait_for(
+                        lambda: not global_state["exclusive"]
+                    )
+                    global_state["active"] += 1
+            for lock in locks:
+                lock.acquire()
+            try:
+                return self._execute_full_suite_shard(verification_root, shard)
+            finally:
+                for lock in reversed(locks):
+                    lock.release()
+                with global_condition:
+                    if exclusive:
+                        global_state["exclusive"] = False
+                    else:
+                        global_state["active"] -= 1
+                    global_condition.notify_all()
 
         for priority in sorted({shard.priority for shard in pending}):
             phase = [shard for shard in pending if shard.priority == priority]
-            serial = [shard for shard in phase if not shard.parallel_safe]
-            parallel = [shard for shard in phase if shard.parallel_safe]
-            for shard in serial:
-                shard_result = self._execute_full_suite_shard(
-                    verification_root,
-                    shard,
+            workers = min(
+                SELF_REPAIR_FULL_SUITE_MAX_PARALLEL_WORKERS,
+                len(phase),
+                max(1, (os.cpu_count() or 2) // 2),
+            )
+            interrupted = False
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(execute, shard): shard for shard in phase}
+                for future in as_completed(futures):
+                    shard = futures[future]
+                    shard_result = future.result()
+                    if not record(shard, shard_result):
+                        interrupted = True
+            if interrupted:
+                return self._aggregate_full_suite_shards(
+                    results,
+                    recoverable=True,
+                    total_shards=len(shards),
                 )
-                if not record(shard, shard_result):
-                    return self._aggregate_full_suite_shards(
-                        results,
-                        recoverable=True,
-                        total_shards=len(shards),
-                    )
-            if parallel:
-                workers = min(
-                    SELF_REPAIR_FULL_SUITE_MAX_PARALLEL_WORKERS,
-                    len(parallel),
-                    max(1, (os.cpu_count() or 2) // 2),
-                )
-                interrupted = False
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = {
-                        pool.submit(
-                            self._execute_full_suite_shard,
-                            verification_root,
-                            shard,
-                        ): shard
-                        for shard in parallel
-                    }
-                    for future in as_completed(futures):
-                        shard = futures[future]
-                        shard_result = future.result()
-                        if not record(shard, shard_result):
-                            interrupted = True
-                if interrupted:
-                    return self._aggregate_full_suite_shards(
-                        results,
-                        recoverable=True,
-                        total_shards=len(shards),
-                    )
         return self._aggregate_full_suite_shards(
             results,
             recoverable=False,
@@ -4040,6 +4105,43 @@ class AutoAgentsSelfRepairRunner:
         )
 
     def _execute_full_suite_shard(
+        self,
+        verification_root: Path,
+        shard: _FullSuiteShard,
+    ) -> "_VerificationResult":
+        if shard.isolated:
+            commit = head_ref(verification_root)
+            if commit:
+                with tempfile.TemporaryDirectory(
+                    prefix="auto-agents-full-suite-shard-"
+                ) as tmp:
+                    isolated_root = Path(tmp) / "verification"
+                    created = False
+                    try:
+                        with self._shard_worktree_lock:
+                            add_worktree(
+                                verification_root,
+                                isolated_root,
+                                ref=commit,
+                            )
+                        created = True
+                        return self._execute_full_suite_shard_command(
+                            isolated_root, shard
+                        )
+                    finally:
+                        if created:
+                            with self._shard_worktree_lock:
+                                try:
+                                    remove_worktree(
+                                        verification_root,
+                                        isolated_root,
+                                        force=True,
+                                    )
+                                except RuntimeError:
+                                    pass
+        return self._execute_full_suite_shard_command(verification_root, shard)
+
+    def _execute_full_suite_shard_command(
         self,
         verification_root: Path,
         shard: _FullSuiteShard,
@@ -4101,6 +4203,12 @@ class AutoAgentsSelfRepairRunner:
                             str(target) for target in item.get("targets", []) or []
                         ),
                         parallel_safe=bool(item.get("parallel_safe", False)),
+                        resource_locks=tuple(
+                            str(resource)
+                            for resource in item.get("resource_locks", []) or []
+                            if str(resource).strip()
+                        ),
+                        isolated=bool(item.get("isolated", False)),
                         priority=int(item.get("priority", 100)),
                         estimated_seconds=float(
                             item.get("estimated_seconds", 0.0) or 0.0
@@ -4164,15 +4272,16 @@ class AutoAgentsSelfRepairRunner:
                 if split_nodes
                 else [nodes or [test_file]]
             )
-            parallel_safe = self._full_suite_shard_parallel_safe(
-                verification_root,
-                test_file,
-            )
             priority = self._full_suite_shard_priority(
                 test_file,
                 priority_paths,
             )
             for index, targets in enumerate(batches, start=1):
+                resource_locks, isolated = self._full_suite_shard_resources(
+                    verification_root,
+                    test_file,
+                    tuple(targets),
+                )
                 shard_id = (
                     test_file
                     if len(batches) == 1
@@ -4186,9 +4295,13 @@ class AutoAgentsSelfRepairRunner:
                         shard_id=shard_id,
                         test_file=test_file,
                         targets=tuple(targets),
-                        parallel_safe=parallel_safe,
+                        parallel_safe="global:exclusive" not in resource_locks,
+                        resource_locks=resource_locks,
+                        isolated=isolated,
                         priority=priority,
-                        estimated_seconds=estimated_seconds,
+                        estimated_seconds=(
+                            estimated_seconds / max(1, len(batches))
+                        ),
                     )
                 )
         ordered = sorted(
@@ -4214,6 +4327,8 @@ class AutoAgentsSelfRepairRunner:
                             "test_file": item.test_file,
                             "targets": list(item.targets),
                             "parallel_safe": item.parallel_safe,
+                            "resource_locks": list(item.resource_locks),
+                            "isolated": item.isolated,
                             "priority": item.priority,
                             "estimated_seconds": item.estimated_seconds,
                         }
@@ -4238,7 +4353,7 @@ class AutoAgentsSelfRepairRunner:
         )
         tree_ref = tree.stdout.strip() if tree.returncode == 0 else ""
         return _search_stable_hash(
-            "full-suite-shard-plan-v1",
+            "full-suite-shard-plan-v2",
             tree_ref,
             test_files,
             SELF_REPAIR_FULL_SUITE_NODE_BATCH_SIZE,
@@ -4302,40 +4417,151 @@ class AutoAgentsSelfRepairRunner:
         return 100
 
     @staticmethod
-    def _full_suite_shard_parallel_safe(
+    def _full_suite_shard_resources(
         verification_root: Path,
         test_file: str,
-    ) -> bool:
-        paths = [verification_root / test_file]
-        paths.extend(
-            path
-            for path in (
-                verification_root / "conftest.py",
-                verification_root / "tests" / "conftest.py",
-            )
-            if path.is_file()
-        )
+        targets: tuple[str, ...],
+    ) -> tuple[tuple[str, ...], bool]:
+        path = verification_root / test_file
         try:
-            source = "\n".join(path.read_text("utf-8") for path in paths).lower()
+            source = path.read_text("utf-8")
+            tree = ast.parse(source, filename=test_file)
         except OSError:
-            return False
-        unsafe_tokens = (
-            "subprocess",
-            "multiprocessing",
-            "threading",
-            "socket",
-            "signal.",
-            "os.environ",
-            "patch.dict",
-            "chdir(",
-            "worktree",
-            "docker",
-            "localhost",
-            "127.0.0.1",
-            "background",
-            "start_new_session",
+            return (("global:exclusive",), False)
+        except SyntaxError:
+            return (("global:exclusive",), False)
+
+        target_names = {
+            target.rsplit("::", 1)[-1].split("[", 1)[0]
+            for target in targets
+            if "::" in target
+        }
+        definitions: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                definitions.setdefault(node.name, []).append(node)
+        selected = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in target_names
+        ]
+        lifecycle_names = {
+            "setup_module",
+            "teardown_module",
+            "setup_function",
+            "teardown_function",
+            "setUp",
+            "tearDown",
+            "setUpClass",
+            "tearDownClass",
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            class_targets = {
+                child.name
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and child.name in target_names
+            }
+            if class_targets:
+                selected.extend(
+                    child
+                    for child in node.body
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and child.name in lifecycle_names
+                )
+        selected.extend(
+            node
+            for nodes in definitions.values()
+            for node in nodes
+            if node.name in lifecycle_names
+            or any(
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and decorator.func.attr == "fixture"
+                and any(
+                    keyword.arg == "autouse"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True
+                    for keyword in decorator.keywords
+                )
+                for decorator in node.decorator_list
+            )
         )
-        return not any(token in source for token in unsafe_tokens)
+        selected = list({id(node): node for node in selected}.values())
+        selected_names = {node.name for node in selected}
+        while selected:
+            referenced: set[str] = set()
+            for node in selected:
+                referenced.update(
+                    child.id
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Name)
+                )
+                referenced.update(
+                    child.attr
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Attribute)
+                )
+                referenced.update(argument.arg for argument in node.args.args)
+            additions = [
+                node
+                for name in sorted(referenced - selected_names)
+                for node in definitions.get(name, [])
+            ]
+            if not additions:
+                break
+            selected.extend(additions)
+            selected_names.update(node.name for node in additions)
+        batch_source = "\n".join(
+            ast.get_source_segment(source, node) or "" for node in selected
+        )
+        if not batch_source.strip():
+            batch_source = source
+        lowered = batch_source.lower()
+        resources: set[str] = set()
+        explicit = re.findall(
+            r"self-repair-resource\s*:\s*([a-z0-9_.:, -]+)",
+            source,
+            flags=re.IGNORECASE,
+        )
+        for declaration in explicit:
+            resources.update(
+                item.strip()
+                for item in re.split(r"[, ]+", declaration)
+                if item.strip()
+            )
+        if "docker" in lowered:
+            resources.add("service:docker")
+        if "localhost" in lowered or "127.0.0.1" in lowered:
+            resources.add("network:fixed-port")
+        if "signal." in lowered or "os.kill" in lowered:
+            resources.add("process:signals")
+        if any(
+            token in lowered
+            for token in (
+                "shared_state",
+                "global fixture",
+                "global_fixture",
+            )
+        ):
+            resources.add("global:exclusive")
+        isolated = any(
+            token in lowered
+            for token in (
+                "subprocess",
+                "worktree",
+                "git ",
+                '["git"',
+                "chdir(",
+                ".write_text(",
+                ".write_bytes(",
+                ".unlink(",
+            )
+        )
+        return tuple(sorted(resources)), isolated
 
     def _full_suite_proof_cache_lookup(
         self,
@@ -4620,6 +4846,32 @@ class AutoAgentsSelfRepairRunner:
                 "updated_at": _utc_now_iso(),
             },
         )
+
+    def _report_full_suite_progress(
+        self,
+        suite_kind: str,
+        *,
+        completed: int,
+        total: int,
+        shard: str,
+    ) -> None:
+        detail = (
+            f"{suite_kind} full-suite progress {completed}/{total} "
+            f"last={shard}"
+        )
+        with self._full_suite_progress_lock:
+            store = getattr(self, "_experiment_store", None)
+            experiment = getattr(self, "_experiment", None)
+            if isinstance(store, SelfRepairExperimentStore) and isinstance(
+                experiment, SelfRepairExperiment
+            ):
+                store.record_health(
+                    experiment,
+                    status=f"validating_{suite_kind}_full_suite",
+                    detail=detail,
+                )
+            if completed in {0, total} or completed % 5 == 0:
+                print(f"[self-repair] {detail}", file=sys.stderr, flush=True)
 
     def _aggregate_full_suite_shards(
         self,
@@ -5760,6 +6012,7 @@ def append_self_repair_history(
     env: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
     merged = dict(os.environ if env is None else env)
+    merged[SELF_REPAIR_HEALTH_REBASE_ENV] = "1"
     if decision.fingerprint:
         merged[SELF_REPAIR_LAST_FINGERPRINT_ENV] = decision.fingerprint
         merged[SELF_REPAIR_REPEAT_COUNT_ENV] = str(max(1, decision.repeat_count))

@@ -24,6 +24,8 @@ from .process_supervision import (
 RUN_LOCK_FD_ENV = "AUTO_AGENTS_RUN_LOCK_FD"
 RUN_LOCK_KEY_ENV = "AUTO_AGENTS_RUN_LOCK_KEY"
 RUN_LOCK_TOKEN_ENV = "AUTO_AGENTS_RUN_TOKEN"
+SELF_REPAIR_HANDOFF_ENV = "AUTO_AGENTS_SELF_REPAIR_LAST_FINGERPRINT"
+SELF_REPAIR_HEALTH_REBASE_ENV = "AUTO_AGENTS_SELF_REPAIR_HEALTH_REBASE"
 
 
 def _safe_int(value: object) -> int:
@@ -49,6 +51,8 @@ class ProjectRunLock:
         self._fd: Optional[int] = None
         self._interrupted_snapshot: dict[str, object] = {}
         self.run_token = str(self._environ.get(RUN_LOCK_TOKEN_ENV, "")).strip() or uuid.uuid4().hex
+        self.health_lease_token = self.run_token
+        self.health_boundary_rebased = False
         self.workflow_kind = "run"
         self.subject_id = ""
         self._started_at = datetime.now(timezone.utc).isoformat()
@@ -66,6 +70,18 @@ class ProjectRunLock:
         inherited_fd = self._inherited_fd()
         if inherited_fd is not None:
             self._fd = inherited_fd
+            explicit_health_rebase = str(
+                self._environ.get(SELF_REPAIR_HEALTH_REBASE_ENV, "")
+            ).strip().lower() in {"1", "true", "yes"}
+            if explicit_health_rebase or str(
+                self._environ.get(SELF_REPAIR_HANDOFF_ENV, "")
+            ).strip():
+                # The OS lock remains inherited under its original token, but health
+                # observers and their durable action mailbox need a new lease after
+                # code replacement. A legacy sidecar exits when the manifest token
+                # changes, providing a mixed-version handoff without signaling it.
+                self.health_lease_token = uuid.uuid4().hex
+                self.health_boundary_rebased = True
             self._write_owner(inherited_fd)
             ACTIVE_PROCESSES.configure(self.project_root, self.run_token, self.control_path)
             return self

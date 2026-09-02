@@ -223,16 +223,150 @@ class HealthActionStore:
             finally:
                 self._release_file_lock(fd)
 
-    def next_pending(self, *, run_token: str) -> Optional[Dict[str, object]]:
-        payload = self._load()
-        for item in payload["requests"]:
-            if (
-                isinstance(item, dict)
-                and str(item.get("state", "")) == "pending"
-                and str(item.get("run_token", "")) == run_token
-            ):
-                return dict(item)
-        return None
+    @staticmethod
+    def _progress_action_is_current(
+        item: Dict[str, object],
+        current: Mapping[str, object],
+    ) -> bool:
+        reason = str(item.get("reason", ""))
+        progress_sensitive = bool(
+            reason.startswith("health_anomaly:")
+            or reason in {
+                "health_observer_disagreement",
+                "self_repair_stagnation",
+            }
+        )
+        if not progress_sensitive:
+            return True
+        evidence = item.get("evidence", {})
+        if not isinstance(evidence, dict):
+            return False
+        for key in ("run_token", "progress_schema_version", "state_digest"):
+            recorded = str(evidence.get(key, ""))
+            if not recorded or recorded != str(current.get(key, "")):
+                return False
+        if reason == "health_observer_disagreement":
+            return bool(
+                str(evidence.get("independent_progress_digest", ""))
+                == str(current.get("progress_digest", ""))
+            )
+        recorded_digest = str(evidence.get("progress_digest", ""))
+        if not recorded_digest or recorded_digest != str(
+            current.get("progress_digest", "")
+        ):
+            return False
+        recorded_progress = evidence.get("progress", {})
+        current_progress = current.get("progress", {})
+        if not isinstance(recorded_progress, dict) or not isinstance(current_progress, dict):
+            return False
+        for key in (
+            "attempt",
+            "execution_entries",
+            "status",
+            "resolution_set",
+        ):
+            if recorded_progress.get(key) != current_progress.get(key):
+                return False
+        return True
+
+    def next_pending(
+        self,
+        *,
+        run_token: str,
+        progress_identity: Optional[Mapping[str, object]] = None,
+    ) -> Optional[Dict[str, object]]:
+        """Return one live request and atomically retire stale progress actions."""
+
+        with self._lock:
+            fd = self._acquire_file_lock()
+            try:
+                payload = self._load()
+                changed = False
+                selected: Optional[Dict[str, object]] = None
+                for item in payload["requests"]:
+                    if (
+                        not isinstance(item, dict)
+                        or str(item.get("state", "")) != "pending"
+                        or str(item.get("run_token", "")) != run_token
+                    ):
+                        continue
+                    if progress_identity is not None and not self._progress_action_is_current(
+                        item, progress_identity
+                    ):
+                        item["state"] = "superseded"
+                        item["updated_at"] = utc_now()
+                        item["detail"] = (
+                            "superseded because durable session progress advanced "
+                            "after the health observation"
+                        )
+                        changed = True
+                        continue
+                    selected = dict(item)
+                    break
+                if changed:
+                    _atomic_json(self.path, payload)
+                return selected
+            finally:
+                self._release_file_lock(fd)
+
+    def supersede_stale_progress(
+        self,
+        *,
+        run_token: str,
+        progress_identity: Mapping[str, object],
+    ) -> int:
+        """Retire progress-sensitive requests invalidated by a newer save."""
+
+        with self._lock:
+            fd = self._acquire_file_lock()
+            try:
+                payload = self._load()
+                changed = 0
+                for item in payload["requests"]:
+                    if (
+                        not isinstance(item, dict)
+                        or str(item.get("state", "")) not in {"pending", "claimed"}
+                        or str(item.get("run_token", "")) != run_token
+                        or self._progress_action_is_current(item, progress_identity)
+                    ):
+                        continue
+                    item["state"] = "superseded"
+                    item["updated_at"] = utc_now()
+                    item["detail"] = (
+                        "superseded by a newer durable session progress boundary"
+                    )
+                    changed += 1
+                if changed:
+                    _atomic_json(self.path, payload)
+                return changed
+            finally:
+                self._release_file_lock(fd)
+
+    def supersede_obsolete(self, *, run_token: str, detail: str = "") -> int:
+        """Retire active requests issued under an earlier health lease."""
+        with self._lock:
+            fd = self._acquire_file_lock()
+            try:
+                payload = self._load()
+                changed = 0
+                for item in payload["requests"]:
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("state", "")) not in {"pending", "claimed"}:
+                        continue
+                    if str(item.get("run_token", "")) == run_token:
+                        continue
+                    item["state"] = "superseded"
+                    item["updated_at"] = utc_now()
+                    item["detail"] = (
+                        detail or "superseded by a fresh health lease"
+                    )[:2000]
+                    changed += 1
+                if changed:
+                    _atomic_json(self.path, payload)
+                return changed
+            finally:
+                self._release_file_lock(fd)
 
     def transition(self, request_id: str, state: str, *, detail: str = "") -> bool:
         if state not in self.STATES:
@@ -281,6 +415,7 @@ class HealthControlChannel:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._generation = 1
+        self._active_operation: Dict[str, object] = {}
 
     @property
     def enabled(self) -> bool:
@@ -329,6 +464,21 @@ class HealthControlChannel:
             return payload
 
         _mutate_control(self.project_root, update)
+
+    def set_active_operation(self, kind: str = "", label: str = "") -> None:
+        normalized = str(kind).strip()
+        if normalized:
+            started_epoch = time.time()
+            self._active_operation = {
+                "kind": normalized,
+                "label": str(label).strip(),
+                "started_at": utc_now(),
+                "started_epoch": started_epoch,
+                "heartbeat_epoch": started_epoch,
+            }
+        else:
+            self._active_operation = {}
+        self._publish()
 
     def close(self, *, reason: str = "") -> None:
         self._phase = TERMINAL_PHASE
@@ -386,9 +536,11 @@ class HealthControlChannel:
             "workflow_kind": self.workflow_kind,
             "subject_id": self._subject_id,
             "run_token": self.run_token,
+            "health_generation": self.run_token,
             "owner_pid": os.getpid(),
             "owner_start_ticks": process_start_ticks(os.getpid()),
             "process_phase": self._phase,
+            "active_operation": dict(self._active_operation),
             "desired_state": desired,
             "applied_state": "enabled" if self._enabled else "disabled",
             "generation": generation,
@@ -407,6 +559,9 @@ class HealthControlChannel:
 
     def _run(self) -> None:
         while not self._stop.wait(CONTROL_POLL_SECONDS):
+            if self._active_operation:
+                self._active_operation["heartbeat_epoch"] = time.time()
+                self._publish()
             payload = self._current()
             if not payload:
                 continue

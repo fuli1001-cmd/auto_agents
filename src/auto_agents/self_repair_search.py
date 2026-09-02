@@ -249,8 +249,8 @@ class SelfRepairExperiment:
                 "diagnosis-specific base/candidate differential crosses the root boundary"
             ),
             "validation:full_suite": "full-suite differential introduces no new failure",
-            "validation:final_review": (
-                "proof-aware adversarial review approves the fully validated candidate"
+            "validation:proof_seal": (
+                "deterministic sealing binds all proof to the immutable candidate"
             ),
         }.items():
             obligations.setdefault(
