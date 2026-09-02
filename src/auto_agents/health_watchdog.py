@@ -189,6 +189,19 @@ class IndependentHealthAuditor:
                     snapshot,
                     progress_lease_seconds=max(60, int(lease)),
                 )
+        active_operation = manifest.get("active_operation", {})
+        active_operation = (
+            dict(active_operation) if isinstance(active_operation, dict) else {}
+        )
+        operation_heartbeat = float(
+            active_operation.get("heartbeat_epoch", 0.0) or 0.0
+        )
+        active_operation_live = bool(
+            str(active_operation.get("kind", "")).strip()
+            and operation_heartbeat
+            and time.time() - operation_heartbeat
+            <= max(5.0, float(self.config.heartbeat_timeout_seconds))
+        )
         audit = {
             "schema_version": SIDECAR_SCHEMA_VERSION,
             "source": "independent_health_auditor",
@@ -197,6 +210,8 @@ class IndependentHealthAuditor:
             "snapshot": snapshot.to_dict(),
             "intervention_active": intervention_active,
             "resume_epoch": resume_epoch,
+            "active_operation": active_operation,
+            "active_operation_live": active_operation_live,
             "updated_at": utc_now(),
         }
         _atomic_json(self.root / "auditor-snapshot.json", audit)
@@ -216,6 +231,12 @@ class IndependentHealthAuditor:
                 sequence=snapshot.sequence,
             )
         if str(manifest.get("process_phase", "")) == "self_repair":
+            if active_operation_live:
+                # A self-repair provider call or validation operation has its own
+                # bounded timeout/progress supervision.  The run-state vector is
+                # intentionally stable while that isolated work is in flight, so
+                # the control-channel heartbeat is the relevant liveness signal.
+                self.self_repair_progress_at = time.time()
             if snapshot.progress.digest != self.self_repair_progress_digest:
                 self.self_repair_progress_digest = snapshot.progress.digest
                 self.self_repair_progress_at = time.time()
@@ -223,7 +244,10 @@ class IndependentHealthAuditor:
                 60.0,
                 float(lease) * float(self.config.goal_stall_lease_multiplier),
             )
-            if time.time() - self.self_repair_progress_at >= self_repair_lease:
+            if (
+                not active_operation_live
+                and time.time() - self.self_repair_progress_at >= self_repair_lease
+            ):
                 self._request(
                     "diagnose",
                     "self_repair_stagnation",

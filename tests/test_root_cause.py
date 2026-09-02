@@ -1291,6 +1291,18 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertIn("3 consecutive", result.reason)
             self.assertIn("candidate=c5", result.summary)
 
+    def test_self_repair_health_preemption_is_infrastructure_interruption(self):
+        self.assertTrue(
+            AutoAgentsSelfRepairRunner._is_infrastructure_candidate_error(
+                RuntimeError("self_repair_stagnation")
+            )
+        )
+        self.assertTrue(
+            AutoAgentsSelfRepairRunner._is_infrastructure_candidate_error(
+                RuntimeError("health_quiesce")
+            )
+        )
+
     def test_recoverable_candidate_stops_new_generation_and_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

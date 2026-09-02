@@ -243,6 +243,50 @@ class HealthWatchTests(unittest.TestCase):
         )
         self.assertIsNone(anomaly)
 
+    def test_run_auditor_uses_live_self_repair_operation_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            bootstrap_project(project, "demo")
+            state = load_run_state(project)
+            manifest = {
+                "run_token": "token",
+                "workflow_kind": "run",
+                "subject_id": state.run_id,
+                "process_phase": "self_repair",
+                "active_operation": {
+                    "kind": "self_repair",
+                    "label": "provider route repair",
+                    "heartbeat_epoch": time.time(),
+                },
+            }
+            auditor = IndependentHealthAuditor(project, manifest)
+            auditor.observe_once(manifest)
+
+            auditor.self_repair_progress_at = time.time() - 10_000
+            auditor.observe_once(manifest)
+
+            self.assertIsNone(auditor.actions.next_pending(run_token="token"))
+            snapshot = json.loads(
+                (auditor.root / "auditor-snapshot.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(snapshot["active_operation_live"])
+
+            stale_manifest = {
+                **manifest,
+                "active_operation": {
+                    **manifest["active_operation"],
+                    "heartbeat_epoch": time.time() - 10_000,
+                },
+            }
+            auditor.self_repair_progress_at = time.time() - 10_000
+            auditor.observe_once(stale_manifest)
+
+            request = auditor.actions.next_pending(run_token="token")
+            self.assertIsNotNone(request)
+            self.assertEqual(request["reason"], "self_repair_stagnation")
+
     def test_removed_progress_requires_declared_rewind(self) -> None:
         evaluator = RunHealthEvaluator(HealthWatchConfig())
         evaluator.evaluate(_snapshot(1, 0, atoms=("task:a",)), progress_lease_seconds=60)
@@ -1188,6 +1232,54 @@ class HealthWatchTests(unittest.TestCase):
             updated = load_run_state(project)
             self.assertEqual(updated.active_repair_case_id, case.case_id)
             self.assertEqual(updated.repair_phase, "quiescing")
+
+    def test_nested_self_repair_stagnation_does_not_start_recursive_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary) / "project"
+            Orchestrator.init_project(project, "demo", "mock")
+            state = load_run_state(project)
+            state.active_repair_case_id = "original-repair"
+            state.repair_phase = "self_repairing"
+            save_run_state(project, state)
+            case = RepairCase(
+                case_id="nested-stagnation",
+                run_id=state.run_id,
+                source="health_watch",
+                kind="self_repair_stagnation",
+                severity="confirmed",
+                symptom="self repair progress did not change",
+            )
+            RepairCaseStore(project, state.run_id).save(case)
+            request = HealthActionRequest(
+                action="diagnose",
+                anomaly=HealthAnomaly(
+                    kind="self_repair_stagnation",
+                    severity="confirmed",
+                    stage="",
+                    root_fingerprint=case.root_fingerprint,
+                    reason=case.symptom,
+                    expected_postconditions=("self repair resumes",),
+                ),
+                repair_case_id=case.case_id,
+            )
+            orchestrator = Orchestrator(project)
+
+            with patch(
+                "auto_agents.self_repair.adjudicate_repair_case"
+            ) as adjudicate:
+                result = orchestrator._handle_health_action(request)
+
+            self.assertEqual(result.case_id, case.case_id)
+            adjudicate.assert_not_called()
+            updated = load_run_state(project)
+            self.assertEqual(updated.active_repair_case_id, "original-repair")
+            self.assertEqual(updated.repair_phase, "self_repairing")
+            stored = RepairCaseStore(project, state.run_id).load(case.case_id)
+            self.assertEqual(stored.status, "superseded")
+            self.assertEqual(
+                stored.history[-1]["event"],
+                "nested_self_repair_stagnation_suppressed",
+            )
 
     def test_non_engine_health_case_is_routed_without_blocking_run(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

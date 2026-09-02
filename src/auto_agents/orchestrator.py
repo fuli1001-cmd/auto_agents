@@ -533,6 +533,7 @@ class Orchestrator:
     RECOVERY_STOP_OWNERS = frozenset(
         {
             "external_provider",
+            "provider_research",
             "target_project",
             "user_input",
             "verification_contract",
@@ -541,6 +542,7 @@ class Orchestrator:
     )
     RECOVERY_STOP_CATEGORIES = {
         "external_provider": "recovery_provider_action_required",
+        "provider_research": "recovery_provider_research_action_required",
         "target_project": "recovery_external_action_required",
         "user_input": "user_input_required",
         "verification_contract": "recovery_contract_action_required",
@@ -554,8 +556,16 @@ class Orchestrator:
             "recovery_evidence_change_required",
             "recovery_infrastructure_action_required",
             "recovery_provider_action_required",
+            "recovery_provider_research_action_required",
         }
     )
+    DETERMINISTIC_PROVIDER_STOP_INVARIANTS = frozenset(
+        {
+            "replan_split_depth_limit",
+            "repeated_failure_no_progress",
+        }
+    )
+    PROVIDER_ARTIFACT_BINDING_SCHEMA_VERSION = 1
     RECOVERY_PREREQUISITE_SCHEMA_VERSION = 1
 
     def __init__(
@@ -1330,11 +1340,9 @@ class Orchestrator:
         self,
         incident: Dict[str, object],
     ) -> Tuple[bool, str]:
-        references = {
-            self._normalize_relative_artifact_path(item)
-            for item in incident.get("provider_reference_paths", []) or []
-            if self._normalize_relative_artifact_path(item)
-        }
+        references = self._provider_reference_document_paths(
+            incident.get("provider_reference_paths", []) or []
+        )
         if not references:
             references = self._provider_reference_paths_from_review(
                 str(incident.get("review", ""))
@@ -1482,9 +1490,12 @@ class Orchestrator:
             route_result["proof_evidence"] = dict(
                 incident.get("proof_evidence", {})
             )
-        route_stage, _feedback = self._verification_failure_owner_route(
-            task,
-            route_result,
+        route_stage, _feedback, _references = (
+            self._verification_failure_owner_route_details(
+                task,
+                route_result,
+                tasks=state.tasks,
+            )
         )
         if route_stage == "provider_research":
             return False
@@ -5220,13 +5231,108 @@ class Orchestrator:
 
     def _active_provider_reference_paths(self) -> Set[str]:
         trace = load_requirements_trace(self.project_root)
-        paths: Set[str] = set()
-        for requirement in external_doc_requirements(trace):
-            for reference in provider_reference_paths(requirement):
-                normalized = self._normalize_relative_artifact_path(reference)
-                if normalized.startswith(".auto-agents/docs/provider_references/"):
-                    paths.add(normalized)
-        return paths
+        return self._provider_reference_document_paths(
+            reference
+            for requirement in external_doc_requirements(trace)
+            for reference in provider_reference_paths(requirement)
+        )
+
+    def _canonical_provider_reference_document_path(
+        self,
+        reference: object,
+    ) -> str:
+        """Return a safe canonical provider Markdown path or an empty string."""
+
+        normalized = self._normalize_relative_artifact_path(reference)
+        prefix = ".auto-agents/docs/provider_references/"
+        if not normalized.startswith(prefix):
+            return ""
+        relative_document = normalized[len(prefix) :]
+        if (
+            not relative_document
+            or not normalized.endswith(".md")
+            or any(
+                part in {"", ".", ".."}
+                for part in relative_document.split("/")
+            )
+        ):
+            return ""
+
+        try:
+            project_root = self.project_root.resolve()
+            provider_root = provider_references_dir(self.project_root).resolve()
+            provider_root.relative_to(project_root)
+            candidate = self.project_root / normalized
+            resolved = candidate.resolve()
+            resolved.relative_to(provider_root)
+            if candidate.exists() and not candidate.is_file():
+                return ""
+        except (OSError, RuntimeError, ValueError):
+            return ""
+        if resolved == provider_root:
+            return ""
+        return normalized
+
+    def _provider_reference_document_paths(
+        self,
+        references: Iterable[object],
+    ) -> Set[str]:
+        """Return canonical provider documents, excluding owner metadata.
+
+        Provider ownership evidence may include both canonical documents and
+        ``provider_references.lock.json``. Only the documents are lock-entry
+        subjects and may be marked ``needs_refresh``.
+        """
+
+        return {
+            canonical
+            for reference in references
+            for canonical in [
+                self._canonical_provider_reference_document_path(reference)
+            ]
+            if canonical
+        }
+
+    def _canonical_provider_reference_lock_path(
+        self,
+        reference: object,
+    ) -> str:
+        """Return the canonical in-project provider lock path, if safe."""
+
+        normalized = self._normalize_relative_artifact_path(reference)
+        lock_path = self._relative_repo_path(
+            provider_references_lock_path(self.project_root)
+        )
+        if normalized != lock_path:
+            return ""
+        try:
+            project_root = self.project_root.resolve()
+            candidate = self.project_root / normalized
+            resolved = candidate.resolve()
+            resolved.relative_to(project_root)
+            if candidate.exists() and not candidate.is_file():
+                return ""
+        except (OSError, RuntimeError, ValueError):
+            return ""
+        return normalized
+
+    def _provider_research_evidence_paths(
+        self,
+        references: Iterable[object],
+    ) -> Set[str]:
+        """Return canonical provider documents plus the canonical lock path."""
+
+        candidates = list(references)
+        evidence_paths = self._provider_reference_document_paths(candidates)
+        evidence_paths.update(
+            canonical
+            for reference in candidates
+            for canonical in [
+                self._canonical_provider_reference_lock_path(reference)
+            ]
+            if canonical
+        )
+        return evidence_paths
 
     def _provider_reference_paths_from_review(self, review_text: str) -> Set[str]:
         active_paths = self._active_provider_reference_paths()
@@ -5276,11 +5382,9 @@ class Orchestrator:
         *,
         reason: str,
     ) -> List[str]:
-        normalized_refs = sorted({
-            self._normalize_relative_artifact_path(reference)
-            for reference in references
-            if self._normalize_relative_artifact_path(reference)
-        })
+        normalized_refs = sorted(
+            self._provider_reference_document_paths(references)
+        )
         if not normalized_refs:
             return []
         lock = load_provider_references_lock(self.project_root)
@@ -5336,17 +5440,32 @@ class Orchestrator:
 
     def _artifact_fingerprints(self, relative_paths: Iterable[str]) -> Dict[str, str]:
         fingerprints: Dict[str, str] = {}
+        try:
+            project_root = self.project_root.resolve()
+        except (OSError, RuntimeError):
+            return fingerprints
         for relative_path in sorted({
             self._normalize_relative_artifact_path(path)
             for path in relative_paths
             if self._normalize_relative_artifact_path(path)
         }):
-            path = self.project_root / relative_path
-            if not path.exists() or not path.is_file():
+            relative = Path(relative_path)
+            if relative.is_absolute() or ".." in relative.parts:
+                fingerprints[relative_path] = "unsafe"
+                continue
+            try:
+                resolved = (self.project_root / relative).resolve()
+                resolved.relative_to(project_root)
+            except (OSError, RuntimeError, ValueError):
+                fingerprints[relative_path] = "unsafe"
+                continue
+            if not resolved.exists() or not resolved.is_file():
                 fingerprints[relative_path] = "missing"
                 continue
             try:
-                fingerprints[relative_path] = hashlib.sha256(path.read_bytes()).hexdigest()
+                fingerprints[relative_path] = hashlib.sha256(
+                    resolved.read_bytes()
+                ).hexdigest()
             except OSError:
                 fingerprints[relative_path] = "unreadable"
         return fingerprints
@@ -5430,15 +5549,44 @@ class Orchestrator:
             / "recovery_incidents"
             / f"{incident_id}.json"
         )
-        provider_references = sorted({
-            self._normalize_relative_artifact_path(item)
-            for item in gate_result.get("provider_reference_paths", []) or []
-            if self._normalize_relative_artifact_path(item)
-        })
+        raw_provider_references = gate_result.get(
+            "provider_reference_paths",
+            [],
+        )
+        provider_candidates = (
+            raw_provider_references
+            if isinstance(raw_provider_references, (list, tuple, set))
+            else []
+        )
+        provider_references = sorted(
+            self._provider_reference_document_paths(provider_candidates)
+        )
         if target_stage == "provider_research" and not provider_references:
             provider_references = sorted(
                 self._provider_reference_paths_from_review(
                     str(gate_result.get("review", ""))
+                )
+            )
+        raw_evidence_refs = gate_result.get("evidence_refs", [])
+        evidence_candidates = (
+            raw_evidence_refs
+            if isinstance(raw_evidence_refs, (list, tuple, set))
+            and raw_evidence_refs
+            else provider_candidates
+        )
+        evidence_refs = {
+            self._normalize_relative_artifact_path(item)
+            for item in evidence_candidates
+            if self._normalize_relative_artifact_path(item)
+        }
+        if target_stage == "provider_research":
+            evidence_refs = self._provider_research_evidence_paths(
+                evidence_refs
+            )
+            evidence_refs.update(provider_references)
+            evidence_refs.add(
+                self._relative_repo_path(
+                    provider_references_lock_path(self.project_root)
                 )
             )
         provider_lock_before: Dict[str, object] = {}
@@ -5496,6 +5644,7 @@ class Orchestrator:
                     gate_result.get("comparable_failures", True),
                 )
             ),
+            "evidence_refs": sorted(evidence_refs),
             "provider_reference_paths": provider_references,
             "provider_lock_before": provider_lock_before,
             "reason": str(gate_result.get("reason", "")).strip(),
@@ -5515,11 +5664,9 @@ class Orchestrator:
         git_ref: str,
         references: Iterable[str],
     ) -> Dict[str, object]:
-        normalized_references = {
-            self._normalize_relative_artifact_path(reference)
-            for reference in references
-            if self._normalize_relative_artifact_path(reference)
-        }
+        normalized_references = self._provider_reference_document_paths(
+            references
+        )
         if not git_ref or not normalized_references:
             return {}
         raw = self._git_text(
@@ -8099,6 +8246,36 @@ class Orchestrator:
         resume_after_action = False
         try:
             state = load_run_state(self.project_root)
+            health_runtime = getattr(self, "_workflow_health_runtime", None)
+            health_channel = getattr(health_runtime, "channel", None)
+            process_phase = str(
+                getattr(health_channel, "process_phase", "")
+            ).strip()
+            nested_self_repair_stagnation = bool(
+                repair_case.kind == "self_repair_stagnation"
+                and (
+                    process_phase == "self_repair"
+                    or (
+                        state.active_repair_case_id
+                        and state.active_repair_case_id != repair_case.case_id
+                        and state.repair_phase
+                    )
+                )
+            )
+            if nested_self_repair_stagnation:
+                # Do not recursively diagnose an auto_agents repair while that
+                # repair is already in progress.  Provider smart-timeout owns the
+                # interrupted operation and can resume it after this stale action
+                # is acknowledged.  Preserve the original repair case and phase.
+                repair_case.status = "superseded"
+                repair_case.history.append(
+                    {
+                        "event": "nested_self_repair_stagnation_suppressed",
+                        "at": utc_now_iso(),
+                    }
+                )
+                RepairCaseStore(self.project_root, state.run_id).save(repair_case)
+                return repair_case
             state.active_repair_case_id = repair_case.case_id
             state.repair_phase = "diagnosing"
             advance_run_health_control(
@@ -8295,6 +8472,19 @@ class Orchestrator:
 
     def mark_self_repair_applied(self, commit_sha: str) -> RunState:
         state = load_run_state(self.project_root)
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        blocker.update(
+            {
+                "status": "retrying",
+                "self_repair_commit": commit_sha,
+                "updated_at": utc_now_iso(),
+            }
+        )
+        state.active_blocker = blocker
         if state.active_repair_case_id:
             repair_case = RepairCaseStore(
                 self.project_root, state.run_id
@@ -8314,15 +8504,6 @@ class Orchestrator:
                 state.last_error = ""
                 save_run_state(self.project_root, state)
                 return state
-        blocker = dict(state.active_blocker)
-        blocker.update(
-            {
-                "status": "retrying",
-                "self_repair_commit": commit_sha,
-                "updated_at": utc_now_iso(),
-            }
-        )
-        state.active_blocker = blocker
         state.status = "pending"
         state.last_error = ""
         incident = self._incident_store(state).active(state)
@@ -11784,22 +11965,13 @@ class Orchestrator:
             and terminal_task is not None
             and terminal_owner is not None
         ):
-            resume_evidence = self._terminal_recovery_resume_evidence(
+            if self._reconcile_invalid_restored_recovery_stop(
                 state,
                 state.tasks,
                 terminal_task,
                 terminal_owner,
                 terminal_route,
-            )
-            if (
-                not bool(resume_evidence["changed"])
-                and self._reconcile_invalid_restored_recovery_stop(
-                    state,
-                    state.tasks,
-                    terminal_task,
-                    terminal_owner,
-                    terminal_route,
-                )
+                require_current_artifacts=False,
             ):
                 if isinstance(state.active_blocker, dict):
                     blocker = {**blocker, **dict(state.active_blocker)}
@@ -17135,6 +17307,7 @@ class Orchestrator:
             "raw_output",
             "raw_log_path",
             "failure_signature",
+            "evidence_refs",
             "provider_reference_paths",
             "route_source",
             "rewind_to_stage",
@@ -19418,6 +19591,41 @@ class Orchestrator:
         ).hexdigest()[:24]
 
     @staticmethod
+    def _recovery_progress_fingerprint(
+        evidence_fingerprint: str,
+        artifact_fingerprints: Mapping[str, str],
+    ) -> str:
+        """Bind no-progress decisions to explicitly owned artifact content."""
+
+        if not artifact_fingerprints:
+            return evidence_fingerprint
+        payload = {
+            "evidence_fingerprint": evidence_fingerprint,
+            "artifact_fingerprints": {
+                str(path): str(fingerprint)
+                for path, fingerprint in sorted(
+                    artifact_fingerprints.items()
+                )
+            },
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:24]
+
+    @staticmethod
+    def _recorded_recovery_progress_fingerprint(
+        entry: Mapping[str, object],
+        *,
+        artifact_sensitive: bool,
+    ) -> str:
+        progress_fingerprint = str(
+            entry.get("progress_fingerprint", "")
+        ).strip()
+        if progress_fingerprint or artifact_sensitive:
+            return progress_fingerprint
+        return str(entry.get("evidence_fingerprint", "")).strip()
+
+    @staticmethod
     def _append_recovery_history_once(task: TaskSpec, entry: Dict[str, object]) -> None:
         identity = (
             entry.get("epoch"),
@@ -19470,11 +19678,27 @@ class Orchestrator:
         stop_category: str = "",
         prerequisite_keys: Optional[List[str]] = None,
         evidence_refs: Optional[List[str]] = None,
+        evidence_artifact_fingerprints: Optional[Dict[str, str]] = None,
+        provider_artifact_binding: Optional[Dict[str, object]] = None,
         prerequisite_fingerprint: str = "",
+        failure_ids: Optional[List[str]] = None,
     ) -> None:
         owner = lineage_owner or task
         normalized_prerequisites = list(prerequisite_keys or [])
         normalized_evidence_refs = list(evidence_refs or [])
+        normalized_failure_ids = sorted(
+            {
+                str(failure_id).strip()
+                for failure_id in failure_ids or []
+                if str(failure_id).strip()
+            }
+        )
+        normalized_artifact_fingerprints = dict(
+            evidence_artifact_fingerprints or {}
+        )
+        normalized_provider_artifact_binding = dict(
+            provider_artifact_binding or {}
+        )
         if normalized_prerequisites and not prerequisite_fingerprint:
             prerequisite_fingerprint = self._recovery_prerequisite_fingerprint(
                 state,
@@ -19484,6 +19708,11 @@ class Orchestrator:
                 prerequisite_keys=normalized_prerequisites,
                 evidence_refs=normalized_evidence_refs,
             )
+        evidence_fingerprint = self._recovery_evidence_fingerprint(
+            owner,
+            state=state,
+            tasks=state.tasks,
+        )
         route = {
             "task_id": task.task_id,
             "task_origin": task.task_origin,
@@ -19493,11 +19722,7 @@ class Orchestrator:
             "max_rounds": int(self.config.execution.recovery.max_rounds),
             "failure_kind": failure_kind,
             "failure_signature": signature,
-            "evidence_fingerprint": self._recovery_evidence_fingerprint(
-                owner,
-                state=state,
-                tasks=state.tasks,
-            ),
+            "evidence_fingerprint": evidence_fingerprint,
             "judge_decision": judge_decision,
             "judge_source": judge_source,
             "outcome": outcome,
@@ -19505,22 +19730,39 @@ class Orchestrator:
             "repair_task_ids": list(repair_task_ids or []),
             "engine_invariant": engine_invariant,
         }
+        if normalized_artifact_fingerprints:
+            route["progress_fingerprint"] = (
+                self._recovery_progress_fingerprint(
+                    evidence_fingerprint,
+                    normalized_artifact_fingerprints,
+                )
+            )
+        if normalized_failure_ids:
+            route["failure_ids"] = normalized_failure_ids
         if (
             stop_owner
             or stop_category
             or normalized_prerequisites
             or normalized_evidence_refs
+            or normalized_artifact_fingerprints
+            or normalized_provider_artifact_binding
             or prerequisite_fingerprint
         ):
-            route.update(
-                {
-                    "stop_owner": stop_owner,
-                    "stop_category": stop_category,
-                    "prerequisite_keys": normalized_prerequisites,
-                    "evidence_refs": normalized_evidence_refs,
-                    "prerequisite_fingerprint": prerequisite_fingerprint,
-                }
-            )
+            stop_details: Dict[str, object] = {
+                "stop_owner": stop_owner,
+                "stop_category": stop_category,
+                "prerequisite_keys": normalized_prerequisites,
+                "evidence_refs": normalized_evidence_refs,
+                "evidence_artifact_fingerprints": (
+                    normalized_artifact_fingerprints
+                ),
+                "prerequisite_fingerprint": prerequisite_fingerprint,
+            }
+            if normalized_provider_artifact_binding:
+                stop_details["provider_artifact_binding"] = (
+                    normalized_provider_artifact_binding
+                )
+            route.update(stop_details)
         state.last_recovery_route = route
 
     @staticmethod
@@ -19645,7 +19887,7 @@ class Orchestrator:
             "Every STOP must name one owner, one or more prerequisite_keys, and one or more exact refs from evidence_catalog.",
             "Do not modify files or propose changes to auto_agents itself.",
             "Return exactly one line: RECOVERY_DECISION: followed by a JSON object.",
-            'Schema: {"decision":"CONTINUE|REPLAN|STOP","reason":"...","actionable_items":["..."],"split_axis":["..."],"owner":"external_provider|target_project|user_input|verification_contract|verification_infrastructure","prerequisite_keys":["..."],"evidence_refs":["exact evidence_catalog key"]}',
+            'Schema: {"decision":"CONTINUE|REPLAN|STOP","reason":"...","actionable_items":["..."],"split_axis":["..."],"owner":"external_provider|provider_research|target_project|user_input|verification_contract|verification_infrastructure","prerequisite_keys":["..."],"evidence_refs":["exact evidence_catalog key"]}',
             "RECOVERY_EVIDENCE_BEGIN",
             json.dumps(evidence, ensure_ascii=False, indent=2),
             "RECOVERY_EVIDENCE_END",
@@ -20090,6 +20332,15 @@ class Orchestrator:
             ),
             owner,
         )
+        if self._reconcile_invalid_restored_recovery_stop(
+            state,
+            tasks,
+            routed_task,
+            owner,
+            route,
+            require_current_artifacts=False,
+        ):
+            return True
         resume_evidence = self._terminal_recovery_resume_evidence(
             state,
             tasks,
@@ -20431,6 +20682,25 @@ class Orchestrator:
                     entry.get("prerequisite_keys", []) or []
                 )
                 evidence_refs = list(entry.get("evidence_refs", []) or [])
+                evidence_artifact_fingerprints = (
+                    dict(entry.get("evidence_artifact_fingerprints", {}))
+                    if isinstance(
+                        entry.get("evidence_artifact_fingerprints", {}),
+                        dict,
+                    )
+                    else {}
+                )
+                provider_artifact_binding_present = (
+                    "provider_artifact_binding" in entry
+                )
+                raw_provider_artifact_binding = entry.get(
+                    "provider_artifact_binding"
+                )
+                provider_artifact_binding = (
+                    dict(raw_provider_artifact_binding)
+                    if isinstance(raw_provider_artifact_binding, dict)
+                    else raw_provider_artifact_binding
+                )
                 prerequisite_fingerprint = str(
                     entry.get("prerequisite_fingerprint", "")
                 )
@@ -20439,19 +20709,25 @@ class Orchestrator:
                     or stop_category
                     or prerequisite_keys
                     or evidence_refs
+                    or evidence_artifact_fingerprints
+                    or provider_artifact_binding_present
                     or prerequisite_fingerprint
                 ):
-                    candidate.update(
-                        {
-                            "stop_owner": stop_owner,
-                            "stop_category": stop_category,
-                            "prerequisite_keys": prerequisite_keys,
-                            "evidence_refs": evidence_refs,
-                            "prerequisite_fingerprint": (
-                                prerequisite_fingerprint
-                            ),
-                        }
-                    )
+                    stop_details: Dict[str, object] = {
+                        "stop_owner": stop_owner,
+                        "stop_category": stop_category,
+                        "prerequisite_keys": prerequisite_keys,
+                        "evidence_refs": evidence_refs,
+                        "evidence_artifact_fingerprints": (
+                            evidence_artifact_fingerprints
+                        ),
+                        "prerequisite_fingerprint": prerequisite_fingerprint,
+                    }
+                    if provider_artifact_binding_present:
+                        stop_details["provider_artifact_binding"] = (
+                            provider_artifact_binding
+                        )
+                    candidate.update(stop_details)
                 score = (
                     round_number,
                     int(bool(signature)),
@@ -20589,6 +20865,102 @@ class Orchestrator:
         routed_task = by_id.get(str(canonical.get("task_id", "")).strip())
         return canonical, routed_task or owner, owner
 
+    def _validated_recovery_route_artifacts(
+        self,
+        route: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Validate persisted artifact keys without reading their contents."""
+
+        raw_fingerprints = route.get("evidence_artifact_fingerprints", {})
+        if not isinstance(raw_fingerprints, dict):
+            return {
+                "valid": False,
+                "reason": "recovery artifact fingerprints must be an object",
+                "fingerprints": {},
+                "paths": [],
+            }
+        if not raw_fingerprints:
+            return {
+                "valid": True,
+                "reason": "recovery route has no artifact fingerprints",
+                "fingerprints": {},
+                "paths": [],
+            }
+        if str(route.get("stop_owner", "")).strip() != "provider_research":
+            return {
+                "valid": False,
+                "reason": (
+                    "artifact fingerprints are only supported for canonical "
+                    "provider_research routes"
+                ),
+                "fingerprints": {},
+                "paths": [],
+            }
+
+        raw_evidence_refs = route.get("evidence_refs", [])
+        if not isinstance(raw_evidence_refs, list):
+            return {
+                "valid": False,
+                "reason": "recovery artifact evidence refs must be a list",
+                "fingerprints": {},
+                "paths": [],
+            }
+
+        evidence_paths: List[str] = []
+        for reference in raw_evidence_refs:
+            path, selector = self._split_evidence_ref(str(reference))
+            normalized = self._normalize_relative_artifact_path(path)
+            if selector or not normalized:
+                return {
+                    "valid": False,
+                    "reason": "recovery artifact evidence refs are not canonical",
+                    "fingerprints": {},
+                    "paths": [],
+                }
+            evidence_paths.append(normalized)
+
+        normalized_fingerprints: Dict[str, str] = {}
+        for raw_path, fingerprint in raw_fingerprints.items():
+            path, selector = self._split_evidence_ref(str(raw_path))
+            normalized = self._normalize_relative_artifact_path(path)
+            if (
+                selector
+                or not normalized
+                or normalized in normalized_fingerprints
+            ):
+                return {
+                    "valid": False,
+                    "reason": "recovery artifact fingerprint keys are not canonical",
+                    "fingerprints": {},
+                    "paths": [],
+                }
+            normalized_fingerprints[normalized] = str(fingerprint)
+
+        evidence_path_set = set(evidence_paths)
+        canonical_paths = self._provider_research_evidence_paths(
+            evidence_path_set | set(normalized_fingerprints)
+        )
+        if (
+            not evidence_path_set
+            or canonical_paths != evidence_path_set
+            or set(normalized_fingerprints) != evidence_path_set
+        ):
+            return {
+                "valid": False,
+                "reason": (
+                    "provider recovery artifact paths are not canonical and "
+                    "confined to the project"
+                ),
+                "fingerprints": {},
+                "paths": [],
+            }
+        return {
+            "valid": True,
+            "reason": "provider recovery artifact paths are canonical",
+            "fingerprints": normalized_fingerprints,
+            "paths": sorted(canonical_paths),
+        }
+
     def _terminal_recovery_resume_evidence(
         self,
         state: RunState,
@@ -20603,16 +20975,64 @@ class Orchestrator:
             tasks=tasks,
         )
         previous_evidence = str(route.get("evidence_fingerprint", "")).strip()
+        raw_prerequisite_keys = route.get("prerequisite_keys", [])
         prerequisite_keys = [
             str(item).strip()
-            for item in route.get("prerequisite_keys", []) or []
+            for item in (
+                raw_prerequisite_keys
+                if isinstance(raw_prerequisite_keys, list)
+                else []
+            )
             if str(item).strip()
         ]
+        raw_evidence_refs = route.get("evidence_refs", [])
         evidence_refs = [
             str(item).strip()
-            for item in route.get("evidence_refs", []) or []
+            for item in (
+                raw_evidence_refs
+                if isinstance(raw_evidence_refs, list)
+                else []
+            )
             if str(item).strip()
         ]
+        artifact_validation = self._validated_recovery_route_artifacts(route)
+        previous_artifact_fingerprints = dict(
+            artifact_validation.get("fingerprints", {})
+        )
+        if not bool(artifact_validation.get("valid")):
+            return {
+                "changed": False,
+                "resume_allowed": False,
+                "evidence_changed": False,
+                "evidence_artifacts_changed": False,
+                "evidence_unknown": (
+                    not previous_evidence or not current_evidence
+                ),
+                "evidence_comparable": bool(
+                    previous_evidence and current_evidence
+                ),
+                "prerequisite_changed": False,
+                "artifact_paths_valid": False,
+                "artifact_path_validation_reason": str(
+                    artifact_validation.get(
+                        "reason",
+                        "invalid recovery artifact paths",
+                    )
+                ),
+                "previous_evidence_fingerprint": previous_evidence,
+                "current_evidence_fingerprint": current_evidence,
+                "previous_prerequisite_fingerprint": str(
+                    route.get("prerequisite_fingerprint", "")
+                ).strip(),
+                "current_prerequisite_fingerprint": "",
+                "previous_evidence_artifact_fingerprints": {},
+                "current_evidence_artifact_fingerprints": {},
+            }
+        current_artifact_fingerprints = (
+            self._artifact_fingerprints(previous_artifact_fingerprints)
+            if previous_artifact_fingerprints
+            else {}
+        )
         previous_prerequisite = str(
             route.get("prerequisite_fingerprint", "")
         ).strip()
@@ -20638,22 +21058,43 @@ class Orchestrator:
             and current_prerequisite
             and previous_prerequisite != current_prerequisite
         )
+        evidence_artifacts_changed = bool(
+            previous_artifact_fingerprints
+            and current_artifact_fingerprints
+            != previous_artifact_fingerprints
+        )
         evidence_unknown = not previous_evidence or not current_evidence
         return {
-            "changed": evidence_changed or prerequisite_changed,
+            "changed": (
+                evidence_changed
+                or prerequisite_changed
+                or evidence_artifacts_changed
+            ),
             "resume_allowed": (
                 evidence_changed
                 or prerequisite_changed
+                or evidence_artifacts_changed
                 or evidence_unknown
             ),
             "evidence_changed": evidence_changed,
+            "evidence_artifacts_changed": evidence_artifacts_changed,
             "evidence_unknown": evidence_unknown,
             "evidence_comparable": not evidence_unknown,
             "prerequisite_changed": prerequisite_changed,
+            "artifact_paths_valid": True,
+            "artifact_path_validation_reason": str(
+                artifact_validation.get("reason", "")
+            ),
             "previous_evidence_fingerprint": previous_evidence,
             "current_evidence_fingerprint": current_evidence,
             "previous_prerequisite_fingerprint": previous_prerequisite,
             "current_prerequisite_fingerprint": current_prerequisite,
+            "previous_evidence_artifact_fingerprints": (
+                previous_artifact_fingerprints
+            ),
+            "current_evidence_artifact_fingerprints": (
+                current_artifact_fingerprints
+            ),
         }
 
     def _reopen_terminal_recovery_epoch(
@@ -20669,6 +21110,300 @@ class Orchestrator:
             task.recovery_round = 0
         state.last_recovery_route = {}
 
+    def _restored_recovery_stop_failure_ids(
+        self,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        route: Mapping[str, object],
+    ) -> List[str]:
+        """Recover the exact failure set bound to a persisted STOP history."""
+
+        epoch = int(route.get("epoch", owner.recovery_epoch) or 0)
+        terminal_round = int(route.get("round", 0) or 0)
+        signature = str(route.get("failure_signature", "")).strip()
+        failure_sets: Set[Tuple[str, ...]] = set()
+
+        raw_route_failures = route.get("failure_ids", [])
+        if isinstance(raw_route_failures, list):
+            route_failures = tuple(
+                sorted(
+                    {
+                        str(item).strip()
+                        for item in raw_route_failures
+                        if str(item).strip()
+                    }
+                )
+            )
+            if route_failures:
+                failure_sets.add(route_failures)
+
+        for lineage_task in self._recovery_lineage_tasks(tasks, task):
+            for entry in lineage_task.recovery_history:
+                if (
+                    not isinstance(entry, dict)
+                    or str(entry.get("result", "")) != "judge_stopped"
+                    or int(entry.get("epoch", 0) or 0) != epoch
+                    or int(entry.get("round", 0) or 0) != terminal_round
+                ):
+                    continue
+                entry_signature = str(
+                    entry.get("failure_signature", entry.get("signature", ""))
+                ).strip()
+                if signature and entry_signature != signature:
+                    continue
+                raw_failures = entry.get("failure_ids", [])
+                if not isinstance(raw_failures, list):
+                    continue
+                failures = tuple(
+                    sorted(
+                        {
+                            str(item).strip()
+                            for item in raw_failures
+                            if str(item).strip()
+                        }
+                    )
+                )
+                if failures:
+                    failure_sets.add(failures)
+
+        if len(failure_sets) != 1:
+            return []
+        return list(next(iter(failure_sets)))
+
+    def _validated_provider_artifact_binding(
+        self,
+        route: Mapping[str, object],
+        failure_ids: Iterable[str],
+    ) -> Dict[str, object]:
+        """Validate durable proof inputs for an exact provider artifact set."""
+
+        if "provider_artifact_binding" not in route:
+            return {
+                "valid": True,
+                "present": False,
+                "proof_evidence": None,
+                "evidence_refs": [],
+            }
+        raw_binding = route.get("provider_artifact_binding")
+        if not isinstance(raw_binding, dict):
+            return {
+                "valid": False,
+                "present": True,
+                "reason": "provider artifact binding must be an object",
+            }
+        if raw_binding.get("schema_version") != (
+            self.PROVIDER_ARTIFACT_BINDING_SCHEMA_VERSION
+        ):
+            return {
+                "valid": False,
+                "present": True,
+                "reason": "provider artifact binding has an unsupported schema",
+            }
+
+        normalized_lists: Dict[str, List[str]] = {}
+        for key in (
+            "failure_ids",
+            "failed_refs",
+            "passed_refs",
+            "evidence_refs",
+        ):
+            raw_values = raw_binding.get(key)
+            if (
+                not isinstance(raw_values, list)
+                or any(
+                    not isinstance(value, str) or not value.strip()
+                    for value in raw_values
+                )
+            ):
+                return {
+                    "valid": False,
+                    "present": True,
+                    "reason": (
+                        f"provider artifact binding {key} must be a list "
+                        "of non-empty strings"
+                    ),
+                }
+            values = [value.strip() for value in raw_values]
+            if len(values) != len(set(values)):
+                return {
+                    "valid": False,
+                    "present": True,
+                    "reason": (
+                        f"provider artifact binding {key} contains duplicates"
+                    ),
+                }
+            normalized_lists[key] = sorted(values)
+
+        expected_failure_ids = sorted(
+            {
+                str(failure_id).strip()
+                for failure_id in failure_ids
+                if str(failure_id).strip()
+            }
+        )
+        if (
+            not expected_failure_ids
+            or normalized_lists["failure_ids"] != expected_failure_ids
+        ):
+            return {
+                "valid": False,
+                "present": True,
+                "reason": (
+                    "provider artifact binding does not match the terminal "
+                    "failure identity"
+                ),
+            }
+
+        normalized_evidence_paths: List[str] = []
+        for reference in normalized_lists["evidence_refs"]:
+            path, selector = self._split_evidence_ref(reference)
+            normalized = self._normalize_relative_artifact_path(path)
+            if selector or not normalized or normalized != reference:
+                return {
+                    "valid": False,
+                    "present": True,
+                    "reason": (
+                        "provider artifact binding evidence refs are not "
+                        "canonical"
+                    ),
+                }
+            normalized_evidence_paths.append(normalized)
+        evidence_path_set = set(normalized_evidence_paths)
+        if (
+            not evidence_path_set
+            or self._provider_research_evidence_paths(evidence_path_set)
+            != evidence_path_set
+        ):
+            return {
+                "valid": False,
+                "present": True,
+                "reason": (
+                    "provider artifact binding evidence refs are not canonical "
+                    "provider artifacts"
+                ),
+            }
+
+        return {
+            "valid": True,
+            "present": True,
+            "proof_evidence": {
+                "ok": False,
+                "failed_refs": normalized_lists["failed_refs"],
+                "passed_refs": normalized_lists["passed_refs"],
+            },
+            "evidence_refs": sorted(evidence_path_set),
+        }
+
+    def _restored_deterministic_provider_route(
+        self,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        route: Mapping[str, object],
+        *,
+        include_artifact_fingerprints: bool = True,
+    ) -> Dict[str, object]:
+        """Recompute provider ownership for a deterministic recovery STOP."""
+
+        failure_ids = self._restored_recovery_stop_failure_ids(
+            tasks,
+            task,
+            owner,
+            route,
+        )
+        if not failure_ids:
+            return {}
+        artifact_binding = self._validated_provider_artifact_binding(
+            route,
+            failure_ids,
+        )
+        if not bool(artifact_binding.get("valid")):
+            return {
+                "binding_valid": False,
+                "reason": str(
+                    artifact_binding.get(
+                        "reason",
+                        "invalid provider artifact binding",
+                    )
+                ),
+                "failure_ids": failure_ids,
+            }
+        proof_evidence = (
+            artifact_binding.get("proof_evidence")
+            if bool(artifact_binding.get("present"))
+            else None
+        )
+        route_owner, _feedback, route_refs = (
+            self._verification_failure_owner_route_details(
+                task,
+                {
+                    "reason": str(route.get("reason", "")).strip(),
+                    "failure_ids": failure_ids,
+                    "current_failure_ids": failure_ids,
+                    "baseline_failure_ids": [],
+                    "new_failure_ids": failure_ids,
+                    "comparable_failures": True,
+                    "baseline_comparison_comparable": True,
+                    "proof_evidence": proof_evidence,
+                },
+                tasks=tasks,
+            )
+        )
+        evidence_refs = sorted(
+            self._provider_research_evidence_paths(route_refs)
+        )
+        if route_owner != "provider_research" or not evidence_refs:
+            return {}
+        if (
+            bool(artifact_binding.get("present"))
+            and set(artifact_binding.get("evidence_refs", []))
+            != set(evidence_refs)
+        ):
+            return {
+                "binding_valid": False,
+                "reason": (
+                    "provider artifact binding does not match the exact "
+                    "failure-specific lineage evidence"
+                ),
+                "expected_stop_owner": route_owner,
+                "expected_stop_category": self.RECOVERY_STOP_CATEGORIES[
+                    route_owner
+                ],
+                "failure_ids": failure_ids,
+                "evidence_refs": evidence_refs,
+            }
+        binding: Dict[str, object] = {
+            "binding_valid": True,
+            "expected_stop_owner": route_owner,
+            "expected_stop_category": self.RECOVERY_STOP_CATEGORIES[
+                route_owner
+            ],
+            "failure_ids": failure_ids,
+            "evidence_refs": evidence_refs,
+        }
+        if include_artifact_fingerprints:
+            binding["evidence_artifact_fingerprints"] = self._artifact_fingerprints(
+                evidence_refs
+            )
+        return binding
+
+    def _restored_split_depth_provider_route(
+        self,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        owner: TaskSpec,
+        route: Mapping[str, object],
+    ) -> Dict[str, object]:
+        """Retain the original split-depth helper for internal callers."""
+
+        return self._restored_deterministic_provider_route(
+            tasks,
+            task,
+            owner,
+            route,
+        )
+
     def _validate_restored_recovery_stop(
         self,
         state: RunState,
@@ -20676,8 +21411,15 @@ class Orchestrator:
         task: TaskSpec,
         owner: TaskSpec,
         route: Mapping[str, object],
+        *,
+        require_current_artifacts: bool = True,
     ) -> Dict[str, object]:
-        """Revalidate persisted STOP provenance before restoring its blocker."""
+        """Revalidate persisted STOP provenance before restoring its blocker.
+
+        Resume callers validate immutable route structure here, then compare
+        mutable prerequisite and artifact fingerprints separately so a real
+        evidence change is not misclassified as a malformed historical route.
+        """
 
         if str(route.get("outcome", "")).strip() != "judge_stopped":
             return {
@@ -20717,6 +21459,25 @@ class Orchestrator:
             for item in raw_evidence_refs
             if str(item).strip()
         ]
+        raw_artifact_fingerprints = route.get(
+            "evidence_artifact_fingerprints",
+            {},
+        )
+        if not isinstance(raw_artifact_fingerprints, dict):
+            return {
+                "valid": False,
+                "reason": (
+                    "restored recovery STOP artifact fingerprints must be an "
+                    "object"
+                ),
+            }
+        artifact_fingerprints = (
+            {
+                str(path): str(fingerprint)
+                for path, fingerprint in raw_artifact_fingerprints.items()
+                if str(path).strip()
+            }
+        )
         prerequisite_fingerprint = str(
             route.get("prerequisite_fingerprint", "")
         ).strip()
@@ -20726,7 +21487,10 @@ class Orchestrator:
                 judge_source == "deterministic"
                 and reason.startswith("deterministic no-progress:")
             )
-            or engine_invariant == "replan_split_depth_limit"
+            or (
+                engine_invariant
+                in self.DETERMINISTIC_PROVIDER_STOP_INVARIANTS
+            )
             or (
                 reason.startswith("replan requested at split depth limit:")
                 and not prerequisite_keys
@@ -20734,7 +21498,123 @@ class Orchestrator:
             )
         )
         if deterministic_stop:
-            if prerequisite_keys or evidence_refs or prerequisite_fingerprint:
+            if blocker_owner == "provider_research":
+                deterministic_stop_label = (
+                    "split-depth"
+                    if engine_invariant == "replan_split_depth_limit"
+                    else "repeated-failure"
+                )
+                provider_invariant_valid = bool(
+                    (
+                        engine_invariant == "replan_split_depth_limit"
+                        and reason.startswith(
+                            "replan requested at split depth limit:"
+                        )
+                    )
+                    or (
+                        engine_invariant == "repeated_failure_no_progress"
+                        and judge_source == "deterministic"
+                        and reason.startswith("deterministic no-progress:")
+                    )
+                )
+                artifact_validation = (
+                    self._validated_recovery_route_artifacts(route)
+                )
+                provider_paths = set(artifact_validation.get("paths", []))
+                failure_binding = self._restored_deterministic_provider_route(
+                    tasks,
+                    task,
+                    owner,
+                    route,
+                    include_artifact_fingerprints=False,
+                )
+                bound_provider_paths = {
+                    self._normalize_relative_artifact_path(
+                        self._split_evidence_ref(ref)[0]
+                    )
+                    for ref in failure_binding.get("evidence_refs", [])
+                    if self._normalize_relative_artifact_path(
+                        self._split_evidence_ref(ref)[0]
+                    )
+                }
+                if (
+                    not provider_invariant_valid
+                    or prerequisite_keys
+                    or prerequisite_fingerprint
+                    or not bool(artifact_validation.get("valid"))
+                    or not provider_paths
+                ):
+                    return {
+                        "valid": False,
+                        "reason": (
+                            f"provider_research {deterministic_stop_label} "
+                            "STOP has invalid "
+                            "structured evidence"
+                        ),
+                    }
+                if (
+                    not bool(failure_binding.get("binding_valid", True))
+                    or failure_binding.get("expected_stop_owner")
+                    != "provider_research"
+                    or provider_paths != bound_provider_paths
+                ):
+                    return {
+                        "valid": False,
+                        "reason": str(
+                            failure_binding.get("reason", "")
+                        )
+                        or (
+                            f"provider_research {deterministic_stop_label} "
+                            "STOP is not exactly bound to one matching "
+                            "failure lineage"
+                        ),
+                        **{
+                            key: value
+                            for key, value in failure_binding.items()
+                            if key
+                            in {
+                                "expected_stop_owner",
+                                "expected_stop_category",
+                                "failure_ids",
+                                "evidence_refs",
+                            }
+                        },
+                    }
+                if category != self.RECOVERY_STOP_CATEGORIES[blocker_owner]:
+                    return {
+                        "valid": False,
+                        "reason": (
+                            f"provider_research {deterministic_stop_label} "
+                            "STOP has invalid "
+                            "category"
+                        ),
+                    }
+                if (
+                    require_current_artifacts
+                    and self._artifact_fingerprints(provider_paths)
+                    != artifact_fingerprints
+                ):
+                    return {
+                        "valid": False,
+                        "reason": (
+                            f"provider_research {deterministic_stop_label} "
+                            "STOP artifact "
+                            "fingerprints no longer match"
+                        ),
+                    }
+                return {
+                    "valid": True,
+                    "reason": (
+                        "engine-generated provider_research "
+                        f"{deterministic_stop_label} STOP"
+                    ),
+                }
+            if (
+                prerequisite_keys
+                or evidence_refs
+                or artifact_fingerprints
+                or prerequisite_fingerprint
+            ):
                 return {
                     "valid": False,
                     "reason": (
@@ -20752,6 +21632,32 @@ class Orchestrator:
                     "valid": False,
                     "reason": "deterministic recovery STOP has invalid category",
                 }
+            provider_binding_candidate = bool(
+                engine_invariant
+                in self.DETERMINISTIC_PROVIDER_STOP_INVARIANTS
+                or reason.startswith("deterministic no-progress:")
+            )
+            if provider_binding_candidate:
+                provider_route = self._restored_deterministic_provider_route(
+                    tasks,
+                    task,
+                    owner,
+                    route,
+                )
+                if provider_route:
+                    legacy_stop_label = (
+                        "split-depth"
+                        if engine_invariant == "replan_split_depth_limit"
+                        else "deterministic"
+                    )
+                    return {
+                        "valid": False,
+                        "reason": (
+                            f"legacy {legacy_stop_label} STOP dropped structured "
+                            "provider_research ownership"
+                        ),
+                        **provider_route,
+                    }
             return {
                 "valid": True,
                 "reason": "engine-generated deterministic recovery STOP",
@@ -20806,7 +21712,10 @@ class Orchestrator:
                 "valid": False,
                 "reason": "restored recovery STOP has no prerequisite_fingerprint",
             }
-        if prerequisite_fingerprint != current_prerequisite_fingerprint:
+        if (
+            require_current_artifacts
+            and prerequisite_fingerprint != current_prerequisite_fingerprint
+        ):
             return {
                 "valid": False,
                 "reason": (
@@ -20828,6 +21737,7 @@ class Orchestrator:
         route: Mapping[str, object],
         *,
         reason: str,
+        validation: Optional[Mapping[str, object]] = None,
     ) -> None:
         """Quarantine an invalid historical STOP and reopen one bounded epoch."""
 
@@ -20840,6 +21750,21 @@ class Orchestrator:
             "terminal_round": terminal_round,
             "reason": reason,
         }
+        validation_details = validation or {}
+        for key in (
+            "expected_stop_owner",
+            "expected_stop_category",
+            "failure_ids",
+            "evidence_refs",
+            "evidence_artifact_fingerprints",
+        ):
+            value = validation_details.get(key)
+            if isinstance(value, list):
+                reconciliation[key] = list(value)
+            elif isinstance(value, dict):
+                reconciliation[key] = dict(value)
+            elif str(value or "").strip():
+                reconciliation[key] = str(value).strip()
         for lineage_task in self._recovery_lineage_tasks(tasks, task):
             for entry in lineage_task.recovery_history:
                 if (
@@ -20908,6 +21833,8 @@ class Orchestrator:
         task: TaskSpec,
         owner: TaskSpec,
         route: Mapping[str, object],
+        *,
+        require_current_artifacts: bool = True,
     ) -> bool:
         validation = self._validate_restored_recovery_stop(
             state,
@@ -20915,6 +21842,7 @@ class Orchestrator:
             task,
             owner,
             route,
+            require_current_artifacts=require_current_artifacts,
         )
         if bool(validation.get("valid")):
             return False
@@ -20925,6 +21853,7 @@ class Orchestrator:
             owner,
             route,
             reason=str(validation.get("reason", "invalid recovery STOP")),
+            validation=validation,
         )
         return True
 
@@ -20935,6 +21864,18 @@ class Orchestrator:
     ) -> bool:
         route, task, owner = self._active_terminal_recovery_route(state, tasks)
         if not route or task is None or owner is None:
+            return False
+        if (
+            str(route.get("outcome", "")) == "judge_stopped"
+            and self._reconcile_invalid_restored_recovery_stop(
+                state,
+                tasks,
+                task,
+                owner,
+                route,
+                require_current_artifacts=False,
+            )
+        ):
             return False
         resume_evidence = self._terminal_recovery_resume_evidence(
             state,
@@ -20950,14 +21891,6 @@ class Orchestrator:
             "terminal recovery evidence is unchanged"
         )
         if str(route.get("outcome", "")) == "judge_stopped":
-            if self._reconcile_invalid_restored_recovery_stop(
-                state,
-                tasks,
-                task,
-                owner,
-                route,
-            ):
-                return False
             return self._block_for_recovery_stop(
                 state,
                 tasks,
@@ -21232,6 +22165,104 @@ class Orchestrator:
             prefer_task_verification_refs=False,
         )
 
+    @classmethod
+    def _provider_artifact_binding_for_result(
+        cls,
+        result: Mapping[str, object],
+        *,
+        failure_ids: Iterable[str],
+        evidence_refs: Iterable[str],
+    ) -> Dict[str, object]:
+        """Persist the proof inputs that produced one exact provider route."""
+
+        proof_evidence = result.get("proof_evidence")
+        proof_evidence = (
+            proof_evidence if isinstance(proof_evidence, dict) else {}
+        )
+
+        def normalized_refs(key: str) -> List[str]:
+            raw_refs = proof_evidence.get(key, [])
+            if not isinstance(raw_refs, (list, tuple, set)):
+                return []
+            return sorted(
+                {
+                    str(reference).strip()
+                    for reference in raw_refs
+                    if str(reference).strip()
+                }
+            )
+
+        return {
+            "schema_version": cls.PROVIDER_ARTIFACT_BINDING_SCHEMA_VERSION,
+            "failure_ids": sorted(
+                {
+                    str(failure_id).strip()
+                    for failure_id in failure_ids
+                    if str(failure_id).strip()
+                }
+            ),
+            "failed_refs": normalized_refs("failed_refs"),
+            "passed_refs": normalized_refs("passed_refs"),
+            "evidence_refs": sorted(
+                {
+                    str(reference).strip()
+                    for reference in evidence_refs
+                    if str(reference).strip()
+                }
+            ),
+        }
+
+    def _deterministic_recovery_stop_details(
+        self,
+        task: TaskSpec,
+        result: Dict[str, object],
+        *,
+        tasks: List[TaskSpec],
+        failure_ids: Iterable[str],
+    ) -> Dict[str, object]:
+        """Preserve a structured owner when an engine invariant stops retries."""
+
+        details: Dict[str, object] = {
+            "stop_owner": "target_project",
+            "stop_category": "recovery_evidence_change_required",
+            "evidence_refs": [],
+            "evidence_artifact_fingerprints": {},
+            "provider_artifact_binding": {},
+        }
+        route_owner, _route_feedback, route_references = (
+            self._verification_failure_owner_route_details(
+                task,
+                result,
+                tasks=tasks,
+            )
+        )
+        if route_owner != "provider_research":
+            return details
+
+        evidence_refs = sorted(
+            self._provider_research_evidence_paths(route_references)
+        )
+        if not evidence_refs:
+            return details
+        details.update(
+            {
+                "stop_owner": route_owner,
+                "stop_category": self.RECOVERY_STOP_CATEGORIES[route_owner],
+                "evidence_refs": evidence_refs,
+                "evidence_artifact_fingerprints": (
+                    self._artifact_fingerprints(evidence_refs)
+                ),
+                "provider_artifact_binding": (
+                    self._provider_artifact_binding_for_result(
+                        result,
+                        failure_ids=failure_ids,
+                        evidence_refs=evidence_refs,
+                    )
+                ),
+            }
+        )
+        return details
+
     def _recover_task_failure_with_judge(
         self,
         state: RunState,
@@ -21371,12 +22402,38 @@ class Orchestrator:
             save_run_state(self.project_root, state)
             return False
 
+        progress_stop_details = self._deterministic_recovery_stop_details(
+            task,
+            result,
+            tasks=tasks,
+            failure_ids=failure_ids,
+        )
+        progress_evidence_refs = list(
+            progress_stop_details["evidence_refs"]
+        )
+        progress_artifact_fingerprints = dict(
+            progress_stop_details["evidence_artifact_fingerprints"]
+        )
+        progress_provider_artifact_binding = dict(
+            progress_stop_details["provider_artifact_binding"]
+        )
+        progress_fingerprint = self._recovery_progress_fingerprint(
+            evidence_fingerprint,
+            progress_artifact_fingerprints,
+        )
+        history_entry["progress_fingerprint"] = progress_fingerprint
+
         prior_same = [
             entry for entry in task.recovery_history
             if isinstance(entry, dict)
             and int(entry.get("epoch", 0) or 0) == int(owner.recovery_epoch)
             and str(entry.get("failure_signature", entry.get("signature", ""))) == signature
             and str(entry.get("evidence_fingerprint", "")) == evidence_fingerprint
+            and self._recorded_recovery_progress_fingerprint(
+                entry,
+                artifact_sensitive=bool(progress_artifact_fingerprints),
+            )
+            == progress_fingerprint
             and str(entry.get("result", "")) in {"requeued", "judge_stopped"}
         ]
         if prior_same:
@@ -21384,15 +22441,34 @@ class Orchestrator:
                 "deterministic no-progress: failure and owner artifacts are "
                 "unchanged"
             )
+            stop_details = progress_stop_details
+            stop_owner = str(stop_details["stop_owner"])
+            stop_category = str(stop_details["stop_category"])
+            stop_refs = list(stop_details["evidence_refs"])
+            stop_artifact_fingerprints = dict(
+                stop_details["evidence_artifact_fingerprints"]
+            )
+            stop_provider_artifact_binding = dict(
+                stop_details["provider_artifact_binding"]
+            )
             stopped_entry = dict(
                 history_entry,
                 result="judge_stopped",
                 judge_decision="STOP",
                 judge_reason=no_progress_reason,
                 judge_source="deterministic",
-                stop_owner="target_project",
-                stop_category="recovery_evidence_change_required",
+                stop_owner=stop_owner,
+                stop_category=stop_category,
+                evidence_refs=stop_refs,
+                evidence_artifact_fingerprints=(
+                    stop_artifact_fingerprints
+                ),
+                engine_invariant="repeated_failure_no_progress",
             )
+            if stop_provider_artifact_binding:
+                stopped_entry["provider_artifact_binding"] = (
+                    stop_provider_artifact_binding
+                )
             self._advance_recovery_stop_cursor(task, owner, next_round)
             self._append_recovery_history_once(task, stopped_entry)
             if owner is not task:
@@ -21407,10 +22483,19 @@ class Orchestrator:
                 round_number=next_round,
                 judge_decision="STOP",
                 judge_source="deterministic",
+                engine_invariant="repeated_failure_no_progress",
                 repair_task_ids=[task.task_id],
                 lineage_owner=owner,
-                stop_owner="target_project",
-                stop_category="recovery_evidence_change_required",
+                stop_owner=stop_owner,
+                stop_category=stop_category,
+                evidence_refs=stop_refs,
+                evidence_artifact_fingerprints=(
+                    stop_artifact_fingerprints
+                ),
+                provider_artifact_binding=(
+                    stop_provider_artifact_binding
+                ),
+                failure_ids=failure_ids,
             )
             return self._block_for_recovery_stop(
                 state,
@@ -21419,8 +22504,9 @@ class Orchestrator:
                 owner,
                 reason=no_progress_reason,
                 signature=signature,
-                blocker_owner="target_project",
-                category="recovery_evidence_change_required",
+                blocker_owner=stop_owner,
+                category=stop_category,
+                evidence_refs=stop_refs,
             )
 
         judgment = self._run_recovery_judge(state, task, owner, feedback, next_round)
@@ -21517,16 +22603,34 @@ class Orchestrator:
             if int(owner.split_depth) >= self.MAX_SPLIT_DEPTH:
                 decision = "STOP"
                 judge_reason = f"replan requested at split depth limit: {judge_reason}"
+                stop_details = progress_stop_details
+                stop_owner = str(stop_details["stop_owner"])
+                stop_category = str(stop_details["stop_category"])
+                stop_refs = list(stop_details["evidence_refs"])
+                stop_artifact_fingerprints = dict(
+                    stop_details["evidence_artifact_fingerprints"]
+                )
+                stop_provider_artifact_binding = dict(
+                    stop_details["provider_artifact_binding"]
+                )
                 stopped_entry = dict(
                     history_entry,
                     result="judge_stopped",
                     judge_decision=decision,
                     judge_reason=judge_reason,
                     judge_source="deterministic",
-                    stop_owner="target_project",
-                    stop_category="recovery_evidence_change_required",
+                    stop_owner=stop_owner,
+                    stop_category=stop_category,
+                    evidence_refs=stop_refs,
+                    evidence_artifact_fingerprints=(
+                        stop_artifact_fingerprints
+                    ),
                     engine_invariant="replan_split_depth_limit",
                 )
+                if stop_provider_artifact_binding:
+                    stopped_entry["provider_artifact_binding"] = (
+                        stop_provider_artifact_binding
+                    )
                 self._advance_recovery_stop_cursor(task, owner, next_round)
                 self._append_recovery_history_once(task, stopped_entry)
                 if owner is not task:
@@ -21547,11 +22651,31 @@ class Orchestrator:
                     engine_invariant="replan_split_depth_limit",
                     repair_task_ids=[task.task_id],
                     lineage_owner=owner,
-                    stop_owner="target_project",
-                    stop_category="recovery_evidence_change_required",
+                    stop_owner=stop_owner,
+                    stop_category=stop_category,
+                    evidence_refs=stop_refs,
+                    evidence_artifact_fingerprints=(
+                        stop_artifact_fingerprints
+                    ),
+                    provider_artifact_binding=(
+                        stop_provider_artifact_binding
+                    ),
+                    failure_ids=failure_ids,
                 )
                 self._persist_tasks(tasks)
                 save_run_state(self.project_root, state)
+                if stop_owner == "provider_research":
+                    return self._block_for_recovery_stop(
+                        state,
+                        tasks,
+                        task,
+                        owner,
+                        reason=judge_reason,
+                        signature=signature,
+                        blocker_owner=stop_owner,
+                        category=stop_category,
+                        evidence_refs=stop_refs,
+                    )
                 return False
             rewind = self._handle_scope_overflow_rewind(
                 state,
@@ -21597,7 +22721,15 @@ class Orchestrator:
             judge_decision="CONTINUE",
             judge_reason=judge_reason,
             judge_source=judge_source,
+            evidence_refs=progress_evidence_refs,
+            evidence_artifact_fingerprints=(
+                progress_artifact_fingerprints
+            ),
         )
+        if progress_provider_artifact_binding:
+            requeued_entry["provider_artifact_binding"] = (
+                progress_provider_artifact_binding
+            )
         if stop_validation and not bool(stop_validation.get("valid")):
             requeued_entry["rejected_stop"] = {
                 "reason": str(stop_validation.get("reason", "")),
@@ -21645,6 +22777,10 @@ class Orchestrator:
             judge_decision="CONTINUE",
             judge_source=judge_source,
             lineage_owner=owner,
+            evidence_refs=progress_evidence_refs,
+            evidence_artifact_fingerprints=(
+                progress_artifact_fingerprints
+            ),
         )
         save_run_state(self.project_root, state)
         self.logger.info(
@@ -21740,25 +22876,43 @@ class Orchestrator:
             rewind_ref = self._git_ref_from_verify_baseline_ref(baseline_ref) or "HEAD"
         review_text = str(gate_result.get("review", ""))
         if target_stage == "provider_research":
-            explicit_provider_paths = sorted(
-                {
-                    self._normalize_relative_artifact_path(item)
-                    for item in gate_result.get(
-                        "provider_reference_paths", []
-                    )
-                    or []
-                    if self._normalize_relative_artifact_path(item)
-                }
+            raw_provider_paths = gate_result.get(
+                "provider_reference_paths",
+                [],
             )
-            owner_artifact_paths = (
-                explicit_provider_paths
-                + [".auto-agents/state/provider_references.lock.json"]
-                if explicit_provider_paths
-                else self._owner_artifact_paths_for_stage(
+            provider_candidates = (
+                raw_provider_paths
+                if isinstance(raw_provider_paths, (list, tuple, set))
+                else []
+            )
+            provider_document_paths = self._provider_reference_document_paths(
+                provider_candidates
+            )
+            raw_evidence_refs = gate_result.get("evidence_refs", [])
+            evidence_candidates = (
+                raw_evidence_refs
+                if isinstance(raw_evidence_refs, (list, tuple, set))
+                and raw_evidence_refs
+                else provider_candidates
+            )
+            owner_evidence_paths = self._provider_research_evidence_paths(
+                evidence_candidates
+            )
+            if owner_evidence_paths or provider_document_paths:
+                owner_artifact_paths = sorted(
+                    owner_evidence_paths
+                    | provider_document_paths
+                    | {
+                        self._relative_repo_path(
+                            provider_references_lock_path(self.project_root)
+                        )
+                    }
+                )
+            else:
+                owner_artifact_paths = self._owner_artifact_paths_for_stage(
                     target_stage,
                     review_text,
                 )
-            )
         else:
             owner_artifact_paths = self._owner_artifact_paths_for_stage(
                 target_stage,
@@ -21810,11 +22964,15 @@ class Orchestrator:
         state.last_error = f"review rejected task {task.task_id}; rewinding to {target_stage}"
         refreshed_refs: List[str] = []
         if target_stage == "provider_research":
-            references = {
-                self._normalize_relative_artifact_path(item)
-                for item in gate_result.get("provider_reference_paths", []) or []
-                if self._normalize_relative_artifact_path(item)
-            }
+            raw_references = gate_result.get(
+                "provider_reference_paths",
+                [],
+            )
+            references = self._provider_reference_document_paths(
+                raw_references
+                if isinstance(raw_references, (list, tuple, set))
+                else []
+            )
             if not references:
                 references = self._provider_reference_paths_from_review(
                     state.rejection_reason
@@ -27712,20 +28870,76 @@ class Orchestrator:
             return next(iter(owners))
         return ""
 
+    @staticmethod
+    def _evidence_repair_proof_contexts(
+        task: TaskSpec,
+        tasks: Optional[Iterable[TaskSpec]],
+    ) -> List[TaskSpec]:
+        """Return local and repair-lineage proof owners without copying proofs."""
+
+        contexts = [task]
+        if task.task_origin != "evidence_repair" or tasks is None:
+            return contexts
+        by_id = {candidate.task_id: candidate for candidate in tasks}
+        cursor = task
+        seen = {task.task_id}
+        while cursor.task_origin == "evidence_repair" and cursor.parent_task_id:
+            parent = by_id.get(cursor.parent_task_id)
+            if parent is None or parent.task_id in seen:
+                break
+            contexts.append(parent)
+            seen.add(parent.task_id)
+            cursor = parent
+        return contexts
+
+    def _provider_research_preflight_mutation_paths(
+        self,
+        task: TaskSpec,
+    ) -> Set[str]:
+        """Read unresolved provider paths from structured preflight state only."""
+
+        preflight = task.evidence_preflight
+        if not isinstance(preflight, dict) or str(
+            preflight.get("decision", "")
+        ).strip().upper() not in {"BLOCK", "ROUTE"}:
+            return set()
+
+        raw_mutations = preflight.get("required_mutations", [])
+        mutations = raw_mutations if isinstance(raw_mutations, list) else []
+        paths = {
+            self._normalize_audit_blocker_path(item.get("path", ""))
+            for item in mutations
+            if isinstance(item, dict)
+            and self._normalize_audit_blocker_path(item.get("path", ""))
+        }
+        raw_partitions = preflight.get("actionable_mutations_by_owner", {})
+        partitions = (
+            raw_partitions if isinstance(raw_partitions, dict) else {}
+        )
+        raw_provider_paths = partitions.get("provider_research", [])
+        if isinstance(raw_provider_paths, list):
+            paths.update(
+                self._normalize_audit_blocker_path(path)
+                for path in raw_provider_paths
+                if self._normalize_audit_blocker_path(path)
+            )
+        return self._provider_research_evidence_paths(paths)
+
     def _provider_reference_proof_dependencies_for_failures(
         self,
         task: TaskSpec,
         failure_ids: Iterable[str],
         *,
         proof_evidence: Optional[Dict[str, object]] = None,
+        tasks: Optional[Iterable[TaskSpec]] = None,
     ) -> Set[str]:
-        """Resolve doc-only proof failures without guessing from test names.
+        """Resolve provider-owned proof failures from structured evidence.
 
-        Structured provider-reference failures take precedence. Behavioral
-        system-boundary proofs remain implementation-owned when only their
-        runtime check failed, including legacy incidents without structured
-        evidence. Deterministic document-contract proofs may still route to the
-        upstream provider owner.
+        Behavioral system-boundary proofs normally remain implementation-owned.
+        An evidence-repair leaf may consult lineage proofs bound to its active
+        verification ref. A mixed lineage proof routes only when structured
+        preflight state identifies an unresolved provider mutation and the proof
+        cites no implementation artifact.
         """
         active_failures = {
             str(failure_id).strip()
@@ -27744,64 +28958,161 @@ class Orchestrator:
             )
             if str(item).strip()
         }
-        matched_references: Set[str] = set()
-        for proof in task.requirement_proofs:
-            if not isinstance(proof, dict):
-                continue
-            refs = [
-                str(ref).strip()
-                for ref in proof.get("evidence_refs", []) or []
-                if str(ref).strip()
+        failed_evidence_paths = {
+            path
+            for item in failed_evidence_refs
+            for path in [
+                self._normalize_audit_blocker_path(
+                    self._split_evidence_ref(item)[0]
+                )
             ]
-            if not any(ref in active_failures for ref in refs):
-                continue
-
-            provider_refs: Set[str] = set()
-            implementation_support: Set[str] = set()
-            for ref in refs:
-                path, _selector = self._split_evidence_ref(ref)
-                path = self._normalize_audit_blocker_path(path)
-                if not path or self._looks_like_pytest_evidence_ref(ref):
+            if path
+        }
+        passed_evidence_paths = {
+            path
+            for item in (
+                proof_evidence.get("passed_refs", [])
+                if isinstance(proof_evidence, dict)
+                else []
+            )
+            for path in [
+                self._normalize_audit_blocker_path(
+                    self._split_evidence_ref(str(item).strip())[0]
+                )
+            ]
+            if path
+        }
+        matched_references: Set[str] = set()
+        structured_lineage_references: Set[str] = set()
+        structured_lineage_has_implementation = False
+        contexts = self._evidence_repair_proof_contexts(task, tasks)
+        repair_requirement_ids = (
+            {
+                str(requirement_id).strip()
+                for requirement_id in task.requirement_ids
+                if str(requirement_id).strip()
+            }
+            if task.task_origin == "evidence_repair"
+            else set()
+        )
+        for context in contexts:
+            lineage_context = context is not task
+            preflight_provider_paths = (
+                self._provider_research_preflight_mutation_paths(context)
+                if task.task_origin == "evidence_repair"
+                else set()
+            )
+            for proof in context.requirement_proofs:
+                if not isinstance(proof, dict):
                     continue
-                owner = self._forbidden_pattern_owner_stage({"path": path})
-                if owner == "provider_research":
-                    provider_refs.add(path)
-                elif owner == "implement":
-                    implementation_support.add(path)
-            explicitly_failed_provider_refs = (
-                provider_refs & failed_evidence_refs
-            )
-            if explicitly_failed_provider_refs:
-                matched_references.update(explicitly_failed_provider_refs)
-                continue
+                proof_requirement_id = str(
+                    proof.get("requirement_id", "")
+                ).strip()
+                if lineage_context and (
+                    not repair_requirement_ids
+                    or proof_requirement_id not in repair_requirement_ids
+                ):
+                    # Exact failure-ref overlap is insufficient to inherit
+                    # ownership from a different requirement's proof.
+                    continue
+                if (
+                    repair_requirement_ids
+                    and proof_requirement_id
+                    and proof_requirement_id not in repair_requirement_ids
+                ):
+                    continue
+                refs = [
+                    str(ref).strip()
+                    for ref in proof.get("evidence_refs", []) or []
+                    if str(ref).strip()
+                ]
+                if not any(ref in active_failures for ref in refs):
+                    continue
 
-            proof_type = str(proof.get("proof_type", "")).strip()
-            proof_strength = str(proof.get("oracle_strength", "")).strip()
-            proof_boundary = str(proof.get("evidence_boundary", "")).strip()
-            behavioral_system_proof = (
-                proof_type
-                in {
-                    "integration_test",
-                    "runtime_evidence",
-                    "benchmark",
-                    "mixed",
-                }
-                and proof_strength in {"behavioral", "semantic", "human"}
-                and proof_boundary
-                in {"system_boundary", "external_side_effect"}
-            )
-            if behavioral_system_proof:
-                continue
+                provider_refs: Set[str] = set()
+                implementation_support: Set[str] = set()
+                for ref in refs:
+                    path, _selector = self._split_evidence_ref(ref)
+                    path = self._normalize_audit_blocker_path(path)
+                    if not path or self._looks_like_pytest_evidence_ref(ref):
+                        continue
+                    provider_paths = self._provider_research_evidence_paths(
+                        [path]
+                    )
+                    if provider_paths:
+                        provider_refs.update(provider_paths)
+                    elif self._forbidden_pattern_owner_stage(
+                        {"path": path}
+                    ) == "implement":
+                        implementation_support.add(path)
+                if (
+                    task.task_origin == "evidence_repair"
+                    and implementation_support
+                ):
+                    structured_lineage_has_implementation = True
+                explicitly_failed_provider_refs = (
+                    provider_refs & failed_evidence_paths
+                )
+                if explicitly_failed_provider_refs:
+                    matched_references.update(explicitly_failed_provider_refs)
+                    # Metadata cited by the same proof still binds ownership
+                    # and must participate in terminal resume fingerprints.
+                    matched_references.update(
+                        provider_refs
+                        - self._provider_reference_document_paths(provider_refs)
+                    )
+                    continue
 
-            if provider_refs and not implementation_support:
-                matched_references.update(provider_refs)
+                proof_type = str(proof.get("proof_type", "")).strip()
+                proof_strength = str(
+                    proof.get("oracle_strength", "")
+                ).strip()
+                proof_boundary = str(
+                    proof.get("evidence_boundary", "")
+                ).strip()
+                behavioral_system_proof = (
+                    proof_type
+                    in {
+                        "integration_test",
+                        "runtime_evidence",
+                        "benchmark",
+                        "mixed",
+                    }
+                    and proof_strength in {"behavioral", "semantic", "human"}
+                    and proof_boundary
+                    in {"system_boundary", "external_side_effect"}
+                )
+                if behavioral_system_proof:
+                    unresolved_provider_paths = (
+                        provider_refs
+                        & preflight_provider_paths
+                        - passed_evidence_paths
+                    )
+                    if unresolved_provider_paths:
+                        structured_lineage_references.update(provider_refs)
+                    continue
+
+                if provider_refs and not implementation_support:
+                    matched_references.update(provider_refs)
+        if (
+            structured_lineage_references
+            and not structured_lineage_has_implementation
+        ):
+            matched_references.update(structured_lineage_references)
         return matched_references
 
-    def _verification_failure_owner_route(
+    def _verification_failure_owner_route_details(
         self,
         task: TaskSpec,
         verify_result: Dict[str, object],
-    ) -> Tuple[str, str]:
+        *,
+        tasks: Optional[Iterable[TaskSpec]] = None,
+    ) -> Tuple[str, str, List[str]]:
+        """Return the owner stage, feedback, and structured ownership refs.
+
+        The refs may include provider metadata such as the lock. Rewind callers
+        must derive refreshable canonical documents separately.
+        """
         comparison_comparable = bool(
             verify_result.get(
                 "baseline_comparison_comparable",
@@ -27809,7 +29120,7 @@ class Orchestrator:
             )
         )
         if not comparison_comparable:
-            return "", ""
+            return "", "", []
 
         failure_ids = [
             str(item).strip()
@@ -27834,7 +29145,7 @@ class Orchestrator:
         else:
             active_failure_ids = failure_ids
         if not active_failure_ids:
-            return "", ""
+            return "", "", []
 
         current_evidence = "\n".join(
             value
@@ -27854,6 +29165,7 @@ class Orchestrator:
             task,
             active_failure_ids,
             proof_evidence=proof_evidence,
+            tasks=tasks,
         )
         provider_signal = re.search(
             r"provider[_ -]?reference|canonical[_ -]?reference|"
@@ -27862,34 +29174,57 @@ class Orchestrator:
             flags=re.IGNORECASE,
         )
         if not provider_signal and not proof_references:
-            return "", ""
+            return "", "", []
 
         scoped_evidence = "\n".join(
             [ownership_evidence, *sorted(set(task.requirement_ids))]
         )
         references = set(proof_references)
-        references.update(
-            self._provider_reference_paths_from_review(scoped_evidence)
-        )
-        normalized_evidence = re.sub(
-            r"[^a-z0-9]+",
-            "_",
-            scoped_evidence.lower(),
-        )
-        for reference in self._active_provider_reference_paths():
-            stem = re.sub(r"[^a-z0-9]+", "_", Path(reference).stem.lower())
-            if stem and stem in normalized_evidence:
-                references.add(reference)
+        if not references:
+            references.update(
+                self._provider_reference_paths_from_review(scoped_evidence)
+            )
+            normalized_evidence = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                scoped_evidence.lower(),
+            )
+            for reference in self._active_provider_reference_paths():
+                stem = re.sub(
+                    r"[^a-z0-9]+",
+                    "_",
+                    Path(reference).stem.lower(),
+                )
+                if stem and stem in normalized_evidence:
+                    references.add(reference)
         references = sorted(references)
         if not references:
-            return "", ""
+            return "", "", []
         feedback = (
             f"{current_evidence}\n\n"
             "The failing verification targets provider_research-owned "
             "canonical reference(s): "
             + ", ".join(references)
         )
-        return "provider_research", feedback
+        return "provider_research", feedback, references
+
+    def _verification_failure_owner_route(
+        self,
+        task: TaskSpec,
+        verify_result: Dict[str, object],
+        *,
+        tasks: Optional[Iterable[TaskSpec]] = None,
+    ) -> Tuple[str, str]:
+        """Return the compatible owner route while retaining structured refs."""
+
+        stage, feedback, _references = (
+            self._verification_failure_owner_route_details(
+                task,
+                verify_result,
+                tasks=tasks,
+            )
+        )
+        return stage, feedback
 
     @staticmethod
     def _review_feedback_is_obsolete_for_task(task: TaskSpec, text: str) -> bool:
@@ -30065,6 +31400,15 @@ class Orchestrator:
                     )
                 except StageOwnershipRouteError as error:
                     reason = str(error)
+                    owner_evidence_refs = (
+                        sorted(
+                            self._provider_research_evidence_paths(
+                                error.paths
+                            )
+                        )
+                        if error.owner_stage == "provider_research"
+                        else []
+                    )
                     return {
                         "ok": False,
                         "review": reason,
@@ -30076,15 +31420,11 @@ class Orchestrator:
                         "rewind_to_stage": error.owner_stage,
                         "expected_owner_stage": error.owner_stage,
                         "rewind_reason": reason,
-                        "provider_reference_paths": (
-                            [
-                                path
-                                for path in error.paths
-                                if self._forbidden_pattern_owner_stage({"path": path})
-                                == "provider_research"
-                            ]
-                            if error.owner_stage == "provider_research"
-                            else []
+                        "evidence_refs": owner_evidence_refs,
+                        "provider_reference_paths": sorted(
+                            self._provider_reference_document_paths(
+                                owner_evidence_refs
+                            )
                         ),
                     }
                 if not result.ok:
@@ -30226,13 +31566,17 @@ class Orchestrator:
                 )
                 rewind_stage = str(verify_result.get("rewind_to_stage", "")).strip()
                 owner_feedback = ""
+                owner_reference_paths: List[str] = []
                 owner_routed = False
                 if not rewind_stage:
-                    rewind_stage, owner_feedback = (
-                        self._verification_failure_owner_route(
-                            task,
-                            verify_result,
-                        )
+                    (
+                        rewind_stage,
+                        owner_feedback,
+                        owner_reference_paths,
+                    ) = self._verification_failure_owner_route_details(
+                        task,
+                        verify_result,
+                        tasks=state.tasks,
                     )
                     owner_routed = bool(rewind_stage)
                 if rewind_stage:
@@ -30245,15 +31589,38 @@ class Orchestrator:
                         comparable_failures=comparable_failures,
                     )
                     self._emit_task_verify_result(task, "fail", last_reason)
-                    provider_reference_paths = (
-                        sorted(
-                            self._provider_reference_paths_from_review(
-                                owner_feedback
+                    owner_evidence_refs: List[str] = []
+                    provider_reference_paths: List[str] = []
+                    if rewind_stage == "provider_research":
+                        raw_structured_paths = (
+                            owner_reference_paths
+                            if owner_routed
+                            else (
+                                verify_result.get("evidence_refs", [])
+                                or verify_result.get(
+                                    "provider_reference_paths",
+                                    [],
+                                )
                             )
                         )
-                        if rewind_stage == "provider_research"
-                        else []
-                    )
+                        structured_paths = (
+                            raw_structured_paths
+                            if isinstance(
+                                raw_structured_paths,
+                                (list, tuple, set),
+                            )
+                            else []
+                        )
+                        owner_evidence_refs = sorted(
+                            self._provider_research_evidence_paths(
+                                structured_paths
+                            )
+                        )
+                        provider_reference_paths = sorted(
+                            self._provider_reference_document_paths(
+                                owner_evidence_refs
+                            )
+                        )
                     return {
                         "ok": False,
                         "review": owner_feedback or last_reason,
@@ -30315,6 +31682,7 @@ class Orchestrator:
                                 reason=last_reason,
                             )
                         ),
+                        "evidence_refs": owner_evidence_refs,
                         "provider_reference_paths": provider_reference_paths,
                         "route_source": (
                             "verification_failure_owner"

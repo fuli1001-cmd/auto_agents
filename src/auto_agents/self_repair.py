@@ -2838,6 +2838,8 @@ class AutoAgentsSelfRepairRunner:
                 "rate limit",
                 "stalled",
                 "unavailable",
+                "health_quiesce",
+                "self_repair_stagnation",
             )
         )
 

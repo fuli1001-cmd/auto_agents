@@ -1294,7 +1294,16 @@ def _auto_repair_auto_agents_and_resume(
         repair_case=repair_case,
         print_agent_output=bool(getattr(args, "print_agent_output", False)),
     )
-    result = runner.run()
+    if health_runtime is not None:
+        health_runtime.set_active_operation(
+            "self_repair",
+            decision.category or "auto_agents_self_repair",
+        )
+    try:
+        result = runner.run()
+    finally:
+        if health_runtime is not None:
+            health_runtime.set_active_operation()
     if not result.ok:
         message = f"automatic auto_agents self-repair failed: {result.reason}"
         orchestrator.record_self_repair_failure(
