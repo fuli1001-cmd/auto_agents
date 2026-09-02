@@ -1611,6 +1611,121 @@ class SessionCollabFlowTests(unittest.TestCase):
             self.assertEqual(result.attempt_epoch, 3)
             self.assertEqual(result.attempts_since_progress, 0)
 
+    def test_collab_resume_rejects_stale_orchestrator_assistance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda _prompt: self.fail(
+                    "stale orchestration assistance must not prompt the user"
+                ),
+            )
+            state = create_session(project_root, "collab")
+            state.status = "executing"
+            state.goal = "Generate the video"
+            state.current_attempt = 1
+            state.attempt_epoch = 2
+            state.attempts_since_progress = 0
+            state.conversation = [
+                {"role": "user", "content": state.goal},
+                {
+                    "role": "agent",
+                    "content": (
+                        "NEED_USER_ASSIST: reached the 25 attempt limit; run "
+                        "auto-agents resume --no-health-watch"
+                    ),
+                },
+            ]
+            session = Session(orchestrator, mode="collab")
+
+            def finish(executing_state):
+                self.assertEqual(executing_state.status, "executing")
+                self.assertEqual(
+                    executing_state.conversation[-1]["role"],
+                    "orchestrator",
+                )
+                executing_state.status = "completed"
+                return executing_state
+
+            with patch.object(
+                session,
+                "_phase_collab_loop",
+                side_effect=finish,
+            ):
+                result = session._drive_local(state)
+
+            self.assertEqual(result.status, "completed")
+            self.assertTrue(
+                any(
+                    item.get("action") == "collab_assistance_rejected"
+                    for item in result.execution_log
+                )
+            )
+
+    def test_repeated_invalid_orchestrator_assistance_stops_on_stall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda _prompt: self.fail(
+                    "invalid orchestration assistance must not prompt the user"
+                ),
+            )
+            state = SessionState(
+                session_id="invalid-assistance",
+                mode="collab",
+                status="executing",
+                goal="Generate the video",
+                hard_ceiling=25,
+            )
+            session = Session(orchestrator, mode="collab")
+            calls = {"count": 0}
+
+            def stale_reply(_state, _label, _prompt):
+                calls["count"] += 1
+                return (
+                    "NEED_USER_ASSIST: 已达到 25 次执行上限，请运行 "
+                    "auto-agents resume --no-health-watch"
+                )
+
+            session._call_agent = stale_reply
+            result = session._phase_collab_loop(state)
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.resolution, "no_progress")
+            self.assertLess(calls["count"], state.hard_ceiling)
+            self.assertFalse(
+                any(
+                    item.get("action") == "attempt_epoch_started"
+                    and item.get("result") == "user assistance supplied"
+                    for item in result.execution_log
+                )
+            )
+
+    def test_collab_prompt_reports_current_attempt_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            session = Session(Orchestrator(project_root), mode="collab")
+            state = SessionState(
+                session_id="attempt-context",
+                mode="collab",
+                goal="Diagnose the app",
+                attempt_epoch=3,
+                attempts_since_progress=4,
+                hard_ceiling=25,
+            )
+
+            prompt = session._build_collab_prompt(state, "")
+
+            self.assertIn(
+                "Current local attempt budget: epoch=3, provider_calls=4, hard_ceiling=25.",
+                prompt,
+            )
+            self.assertIn(
+                "never ask the user to run, resume, stop, or reconfigure auto-agents",
+                prompt,
+            )
+
     def test_collab_interrupt_restores_readonly_mutation_before_pausing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)

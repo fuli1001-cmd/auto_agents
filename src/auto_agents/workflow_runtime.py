@@ -598,6 +598,12 @@ class WorkflowCoordinator:
             state.resume_phase = ""
             state.resolution = ""
             save_session_state(self.project_root, state)
+        elif state.status == "waiting_user":
+            # A process can exit while the interactive input prompt is open.
+            # Re-enter execution so the saved assistance marker is validated
+            # and, when still valid, presented to the user again.
+            state.status = "executing"
+            save_session_state(self.project_root, state)
         if bool(getattr(self.health_runtime, "fresh_health_boundary", False)):
             self.health_runtime.publish_session(state)
         while True:

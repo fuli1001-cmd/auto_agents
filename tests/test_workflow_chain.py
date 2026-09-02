@@ -402,6 +402,58 @@ class WorkflowStoreTests(unittest.TestCase):
                 )
             )
 
+    def test_waiting_user_resume_revalidates_saved_assistance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(
+                root,
+                user_input_fn=lambda _prompt: "browser check passed",
+            )
+            coordinator = WorkflowCoordinator(orchestrator)
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", "session-a")
+            )
+            state = SessionState(
+                session_id="session-a",
+                mode="collab",
+                status="waiting_user",
+                goal="Check the browser",
+                workflow_id=snapshot.workflow_id,
+                conversation=[
+                    {"role": "user", "content": "Check the browser"},
+                    {
+                        "role": "agent",
+                        "content": "NEED_USER_ASSIST: inspect the browser result",
+                    },
+                ],
+            )
+            save_session_state(root, state)
+            session = Session(
+                orchestrator,
+                mode="collab",
+                coordinator=coordinator,
+            )
+
+            def finish(resumed):
+                self.assertEqual(resumed.status, "executing")
+                self.assertEqual(
+                    resumed.conversation[-1],
+                    {"role": "user", "content": "browser check passed"},
+                )
+                resumed.status = "completed"
+                return resumed
+
+            with patch.object(session, "_phase_collab_loop", side_effect=finish):
+                result = coordinator._drive_session(
+                    session,
+                    state,
+                    snapshot,
+                    root=False,
+                )
+
+            self.assertEqual(result.status, "completed")
+
     def test_resuming_child_session_reenters_workflow_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _make_project(tmp)

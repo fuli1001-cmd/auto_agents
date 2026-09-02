@@ -93,6 +93,11 @@ _FIX_VERIFY = re.compile(r"^FIX_VERIFY:\s*(.+)$", re.MULTILINE)
 _COMMIT_MESSAGE = re.compile(r"^COMMIT_MESSAGE:\s*(.+)$", re.MULTILINE)
 _PERSISTENCE_CHANGE = re.compile(r"^PERSISTENCE_CHANGE:\s*(\{.*\})\s*$", re.MULTILINE)
 _SHELL_CONTROL_TOKENS = re.compile(r"[|;&<>`\n]")
+_ORCHESTRATOR_CONTROL_ASSISTANCE = re.compile(
+    r"(?:\bauto-agents\b|\bauto_agents(?:\.py)?\b)\s+"
+    r"(?:resume|collab|fix|run|health-watch|stop)\b|--no-health-watch",
+    re.IGNORECASE,
+)
 # Version 2 makes pre-fix records ineligible after rejected-output and process
 # resume boundaries became explicit continuation invalidation points.
 _PROVIDER_CONTINUATION_POLICY_VERSION = 2
@@ -1289,8 +1294,79 @@ class Session:
         assist_match = _NEED_USER_ASSIST.search(reply)
         if not assist_match:
             return False
+        assistance_error = self._collab_assistance_error(
+            state,
+            assist_match.group(1),
+        )
+        if assistance_error:
+            self._reject_collab_assistance(state, assistance_error)
+            return False
         self._handle_collab_assistance(state, reply, assist_match)
         return True
+
+    def _collab_assistance_error(
+        self,
+        state: SessionState,
+        assistance: str,
+    ) -> str:
+        normalized = " ".join(str(assistance).split())
+        attempts = self._attempts_in_current_epoch(state)
+        if _ORCHESTRATOR_CONTROL_ASSISTANCE.search(normalized):
+            return (
+                "orchestrator_control_request: NEED_USER_ASSIST may request "
+                "external information or a user-only action, but it may not ask "
+                "the user to run or reconfigure "
+                "auto-agents. Continue in the current workflow and emit a valid "
+                "ROUTE_WORKFLOW marker when another workflow is needed. "
+                f"Current attempt epoch={state.attempt_epoch}, calls={attempts}, "
+                f"hard_ceiling={state.hard_ceiling}."
+            )
+        lower = normalized.casefold()
+        limit_claimed = any(
+            marker in lower
+            for marker in (
+                "执行上限",
+                "次数上限",
+                "attempt limit",
+                "attempt ceiling",
+                "hard ceiling",
+            )
+        )
+        if limit_claimed and attempts < state.hard_ceiling:
+            return (
+                "stale_attempt_ceiling_claim: NEED_USER_ASSIST claimed that the "
+                "attempt ceiling was reached, "
+                f"but the current epoch has {attempts}/{state.hard_ceiling} "
+                "provider calls. Re-evaluate the durable state and continue."
+            )
+        return ""
+
+    def _reject_collab_assistance(
+        self,
+        state: SessionState,
+        reason: str,
+    ) -> None:
+        state.conversation.append(
+            {
+                "role": "orchestrator",
+                "content": "Rejected stale or invalid assistance marker: " + reason,
+            }
+        )
+        state.execution_log.append(
+            {
+                "attempt": state.current_attempt,
+                "attempt_epoch": state.attempt_epoch,
+                "action": "collab_assistance_rejected",
+                "result": reason[:500],
+                "timestamp": self._now(),
+            }
+        )
+        self._update_stall_state(
+            state,
+            self._compute_diff_hash(),
+            self._compute_verify_sig(reason.partition(":")[0]),
+        )
+        self._save(state)
 
     @staticmethod
     def _unsafe_protocol_refs(payload: Dict[str, object]) -> List[str]:
@@ -1862,6 +1938,18 @@ class Session:
             # Check for NEED_USER_ASSIST — counts as progress
             assist_match = _NEED_USER_ASSIST.search(reply)
             if assist_match:
+                assistance_error = self._collab_assistance_error(
+                    state,
+                    assist_match.group(1),
+                )
+                if assistance_error:
+                    self._reject_collab_assistance(state, assistance_error)
+                    stop = self._should_stop(state, assistance_error)
+                    if stop:
+                        self._print(stop)
+                        break
+                    feedback = assistance_error
+                    continue
                 self._handle_collab_assistance(state, reply, assist_match)
                 feedback = ""
                 continue
@@ -2759,6 +2847,13 @@ class Session:
 
         lines.extend([
             "",
+            (
+                "Current local attempt budget: "
+                f"epoch={state.attempt_epoch}, "
+                f"provider_calls={self._attempts_in_current_epoch(state)}, "
+                f"hard_ceiling={state.hard_ceiling}."
+            ),
+            "",
             "You are the read-only diagnostic and routing frame for a collaborative workflow. Your task:",
             "1. Analyze the current state of the code and previous execution results without editing product files",
             "2. Determine the next workflow needed to achieve the user's overall goal",
@@ -2770,6 +2865,7 @@ class Session:
             "7. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",
             "8. Provide a brief diagnostic status update",
             "9. Never implement, fix, commit, or edit target-project code in collab; route every write to fix or run",
+            "10. NEED_USER_ASSIST is only for information or actions that require the user; never ask the user to run, resume, stop, or reconfigure auto-agents",
             "",
             "EXECUTION SAFETY RULES (critical — follow strictly):",
             "- Set a timeout for EVERY HTTP request or polling loop (max 60s per request, 5 min total for repeated polling).",
