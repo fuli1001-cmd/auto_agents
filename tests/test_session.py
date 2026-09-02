@@ -43,6 +43,7 @@ from auto_agents.models import (
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import load_requirements_trace, stamp_requirement_contract_hashes
 from auto_agents.session import Session
+from auto_agents.workflow_chain import WorkflowStore
 
 
 def _make_project(tmp: str, name: str = "demo") -> Path:
@@ -894,6 +895,233 @@ class SessionCollabFlowTests(unittest.TestCase):
             state = session.start()
 
             self.assertEqual(state.status, "completed")
+
+    def test_collab_converse_normalizes_enveloped_fix_disposition_without_user_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "collab")
+            state.goal = "Generate the requested fox story test video"
+            state.conversation = [{"role": "user", "content": state.goal}]
+            save_session_state(project_root, state)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"collab unexpectedly prompted the user: {prompt}"
+                ),
+            )
+            reply = json.dumps(
+                {
+                    "FIX_DISPOSITION": "v1",
+                    "decision": "fix",
+                    "summary": "Repair storyboard convergence",
+                    "reason": "Existing bounded storyboard defect",
+                    "reproduction": "Create the fox story video",
+                    "expected": "Video generation completes",
+                    "actual": "Storyboard repair stops without progress",
+                    "evidence_refs": ["tests/test_storyboard.py::test_convergence"],
+                    "affected_contracts": ["storyboard-candidate-pipeline-v3"],
+                    "verification_command": "pytest -q tests/test_storyboard.py",
+                    "persistence_change": {
+                        "strategy": "clean_break",
+                        "storage_transition": "none",
+                        "compatibility_policy": "reject_legacy",
+                        "target_ids": ["local-db"],
+                        "physical_schema_change": False,
+                        "historical_data_action": "none",
+                    },
+                },
+                ensure_ascii=False,
+            )
+
+            def mock_run(request):
+                write_text(request.output_path, reply)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=reply,
+                    stdout=reply,
+                    returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            result = Session(orchestrator, mode="collab")._phase_converse(state)
+
+            self.assertEqual(result.status, "waiting_child")
+            handoff = WorkflowStore(project_root).load_handoff(
+                result.active_handoff_id
+            )
+            self.assertEqual(handoff.target, "fix")
+            issue_seed = handoff.payload["issue_seed"]
+            self.assertEqual(
+                issue_seed["reproduction"], ["Create the fox story video"]
+            )
+            self.assertNotIn("persistence_change", issue_seed)
+            normalized = next(
+                item
+                for item in result.execution_log
+                if item.get("action") == "collab_foreign_disposition_normalized"
+            )
+            self.assertTrue(normalized["discarded_persistence_change"])
+
+    def test_collab_loop_normalizes_fix_disposition_marker_to_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"collab unexpectedly prompted the user: {prompt}"
+                ),
+            )
+            reply = (
+                'FIX_DISPOSITION v1: {"decision":"fix",'
+                '"summary":"Repair storyboard convergence",'
+                '"reason":"Existing bounded defect",'
+                '"reproduction":["Create video"],'
+                '"expected":"generation completes",'
+                '"actual":"storyboard stops",'
+                '"evidence_refs":[],"affected_contracts":[],'
+                '"verification_command":"pytest -q"}'
+            )
+
+            def mock_run(request):
+                write_text(request.output_path, reply)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=reply,
+                    stdout=reply,
+                    returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            state = create_session(project_root, "collab")
+            state.status = "executing"
+            state.goal = "Generate video"
+            state.conversation = [{"role": "user", "content": state.goal}]
+            save_session_state(project_root, state)
+
+            result = Session(orchestrator, mode="collab")._phase_collab_loop(
+                state
+            )
+
+            self.assertEqual(result.status, "waiting_child")
+            handoff = WorkflowStore(project_root).load_handoff(
+                result.active_handoff_id
+            )
+            self.assertEqual(handoff.target, "fix")
+
+    def test_collab_converse_normalizes_run_iteration_disposition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "collab")
+            state.goal = "Add export support"
+            state.conversation = [{"role": "user", "content": state.goal}]
+            save_session_state(project_root, state)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"collab unexpectedly prompted the user: {prompt}"
+                ),
+            )
+            reply = json.dumps(
+                {
+                    "FIX_DISPOSITION": "v1",
+                    "decision": "run_iteration",
+                    "reason": "Missing public capability",
+                    "spec_seed": {
+                        "title": "Export support",
+                        "goal": "Add export support",
+                        "gap": "No export API",
+                        "capability": "Export results",
+                        "acceptance": ["Export succeeds"],
+                        "non_goals": [],
+                        "evidence": [],
+                        "open_decisions": [],
+                    },
+                }
+            )
+
+            def mock_run(request):
+                write_text(request.output_path, reply)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=reply,
+                    stdout=reply,
+                    returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            result = Session(orchestrator, mode="collab")._phase_converse(state)
+
+            self.assertEqual(result.status, "waiting_child")
+            handoff = WorkflowStore(project_root).load_handoff(
+                result.active_handoff_id
+            )
+            self.assertEqual(handoff.target, "run")
+            self.assertEqual(handoff.payload["spec_seed"]["title"], "Export support")
+
+    def test_collab_resume_consumes_pending_foreign_disposition_without_agent_or_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            reply = json.dumps(
+                {
+                    "FIX_DISPOSITION": "v1",
+                    "decision": "fix",
+                    "summary": "Repair storyboard convergence",
+                    "reason": "Existing bounded storyboard defect",
+                    "reproduction": "Create the fox story video",
+                    "expected": "Video generation completes",
+                    "actual": "Storyboard repair stops without progress",
+                    "evidence_refs": [],
+                    "affected_contracts": [],
+                    "verification_command": "pytest -q tests/test_storyboard.py",
+                }
+            )
+            state = create_session(project_root, "collab")
+            state.status = "paused"
+            state.resolution = "interrupted_by_user"
+            state.goal = "Generate the requested fox story test video"
+            state.conversation = [
+                {"role": "user", "content": state.goal},
+                {"role": "agent", "content": reply},
+            ]
+            save_session_state(project_root, state)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"collab unexpectedly prompted the user: {prompt}"
+                ),
+            )
+            orchestrator.adapter.run = lambda _request: self.fail(
+                "resume should not need another collab agent call before routing"
+            )
+
+            with patch(
+                "auto_agents.workflow_runtime.WorkflowCoordinator._drive_fix_child",
+                return_value={
+                    "status": "paused",
+                    "resolution": "child paused for test",
+                    "summary": "child paused for test",
+                    "changed_paths": [],
+                },
+            ):
+                result = Session(orchestrator, mode="collab").resume(
+                    state.session_id
+                )
+
+            self.assertEqual(result.status, "waiting_child")
+            handoff = WorkflowStore(project_root).load_handoff(
+                result.active_handoff_id
+            )
+            self.assertEqual(handoff.target, "fix")
+            self.assertEqual(
+                handoff.payload["issue_seed"]["summary"],
+                "Repair storyboard convergence",
+            )
 
     def test_collab_verification_failure_honors_hard_ceiling_for_markers(self) -> None:
         for marker in (

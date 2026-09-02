@@ -1745,6 +1745,12 @@ Automatic returns never reopen session selection or ask for the goal again. A se
 resumes the exact durable root session, while `fix` and `run` children return through their recorded
 handoff to the same parent `collab` session.
 
+If a provider emits a fix-only `FIX_DISPOSITION` while still inside the read-only collab frame,
+auto_agents deterministically normalizes bounded `fix`, `run_iteration`, and `resume_child`
+decisions into the matching workflow handoff instead of asking the user to repair the protocol.
+Persistence declarations are not inherited across this normalization boundary; the child workflow
+must classify and validate them independently.
+
 Each verification entry in the saved session log records its `progress` or `final` scope, logical
 command count, physically executed command count, certificate hits, and wall-clock duration.
 

@@ -360,6 +360,25 @@ class Session:
         """Drive the session through its phases until completion or pause."""
         try:
             self._check_health_action()
+            if self.mode == "collab" and state.status in {"conversing", "executing"}:
+                routed, normalization_error = (
+                    self._resume_pending_collab_disposition(state)
+                )
+                if routed is not None:
+                    return routed
+                if normalization_error:
+                    state.conversation.append(
+                        {"role": "user", "content": normalization_error}
+                    )
+                    state.execution_log.append(
+                        {
+                            "attempt": state.current_attempt,
+                            "action": "collab_protocol_normalization_retry",
+                            "result": normalization_error[:500],
+                            "timestamp": self._now(),
+                        }
+                    )
+                    self._save(state)
             if state.status == "conversing":
                 state = self._phase_converse(state)
 
@@ -459,6 +478,28 @@ class Session:
 
             state.conversation.append({"role": "agent", "content": reply})
             self._save(state)
+
+            if self.mode == "collab":
+                routed, normalization_error = (
+                    self._route_collab_foreign_fix_disposition(state, reply)
+                )
+                if routed is not None:
+                    return routed
+                if normalization_error:
+                    state.conversation.append(
+                        {"role": "user", "content": normalization_error}
+                    )
+                    state.execution_log.append(
+                        {
+                            "attempt": rounds,
+                            "action": "collab_protocol_normalization_retry",
+                            "result": normalization_error[:500],
+                            "timestamp": self._now(),
+                        }
+                    )
+                    self._save(state)
+                    self._print_agent_thinking()
+                    continue
 
             if self.mode == "fix":
                 disposition, disposition_error = self._parse_protocol_json(
@@ -738,6 +779,172 @@ class Session:
                 + ", ".join(unsafe_refs[:5])
             )
         return dict(payload), ""
+
+    @staticmethod
+    def _parse_protocol_envelope(
+        reply: str,
+        *,
+        marker: str,
+        version: str,
+        label: str,
+    ) -> Tuple[Optional[Dict[str, object]], str]:
+        try:
+            payload = json.loads(reply.strip())
+        except json.JSONDecodeError:
+            return None, ""
+        if not isinstance(payload, dict) or marker not in payload:
+            return None, ""
+        declared = str(payload.get(marker, "")).strip().lower()
+        if declared != version.lower():
+            return None, f"{label} envelope version must be {version}."
+        normalized = dict(payload)
+        normalized.pop(marker, None)
+        unsafe_refs = Session._unsafe_protocol_refs(normalized)
+        if unsafe_refs:
+            return None, (
+                f"{label} contains unsafe evidence references: "
+                + ", ".join(unsafe_refs[:5])
+            )
+        return normalized, ""
+
+    def _route_collab_foreign_fix_disposition(
+        self,
+        state: SessionState,
+        reply: str,
+    ) -> Tuple[Optional[SessionState], str]:
+        disposition, error = self._parse_protocol_json(
+            _FIX_DISPOSITION,
+            reply,
+            label="FIX_DISPOSITION v1",
+        )
+        if disposition is None and not error:
+            disposition, error = self._parse_protocol_envelope(
+                reply,
+                marker="FIX_DISPOSITION",
+                version="v1",
+                label="FIX_DISPOSITION v1",
+            )
+        if error or disposition is None:
+            return None, error
+
+        decision = str(disposition.get("decision", "")).strip()
+        if decision == "fix":
+            issue_seed = {
+                key: disposition[key]
+                for key in (
+                    "summary",
+                    "reason",
+                    "expected",
+                    "actual",
+                    "evidence_refs",
+                    "affected_contracts",
+                    "verification_command",
+                )
+                if key in disposition
+            }
+            reproduction = disposition.get("reproduction")
+            if isinstance(reproduction, str) and reproduction.strip():
+                issue_seed["reproduction"] = [reproduction.strip()]
+            elif isinstance(reproduction, list):
+                issue_seed["reproduction"] = list(reproduction)
+            issue_seed["decision"] = "fix"
+            issue_seed["reported_goal"] = state.goal
+            discarded_persistence = isinstance(
+                disposition.get("persistence_change"), dict
+            )
+            state.execution_log.append(
+                {
+                    "attempt": state.current_attempt,
+                    "action": "collab_foreign_disposition_normalized",
+                    "result": "fix",
+                    "discarded_persistence_change": discarded_persistence,
+                    "timestamp": self._now(),
+                }
+            )
+            self._save(state)
+            return (
+                self._prepare_workflow_handoff(
+                    state,
+                    target="fix",
+                    reason=str(
+                        disposition.get("reason")
+                        or disposition.get("summary")
+                        or "bounded defect"
+                    ),
+                    payload={"issue_seed": issue_seed},
+                ),
+                "",
+            )
+
+        if decision == "run_iteration":
+            spec_seed = disposition.get("spec_seed")
+            if not isinstance(spec_seed, dict) or not spec_seed:
+                return None, (
+                    "Collab received FIX_DISPOSITION decision=run_iteration without "
+                    "spec_seed. Emit ROUTE_WORKFLOW v1 target=run with a complete spec_seed."
+                )
+            state.execution_log.append(
+                {
+                    "attempt": state.current_attempt,
+                    "action": "collab_foreign_disposition_normalized",
+                    "result": "run",
+                    "timestamp": self._now(),
+                }
+            )
+            self._save(state)
+            return (
+                self._prepare_workflow_handoff(
+                    state,
+                    target="run",
+                    reason=str(
+                        disposition.get("reason")
+                        or disposition.get("summary")
+                        or "product iteration"
+                    ),
+                    payload={"spec_seed": dict(spec_seed)},
+                ),
+                "",
+            )
+
+        if decision == "resume_child":
+            resume_id = str(disposition.get("resume_handoff_id", "")).strip()
+            if not resume_id:
+                return None, (
+                    "Collab received FIX_DISPOSITION decision=resume_child without "
+                    "resume_handoff_id."
+                )
+            return (
+                self._prepare_workflow_handoff(
+                    state,
+                    target="resume",
+                    reason=str(disposition.get("reason") or "resume child"),
+                    payload={"resume_handoff_id": resume_id},
+                ),
+                "",
+            )
+
+        return None, (
+            "Collab cannot consume FIX_DISPOSITION decision="
+            f"{decision or '<missing>'}. Emit the matching ROUTE_WORKFLOW v1, "
+            "NEED_USER_ASSIST, or GOAL_ACHIEVED marker instead."
+        )
+
+    def _resume_pending_collab_disposition(
+        self,
+        state: SessionState,
+    ) -> Tuple[Optional[SessionState], str]:
+        if state.active_handoff_id or not state.conversation:
+            return None, ""
+        latest = state.conversation[-1]
+        if str(latest.get("role", "")).strip().lower() not in {
+            "agent",
+            "assistant",
+        }:
+            return None, ""
+        return self._route_collab_foreign_fix_disposition(
+            state,
+            str(latest.get("content", "")),
+        )
 
     @staticmethod
     def _unsafe_protocol_refs(payload: Dict[str, object]) -> List[str]:
@@ -1227,6 +1434,24 @@ class Session:
                     reason=str(route.get("reason") or route.get("summary") or target),
                     payload=payload,
                 )
+
+            routed, normalization_error = (
+                self._route_collab_foreign_fix_disposition(state, reply)
+            )
+            if routed is not None:
+                return routed
+            if normalization_error:
+                feedback = normalization_error
+                state.execution_log.append(
+                    {
+                        "attempt": state.current_attempt,
+                        "action": "collab_protocol_normalization_retry",
+                        "result": normalization_error[:500],
+                        "timestamp": self._now(),
+                    }
+                )
+                self._save(state)
+                continue
 
             # Check for NEED_USER_ASSIST — counts as progress
             assist_match = _NEED_USER_ASSIST.search(reply)
@@ -1801,8 +2026,13 @@ class Session:
                 )
                 lines.extend(f"  - {command}" for command in gate_commands)
         else:
-            lines.append(
-                "- If the goal is clear enough to proceed, output 'GOAL_CLEAR' on a line by itself at the end."
+            lines.extend(
+                [
+                    "- Never output FIX_DISPOSITION in collab mode; that protocol belongs to the child fix workflow.",
+                    "- If an existing-behavior defect is already clear, output one single-line ROUTE_WORKFLOW v1 marker with target='fix', reason, summary, and issue_seed.",
+                    "- If a missing capability or requirements, architecture, or persistence change is already clear, output one single-line ROUTE_WORKFLOW v1 marker with target='run', reason, summary, and spec_seed.",
+                    "- Otherwise, if the goal is clear enough for more read-only diagnosis, output 'GOAL_CLEAR' on a line by itself at the end.",
+                ]
             )
         lines.extend([
             "- Always explain your understanding before asking questions or declaring ready.",
