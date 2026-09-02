@@ -326,9 +326,27 @@ class Session:
         where the previous run left off while preserving all prior context.
         """
         existing = load_session_state(self.project_root, session_id)
-        if existing.status == "completed":
-            self._print(f"Session {session_id} is already completed.")
-            return existing
+        if existing.mode != self.mode:
+            raise ValueError(
+                f"session {session_id} is {existing.mode}, not {self.mode}"
+            )
+        if existing.status == "completed" and not existing.parent_handoff_id:
+            if not existing.workflow_id:
+                self._print(f"Session {session_id} is already completed.")
+                return existing
+            from .workflow_chain import WorkflowStore
+
+            workflow_store = WorkflowStore(self.project_root)
+            snapshot = workflow_store.load(existing.workflow_id)
+            from .workflow_runtime import _head_contains_completed_session
+
+            if snapshot.status == "completed" and _head_contains_completed_session(
+                self.project_root,
+                session_id,
+            ):
+                workflow_store.clear_active(snapshot.workflow_id)
+                self._print(f"Session {session_id} is already completed.")
+                return existing
         if self._coordinator is None:
             from .workflow_runtime import WorkflowCoordinator
 
@@ -358,9 +376,19 @@ class Session:
 
     def _drive_local(self, state: SessionState) -> SessionState:
         """Drive the session through its phases until completion or pause."""
+        active_phase = (
+            state.status if state.status in {"conversing", "executing"} else ""
+        )
         try:
             self._check_health_action()
+            if self._reconcile_prepared_session_handoff(state):
+                return state
             if self.mode == "collab" and state.status in {"conversing", "executing"}:
+                # A provider can be interrupted after mutating the target but
+                # before the read-only guard gets a chance to roll it back.
+                # Restore that durable preimage before consuming a saved route
+                # or capturing any baseline for a child workflow.
+                self._reconcile_interrupted_collab_checkpoints(state)
                 routed, normalization_error = (
                     self._resume_pending_collab_disposition(state)
                 )
@@ -379,10 +407,26 @@ class Session:
                         }
                     )
                     self._save(state)
+                elif state.status == "conversing":
+                    goal_clear_error = self._resume_pending_collab_goal_clear(
+                        state
+                    )
+                    if goal_clear_error:
+                        state.conversation.append(
+                            {"role": "user", "content": goal_clear_error}
+                        )
+                        self._save(state)
+                if state.status == "executing" and not state.active_handoff_id:
+                    self._resume_pending_collab_assistance(state)
+                    completed = self._resume_pending_collab_completion(state)
+                    if completed is not None:
+                        return completed
             if state.status == "conversing":
+                active_phase = "conversing"
                 state = self._phase_converse(state)
 
             if state.status == "executing":
+                active_phase = "executing"
                 if self.mode == "fix":
                     if state.return_phase == "after_child":
                         state = self._phase_fix_after_child(state)
@@ -395,10 +439,20 @@ class Session:
             self._check_health_action()
         except KeyboardInterrupt:
             self._print("\nSession interrupted by user. Progress saved.")
+            state.resume_phase = (
+                state.status
+                if state.status in {"conversing", "executing"}
+                else active_phase
+            )
             state.status = "paused"
             state.resolution = "interrupted_by_user"
             self._save(state)
         except RuntimeError as exc:
+            state.resume_phase = (
+                state.status
+                if state.status in {"conversing", "executing"}
+                else active_phase
+            )
             state.status = "failed"
             state.execution_log.append({
                 "attempt": state.current_attempt,
@@ -409,6 +463,46 @@ class Session:
             self._save(state)
             raise
         return state
+
+    def _reconcile_prepared_session_handoff(self, state: SessionState) -> bool:
+        """Recover a handoff prepared just before its parent-state receipt."""
+
+        if state.active_handoff_id or not state.workflow_id:
+            return False
+        from .workflow_chain import WorkflowRef, WorkflowStore
+
+        store = (
+            self._coordinator.store
+            if self._coordinator is not None
+            else WorkflowStore(self.project_root)
+        )
+        snapshot = store.load(state.workflow_id)
+        handoff_id = str(snapshot.active_handoff_id).strip()
+        if not handoff_id:
+            return False
+        try:
+            handoff = store.load_handoff(handoff_id)
+        except (FileNotFoundError, RuntimeError, ValueError):
+            return False
+        if (
+            handoff.parent != WorkflowRef(state.mode, state.session_id)
+            or handoff.returned_at
+        ):
+            return False
+        state.active_handoff_id = handoff_id
+        state.status = "waiting_child"
+        state.return_phase = ""
+        state.execution_log.append(
+            {
+                "attempt": state.current_attempt,
+                "action": "prepared_handoff_reconciled",
+                "result": f"{handoff.target}: {handoff.reason}"[:500],
+                "handoff_id": handoff_id,
+                "timestamp": self._now(),
+            }
+        )
+        self._save(state)
+        return True
 
     def _drive(self, state: SessionState) -> SessionState:
         """Backward-compatible local driver used by older integrations."""
@@ -481,7 +575,7 @@ class Session:
 
             if self.mode == "collab":
                 routed, normalization_error = (
-                    self._route_collab_foreign_fix_disposition(state, reply)
+                    self._route_collab_workflow_reply(state, reply)
                 )
                 if routed is not None:
                     return routed
@@ -533,6 +627,45 @@ class Session:
                         )
                         self._save(state)
                         continue
+                    if decision == "run_iteration":
+                        spec_seed = disposition.get("spec_seed")
+                        if not isinstance(spec_seed, dict) or not spec_seed:
+                            state.conversation.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "FIX_DISPOSITION v1 decision=run_iteration "
+                                        "requires a non-empty spec_seed JSON object."
+                                    ),
+                                }
+                            )
+                            self._save(state)
+                            continue
+                    if decision == "resume_child" and not str(
+                        disposition.get("resume_handoff_id", "")
+                    ).strip():
+                        state.conversation.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "FIX_DISPOSITION v1 decision=resume_child "
+                                    "requires resume_handoff_id."
+                                ),
+                            }
+                        )
+                        self._save(state)
+                        continue
+                    if decision == "resume_child":
+                        resume_error = self._resume_handoff_error(
+                            state,
+                            str(disposition["resume_handoff_id"]).strip(),
+                        )
+                        if resume_error:
+                            state.conversation.append(
+                                {"role": "user", "content": resume_error}
+                            )
+                            self._save(state)
+                            continue
                     issue_ref = self._materialize_fix_issue(state, disposition)
                     if decision == "fix":
                         verify_command = str(
@@ -553,6 +686,19 @@ class Session:
                                         "role": "user",
                                         "content": "Invalid persistence contract: "
                                         + "; ".join(errors),
+                                    }
+                                )
+                                self._save(state)
+                                continue
+                            target_errors = self._session_persistence_target_errors(
+                                persistence_payload
+                            )
+                            if target_errors:
+                                state.conversation.append(
+                                    {
+                                        "role": "user",
+                                        "content": "Invalid persistence targets: "
+                                        + "; ".join(target_errors),
                                     }
                                 )
                                 self._save(state)
@@ -578,7 +724,10 @@ class Session:
                             state,
                             target="run",
                             reason=str(disposition.get("reason", "")),
-                            payload={"spec_seed": dict(disposition.get("spec_seed", {})), "fix_disposition": payload},
+                            payload={
+                                "spec_seed": dict(disposition["spec_seed"]),
+                                "fix_disposition": payload,
+                            },
                         )
                     if decision == "resume_child":
                         return self._prepare_workflow_handoff(
@@ -913,6 +1062,9 @@ class Session:
                     "Collab received FIX_DISPOSITION decision=resume_child without "
                     "resume_handoff_id."
                 )
+            resume_error = self._resume_handoff_error(state, resume_id)
+            if resume_error:
+                return None, resume_error
             return (
                 self._prepare_workflow_handoff(
                     state,
@@ -929,6 +1081,127 @@ class Session:
             "NEED_USER_ASSIST, or GOAL_ACHIEVED marker instead."
         )
 
+    def _route_collab_workflow_reply(
+        self,
+        state: SessionState,
+        reply: str,
+    ) -> Tuple[Optional[SessionState], str]:
+        """Normalize and validate every workflow route accepted by collab."""
+
+        route, error = self._parse_protocol_json(
+            _ROUTE_WORKFLOW,
+            reply,
+            label="ROUTE_WORKFLOW v1",
+        )
+        if route is None and not error:
+            route, error = self._parse_protocol_envelope(
+                reply,
+                marker="ROUTE_WORKFLOW",
+                version="v1",
+                label="ROUTE_WORKFLOW v1",
+            )
+        if error:
+            return None, error
+        if route is None:
+            routed, foreign_error = self._route_collab_foreign_fix_disposition(
+                state,
+                reply,
+            )
+            if routed is not None or foreign_error:
+                return routed, foreign_error
+            legacy_bug = _BUG_FOUND.search(reply)
+            if legacy_bug:
+                reason = legacy_bug.group(1).strip()
+                self._print(f"\nAgent found a bug: {reason}")
+                return (
+                    self._prepare_workflow_handoff(
+                        state,
+                        target="fix",
+                        reason=reason,
+                        payload={
+                            "issue_seed": {
+                                "summary": reason,
+                                "reported_goal": state.goal,
+                                "reason": (
+                                    "Legacy BUG_FOUND marker routed through fix."
+                                ),
+                            }
+                        },
+                    ),
+                    "",
+                )
+            return None, ""
+
+        target = str(route.get("target", "")).strip()
+        if target not in {"fix", "run", "resume"}:
+            return None, "ROUTE_WORKFLOW v1 target must be fix, run, or resume."
+
+        if target == "resume":
+            resume_id = str(route.get("resume_handoff_id", "")).strip()
+            if not resume_id:
+                return None, (
+                    "ROUTE_WORKFLOW v1 target=resume requires resume_handoff_id."
+                )
+            resume_error = self._resume_handoff_error(state, resume_id)
+            if resume_error:
+                return None, resume_error
+            payload = {"resume_handoff_id": resume_id}
+        elif target == "fix":
+            raw_issue_seed = route.get("issue_seed", {})
+            if raw_issue_seed is None:
+                raw_issue_seed = {}
+            if not isinstance(raw_issue_seed, dict):
+                return None, "ROUTE_WORKFLOW v1 issue_seed must be a JSON object."
+            issue_seed = dict(raw_issue_seed)
+            issue_seed.setdefault("summary", str(route.get("summary", "")))
+            issue_seed.setdefault("reason", str(route.get("reason", "")))
+            payload = {"issue_seed": issue_seed}
+        else:
+            raw_spec_seed = route.get("spec_seed")
+            if not isinstance(raw_spec_seed, dict) or not raw_spec_seed:
+                return None, (
+                    "ROUTE_WORKFLOW v1 target=run requires a non-empty "
+                    "spec_seed JSON object."
+                )
+            payload = {"spec_seed": dict(raw_spec_seed)}
+
+        return (
+            self._prepare_workflow_handoff(
+                state,
+                target=target,
+                reason=str(route.get("reason") or route.get("summary") or target),
+                payload=payload,
+            ),
+            "",
+        )
+
+    def _resume_handoff_error(
+        self,
+        state: SessionState,
+        resume_handoff_id: str,
+    ) -> str:
+        from .workflow_chain import WorkflowStore
+
+        if not state.workflow_id:
+            return "Cannot resume a child before the parent workflow is durable."
+        store = (
+            self._coordinator.store
+            if self._coordinator is not None
+            else WorkflowStore(self.project_root)
+        )
+        try:
+            original = store.load_handoff(resume_handoff_id)
+        except (FileNotFoundError, RuntimeError, ValueError):
+            return f"Unknown resume_handoff_id: {resume_handoff_id}."
+        if original.workflow_id != state.workflow_id:
+            return (
+                f"resume_handoff_id {resume_handoff_id} belongs to another "
+                "workflow."
+            )
+        if original.child is None:
+            return f"Handoff {resume_handoff_id} has no child to resume."
+        return ""
+
     def _resume_pending_collab_disposition(
         self,
         state: SessionState,
@@ -941,10 +1214,80 @@ class Session:
             "assistant",
         }:
             return None, ""
-        return self._route_collab_foreign_fix_disposition(
+        return self._route_collab_workflow_reply(
             state,
             str(latest.get("content", "")),
         )
+
+    def _resume_pending_collab_goal_clear(
+        self,
+        state: SessionState,
+    ) -> str:
+        if not state.conversation:
+            return ""
+        latest = state.conversation[-1]
+        if str(latest.get("role", "")).strip().lower() not in {
+            "agent",
+            "assistant",
+        }:
+            return ""
+        reply = str(latest.get("content", ""))
+        if not _GOAL_CLEAR.search(reply):
+            return ""
+        marker_error = self._apply_session_persistence_marker(state, reply)
+        if marker_error:
+            return marker_error
+        state.status = "executing"
+        state.execution_log.append(
+            {
+                "attempt": state.current_attempt,
+                "action": "collab_goal_clear_reconciled",
+                "result": "resumed saved GOAL_CLEAR response",
+                "timestamp": self._now(),
+            }
+        )
+        self._save(state)
+        self._print("Resuming execution from the saved goal clarification.")
+        return ""
+
+    def _resume_pending_collab_completion(
+        self,
+        state: SessionState,
+    ) -> Optional[SessionState]:
+        if not state.conversation:
+            return None
+        latest = state.conversation[-1]
+        if str(latest.get("role", "")).strip().lower() not in {
+            "agent",
+            "assistant",
+        }:
+            return None
+        reply = str(latest.get("content", ""))
+        achieved_match = _GOAL_ACHIEVED.search(reply)
+        if not achieved_match:
+            return None
+        self._prepare_collab_execution(state)
+        return self._handle_collab_goal_achieved(
+            state,
+            reply,
+            achieved_match,
+        )
+
+    def _resume_pending_collab_assistance(self, state: SessionState) -> bool:
+        if not state.conversation:
+            return False
+        latest = state.conversation[-1]
+        if str(latest.get("role", "")).strip().lower() not in {
+            "agent",
+            "assistant",
+        }:
+            return False
+        reply = str(latest.get("content", ""))
+        assist_match = _NEED_USER_ASSIST.search(reply)
+        if not assist_match:
+            return False
+        self._handle_collab_assistance(state, reply, assist_match)
+        return True
 
     @staticmethod
     def _unsafe_protocol_refs(payload: Dict[str, object]) -> List[str]:
@@ -1112,13 +1455,30 @@ class Session:
                     restore_root,
                 )
                 restore_guard.cleanup()
+                raw_spec_seed = disposition.get("spec_seed")
+                if not isinstance(raw_spec_seed, dict) or not raw_spec_seed:
+                    feedback = (
+                        "FIX_DISPOSITION v1 decision=run_iteration requires a "
+                        "non-empty spec_seed JSON object."
+                    )
+                    state.execution_log.append(
+                        {
+                            "attempt": state.current_attempt,
+                            "action": "fix_route_rejected",
+                            "result": feedback,
+                            "rolled_back_paths": restored,
+                            "timestamp": self._now(),
+                        }
+                    )
+                    self._save(state)
+                    continue
                 issue_ref = self._materialize_fix_issue(state, disposition)
                 return self._prepare_workflow_handoff(
                     state,
                     target="run",
                     reason=str(disposition.get("reason", "fix scope expanded")),
                     payload={
-                        "spec_seed": dict(disposition.get("spec_seed", {})),
+                        "spec_seed": dict(raw_spec_seed),
                         "fix_disposition": dict(disposition),
                         "issue_ref": issue_ref,
                         "rolled_back_paths": restored,
@@ -1184,7 +1544,14 @@ class Session:
                 self._run_session_persistence_action(state)
                 state.status = "completed"
                 state.resolution = "fixed"
-                self._git_commit(state, "fix", reply=reply)
+                if not self._git_commit(state, "fix", reply=reply):
+                    state.status = "failed"
+                    state.resolution = "commit_failed"
+                    self._save(state)
+                    self._print(
+                        "Verification passed, but the fix commit did not complete."
+                    )
+                    return state
                 self._record_release_attestation(state, verify)
                 self._release_baseline(state)
                 self._print(f"Bug fix completed in session {state.session_id}.")
@@ -1266,9 +1633,22 @@ class Session:
             state.status = "completed"
             state.resolution = "resolved_by_iteration"
             state.stall_count = 0
+            self._run_session_persistence_action(state)
+            committed = self._git_commit(
+                state,
+                "fix",
+                reply=str(result.get("summary", "")),
+            )
+            if not committed:
+                state.status = "failed"
+                state.resolution = "commit_failed"
+                self._save(state)
+                self._print(
+                    "Verification passed, but the parent fix receipt was not committed."
+                )
+                return state
             self._record_release_attestation(state, verify)
             self._release_baseline(state)
-            self._save(state)
             self._print("The routed iteration resolved the original issue.")
             return state
 
@@ -1299,14 +1679,7 @@ class Session:
     # ── Phase 2b: Collab mode loop ───────────────────────────────
 
     def _phase_collab_loop(self, state: SessionState) -> SessionState:
-        self._current_state = state
-        # Collab can be the first command after a v2 -> v3 policy migration.
-        # Materialize the generated verification config before resolving the
-        # plan or capturing the shared session baseline.
-        self.orch._apply_generated_verification_config()
-        final_plan = self._release_gate_plan()
-        if final_plan.commands or final_plan.parallel_groups:
-            self._ensure_baseline(state)
+        self._prepare_collab_execution(state)
         feedback = ""
         while True:
             self._check_health_action()
@@ -1342,6 +1715,15 @@ class Session:
                     reply = self._call_agent(
                         state, f"collab-{state.current_attempt}", prompt
                     )
+                except KeyboardInterrupt:
+                    self._restore_collab_mutations(
+                        state,
+                        before_snapshot,
+                        restore_root,
+                    )
+                    if durable_restore is not None:
+                        shutil.rmtree(durable_restore, ignore_errors=True)
+                    raise
                 except RuntimeError as exc:
                     self._restore_collab_mutations(
                         state,
@@ -1404,39 +1786,9 @@ class Session:
             })
             self._save(state)
 
-            route, route_error = self._parse_protocol_json(
-                _ROUTE_WORKFLOW,
+            routed, normalization_error = self._route_collab_workflow_reply(
+                state,
                 reply,
-                label="ROUTE_WORKFLOW v1",
-            )
-            if route_error:
-                feedback = route_error
-                continue
-            if route is not None:
-                target = str(route.get("target", "")).strip()
-                if target not in {"fix", "run", "resume"}:
-                    feedback = "ROUTE_WORKFLOW v1 target must be fix, run, or resume."
-                    continue
-                if target == "resume":
-                    payload = {
-                        "resume_handoff_id": str(route.get("resume_handoff_id", ""))
-                    }
-                elif target == "fix":
-                    issue_seed = dict(route.get("issue_seed", {}))
-                    issue_seed.setdefault("summary", str(route.get("summary", "")))
-                    issue_seed.setdefault("reason", str(route.get("reason", "")))
-                    payload = {"issue_seed": issue_seed}
-                else:
-                    payload = {"spec_seed": dict(route.get("spec_seed", {}))}
-                return self._prepare_workflow_handoff(
-                    state,
-                    target=target,
-                    reason=str(route.get("reason") or route.get("summary") or target),
-                    payload=payload,
-                )
-
-            routed, normalization_error = (
-                self._route_collab_foreign_fix_disposition(state, reply)
             )
             if routed is not None:
                 return routed
@@ -1456,82 +1808,22 @@ class Session:
             # Check for NEED_USER_ASSIST — counts as progress
             assist_match = _NEED_USER_ASSIST.search(reply)
             if assist_match:
-                state.stall_count = 0
-                display = reply.strip()
-                self._print(f"\nAgent:\n{display}")
-                self._print(f"\nAgent needs your assistance: {assist_match.group(1)}")
-                state.status = "waiting_user"
-                self._save(state)
-                user_reply = self._prompt_user("\nYour response (or result): ", multiline=True)
-                state.conversation.append({"role": "user", "content": user_reply.strip() or "Done."})
-                state.status = "executing"
-                self._save(state)
-                self._print_agent_thinking()
+                self._handle_collab_assistance(state, reply, assist_match)
                 feedback = ""
                 continue
 
             # Check for GOAL_ACHIEVED — counts as progress
             achieved_match = _GOAL_ACHIEVED.search(reply)
             if achieved_match:
-                display = _GOAL_ACHIEVED.sub("", reply).strip()
-                if display:
-                    self._print(f"\nAgent:\n{display}")
-                self._print(f"\nAgent believes the goal is achieved: {achieved_match.group(1)}")
-
-                # Verify
-                verify = self._run_verify(scope="final")
-                self._append_verification_log(state, "verify", verify)
-                self._save(state)
-
-                if not verify["ok"]:
-                    verify_reason = str(verify["reason"])
-                    self._print(f"Verification failed: {verify_reason}")
-                    self._print("Continuing the loop to fix verification issues.")
-                    feedback, stop = self._collab_verify_failure(state, verify_reason)
-                    if stop:
-                        self._print(stop)
-                        break
-                    continue
-
-                state.stall_count = 0
-                self._print("Final verification passed!")
-                answer = self._prompt_user("Do you confirm the goal is achieved? (y/n) [y]: ", default="y")
-                if answer.strip().lower() not in ("n", "no"):
-                    self._run_session_persistence_action(state)
-                    state.status = "completed"
-                    self._git_commit(state, "collab", reply=reply)
-                    self._record_release_attestation(state, verify)
-                    self._release_baseline(state)
-                    self._print(f"Collaborative session {state.session_id} completed successfully.")
-                    return state
-
-                committed = self._commit_verified_progress(state, "collab", reply=reply)
-                if committed:
-                    self._print("Verified progress committed before continuing.")
-                user_feedback = self._prompt_user("What still needs to be done? ", multiline=True)
-                state.conversation.append({"role": "user", "content": user_feedback.strip() or "Not yet done."})
-                self._save(state)
-                self._print_agent_thinking()
+                terminal = self._handle_collab_goal_achieved(
+                    state,
+                    reply,
+                    achieved_match,
+                )
+                if terminal is not None:
+                    return terminal
                 feedback = ""
                 continue
-
-            # Legacy marker: route the diagnosed defect through fix; collab never
-            # owns or commits the product change itself.
-            bug_match = _BUG_FOUND.search(reply)
-            if bug_match:
-                self._print(f"\nAgent found a bug: {bug_match.group(1)}")
-                return self._prepare_workflow_handoff(
-                    state,
-                    target="fix",
-                    reason=bug_match.group(1).strip(),
-                    payload={
-                        "issue_seed": {
-                            "summary": bug_match.group(1).strip(),
-                            "reported_goal": state.goal,
-                            "reason": "Legacy BUG_FOUND marker routed through fix.",
-                        }
-                    },
-                )
 
             # General diagnostic output (no special marker). It is not treated
             # as implementation progress and never commits project files.
@@ -1554,6 +1846,120 @@ class Session:
         self._save(state)
         self._print("Collab session stopped (no further progress). Session marked as failed.")
         return state
+
+    def _prepare_collab_execution(self, state: SessionState) -> None:
+        self._current_state = state
+        # Collab can be the first command after a v2 -> v3 policy migration.
+        # Materialize the generated verification config before resolving the
+        # plan or capturing the shared session baseline.
+        self.orch._apply_generated_verification_config()
+        final_plan = self._release_gate_plan()
+        if final_plan.commands or final_plan.parallel_groups:
+            self._ensure_baseline(state)
+
+    def _handle_collab_goal_achieved(
+        self,
+        state: SessionState,
+        reply: str,
+        achieved_match: re.Match,
+    ) -> Optional[SessionState]:
+        display = _GOAL_ACHIEVED.sub("", reply).strip()
+        if display:
+            self._print(f"\nAgent:\n{display}")
+        self._print(
+            f"\nAgent believes the goal is achieved: {achieved_match.group(1)}"
+        )
+
+        verify = self._run_verify(scope="final")
+        self._append_verification_log(state, "verify", verify)
+        self._save(state)
+
+        if not verify["ok"]:
+            verify_reason = str(verify["reason"])
+            self._print(f"Verification failed: {verify_reason}")
+            self._print("Continuing the loop to fix verification issues.")
+            retry_feedback, stop = self._collab_verify_failure(
+                state,
+                verify_reason,
+            )
+            if stop:
+                self._print(stop)
+                state.status = "failed"
+                self._save(state)
+                self._print(
+                    "Collab session stopped (no further progress). "
+                    "Session marked as failed."
+                )
+                return state
+            state.conversation.append(
+                {"role": "user", "content": retry_feedback}
+            )
+            self._save(state)
+            return None
+
+        state.stall_count = 0
+        self._print("Final verification passed!")
+        answer = self._prompt_user(
+            "Do you confirm the goal is achieved? (y/n) [y]: ",
+            default="y",
+        )
+        if answer.strip().lower() not in ("n", "no"):
+            self._run_session_persistence_action(state)
+            state.status = "completed"
+            state.resolution = "goal_achieved"
+            if not self._git_commit(state, "collab", reply=reply):
+                state.status = "failed"
+                state.resolution = "commit_failed"
+                self._save(state)
+                self._print(
+                    "Final verification passed, but the collab receipt was not committed."
+                )
+                return state
+            self._record_release_attestation(state, verify)
+            self._release_baseline(state)
+            self._print(
+                f"Collaborative session {state.session_id} completed successfully."
+            )
+            return state
+
+        committed = self._commit_verified_progress(state, "collab", reply=reply)
+        if committed:
+            self._print("Verified progress committed before continuing.")
+        user_feedback = self._prompt_user(
+            "What still needs to be done? ",
+            multiline=True,
+        )
+        state.conversation.append(
+            {
+                "role": "user",
+                "content": user_feedback.strip() or "Not yet done.",
+            }
+        )
+        self._save(state)
+        self._print_agent_thinking()
+        return None
+
+    def _handle_collab_assistance(
+        self,
+        state: SessionState,
+        reply: str,
+        assist_match: re.Match,
+    ) -> None:
+        state.stall_count = 0
+        self._print(f"\nAgent:\n{reply.strip()}")
+        self._print(f"\nAgent needs your assistance: {assist_match.group(1)}")
+        state.status = "waiting_user"
+        self._save(state)
+        user_reply = self._prompt_user(
+            "\nYour response (or result): ",
+            multiline=True,
+        )
+        state.conversation.append(
+            {"role": "user", "content": user_reply.strip() or "Done."}
+        )
+        state.status = "executing"
+        self._save(state)
+        self._print_agent_thinking()
 
     def _phase_provider_resolve_execute(self, state: SessionState) -> SessionState:
         self._current_state = state
@@ -3149,7 +3555,29 @@ class Session:
         if not checkpoint_root.is_dir():
             return
         for path in sorted(checkpoint_root.glob(f"collab-{state.session_id}-*")):
-            manifest = read_json(path / "manifest.json", default={})
+            manifest_path = path / "manifest.json"
+            manifest = read_json(manifest_path, default={})
+            if (
+                not manifest_path.is_file()
+                or not isinstance(manifest, dict)
+                or manifest.get("schema_version") != 1
+                or not isinstance(manifest.get("before_snapshot"), dict)
+            ):
+                # The manifest is written only after the restore point is
+                # complete and before the provider call starts. A partial
+                # directory therefore cannot contain provider mutations and
+                # must not be interpreted as an empty-worktree checkpoint.
+                state.execution_log.append(
+                    {
+                        "attempt": state.current_attempt,
+                        "action": "collab_incomplete_checkpoint_discarded",
+                        "result": str(path),
+                        "timestamp": self._now(),
+                    }
+                )
+                self._save(state)
+                shutil.rmtree(path, ignore_errors=True)
+                continue
             before = (
                 {
                     str(key): str(value)
@@ -3159,7 +3587,7 @@ class Session:
                 and isinstance(manifest.get("before_snapshot"), dict)
                 else {}
             )
-            if not before and not (path / ".git-index.snapshot").exists():
+            if not (path / ".git-index.snapshot").is_file():
                 raise RuntimeError(
                     f"collab checkpoint is incomplete and cannot be reconciled: {path}"
                 )

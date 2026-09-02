@@ -43,7 +43,7 @@ from auto_agents.models import (
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import load_requirements_trace, stamp_requirement_contract_hashes
 from auto_agents.session import Session
-from auto_agents.workflow_chain import WorkflowStore
+from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
 
 
 def _make_project(tmp: str, name: str = "demo") -> Path:
@@ -896,6 +896,94 @@ class SessionCollabFlowTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
 
+    def test_collab_converse_routes_standard_workflow_without_user_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "collab")
+            state.goal = "Repair the existing video generation regression"
+            state.conversation = [{"role": "user", "content": state.goal}]
+            save_session_state(project_root, state)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"collab unexpectedly prompted the user: {prompt}"
+                ),
+            )
+            reply = (
+                'ROUTE_WORKFLOW v1: {"target":"fix",'
+                '"reason":"existing regression","summary":"video fails",'
+                '"issue_seed":{"expected":"video completes",'
+                '"actual":"generation stops"}}'
+            )
+
+            def mock_run(request):
+                write_text(request.output_path, reply)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=reply,
+                    stdout=reply,
+                    returncode=0,
+                )
+
+            orchestrator.adapter.run = mock_run
+            result = Session(orchestrator, mode="collab")._phase_converse(state)
+
+            self.assertEqual(result.status, "waiting_child")
+            handoff = WorkflowStore(project_root).load_handoff(
+                result.active_handoff_id
+            )
+            self.assertEqual(handoff.target, "fix")
+            self.assertEqual(handoff.payload["issue_seed"]["summary"], "video fails")
+
+    def test_collab_accepts_route_envelope_and_rejects_malformed_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            session = Session(orchestrator, mode="collab")
+            state = create_session(project_root, "collab")
+            state.goal = "Add export support"
+
+            routed, error = session._route_collab_workflow_reply(
+                state,
+                json.dumps(
+                    {
+                        "ROUTE_WORKFLOW": "v1",
+                        "target": "run",
+                        "reason": "missing capability",
+                        "spec_seed": {"title": "Export", "goal": state.goal},
+                    }
+                ),
+            )
+
+            self.assertEqual(error, "")
+            self.assertIsNotNone(routed)
+            handoff = WorkflowStore(project_root).load_handoff(
+                routed.active_handoff_id
+            )
+            self.assertEqual(handoff.target, "run")
+
+            malformed_state = create_session(project_root, "collab")
+            malformed_state.goal = "Repair export"
+            routed, error = session._route_collab_workflow_reply(
+                malformed_state,
+                'ROUTE_WORKFLOW v1: {"target":"fix","issue_seed":"bad"}',
+            )
+
+            self.assertIsNone(routed)
+            self.assertIn("issue_seed must be a JSON object", error)
+
+            routed, error = session._route_collab_workflow_reply(
+                state,
+                (
+                    'ROUTE_WORKFLOW v1: {"target":"resume",'
+                    '"resume_handoff_id":"missing-handoff"}'
+                ),
+            )
+            self.assertIsNone(routed)
+            self.assertIn("Unknown resume_handoff_id", error)
+
     def test_collab_converse_normalizes_enveloped_fix_disposition_without_user_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
@@ -1121,6 +1209,297 @@ class SessionCollabFlowTests(unittest.TestCase):
             self.assertEqual(
                 handoff.payload["issue_seed"]["summary"],
                 "Repair storyboard convergence",
+            )
+
+    def test_collab_resume_consumes_pending_standard_route_without_agent_or_user(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            reply = (
+                'ROUTE_WORKFLOW v1: {"target":"fix",'
+                '"reason":"bounded regression","summary":"repair export",'
+                '"issue_seed":{"expected":"export succeeds",'
+                '"actual":"export fails"}}'
+            )
+            state = create_session(project_root, "collab")
+            state.status = "paused"
+            state.resolution = "interrupted_by_user"
+            state.resume_phase = "conversing"
+            state.goal = "Repair export"
+            state.conversation = [
+                {"role": "user", "content": state.goal},
+                {"role": "agent", "content": reply},
+            ]
+            save_session_state(project_root, state)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"collab unexpectedly prompted the user: {prompt}"
+                ),
+            )
+            orchestrator.adapter.run = lambda _request: self.fail(
+                "resume should consume the saved route before another agent call"
+            )
+
+            with patch(
+                "auto_agents.workflow_runtime.WorkflowCoordinator._drive_fix_child",
+                return_value={
+                    "status": "paused",
+                    "resolution": "child paused for test",
+                    "summary": "child paused for test",
+                    "changed_paths": [],
+                },
+            ):
+                result = Session(orchestrator, mode="collab").resume(
+                    state.session_id
+                )
+
+            self.assertEqual(result.status, "waiting_child")
+            handoff = WorkflowStore(project_root).load_handoff(
+                result.active_handoff_id
+            )
+            self.assertEqual(handoff.target, "fix")
+
+    def test_collab_reconciles_prepared_handoff_before_replaying_route(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            state = create_session(project_root, "collab")
+            state.status = "executing"
+            state.goal = "Repair export"
+            state.conversation = [
+                {"role": "user", "content": state.goal},
+                {
+                    "role": "agent",
+                    "content": (
+                        'ROUTE_WORKFLOW v1: {"target":"fix",'
+                        '"reason":"bounded regression",'
+                        '"issue_seed":{"summary":"repair export"}}'
+                    ),
+                },
+            ]
+            store = WorkflowStore(project_root)
+            snapshot = store.create_root(
+                WorkflowRef("collab", state.session_id)
+            )
+            state.workflow_id = snapshot.workflow_id
+            prepared = store.prepare_handoff(
+                snapshot,
+                parent=WorkflowRef("collab", state.session_id),
+                target="fix",
+                goal=state.goal,
+                reason="bounded regression",
+                payload={"issue_seed": {"summary": "repair export"}},
+            )
+            save_session_state(project_root, state)
+            session = Session(orchestrator, mode="collab")
+            session._call_agent = lambda *_args, **_kwargs: self.fail(
+                "the saved handoff must be recovered before replaying the route"
+            )
+
+            result = session._drive_local(state)
+
+            self.assertEqual(result.status, "waiting_child")
+            self.assertEqual(result.active_handoff_id, prepared.handoff_id)
+            handoff_files = list(
+                (project_root / ".auto-agents" / "state" / "handoffs").glob(
+                    "*.json"
+                )
+            )
+            self.assertEqual(len(handoff_files), 1)
+            self.assertTrue(
+                any(
+                    item.get("action") == "prepared_handoff_reconciled"
+                    for item in result.execution_log
+                )
+            )
+
+    def test_collab_resume_consumes_saved_goal_clear_before_another_agent_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            state = create_session(project_root, "collab")
+            state.status = "conversing"
+            state.goal = "Verify the browser flow"
+            state.conversation = [
+                {"role": "user", "content": state.goal},
+                {
+                    "role": "agent",
+                    "content": "The goal is clear and bounded.\nGOAL_CLEAR\n",
+                },
+            ]
+            session = Session(orchestrator, mode="collab")
+            session._call_agent = lambda *_args, **_kwargs: self.fail(
+                "the saved GOAL_CLEAR must be consumed before another agent call"
+            )
+
+            def finish(executing_state):
+                self.assertEqual(executing_state.status, "executing")
+                executing_state.status = "completed"
+                return executing_state
+
+            with patch.object(
+                session,
+                "_phase_collab_loop",
+                side_effect=finish,
+            ):
+                result = session._drive_local(state)
+
+            self.assertEqual(result.status, "completed")
+            self.assertTrue(
+                any(
+                    item.get("action") == "collab_goal_clear_reconciled"
+                    for item in result.execution_log
+                )
+            )
+
+    def test_collab_resume_finishes_saved_goal_achieved_before_agent_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda _prompt: "y",
+            )
+            state = create_session(project_root, "collab")
+            state.status = "executing"
+            state.goal = "Verify the browser flow"
+            state.conversation = [
+                {"role": "user", "content": state.goal},
+                {
+                    "role": "agent",
+                    "content": "GOAL_ACHIEVED: browser flow verified\n",
+                },
+            ]
+            session = Session(orchestrator, mode="collab")
+            session._call_agent = lambda *_args, **_kwargs: self.fail(
+                "the saved completion must be handled before another agent call"
+            )
+
+            with (
+                patch.object(
+                    session,
+                    "_run_verify",
+                    return_value={"ok": True, "reason": "passed"},
+                ),
+                patch.object(session, "_git_commit", return_value=True),
+                patch.object(session, "_record_release_attestation"),
+                patch.object(session, "_release_baseline"),
+            ):
+                result = session._drive_local(state)
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(result.resolution, "goal_achieved")
+
+    def test_collab_does_not_report_success_when_receipt_commit_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda _prompt: "y",
+            )
+            state = create_session(project_root, "collab")
+            state.status = "executing"
+            state.goal = "Verify the browser flow"
+            state.conversation = [
+                {"role": "user", "content": state.goal},
+                {
+                    "role": "agent",
+                    "content": "GOAL_ACHIEVED: browser flow verified\n",
+                },
+            ]
+            session = Session(orchestrator, mode="collab")
+
+            with (
+                patch.object(
+                    session,
+                    "_run_verify",
+                    return_value={"ok": True, "reason": "passed"},
+                ),
+                patch.object(session, "_git_commit", return_value=False),
+            ):
+                result = session._drive_local(state)
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.resolution, "commit_failed")
+
+    def test_collab_resume_replays_saved_assistance_request_before_agent_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda _prompt: "browser result: passed",
+            )
+            state = create_session(project_root, "collab")
+            state.status = "executing"
+            state.goal = "Verify the browser flow"
+            state.conversation = [
+                {"role": "user", "content": state.goal},
+                {
+                    "role": "agent",
+                    "content": "NEED_USER_ASSIST: run the browser smoke test",
+                },
+            ]
+            session = Session(orchestrator, mode="collab")
+            session._call_agent = lambda *_args, **_kwargs: self.fail(
+                "the saved assistance request must be replayed first"
+            )
+
+            def finish(executing_state):
+                self.assertEqual(executing_state.status, "executing")
+                executing_state.status = "completed"
+                return executing_state
+
+            with patch.object(
+                session,
+                "_phase_collab_loop",
+                side_effect=finish,
+            ):
+                result = session._drive_local(state)
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(
+                result.conversation[-1],
+                {"role": "user", "content": "browser result: passed"},
+            )
+
+    def test_collab_interrupt_restores_readonly_mutation_before_pausing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            app_path = project_root / "app.py"
+            write_text(app_path, "value = 1\n")
+            commit_all(project_root, "chore: baseline")
+            orchestrator = Orchestrator(project_root)
+            session = Session(orchestrator, mode="collab")
+            state = create_session(project_root, "collab")
+            state.status = "executing"
+            state.goal = "Inspect the app"
+            snapshot = WorkflowStore(project_root).create_root(
+                WorkflowRef("collab", state.session_id)
+            )
+            state.workflow_id = snapshot.workflow_id
+            save_session_state(project_root, state)
+
+            def interrupting_agent(*_args, **_kwargs):
+                write_text(app_path, "mutated = True\n")
+                raise KeyboardInterrupt
+
+            with patch.object(session, "_call_agent", side_effect=interrupting_agent):
+                result = session._drive_local(state)
+
+            self.assertEqual(result.status, "paused")
+            self.assertEqual(result.resume_phase, "executing")
+            self.assertEqual(app_path.read_text(encoding="utf-8"), "value = 1\n")
+            checkpoint_root = (
+                project_root
+                / ".auto-agents"
+                / "state"
+                / "workflows"
+                / snapshot.workflow_id
+                / "checkpoints"
+            )
+            self.assertEqual(
+                list(checkpoint_root.glob(f"collab-{state.session_id}-*")),
+                [],
             )
 
     def test_collab_verification_failure_honors_hard_ceiling_for_markers(self) -> None:
@@ -1543,6 +1922,35 @@ class SessionCollabFlowTests(unittest.TestCase):
 
 class SessionResumeTests(unittest.TestCase):
     """Test session resume and persistence."""
+
+    def test_resume_rejects_session_from_another_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "fix")
+            orchestrator = Orchestrator(project_root)
+
+            with self.assertRaisesRegex(ValueError, "is fix, not collab"):
+                Session(orchestrator, mode="collab").resume(state.session_id)
+
+    def test_interrupted_conversation_records_exact_resume_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(project_root)
+            session = Session(orchestrator, mode="collab")
+            state = create_session(project_root, "collab")
+            state.goal = "Clarify the browser test"
+
+            with patch.object(
+                session,
+                "_phase_converse",
+                side_effect=KeyboardInterrupt,
+            ):
+                interrupted = session._drive_local(state)
+
+            self.assertEqual(interrupted.status, "paused")
+            self.assertEqual(interrupted.resume_phase, "conversing")
+            restored = load_session_state(project_root, state.session_id)
+            self.assertEqual(restored.resume_phase, "conversing")
 
     def test_resume_conversing_session(self) -> None:
         """Resume a session that was interrupted during conversation."""
@@ -2847,6 +3255,52 @@ class ResumeFailedSessionTests(unittest.TestCase):
             session = Session(orchestrator, mode="fix")
             result = session.resume(state.session_id)
             self.assertEqual(result.status, "completed")
+
+    def test_resume_completed_session_finishes_missing_commit_and_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            commit_all(project_root, "chore: baseline")
+            state = create_session(project_root, "collab")
+            state.status = "completed"
+            state.resolution = "goal_achieved"
+            store = WorkflowStore(project_root)
+            snapshot = store.create_root(
+                WorkflowRef("collab", state.session_id)
+            )
+            state.workflow_id = snapshot.workflow_id
+            save_session_state(project_root, state)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"completion reconciliation prompted unexpectedly: {prompt}"
+                ),
+            )
+
+            result = Session(orchestrator, mode="collab").resume(
+                state.session_id
+            )
+
+            self.assertEqual(result.status, "completed")
+            committed = json.loads(
+                subprocess.run(
+                    [
+                        "git",
+                        "show",
+                        (
+                            "HEAD:.auto-agents/state/sessions/"
+                            f"{state.session_id}/session_state.json"
+                        ),
+                    ],
+                    cwd=project_root,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout
+            )
+            self.assertEqual(committed["status"], "completed")
+            self.assertEqual(store.load(snapshot.workflow_id).status, "completed")
+            self.assertIsNone(store.active())
 
     def test_offer_resume_includes_failed(self) -> None:
         """offer_resume_or_new should offer to resume a failed session."""

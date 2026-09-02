@@ -66,6 +66,7 @@ class WorkflowCoordinator:
             state = create_session(self.project_root, session.mode)
             state.workflow_id = active.workflow_id
             state.auto_approve = bool(self.auto_approve)
+            state.full_verify = bool(session._full_verify)
             save_session_state(self.project_root, state)
             active.active_frame = WorkflowRef(session.mode, state.session_id)
             self.store.save(active)
@@ -133,6 +134,7 @@ class WorkflowCoordinator:
                 )
         state = create_session(self.project_root, session.mode)
         state.auto_approve = bool(self.auto_approve)
+        state.full_verify = bool(session._full_verify)
         state.lineage_head_ref = head_ref(self.project_root)
         state.protected_preexisting_paths = list(changed_paths(self.project_root))
         snapshot = self.store.create_root(
@@ -179,6 +181,7 @@ class WorkflowCoordinator:
         if not state.conversation and state.goal:
             state.conversation.append({"role": "user", "content": state.goal})
         state.auto_approve = bool(self.auto_approve)
+        state.full_verify = bool(session._full_verify)
         state.lineage_head_ref = str(handoff.payload.get("head_before", "")) or head_ref(
             self.project_root
         )
@@ -202,10 +205,33 @@ class WorkflowCoordinator:
 
     def resume_session(self, session: object, session_id: str):
         state = load_session_state(self.project_root, session_id)
+        if state.mode != session.mode:
+            raise ValueError(
+                f"session {session_id} is {state.mode}, not {session.mode}"
+            )
         self.auto_approve = bool(self.auto_approve or state.auto_approve)
+        self.full_verify = bool(self.full_verify or state.full_verify)
         session._auto_approve = self.auto_approve
+        session._full_verify = self.full_verify
+        self.orch._force_full_verify = bool(
+            self.full_verify and session.mode == "fix"
+        )
         if state.auto_approve != self.auto_approve:
             state.auto_approve = self.auto_approve
+            save_session_state(self.project_root, state)
+        if state.full_verify != self.full_verify:
+            state.full_verify = self.full_verify
+            save_session_state(self.project_root, state)
+        if state.parent_handoff_id and not state.workflow_id:
+            try:
+                parent_handoff = self.store.load_handoff(
+                    state.parent_handoff_id
+                )
+            except (FileNotFoundError, RuntimeError, ValueError) as error:
+                raise RuntimeError(
+                    f"child session {session_id} has no recoverable parent workflow"
+                ) from error
+            state.workflow_id = parent_handoff.workflow_id
             save_session_state(self.project_root, state)
         if not state.workflow_id:
             snapshot = self.store.create_root(WorkflowRef(state.mode, state.session_id))
@@ -216,10 +242,17 @@ class WorkflowCoordinator:
             save_session_state(self.project_root, state)
         else:
             snapshot = self.store.load(state.workflow_id)
-            self.store.activate(snapshot.workflow_id)
+        if state.parent_handoff_id:
+            # A child session is not an independent workflow root. Resume the
+            # durable root so the child receipt is consumed and control
+            # returns through every recorded parent frame automatically.
+            return self.resume_workflow(snapshot.workflow_id)
+        self.store.activate(snapshot.workflow_id)
         self._reconcile_open_operations(snapshot)
         self.store.begin_resume(snapshot)
-        return self._drive_session(session, state, snapshot, root=not bool(state.parent_handoff_id))
+        self._ensure_completed_session_commit(session, state)
+        snapshot = self.store.load(snapshot.workflow_id)
+        return self._drive_session(session, state, snapshot, root=True)
 
     def resume_active(self):
         snapshot = self.store.active()
@@ -233,7 +266,7 @@ class WorkflowCoordinator:
             snapshot = candidates[0]
             self.store.activate(snapshot.workflow_id)
         root = snapshot.root
-        self._inherit_root_auto_approve(snapshot)
+        self._inherit_root_policies(snapshot)
         if root.kind in {"collab", "fix", "provider_resolve"}:
             from .session import Session
 
@@ -342,7 +375,7 @@ class WorkflowCoordinator:
         self._reconcile_open_operations(snapshot)
         self.store.begin_resume(snapshot)
         root = snapshot.root
-        self._inherit_root_auto_approve(snapshot)
+        self._inherit_root_policies(snapshot)
         if root.kind in {"collab", "fix", "provider_resolve"}:
             from .session import Session
 
@@ -355,25 +388,33 @@ class WorkflowCoordinator:
                 health_runtime=self.health_runtime,
                 coordinator=self,
             )
+            state = load_session_state(
+                self.project_root,
+                root.native_id,
+            )
+            self._ensure_completed_session_commit(session, state)
+            snapshot = self.store.load(snapshot.workflow_id)
             return self._drive_session(
                 session,
-                load_session_state(self.project_root, root.native_id),
+                state,
                 snapshot,
                 root=True,
             )
         return self._resume_run_root(snapshot)
 
-    def _inherit_root_auto_approve(self, snapshot: WorkflowSnapshot) -> None:
-        """Restore the workflow-wide approval policy from its durable root state."""
+    def _inherit_root_policies(self, snapshot: WorkflowSnapshot) -> None:
+        """Restore durable approval and verification policies from the root."""
 
         inherited = False
+        inherited_full_verify = False
+        root_session = None
         if snapshot.root.kind in {"collab", "fix", "provider_resolve"}:
             try:
-                inherited = bool(
-                    load_session_state(
-                        self.project_root, snapshot.root.native_id
-                    ).auto_approve
+                root_session = load_session_state(
+                    self.project_root, snapshot.root.native_id
                 )
+                inherited = bool(root_session.auto_approve)
+                inherited_full_verify = bool(root_session.full_verify)
             except FileNotFoundError:
                 inherited = False
         elif snapshot.root.kind == "run":
@@ -386,6 +427,21 @@ class WorkflowCoordinator:
             except FileNotFoundError:
                 inherited = False
         self.auto_approve = bool(self.auto_approve or inherited)
+        self.full_verify = bool(self.full_verify or inherited_full_verify)
+        if (
+            root_session is not None
+            and self.auto_approve
+            and not root_session.auto_approve
+        ):
+            root_session.auto_approve = True
+            save_session_state(self.project_root, root_session)
+        if (
+            root_session is not None
+            and self.full_verify
+            and not root_session.full_verify
+        ):
+            root_session.full_verify = True
+            save_session_state(self.project_root, root_session)
 
     def _reconcile_open_operations(self, snapshot: WorkflowSnapshot) -> None:
         intents: Dict[str, Dict[str, object]] = {}
@@ -420,6 +476,32 @@ class WorkflowCoordinator:
                 },
             )
 
+    def _ensure_completed_session_commit(
+        self,
+        session: object,
+        state: object,
+    ) -> None:
+        if (
+            state.status != "completed"
+            or state.mode not in {"fix", "collab"}
+            or _head_contains_completed_session(
+                self.project_root,
+                state.session_id,
+            )
+        ):
+            return
+        session._coordinator = self
+        session._coordinator_managed = True
+        session._git_commit(state, state.mode)
+        if not _head_contains_completed_session(
+            self.project_root,
+            state.session_id,
+        ):
+            raise RuntimeError(
+                "completed session is missing its durable Git commit: "
+                f"{state.session_id}"
+            )
+
     def _drive_session(
         self,
         session: object,
@@ -431,13 +513,31 @@ class WorkflowCoordinator:
         session._coordinator = self
         session._coordinator_managed = True
         if state.status == "failed":
-            state.status = "executing"
+            state.status = (
+                "waiting_child"
+                if state.active_handoff_id
+                else (
+                    state.resume_phase
+                    if state.resume_phase in {"conversing", "executing"}
+                    else "executing"
+                )
+            )
+            state.resume_phase = ""
             state.current_attempt = 0
             state.stall_count = 0
             state.consecutive_agent_errors = 0
             save_session_state(self.project_root, state)
         elif state.status == "paused" and state.resolution == "interrupted_by_user":
-            state.status = "executing" if state.goal else "conversing"
+            state.status = (
+                "waiting_child"
+                if state.active_handoff_id
+                else (
+                    state.resume_phase
+                    if state.resume_phase in {"conversing", "executing"}
+                    else ("executing" if state.goal else "conversing")
+                )
+            )
+            state.resume_phase = ""
             state.resolution = ""
             save_session_state(self.project_root, state)
         while True:
@@ -514,7 +614,7 @@ class WorkflowCoordinator:
                 handoff,
             )
         self.store.record_result(snapshot, handoff, status=native_status, result=result)
-        if native_status in {"paused", "waiting_user"}:
+        if native_status in {"paused", "waiting_user", "waiting_child"}:
             parent_state.status = "waiting_child"
             save_session_state(self.project_root, parent_state)
             return None
@@ -672,7 +772,7 @@ class WorkflowCoordinator:
             self.orch,
             mode="fix",
             print_agent_output=self.print_agent_output,
-            full_verify=self.full_verify,
+            full_verify=bool(self.full_verify and snapshot.root.kind == "fix"),
             auto_approve=self.auto_approve,
             health_runtime=self.health_runtime,
             coordinator=self,
@@ -800,7 +900,9 @@ class WorkflowCoordinator:
                 self.orch,
                 mode="fix",
                 print_agent_output=self.print_agent_output,
-                full_verify=self.full_verify,
+                full_verify=bool(
+                    self.full_verify and snapshot.root.kind == "fix"
+                ),
                 auto_approve=self.auto_approve,
                 health_runtime=self.health_runtime,
                 coordinator=self,

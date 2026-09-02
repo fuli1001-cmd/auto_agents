@@ -962,6 +962,27 @@ def _run_command_for_self_repair_resume(
 ) -> list[str]:
     runtime_root = (repo_root or auto_agents_repo_root()).resolve()
     source_command = str(getattr(args, "command", "run") or "run")
+    if source_command == "answer":
+        try:
+            answered_state = load_run_state(Path(str(args.project)))
+            answered_context = dict(answered_state.resume_context)
+        except (OSError, RuntimeError, FileNotFoundError, ValueError):
+            answered_context = {}
+        workflow_id = str(answered_context.get("workflow_id", "")).strip()
+        parent_handoff_id = str(
+            answered_context.get("parent_handoff_id", "")
+        ).strip()
+        if workflow_id and parent_handoff_id:
+            return [
+                sys.executable,
+                str(runtime_root / "auto_agents.py"),
+                "resume",
+                "--project",
+                str(args.project),
+                "--workflow",
+                workflow_id,
+                "--print-agent-output",
+            ]
     resume_command = "run" if source_command == "answer" else source_command
     command = [
         sys.executable,
@@ -982,6 +1003,8 @@ def _run_command_for_self_repair_resume(
             command.append("--auto-approve")
         if bool(getattr(args, "full_verify", False)):
             command.append("--full-verify")
+        if bool(getattr(args, "no_health_watch", False)):
+            command.append("--no-health-watch")
         if getattr(args, "autonomy", None):
             command.extend(["--autonomy", str(args.autonomy)])
         return command

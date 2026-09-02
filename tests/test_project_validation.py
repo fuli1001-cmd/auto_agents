@@ -322,6 +322,7 @@ class ProjectValidationTests(unittest.TestCase):
                     "--provider",
                     "codex",
                     "--auto-approve",
+                    "--no-health-watch",
                 ]
             )
 
@@ -330,6 +331,7 @@ class ProjectValidationTests(unittest.TestCase):
             session_flag = command.index("--session")
             self.assertEqual(command[session_flag + 1], state.session_id)
             self.assertIn("--auto-approve", command)
+            self.assertIn("--no-health-watch", command)
             self.assertIn("codex", command)
 
     def test_self_repair_resume_keeps_explicit_session_without_active_workflow(self) -> None:
@@ -347,6 +349,29 @@ class ProjectValidationTests(unittest.TestCase):
 
         session_flag = command.index("--session")
         self.assertEqual(command[session_flag + 1], "explicit-session")
+
+    def test_answer_self_repair_resumes_nested_workflow_instead_of_run_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            run_state = load_run_state(project_root)
+            run_state.resume_context.update(
+                {
+                    "workflow_id": "workflow-parent",
+                    "parent_handoff_id": "handoff-run",
+                }
+            )
+            save_run_state(project_root, run_state)
+            args = build_parser().parse_args(
+                ["answer", "--project", str(project_root), "--yes"]
+            )
+
+            command = _run_command_for_self_repair_resume(args)
+
+            self.assertEqual(command[2], "resume")
+            workflow_flag = command.index("--workflow")
+            self.assertEqual(command[workflow_flag + 1], "workflow-parent")
+            self.assertIn("--print-agent-output", command)
 
     def test_removed_self_repair_budget_fields_fail_during_config_load(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_candidates_per_root was removed"):

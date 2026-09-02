@@ -243,6 +243,7 @@ class WorkflowStoreTests(unittest.TestCase):
                 status="paused",
                 workflow_id=snapshot.workflow_id,
                 auto_approve=True,
+                full_verify=True,
             )
             save_session_state(root, state)
 
@@ -252,7 +253,9 @@ class WorkflowStoreTests(unittest.TestCase):
                 coordinator.resume_workflow(snapshot.workflow_id)
 
             self.assertTrue(coordinator.auto_approve)
+            self.assertTrue(coordinator.full_verify)
             self.assertTrue(drive.call_args.args[0]._auto_approve)
+            self.assertTrue(drive.call_args.args[0]._full_verify)
 
     def test_resume_with_auto_approve_upgrades_saved_root_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -289,6 +292,176 @@ class WorkflowStoreTests(unittest.TestCase):
                 if item.session_id == state.session_id
             )
             self.assertTrue(saved.auto_approve)
+
+    def test_resume_restores_interrupted_conversation_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator)
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", "session-a")
+            )
+            state = SessionState(
+                session_id="session-a",
+                mode="collab",
+                status="paused",
+                resolution="interrupted_by_user",
+                resume_phase="conversing",
+                goal="Clarify the goal",
+                workflow_id=snapshot.workflow_id,
+            )
+            save_session_state(root, state)
+            session = Session(
+                orchestrator,
+                mode="collab",
+                coordinator=coordinator,
+            )
+            seen = []
+
+            def finish(resumed):
+                seen.append(resumed.status)
+                resumed.status = "completed"
+                return resumed
+
+            with patch.object(session, "_drive_local", side_effect=finish):
+                result = coordinator._drive_session(
+                    session,
+                    state,
+                    snapshot,
+                    root=False,
+                )
+
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(seen, ["conversing"])
+            self.assertEqual(result.resume_phase, "")
+
+    def test_resuming_child_session_reenters_workflow_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator)
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", "parent-collab")
+            )
+            child = SessionState(
+                session_id="child-fix",
+                mode="fix",
+                status="completed",
+                workflow_id=snapshot.workflow_id,
+                parent_handoff_id="handoff-parent",
+                auto_approve=True,
+            )
+            save_session_state(root, child)
+            root_state = SessionState(
+                session_id="parent-collab",
+                mode="collab",
+                status="waiting_child",
+                workflow_id=snapshot.workflow_id,
+            )
+
+            with patch.object(
+                coordinator,
+                "resume_workflow",
+                return_value=root_state,
+            ) as resume_workflow:
+                result = coordinator.resume_session(
+                    Session(
+                        orchestrator,
+                        mode="fix",
+                        auto_approve=True,
+                        coordinator=coordinator,
+                    ),
+                    child.session_id,
+                )
+
+            self.assertIs(result, root_state)
+            resume_workflow.assert_called_once_with(snapshot.workflow_id)
+
+    def test_nested_waiting_child_does_not_return_to_collab_early(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator)
+            parent = SessionState(
+                session_id="parent-collab",
+                mode="collab",
+                status="waiting_child",
+                goal="Complete the workflow",
+            )
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", parent.session_id)
+            )
+            parent.workflow_id = snapshot.workflow_id
+            handoff = coordinator.store.prepare_handoff(
+                snapshot,
+                parent=WorkflowRef("collab", parent.session_id),
+                target="fix",
+                goal=parent.goal,
+                reason="bounded defect",
+                payload={},
+            )
+            parent.active_handoff_id = handoff.handoff_id
+            save_session_state(root, parent)
+
+            with patch.object(
+                coordinator,
+                "_drive_fix_child",
+                return_value={
+                    "status": "waiting_child",
+                    "resolution": "nested run is paused",
+                    "summary": "nested run is paused",
+                    "changed_paths": [],
+                },
+            ):
+                result = coordinator._drive_handoff(
+                    Session(orchestrator, mode="collab"),
+                    parent,
+                    snapshot,
+                )
+
+            self.assertIsNone(result)
+            self.assertEqual(parent.status, "waiting_child")
+            recorded = coordinator.store.load_handoff(handoff.handoff_id)
+            self.assertEqual(recorded.status, "waiting_child")
+            self.assertEqual(recorded.returned_at, "")
+
+    def test_failed_parent_with_active_handoff_resumes_child_first(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator)
+            parent = SessionState(
+                session_id="parent-collab",
+                mode="collab",
+                status="failed",
+                goal="Complete the workflow",
+                active_handoff_id="handoff-active",
+                resume_phase="executing",
+            )
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", parent.session_id)
+            )
+            parent.workflow_id = snapshot.workflow_id
+
+            with patch.object(
+                coordinator,
+                "_drive_handoff",
+                return_value=None,
+            ) as drive_handoff:
+                result = coordinator._drive_session(
+                    Session(orchestrator, mode="collab"),
+                    parent,
+                    snapshot,
+                    root=False,
+                )
+
+            self.assertEqual(result.status, "waiting_child")
+            self.assertEqual(result.resume_phase, "")
+            drive_handoff.assert_called_once()
 
 
 class RoutedWorkflowTests(unittest.TestCase):
@@ -416,6 +589,44 @@ class RoutedWorkflowTests(unittest.TestCase):
             self.assertEqual(state.status, "completed")
             self.assertIn("export.py", state.lineage_changed_paths)
 
+    def test_collab_full_verify_does_not_leak_into_child_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator, full_verify=True)
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", "parent-collab")
+            )
+            handoff = coordinator.store.prepare_handoff(
+                snapshot,
+                parent=WorkflowRef("collab", "parent-collab"),
+                target="fix",
+                goal="Repair app",
+                reason="bounded defect",
+                payload={},
+            )
+            child = SessionState(
+                session_id="child-fix",
+                mode="fix",
+                status="completed",
+                resolution="fixed",
+            )
+
+            def finish(session, **_kwargs):
+                self.assertFalse(session._full_verify)
+                self.assertFalse(orchestrator._force_full_verify)
+                return child
+
+            with patch.object(
+                coordinator,
+                "start_seeded_session",
+                side_effect=finish,
+            ):
+                result = coordinator._drive_fix_child(handoff, snapshot)
+
+            self.assertEqual(result["status"], "completed")
+
     def test_standalone_fix_can_upgrade_to_run_and_verify_original_issue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _make_project(tmp)
@@ -469,6 +680,23 @@ class RoutedWorkflowTests(unittest.TestCase):
             self.assertEqual(state.resolution, "resolved_by_iteration")
             self.assertIn("export.py", state.lineage_changed_paths)
             self.assertEqual(len(list((root / "specs" / "iterations").glob("*.md"))), 1)
+            committed_session = json.loads(
+                subprocess.run(
+                    [
+                        "git",
+                        "show",
+                        (
+                            "HEAD:.auto-agents/state/sessions/"
+                            f"{state.session_id}/session_state.json"
+                        ),
+                    ],
+                    cwd=root,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout
+            )
+            self.assertEqual(committed_session["status"], "completed")
 
     def test_late_fix_upgrade_rolls_back_attempt_before_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -603,7 +831,20 @@ class RoutedWorkflowTests(unittest.TestCase):
                 mode="collab",
                 status="executing",
                 workflow_id=snapshot.workflow_id,
+                goal="Repair the app",
+                conversation=[
+                    {"role": "user", "content": "Repair the app"},
+                    {
+                        "role": "agent",
+                        "content": (
+                            'ROUTE_WORKFLOW v1: {"target":"fix",'
+                            '"reason":"bounded defect",'
+                            '"issue_seed":{"summary":"repair app"}}'
+                        ),
+                    },
+                ],
             )
+            save_session_state(root, state)
             before = orchestrator._worktree_change_snapshot()
             checkpoint = (
                 store.workflow_root(snapshot.workflow_id)
@@ -613,13 +854,47 @@ class RoutedWorkflowTests(unittest.TestCase):
             session._capture_collab_restore_point(checkpoint, before)
             write_text(root / "app.py", "interrupted mutation\n")
 
-            session._reconcile_interrupted_collab_checkpoints(state)
+            result = session._drive_local(state)
 
+            self.assertEqual(result.status, "waiting_child")
             self.assertEqual((root / "app.py").read_text(), "value = 1\n")
             self.assertFalse(checkpoint.exists())
             self.assertTrue(
                 any(
                     item.get("action") == "collab_interruption_reconciled"
+                    for item in state.execution_log
+                )
+            )
+
+    def test_resume_discards_checkpoint_not_armed_before_provider_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            session = Session(orchestrator, mode="collab")
+            store = WorkflowStore(root)
+            snapshot = store.create_root(WorkflowRef("collab", "session-a"))
+            state = SessionState(
+                session_id="session-a",
+                mode="collab",
+                status="executing",
+                workflow_id=snapshot.workflow_id,
+            )
+            checkpoint = (
+                store.workflow_root(snapshot.workflow_id)
+                / "checkpoints"
+                / "collab-session-a-1"
+            )
+            checkpoint.mkdir(parents=True)
+            write_text(checkpoint / "partial", "capture interrupted\n")
+
+            session._reconcile_interrupted_collab_checkpoints(state)
+
+            self.assertFalse(checkpoint.exists())
+            self.assertTrue(
+                any(
+                    item.get("action")
+                    == "collab_incomplete_checkpoint_discarded"
                     for item in state.execution_log
                 )
             )

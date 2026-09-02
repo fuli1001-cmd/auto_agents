@@ -1735,6 +1735,9 @@ python3 -m auto_agents collab --project /tmp/demo
 python3 -m auto_agents collab --project /tmp/demo --full-verify
 ```
 
+The `--full-verify` choice is durable across pauses and answer-driven workflow resume, but remains
+scoped to collab's final attestation; it is not inherited by routed `fix` children.
+
 `collab --auto-approve` is a workflow-wide policy: routed `fix` and `run` children inherit it, as
 does a `run` reached through `collab -> fix -> run`. Each child applies its own existing
 `--auto-approve` semantics. The policy is recorded in durable session and handoff state so workflow
@@ -1743,7 +1746,17 @@ and production persistence protections remain manual or prohibited.
 
 Automatic returns never reopen session selection or ask for the goal again. A self-repair restart
 resumes the exact durable root session, while `fix` and `run` children return through their recorded
-handoff to the same parent `collab` session.
+handoff to the same parent `collab` session. Resuming a child `fix` session directly also re-enters
+its workflow root so the parent receipt cannot be stranded. Nested `waiting_child` states remain in
+the child chain until the deepest run actually returns.
+
+Interruption recovery preserves whether the session was still conversing or already executing.
+Before a saved collab route is consumed or a child baseline is captured, any unfinished read-only
+checkpoint is restored; Ctrl+C during a collab provider turn performs the same rollback immediately.
+Standard `ROUTE_WORKFLOW v1` markers are accepted during both conversation and execution, including
+the equivalent JSON envelope, and a saved unconsumed route is applied before another agent call.
+Saved `GOAL_CLEAR`, `GOAL_ACHIEVED`, and `NEED_USER_ASSIST` replies are likewise completed or replayed
+from their durable boundary instead of spending a fresh diagnostic turn.
 
 If a provider emits a fix-only `FIX_DISPOSITION` while still inside the read-only collab frame,
 auto_agents deterministically normalizes bounded `fix`, `run_iteration`, and `resume_child`

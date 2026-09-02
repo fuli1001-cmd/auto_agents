@@ -1927,6 +1927,7 @@ class SessionState:
     parent_handoff_id: str = ""
     active_handoff_id: str = ""
     return_phase: str = ""
+    resume_phase: str = ""
     lineage_changed_paths: List[str] = field(default_factory=list)
     lineage_head_ref: str = ""
     last_child_result_ref: str = ""
@@ -1960,6 +1961,7 @@ class SessionState:
     persistence_actions: Dict[str, Dict[str, object]] = field(default_factory=dict)
     provider_continuations: Dict[str, Dict[str, object]] = field(default_factory=dict)
     auto_approve: bool = False
+    full_verify: bool = False
 
     @classmethod
     def from_dict(cls, data: Dict[str, object]) -> "SessionState":
@@ -1970,6 +1972,7 @@ class SessionState:
             parent_handoff_id=str(data.get("parent_handoff_id", "")),
             active_handoff_id=str(data.get("active_handoff_id", "")),
             return_phase=str(data.get("return_phase", "")),
+            resume_phase=str(data.get("resume_phase", "")),
             lineage_changed_paths=[
                 str(item) for item in data.get("lineage_changed_paths", [])
             ],
@@ -2029,6 +2032,7 @@ class SessionState:
                 if isinstance(value, dict)
             },
             auto_approve=bool(data.get("auto_approve", False)),
+            full_verify=bool(data.get("full_verify", False)),
         )
 
     def to_dict(self) -> Dict[str, object]:
@@ -2039,6 +2043,7 @@ class SessionState:
             "parent_handoff_id": self.parent_handoff_id,
             "active_handoff_id": self.active_handoff_id,
             "return_phase": self.return_phase,
+            "resume_phase": self.resume_phase,
             "lineage_changed_paths": list(self.lineage_changed_paths),
             "lineage_head_ref": self.lineage_head_ref,
             "last_child_result_ref": self.last_child_result_ref,
@@ -2072,6 +2077,7 @@ class SessionState:
                 for key, value in self.provider_continuations.items()
             },
             "auto_approve": self.auto_approve,
+            "full_verify": self.full_verify,
         }
 
 
