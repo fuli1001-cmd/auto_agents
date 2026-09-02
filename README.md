@@ -1741,6 +1741,10 @@ does a `run` reached through `collab -> fix -> run`. Each child applies its own 
 resume does not silently downgrade it. Mandatory exceptions such as frontend prototype selection
 and production persistence protections remain manual or prohibited.
 
+Automatic returns never reopen session selection or ask for the goal again. A self-repair restart
+resumes the exact durable root session, while `fix` and `run` children return through their recorded
+handoff to the same parent `collab` session.
+
 Each verification entry in the saved session log records its `progress` or `final` scope, logical
 command count, physically executed command count, certificate hits, and wall-clock duration.
 

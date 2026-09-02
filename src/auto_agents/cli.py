@@ -971,8 +971,9 @@ def _run_command_for_self_repair_resume(
         str(args.project),
     ]
     if getattr(args, "command", "run") in {"fix", "collab", "provider-resolve"}:
-        if getattr(args, "session", None):
-            command.extend(["--session", str(args.session)])
+        session_id = _session_id_for_self_repair_resume(args)
+        if session_id:
+            command.extend(["--session", session_id])
         if getattr(args, "provider", None):
             command.extend(["--provider", str(args.provider)])
         if bool(getattr(args, "print_agent_output", False)):
@@ -1015,6 +1016,42 @@ def _run_command_for_self_repair_resume(
     if getattr(args, "secret_echo", None):
         command.extend(["--secret-echo", str(args.secret_echo)])
     return command
+
+
+def _session_id_for_self_repair_resume(args) -> str:
+    """Resolve the exact durable root session for an automatic CLI restart."""
+
+    explicit = str(getattr(args, "session", "") or "").strip()
+    if explicit:
+        return explicit
+    command = str(getattr(args, "command", "") or "").strip()
+    if command not in {"fix", "collab", "provider-resolve"}:
+        return ""
+    raw_project = str(getattr(args, "project", "") or "").strip()
+    if not raw_project:
+        return ""
+    project_root = Path(raw_project).expanduser()
+    from .config import load_session_state
+    from .workflow_chain import WorkflowStore
+
+    try:
+        snapshot = WorkflowStore(project_root).active()
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+        return ""
+    if snapshot is None:
+        return ""
+    if snapshot.status in {"completed", "suspended"}:
+        return ""
+    expected_mode = _session_mode_for_command(command)
+    if snapshot.root.kind != expected_mode:
+        return ""
+    try:
+        state = load_session_state(project_root, snapshot.root.native_id)
+    except (OSError, RuntimeError, FileNotFoundError, ValueError, json.JSONDecodeError):
+        return ""
+    if state.mode != expected_mode or state.status == "completed":
+        return ""
+    return state.session_id
 
 
 def _run_self_repair_resume_process(

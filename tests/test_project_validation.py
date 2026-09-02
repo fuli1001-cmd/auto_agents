@@ -18,6 +18,7 @@ from auto_agents.cli import (
     _auto_repair_auto_agents_and_resume,
     _preflight_automatic_self_repair,
     _promote_pending_self_repairs,
+    _run_command_for_self_repair_resume,
     build_parser,
     main,
 )
@@ -93,6 +94,7 @@ from auto_agents.validation import (
     validate_task_plan_payload,
     validation_report,
 )
+from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
 
 
 class ProjectRunLockTests(unittest.TestCase):
@@ -296,6 +298,56 @@ class ProjectRunLockTests(unittest.TestCase):
 
 
 class ProjectValidationTests(unittest.TestCase):
+    def test_self_repair_resume_binds_active_collab_root_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            state = create_session(project_root, "collab")
+            state.status = "failed"
+            state.goal = "Generate the requested test video"
+            state.auto_approve = True
+            store = WorkflowStore(project_root)
+            snapshot = store.create_root(
+                WorkflowRef("collab", state.session_id)
+            )
+            snapshot.active_frame = WorkflowRef("run", "child-run")
+            store.save(snapshot)
+            state.workflow_id = snapshot.workflow_id
+            save_session_state(project_root, state)
+            args = build_parser().parse_args(
+                [
+                    "collab",
+                    "--project",
+                    str(project_root),
+                    "--provider",
+                    "codex",
+                    "--auto-approve",
+                ]
+            )
+
+            command = _run_command_for_self_repair_resume(args)
+
+            session_flag = command.index("--session")
+            self.assertEqual(command[session_flag + 1], state.session_id)
+            self.assertIn("--auto-approve", command)
+            self.assertIn("codex", command)
+
+    def test_self_repair_resume_keeps_explicit_session_without_active_workflow(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "fix",
+                "--project",
+                "/tmp/demo",
+                "--session",
+                "explicit-session",
+            ]
+        )
+
+        command = _run_command_for_self_repair_resume(args)
+
+        session_flag = command.index("--session")
+        self.assertEqual(command[session_flag + 1], "explicit-session")
+
     def test_removed_self_repair_budget_fields_fail_during_config_load(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_candidates_per_root was removed"):
             AutonomyConfig.from_dict({"max_candidates_per_root": 3})
