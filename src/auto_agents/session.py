@@ -3645,6 +3645,11 @@ class Session:
             if not path.startswith(session_prefix)
             and not (checkpoint_prefix and path.startswith(checkpoint_prefix))
             and not path.startswith(".auto-agents/state/checkpoint_blobs/")
+            and path
+            not in {
+                ".auto-agents/state/health-watch-control.json",
+                ".auto-agents/state/health-watch-control.lock",
+            }
             and path != ".auto-agents/.gitignore"
         ]
         if not offending:
@@ -3949,7 +3954,9 @@ class Session:
                 path for path in changed_paths(self.project_root) if path not in protected
             ]
             owned_state = [
-                f".auto-agents/state/sessions/{state.session_id}",
+                f".auto-agents/state/sessions/{state.session_id}/session_state.json",
+                f".auto-agents/state/sessions/{state.session_id}/issue.json",
+                f".auto-agents/state/sessions/{state.session_id}/issue.md",
                 ".auto-agents/state/handoffs",
                 f".auto-agents/state/workflows/{state.workflow_id}",
                 ".auto-agents/state/workflows/active.json",

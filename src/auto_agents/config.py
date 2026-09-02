@@ -57,14 +57,23 @@ AUTO_GITIGNORE_ENTRIES = (
     "state/release_jobs.sqlite3-wal",
     "state/release-worker.log",
     "state/release-worker.lock",
+    "state/health-watch-control.json",
+    "state/health-watch-control.lock",
     "state/checkpoint_blobs/",
     "state/root_cause_certificates/",
+    "state/sessions/*/prompts/",
+    "state/sessions/*/outputs/",
+    "state/sessions/*/health/",
     "state/sessions/*/performance_trace.jsonl",
     "state/workflows/*/checkpoints/",
     "state/workflows/*/event_index.sqlite3",
     "state/workflows/*/event_index.sqlite3-*",
 )
-LEGACY_AUTO_GITIGNORE_ENTRIES = {"state/run_state.json"}
+LEGACY_AUTO_GITIGNORE_ENTRIES = {
+    "state/run_state.json",
+    "state/sessions",
+    "state/sessions/",
+}
 
 
 PROJECT_BRIEF_TEMPLATE = """# Project Brief
@@ -825,6 +834,7 @@ def load_session_state(project_root: Path, session_id: str) -> SessionState:
 
 
 def save_session_state(project_root: Path, state: SessionState) -> None:
+    ensure_auto_gitignore(project_root)
     path = session_state_path(project_root, state.session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, state.to_dict())

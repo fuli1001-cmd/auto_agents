@@ -12,6 +12,7 @@ from auto_agents.config import (
     agent_instructions_lock_path,
     config_path,
     docs_dir,
+    ensure_auto_gitignore,
     load_project_config,
     project_rules_path,
     provider_references_dir,
@@ -57,7 +58,10 @@ class BootstrapTests(unittest.TestCase):
                 "state/parallel_tuning.json\nstate/release_jobs.sqlite3\n"
                 "state/release_jobs.sqlite3-shm\nstate/release_jobs.sqlite3-wal\n"
                 "state/release-worker.log\nstate/release-worker.lock\n"
+                "state/health-watch-control.json\nstate/health-watch-control.lock\n"
                 "state/checkpoint_blobs/\nstate/root_cause_certificates/\n"
+                "state/sessions/*/prompts/\nstate/sessions/*/outputs/\n"
+                "state/sessions/*/health/\n"
                 "state/sessions/*/performance_trace.jsonl\n"
                 "state/workflows/*/checkpoints/\n"
                 "state/workflows/*/event_index.sqlite3\n"
@@ -93,11 +97,31 @@ class BootstrapTests(unittest.TestCase):
                 ],
                 cwd=str(project_root),
             )
+            session_prompt_ignore = subprocess.run(
+                [
+                    "git",
+                    "check-ignore",
+                    "-q",
+                    ".auto-agents/state/sessions/session-001/prompts/fix-1.txt",
+                ],
+                cwd=str(project_root),
+            )
+            health_control_ignore = subprocess.run(
+                [
+                    "git",
+                    "check-ignore",
+                    "-q",
+                    ".auto-agents/state/health-watch-control.json",
+                ],
+                cwd=str(project_root),
+            )
             self.assertEqual(task_archive_ignore.returncode, 1)
             self.assertEqual(run_state_archive_ignore.returncode, 0)
             self.assertEqual(run_log_ignore.returncode, 0)
             self.assertEqual(failed_log_ignore.returncode, 0)
             self.assertEqual(session_ignore.returncode, 1)
+            self.assertEqual(session_prompt_ignore.returncode, 0)
+            self.assertEqual(health_control_ignore.returncode, 0)
             gitignore = (project_root / ".gitignore").read_text(encoding="utf-8")
             self.assertIn(".env", gitignore)
             self.assertIn(".conda/", gitignore)
@@ -118,6 +142,45 @@ class BootstrapTests(unittest.TestCase):
             self.assertFalse(config.providers["antigravity-claude"].prompt_via_stdin)
             self.assertFalse(config.providers["antigravity-gemini"].prompt_via_stdin)
             self.assertIn("mock", config.providers)
+
+    def test_auto_gitignore_migrates_legacy_session_directory_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            ignore_path = auto_dir(project_root) / ".gitignore"
+            ignore_path.write_text(
+                "runs/\nstate/sessions/\nstate/run_state.json\n",
+                encoding="utf-8",
+            )
+
+            ensure_auto_gitignore(project_root)
+
+            entries = ignore_path.read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("state/sessions/", entries)
+            self.assertNotIn("state/run_state.json", entries)
+            self.assertIn("state/sessions/*/prompts/", entries)
+            self.assertIn("state/sessions/*/outputs/", entries)
+            self.assertIn("state/sessions/*/health/", entries)
+            session_state_ignore = subprocess.run(
+                [
+                    "git",
+                    "check-ignore",
+                    "-q",
+                    ".auto-agents/state/sessions/session-001/session_state.json",
+                ],
+                cwd=str(project_root),
+            )
+            prompt_ignore = subprocess.run(
+                [
+                    "git",
+                    "check-ignore",
+                    "-q",
+                    ".auto-agents/state/sessions/session-001/prompts/fix-1.txt",
+                ],
+                cwd=str(project_root),
+            )
+            self.assertEqual(session_state_ignore.returncode, 1)
+            self.assertEqual(prompt_ignore.returncode, 0)
 
     def test_init_project_bootstraps_copilot_cli_profile_map(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

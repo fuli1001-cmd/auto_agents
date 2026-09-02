@@ -1421,6 +1421,125 @@ class SessionCollabFlowTests(unittest.TestCase):
             self.assertEqual(result.status, "failed")
             self.assertEqual(result.resolution, "commit_failed")
 
+    def test_session_commit_tracks_only_durable_session_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            commit_all(project_root, "chore: baseline")
+            write_text(
+                project_root / ".auto-agents" / ".gitignore",
+                "runs/\nstate/sessions/\nstate/run_state.json\n",
+            )
+            orchestrator = Orchestrator(project_root)
+            state = create_session(project_root, "fix")
+            state.status = "executing"
+            state.goal = "Repair the app"
+            store = WorkflowStore(project_root)
+            workflow = store.create_root(WorkflowRef("fix", state.session_id))
+            state.workflow_id = workflow.workflow_id
+            save_session_state(project_root, state)
+            root = session_state_path(project_root, state.session_id).parent
+            write_json(root / "issue.json", {"summary": "Repair the app"})
+            write_text(root / "issue.md", "# Repair the app\n")
+            write_text(root / "prompts" / "fix-1.txt", "private prompt\n")
+            write_text(root / "outputs" / "fix-1.md", "provider output\n")
+            write_json(root / "health" / "summary.json", {"status": "observing"})
+            write_text(root / "performance_trace.jsonl", "{}\n")
+            write_text(root / "local-debug.txt", "not durable\n")
+            session = Session(orchestrator, mode="fix")
+            session._coordinator = SimpleNamespace(store=store)
+
+            committed = session._git_commit(
+                state,
+                "fix",
+                reply="COMMIT_MESSAGE: persist durable session state",
+            )
+
+            self.assertTrue(committed)
+            tracked = subprocess.run(
+                ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.splitlines()
+            prefix = f".auto-agents/state/sessions/{state.session_id}/"
+            self.assertIn(prefix + "session_state.json", tracked)
+            self.assertIn(prefix + "issue.json", tracked)
+            self.assertIn(prefix + "issue.md", tracked)
+            self.assertNotIn(prefix + "prompts/fix-1.txt", tracked)
+            self.assertNotIn(prefix + "outputs/fix-1.md", tracked)
+            self.assertNotIn(prefix + "health/summary.json", tracked)
+            self.assertNotIn(prefix + "performance_trace.jsonl", tracked)
+            self.assertNotIn(prefix + "local-debug.txt", tracked)
+            ignore_entries = (
+                project_root / ".auto-agents" / ".gitignore"
+            ).read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("state/sessions/", ignore_entries)
+
+    def test_collab_allows_health_control_telemetry_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            commit_all(project_root, "chore: baseline")
+            control_path = (
+                project_root
+                / ".auto-agents"
+                / "state"
+                / "health-watch-control.json"
+            )
+            write_json(control_path, {"active_operation": {}})
+            subprocess.run(
+                ["git", "add", "-f", str(control_path.relative_to(project_root))],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "chore: legacy tracked health control"],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            orchestrator = Orchestrator(project_root)
+            session = Session(orchestrator, mode="collab")
+            state = SessionState(
+                session_id="readonly-health",
+                mode="collab",
+                status="executing",
+                goal="Diagnose app",
+                hard_ceiling=1,
+            )
+
+            def report_diagnosis(_state, _label, _prompt):
+                write_json(
+                    control_path,
+                    {"active_operation": {"kind": "provider", "label": "collab-1"}},
+                )
+                return "Diagnosis is complete but has no workflow marker yet."
+
+            session._call_agent = report_diagnosis
+            result = session._phase_collab_loop(state)
+
+            self.assertEqual(result.status, "failed")
+            self.assertTrue(
+                any(item.get("action") == "collab" for item in result.execution_log)
+            )
+            self.assertFalse(
+                any(
+                    item.get("action") == "collab_mutation_restored"
+                    for item in result.execution_log
+                )
+            )
+            self.assertEqual(
+                json.loads(control_path.read_text(encoding="utf-8"))[
+                    "active_operation"
+                ]["kind"],
+                "provider",
+            )
+
     def test_collab_resume_replays_saved_assistance_request_before_agent_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
