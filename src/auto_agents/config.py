@@ -4,7 +4,7 @@ import copy
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 from uuid import uuid4
 
 from .io_utils import read_json, read_text, write_if_missing, write_json, write_text
@@ -385,6 +385,13 @@ DEFAULT_CONFIG = {
             "max_interventions_per_root": 3,
             "quiesce_timeout_seconds": 600,
             "boundary_replay_timeout_seconds": 1200,
+        },
+        "session_limits": {
+            "hard_ceiling": {
+                "fix": 15,
+                "collab": 25,
+                "provider_resolve": 15,
+            },
         },
         "provider_failover": {
             "probe_enabled": True,
@@ -809,14 +816,26 @@ def session_artifact_paths(
     return prompt_path, output_path
 
 
-def create_session(project_root: Path, mode: str) -> SessionState:
+def create_session(
+    project_root: Path,
+    mode: str,
+    *,
+    hard_ceiling: Optional[int] = None,
+) -> SessionState:
     session_id = uuid4().hex[:12]
     now = datetime.now(timezone.utc).isoformat()
     state = SessionState(
         session_id=session_id,
         mode=mode,
         max_attempts=DEFAULT_SESSION_MAX_ATTEMPTS.get(mode, 4),
-        hard_ceiling=SESSION_HARD_CEILING.get(mode, 15),
+        hard_ceiling=max(
+            1,
+            int(
+                hard_ceiling
+                if hard_ceiling is not None
+                else SESSION_HARD_CEILING.get(mode, 15)
+            ),
+        ),
         created_at=now,
         updated_at=now,
     )

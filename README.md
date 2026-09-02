@@ -1944,3 +1944,10 @@ persisted session state under `.auto-agents/state/sessions/` and never roll back
 Both `fix` and `collab` accept `--provider` and `--print-agent-output`. Session state is persisted
 independently at `.auto-agents/state/sessions/<session_id>/` and does not interfere with the main
 `run_state.json`.
+
+Session loops keep a finite hard ceiling as a final circuit breaker. Configure per-mode defaults
+under `execution.session_limits.hard_ceiling` (`fix`, `collab`, and `provider_resolve`, each clamped
+to `1..100`). The budget counts provider calls since the latest durable progress boundary; routing
+a workflow, receiving a child result, supplying requested user input, or resuming the session starts
+a fresh local attempt epoch. Repeated identical no-progress outcomes still stop earlier via the stall
+threshold.

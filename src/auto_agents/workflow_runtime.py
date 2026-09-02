@@ -56,6 +56,15 @@ class WorkflowCoordinator:
         self.health_runtime = health_runtime
         self.run_lock = run_lock
 
+    def _create_session(self, session: object):
+        return create_session(
+            self.project_root,
+            session.mode,
+            hard_ceiling=session.config.execution.session_limits.for_mode(
+                session.mode
+            ),
+        )
+
     def start_session(self, session: object):
         active = self.store.active()
         if (
@@ -63,7 +72,7 @@ class WorkflowCoordinator:
             and active.root.kind == "run"
             and session.mode == "provider_resolve"
         ):
-            state = create_session(self.project_root, session.mode)
+            state = self._create_session(session)
             state.workflow_id = active.workflow_id
             state.auto_approve = bool(self.auto_approve)
             state.full_verify = bool(session._full_verify)
@@ -132,7 +141,7 @@ class WorkflowCoordinator:
                 raise RuntimeError(
                     f"workflow {active.workflow_id} is already active; resume it or explicitly choose a new session"
                 )
-        state = create_session(self.project_root, session.mode)
+        state = self._create_session(session)
         state.auto_approve = bool(self.auto_approve)
         state.full_verify = bool(session._full_verify)
         state.lineage_head_ref = head_ref(self.project_root)
@@ -167,11 +176,11 @@ class WorkflowCoordinator:
             try:
                 state = load_session_state(self.project_root, child_id)
             except FileNotFoundError:
-                state = create_session(self.project_root, session.mode)
+                state = self._create_session(session)
                 handoff.payload["child_session_id"] = state.session_id
                 self.store.save_handoff(handoff)
         else:
-            state = create_session(self.project_root, session.mode)
+            state = self._create_session(session)
             handoff.payload["child_session_id"] = state.session_id
             self.store.save_handoff(handoff)
         self.auto_approve = bool(
@@ -212,10 +221,25 @@ class WorkflowCoordinator:
             raise ValueError(
                 f"session {session_id} is {state.mode}, not {session.mode}"
             )
-        if state.status != "completed" and session._invalidate_provider_continuations(
-            state,
-            reason="process-level session resume uses the durable transcript",
-        ):
+        resume_state_changed = False
+        if state.status != "completed":
+            resume_state_changed = session._invalidate_provider_continuations(
+                state,
+                reason="process-level session resume uses the durable transcript",
+            )
+            if not (
+                state.status == "failed"
+                or (
+                    state.status == "paused"
+                    and state.resolution == "interrupted_by_user"
+                )
+            ):
+                session._begin_attempt_epoch(
+                    state,
+                    reason="process-level session resume",
+                )
+                resume_state_changed = True
+        if resume_state_changed:
             save_session_state(self.project_root, state)
         self.auto_approve = bool(self.auto_approve or state.auto_approve)
         self.full_verify = bool(self.full_verify or state.full_verify)
@@ -536,6 +560,11 @@ class WorkflowCoordinator:
                 state,
                 reason="failed session started a fresh durable resume boundary",
             )
+            state.current_attempt = 0
+            session._begin_attempt_epoch(
+                state,
+                reason="failed session resumed",
+            )
             state.status = (
                 "waiting_child"
                 if state.active_handoff_id
@@ -546,14 +575,16 @@ class WorkflowCoordinator:
                 )
             )
             state.resume_phase = ""
-            state.current_attempt = 0
-            state.stall_count = 0
-            state.consecutive_agent_errors = 0
+            state.resolution = ""
             save_session_state(self.project_root, state)
         elif state.status == "paused" and state.resolution == "interrupted_by_user":
             session._invalidate_provider_continuations(
                 state,
                 reason="interrupted session started a fresh durable resume boundary",
+            )
+            session._begin_attempt_epoch(
+                state,
+                reason="interrupted session resumed",
             )
             state.status = (
                 "waiting_child"
@@ -962,10 +993,14 @@ class WorkflowCoordinator:
         parent_state.active_handoff_id = ""
         parent_state.return_phase = "after_child"
         parent_state.status = "executing"
+        parent_state.attempt_epoch += 1
+        parent_state.attempts_since_progress = 0
+        parent_state.consecutive_agent_errors = 0
         summary = str(result.get("summary") or result.get("resolution") or result.get("status", ""))
         parent_state.execution_log.append(
             {
                 "attempt": parent_state.current_attempt,
+                "attempt_epoch": parent_state.attempt_epoch,
                 "action": "child_returned",
                 "result": summary[:500],
                 "handoff_id": handoff.handoff_id,

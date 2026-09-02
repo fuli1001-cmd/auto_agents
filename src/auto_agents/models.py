@@ -1358,6 +1358,38 @@ class AutonomyConfig:
 
 
 @dataclass
+class SessionLimitsConfig:
+    hard_ceiling: Dict[str, int] = field(
+        default_factory=lambda: dict(SESSION_HARD_CEILING)
+    )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "SessionLimitsConfig":
+        configured = data.get("hard_ceiling", {})
+        values = dict(configured) if isinstance(configured, dict) else {}
+        return cls(
+            hard_ceiling={
+                mode: min(
+                    100,
+                    max(1, int(values.get(mode, default) or default)),
+                )
+                for mode, default in SESSION_HARD_CEILING.items()
+            }
+        )
+
+    def for_mode(self, mode: str) -> int:
+        return int(
+            self.hard_ceiling.get(
+                mode,
+                SESSION_HARD_CEILING.get(mode, 15),
+            )
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"hard_ceiling": dict(self.hard_ceiling)}
+
+
+@dataclass
 class ExecutionConfig:
     acceleration: AccelerationConfig = field(default_factory=AccelerationConfig)
     parallel_tasks: ParallelTasksConfig = field(default_factory=ParallelTasksConfig)
@@ -1373,6 +1405,7 @@ class ExecutionConfig:
         default_factory=SelfRepairDiagnosisConfig
     )
     autonomy: AutonomyConfig = field(default_factory=AutonomyConfig)
+    session_limits: SessionLimitsConfig = field(default_factory=SessionLimitsConfig)
     user_input: UserInputConfig = field(default_factory=UserInputConfig)
     project_runtime: ProjectRuntimeConfig = field(default_factory=ProjectRuntimeConfig)
 
@@ -1403,6 +1436,9 @@ class ExecutionConfig:
                 dict(data.get("self_repair_diagnosis", {}))
             ),
             autonomy=AutonomyConfig.from_dict(dict(data.get("autonomy", {}))),
+            session_limits=SessionLimitsConfig.from_dict(
+                dict(data.get("session_limits", {}))
+            ),
             user_input=UserInputConfig.from_dict(
                 dict(data.get("user_input", {}))
             ),
@@ -1423,6 +1459,7 @@ class ExecutionConfig:
             "provider_failover": self.provider_failover.to_dict(),
             "self_repair_diagnosis": self.self_repair_diagnosis.to_dict(),
             "autonomy": self.autonomy.to_dict(),
+            "session_limits": self.session_limits.to_dict(),
             "user_input": self.user_input.to_dict(),
             "project_runtime": self.project_runtime.to_dict(),
         }
@@ -1939,6 +1976,8 @@ class SessionState:
     conversation: List[Dict[str, str]] = field(default_factory=list)
     execution_log: List[Dict[str, object]] = field(default_factory=list)
     current_attempt: int = 0
+    attempt_epoch: int = 0
+    attempts_since_progress: int = 0
     max_attempts: int = 4
     resolution: str = ""
     created_at: str = ""
@@ -1992,6 +2031,13 @@ class SessionState:
             ],
             execution_log=list(data.get("execution_log", [])),
             current_attempt=int(data.get("current_attempt", 0)),
+            attempt_epoch=int(data.get("attempt_epoch", 0)),
+            attempts_since_progress=int(
+                data.get(
+                    "attempts_since_progress",
+                    data.get("current_attempt", 0),
+                )
+            ),
             max_attempts=int(data.get("max_attempts", 4)),
             resolution=str(data.get("resolution", "")),
             created_at=str(data.get("created_at", "")),
@@ -2055,6 +2101,8 @@ class SessionState:
             "conversation": list(self.conversation),
             "execution_log": list(self.execution_log),
             "current_attempt": self.current_attempt,
+            "attempt_epoch": self.attempt_epoch,
+            "attempts_since_progress": self.attempts_since_progress,
             "max_attempts": self.max_attempts,
             "resolution": self.resolution,
             "created_at": self.created_at,

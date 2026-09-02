@@ -19,10 +19,12 @@ from auto_agents.config import (
     create_session,
     delete_session,
     list_sessions,
+    load_project_config,
     load_session_state,
     load_run_state,
     provider_references_lock_path,
     requirements_trace_path,
+    save_project_config,
     save_session_state,
     save_run_state,
     session_state_path,
@@ -49,6 +51,7 @@ from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import load_requirements_trace, stamp_requirement_contract_hashes
 from auto_agents.session import Session
 from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
+from auto_agents.workflow_runtime import WorkflowCoordinator
 
 
 def _make_project(tmp: str, name: str = "demo") -> Path:
@@ -206,6 +209,8 @@ class SessionStateModelTests(unittest.TestCase):
             conversation=[{"role": "user", "content": "hello"}],
             execution_log=[{"attempt": 1, "action": "fix", "result": "ok", "timestamp": "t"}],
             current_attempt=1,
+            attempt_epoch=2,
+            attempts_since_progress=3,
             max_attempts=4,
             created_at="2026-01-01T00:00:00Z",
             updated_at="2026-01-01T00:00:01Z",
@@ -218,6 +223,8 @@ class SessionStateModelTests(unittest.TestCase):
         self.assertEqual(len(restored.conversation), 1)
         self.assertEqual(len(restored.execution_log), 1)
         self.assertEqual(restored.current_attempt, 1)
+        self.assertEqual(restored.attempt_epoch, 2)
+        self.assertEqual(restored.attempts_since_progress, 3)
         self.assertEqual(restored.max_attempts, 4)
 
     def test_defaults(self) -> None:
@@ -226,6 +233,8 @@ class SessionStateModelTests(unittest.TestCase):
         self.assertEqual(state.status, "conversing")
         self.assertEqual(state.conversation, [])
         self.assertEqual(state.max_attempts, 4)
+        self.assertEqual(state.attempt_epoch, 0)
+        self.assertEqual(state.attempts_since_progress, 0)
 
     def test_json_round_trip(self) -> None:
         state = SessionState(session_id="j1", mode="collab", goal="test")
@@ -342,6 +351,19 @@ class SessionConfigTests(unittest.TestCase):
             state = create_session(project_root, "provider_resolve")
             self.assertEqual(state.mode, "provider_resolve")
             self.assertEqual(state.max_attempts, DEFAULT_SESSION_MAX_ATTEMPTS["provider_resolve"])
+
+    def test_project_config_sets_new_session_hard_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            config = load_project_config(project_root)
+            config.execution.session_limits.hard_ceiling["collab"] = 7
+            save_project_config(project_root, config)
+            orchestrator = Orchestrator(project_root)
+            session = Session(orchestrator, mode="collab")
+
+            state = WorkflowCoordinator(orchestrator)._create_session(session)
+
+            self.assertEqual(state.hard_ceiling, 7)
 
     def test_list_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1555,6 +1577,8 @@ class SessionCollabFlowTests(unittest.TestCase):
             state = create_session(project_root, "collab")
             state.status = "executing"
             state.goal = "Verify the browser flow"
+            state.attempt_epoch = 2
+            state.attempts_since_progress = 24
             state.conversation = [
                 {"role": "user", "content": state.goal},
                 {
@@ -1584,6 +1608,8 @@ class SessionCollabFlowTests(unittest.TestCase):
                 result.conversation[-1],
                 {"role": "user", "content": "browser result: passed"},
             )
+            self.assertEqual(result.attempt_epoch, 3)
+            self.assertEqual(result.attempts_since_progress, 0)
 
     def test_collab_interrupt_restores_readonly_mutation_before_pausing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1661,7 +1687,39 @@ class SessionCollabFlowTests(unittest.TestCase):
                 else:
                     self.assertEqual(result.status, "failed")
                     self.assertEqual(result.current_attempt, 2)
+                    self.assertEqual(result.resolution, "hard_ceiling_reached")
                     self.assertEqual(call_agent.call_count, 2)
+
+    def test_repeated_collab_rollbacks_stop_on_stall_before_hard_ceiling(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            _configure_git_identity(project_root)
+            app_path = project_root / "app.py"
+            write_text(app_path, "value = 1\n")
+            commit_all(project_root, "chore: baseline")
+            orchestrator = Orchestrator(project_root)
+            session = Session(orchestrator, mode="collab")
+            state = SessionState(
+                session_id="repeated-rollback",
+                mode="collab",
+                status="executing",
+                goal="Diagnose app",
+                hard_ceiling=25,
+            )
+            calls = {"count": 0}
+
+            def mutate(_state, _label, _prompt):
+                calls["count"] += 1
+                write_text(app_path, "value = 2\n")
+                return "I changed the file directly."
+
+            session._call_agent = mutate
+            result = session._phase_collab_loop(state)
+
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(result.resolution, "no_progress")
+            self.assertLess(calls["count"], state.hard_ceiling)
+            self.assertEqual(app_path.read_text(encoding="utf-8"), "value = 1\n")
 
     def test_collab_verification_uses_preexisting_failure_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3288,6 +3346,8 @@ class SessionStateNewFieldsTests(unittest.TestCase):
         self.assertEqual(state.last_verify_sig, "")
         self.assertEqual(state.consecutive_agent_errors, 0)
         self.assertEqual(state.hard_ceiling, 15)
+        self.assertEqual(state.attempt_epoch, 0)
+        self.assertEqual(state.attempts_since_progress, 0)
         self.assertEqual(state.fix_verify_command, "")
         self.assertEqual(state.baseline_failures, [])
         self.assertEqual(state.baseline_git_ref, "")
@@ -3300,6 +3360,8 @@ class SessionStateNewFieldsTests(unittest.TestCase):
             last_verify_sig="def",
             consecutive_agent_errors=3,
             hard_ceiling=20,
+            attempt_epoch=4,
+            attempts_since_progress=5,
             fix_verify_command="pytest -k test_bug",
             baseline_failures=["tests/test_a.py::test_x", "cmd:npm test"],
             baseline_git_ref="abc123",
@@ -3310,6 +3372,8 @@ class SessionStateNewFieldsTests(unittest.TestCase):
         self.assertEqual(restored.last_verify_sig, "def")
         self.assertEqual(restored.consecutive_agent_errors, 3)
         self.assertEqual(restored.hard_ceiling, 20)
+        self.assertEqual(restored.attempt_epoch, 4)
+        self.assertEqual(restored.attempts_since_progress, 5)
         self.assertEqual(restored.fix_verify_command, "pytest -k test_bug")
         self.assertEqual(restored.baseline_failures, ["tests/test_a.py::test_x", "cmd:npm test"])
         self.assertEqual(restored.baseline_git_ref, "abc123")
@@ -3334,6 +3398,8 @@ class SessionStateNewFieldsTests(unittest.TestCase):
         self.assertEqual(restored.last_diff_hash, "")
         self.assertEqual(restored.consecutive_agent_errors, 0)
         self.assertEqual(restored.hard_ceiling, 15)  # default for fix mode
+        self.assertEqual(restored.attempt_epoch, 0)
+        self.assertEqual(restored.attempts_since_progress, 2)
         self.assertEqual(restored.fix_verify_command, "")
         self.assertEqual(restored.baseline_failures, [])
         self.assertEqual(restored.baseline_git_ref, "")
@@ -3715,6 +3781,23 @@ class ConvergenceHelperTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn("Hard attempt ceiling", result)
 
+    def test_hard_ceiling_uses_calls_since_last_progress_boundary(self) -> None:
+        state = SessionState(
+            session_id="x",
+            current_attempt=40,
+            attempt_epoch=3,
+            attempts_since_progress=2,
+            hard_ceiling=25,
+        )
+        session = self._make_stub_session()
+
+        self.assertIsNone(session._should_stop(state, "still progressing"))
+        state.attempts_since_progress = 25
+        result = session._should_stop(state, "stalled in current epoch")
+
+        self.assertIsNotNone(result)
+        self.assertIn("since the last durable progress boundary", result)
+
     def test_should_not_stop_when_progressing(self) -> None:
         state = SessionState(session_id="x", current_attempt=5, stall_count=1)
         session = self._make_stub_session()
@@ -3769,6 +3852,8 @@ class SessionsListSlimTests(unittest.TestCase):
         self.assertNotIn("conversation", row)
         self.assertNotIn("execution_log", row)
         self.assertNotIn("current_attempt", row)
+        self.assertNotIn("attempt_epoch", row)
+        self.assertNotIn("attempts_since_progress", row)
         self.assertNotIn("max_attempts", row)
         self.assertNotIn("updated_at", row)
 

@@ -3385,6 +3385,7 @@ def main(argv: list[str] | None = None) -> int:
 
             _SESSIONS_OMIT = {
                 "conversation", "execution_log", "current_attempt",
+                "attempt_epoch", "attempts_since_progress",
                 "max_attempts", "updated_at", "stall_count", "last_diff_hash",
                 "last_verify_sig", "consecutive_agent_errors", "hard_ceiling",
                 "baseline_failures", "baseline_git_ref", "fix_verify_command",

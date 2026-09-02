@@ -311,6 +311,8 @@ class WorkflowStoreTests(unittest.TestCase):
                 resume_phase="conversing",
                 goal="Clarify the goal",
                 workflow_id=snapshot.workflow_id,
+                attempt_epoch=2,
+                attempts_since_progress=24,
             )
             state.provider_continuations = {
                 "collab": {
@@ -344,6 +346,8 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(seen, ["conversing"])
             self.assertEqual(result.resume_phase, "")
             self.assertEqual(result.provider_continuations, {})
+            self.assertEqual(result.attempt_epoch, 3)
+            self.assertEqual(result.attempts_since_progress, 0)
 
     def test_resume_invalidates_continuation_before_driving_executing_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -360,6 +364,8 @@ class WorkflowStoreTests(unittest.TestCase):
                 status="executing",
                 goal="Diagnose the app",
                 workflow_id=snapshot.workflow_id,
+                attempt_epoch=2,
+                attempts_since_progress=24,
                 provider_continuations={
                     "collab": {
                         "provider_session_id": "stale-provider-session",
@@ -378,6 +384,8 @@ class WorkflowStoreTests(unittest.TestCase):
             def finish(_session, resumed, _snapshot, *, root):
                 self.assertTrue(root)
                 self.assertEqual(resumed.provider_continuations, {})
+                self.assertEqual(resumed.attempt_epoch, 3)
+                self.assertEqual(resumed.attempts_since_progress, 0)
                 resumed.status = "failed"
                 return resumed
 
@@ -578,6 +586,8 @@ class RoutedWorkflowTests(unittest.TestCase):
             self.assertEqual(state.status, "completed")
             self.assertEqual(state.lineage_changed_paths, ["app.py"])
             self.assertEqual((root / "app.py").read_text(), "fixed = True\n")
+            self.assertGreaterEqual(state.attempt_epoch, 2)
+            self.assertEqual(state.attempts_since_progress, 1)
             self.assertTrue(any(item.get("action") == "child_returned" for item in state.execution_log))
             fix_state = next(
                 item for item in list_sessions(root) if item.mode == "fix"

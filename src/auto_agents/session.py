@@ -1385,6 +1385,11 @@ class Session:
                 "timestamp": self._now(),
             }
         )
+        self._begin_attempt_epoch(
+            state,
+            reason=f"workflow routed to {target}",
+            reset_stall=False,
+        )
         self._save(state)
         return state
 
@@ -1398,7 +1403,11 @@ class Session:
         while True:
             self._reconcile_interrupted_collab_checkpoints(state)
             self._check_health_action()
-            state.current_attempt += 1
+            stop = self._should_stop(state, "attempt limit reached")
+            if stop:
+                self._print(stop)
+                break
+            self._record_agent_attempt(state)
             self._save(state)
             self._print(f"\n--- Fix attempt {state.current_attempt} ---")
 
@@ -1508,6 +1517,10 @@ class Session:
                     {"role": "user", "content": user_reply.strip() or persistence_issue}
                 )
                 state.status = "executing"
+                self._begin_attempt_epoch(
+                    state,
+                    reason="user supplied persistence guidance",
+                )
                 self._save(state)
                 feedback = persistence_issue
                 continue
@@ -1580,6 +1593,7 @@ class Session:
             feedback = self.orch._format_retry_feedback("local_verification", reason=verify_reason)
 
         state.status = "failed"
+        self._record_terminal_stop(state)
         self._save(state)
         self._print("Fix session stopped (no further progress). Session marked as failed.")
         return state
@@ -1691,7 +1705,7 @@ class Session:
             if stop:
                 self._print(stop)
                 break
-            state.current_attempt += 1
+            self._record_agent_attempt(state)
             self._save(state)
             self._print(f"\n--- Collab iteration {state.current_attempt} ---")
 
@@ -1788,9 +1802,18 @@ class Session:
                             "timestamp": self._now(),
                         }
                     )
+                    self._update_stall_state(
+                        state,
+                        self._compute_diff_hash(),
+                        self._compute_verify_sig(reason),
+                    )
                     self._save(state)
                     if durable_restore is not None:
                         shutil.rmtree(durable_restore, ignore_errors=True)
+                    stop = self._should_stop(state, reason)
+                    if stop:
+                        self._print(stop)
+                        break
                     feedback = reason + ". Diagnose and emit ROUTE_WORKFLOW v1 instead of editing."
                     continue
                 if durable_restore is not None:
@@ -1824,7 +1847,16 @@ class Session:
                         "timestamp": self._now(),
                     }
                 )
+                self._update_stall_state(
+                    state,
+                    self._compute_diff_hash(),
+                    self._compute_verify_sig(normalization_error),
+                )
                 self._save(state)
+                stop = self._should_stop(state, normalization_error)
+                if stop:
+                    self._print(stop)
+                    break
                 continue
 
             # Check for NEED_USER_ASSIST — counts as progress
@@ -1865,6 +1897,7 @@ class Session:
             )
 
         state.status = "failed"
+        self._record_terminal_stop(state)
         self._save(state)
         self._print("Collab session stopped (no further progress). Session marked as failed.")
         return state
@@ -1907,6 +1940,7 @@ class Session:
             if stop:
                 self._print(stop)
                 state.status = "failed"
+                self._record_terminal_stop(state)
                 self._save(state)
                 self._print(
                     "Collab session stopped (no further progress). "
@@ -1957,6 +1991,10 @@ class Session:
                 "content": user_feedback.strip() or "Not yet done.",
             }
         )
+        self._begin_attempt_epoch(
+            state,
+            reason="user rejected completion and supplied new guidance",
+        )
         self._save(state)
         self._print_agent_thinking()
         return None
@@ -1980,6 +2018,10 @@ class Session:
             {"role": "user", "content": user_reply.strip() or "Done."}
         )
         state.status = "executing"
+        self._begin_attempt_epoch(
+            state,
+            reason="user assistance supplied",
+        )
         self._save(state)
         self._print_agent_thinking()
 
@@ -3774,6 +3816,66 @@ class Session:
             )
         return offending
 
+    @staticmethod
+    def _record_agent_attempt(state: SessionState) -> None:
+        """Count one provider invocation in both the audit and local budgets."""
+        state.current_attempt += 1
+        state.attempts_since_progress += 1
+
+    def _begin_attempt_epoch(
+        self,
+        state: SessionState,
+        *,
+        reason: str,
+        reset_stall: bool = True,
+    ) -> None:
+        """Open a fresh local attempt budget after durable workflow progress."""
+        state.attempt_epoch += 1
+        state.attempts_since_progress = 0
+        state.consecutive_agent_errors = 0
+        if reset_stall:
+            state.stall_count = 0
+            state.last_diff_hash = ""
+            state.last_verify_sig = ""
+        state.execution_log.append(
+            {
+                "attempt": state.current_attempt,
+                "attempt_epoch": state.attempt_epoch,
+                "action": "attempt_epoch_started",
+                "result": reason[:500],
+                "timestamp": self._now(),
+            }
+        )
+
+    @staticmethod
+    def _attempts_in_current_epoch(state: SessionState) -> int:
+        if state.attempt_epoch or state.attempts_since_progress:
+            return state.attempts_since_progress
+        # Compatibility for in-memory callers and pre-epoch session records.
+        return state.current_attempt
+
+    def _record_terminal_stop(self, state: SessionState) -> None:
+        resolution = ""
+        if state.stall_count >= SESSION_STALL_THRESHOLD:
+            resolution = "no_progress"
+        elif state.consecutive_agent_errors >= SESSION_AGENT_ERROR_THRESHOLD:
+            resolution = "agent_errors_exhausted"
+        elif self._attempts_in_current_epoch(state) >= state.hard_ceiling:
+            resolution = "hard_ceiling_reached"
+        if not resolution:
+            return
+        if not state.resolution:
+            state.resolution = resolution
+        state.execution_log.append(
+            {
+                "attempt": state.current_attempt,
+                "attempt_epoch": state.attempt_epoch,
+                "action": "session_stopped",
+                "result": state.resolution,
+                "timestamp": self._now(),
+            }
+        )
+
     def _should_stop(self, state: SessionState, reason: str) -> Optional[str]:
         """Return a stop-reason string if the session should stop, else None."""
         if state.stall_count >= SESSION_STALL_THRESHOLD:
@@ -3794,9 +3896,12 @@ class Session:
                 f"Provider recovery attempt limit ({state.max_attempts}) reached. "
                 "Stopping."
             )
-        if state.current_attempt >= state.hard_ceiling:
+        attempts_in_epoch = self._attempts_in_current_epoch(state)
+        if attempts_in_epoch >= state.hard_ceiling:
             return (
-                f"Hard attempt ceiling ({state.hard_ceiling}) reached. Stopping."
+                f"Hard attempt ceiling ({state.hard_ceiling}) reached after "
+                f"{attempts_in_epoch} agent calls since the last durable progress "
+                "boundary. Stopping."
             )
         return None
 
