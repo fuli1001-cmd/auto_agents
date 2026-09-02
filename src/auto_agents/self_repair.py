@@ -1176,7 +1176,12 @@ class AutoAgentsSelfRepairJudge:
     def _effort(self) -> str:
         config = getattr(self.orchestrator, "config", None)
         efforts = getattr(config, "efforts", {}) if config is not None else {}
-        return str(efforts.get("self_repair", "max")).strip() or "max"
+        return str(
+            efforts.get(
+                "self_repair_review",
+                efforts.get("self_repair", "max"),
+            )
+        ).strip() or "max"
 
     def _build_prompt(self) -> str:
         state_payload = self.state.to_dict() if self.state is not None else {}
@@ -3568,7 +3573,7 @@ class AutoAgentsSelfRepairRunner:
         )
         request = AgentRequest(
             stage="self_repair_candidate_review",
-            effort=self._effort(),
+            effort=self._review_effort(),
             prompt=prompt,
             cwd=repair_root,
             output_path=output_path,
@@ -5544,7 +5549,17 @@ class AutoAgentsSelfRepairRunner:
     def _effort(self) -> str:
         config = getattr(self.target_orchestrator, "config", None)
         efforts = getattr(config, "efforts", {}) if config is not None else {}
-        return str(efforts.get("self_repair", "max")).strip() or "max"
+        return str(efforts.get("self_repair", "deep")).strip() or "deep"
+
+    def _review_effort(self) -> str:
+        config = getattr(self.target_orchestrator, "config", None)
+        efforts = getattr(config, "efforts", {}) if config is not None else {}
+        return str(
+            efforts.get(
+                "self_repair_review",
+                efforts.get("self_repair", "max"),
+            )
+        ).strip() or "max"
 
     def _artifact_paths(self) -> tuple[Path, Path]:
         candidate_id = str(getattr(self, "_candidate_id", "")).strip()

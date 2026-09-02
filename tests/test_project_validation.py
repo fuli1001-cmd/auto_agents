@@ -1073,13 +1073,15 @@ class ProjectValidationTests(unittest.TestCase):
         del payload["efforts"]["provider_research"]
         del payload["efforts"]["sync-agent-instructions"]
         del payload["efforts"]["self_repair"]
+        del payload["efforts"]["self_repair_review"]
 
         self.assertEqual(validate_project_config_payload(payload), [])
 
         config = ProjectConfig.from_dict(payload)
         self.assertEqual(config.efforts["provider_research"], "deep")
         self.assertEqual(config.efforts["sync-agent-instructions"], "deep")
-        self.assertEqual(config.efforts["self_repair"], "max")
+        self.assertEqual(config.efforts["self_repair"], "deep")
+        self.assertEqual(config.efforts["self_repair_review"], "max")
 
     def test_project_config_rejects_legacy_agent_instructions_node(self) -> None:
         payload = copy.deepcopy(DEFAULT_CONFIG)
@@ -2492,7 +2494,11 @@ class ProjectValidationTests(unittest.TestCase):
 
     def test_self_repair_runner_uses_dedicated_effort(self) -> None:
         class FakeConfig:
-            efforts = {"self_repair": "balanced", "implement": "max"}
+            efforts = {
+                "self_repair": "balanced",
+                "self_repair_review": "max",
+                "implement": "max",
+            }
 
         class FakeOrchestrator:
             config = FakeConfig()
@@ -2505,6 +2511,7 @@ class ProjectValidationTests(unittest.TestCase):
         )
 
         self.assertEqual(runner._effort(), "balanced")
+        self.assertEqual(runner._review_effort(), "max")
 
     def test_cli_run_auto_starts_fresh_provider_resolve_for_current_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

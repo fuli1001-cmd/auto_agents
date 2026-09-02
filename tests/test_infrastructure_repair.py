@@ -25,6 +25,11 @@ def test_incident_judge_has_independent_max_effort() -> None:
     assert DEFAULT_EFFORTS["incident_judge"] != DEFAULT_EFFORTS["arbiter"]
 
 
+def test_self_repair_generation_and_review_have_distinct_defaults() -> None:
+    assert DEFAULT_EFFORTS["self_repair"] == "deep"
+    assert DEFAULT_EFFORTS["self_repair_review"] == "max"
+
+
 def test_new_infrastructure_owner_and_action_are_valid() -> None:
     diagnosis = parse_incident_diagnosis(
         json.dumps(

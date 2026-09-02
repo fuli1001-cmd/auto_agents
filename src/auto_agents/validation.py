@@ -58,6 +58,7 @@ DEFAULTED_EFFORT_STAGES = {
     "incident_judge",
     "visual_judge",
     "self_repair",
+    "self_repair_review",
     "evidence_preflight",
 }
 MAX_ACCEPTANCE_WITHOUT_SCOPE_RATIONALE = 5

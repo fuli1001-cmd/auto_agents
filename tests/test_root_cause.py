@@ -122,7 +122,10 @@ class _FakeOrchestrator:
             "Config",
             (),
             {
-                "efforts": {"self_repair": "max"},
+                "efforts": {
+                    "self_repair": "deep",
+                    "self_repair_review": "max",
+                },
                 "execution": type(
                     "Execution",
                     (),
@@ -571,6 +574,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertTrue(
                 all(item.sandbox_mode == "read-only" for item in fake.requests)
             )
+            self.assertTrue(all(item.effort == "max" for item in fake.requests))
             self.assertTrue(
                 all(
                     not item.record_execution_incidents
@@ -1215,7 +1219,10 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                         "Config",
                         (),
                         {
-                            "efforts": {"self_repair": "max"},
+                            "efforts": {
+                                "self_repair": "deep",
+                                "self_repair_review": "max",
+                            },
                             "execution": type(
                                 "Execution", (), {"autonomy": autonomy}
                             )(),
@@ -2678,6 +2685,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(len(orchestrator.review_requests), 1)
             review_request = orchestrator.review_requests[0]
             self.assertEqual(review_request.timeout_seconds, 60)
+            self.assertEqual(review_request.effort, "max")
             self.assertEqual(review_request.progress_lease_seconds, 60)
             self.assertTrue(review_request.progress_managed_timeout)
             self.assertIn(

@@ -1235,7 +1235,12 @@ class RootCauseCoordinator:
     def _effort(self) -> str:
         config = getattr(self.orchestrator, "config", None)
         efforts = getattr(config, "efforts", {}) if config is not None else {}
-        return str(efforts.get("self_repair", "max")).strip() or "max"
+        return str(
+            efforts.get(
+                "self_repair_review",
+                efforts.get("self_repair", "max"),
+            )
+        ).strip() or "max"
 
     def _prompt(
         self,

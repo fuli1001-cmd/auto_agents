@@ -622,7 +622,8 @@ configuration balances quality and token usage:
 | implement | `deep` | `deep` | Stronger reasoning reduces review rejections |
 | review | `balanced` | auto-escalated | Automatically escalated to `deep` for risky diffs |
 | verify | `balanced` | `balanced` | Runs local commands, no LLM reasoning needed |
-| self_repair | `max` | `max` | Repairs auto_agents itself after eligible orchestrator-owned failures |
+| self_repair | `deep` | `deep` | Generates auto_agents repair candidates after eligible orchestrator-owned failures |
+| self_repair_review | `max` | `max` | Performs root-cause judgment and the complete pre-validation semantic review |
 | evidence_preflight | `balanced` | conditional | Checks high-risk proof feasibility before code changes |
 | readme | `balanced` | `balanced` | Interactive README generation from finalized repo |
 
