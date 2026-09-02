@@ -93,6 +93,9 @@ _FIX_VERIFY = re.compile(r"^FIX_VERIFY:\s*(.+)$", re.MULTILINE)
 _COMMIT_MESSAGE = re.compile(r"^COMMIT_MESSAGE:\s*(.+)$", re.MULTILINE)
 _PERSISTENCE_CHANGE = re.compile(r"^PERSISTENCE_CHANGE:\s*(\{.*\})\s*$", re.MULTILINE)
 _SHELL_CONTROL_TOKENS = re.compile(r"[|;&<>`\n]")
+# Version 2 makes pre-fix records ineligible after rejected-output and process
+# resume boundaries became explicit continuation invalidation points.
+_PROVIDER_CONTINUATION_POLICY_VERSION = 2
 
 
 class Session:
@@ -1718,20 +1721,32 @@ class Session:
                         state, f"collab-{state.current_attempt}", prompt
                     )
                 except KeyboardInterrupt:
-                    self._restore_collab_mutations(
+                    offending = self._restore_collab_mutations(
                         state,
                         before_snapshot,
                         restore_root,
                     )
+                    if offending:
+                        self._invalidate_provider_continuations(
+                            state,
+                            keys=["collab"],
+                            reason="interrupted collab response was rolled back",
+                        )
                     if durable_restore is not None:
                         shutil.rmtree(durable_restore, ignore_errors=True)
                     raise
                 except RuntimeError as exc:
-                    self._restore_collab_mutations(
+                    offending = self._restore_collab_mutations(
                         state,
                         before_snapshot,
                         restore_root,
                     )
+                    if offending:
+                        self._invalidate_provider_continuations(
+                            state,
+                            keys=["collab"],
+                            reason="failed collab response was rolled back",
+                        )
                     if durable_restore is not None:
                         shutil.rmtree(durable_restore, ignore_errors=True)
                     err_msg = str(exc)
@@ -1756,6 +1771,11 @@ class Session:
                     restore_root,
                 )
                 if offending:
+                    self._invalidate_provider_continuations(
+                        state,
+                        keys=["collab"],
+                        reason="collab response rejected after read-only rollback",
+                    )
                     reason = (
                         "Collab is diagnostic-only and restored product mutations from "
                         "the agent attempt. Changed paths: " + ", ".join(offending[:10])
@@ -2836,7 +2856,8 @@ class Session:
             and acceleration.session_continuation_enabled
             and continuation.get("head") == current_head
             and continuation.get("workspace_fingerprint") == current_workspace
-            and int(continuation.get("policy_version", 0) or 0) == 1
+            and int(continuation.get("policy_version", 0) or 0)
+            == _PROVIDER_CONTINUATION_POLICY_VERSION
         ):
             resume_session_id = str(
                 continuation.get("provider_session_id", "")
@@ -2914,11 +2935,43 @@ class Session:
                 "provider": self.orch._current_provider,
                 "head": head_ref(self.project_root),
                 "workspace_fingerprint": worktree_fingerprint(self.project_root),
-                "policy_version": 1,
+                "policy_version": _PROVIDER_CONTINUATION_POLICY_VERSION,
                 "updated_at": self._now(),
             }
             self._save(state)
         return (result.summary or result.stdout).strip()
+
+    def _invalidate_provider_continuations(
+        self,
+        state: SessionState,
+        *,
+        reason: str,
+        keys: Optional[List[str]] = None,
+    ) -> bool:
+        selected = (
+            sorted(state.provider_continuations)
+            if keys is None
+            else sorted(
+                {
+                    str(key).strip()
+                    for key in keys
+                    if str(key).strip() in state.provider_continuations
+                }
+            )
+        )
+        if not selected:
+            return False
+        for key in selected:
+            state.provider_continuations.pop(key, None)
+        state.execution_log.append(
+            {
+                "attempt": state.current_attempt,
+                "action": "provider_continuation_invalidated",
+                "result": f"{', '.join(selected)}: {reason}"[:500],
+                "timestamp": self._now(),
+            }
+        )
+        return True
 
     def _run_verify(self, scope: str = "final") -> Dict[str, object]:
         publish_operation = getattr(
@@ -3614,6 +3667,11 @@ class Session:
                     f"collab checkpoint is incomplete and cannot be reconciled: {path}"
                 )
             restored = self._restore_collab_mutations(state, before, path)
+            self._invalidate_provider_continuations(
+                state,
+                keys=["collab"],
+                reason="interrupted collab checkpoint was reconciled",
+            )
             state.execution_log.append(
                 {
                     "attempt": state.current_attempt,

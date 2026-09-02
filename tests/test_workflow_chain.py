@@ -12,6 +12,7 @@ from auto_agents.cli import build_parser, main
 from auto_agents.config import (
     list_sessions,
     load_run_state,
+    load_session_state,
     save_run_state,
     save_session_state,
 )
@@ -311,6 +312,13 @@ class WorkflowStoreTests(unittest.TestCase):
                 goal="Clarify the goal",
                 workflow_id=snapshot.workflow_id,
             )
+            state.provider_continuations = {
+                "collab": {
+                    "provider_session_id": "interrupted-provider-session",
+                    "provider": "mock",
+                    "policy_version": 2,
+                }
+            }
             save_session_state(root, state)
             session = Session(
                 orchestrator,
@@ -335,6 +343,56 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(result.status, "completed")
             self.assertEqual(seen, ["conversing"])
             self.assertEqual(result.resume_phase, "")
+            self.assertEqual(result.provider_continuations, {})
+
+    def test_resume_invalidates_continuation_before_driving_executing_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator)
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", "session-a")
+            )
+            state = SessionState(
+                session_id="session-a",
+                mode="collab",
+                status="executing",
+                goal="Diagnose the app",
+                workflow_id=snapshot.workflow_id,
+                provider_continuations={
+                    "collab": {
+                        "provider_session_id": "stale-provider-session",
+                        "provider": "codex",
+                        "policy_version": 2,
+                    }
+                },
+            )
+            save_session_state(root, state)
+            session = Session(
+                orchestrator,
+                mode="collab",
+                coordinator=coordinator,
+            )
+
+            def finish(_session, resumed, _snapshot, *, root):
+                self.assertTrue(root)
+                self.assertEqual(resumed.provider_continuations, {})
+                resumed.status = "failed"
+                return resumed
+
+            with patch.object(coordinator, "_drive_session", side_effect=finish):
+                result = coordinator.resume_session(session, state.session_id)
+
+            self.assertEqual(result.provider_continuations, {})
+            persisted = load_session_state(root, state.session_id)
+            self.assertEqual(persisted.provider_continuations, {})
+            self.assertTrue(
+                any(
+                    item.get("action") == "provider_continuation_invalidated"
+                    for item in persisted.execution_log
+                )
+            )
 
     def test_resuming_child_session_reenters_workflow_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -805,6 +863,11 @@ class RoutedWorkflowTests(unittest.TestCase):
 
             def mutate(_state, _label, _prompt):
                 write_text(root / "app.py", "value = 2\n")
+                _state.provider_continuations["collab"] = {
+                    "provider_session_id": "rejected-provider-session",
+                    "provider": "mock",
+                    "policy_version": 2,
+                }
                 return "I changed the file directly."
 
             session._call_agent = mutate
@@ -814,6 +877,13 @@ class RoutedWorkflowTests(unittest.TestCase):
             self.assertEqual((root / "app.py").read_text(), "value = 1\n")
             self.assertTrue(
                 any(item.get("action") == "collab_mutation_restored" for item in result.execution_log)
+            )
+            self.assertNotIn("collab", result.provider_continuations)
+            self.assertTrue(
+                any(
+                    item.get("action") == "provider_continuation_invalidated"
+                    for item in result.execution_log
+                )
             )
 
     def test_resume_reconciles_durable_collab_readonly_checkpoint(self) -> None:

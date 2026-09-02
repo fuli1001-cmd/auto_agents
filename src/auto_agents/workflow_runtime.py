@@ -212,6 +212,11 @@ class WorkflowCoordinator:
             raise ValueError(
                 f"session {session_id} is {state.mode}, not {session.mode}"
             )
+        if state.status != "completed" and session._invalidate_provider_continuations(
+            state,
+            reason="process-level session resume uses the durable transcript",
+        ):
+            save_session_state(self.project_root, state)
         self.auto_approve = bool(self.auto_approve or state.auto_approve)
         self.full_verify = bool(self.full_verify or state.full_verify)
         session._auto_approve = self.auto_approve
@@ -527,6 +532,10 @@ class WorkflowCoordinator:
         session._coordinator = self
         session._coordinator_managed = True
         if state.status == "failed":
+            session._invalidate_provider_continuations(
+                state,
+                reason="failed session started a fresh durable resume boundary",
+            )
             state.status = (
                 "waiting_child"
                 if state.active_handoff_id
@@ -542,6 +551,10 @@ class WorkflowCoordinator:
             state.consecutive_agent_errors = 0
             save_session_state(self.project_root, state)
         elif state.status == "paused" and state.resolution == "interrupted_by_user":
+            session._invalidate_provider_continuations(
+                state,
+                reason="interrupted session started a fresh durable resume boundary",
+            )
             state.status = (
                 "waiting_child"
                 if state.active_handoff_id

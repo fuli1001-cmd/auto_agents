@@ -27,7 +27,12 @@ from auto_agents.config import (
     save_run_state,
     session_state_path,
 )
-from auto_agents.git_ops import commit_all, working_tree_clean
+from auto_agents.git_ops import (
+    commit_all,
+    head_ref,
+    working_tree_clean,
+    worktree_fingerprint,
+)
 from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import (
     AgentResult,
@@ -3069,6 +3074,13 @@ class SessionContinuationTests(unittest.TestCase):
                 mode="collab",
                 status="executing",
             )
+            state.provider_continuations["collab"] = {
+                "provider_session_id": "legacy-provider-session",
+                "provider": "mock",
+                "head": head_ref(root),
+                "workspace_fingerprint": worktree_fingerprint(root),
+                "policy_version": 1,
+            }
             requests = []
 
             def run(request):
@@ -3091,6 +3103,10 @@ class SessionContinuationTests(unittest.TestCase):
             self.assertEqual(requests[0].resume_session_id, "")
             self.assertEqual(requests[1].resume_session_id, "provider-session-1")
             self.assertEqual(requests[2].resume_session_id, "")
+            self.assertEqual(
+                state.provider_continuations["collab"]["policy_version"],
+                2,
+            )
             self.assertTrue(
                 all(item.sandbox_mode == "read-only" for item in requests)
             )
@@ -3333,6 +3349,13 @@ class ResumeFailedSessionTests(unittest.TestCase):
             state.status = "failed"
             state.goal = "Button crash"
             state.current_attempt = 4
+            state.provider_continuations = {
+                "fix": {
+                    "provider_session_id": "stale-provider-session",
+                    "provider": "mock",
+                    "policy_version": 2,
+                }
+            }
             state.conversation = [
                 {"role": "user", "content": "Button crash"},
                 {"role": "agent", "content": "I see the crash.\nGOAL_CLEAR\n"},
@@ -3362,6 +3385,13 @@ class ResumeFailedSessionTests(unittest.TestCase):
             self.assertEqual(result.resolution, "fixed")
             # current_attempt should have been reset and incremented
             self.assertEqual(result.current_attempt, 1)
+            self.assertEqual(result.provider_continuations, {})
+            self.assertTrue(
+                any(
+                    item.get("action") == "provider_continuation_invalidated"
+                    for item in result.execution_log
+                )
+            )
 
     def test_resume_completed_still_noop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
