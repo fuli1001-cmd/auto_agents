@@ -1973,6 +1973,7 @@ class SessionState:
     mode: str = "fix"
     status: str = "conversing"
     goal: str = ""
+    goal_execution_environment: Dict[str, object] = field(default_factory=dict)
     conversation: List[Dict[str, str]] = field(default_factory=list)
     execution_log: List[Dict[str, object]] = field(default_factory=list)
     current_attempt: int = 0
@@ -2024,6 +2025,11 @@ class SessionState:
             mode=str(data.get("mode", "fix")),
             status=str(data.get("status", "conversing")),
             goal=str(data.get("goal", "")),
+            goal_execution_environment=(
+                dict(data.get("goal_execution_environment", {}))
+                if isinstance(data.get("goal_execution_environment"), dict)
+                else {}
+            ),
             conversation=[
                 {str(k): str(v) for k, v in dict(item).items()}
                 for item in data.get("conversation", [])
@@ -2098,6 +2104,9 @@ class SessionState:
             "mode": self.mode,
             "status": self.status,
             "goal": self.goal,
+            "goal_execution_environment": dict(
+                self.goal_execution_environment
+            ),
             "conversation": list(self.conversation),
             "execution_log": list(self.execution_log),
             "current_attempt": self.current_attempt,

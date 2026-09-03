@@ -757,6 +757,12 @@ class IterationSpecBuilder:
         non_goals = _string_list(seed.get("non_goals"))
         evidence = _string_list(seed.get("evidence"))
         open_decisions = _string_list(seed.get("open_decisions"))
+        raw_goal_environment = seed.get("goal_execution_environment", {})
+        goal_environment = (
+            dict(raw_goal_environment)
+            if isinstance(raw_goal_environment, dict)
+            else {}
+        )
         lines = [
             f"# Iteration Request: {title}",
             "",
@@ -774,6 +780,14 @@ class IterationSpecBuilder:
             "## Requested Capability",
             "",
             capability or goal,
+            "",
+            "## Goal Execution Environment",
+            "",
+            (
+                json.dumps(goal_environment, ensure_ascii=False, sort_keys=True)
+                if goal_environment
+                else "Not recorded; implementation must not infer an environment."
+            ),
             "",
             "## Acceptance Criteria",
             "",

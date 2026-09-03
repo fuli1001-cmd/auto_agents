@@ -87,6 +87,10 @@ _REQUIRES_CLARIFY = re.compile(r"^REQUIRES_CLARIFY:\s*(.+)$", re.MULTILINE)
 _REQUIREMENT_ID = re.compile(r"\bREQ-[A-Za-z0-9_-]+\b")
 _BUG_FOUND = re.compile(r"^BUG_FOUND:\s*(.+)$", re.MULTILINE)
 _GOAL_ACHIEVED = re.compile(r"^GOAL_ACHIEVED:\s*(.+)$", re.MULTILINE)
+_GOAL_ENVIRONMENT = re.compile(
+    r"^GOAL_ENVIRONMENT\s+v1:\s*(\{.*\})\s*$",
+    re.MULTILINE,
+)
 _ROUTE_WORKFLOW = re.compile(r"^ROUTE_WORKFLOW\s+v1:\s*(\{.*\})\s*$", re.MULTILINE)
 _FIX_DISPOSITION = re.compile(r"^FIX_DISPOSITION\s+v1:\s*(\{.*\})\s*$", re.MULTILINE)
 _FIX_VERIFY = re.compile(r"^FIX_VERIFY:\s*(.+)$", re.MULTILINE)
@@ -582,6 +586,49 @@ class Session:
             self._save(state)
 
             if self.mode == "collab":
+                if not self._goal_environment_confirmed(state):
+                    handled, environment_error = (
+                        self._consume_goal_environment_reply(state, reply)
+                    )
+                    if environment_error:
+                        state.conversation.append(
+                            {"role": "user", "content": environment_error}
+                        )
+                        state.execution_log.append(
+                            {
+                                "attempt": rounds,
+                                "action": "goal_environment_protocol_retry",
+                                "result": environment_error[:500],
+                                "timestamp": self._now(),
+                            }
+                        )
+                        self._save(state)
+                        self._print_agent_thinking()
+                        continue
+                    if handled:
+                        self._print_agent_thinking()
+                        continue
+                    missing_environment = (
+                        "Before routing or implementing the goal, output exactly one "
+                        "GOAL_ENVIRONMENT v1 marker. Infer a confirmed real or "
+                        "simulated outcome only when the user's goal is explicit; "
+                        "otherwise generate a project-specific, plain-language "
+                        "question and choices with decision=ask_user."
+                    )
+                    state.conversation.append(
+                        {"role": "user", "content": missing_environment}
+                    )
+                    state.execution_log.append(
+                        {
+                            "attempt": rounds,
+                            "action": "goal_environment_required",
+                            "result": missing_environment[:500],
+                            "timestamp": self._now(),
+                        }
+                    )
+                    self._save(state)
+                    self._print_agent_thinking()
+                    continue
                 routed, normalization_error = (
                     self._route_collab_workflow_reply(state, reply)
                 )
@@ -903,6 +950,16 @@ class Session:
             self._save(state)
             self._print_agent_thinking()
 
+        if self.mode == "collab" and not self._goal_environment_confirmed(state):
+            state.status = "failed"
+            state.resolution = "goal_execution_environment_unresolved"
+            self._save(state)
+            self._print(
+                "Could not establish the goal's execution environment; "
+                "stopping before implementation."
+            )
+            return state
+
         # Max rounds reached – force proceed
         self._print("Max clarification rounds reached. Proceeding with current understanding.")
         state.status = "executing"
@@ -981,6 +1038,226 @@ class Session:
                 label="FIX_DISPOSITION v1",
             )
         return disposition, error
+
+    @staticmethod
+    def _goal_environment_confirmed(state: SessionState) -> bool:
+        contract = state.goal_execution_environment
+        return bool(
+            isinstance(contract, dict)
+            and contract.get("confirmed") is True
+            and str(contract.get("mode", "")).strip() in {"real", "simulated"}
+        )
+
+    def _parse_goal_environment(
+        self,
+        reply: str,
+    ) -> Tuple[Optional[Dict[str, object]], str]:
+        payload, error = self._parse_protocol_json(
+            _GOAL_ENVIRONMENT,
+            reply,
+            label="GOAL_ENVIRONMENT v1",
+        )
+        if payload is None and not error:
+            payload, error = self._parse_protocol_envelope(
+                reply,
+                marker="GOAL_ENVIRONMENT",
+                version="v1",
+                label="GOAL_ENVIRONMENT v1",
+            )
+        return payload, error
+
+    @staticmethod
+    def _goal_environment_choices(
+        payload: Dict[str, object],
+    ) -> Tuple[List[Dict[str, str]], str]:
+        raw_choices = payload.get("choices")
+        if not isinstance(raw_choices, list):
+            return [], (
+                "GOAL_ENVIRONMENT v1 decision=ask_user requires two "
+                "project-specific choices."
+            )
+        choices: List[Dict[str, str]] = []
+        for raw in raw_choices:
+            if not isinstance(raw, dict):
+                return [], "GOAL_ENVIRONMENT v1 choices must be JSON objects."
+            value = str(raw.get("value", "")).strip()
+            label = str(raw.get("label", "")).strip()
+            description = str(raw.get("description", "")).strip()
+            if value not in {"real", "simulated"} or not label or not description:
+                return [], (
+                    "Each GOAL_ENVIRONMENT v1 choice requires value=real or "
+                    "simulated plus a non-empty project-specific label and "
+                    "description."
+                )
+            choices.append(
+                {
+                    "value": value,
+                    "label": label,
+                    "description": description,
+                }
+            )
+        if len(choices) != 2 or {item["value"] for item in choices} != {
+            "real",
+            "simulated",
+        }:
+            return [], (
+                "GOAL_ENVIRONMENT v1 choices must contain exactly one real "
+                "choice and one simulated choice."
+            )
+        return choices, ""
+
+    def _record_goal_environment(
+        self,
+        state: SessionState,
+        *,
+        mode: str,
+        source: str,
+        summary: str,
+        label: str = "",
+        question: str = "",
+        answer: str = "",
+    ) -> None:
+        state.goal_execution_environment = {
+            "schema_version": 1,
+            "mode": mode,
+            "source": source,
+            "summary": summary,
+            "label": label,
+            "question": question,
+            "answer": answer,
+            "confirmed": True,
+            "confirmed_at": self._now(),
+        }
+        state.execution_log.append(
+            {
+                "attempt": state.current_attempt,
+                "action": "goal_execution_environment_confirmed",
+                "result": f"{mode}: {summary}"[:500],
+                "source": source,
+                "timestamp": self._now(),
+            }
+        )
+        self._save(state)
+
+    def _consume_goal_environment_reply(
+        self,
+        state: SessionState,
+        reply: str,
+    ) -> Tuple[bool, str]:
+        payload, error = self._parse_goal_environment(reply)
+        if error or payload is None:
+            return False, error
+        decision = str(payload.get("decision", "")).strip()
+        if decision in {"real", "simulated"}:
+            summary = str(payload.get("summary", "")).strip()
+            if not summary:
+                return False, (
+                    "GOAL_ENVIRONMENT v1 decision=real or simulated requires "
+                    "a project-specific summary of the accepted outcome."
+                )
+            self._record_goal_environment(
+                state,
+                mode=decision,
+                source="explicit_goal",
+                summary=summary,
+                label=str(payload.get("label", "")).strip(),
+            )
+            return True, ""
+        if decision != "ask_user":
+            return False, (
+                "GOAL_ENVIRONMENT v1 decision must be real, simulated, or "
+                "ask_user."
+            )
+
+        question = str(payload.get("question", "")).strip()
+        if not question:
+            return False, (
+                "GOAL_ENVIRONMENT v1 decision=ask_user requires a "
+                "project-specific plain-language question."
+            )
+        choices, choice_error = self._goal_environment_choices(payload)
+        if choice_error:
+            return False, choice_error
+        display = [question]
+        for index, choice in enumerate(choices, start=1):
+            display.append(
+                f"{index}. {choice['label']}: {choice['description']}"
+            )
+        self._print("\nAgent:\n" + "\n".join(display))
+        user_reply = self._prompt_user("\nYour reply: ", multiline=True).strip()
+        state.conversation.append(
+            {
+                "role": "user",
+                "content": user_reply or "No selection provided.",
+            }
+        )
+        selected = next(
+            (
+                choice
+                for index, choice in enumerate(choices, start=1)
+                if user_reply.casefold()
+                in {
+                    str(index),
+                    choice["value"].casefold(),
+                    choice["label"].casefold(),
+                }
+            ),
+            None,
+        )
+        if selected is not None:
+            self._record_goal_environment(
+                state,
+                mode=selected["value"],
+                source="user_selection",
+                summary=selected["description"],
+                label=selected["label"],
+                question=question,
+                answer=user_reply,
+            )
+        else:
+            self._save(state)
+        return True, ""
+
+    def _goal_environment_prompt_lines(
+        self,
+        state: SessionState,
+    ) -> List[str]:
+        if self._goal_environment_confirmed(state):
+            contract = json.dumps(
+                state.goal_execution_environment,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            lines = [
+                "Confirmed goal execution environment (binding):",
+                contract,
+                (
+                    "Preserve this choice across diagnosis, routing, "
+                    "implementation, and acceptance. Do not silently change or "
+                    "downgrade it."
+                ),
+            ]
+            if str(state.goal_execution_environment.get("mode")) == "real":
+                lines.append(
+                    "Mocks or fixtures may support internal tests, but they cannot "
+                    "serve as the final completion evidence for this real outcome."
+                )
+            else:
+                lines.append(
+                    "Simulated artifacts are allowed for this goal, but disclose "
+                    "their nature and do not represent them as real-world output."
+                )
+            return lines
+        return [
+            "Before routing or implementation, determine the outcome environment required by the user's goal.",
+            "- If the goal explicitly requires an externally usable or real outcome, return one final marker: GOAL_ENVIRONMENT v1: {\"decision\":\"real\",\"summary\":\"<project-specific accepted outcome>\"}",
+            "- If the goal explicitly requests an offline, simulated, mock, fixture, or rehearsal outcome, use decision=simulated with a project-specific summary.",
+            "- Never infer simulated merely from words such as test, demo, verify, sample, or prototype when the expected deliverable is unclear.",
+            "- If unclear, return decision=ask_user with question and exactly two choices (value real and simulated), each containing a project-specific label and description.",
+            "- Generate the question and choice wording from this project, its artifacts, and the user's goal. Do not reuse a stock example from another project.",
+            "- Use plain user-facing language in question, label, and description; avoid internal implementation terminology unless the user already used it.",
+            "- The GOAL_ENVIRONMENT marker must be the entire final response for this turn. Do not route, edit, or implement in the same turn.",
+        ]
 
     def _route_collab_foreign_fix_disposition(
         self,
@@ -1230,7 +1507,11 @@ class Session:
         self,
         state: SessionState,
     ) -> Tuple[Optional[SessionState], str]:
-        if state.active_handoff_id or not state.conversation:
+        if (
+            state.active_handoff_id
+            or not state.conversation
+            or not self._goal_environment_confirmed(state)
+        ):
             return None, ""
         latest = state.conversation[-1]
         if str(latest.get("role", "")).strip().lower() not in {
@@ -1258,6 +1539,11 @@ class Session:
         reply = str(latest.get("content", ""))
         if not _GOAL_CLEAR.search(reply):
             return ""
+        if not self._goal_environment_confirmed(state):
+            return (
+                "Saved GOAL_CLEAR cannot be resumed until the goal execution "
+                "environment is confirmed."
+            )
         marker_error = self._apply_session_persistence_marker(state, reply)
         if marker_error:
             return marker_error
@@ -1289,6 +1575,8 @@ class Session:
         reply = str(latest.get("content", ""))
         achieved_match = _GOAL_ACHIEVED.search(reply)
         if not achieved_match:
+            return None
+        if not self._goal_environment_confirmed(state):
             return None
         self._prepare_collab_execution(state)
         return self._handle_collab_goal_achieved(
@@ -1452,6 +1740,11 @@ class Session:
             self.orch._apply_generated_verification_config()
             self._ensure_baseline(state)
         handoff_payload = dict(payload)
+        if self._goal_environment_confirmed(state):
+            handoff_payload.setdefault(
+                "goal_execution_environment",
+                dict(state.goal_execution_environment),
+            )
         handoff_payload.setdefault("auto_approve", bool(state.auto_approve))
         handoff_payload.setdefault("head_before", head_ref(self.project_root))
         handoff_payload.setdefault(
@@ -1785,6 +2078,20 @@ class Session:
     # ── Phase 2b: Collab mode loop ───────────────────────────────
 
     def _phase_collab_loop(self, state: SessionState) -> SessionState:
+        if not self._goal_environment_confirmed(state):
+            state.status = "conversing"
+            state.execution_log.append(
+                {
+                    "attempt": state.current_attempt,
+                    "action": "goal_environment_required_before_collab",
+                    "result": (
+                        "returned to clarification before implementation routing"
+                    ),
+                    "timestamp": self._now(),
+                }
+            )
+            self._save(state)
+            return state
         self._prepare_collab_execution(state)
         feedback = ""
         while True:
@@ -2599,6 +2906,9 @@ class Session:
             content = msg.get("content", "")
             lines.append(f"\n[{role.upper()}]:\n{content}")
 
+        if self.mode == "collab" or self._goal_environment_confirmed(state):
+            lines.extend(["", *self._goal_environment_prompt_lines(state)])
+
         lines.extend([
             "",
             f"Analyze the codebase and the {label} description.",
@@ -2755,6 +3065,8 @@ class Session:
             consolidated,
             "",
         ]
+        if self._goal_environment_confirmed(state):
+            lines.extend([*self._goal_environment_prompt_lines(state), ""])
         if feedback:
             lines.extend([
                 "Previous attempt issues:",
@@ -2883,6 +3195,8 @@ class Session:
             "",
             "User's goal:",
             consolidated,
+            "",
+            *self._goal_environment_prompt_lines(state),
             "",
             "--- Conversation History ---",
         ]

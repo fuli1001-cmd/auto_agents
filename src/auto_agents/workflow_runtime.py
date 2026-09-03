@@ -190,6 +190,12 @@ class WorkflowCoordinator:
         state.workflow_id = snapshot.workflow_id
         state.parent_handoff_id = handoff.handoff_id
         state.goal = handoff.goal
+        raw_goal_environment = handoff.payload.get(
+            "goal_execution_environment",
+            {},
+        )
+        if isinstance(raw_goal_environment, dict) and raw_goal_environment:
+            state.goal_execution_environment = dict(raw_goal_environment)
         if not state.conversation and state.goal:
             state.conversation.append({"role": "user", "content": state.goal})
         state.auto_approve = bool(self.auto_approve)
@@ -940,6 +946,15 @@ class WorkflowCoordinator:
             state = current
         elif handoff.child is None:
             seed = dict(handoff.payload.get("spec_seed", {}))
+            raw_goal_environment = handoff.payload.get(
+                "goal_execution_environment",
+                {},
+            )
+            if isinstance(raw_goal_environment, dict) and raw_goal_environment:
+                seed.setdefault(
+                    "goal_execution_environment",
+                    dict(raw_goal_environment),
+                )
             self.store.append_event(
                 snapshot,
                 "operation_intent",
@@ -963,6 +978,16 @@ class WorkflowCoordinator:
                     "iteration_spec_commit": spec["commit_sha"],
                     "auto_approve": self.auto_approve,
                     "print_agent_output": self.print_agent_output,
+                    **(
+                        {
+                            "goal_execution_environment": dict(
+                                raw_goal_environment
+                            )
+                        }
+                        if isinstance(raw_goal_environment, dict)
+                        and raw_goal_environment
+                        else {}
+                    ),
                 }
             )
             save_run_state(self.project_root, state)

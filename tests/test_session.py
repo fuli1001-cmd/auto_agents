@@ -65,6 +65,20 @@ def _make_project(tmp: str, name: str = "demo") -> Path:
     return project_root
 
 
+def _confirm_collab_state(
+    state: SessionState,
+    mode: str = "simulated",
+) -> SessionState:
+    state.goal_execution_environment = {
+        "schema_version": 1,
+        "mode": mode,
+        "source": "test_fixture",
+        "summary": "Confirmed environment for an existing workflow test.",
+        "confirmed": True,
+    }
+    return state
+
+
 def _make_provider_blocked_project(tmp: str, name: str = "demo") -> tuple[Path, str]:
     project_root = Path(tmp) / name
     Orchestrator.init_project(project_root, name, "mock")
@@ -206,6 +220,11 @@ class SessionStateModelTests(unittest.TestCase):
             mode="fix",
             status="conversing",
             goal="Button does not work",
+            goal_execution_environment={
+                "mode": "real",
+                "confirmed": True,
+                "summary": "Repair the actual button behavior.",
+            },
             conversation=[{"role": "user", "content": "hello"}],
             execution_log=[{"attempt": 1, "action": "fix", "result": "ok", "timestamp": "t"}],
             current_attempt=1,
@@ -220,6 +239,7 @@ class SessionStateModelTests(unittest.TestCase):
         self.assertEqual(restored.session_id, "abc123")
         self.assertEqual(restored.mode, "fix")
         self.assertEqual(restored.goal, "Button does not work")
+        self.assertEqual(restored.goal_execution_environment["mode"], "real")
         self.assertEqual(len(restored.conversation), 1)
         self.assertEqual(len(restored.execution_log), 1)
         self.assertEqual(restored.current_attempt, 1)
@@ -884,6 +904,170 @@ class SessionFixFlowTests(unittest.TestCase):
 
 
 class SessionCollabFlowTests(unittest.TestCase):
+    def test_collab_asks_dynamic_environment_question_before_goal_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp, "package-builder")
+            state = create_session(project_root, "collab")
+            state.goal = "Test publishing the package"
+            state.conversation = [{"role": "user", "content": state.goal}]
+            save_session_state(project_root, state)
+            prompts = []
+            outputs = []
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda _prompt: "2",
+            )
+
+            def mock_run(request):
+                prompts.append(request.prompt)
+                if len(prompts) == 1:
+                    content = (
+                        'GOAL_ENVIRONMENT v1: {"decision":"ask_user",'
+                        '"question":"这次发布检查希望做到哪一步？",'
+                        '"choices":['
+                        '{"value":"real","label":"发布到实际仓库",'
+                        '"description":"完成一次外部可访问的软件包发布。"},'
+                        '{"value":"simulated","label":"只演练发布流程",'
+                        '"description":"不连接外部仓库，只检查构建和发布步骤。"}]}'
+                    )
+                else:
+                    content = "GOAL_CLEAR\n"
+                outputs.append(content)
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content,
+                    stdout=content,
+                    returncode=0,
+                )
+
+            orchestrator._call_with_failover = mock_run
+            result = Session(orchestrator, mode="collab")._phase_converse(state)
+
+            self.assertEqual(result.status, "executing")
+            self.assertEqual(
+                result.goal_execution_environment["mode"], "simulated"
+            )
+            self.assertEqual(
+                result.goal_execution_environment["source"], "user_selection"
+            )
+            self.assertEqual(
+                result.goal_execution_environment["label"],
+                "只演练发布流程",
+            )
+            self.assertIn("这次发布检查希望做到哪一步？", outputs[0])
+            self.assertNotIn("实际成片", prompts[0])
+            self.assertIn("Confirmed goal execution environment", prompts[1])
+
+    def test_collab_infers_explicit_real_environment_without_user_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "collab")
+            state.goal = "Publish the real package to the configured registry"
+            state.conversation = [{"role": "user", "content": state.goal}]
+            save_session_state(project_root, state)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"explicit environment unexpectedly prompted user: {prompt}"
+                ),
+            )
+            replies = iter(
+                [
+                    (
+                        'GOAL_ENVIRONMENT v1: {"decision":"real",'
+                        '"summary":"Publish an externally accessible package '
+                        'to the configured registry."}'
+                    ),
+                    "GOAL_CLEAR\n",
+                ]
+            )
+
+            def mock_run(request):
+                content = next(replies)
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content,
+                    stdout=content,
+                    returncode=0,
+                )
+
+            orchestrator._call_with_failover = mock_run
+            result = Session(orchestrator, mode="collab")._phase_converse(state)
+
+            self.assertEqual(result.status, "executing")
+            self.assertEqual(result.goal_execution_environment["mode"], "real")
+            self.assertEqual(
+                result.goal_execution_environment["source"], "explicit_goal"
+            )
+
+    def test_collab_rejects_route_until_environment_is_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "collab")
+            state.goal = "Test export"
+            state.conversation = [{"role": "user", "content": state.goal}]
+            save_session_state(project_root, state)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"environment should be inferred here: {prompt}"
+                ),
+            )
+            replies = iter(
+                [
+                    (
+                        'ROUTE_WORKFLOW v1: {"target":"fix",'
+                        '"reason":"export fails","issue_seed":{}}'
+                    ),
+                    (
+                        'GOAL_ENVIRONMENT v1: {"decision":"simulated",'
+                        '"summary":"Exercise export without external services."}'
+                    ),
+                    (
+                        'ROUTE_WORKFLOW v1: {"target":"fix",'
+                        '"reason":"export fails",'
+                        '"issue_seed":{"summary":"repair export"}}'
+                    ),
+                ]
+            )
+
+            def mock_run(request):
+                content = next(replies)
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content,
+                    stdout=content,
+                    returncode=0,
+                )
+
+            orchestrator._call_with_failover = mock_run
+            result = Session(orchestrator, mode="collab")._phase_converse(state)
+
+            self.assertEqual(result.status, "waiting_child")
+            handoff = WorkflowStore(project_root).load_handoff(
+                result.active_handoff_id
+            )
+            self.assertEqual(handoff.target, "fix")
+            self.assertEqual(
+                handoff.payload["goal_execution_environment"]["mode"],
+                "simulated",
+            )
+            self.assertTrue(
+                any(
+                    item.get("action") == "goal_environment_required"
+                    for item in result.execution_log
+                )
+            )
+
     """Test the collab mode workflow with mock adapter."""
 
     def test_collab_goal_achieved(self) -> None:
@@ -904,6 +1088,17 @@ class SessionCollabFlowTests(unittest.TestCase):
             def mock_run(request):
                 call_count["n"] += 1
                 if call_count["n"] == 1:
+                    content = (
+                        'GOAL_ENVIRONMENT v1: {"decision":"simulated",'
+                        '"summary":"Exercise the frontend video workflow '
+                        'with test artifacts."}'
+                    )
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                if call_count["n"] == 2:
                     content = "I understand, you want to test video generation.\nGOAL_CLEAR\n"
                     write_text(request.output_path, content)
                     return AgentResult(
@@ -927,6 +1122,7 @@ class SessionCollabFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state)
             state.goal = "Repair the existing video generation regression"
             state.conversation = [{"role": "user", "content": state.goal}]
             save_session_state(project_root, state)
@@ -1015,6 +1211,7 @@ class SessionCollabFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state)
             state.goal = "Generate the requested fox story test video"
             state.conversation = [{"role": "user", "content": state.goal}]
             save_session_state(project_root, state)
@@ -1241,6 +1438,7 @@ class SessionCollabFlowTests(unittest.TestCase):
 
             orchestrator.adapter.run = mock_run
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state)
             state.status = "executing"
             state.goal = "Generate video"
             state.conversation = [{"role": "user", "content": state.goal}]
@@ -1260,6 +1458,7 @@ class SessionCollabFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = _make_project(tmp)
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state)
             state.goal = "Add export support"
             state.conversation = [{"role": "user", "content": state.goal}]
             save_session_state(project_root, state)
@@ -1326,6 +1525,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 }
             )
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state)
             state.status = "paused"
             state.resolution = "interrupted_by_user"
             state.goal = "Generate the requested fox story test video"
@@ -1377,6 +1577,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 '"actual":"export fails"}}'
             )
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state)
             state.status = "paused"
             state.resolution = "interrupted_by_user"
             state.resume_phase = "conversing"
@@ -1420,6 +1621,7 @@ class SessionCollabFlowTests(unittest.TestCase):
             project_root = _make_project(tmp)
             orchestrator = Orchestrator(project_root)
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state)
             state.status = "executing"
             state.goal = "Repair export"
             state.conversation = [
@@ -1474,6 +1676,7 @@ class SessionCollabFlowTests(unittest.TestCase):
             project_root = _make_project(tmp)
             orchestrator = Orchestrator(project_root)
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state)
             state.status = "conversing"
             state.goal = "Verify the browser flow"
             state.conversation = [
@@ -1516,6 +1719,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 user_input_fn=lambda _prompt: "y",
             )
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state, "real")
             state.status = "executing"
             state.goal = "Verify the browser flow"
             state.conversation = [
@@ -1553,6 +1757,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 user_input_fn=lambda _prompt: "y",
             )
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state, "real")
             state.status = "executing"
             state.goal = "Verify the browser flow"
             state.conversation = [
@@ -1668,6 +1873,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 goal="Diagnose app",
                 hard_ceiling=1,
             )
+            _confirm_collab_state(state)
 
             def report_diagnosis(_state, _label, _prompt):
                 write_json(
@@ -1704,6 +1910,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 user_input_fn=lambda _prompt: "browser result: passed",
             )
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state, "real")
             state.status = "executing"
             state.goal = "Verify the browser flow"
             state.attempt_epoch = 2
@@ -1750,6 +1957,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 ),
             )
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state, "real")
             state.status = "executing"
             state.goal = "Generate the video"
             state.current_attempt = 1
@@ -1807,6 +2015,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 goal="Generate the video",
                 hard_ceiling=25,
             )
+            _confirm_collab_state(state)
             session = Session(orchestrator, mode="collab")
             calls = {"count": 0}
 
@@ -1865,6 +2074,7 @@ class SessionCollabFlowTests(unittest.TestCase):
             orchestrator = Orchestrator(project_root)
             session = Session(orchestrator, mode="collab")
             state = create_session(project_root, "collab")
+            _confirm_collab_state(state)
             state.status = "executing"
             state.goal = "Inspect the app"
             snapshot = WorkflowStore(project_root).create_root(
@@ -1911,6 +2121,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                     max_attempts=10,
                     hard_ceiling=2,
                 )
+                _confirm_collab_state(state)
                 session = Session(orchestrator, mode="collab")
 
                 with (
@@ -1950,6 +2161,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 goal="Diagnose app",
                 hard_ceiling=25,
             )
+            _confirm_collab_state(state)
             calls = {"count": 0}
 
             def mutate(_state, _label, _prompt):
@@ -1998,6 +2210,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 mode="collab",
                 status="executing",
             )
+            _confirm_collab_state(state)
             session = Session(orchestrator, mode="collab")
             orchestrator.config.gates.commands = ["test gate"]
 
@@ -2026,6 +2239,7 @@ class SessionCollabFlowTests(unittest.TestCase):
             project_root = _make_project(tmp)
             orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "y")
             state = SessionState(session_id="collab-config-sync", mode="collab")
+            _confirm_collab_state(state)
             session = Session(orchestrator, mode="collab")
             events = []
             plan = SimpleNamespace(commands=["test gate"], parallel_groups=[])
@@ -2069,6 +2283,7 @@ class SessionCollabFlowTests(unittest.TestCase):
             project_root = _make_project(tmp)
             orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "y")
             state = SessionState(session_id="collab-two-tier", mode="collab")
+            _confirm_collab_state(state)
             session = Session(orchestrator, mode="collab")
 
             with (
@@ -2106,6 +2321,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 mode="collab",
                 hard_ceiling=1,
             )
+            _confirm_collab_state(state)
             session = Session(orchestrator, mode="collab")
 
             with (
@@ -2131,6 +2347,7 @@ class SessionCollabFlowTests(unittest.TestCase):
             project_root = _make_project(tmp)
             orchestrator = Orchestrator(project_root, user_input_fn=lambda _prompt: "y")
             state = SessionState(session_id="collab-marker-scopes", mode="collab")
+            _confirm_collab_state(state)
             session = Session(orchestrator, mode="collab")
 
             with (
@@ -2179,13 +2396,23 @@ class SessionCollabFlowTests(unittest.TestCase):
             def mock_run(request):
                 call_count["n"] += 1
                 if call_count["n"] == 1:
-                    content = "I'll help test the video player.\nGOAL_CLEAR\n"
+                    content = (
+                        'GOAL_ENVIRONMENT v1: {"decision":"real",'
+                        '"summary":"Verify the actual browser player behavior."}'
+                    )
                     write_text(request.output_path, content)
                     return AgentResult(
                         ok=True, command=["mock"], output_path=request.output_path,
                         summary=content.strip(), stdout=content, returncode=0,
                     )
                 if call_count["n"] == 2:
+                    content = "I'll help test the video player.\nGOAL_CLEAR\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                if call_count["n"] == 3:
                     content = "I've set up the test server.\nNEED_USER_ASSIST: Please open http://localhost:3000 and check the player\n"
                     write_text(request.output_path, content)
                     return AgentResult(
@@ -2225,8 +2452,13 @@ class SessionCollabFlowTests(unittest.TestCase):
             def mock_run(request):
                 call_count["n"] += 1
                 if call_count["n"] == 1:
-                    content = "I'll help test the video player.\nGOAL_CLEAR\n"
+                    content = (
+                        'GOAL_ENVIRONMENT v1: {"decision":"real",'
+                        '"summary":"Verify the actual browser player behavior."}'
+                    )
                 elif call_count["n"] == 2:
+                    content = "I'll help test the video player.\nGOAL_CLEAR\n"
+                elif call_count["n"] == 3:
                     content = "I've set up the test server.\nNEED_USER_ASSIST: Please open http://localhost:3000 and check the player\n"
                 else:
                     content = "Based on your feedback, everything works.\nGOAL_ACHIEVED: Video player verified working in browser\n"
@@ -2243,7 +2475,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 state = session.start()
 
             self.assertEqual(state.status, "completed")
-            self.assertEqual(captured.getvalue().count("Agent is thinking, please wait..."), 2)
+            self.assertEqual(captured.getvalue().count("Agent is thinking, please wait..."), 3)
 
     def test_collab_flow_commits_completed_session_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2263,6 +2495,12 @@ class SessionCollabFlowTests(unittest.TestCase):
             def mock_run(request):
                 call_count["n"] += 1
                 if call_count["n"] == 1:
+                    content = (
+                        'GOAL_ENVIRONMENT v1: {"decision":"simulated",'
+                        '"summary":"Exercise the frontend video workflow '
+                        'with test artifacts."}'
+                    )
+                elif call_count["n"] == 2:
                     content = "I understand, you want to test video generation.\nGOAL_CLEAR\n"
                 else:
                     content = "Set up test harness and generated video.\nGOAL_ACHIEVED: Test video generated successfully at output/test.mp4\n"
@@ -2314,11 +2552,16 @@ class SessionCollabFlowTests(unittest.TestCase):
             def mock_run(request):
                 call_count["n"] += 1
                 if call_count["n"] == 1:
-                    content = "I understand the goal.\nGOAL_CLEAR\n"
+                    content = (
+                        'GOAL_ENVIRONMENT v1: {"decision":"real",'
+                        '"summary":"Make the actual browser flow work end-to-end."}'
+                    )
                 elif call_count["n"] == 2:
+                    content = "I understand the goal.\nGOAL_CLEAR\n"
+                elif call_count["n"] == 3:
                     app_file.write_text("value = 1\n", encoding="utf-8")
                     content = "Applied the first browser fix.\nGOAL_ACHIEVED: The main flow now works\n"
-                elif call_count["n"] == 3:
+                elif call_count["n"] == 4:
                     content = "Diagnostic check complete.\nGOAL_ACHIEVED: The main flow now works\n"
                 else:
                     content = "Final diagnostic check complete.\nGOAL_ACHIEVED: The browser flow is fully working\n"
@@ -3454,13 +3697,23 @@ class CollabStallRetryTests(unittest.TestCase):
             def mock_failover(request):
                 call_count["n"] += 1
                 if call_count["n"] == 1:
-                    content = "Understood.\nGOAL_CLEAR\n"
+                    content = (
+                        'GOAL_ENVIRONMENT v1: {"decision":"simulated",'
+                        '"summary":"Exercise video generation with test artifacts."}'
+                    )
                     write_text(request.output_path, content)
                     return AgentResult(
                         ok=True, command=["mock"], output_path=request.output_path,
                         summary=content.strip(), stdout=content, returncode=0,
                     )
                 if call_count["n"] == 2:
+                    content = "Understood.\nGOAL_CLEAR\n"
+                    write_text(request.output_path, content)
+                    return AgentResult(
+                        ok=True, command=["mock"], output_path=request.output_path,
+                        summary=content.strip(), stdout=content, returncode=0,
+                    )
+                if call_count["n"] == 3:
                     # Simulate a stall — agent returns failure with stall indicator
                     return AgentResult(
                         ok=False, command=["mock"], output_path=request.output_path,
@@ -3842,6 +4095,7 @@ class ResumeFailedSessionTests(unittest.TestCase):
             save_session_state(project_root, older)
 
             newer = create_session(project_root, "collab")
+            _confirm_collab_state(newer)
             newer.status = "failed"
             newer.goal = "newer collab goal"
             newer.updated_at = "2026-01-02T00:00:00+00:00"

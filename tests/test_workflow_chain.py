@@ -28,7 +28,7 @@ from auto_agents.workflow_chain import (
 )
 from auto_agents.workflow_runtime import WorkflowCoordinator
 
-from test_session import _configure_git_identity, _make_project
+from test_session import _configure_git_identity, _confirm_collab_state, _make_project
 
 
 def _commit_baseline(root: Path) -> None:
@@ -594,7 +594,12 @@ class RoutedWorkflowTests(unittest.TestCase):
 
             def mock_run(request):
                 prompt = request.prompt
-                if "read-only diagnostic and routing" in prompt:
+                if "outcome environment required by the user's goal" in prompt:
+                    content = (
+                        'GOAL_ENVIRONMENT v1: {"decision":"real",'
+                        '"summary":"Repair the actual button behavior."}'
+                    )
+                elif "read-only diagnostic and routing" in prompt:
                     if "Child workflow fix returned" in prompt:
                         content = "GOAL_ACHIEVED: the button no longer crashes\n"
                     else:
@@ -645,6 +650,9 @@ class RoutedWorkflowTests(unittest.TestCase):
                 item for item in list_sessions(root) if item.mode == "fix"
             )
             self.assertTrue(fix_state.auto_approve)
+            self.assertEqual(
+                fix_state.goal_execution_environment["mode"], "real"
+            )
             handoff_id = next(
                 item["handoff_id"]
                 for item in state.execution_log
@@ -663,7 +671,12 @@ class RoutedWorkflowTests(unittest.TestCase):
             )
 
             def mock_agent(request):
-                if "read-only diagnostic and routing" in request.prompt:
+                if "outcome environment required by the user's goal" in request.prompt:
+                    content = (
+                        'GOAL_ENVIRONMENT v1: {"decision":"real",'
+                        '"summary":"Add export support to the actual project."}'
+                    )
+                elif "read-only diagnostic and routing" in request.prompt:
                     if "Child workflow run returned" in request.prompt:
                         content = "GOAL_ACHIEVED: export support is available\n"
                     else:
@@ -694,6 +707,12 @@ class RoutedWorkflowTests(unittest.TestCase):
                 self.assertTrue(kwargs["auto_approve"])
                 run_state = load_run_state(root)
                 self.assertTrue(run_state.resume_context["auto_approve"])
+                self.assertEqual(
+                    run_state.resume_context["goal_execution_environment"][
+                        "mode"
+                    ],
+                    "real",
+                )
                 write_text(root / "export.py", "enabled = True\n")
                 commit_only_paths(root, "feat: add export support", ["export.py"])
                 run_state.status = "completed"
@@ -708,6 +727,11 @@ class RoutedWorkflowTests(unittest.TestCase):
 
             self.assertEqual(state.status, "completed")
             self.assertIn("export.py", state.lineage_changed_paths)
+            iteration_spec = next((root / "specs" / "iterations").glob("*.md"))
+            self.assertIn(
+                '"mode": "real"',
+                iteration_spec.read_text(encoding="utf-8"),
+            )
 
     def test_collab_full_verify_does_not_leak_into_child_fix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1051,6 +1075,7 @@ class RoutedWorkflowTests(unittest.TestCase):
                 goal="Diagnose app",
                 hard_ceiling=1,
             )
+            _confirm_collab_state(state)
 
             def mutate(_state, _label, _prompt):
                 write_text(root / "app.py", "value = 2\n")
@@ -1105,6 +1130,7 @@ class RoutedWorkflowTests(unittest.TestCase):
                     },
                 ],
             )
+            _confirm_collab_state(state, "real")
             save_session_state(root, state)
             before = orchestrator._worktree_change_snapshot()
             checkpoint = (
@@ -1223,6 +1249,7 @@ class RoutedWorkflowTests(unittest.TestCase):
                 baseline_head_ref=baseline,
                 lineage_head_ref=baseline,
             )
+            _confirm_collab_state(parent, "real")
             snapshot = coordinator.store.create_root(
                 WorkflowRef("collab", parent.session_id)
             )
