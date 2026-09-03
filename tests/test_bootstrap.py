@@ -14,6 +14,7 @@ from auto_agents.config import (
     docs_dir,
     ensure_auto_gitignore,
     load_project_config,
+    migrate_project_config,
     project_rules_path,
     provider_references_dir,
     provider_references_lock_path,
@@ -23,6 +24,7 @@ from auto_agents.config import (
 )
 from auto_agents.git_ops import is_repo
 from auto_agents.orchestrator import Orchestrator
+from auto_agents.run_lock import ProjectRunLock
 
 
 class BootstrapTests(unittest.TestCase):
@@ -243,7 +245,7 @@ class BootstrapTests(unittest.TestCase):
             config = load_project_config(project_root)
             self.assertEqual(config.providers["copilot-cli"].idle_timeout_seconds, 3600)
 
-    def test_load_project_config_migrates_v2_gates_to_incremental_v3(self) -> None:
+    def test_explicit_project_config_migration_upgrades_v2_gates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo")
@@ -261,7 +263,11 @@ class BootstrapTests(unittest.TestCase):
             ]
             config_file.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
+            before = config_file.read_bytes()
             config = load_project_config(project_root)
+            self.assertEqual(config_file.read_bytes(), before)
+            with ProjectRunLock(project_root, environ={}):
+                self.assertTrue(migrate_project_config(project_root))
             persisted = json.loads(config_file.read_text(encoding="utf-8"))
 
             self.assertEqual(config.gates.verification_policy_version, 3)

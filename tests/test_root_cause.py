@@ -2597,6 +2597,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             class RepairOrchestrator:
                 def __init__(self):
                     self.repair_calls = 0
+                    self.generation_requests = []
                     self.review_requests = []
                     autonomy = type(
                         "Autonomy",
@@ -2638,6 +2639,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                             summary=json.dumps(payload),
                         )
                     self.repair_calls += 1
+                    self.generation_requests.append(request)
                     if self.repair_calls == 2:
                         self.assert_feedback(request.prompt)
                         write_text(request.cwd / "fixed.py", "FIXED = True\n")
@@ -2682,6 +2684,14 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
             self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
             self.assertEqual(orchestrator.repair_calls, 2)
+            self.assertTrue(orchestrator.generation_requests)
+            self.assertTrue(
+                all(
+                    request.progress_managed_timeout
+                    and request.progress_lease_seconds == 300
+                    for request in orchestrator.generation_requests
+                )
+            )
             self.assertEqual(len(orchestrator.review_requests), 1)
             review_request = orchestrator.review_requests[0]
             self.assertEqual(review_request.timeout_seconds, 60)
@@ -2703,6 +2713,103 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(result.status, "approved_candidate")
             self.assertTrue((Path(result.runtime_root) / "fixed.py").is_file())
             runner.cleanup_runtime(result)
+
+    def test_infrastructure_interruption_preserves_and_resumes_partial_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=auto_root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            repair_one = root / "repair-one"
+            repair_two = root / "repair-two"
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(repair_one), base],
+                cwd=auto_root,
+                check=True,
+                capture_output=True,
+            )
+            try:
+                write_text(repair_one / "README.md", "unfinished repair\n")
+                write_text(repair_one / "new_test.py", "PROOF = True\n")
+                runner = AutoAgentsSelfRepairRunner(
+                    object(),
+                    target_project_root=target_root,
+                    error=RuntimeError("provider timed out"),
+                    decision=SelfRepairDecision(True, category="timeout"),
+                )
+                runner.repo_root = auto_root
+                experiment = SelfRepairExperiment.create(
+                    run_id="run-1",
+                    root_fingerprint="root-1",
+                    category="timeout",
+                    base_commit=base,
+                    expected_postconditions=("repair completes",),
+                    max_consecutive_non_improvements=3,
+                    max_frontier_candidates=8,
+                )
+                store = SelfRepairExperimentStore(
+                    target_root,
+                    "run-1",
+                    "root-1",
+                )
+                runner._experiment = experiment
+                runner._experiment_store = store
+
+                runner._preserve_interrupted_candidate(
+                    repair_one,
+                    base_head=base,
+                    candidate_id="c1-timeout",
+                )
+
+                partial = store.candidate_root("c1-timeout") / "partial-candidate.diff"
+                self.assertTrue(partial.is_file())
+                self.assertIn("new_test.py", partial.read_text(encoding="utf-8"))
+                experiment.candidates["c1-timeout"] = SelfRepairCandidateRecord(
+                    candidate_id="c1-timeout",
+                    parent_candidate_id="base",
+                    parent_ref=base,
+                    status="infrastructure_blocked",
+                    infrastructure_failure=True,
+                )
+                subprocess.run(
+                    ["git", "worktree", "add", "--detach", str(repair_two), base],
+                    cwd=auto_root,
+                    check=True,
+                    capture_output=True,
+                )
+                try:
+                    resumed = runner._resume_interrupted_candidate(
+                        repair_two,
+                        base_head=base,
+                    )
+                    self.assertEqual(resumed, "c1-timeout")
+                    self.assertEqual(
+                        (repair_two / "README.md").read_text(encoding="utf-8"),
+                        "unfinished repair\n",
+                    )
+                    self.assertTrue((repair_two / "new_test.py").is_file())
+                finally:
+                    subprocess.run(
+                        ["git", "worktree", "remove", "--force", str(repair_two)],
+                        cwd=auto_root,
+                        check=False,
+                        capture_output=True,
+                    )
+            finally:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(repair_one)],
+                    cwd=auto_root,
+                    check=False,
+                    capture_output=True,
+                )
 
     def test_semantic_review_cannot_defer_code_finding_until_post_full_suite(self):
         with tempfile.TemporaryDirectory() as tmp:

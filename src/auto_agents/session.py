@@ -126,7 +126,6 @@ class Session:
     ) -> None:
         self.orch = orchestrator
         self.project_root = orchestrator.project_root
-        self.config = orchestrator.config
         self.mode = mode
         self._print_agent_output = print_agent_output
         self._full_verify = bool(full_verify)
@@ -142,6 +141,19 @@ class Session:
         self._current_state: Optional[SessionState] = None
         # Expose the same user-input helper used by the orchestrator.
         self._prompt_user = orchestrator._prompt_user
+
+    @property
+    def config(self):
+        """Always use configuration from the current lifecycle generation."""
+
+        return self.orch.config
+
+    def _prepare_project_config_for_supervision(self) -> bool:
+        return bool(self.orch._prepare_project_config_for_supervision())
+
+    def _supervised_worktree_snapshot(self) -> Dict[str, str]:
+        self._prepare_project_config_for_supervision()
+        return self.orch._worktree_change_snapshot()
 
     def _gate_commands(self) -> List[str]:
         if self.config.gates.steps and not self.config.gates.parallel_groups:
@@ -1797,7 +1809,7 @@ class Session:
             self._print(f"\n--- Fix attempt {state.current_attempt} ---")
 
             prompt = self._build_fix_prompt(state, feedback)
-            before_snapshot = self.orch._worktree_change_snapshot()
+            before_snapshot = self._supervised_worktree_snapshot()
             restore_guard = tempfile.TemporaryDirectory(
                 prefix="auto-agents-fix-route-"
             )
@@ -2105,7 +2117,7 @@ class Session:
             self._print(f"\n--- Collab iteration {state.current_attempt} ---")
 
             prompt = self._build_collab_prompt(state, feedback)
-            before_snapshot = self.orch._worktree_change_snapshot()
+            before_snapshot = self._supervised_worktree_snapshot()
             if state.workflow_id:
                 durable_restore = (
                     self.project_root
@@ -2475,7 +2487,7 @@ class Session:
             with tempfile.TemporaryDirectory(prefix="auto-agents-provider-restore-") as restore_tmp:
                 restore_root = Path(restore_tmp)
                 self._capture_provider_artifact_restore_point(restore_root)
-                worktree_before = self.orch._worktree_change_snapshot()
+                worktree_before = self._supervised_worktree_snapshot()
                 try:
                     reply = self._call_agent(
                         state,
@@ -3344,6 +3356,7 @@ class Session:
 
     def _call_agent(self, state: SessionState, label: str, prompt: str) -> str:
         """Call the AI agent and return its reply text."""
+        self._prepare_project_config_for_supervision()
         prompt_path, output_path = session_artifact_paths(
             self.project_root, state.session_id, label,
         )

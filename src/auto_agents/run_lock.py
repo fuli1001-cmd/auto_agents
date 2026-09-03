@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -26,6 +27,10 @@ RUN_LOCK_KEY_ENV = "AUTO_AGENTS_RUN_LOCK_KEY"
 RUN_LOCK_TOKEN_ENV = "AUTO_AGENTS_RUN_TOKEN"
 SELF_REPAIR_HANDOFF_ENV = "AUTO_AGENTS_SELF_REPAIR_LAST_FINGERPRINT"
 SELF_REPAIR_HEALTH_REBASE_ENV = "AUTO_AGENTS_SELF_REPAIR_HEALTH_REBASE"
+
+
+_ACQUIRED_PROJECT_LOCKS: dict[Path, list["ProjectRunLock"]] = {}
+_ACQUIRED_PROJECT_LOCKS_GUARD = threading.RLock()
 
 
 def _safe_int(value: object) -> int:
@@ -49,6 +54,7 @@ class ProjectRunLock:
         self.path = Path(tempfile.gettempdir()) / "auto-agents-run-locks" / f"{self.key}.lock"
         self.control_path = self.path.with_suffix(".processes.json")
         self._fd: Optional[int] = None
+        self._acquired_pid = 0
         self._interrupted_snapshot: dict[str, object] = {}
         self.run_token = str(self._environ.get(RUN_LOCK_TOKEN_ENV, "")).strip() or uuid.uuid4().hex
         self.health_lease_token = self.run_token
@@ -70,6 +76,7 @@ class ProjectRunLock:
         inherited_fd = self._inherited_fd()
         if inherited_fd is not None:
             self._fd = inherited_fd
+            self._acquired_pid = os.getpid()
             explicit_health_rebase = str(
                 self._environ.get(SELF_REPAIR_HEALTH_REBASE_ENV, "")
             ).strip().lower() in {"1", "true", "yes"}
@@ -84,6 +91,7 @@ class ProjectRunLock:
                 self.health_boundary_rebased = True
             self._write_owner(inherited_fd)
             ACTIVE_PROCESSES.configure(self.project_root, self.run_token, self.control_path)
+            _register_project_lock(self)
             return self
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,6 +107,7 @@ class ProjectRunLock:
             ) from error
 
         self._fd = fd
+        self._acquired_pid = os.getpid()
         previous_owner = _read_json_path(self.path)
         previous_control = read_process_control(self.control_path)
         previous_health = _read_json_path(
@@ -145,6 +154,7 @@ class ProjectRunLock:
             }
         self._write_owner(fd)
         ACTIVE_PROCESSES.configure(self.project_root, self.run_token, self.control_path)
+        _register_project_lock(self)
         return self
 
     @property
@@ -238,6 +248,8 @@ class ProjectRunLock:
         if self._fd is None:
             return
         fd, self._fd = self._fd, None
+        self._acquired_pid = 0
+        _unregister_project_lock(self)
         ACTIVE_PROCESSES.clear_configuration(remove_if_empty=True)
         os.close(fd)
 
@@ -246,6 +258,52 @@ class ProjectRunLock:
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.release()
+
+
+def _register_project_lock(lock: ProjectRunLock) -> None:
+    with _ACQUIRED_PROJECT_LOCKS_GUARD:
+        locks = _ACQUIRED_PROJECT_LOCKS.setdefault(lock.project_root, [])
+        if lock not in locks:
+            locks.append(lock)
+
+
+def _unregister_project_lock(lock: ProjectRunLock) -> None:
+    with _ACQUIRED_PROJECT_LOCKS_GUARD:
+        locks = _ACQUIRED_PROJECT_LOCKS.get(lock.project_root, [])
+        remaining = [candidate for candidate in locks if candidate is not lock]
+        if remaining:
+            _ACQUIRED_PROJECT_LOCKS[lock.project_root] = remaining
+        else:
+            _ACQUIRED_PROJECT_LOCKS.pop(lock.project_root, None)
+
+
+def require_project_run_lock(project_root: Path) -> ProjectRunLock:
+    """Return this process's acquired lifecycle lock or reject a config write."""
+
+    resolved = project_root.expanduser().resolve()
+    with _ACQUIRED_PROJECT_LOCKS_GUARD:
+        candidates = list(_ACQUIRED_PROJECT_LOCKS.get(resolved, []))
+    for lock in reversed(candidates):
+        # A fork inherits Python objects and descriptors but not lifecycle
+        # authority. The child must explicitly adopt the inherited lock.
+        if lock._acquired_pid != os.getpid():
+            continue
+        try:
+            fd_stat = os.fstat(lock.fileno)
+            path_stat = lock.path.stat()
+        except (OSError, RuntimeError):
+            continue
+        owner = lock.owner_payload()
+        if (
+            (fd_stat.st_dev, fd_stat.st_ino)
+            == (path_stat.st_dev, path_stat.st_ino)
+            and str(owner.get("project", "")) == str(resolved)
+            and str(owner.get("run_token", "")) == lock.run_token
+        ):
+            return lock
+    raise RuntimeError(
+        "project config migration requires an acquired ProjectRunLock"
+    )
 
 
 def _read_json_path(path: Path) -> dict[str, object]:

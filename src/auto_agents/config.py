@@ -699,13 +699,14 @@ def import_sys():
     return sys
 
 
-def load_project_config(project_root: Path) -> ProjectConfig:
-    data = read_json(config_path(project_root), default=None)
-    if data is None:
-        raise FileNotFoundError(f"Missing config: {config_path(project_root)}")
-    gates = data.get("gates") if isinstance(data, dict) else None
+def _apply_project_config_migrations(data: object) -> bool:
+    """Apply compatibility migrations in memory and report whether data changed."""
+
+    if not isinstance(data, dict):
+        return False
     migrated = False
-    execution = data.get("execution") if isinstance(data, dict) else None
+    gates = data.get("gates")
+    execution = data.get("execution")
     if isinstance(execution, dict) and "acceleration" not in execution:
         execution["acceleration"] = copy.deepcopy(
             DEFAULT_CONFIG["execution"]["acceleration"]
@@ -728,9 +729,44 @@ def load_project_config(project_root: Path) -> ProjectConfig:
                 ):
                     step["result_cache_scope"] = "auto"
             migrated = True
-    if migrated:
-        write_json(config_path(project_root), data)
+    return migrated
+
+
+def load_project_config(project_root: Path) -> ProjectConfig:
+    """Load effective configuration without modifying the project."""
+
+    data = read_json(config_path(project_root), default=None)
+    if data is None:
+        raise FileNotFoundError(f"Missing config: {config_path(project_root)}")
+    _apply_project_config_migrations(data)
     return ProjectConfig.from_dict(data)
+
+
+def migrate_project_config(project_root: Path) -> bool:
+    """Persist compatibility migrations under the project lifecycle lock."""
+
+    path = config_path(project_root)
+    data = read_json(path, default=None)
+    if data is None:
+        raise FileNotFoundError(f"Missing config: {path}")
+    migrated = _apply_project_config_migrations(data)
+    if not migrated:
+        return False
+
+    # Import lazily so side-effect-free readers, including the health sidecar,
+    # do not initialize or depend on the lock implementation.
+    from .run_lock import require_project_run_lock
+
+    require_project_run_lock(project_root)
+    # Re-read only after proving ownership. This keeps the whole-file
+    # read/modify/write transaction inside one lifecycle boundary.
+    data = read_json(path, default=None)
+    if data is None:
+        raise FileNotFoundError(f"Missing config: {path}")
+    migrated = _apply_project_config_migrations(data)
+    if migrated:
+        write_json(path, data)
+    return migrated
 
 
 def save_project_config(project_root: Path, config: ProjectConfig) -> None:

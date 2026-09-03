@@ -60,6 +60,7 @@ from .config import (
     load_project_config,
     load_run_state,
     load_task_plan,
+    migrate_project_config,
     provider_references_dir,
     provider_references_lock_path,
     run_path,
@@ -651,6 +652,30 @@ class Orchestrator:
         self._clarify_pre_trace_ids: Set[str] = set()
         self._clarify_pre_trace_payload: Dict[str, object] = {}
         self._clarify_historical_tasks: List[dict] = []
+
+    def _prepare_project_config_for_supervision(self) -> bool:
+        """Migrate and rebase configuration before assigning provider writes."""
+
+        migrated = migrate_project_config(self.project_root)
+        if not migrated:
+            return False
+        config = load_project_config(self.project_root)
+        health_runtime = getattr(self, "_workflow_health_runtime", None)
+        if health_runtime is not None:
+            # Preserve command-scoped --no-health-watch policy across reloads.
+            config.execution.health_watch.enabled = bool(health_runtime.enabled)
+        self.config = config
+        self.adapter = self._build_adapter(self.config)
+        self._current_provider = self.config.active_provider
+        self._failed_providers.intersection_update(self.config.providers)
+        self._provider_health = {
+            provider: health
+            for provider, health in self._provider_health.items()
+            if provider in self.config.providers
+        }
+        if self._last_successful_provider not in self.config.providers:
+            self._last_successful_provider = None
+        return True
 
     def _run_requirements_audit(self, *args, **kwargs) -> Dict[str, object]:
         self.logger.info("[requirements-audit] start")
@@ -2777,6 +2802,7 @@ class Orchestrator:
         secret_echo: Optional[str] = None,
         autonomy_mode: Optional[str] = None,
     ) -> RunState:
+        self._prepare_project_config_for_supervision()
         ensure_repo(self.project_root, auto_init=self.config.git.auto_init_repo)
         self._ensure_agent_instructions_synced()
         self._print_agent_output = print_agent_output
@@ -6176,7 +6202,17 @@ class Orchestrator:
             source = self.project_root / relative
             target = restore_root / relative
             if source.is_dir():
-                shutil.copytree(source, target, dirs_exist_ok=True)
+                # SQLite WAL/SHM files are ephemeral cache coordination state:
+                # they may disappear after copytree enumerates a directory and
+                # they are not a valid standalone rollback snapshot. Excluding
+                # them prevents a concurrent checkpoint from aborting the
+                # provider transaction's durable restore-point capture.
+                shutil.copytree(
+                    source,
+                    target,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("*.sqlite3-wal", "*.sqlite3-shm"),
+                )
             elif source.exists() or source.is_symlink():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target, follow_symlinks=False)
@@ -32650,6 +32686,9 @@ class Orchestrator:
         task_origin: str = "",
         mutable_artifacts: Iterable[str] = (),
     ) -> AgentResult:
+        # Complete engine-owned migrations before the mutation snapshot. A
+        # provider or health observer can then never be blamed for this write.
+        self._prepare_project_config_for_supervision()
         attempts = self._max_attempts(stage)
         active_run_id = run_id or (state.run_id if state is not None else load_run_state(self.project_root).run_id)
         snapshot_before = self._worktree_change_snapshot()

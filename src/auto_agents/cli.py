@@ -3292,13 +3292,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "provider-research":
         try:
-            project_root = Path(args.project)
-            spec_file = Path(args.spec_file) if args.spec_file else _default_spec_file(project_root)
-            orchestrator = Orchestrator(project_root, agent_output_stream=sys.stderr)
-            state = orchestrator.run_provider_research(spec_file=spec_file)
+            project_root = Path(args.project).expanduser().resolve()
+            with ProjectRunLock(project_root):
+                spec_file = (
+                    Path(args.spec_file)
+                    if args.spec_file
+                    else _default_spec_file(project_root)
+                )
+                orchestrator = Orchestrator(
+                    project_root,
+                    agent_output_stream=sys.stderr,
+                )
+                state = orchestrator.run_provider_research(spec_file=spec_file)
             print(json.dumps(state.to_dict(), indent=2, ensure_ascii=False))
             return 0
-        except (RuntimeError, FileNotFoundError, ValueError) as error:
+        except (
+            OSError,
+            RuntimeError,
+            FileNotFoundError,
+            ValueError,
+            RunAlreadyActiveError,
+        ) as error:
             print(json.dumps({"ok": False, "error": str(error)}, indent=2, ensure_ascii=False))
             return 1
 

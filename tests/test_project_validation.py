@@ -30,6 +30,7 @@ from auto_agents.config import (
     create_session,
     load_project_config,
     load_run_state,
+    migrate_project_config,
     save_session_state,
     requirements_trace_path,
     run_path,
@@ -930,7 +931,11 @@ class ProjectValidationTests(unittest.TestCase):
             payload["execution"]["parallel_tasks"]["enabled"] = False
             write_json(config_file, payload)
 
+            before = config_file.read_bytes()
             config = load_project_config(project_root)
+            self.assertEqual(config_file.read_bytes(), before)
+            with ProjectRunLock(project_root, environ={}):
+                self.assertTrue(migrate_project_config(project_root))
             persisted = read_json(config_file, default={})
 
             self.assertTrue(config.execution.acceleration.enabled)

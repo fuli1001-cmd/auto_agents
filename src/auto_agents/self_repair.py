@@ -1639,6 +1639,11 @@ class AutoAgentsSelfRepairRunner:
         self._base_prewarm_error: Optional[BaseException] = None
         self._shard_worktree_lock = threading.Lock()
         self._full_suite_progress_lock = threading.Lock()
+        self._candidate_id = ""
+        self._candidate_partial_fingerprint = ""
+        self._candidate_partial_diff_line_count = 0
+        self._candidate_partial_path = ""
+        self._candidate_resumed_from = ""
 
     def _autonomy_config(self) -> object:
         config = getattr(self.target_orchestrator, "config", None)
@@ -2583,7 +2588,7 @@ class AutoAgentsSelfRepairRunner:
         seen_fingerprints = {
             item.patch_fingerprint
             for item in experiment.candidates.values()
-            if item.patch_fingerprint
+            if item.patch_fingerprint and not item.infrastructure_failure
         }
         outcomes: list[SelfRepairResult] = []
         while not experiment.patience_exhausted:
@@ -2720,6 +2725,10 @@ class AutoAgentsSelfRepairRunner:
                 status="self_repairing",
                 detail=f"starting candidate attempt {attempt}",
             )
+            self._candidate_partial_fingerprint = ""
+            self._candidate_partial_diff_line_count = 0
+            self._candidate_partial_path = ""
+            self._candidate_resumed_from = ""
             try:
                 candidate = self._run_candidate(
                     experiment_id=experiment_id,
@@ -2729,15 +2738,21 @@ class AutoAgentsSelfRepairRunner:
                     seen_fingerprints=seen_fingerprints,
                 )
             except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                interrupted_candidate_id = (
+                    str(getattr(self, "_candidate_id", "")).strip()
+                    or f"c{attempt}-exception"
+                )
                 candidate = SelfRepairResult(
                     ok=False,
                     status="candidate_exception",
                     category=self.decision.category,
                     reason=str(error),
                     experiment_id=experiment_id,
-                    candidate_id=f"c{attempt}-exception",
+                    candidate_id=interrupted_candidate_id,
                     base_commit=experiment.best_search_ref,
                     parent_candidate_id=experiment.best_search_candidate_id,
+                    patch_fingerprint=self._candidate_partial_fingerprint,
+                    diff_line_count=self._candidate_partial_diff_line_count,
                     infrastructure_failure=self._is_infrastructure_candidate_error(error),
                 )
             candidate.parent_candidate_id = experiment.best_search_candidate_id
@@ -2775,11 +2790,16 @@ class AutoAgentsSelfRepairRunner:
                 store.save(experiment)
                 return candidate
             if candidate.infrastructure_failure:
+                underlying_reason = candidate.reason.strip()
+                preserved = self._candidate_partial_path
                 candidate.status = "infrastructure_blocked"
                 candidate.reason = (
                     "self-repair search was interrupted by provider or infrastructure "
-                    f"failure; experiment {experiment.experiment_id} remains resumable"
+                    f"failure: {underlying_reason}; experiment "
+                    f"{experiment.experiment_id} remains resumable"
                 )
+                if preserved:
+                    candidate.reason += f"; interrupted candidate patch saved at {preserved}"
                 stored_candidate = experiment.candidates.get(candidate.candidate_id)
                 if stored_candidate is not None:
                     stored_candidate.status = candidate.status
@@ -2847,6 +2867,102 @@ class AutoAgentsSelfRepairRunner:
                 "self_repair_stagnation",
             )
         )
+
+    def _preserve_interrupted_candidate(
+        self,
+        repair_root: Path,
+        *,
+        base_head: str,
+        candidate_id: str,
+    ) -> None:
+        """Save an isolated provider's unfinished patch before temp cleanup."""
+
+        try:
+            paths = changed_paths(repair_root)
+            if not paths:
+                return
+            fingerprint = worktree_fingerprint(
+                repair_root,
+                ignored_prefixes=(),
+            )
+            staged = subprocess.run(
+                ["git", "add", "-A", "--"],
+                cwd=str(repair_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if staged.returncode != 0:
+                return
+            diff = subprocess.run(
+                ["git", "diff", "--cached", "--binary", base_head, "--"],
+                cwd=str(repair_root),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+            )
+            if diff.returncode != 0 or not diff.stdout.strip():
+                return
+            path = (
+                self._experiment_store.candidate_root(candidate_id)
+                / "partial-candidate.diff"
+            )
+            write_text(path, diff.stdout)
+            numstat = subprocess.run(
+                ["git", "diff", "--cached", "--numstat", base_head, "--"],
+                cwd=str(repair_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            line_count = 0
+            for line in numstat.stdout.splitlines():
+                added, _, remainder = line.partition("\t")
+                removed, _, _ = remainder.partition("\t")
+                try:
+                    line_count += int(added) + int(removed)
+                except ValueError:
+                    line_count += 1
+            self._candidate_partial_fingerprint = fingerprint
+            self._candidate_partial_diff_line_count = line_count
+            self._candidate_partial_path = str(path)
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            # Preserve the original provider/infrastructure error. Failure to
+            # produce a diagnostic patch must not hide the actual interruption.
+            return
+
+    def _resume_interrupted_candidate(
+        self,
+        repair_root: Path,
+        *,
+        base_head: str,
+    ) -> str:
+        """Apply the latest compatible infrastructure-interrupted patch."""
+
+        experiment = getattr(self, "_experiment", None)
+        store = getattr(self, "_experiment_store", None)
+        if not isinstance(experiment, SelfRepairExperiment) or store is None:
+            return ""
+        for record in reversed(list(experiment.candidates.values())):
+            if record.candidate_id == "base":
+                continue
+            # Only the immediately preceding outcome can be continued. Once a
+            # completed candidate exists, older unfinished work is stale.
+            if not record.infrastructure_failure or record.parent_ref != base_head:
+                return ""
+            path = store.candidate_root(record.candidate_id) / "partial-candidate.diff"
+            if not path.is_file():
+                return ""
+            applied = subprocess.run(
+                ["git", "apply", "--index", "--binary", str(path)],
+                cwd=str(repair_root),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            return record.candidate_id if applied.returncode == 0 else ""
+        return ""
 
     @staticmethod
     def _decorate_candidate_result(
@@ -2920,6 +3036,10 @@ class AutoAgentsSelfRepairRunner:
             try:
                 add_worktree(self.repo_root, repair_root, ref=base_head or "HEAD")
                 created = True
+                self._candidate_resumed_from = self._resume_interrupted_candidate(
+                    repair_root,
+                    base_head=base_head,
+                )
                 target_snapshot = Path(tmp) / "target-evidence"
                 RootCauseCoordinator._copy_diagnostic_tree(
                     self.target_project_root,
@@ -2948,6 +3068,14 @@ class AutoAgentsSelfRepairRunner:
                     cwd=repair_root,
                     output_path=output_path,
                     timeout_seconds=candidate_timeout,
+                    # Candidate generation can legitimately exceed the legacy
+                    # wall-clock timeout while it is still editing or running
+                    # focused checks. Let semantic/tool progress renew this
+                    # lease; smart_timeout.safety_ceiling_seconds remains the
+                    # absolute bound. The timeout is still the fallback when
+                    # smart supervision is disabled.
+                    progress_lease_seconds=candidate_timeout,
+                    progress_managed_timeout=True,
                     progress_report_path=(
                         self._experiment_store.candidate_root(candidate_id)
                         / "provider-progress.json"
@@ -2967,9 +3095,17 @@ class AutoAgentsSelfRepairRunner:
                         else None
                     ),
                 )
-                result: AgentResult = self.target_orchestrator._call_with_failover(
-                    request
-                )
+                try:
+                    result: AgentResult = (
+                        self.target_orchestrator._call_with_failover(request)
+                    )
+                except (OSError, RuntimeError, subprocess.SubprocessError):
+                    self._preserve_interrupted_candidate(
+                        repair_root,
+                        base_head=base_head,
+                        candidate_id=candidate_id,
+                    )
+                    raise
                 if hasattr(self.target_orchestrator, "_emit_agent_output"):
                     self.target_orchestrator._emit_agent_output(
                         f"self-repair-{candidate_id}",
@@ -2977,27 +3113,11 @@ class AutoAgentsSelfRepairRunner:
                     )
                 if not result.ok:
                     detail = self._agent_failure_detail(result)
-                    partial_paths = changed_paths(repair_root)
-                    partial_fingerprint = ""
-                    if partial_paths:
-                        partial_fingerprint = worktree_fingerprint(
-                            repair_root,
-                            ignored_prefixes=(),
-                        )
-                        partial_diff = subprocess.run(
-                            ["git", "diff", "--binary", base_head, "--"],
-                            cwd=str(repair_root),
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                            capture_output=True,
-                        ).stdout
-                        if hasattr(self, "_experiment_store"):
-                            write_text(
-                                self._experiment_store.candidate_root(candidate_id)
-                                / "partial-candidate.diff",
-                                partial_diff,
-                            )
+                    self._preserve_interrupted_candidate(
+                        repair_root,
+                        base_head=base_head,
+                        candidate_id=candidate_id,
+                    )
                     return SelfRepairResult(
                         ok=False,
                         status="candidate_failed",
@@ -3007,7 +3127,8 @@ class AutoAgentsSelfRepairRunner:
                         experiment_id=experiment_id,
                         candidate_id=candidate_id,
                         base_commit=base_head,
-                        patch_fingerprint=partial_fingerprint,
+                        patch_fingerprint=self._candidate_partial_fingerprint,
+                        diff_line_count=self._candidate_partial_diff_line_count,
                         infrastructure_failure=self._is_infrastructure_candidate_error(
                             detail
                         ),
@@ -5654,6 +5775,12 @@ class AutoAgentsSelfRepairRunner:
             f"Self-repair category: {self.decision.category}",
             f"Classifier reason: {classifier_reason}",
             f"Candidate attempt: {getattr(self, '_candidate_attempt', 1)}",
+            (
+                "Resumed unfinished patch from infrastructure-interrupted candidate: "
+                f"{self._candidate_resumed_from}"
+                if self._candidate_resumed_from
+                else "No unfinished candidate patch was resumed."
+            ),
             "Prior candidate failures:",
             json.dumps(
                 getattr(self, "_candidate_prior_failures", []),

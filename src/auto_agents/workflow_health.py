@@ -69,6 +69,26 @@ class WorkflowHealthRuntime:
     def start(self, subject_id: str = "") -> None:
         self._subject_id = str(subject_id).strip()
         try:
+            if self.orchestrator is not None:
+                prepare = getattr(
+                    self.orchestrator,
+                    "_prepare_project_config_for_supervision",
+                    None,
+                )
+                if callable(prepare):
+                    prepare()
+                health_config = getattr(
+                    getattr(
+                        getattr(self.orchestrator, "config", None),
+                        "execution",
+                        None,
+                    ),
+                    "health_watch",
+                    None,
+                )
+                if health_config is not None:
+                    # Reapply command-scoped --no-health-watch after a reload.
+                    health_config.enabled = self.channel.enabled
             self._rebase_subject_actions(self._subject_id)
             self.channel.start(self._subject_id)
             baseline_ready = bool(
