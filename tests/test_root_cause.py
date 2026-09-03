@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import signal
 import subprocess
@@ -1330,6 +1332,157 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 RuntimeError("health_quiesce")
             )
         )
+
+    def test_unhandled_self_repair_failure_is_persisted_and_resumable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents" / "state" / "run_state.json",
+                RunState(run_id="target-run", status="blocked").to_dict(),
+            )
+            orchestrator = type(
+                "Orchestrator",
+                (),
+                {"config": type("Config", (), {"execution": object()})()},
+            )()
+            runner = AutoAgentsSelfRepairRunner(
+                orchestrator,
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(
+                    True,
+                    category="runner_exception",
+                    fingerprint="runner-exception",
+                ),
+            )
+            runner.repo_root = auto_root
+            store, experiment = runner._load_or_create_experiment()
+            experiment.current_candidate_id = "c1-interrupted"
+            store.save(experiment)
+            runner._candidate_id = "c1-interrupted"
+
+            with (
+                patch.object(
+                    runner,
+                    "_run_search",
+                    side_effect=TypeError("invalid candidate payload"),
+                ),
+                patch.object(runner, "_finish_base_full_suite_prewarm"),
+            ):
+                result = runner.run()
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.status, "self_repair_exception")
+            self.assertTrue(result.infrastructure_failure)
+            self.assertIn("TypeError: invalid candidate payload", result.reason)
+            persisted = store.load()
+            self.assertIsNotNone(persisted)
+            self.assertEqual(persisted.status, "active")
+            self.assertEqual(persisted.current_candidate_id, "")
+            heartbeat = json.loads(
+                (store.root / "health" / "heartbeat.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(heartbeat["status"], "infrastructure_blocked")
+            self.assertTrue(
+                (store.candidate_root("c1-interrupted") / "result.json").is_file()
+            )
+
+    def test_self_repair_candidate_phase_is_visible_and_durable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents" / "state" / "run_state.json",
+                RunState(run_id="target-run", status="blocked").to_dict(),
+            )
+            orchestrator = type(
+                "Orchestrator",
+                (),
+                {"config": type("Config", (), {"execution": object()})()},
+            )()
+            runner = AutoAgentsSelfRepairRunner(
+                orchestrator,
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(
+                    True,
+                    category="phase-progress",
+                    fingerprint="phase-progress",
+                ),
+            )
+            runner.repo_root = auto_root
+            store, experiment = runner._load_or_create_experiment()
+            experiment.current_candidate_id = "c1-progress"
+            store.save(experiment)
+            runner._candidate_id = "c1-progress"
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(stderr):
+                runner._report_candidate_phase(
+                    "reviewing_candidate",
+                    "starting adversarial review",
+                )
+
+            self.assertIn(
+                "candidate=c1-progress phase=reviewing_candidate",
+                stderr.getvalue(),
+            )
+            heartbeat = json.loads(
+                (store.root / "health" / "heartbeat.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(heartbeat["status"], "reviewing_candidate")
+            self.assertIn("starting adversarial review", heartbeat["detail"])
+
+    def test_terminal_self_repair_does_not_wait_unbounded_for_prewarm(self):
+        orchestrator = type(
+            "Orchestrator",
+            (),
+            {"config": type("Config", (), {"execution": object()})()},
+        )()
+        runner = AutoAgentsSelfRepairRunner(
+            orchestrator,
+            target_project_root=Path("/tmp/target"),
+            error=RuntimeError("terminal"),
+            decision=SelfRepairDecision(True, category="prewarm_cleanup"),
+        )
+
+        class PendingThread:
+            def __init__(self):
+                self.join_timeouts = []
+
+            def join(self, timeout=None):
+                self.join_timeouts.append(timeout)
+
+            def is_alive(self):
+                return True
+
+        pending = PendingThread()
+        runner._base_prewarm_thread = pending
+        with patch.object(
+            runner,
+            "_run_search",
+            return_value=SelfRepairResult(
+                ok=False,
+                status="infrastructure_blocked",
+                reason="provider stopped",
+            ),
+        ):
+            result = runner.run()
+
+        self.assertFalse(result.ok)
+        self.assertEqual(pending.join_timeouts, [5])
+        self.assertIn("background full-suite prewarm did not terminate", result.reason)
 
     def test_recoverable_candidate_stops_new_generation_and_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -77,7 +77,9 @@ SELF_REPAIR_FULL_SUITE_CHECKPOINT_SCHEMA_VERSION = 1
 SELF_REPAIR_FULL_SUITE_NODE_BATCH_SIZE = 24
 SELF_REPAIR_FULL_SUITE_NODE_BATCH_THRESHOLD_SECONDS = 120
 SELF_REPAIR_FULL_SUITE_MAX_PARALLEL_WORKERS = 4
+SELF_REPAIR_BACKGROUND_CLEANUP_TIMEOUT_SECONDS = 5
 SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
+    "self_repair_exception": 0,
     "candidate_exception": 0,
     "candidate_failed": 10,
     "candidate_noop": 20,
@@ -96,6 +98,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
     "already_repaired": 100,
 }
 SELF_REPAIR_CANDIDATE_VALIDATION_STAGES = {
+    "self_repair_exception": "runner",
     "candidate_exception": "generation",
     "candidate_failed": "generation",
     "candidate_noop": "generation",
@@ -2527,7 +2530,9 @@ class AutoAgentsSelfRepairRunner:
             self._base_prewarm_thread = threading.Thread(
                 target=prewarm,
                 name="auto-agents-self-repair-base-prewarm",
-                daemon=False,
+                # A speculative proof must never keep the foreground collab
+                # process alive after self-repair has reached a terminal result.
+                daemon=True,
             )
             self._base_prewarm_thread.start()
 
@@ -2549,17 +2554,144 @@ class AutoAgentsSelfRepairRunner:
                 return None
             return self._base_prewarm_result
 
-    def _finish_base_full_suite_prewarm(self) -> None:
+    def _finish_base_full_suite_prewarm(
+        self,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
         with self._base_prewarm_lock:
             thread = self._base_prewarm_thread
-        if thread is not None:
-            thread.join()
+        if thread is None:
+            return True
+        thread.join(timeout=timeout_seconds)
+        return not thread.is_alive()
 
     def run(self) -> SelfRepairResult:
         try:
-            return self._run_search()
-        finally:
-            self._finish_base_full_suite_prewarm()
+            result = self._run_search()
+        except Exception as error:
+            result = self._record_unhandled_runner_failure(error)
+        except BaseException:
+            self._finish_base_full_suite_prewarm(
+                timeout_seconds=SELF_REPAIR_BACKGROUND_CLEANUP_TIMEOUT_SECONDS
+            )
+            raise
+        prewarm_finished = self._finish_base_full_suite_prewarm(
+            timeout_seconds=SELF_REPAIR_BACKGROUND_CLEANUP_TIMEOUT_SECONDS
+        )
+        if prewarm_finished:
+            return result
+        cleanup_error = RuntimeError(
+            "background full-suite prewarm did not terminate at the "
+            "self-repair boundary"
+        )
+        if result.ok:
+            return self._record_unhandled_runner_failure(cleanup_error)
+        result.reason = (
+            f"{result.reason}; {cleanup_error}; cleanup will finish with the "
+            "foreground process"
+        )
+        return result
+
+    def _record_unhandled_runner_failure(
+        self,
+        error: Exception,
+    ) -> SelfRepairResult:
+        """Persist an unexpected search failure as a resumable terminal result."""
+
+        detail = f"{type(error).__name__}: {error}".strip()
+        experiment = getattr(self, "_experiment", None)
+        store = getattr(self, "_experiment_store", None)
+        candidate_id = ""
+        attempt = 0
+        experiment_id = ""
+        base_commit = ""
+        parent_candidate_id = "base"
+        if isinstance(experiment, SelfRepairExperiment):
+            attempt = experiment.attempt_count + 1
+            experiment_id = experiment.experiment_id
+            base_commit = experiment.best_search_ref
+            parent_candidate_id = experiment.best_search_candidate_id
+            candidate_id = str(experiment.current_candidate_id).strip()
+        else:
+            candidate_id = str(getattr(self, "_candidate_id", "")).strip()
+        result = SelfRepairResult(
+            ok=False,
+            status="self_repair_exception",
+            category=self.decision.category or "self_repair_exception",
+            reason=(
+                "self-repair runner exited unexpectedly; its persisted "
+                f"experiment remains resumable: {detail}"
+            ),
+            summary=detail,
+            experiment_id=experiment_id,
+            candidate_id=candidate_id or f"attempt-{attempt or 1}-exception",
+            base_commit=base_commit,
+            parent_candidate_id=parent_candidate_id,
+            attempt=attempt,
+            infrastructure_failure=True,
+        )
+        self._decorate_candidate_result(result, attempt=attempt)
+        if isinstance(experiment, SelfRepairExperiment) and isinstance(
+            store, SelfRepairExperimentStore
+        ):
+            experiment.status = "active"
+            experiment.current_candidate_id = ""
+            try:
+                store.record_health(
+                    experiment,
+                    status="infrastructure_blocked",
+                    detail=result.reason,
+                )
+                store.save(experiment)
+            except (OSError, RuntimeError, ValueError):
+                pass
+        if experiment_id:
+            self._record_candidate_result(result, attempt=attempt)
+        return result
+
+    def _report_candidate_phase(self, phase: str, detail: str) -> None:
+        """Expose post-generation validation so a live search is not silent."""
+
+        candidate_id = str(getattr(self, "_candidate_id", "")).strip()
+        normalized_phase = str(phase).strip() or "working"
+        rendered_detail = " ".join(str(detail).split())
+        message = (
+            f"candidate={candidate_id or 'unknown'} "
+            f"phase={normalized_phase}"
+        )
+        if rendered_detail:
+            message += f" {rendered_detail}"
+        try:
+            print(f"[self-repair] {message}", file=sys.stderr, flush=True)
+        except OSError:
+            pass
+        health_runtime = getattr(
+            self.target_orchestrator,
+            "_workflow_health_runtime",
+            None,
+        )
+        if health_runtime is not None:
+            try:
+                health_runtime.set_active_operation(
+                    "self_repair",
+                    f"{candidate_id or 'unknown'}:{normalized_phase}",
+                )
+            except Exception:
+                pass
+        experiment = getattr(self, "_experiment", None)
+        store = getattr(self, "_experiment_store", None)
+        if isinstance(experiment, SelfRepairExperiment) and isinstance(
+            store, SelfRepairExperimentStore
+        ):
+            try:
+                store.record_health(
+                    experiment,
+                    status=normalized_phase,
+                    detail=message,
+                )
+            except (OSError, RuntimeError, ValueError):
+                pass
 
     def _compact_diagnosis_payload(self) -> dict[str, object]:
         if self.diagnosis is None:
@@ -3824,10 +3956,18 @@ class AutoAgentsSelfRepairRunner:
                     sorted(changed),
                     summary[-2000:],
                 )
+                self._report_candidate_phase(
+                    "validating_boundary_replay",
+                    "candidate generation completed; replaying the blocked boundary",
+                )
                 replay = self._replay_candidate(
                     repair_root,
                     candidate_commit,
                     candidate_id,
+                )
+                self._report_candidate_phase(
+                    "validating_diagnosis_differential",
+                    "boundary replay completed; running diagnosis-specific proof",
                 )
                 differential = self._diagnosis_differential(
                     self._experiment.base_commit,
@@ -3865,6 +4005,10 @@ class AutoAgentsSelfRepairRunner:
                         )
                         or 600
                     ),
+                )
+                self._report_candidate_phase(
+                    "reviewing_candidate",
+                    "differential proof completed; starting adversarial review",
                 )
                 review = self._review_candidate(
                     repair_root,
@@ -3948,6 +4092,10 @@ class AutoAgentsSelfRepairRunner:
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
                     )
+                self._report_candidate_phase(
+                    "validating_focused_tests",
+                    "adversarial review approved; running focused verification",
+                )
                 verification = self._run_active_group_verification(repair_root)
                 if not verification.ok:
                     baseline_verification = self._run_verification_at_ref(
@@ -4036,6 +4184,10 @@ class AutoAgentsSelfRepairRunner:
                             "validation:focused",
                         ],
                     )
+                self._report_candidate_phase(
+                    "validating_integration",
+                    "finding groups are integrated; running required verification",
+                )
                 integration_verification = self._run_verification(repair_root)
                 if not integration_verification.ok:
                     return SelfRepairResult(
@@ -4139,6 +4291,10 @@ class AutoAgentsSelfRepairRunner:
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
                     )
+                self._report_candidate_phase(
+                    "reviewing_integration",
+                    "required verification passed; reviewing the integrated repair",
+                )
                 integration_review = self._review_candidate(
                     repair_root,
                     self._experiment.base_commit,
@@ -4193,6 +4349,10 @@ class AutoAgentsSelfRepairRunner:
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
                     )
+                self._report_candidate_phase(
+                    "validating_full_suite",
+                    "integration review approved; running full-suite differential",
+                )
                 self._start_base_full_suite_prewarm(
                     self._experiment.base_commit
                 )
@@ -4269,6 +4429,10 @@ class AutoAgentsSelfRepairRunner:
                         + json.dumps(integration_review.payload, ensure_ascii=False),
                     )
                     if part
+                )
+                self._report_candidate_phase(
+                    "sealing_proof",
+                    "full-suite differential passed; sealing candidate evidence",
                 )
                 proof_seal = self._deterministic_proof_seal(
                     repair_root,

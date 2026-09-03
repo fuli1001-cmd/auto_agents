@@ -3205,6 +3205,81 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("self-repair verification failed", failure["reason"])
             self.assertIn("ModuleNotFoundError", failure["verification"])
 
+    def test_cli_unhandled_self_repair_exception_blocks_and_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            decision = SelfRepairDecision(
+                True,
+                category="self_repair_runtime",
+                reason="repair the engine runtime",
+                fingerprint="runtime-fingerprint",
+            )
+
+            class FakeHealthRuntime:
+                def __init__(self):
+                    self.operations = []
+                    self.phases = []
+
+                def set_phase(self, phase):
+                    self.phases.append(phase)
+
+                def set_active_operation(self, kind="", label=""):
+                    self.operations.append((kind, label))
+
+            class CrashingSelfRepairRunner:
+                repo_root = Path("/tmp/auto_agents_repo")
+
+                def __init__(self, target_orchestrator, **kwargs):
+                    del target_orchestrator, kwargs
+
+                def run(self):
+                    raise TypeError("unexpected candidate state")
+
+            health_runtime = FakeHealthRuntime()
+            orchestrator._workflow_health_runtime = health_runtime
+            stdout = io.StringIO()
+            args = type("Args", (), {"print_agent_output": False})()
+            with (
+                ProjectRunLock(project_root) as run_lock,
+                patch(
+                    "auto_agents.cli.AutoAgentsSelfRepairRunner",
+                    CrashingSelfRepairRunner,
+                ),
+                patch("auto_agents.cli._run_self_repair_resume_process") as resume_run,
+                patch("auto_agents.cli._notify_run_blocked") as notify_blocked,
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                exit_code = _auto_repair_auto_agents_and_resume(
+                    project_root,
+                    orchestrator,
+                    RuntimeError("terminal"),
+                    decision,
+                    args,
+                    run_lock,
+                )
+
+            self.assertEqual(exit_code, 3)
+            payload = json.loads(stdout.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertIn("self-repair runner exited unexpectedly", payload["error"])
+            self.assertIn("TypeError: unexpected candidate state", payload["error"])
+            self.assertEqual(
+                health_runtime.operations,
+                [
+                    ("self_repair", "self_repair_runtime"),
+                    ("", ""),
+                ],
+            )
+            resume_run.assert_not_called()
+            notify_blocked.assert_called_once()
+            state = load_run_state(project_root)
+            self.assertEqual(state.status, "blocked")
+            failure = state.active_blocker["self_repair_failure"]
+            self.assertIn("unexpected candidate state", failure["reason"])
+
     def test_cli_meta_triages_non_auto_agents_blocker_and_resumes_after_repair(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

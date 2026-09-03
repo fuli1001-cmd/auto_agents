@@ -91,6 +91,7 @@ from .self_repair import (
     SELF_REPAIR_DISABLED_ENV,
     AutoAgentsSelfRepairRunner,
     SelfRepairDecision,
+    SelfRepairResult,
     SelfRepairTriageResult,
     adjudicate_auto_agents_error,
     append_self_repair_history,
@@ -1340,11 +1341,31 @@ def _auto_repair_auto_agents_and_resume(
             decision.category or "auto_agents_self_repair",
         )
     try:
-        result = runner.run()
+        try:
+            result = runner.run()
+        except Exception as repair_error:
+            detail = (
+                f"{type(repair_error).__name__}: {repair_error}"
+            ).strip()
+            result = SelfRepairResult(
+                ok=False,
+                status="self_repair_exception",
+                category=(
+                    decision.category or "self_repair_exception"
+                ),
+                reason=(
+                    "self-repair runner exited unexpectedly; collab will "
+                    f"persist a blocker and exit: {detail}"
+                ),
+                infrastructure_failure=True,
+            )
     finally:
         if health_runtime is not None:
             health_runtime.set_active_operation()
     if not result.ok:
+        # No provider, test, or speculative validation process may outlive a
+        # terminal self-repair boundary and keep the foreground collab alive.
+        ACTIVE_PROCESSES.terminate_all()
         message = f"automatic auto_agents self-repair failed: {result.reason}"
         orchestrator.record_self_repair_failure(
             category=result.category or decision.category or "self_repair_failed",
