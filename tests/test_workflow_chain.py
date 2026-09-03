@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from auto_agents.cli import build_parser, main
 from auto_agents.config import (
+    archived_run_state_path,
     create_session,
     list_sessions,
     load_run_state,
@@ -18,7 +19,7 @@ from auto_agents.config import (
     save_session_state,
 )
 from auto_agents.git_ops import commit_only_paths
-from auto_agents.io_utils import write_text
+from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import AgentResult, SessionState
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.session import Session
@@ -1182,6 +1183,101 @@ class RoutedWorkflowTests(unittest.TestCase):
             self.assertEqual(result["status"], "blocked")
             self.assertEqual(result["resolution"], "active_run_conflict")
             self.assertFalse((root / "specs" / "iterations").exists())
+
+    def test_divergent_completed_archive_recovers_and_binds_successor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            current = load_run_state(root)
+            predecessor_run_id = current.run_id
+            current.status = "completed"
+            current.current_stage = "readme"
+            save_run_state(root, current)
+            state_archive = archived_run_state_path(root, predecessor_run_id)
+            existing_archive = {
+                "run_id": predecessor_run_id,
+                "status": "completed",
+                "archive_provenance": "preexisting",
+            }
+            write_json(state_archive, existing_archive)
+
+            coordinator = WorkflowCoordinator(orchestrator, auto_approve=True)
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", "parent")
+            )
+            handoff = coordinator.store.prepare_handoff(
+                snapshot,
+                parent=WorkflowRef("collab", "parent"),
+                target="run",
+                goal="Add capability",
+                reason="feature gap",
+                payload={"spec_seed": {"title": "Capability"}},
+            )
+
+            calls = []
+
+            def complete_successor(**_kwargs):
+                state = load_run_state(root)
+                calls.append(state.run_id)
+                self.assertNotEqual(state.run_id, predecessor_run_id)
+                self.assertEqual(
+                    state.resume_context["parent_handoff_id"],
+                    handoff.handoff_id,
+                )
+                state.status = "completed"
+                save_run_state(root, state)
+                return state
+
+            orchestrator.run = complete_successor
+
+            with patch.object(
+                coordinator.store,
+                "bind_child",
+                side_effect=RuntimeError("interrupted before child binding"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "interrupted before child binding",
+                ):
+                    coordinator._drive_run_child(handoff, snapshot)
+
+            persisted_successor = load_run_state(root)
+            self.assertNotEqual(persisted_successor.run_id, predecessor_run_id)
+            self.assertEqual(
+                persisted_successor.resume_context["parent_handoff_id"],
+                handoff.handoff_id,
+            )
+            self.assertIsNone(handoff.child)
+
+            first = coordinator._drive_run_child(handoff, snapshot)
+            second = coordinator._drive_run_child(handoff, snapshot)
+
+            successor = load_run_state(root)
+            self.assertEqual(first["status"], "completed")
+            self.assertEqual(second["status"], "completed")
+            self.assertEqual(calls, [successor.run_id])
+            self.assertEqual(handoff.child, WorkflowRef("run", successor.run_id))
+            self.assertEqual(
+                json.loads(state_archive.read_text(encoding="utf-8")),
+                existing_archive,
+            )
+            receipts = successor.resume_context[
+                "previous_run_archive_recovery_receipts"
+            ]
+            self.assertEqual(len(receipts), 1)
+            receipt_path = Path(receipts[0]["receipt_path"])
+            self.assertTrue(receipt_path.is_file())
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["resolution"], "preserved_existing_archive")
+            self.assertEqual(receipt["archive_path"], str(state_archive))
+            self.assertEqual(receipt["candidate_payload"]["run_id"], predecessor_run_id)
+            recovery_events = [
+                event
+                for event in coordinator.store.events(snapshot.workflow_id)
+                if event.get("kind") == "completed_run_archive_recovered"
+            ]
+            self.assertEqual(len(recovery_events), 1)
 
     def test_collab_restores_product_mutation_instead_of_committing_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

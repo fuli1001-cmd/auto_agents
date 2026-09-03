@@ -3425,12 +3425,95 @@ class Orchestrator:
             raise RuntimeError(f"archive already exists with different content: {path}")
         write_json(path, payload)
 
+    def _preserve_divergent_archive_candidate(
+        self,
+        *,
+        state: RunState,
+        archive_path: Path,
+        archive_kind: str,
+        candidate_payload: object,
+    ) -> Dict[str, object]:
+        existing_bytes = archive_path.read_bytes()
+        candidate_bytes = (
+            json.dumps(
+                candidate_payload,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        existing_sha256 = hashlib.sha256(existing_bytes).hexdigest()
+        candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+        fingerprint = hashlib.sha256(
+            (
+                f"{archive_kind}\0{archive_path}\0"
+                f"{existing_sha256}\0{candidate_sha256}"
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        receipt_path = (
+            run_path(self.project_root, state.run_id)
+            / "archive_recovery"
+            / f"{archive_kind}-{fingerprint}.json"
+        )
+        receipt = {
+            "schema_version": 1,
+            "kind": "completed_run_archive_divergence",
+            "resolution": "preserved_existing_archive",
+            "run_id": state.run_id,
+            "archive_kind": archive_kind,
+            "archive_path": str(archive_path),
+            "existing_payload_sha256": existing_sha256,
+            "candidate_payload_sha256": candidate_sha256,
+            "candidate_payload": candidate_payload,
+        }
+        self._write_archive_json(receipt_path, receipt)
+        return {
+            "archive_kind": archive_kind,
+            "archive_path": str(archive_path),
+            "receipt_path": str(receipt_path),
+            "existing_payload_sha256": existing_sha256,
+            "candidate_payload_sha256": candidate_sha256,
+            "resolution": "preserved_existing_archive",
+        }
+
     def _archive_completed_run(self, state: RunState) -> Tuple[Path, Path]:
         task_archive = archived_task_plan_path(self.project_root, state.run_id)
         state_archive = archived_run_state_path(self.project_root, state.run_id)
-        run_state_payload = read_json(run_state_path(self.project_root), default=state.to_dict())
-        self._write_archive_json(task_archive, load_task_plan(self.project_root))
-        self._write_archive_json(state_archive, run_state_payload)
+        run_state_payload = read_json(
+            run_state_path(self.project_root),
+            default=state.to_dict(),
+        )
+        archive_payloads = (
+            ("task_plan", task_archive, load_task_plan(self.project_root)),
+            ("run_state", state_archive, run_state_payload),
+        )
+        recovery_receipts: List[Dict[str, object]] = []
+        for archive_kind, archive_path, payload in archive_payloads:
+            try:
+                self._write_archive_json(archive_path, payload)
+            except RuntimeError as error:
+                if not str(error).startswith(
+                    "archive already exists with different content:"
+                ):
+                    raise
+                recovery_receipts.append(
+                    self._preserve_divergent_archive_candidate(
+                        state=state,
+                        archive_path=archive_path,
+                        archive_kind=archive_kind,
+                        candidate_payload=payload,
+                    )
+                )
+        if recovery_receipts:
+            state.resume_context[
+                "previous_run_archive_recovery_receipts"
+            ] = recovery_receipts
+        else:
+            state.resume_context.pop(
+                "previous_run_archive_recovery_receipts",
+                None,
+            )
         return task_archive, state_archive
 
     def restart_blocked_run(self) -> RunState:
@@ -3472,16 +3555,23 @@ class Orchestrator:
         save_run_state(self.project_root, restarted)
         return restarted
 
-    def _start_new_iteration(self, state: RunState) -> RunState:
+    def _start_new_iteration(
+        self,
+        state: RunState,
+        *,
+        resume_context_updates: Optional[Mapping[str, object]] = None,
+    ) -> RunState:
         previous_run_id = state.run_id
+        successor_run_id = uuid.uuid4().hex[:12]
         task_archive, _state_archive = self._archive_completed_run(state)
         context = dict(state.resume_context)
         context.pop("evidence_preflight_routes", None)
         context.pop("provider_recovery_contract_receipts", None)
         context["previous_run_id"] = previous_run_id
         context["previous_task_plan_archive"] = str(task_archive)
+        context.update(dict(resume_context_updates or {}))
 
-        state.run_id = uuid.uuid4().hex[:12]
+        state.run_id = successor_run_id
         state.status = "pending"
         state.current_stage = "clarify"
         state.pending_approval = ""
@@ -3508,6 +3598,7 @@ class Orchestrator:
         state.rejected_stage = ""
         state.resume_context = context
         save_task_plan(self.project_root, {"tasks": []})
+        save_run_state(self.project_root, state)
         return state
 
     def _ensure_preconditions(

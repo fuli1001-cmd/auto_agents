@@ -25,6 +25,7 @@ from .git_ops import (
     head_ref,
 )
 from .io_utils import read_json, write_json
+from .models import RunState
 from .workflow_chain import (
     IssueBriefBuilder,
     IterationSpecBuilder,
@@ -1041,6 +1042,11 @@ class WorkflowCoordinator:
 
         if handoff.child is None and existing_same_handoff:
             child = WorkflowRef("run", current.run_id)
+            self._record_completed_run_archive_recovery(
+                snapshot,
+                handoff,
+                current,
+            )
             self.store.bind_child(snapshot, handoff, child)
             state = current
         elif handoff.child is None:
@@ -1071,39 +1077,44 @@ class WorkflowCoordinator:
                 operation_id=f"spec-{handoff.handoff_id}",
                 details=dict(spec),
             )
-            state = self.orch._start_new_iteration(current)
-            state.resume_context.update(
-                {
-                    "spec_file": str(self.project_root / spec["path"]),
-                    "workflow_id": snapshot.workflow_id,
-                    "parent_handoff_id": handoff.handoff_id,
-                    "iteration_spec_sha256": spec["sha256"],
-                    "iteration_spec_commit": spec["commit_sha"],
-                    "auto_approve": self.auto_approve,
-                    "print_agent_output": self.print_agent_output,
-                    **(
-                        {
-                            "goal_execution_environment": dict(
-                                raw_goal_environment
-                            )
-                        }
-                        if isinstance(raw_goal_environment, dict)
-                        and raw_goal_environment
-                        else {}
-                    ),
-                    **(
-                        {
-                            "authorization_policy": dict(
-                                raw_authorization_policy
-                            )
-                        }
-                        if isinstance(raw_authorization_policy, dict)
-                        and raw_authorization_policy
-                        else {}
-                    ),
-                }
+            successor_context = {
+                "spec_file": str(self.project_root / spec["path"]),
+                "workflow_id": snapshot.workflow_id,
+                "parent_handoff_id": handoff.handoff_id,
+                "iteration_spec_sha256": spec["sha256"],
+                "iteration_spec_commit": spec["commit_sha"],
+                "auto_approve": self.auto_approve,
+                "print_agent_output": self.print_agent_output,
+                **(
+                    {
+                        "goal_execution_environment": dict(
+                            raw_goal_environment
+                        )
+                    }
+                    if isinstance(raw_goal_environment, dict)
+                    and raw_goal_environment
+                    else {}
+                ),
+                **(
+                    {
+                        "authorization_policy": dict(
+                            raw_authorization_policy
+                        )
+                    }
+                    if isinstance(raw_authorization_policy, dict)
+                    and raw_authorization_policy
+                    else {}
+                ),
+            }
+            state = self.orch._start_new_iteration(
+                current,
+                resume_context_updates=successor_context,
             )
-            save_run_state(self.project_root, state)
+            self._record_completed_run_archive_recovery(
+                snapshot,
+                handoff,
+                state,
+            )
             child = WorkflowRef("run", state.run_id)
             self.store.bind_child(snapshot, handoff, child)
         else:
@@ -1143,6 +1154,38 @@ class WorkflowCoordinator:
                 result_state.last_error = str(error)
                 save_run_state(self.project_root, result_state)
         return self._run_result(result_state, handoff)
+
+    def _record_completed_run_archive_recovery(
+        self,
+        snapshot: WorkflowSnapshot,
+        handoff: WorkflowHandoff,
+        state: RunState,
+    ) -> None:
+        recovery_receipts = state.resume_context.get(
+            "previous_run_archive_recovery_receipts",
+            [],
+        )
+        if not isinstance(recovery_receipts, list) or not recovery_receipts:
+            return
+        if any(
+            event.get("kind") == "completed_run_archive_recovered"
+            and event.get("operation_id") == handoff.handoff_id
+            for event in self.store.events(snapshot.workflow_id)
+        ):
+            return
+        self.store.append_event(
+            snapshot,
+            "completed_run_archive_recovered",
+            operation_id=handoff.handoff_id,
+            details={
+                "predecessor_run_id": state.resume_context.get(
+                    "previous_run_id",
+                    "",
+                ),
+                "successor_run_id": state.run_id,
+                "receipts": recovery_receipts,
+            },
+        )
 
     def _resume_existing_child(
         self,
