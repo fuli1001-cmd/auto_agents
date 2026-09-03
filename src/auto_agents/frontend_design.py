@@ -41,8 +41,11 @@ _IGNORED_SCAN_DIRS = {
     ".nuxt",
     ".output",
     ".svelte-kit",
+    ".tmp",
+    ".tmp-tests",
     ".venv",
     ".conda",
+    ".conda-pkgs",
     "build",
     "coverage",
     "dist",
@@ -470,8 +473,9 @@ def validate_prototype_manifest(
     pages = payload.get("pages")
     if not isinstance(pages, list) or not pages:
         return ["frontend prototype manifest pages must be a non-empty array"]
-    if len(pages) > max_pages:
-        errors.append(f"frontend prototype manifest may contain at most {max_pages} pages")
+    # ``max_pages`` bounds one generation batch, not the lifetime size of an
+    # approved contract. Redesigns may append newly required surfaces while
+    # preserving pages that were approved in earlier iterations.
     viewports = payload.get("viewports")
     if not isinstance(viewports, list) or not viewports or any(
         not isinstance(item, str) or not re.fullmatch(r"[1-9][0-9]*x[1-9][0-9]*", item)
@@ -820,27 +824,43 @@ def selected_surface_specs(trace_payload: object, *, max_pages: int) -> List[Dic
         rank = {"core": 0, "primary": 0, "secondary": 1, "optional": 2}.get(raw, 1)
         return rank, str(item.get("id", item.get("name", "")))
 
+    ordered = sorted(surfaces, key=priority)
+    required = [
+        surface
+        for surface in ordered
+        if str(surface.get("priority", "secondary")).strip().lower()
+        in {"core", "primary"}
+    ]
+    lower_priority = [surface for surface in ordered if surface not in required]
+    selected_surfaces = [
+        *required,
+        *lower_priority[: max(0, max_pages - len(required))],
+    ]
     selected: List[Dict[str, object]] = []
-    for index, surface in enumerate(sorted(surfaces, key=priority)[:max_pages], start=1):
+    for index, surface in enumerate(selected_surfaces, start=1):
         surface_id = str(surface.get("id", "")).strip() or f"surface-{index}"
-        selected.append(
-            {
-                "id": surface_id,
-                "name": str(surface.get("name", "")).strip() or surface_id,
-                "route": str(surface.get("route", "")).strip(),
-                "purpose": str(surface.get("purpose", "")).strip(),
-                "key_states": [
-                    str(item).strip()
-                    for item in surface.get("key_states", []) or []
-                    if str(item).strip()
-                ],
-                "requirement_ids": [
-                    str(item).strip()
-                    for item in surface.get("requirement_ids", []) or []
-                    if str(item).strip()
-                ],
-            }
-        )
+        normalized = {
+            "id": surface_id,
+            "name": str(surface.get("name", "")).strip() or surface_id,
+            "route": str(surface.get("route", "")).strip(),
+            "purpose": str(surface.get("purpose", "")).strip(),
+            "key_states": [
+                str(item).strip()
+                for item in surface.get("key_states", []) or []
+                if str(item).strip()
+            ],
+            "requirement_ids": [
+                str(item).strip()
+                for item in surface.get("requirement_ids", []) or []
+                if str(item).strip()
+            ],
+        }
+        html_ref = str(
+            surface.get("html_ref", surface.get("prototype_ref", ""))
+        ).strip()
+        if html_ref:
+            normalized["html_ref"] = html_ref
+        selected.append(normalized)
     return selected
 
 

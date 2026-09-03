@@ -345,6 +345,9 @@ class ParallelTuningTests(unittest.TestCase):
                 "base_ref": "b" * 40,
                 "changed_paths": ["app/shared.py"],
                 "verify_current_failure_ids": [],
+                "retained_verify_baselines": {
+                    "task-b": {"verify_baseline_snapshot_commit": "c" * 40}
+                },
             }
 
             orchestrator._defer_parallel_task_result(
@@ -362,6 +365,10 @@ class ParallelTuningTests(unittest.TestCase):
             self.assertEqual(
                 pending["peer_verification_commands"],
                 ["pytest -q tests/test_peer.py"],
+            )
+            self.assertEqual(
+                pending["retained_verify_baselines"],
+                result["retained_verify_baselines"],
             )
             self.assertEqual(
                 state.resume_context["parallel_integration_metrics"]["deferred"], 1
@@ -472,6 +479,53 @@ class ParallelTuningTests(unittest.TestCase):
                 state.resume_context["parallel_integration_metrics"]["replay_conflicts"],
                 1,
             )
+
+    def test_replay_persists_retained_baseline_before_result_ref_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            orchestrator = Orchestrator(root)
+            task = TaskSpec(
+                task_id="task-b",
+                title="B",
+                description="Update shared code.",
+                acceptance=["done"],
+            )
+            tasks = [task]
+            state = RunState(
+                run_id="test",
+                current_stage="implement",
+                tasks=tasks,
+            )
+            state.resume_context["parallel_integration_pending"] = {
+                task.task_id: {
+                    "task": task.to_dict(),
+                    "result_ref": "refs/auto-agents/runs/test/tasks/task-b",
+                    "retained_verify_baselines": {"task-b": {"snapshot": "proof"}},
+                }
+            }
+            events: list[str] = []
+            orchestrator._merge_parallel_retained_verify_baselines = Mock(
+                side_effect=lambda *_args: events.append("merge") or [task.task_id]
+            )
+            orchestrator._persist_parallel_runtime_state = Mock(
+                side_effect=lambda *_args: events.append("persist")
+            )
+            orchestrator._replay_parallel_pending_result = Mock(
+                side_effect=lambda *_args: events.append("replay")
+                or {"ok": False, "kind": "conflict", "reason": "conflict"}
+            )
+            orchestrator._delete_parallel_result_ref = Mock(
+                side_effect=lambda *_args: events.append("delete")
+            )
+
+            outcome = orchestrator._process_next_parallel_pending_integration(
+                state,
+                tasks,
+            )
+
+            self.assertEqual(outcome, "retry")
+            self.assertEqual(events[:4], ["merge", "persist", "replay", "delete"])
 
     def test_resume_capture_preserves_parallel_integration_runtime_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

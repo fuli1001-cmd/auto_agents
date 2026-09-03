@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import unittest
 import sys
@@ -90,6 +91,187 @@ class RecoveryResilienceTests(unittest.TestCase):
                 state.localized_blockers[0]["task_id"],
                 blocked.task_id,
             )
+
+    def test_terminal_engine_invariant_survives_late_independent_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+            )
+            orchestrator._block_run(
+                state,
+                owner="auto_agents",
+                category="retained_verify_baseline_snapshot_lost",
+                reason="immutable baseline is unavailable",
+                fingerprint="engine-root",
+            )
+            state.last_recovery_route = {
+                "outcome": "invariant_violation",
+                "engine_invariant": "dirty_verify_baseline_checkpoint_lost",
+            }
+
+            orchestrator._block_run(
+                state,
+                owner="target_project",
+                category="project_configuration_required",
+                reason="an approved prototype is missing",
+                fingerprint="target-root",
+            )
+
+            self.assertEqual(
+                state.active_blocker["category"],
+                "retained_verify_baseline_snapshot_lost",
+            )
+            self.assertEqual(state.last_error, "immutable baseline is unavailable")
+            secondary = state.resume_context["secondary_blockers"]
+            self.assertEqual(len(secondary), 1)
+            self.assertEqual(
+                secondary[0]["category"],
+                "project_configuration_required",
+            )
+
+    def test_live_legacy_retained_baseline_is_snapshotted_before_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            retained = root / "retained.py"
+            write_text(retained, "VALUE = 'base'\n")
+            base_ref = commit_all(root, "test: add baseline source")
+            write_text(retained, "VALUE = 'handoff'\n")
+            paths = orchestrator._changed_paths_excluding_agent_instructions()
+            fingerprint = (
+                orchestrator._worktree_fingerprint_excluding_agent_instructions()
+            )
+            owner = TaskSpec(
+                task_id="task-001",
+                title="Owner",
+                description="",
+                acceptance=[],
+            )
+            repair = TaskSpec(
+                task_id="repair-task-001-r1-1",
+                title="Repair",
+                description="",
+                acceptance=[],
+                parent_task_id=owner.task_id,
+                task_origin="evidence_repair",
+                verify_baseline_ref=f"{base_ref}:{fingerprint}",
+                verify_baseline_schema_version=VERIFY_BASELINE_SCHEMA_VERSION,
+            )
+            state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[repair, owner],
+                resume_context={
+                    "retained_worktree_ownership": {
+                        owner.task_id: {
+                            "version": 1,
+                            "owner_task_id": owner.task_id,
+                            "head_ref": base_ref,
+                            "worktree_fingerprint": fingerprint,
+                            "changed_paths": paths,
+                            "path_fingerprints": (
+                                orchestrator._retained_worktree_path_fingerprints(
+                                    paths
+                                )
+                            ),
+                            "source": "legacy",
+                        }
+                    }
+                },
+            )
+
+            migrated = orchestrator._migrate_live_legacy_retained_verify_baselines(
+                state
+            )
+
+            self.assertEqual(migrated, [owner.task_id])
+            record = state.resume_context["retained_worktree_ownership"][
+                owner.task_id
+            ]
+            self.assertTrue(
+                orchestrator._retained_verify_baseline_snapshot_is_complete(record)
+            )
+            self.assertTrue(ref_exists(root, record["verify_baseline_snapshot_ref"]))
+            self.assertEqual(
+                repair.verify_baseline_source_ref,
+                record["verify_baseline_snapshot_commit"],
+            )
+
+    def test_parallel_retained_baseline_handoff_is_durably_mergeable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            retained = root / "retained.py"
+            write_text(retained, "VALUE = 'base'\n")
+            commit_all(root, "test: add baseline source")
+            write_text(retained, "VALUE = 'worker candidate'\n")
+            owner = TaskSpec(
+                task_id="task-001",
+                title="Owner",
+                description="",
+                acceptance=[],
+            )
+            worker_state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[owner],
+            )
+            orchestrator._capture_retained_worktree_ownership(
+                worker_state,
+                [owner.task_id],
+                source="worker",
+            )
+            record = worker_state.resume_context["retained_worktree_ownership"][
+                owner.task_id
+            ]
+            handoff = orchestrator._parallel_retained_verify_baseline_handoff(
+                worker_state,
+                owner,
+            )
+            main_state = RunState(
+                run_id="run-001",
+                current_stage="implement",
+                tasks=[owner],
+            )
+
+            merged = orchestrator._merge_parallel_retained_verify_baselines(
+                main_state,
+                {
+                    "retained_verify_baselines": {
+                        owner.task_id: handoff[owner.task_id],
+                    }
+                },
+            )
+
+            self.assertEqual(merged, [owner.task_id])
+            promoted = main_state.resume_context["retained_worktree_ownership"][
+                owner.task_id
+            ]
+            self.assertEqual(
+                promoted["verify_baseline_snapshot_commit"],
+                record["verify_baseline_snapshot_commit"],
+            )
+            self.assertTrue(
+                ref_exists(root, promoted["verify_baseline_snapshot_ref"])
+            )
+            tampered = json.loads(json.dumps(record))
+            tampered["path_fingerprints"]["retained.py"] = "0" * 64
+            rejected = orchestrator._merge_parallel_retained_verify_baselines(
+                RunState(
+                    run_id="run-001",
+                    current_stage="implement",
+                    tasks=[owner],
+                ),
+                {
+                    "retained_verify_baselines": {
+                        owner.task_id: tampered,
+                    }
+                },
+            )
+            self.assertEqual(rejected, [])
 
     def test_failure_identity_diagnostic_uses_recovery_probe_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

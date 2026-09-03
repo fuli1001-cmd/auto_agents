@@ -138,6 +138,7 @@ from .execution_recovery import (
 from .frontend_fidelity import (
     frontend_fidelity_requirement_ids,
     frontend_requirement_ids_are_preservation_only,
+    requirement_is_frontend_fidelity,
     validate_frontend_fidelity_trace,
 )
 from .frontend_design import (
@@ -3631,12 +3632,15 @@ class Orchestrator:
                 f"Read the project brief: {docs_dir(self.project_root) / 'project_brief.md'}",
                 f"Read the requirements trace: {requirements_trace_path(self.project_root)}",
                 "The visual source(s) of truth are: " + ", ".join(source_refs),
-                f"Create no more than {self.config.frontend_design.max_pages} core pages, using exactly the requested surfaces below when possible:",
+                "Create every requested surface below. frontend_design.max_pages "
+                "limits a normal generation batch, but contract recovery may include "
+                "additional previously approved or newly required pages:",
                 json.dumps(surfaces, ensure_ascii=False, indent=2),
                 f"Write all output only inside: {prototype_root}",
                 f"Write a gallery/navigation entry page at: {index}",
                 f"Write a manifest at: {manifest}",
                 "manifest.json must be JSON with version=1, index_ref, viewports, and pages. Each page must contain id, title, route, html_ref, and requirement_ids. Paths must be repository-relative.",
+                "When a requested surface provides html_ref, use that exact repository-relative path.",
                 "Every page must be a self-contained HTML file with inline CSS and, if needed, inline JavaScript. Include a viewport meta tag. Do not use remote URLs, file URLs, external fonts, CDNs, script src, build tools, or network dependencies.",
                 "Make the prototype polished enough for a real design approval: complete layout, representative copy/data, responsive behavior, important states, accessible contrast, focus treatment, and semantic controls.",
                 "Follow DESIGN.md exactly when it is listed as a source. Existing user-provided design/prototype references take precedence over generic conventions.",
@@ -8513,6 +8517,44 @@ class Orchestrator:
             "status": "blocked",
             "updated_at": utc_now_iso(),
         }
+        terminal_route = (
+            state.last_recovery_route
+            if isinstance(state.last_recovery_route, dict)
+            else {}
+        )
+        terminal_invariant_active = bool(
+            state.status == "blocked"
+            and previous
+            and str(previous.get("owner", "")).strip() == "auto_agents"
+            and str(terminal_route.get("outcome", "")).strip()
+            == "invariant_violation"
+            and str(terminal_route.get("engine_invariant", "")).strip()
+        )
+        if terminal_invariant_active and not same:
+            raw_secondary = state.resume_context.get("secondary_blockers", [])
+            secondary = (
+                [dict(item) for item in raw_secondary if isinstance(item, dict)]
+                if isinstance(raw_secondary, list)
+                else []
+            )
+            identity = (
+                str(blocker.get("category", "")),
+                str(blocker.get("fingerprint", "")),
+            )
+            secondary = [
+                item
+                for item in secondary
+                if (
+                    str(item.get("category", "")),
+                    str(item.get("fingerprint", "")),
+                )
+                != identity
+            ]
+            blocker["status"] = "secondary"
+            blocker["primary_category"] = str(previous.get("category", ""))
+            secondary.append(blocker)
+            state.resume_context["secondary_blockers"] = secondary[-20:]
+            return
         normalized_task_id = str(task_id).strip()
         can_localize = bool(
             normalized_task_id
@@ -9783,6 +9825,242 @@ class Orchestrator:
         )
         return captured
 
+    def _bind_parallel_retained_verify_baseline_source(
+        self,
+        state: RunState,
+        owner_id: str,
+        record: Mapping[str, object],
+    ) -> None:
+        source_ref = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")
+            or record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_REF, "")
+        ).strip()
+        if not source_ref:
+            return
+        tasks_by_id = {task.task_id: task for task in state.tasks}
+        record_identity = self._retained_record_verify_baseline_identity(record)
+        for task in state.tasks:
+            if task.task_origin != "evidence_repair":
+                continue
+            lineage: Set[str] = set()
+            cursor: Optional[TaskSpec] = task
+            while cursor is not None and cursor.task_id not in lineage:
+                lineage.add(cursor.task_id)
+                cursor = tasks_by_id.get(cursor.parent_task_id)
+            if (
+                owner_id in lineage
+                and self._dirty_verify_baseline_identity(task.verify_baseline_ref)
+                == record_identity
+            ):
+                task.verify_baseline_source_ref = source_ref
+                task.verify_baseline_failures = []
+
+    def _migrate_live_legacy_retained_verify_baselines(
+        self,
+        state: RunState,
+    ) -> List[str]:
+        """Snapshot byte-matching legacy ownership before the worktree advances."""
+
+        records = self._retained_worktree_ownership_records(state)
+        migrated: List[str] = []
+        for owner_id, current in list(records.items()):
+            if self._retained_verify_baseline_snapshot_is_complete(current):
+                continue
+            if not self._retained_worktree_snapshot_matches(
+                current,
+                allow_pending_planning_changes=True,
+            ):
+                continue
+            replacement = copy.deepcopy(current)
+            if not str(
+                replacement.get("verify_baseline_cache_identity", "")
+            ).strip():
+                replacement["verify_baseline_cache_identity"] = (
+                    f"{str(current.get('head_ref', '')).strip()}:"
+                    f"{str(current.get('worktree_fingerprint', '')).strip()}"
+                )
+            replacement["verify_baseline_snapshot_id"] = uuid.uuid4().hex
+            replacement["migrated_at"] = utc_now_iso()
+            replacement["migration_source"] = "live_legacy_retained_worktree"
+            replacement.update(
+                self._create_retained_verify_baseline_snapshot(state, replacement)
+            )
+            records[owner_id] = replacement
+            self._bind_parallel_retained_verify_baseline_source(
+                state,
+                owner_id,
+                replacement,
+            )
+            migrated.append(owner_id)
+        if migrated:
+            state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+            raw_audit = state.resume_context.get(
+                "retained_verify_baseline_migrations", {}
+            )
+            audit = dict(raw_audit) if isinstance(raw_audit, dict) else {}
+            for owner_id in migrated:
+                record = records[owner_id]
+                audit[owner_id] = {
+                    "migrated_at": str(record.get("migrated_at", "")),
+                    "source": "live_legacy_retained_worktree",
+                    "snapshot_ref": str(
+                        record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_REF, "")
+                    ),
+                    "snapshot_commit": str(
+                        record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")
+                    ),
+                }
+            state.resume_context["retained_verify_baseline_migrations"] = audit
+        return migrated
+
+    def _parallel_retained_verify_baseline_handoff(
+        self,
+        state: RunState,
+        task: TaskSpec,
+    ) -> Dict[str, Dict[str, object]]:
+        records = self._retained_worktree_ownership_records(state)
+        tasks_by_id = {candidate.task_id: candidate for candidate in state.tasks}
+        lineage: Set[str] = set()
+        cursor: Optional[TaskSpec] = task
+        while cursor is not None and cursor.task_id not in lineage:
+            lineage.add(cursor.task_id)
+            cursor = tasks_by_id.get(cursor.parent_task_id)
+        return {
+            owner_id: copy.deepcopy(record)
+            for owner_id, record in records.items()
+            if owner_id in lineage
+            and self._retained_verify_baseline_snapshot_is_complete(record)
+            and self._resolved_retained_verify_baseline_snapshot(record)
+            and self._retained_verify_baseline_snapshot_matches_record(record)
+        }
+
+    def _retained_verify_baseline_snapshot_matches_record(
+        self,
+        record: Mapping[str, object],
+    ) -> bool:
+        snapshot_commit = str(
+            record.get(_RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT, "")
+        ).strip()
+        raw_paths = record.get("changed_paths", [])
+        raw_fingerprints = record.get("path_fingerprints", {})
+        if (
+            not snapshot_commit
+            or not isinstance(raw_paths, list)
+            or not isinstance(raw_fingerprints, dict)
+        ):
+            return False
+        paths = sorted(
+            {
+                str(path).strip().replace("\\", "/")
+                for path in raw_paths
+                if str(path).strip()
+            }
+        )
+        fingerprints = {
+            str(path).strip().replace("\\", "/"): str(value).strip()
+            for path, value in raw_fingerprints.items()
+            if str(path).strip() and str(value).strip()
+        }
+        if not paths or set(paths) != set(fingerprints):
+            return False
+        for path in paths:
+            readable, content = self._git_path_bytes_at_commit(
+                snapshot_commit,
+                path,
+            )
+            if (
+                not readable
+                or hashlib.sha256(content).hexdigest() != fingerprints[path]
+            ):
+                return False
+        return True
+
+    def _merge_parallel_retained_verify_baselines(
+        self,
+        state: RunState,
+        result: Mapping[str, object],
+    ) -> List[str]:
+        """Promote validated worker snapshots before their transient refs are removed."""
+
+        raw_handoff = result.get("retained_verify_baselines", {})
+        if not isinstance(raw_handoff, dict):
+            return []
+        records = self._retained_worktree_ownership_records(state)
+        merged: List[str] = []
+        for raw_owner_id, raw_record in raw_handoff.items():
+            owner_id = str(raw_owner_id).strip()
+            if not owner_id or not isinstance(raw_record, dict):
+                continue
+            incoming = copy.deepcopy(raw_record)
+            if (
+                str(incoming.get("owner_task_id", "")).strip() != owner_id
+                or not self._retained_verify_baseline_snapshot_is_complete(
+                    incoming
+                )
+                or not self._resolved_retained_verify_baseline_snapshot(incoming)
+                or not self._retained_verify_baseline_snapshot_matches_record(
+                    incoming
+                )
+            ):
+                continue
+            previous = records.get(owner_id)
+            if isinstance(previous, dict) and previous != incoming:
+                incoming_history = copy.deepcopy(
+                    incoming.get(
+                        _RETAINED_VERIFY_BASELINE_SNAPSHOT_HISTORY,
+                        [],
+                    )
+                )
+                self._carry_retained_verify_baseline_snapshot_history(
+                    previous,
+                    incoming,
+                )
+                combined = list(
+                    incoming.get(
+                        _RETAINED_VERIFY_BASELINE_SNAPSHOT_HISTORY,
+                        [],
+                    )
+                )
+                if isinstance(incoming_history, list):
+                    combined.extend(
+                        item for item in incoming_history if isinstance(item, dict)
+                    )
+                deduplicated: List[Dict[str, object]] = []
+                seen: Set[Tuple[str, str]] = set()
+                for item in combined:
+                    key = (
+                        str(
+                            item.get(
+                                _RETAINED_VERIFY_BASELINE_SNAPSHOT_COMMIT,
+                                "",
+                            )
+                        ),
+                        str(
+                            item.get(
+                                _RETAINED_VERIFY_BASELINE_SNAPSHOT_TREE,
+                                "",
+                            )
+                        ),
+                    )
+                    if not all(key) or key in seen:
+                        continue
+                    seen.add(key)
+                    deduplicated.append(item)
+                if deduplicated:
+                    incoming[
+                        _RETAINED_VERIFY_BASELINE_SNAPSHOT_HISTORY
+                    ] = deduplicated
+            records[owner_id] = incoming
+            self._bind_parallel_retained_verify_baseline_source(
+                state,
+                owner_id,
+                incoming,
+            )
+            merged.append(owner_id)
+        if merged:
+            state.resume_context[_RETAINED_WORKTREE_OWNERSHIP_CONTEXT] = records
+        return merged
+
     def _restore_missing_ready_owner_before_evidence_repair(
         self,
         state: RunState,
@@ -9794,6 +10072,7 @@ class Orchestrator:
         if task.task_id in records:
             # Existing records remain subject to the exact snapshot validator.
             # Do not overwrite stale or mismatched evidence with a newer claim.
+            self._migrate_live_legacy_retained_verify_baselines(state)
             return False
         if not bool(self._implementation_ready_markers(state).get(task.task_id)):
             return False
@@ -15791,6 +16070,18 @@ class Orchestrator:
                 ",".join(restored_persisted_owner_ids),
             )
 
+        migrated_legacy_owner_ids = (
+            self._migrate_live_legacy_retained_verify_baselines(state)
+        )
+        if migrated_legacy_owner_ids:
+            self._persist_tasks(tasks)
+            save_run_state(self.project_root, state)
+            self.logger.info(
+                "[recovery] snapshotted live legacy retained baselines before "
+                "implementation progress tasks=%s",
+                ",".join(migrated_legacy_owner_ids),
+            )
+
         self._normalize_legacy_execution_recovery_tasks(state, tasks)
         prebaseline_recovery: Optional[TaskSpec] = None
         recovery_pending = False
@@ -16168,6 +16459,19 @@ class Orchestrator:
         frontend_requirement_ids = set(
             frontend_fidelity_requirement_ids(trace_payload)
         )
+        if isinstance(trace_payload, dict):
+            task_requirement_ids = set(task.requirement_ids)
+            for requirement in trace_payload.get("requirements", []) or []:
+                if not isinstance(requirement, dict):
+                    continue
+                requirement_id = str(requirement.get("id", "")).strip()
+                if (
+                    requirement_id in task_requirement_ids
+                    and requirement.get("status") == "active"
+                    and requirement.get("priority") == "mandatory"
+                    and requirement_is_frontend_fidelity(requirement)
+                ):
+                    frontend_requirement_ids.add(requirement_id)
         for surface in selected_surface_specs(
             trace_payload,
             max_pages=self.config.frontend_design.max_pages,
@@ -16182,6 +16486,144 @@ class Orchestrator:
             for requirement_id in task.requirement_ids
             if requirement_id in frontend_requirement_ids
         ]
+
+    def _ensure_task_frontend_recovery_surface(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        missing_ids: Iterable[str],
+        lock: Mapping[str, object],
+    ) -> None:
+        """Make a legacy task's missing page explicit before prototype recovery."""
+
+        trace = load_requirements_trace(self.project_root, normalize=False)
+        if not isinstance(trace, dict):
+            return
+        requirements = {
+            str(item.get("id", "")).strip(): item
+            for item in trace.get("requirements", []) or []
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        }
+        active_missing = [
+            requirement_id
+            for requirement_id in dict.fromkeys(
+                str(item).strip() for item in missing_ids if str(item).strip()
+            )
+            if requirement_id in requirements
+            and requirements[requirement_id].get("status") == "active"
+            and requirements[requirement_id].get("priority") == "mandatory"
+        ]
+        if not active_missing:
+            return
+
+        raw_scope = trace.get("frontend_scope")
+        scope = dict(raw_scope) if isinstance(raw_scope, dict) else {}
+        raw_surfaces = scope.get("surfaces", [])
+        surfaces = [
+            copy.deepcopy(item)
+            for item in raw_surfaces
+            if isinstance(item, dict)
+        ] if isinstance(raw_surfaces, list) else []
+        known_ids = {
+            str(surface.get("id", "")).strip()
+            for surface in surfaces
+            if str(surface.get("id", "")).strip()
+        }
+        covered_ids = {
+            str(requirement_id).strip()
+            for surface in surfaces
+            for requirement_id in surface.get("requirement_ids", []) or []
+            if str(requirement_id).strip()
+        }
+
+        prototype = lock.get("prototype", {}) if isinstance(lock, Mapping) else {}
+        locked_pages = (
+            prototype.get("pages", [])
+            if isinstance(prototype, Mapping)
+            else []
+        )
+        for page in locked_pages if isinstance(locked_pages, list) else []:
+            if not isinstance(page, Mapping):
+                continue
+            page_id = str(page.get("id", "")).strip()
+            page_requirements = [
+                str(requirement_id).strip()
+                for requirement_id in page.get("requirement_ids", []) or []
+                if str(requirement_id).strip() in requirements
+                and requirements[str(requirement_id).strip()].get("status")
+                == "active"
+                and requirements[str(requirement_id).strip()].get("priority")
+                == "mandatory"
+            ]
+            if not page_id or page_id in known_ids or not page_requirements:
+                continue
+            surfaces.append(
+                {
+                    "id": page_id,
+                    "name": str(page.get("title", "")).strip() or page_id,
+                    "route": str(page.get("route", "")).strip(),
+                    "priority": "core",
+                    "purpose": "Preserve this previously approved surface during contract recovery.",
+                    "key_states": [],
+                    "requirement_ids": page_requirements,
+                    "html_ref": str(page.get("html_ref", "")).strip(),
+                }
+            )
+            known_ids.add(page_id)
+            covered_ids.update(page_requirements)
+
+        unresolved = [
+            requirement_id
+            for requirement_id in active_missing
+            if requirement_id not in covered_ids
+        ]
+        if unresolved:
+            prototype_refs: List[str] = []
+            for proof in task.requirement_proofs:
+                if not isinstance(proof, dict):
+                    continue
+                for raw_ref in proof.get("evidence_refs", []) or []:
+                    ref = str(raw_ref).split("::", 1)[0].strip()
+                    if (
+                        ref.startswith(
+                            ".auto-agents/docs/frontend_prototype/"
+                        )
+                        and ref.endswith((".html", ".htm"))
+                        and not ref.endswith("/index.html")
+                        and ref not in prototype_refs
+                    ):
+                        prototype_refs.append(ref)
+            numeric_ids = [
+                int(match.group(1))
+                for surface_id in known_ids
+                for match in [re.fullmatch(r"SURF-(\d+)", surface_id)]
+                if match is not None
+            ]
+            surface_id = f"SURF-{max(numeric_ids, default=0) + 1:03d}"
+            surfaces.append(
+                {
+                    "id": surface_id,
+                    "name": task.title,
+                    "route": "",
+                    "priority": "core",
+                    "purpose": task.description,
+                    "key_states": list(task.acceptance),
+                    "requirement_ids": unresolved,
+                    **(
+                        {"html_ref": prototype_refs[0]}
+                        if prototype_refs
+                        else {}
+                    ),
+                }
+            )
+
+        scope["requested"] = True
+        scope["surfaces"] = surfaces
+        trace["frontend_scope"] = scope
+        write_json(requirements_trace_path(self.project_root), trace)
+        state.resume_context["frontend_contract_recovery_requirement_ids"] = (
+            active_missing
+        )
 
     def _route_frontend_design_contract_prerequisite(
         self,
@@ -16201,6 +16643,13 @@ class Orchestrator:
         if approved_frontend_design(self.project_root) and not missing_ids:
             state.resume_context.pop(self.FRONTEND_CONTRACT_RECOVERY_CONTEXT, None)
             return None
+
+        self._ensure_task_frontend_recovery_surface(
+            state,
+            task,
+            missing_ids or task_requirement_ids,
+            lock,
+        )
 
         task.status = "pending"
         self._clear_implementation_ready_marker(state, task)
@@ -16500,6 +16949,14 @@ class Orchestrator:
             batch_deferred = 0
             for task in batch:
                 result = results[task.task_id]
+                merged_baselines = self._merge_parallel_retained_verify_baselines(
+                    state,
+                    result,
+                )
+                if merged_baselines:
+                    # Snapshot metadata must be durable before any result or
+                    # failure-checkpoint ref can be removed below.
+                    self._persist_parallel_runtime_state(state, tasks)
                 if not result["ok"]:
                     if self._parallel_result_is_provider_pressure(result):
                         if provider_pressure_result is None:
@@ -17836,7 +18293,10 @@ class Orchestrator:
             save_run_state(worktree_path, worker_state)
             worker._persist_tasks(worker_tasks)
             worker_task = next(task for task in worker_tasks if task.task_id == task_id)
-            if worker._ensure_task_verify_baseline(worker_task):
+            if worker._ensure_task_verify_baseline(
+                worker_task,
+                state=worker_state,
+            ):
                 worker._persist_tasks(worker_tasks)
             restored_checkpoint_ref = self._restore_task_failure_checkpoint(
                 state,
@@ -17859,6 +18319,12 @@ class Orchestrator:
                     dependency_links=dependency_links,
                 )
                 result = self._parallel_task_failure_result(worker_task, gate_result)
+                result["retained_verify_baselines"] = (
+                    worker._parallel_retained_verify_baseline_handoff(
+                        worker_state,
+                        worker_task,
+                    )
+                )
                 result["failure_checkpoint"] = checkpoint
                 result["diagnostic_paths"] = list(
                     checkpoint.get("diagnostic_paths", [])
@@ -17910,6 +18376,12 @@ class Orchestrator:
                 "changed_paths": worker_changed_paths,
                 "verify_current_failure_ids": list(gate_result.get("verify_current_failure_ids", [])),
                 "recovered_checkpoint_ref": restored_checkpoint_ref,
+                "retained_verify_baselines": (
+                    worker._parallel_retained_verify_baseline_handoff(
+                        worker_state,
+                        worker_task,
+                    )
+                ),
             }
             return dict(self._rebase_parallel_worker_paths(result, worktree_path))
         except GateCommandExecutionError:
@@ -17965,6 +18437,9 @@ class Orchestrator:
                 for item in result.get("verify_current_failure_ids", [])
                 if str(item).strip()
             ],
+            "retained_verify_baselines": copy.deepcopy(
+                result.get("retained_verify_baselines", {})
+            ),
         }
         self._set_parallel_pending_integrations(state, pending)
         self._record_parallel_task_paths(
@@ -18106,6 +18581,12 @@ class Orchestrator:
             task = tasks_by_id.get(task_id)
             entry = pending[task_id]
             result_ref = str(entry.get("result_ref", "")).strip()
+            merged_baselines = self._merge_parallel_retained_verify_baselines(
+                state,
+                entry,
+            )
+            if merged_baselines:
+                self._persist_parallel_runtime_state(state, tasks)
             if task is None or task.status == "done":
                 pending.pop(task_id, None)
                 self._delete_parallel_result_ref(result_ref)

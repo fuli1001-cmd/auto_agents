@@ -375,12 +375,66 @@ class FrontendDesignTests(unittest.TestCase):
             root = Path(tmp)
             write_text(root / "docs/example.html", HTML)
             write_text(root / "tests/fixture.tsx", "export const Fixture = () => null")
+            write_text(root / ".tmp/conda-pkgs/python/idlelib/help.html", HTML)
+            write_text(root / ".tmp-tests/browser/report.html", HTML)
             self.assertFalse(discover_existing_frontend(root).existing_frontend)
 
             write_text(root / "src/pages/Home.tsx", "export const Home = () => <main />")
             result = discover_existing_frontend(root)
             self.assertTrue(result.existing_frontend)
             self.assertIn("src/pages/Home.tsx", result.evidence)
+
+    def test_approved_manifest_can_grow_beyond_generation_batch_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prototype = frontend_prototype_dir(root)
+            write_text(prototype / "index.html", HTML)
+            pages = []
+            for index in range(1, 5):
+                page = prototype / f"surface-{index}.html"
+                write_text(page, HTML)
+                pages.append(
+                    {
+                        "id": f"SURF-{index:03d}",
+                        "title": f"Surface {index}",
+                        "route": f"/surface-{index}",
+                        "html_ref": page.relative_to(root).as_posix(),
+                        "requirement_ids": [f"REQ-{index:03d}"],
+                    }
+                )
+
+            errors = validate_prototype_manifest(
+                root,
+                {
+                    "version": 1,
+                    "index_ref": (prototype / "index.html").relative_to(root).as_posix(),
+                    "viewports": ["1440x900", "390x844"],
+                    "pages": pages,
+                },
+                max_pages=3,
+            )
+
+            self.assertEqual(errors, [])
+
+            selected = selected_surface_specs(
+                {
+                    "frontend_scope": {
+                        "requested": True,
+                        "surfaces": [
+                            {
+                                "id": page["id"],
+                                "name": page["title"],
+                                "route": page["route"],
+                                "priority": "core",
+                                "requirement_ids": page["requirement_ids"],
+                            }
+                            for page in pages
+                        ],
+                    }
+                },
+                max_pages=3,
+            )
+            self.assertEqual(len(selected), 4)
 
     def test_catalog_parser_and_selection_require_unique_winner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -524,6 +578,108 @@ class FrontendDesignTests(unittest.TestCase):
             self.assertNotIn(
                 task.task_id,
                 state.resume_context.get("implementation_ready_tasks", {}),
+            )
+
+    def test_unlisted_active_frontend_requirement_rewinds_before_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_frontend_fidelity_trace(root)
+            trace = json.loads(
+                requirements_trace_path(root).read_text(encoding="utf-8")
+            )
+            trace["frontend_scope"]["surfaces"][0]["id"] = "SURF-001"
+            trace["requirements"].append(
+                {
+                    "id": "REQ-002",
+                    "status": "active",
+                    "priority": "mandatory",
+                    "text": "The account page must match the approved static prototype.",
+                    "acceptance_oracles": [
+                        "Desktop and mobile screenshots match the approved account prototype."
+                    ],
+                    "oracle_type": "mixed",
+                    "oracle_strength": "human",
+                    "evidence_boundary": "system_boundary",
+                    "forbidden_proxy_oracles": [],
+                }
+            )
+            write_json(requirements_trace_path(root), trace)
+            write_json(
+                frontend_design_lock_path(root),
+                {
+                    "prototype": {
+                        "pages": [
+                            {
+                                "id": f"SURF-{index:03d}",
+                                "title": f"Existing surface {index}",
+                                "route": f"/existing-{index}",
+                                "html_ref": (
+                                    ".auto-agents/docs/frontend_prototype/"
+                                    f"existing-{index}.html"
+                                ),
+                                "requirement_ids": ["REQ-001"],
+                            }
+                            for index in range(1, 4)
+                        ]
+                    }
+                },
+            )
+            task = TaskSpec(
+                task_id="task-account",
+                title="Implement account identity",
+                description="Implement the account page from its approved prototype.",
+                acceptance=["The account page matches the static prototype."],
+                requirement_ids=["REQ-002"],
+                requirement_proofs=[
+                    {
+                        "requirement_id": "REQ-002",
+                        "evidence_refs": [
+                            ".auto-agents/docs/frontend_prototype/account-identity.html"
+                        ],
+                    }
+                ],
+                status="pending",
+            )
+            state = load_run_state(root)
+            state.status = "pending"
+            state.current_stage = "implement"
+            state.approved_gates = [
+                "requirements",
+                "prototype",
+                "architecture",
+                "release",
+            ]
+            state.tasks = [task]
+
+            orchestrator = Orchestrator(root)
+            with patch.object(
+                orchestrator, "_ensure_evidence_preflight"
+            ) as evidence_preflight:
+                result = orchestrator._execute_task_in_main_worktree(
+                    state, [task], task
+                )
+
+            self.assertIs(result, state)
+            evidence_preflight.assert_not_called()
+            self.assertEqual(state.current_stage, "prototype")
+            self.assertTrue(
+                state.resume_context[
+                    Orchestrator.FRONTEND_CONTRACT_RECOVERY_CONTEXT
+                ]
+            )
+            updated = json.loads(
+                requirements_trace_path(root).read_text(encoding="utf-8")
+            )
+            account = next(
+                surface
+                for surface in updated["frontend_scope"]["surfaces"]
+                if "REQ-002" in surface["requirement_ids"]
+            )
+            self.assertEqual(account["id"], "SURF-004")
+            self.assertEqual(
+                account["html_ref"],
+                ".auto-agents/docs/frontend_prototype/account-identity.html",
             )
 
     def test_stale_approved_contract_rewinds_before_frontend_task_preflight(self) -> None:
