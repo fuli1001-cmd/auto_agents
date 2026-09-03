@@ -808,7 +808,7 @@ class PersistenceExecutionTests(unittest.TestCase):
                     candidate_fingerprint="candidate",
                 )
 
-    def test_orchestrator_auto_approve_executes_clean_break_and_records_ledger(self) -> None:
+    def test_orchestrator_auto_approve_does_not_authorize_clean_break(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"
             Orchestrator.init_project(root, "demo", "mock")
@@ -847,12 +847,15 @@ class PersistenceExecutionTests(unittest.TestCase):
                 tasks=[task],
                 resume_context={"auto_approve": True},
             )
-            result = orchestrator._run_task_persistence_action(state, task)
-            self.assertTrue(result["ok"])
-            self.assertEqual((root / ".data" / "app.db").read_text(), "v2")
-            self.assertEqual(state.persistence_actions["task-db"]["status"], "verified")
+            with self.assertRaises(PersistenceContractError):
+                orchestrator._run_task_persistence_action(state, task)
+
+            self.assertEqual((root / ".data" / "app.db").read_text(), "legacy")
+            self.assertEqual(state.status, "paused")
+            self.assertEqual(state.pending_approval, "persistence-reset")
             self.assertEqual(
-                state.persistence_actions["_clean_break_approval"]["approval"], "auto"
+                state.persistence_actions["_clean_break_approval"]["status"],
+                "pending_approval",
             )
 
     def test_declined_clean_break_persists_resumable_approval_gate(self) -> None:

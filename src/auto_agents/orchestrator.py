@@ -44,6 +44,7 @@ from .agent_instructions import (
     sync_agent_instructions,
     write_normalized_project_rules,
 )
+from .authorization import authorization_policy_for_state
 from .repomap import RepoMapBuilder, RepoMapResult
 from .config import (
     archived_run_state_path,
@@ -219,6 +220,11 @@ from .persistence import (
     persistence_candidate_fingerprint,
     persistence_change_strategy,
     persistence_storage_transition,
+)
+from .postconditions import (
+    legacy_postcondition_claims,
+    postcondition_set_digest,
+    verify_blocker_postconditions,
 )
 from .prototype_variants import (
     add_variant,
@@ -1036,7 +1042,16 @@ class Orchestrator:
         engine_root = Path(__file__).resolve().parents[2]
         revision = head_ref(engine_root)
         hasher = hashlib.sha256()
-        for name in ("orchestrator.py", "gates.py", "requirements.py"):
+        for name in (
+            "orchestrator.py",
+            "gates.py",
+            "requirements.py",
+            "authorization.py",
+            "postconditions.py",
+            "session_health.py",
+            "health_watchdog.py",
+            "workflow_runtime.py",
+        ):
             path = Path(__file__).resolve().parent / name
             try:
                 hasher.update(path.read_bytes())
@@ -1106,11 +1121,23 @@ class Orchestrator:
             not commit_sha
             or not str(failure.get("verification", "")).strip()
             or not expected_postconditions
-            or not self._installed_engine_contains_commit(commit_sha)
         ):
             return False
 
         revision = self._installed_engine_revision()
+        contains_original_commit = self._installed_engine_contains_commit(commit_sha)
+        claims, receipts = verify_blocker_postconditions(
+            blocker,
+            engine_revision=revision,
+        )
+        equivalent_repair_verified = bool(
+            claims
+            and len(receipts) == len(claims)
+            and all(receipt.result == "pass" for receipt in receipts)
+        )
+        if not contains_original_commit and not equivalent_repair_verified:
+            return False
+
         recovery_revisions = state.resume_context.get(
             self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
             {},
@@ -1119,8 +1146,16 @@ class Orchestrator:
             recovery_revisions = {}
         fingerprint = str(blocker.get("fingerprint", "")).strip()
         category = str(blocker.get("category", "")).strip()
+        claim_set_digest = (
+            postcondition_set_digest(claims)
+            if claims
+            else f"ancestor:{commit_sha}"
+        )
         recovery_key = "approved_self_repair:" + hashlib.sha256(
-            f"{category}\0{fingerprint}\0{commit_sha}".encode("utf-8")
+            (
+                f"{category}\0{fingerprint}\0{commit_sha}\0"
+                f"{claim_set_digest}"
+            ).encode("utf-8")
         ).hexdigest()[:24]
 
         already_prepared = bool(
@@ -1149,12 +1184,50 @@ class Orchestrator:
                 "status": "retrying",
                 "installed_engine_recovery_revision": revision,
                 "installed_engine_recovery_commit": commit_sha,
-                "installed_engine_recovery_postcondition_count": len(
-                    expected_postconditions
+                "installed_engine_recovery_method": (
+                    "commit_ancestry"
+                    if contains_original_commit
+                    else "versioned_postconditions"
                 ),
+                "installed_engine_recovery_postcondition_count": len(claims),
+                "installed_engine_recovery_claim_digest": claim_set_digest,
                 "updated_at": utc_now_iso(),
             }
         )
+        if claims:
+            blocker["postcondition_claims"] = [
+                claim.to_dict() for claim in claims
+            ]
+            blocker["postcondition_receipts"] = [
+                receipt.to_dict() for receipt in receipts
+            ]
+            if state.active_repair_case_id:
+                repair_case = RepairCaseStore(
+                    self.project_root,
+                    state.run_id,
+                ).load(state.active_repair_case_id)
+                if repair_case is not None:
+                    repair_case.postcondition_claims = [
+                        claim.to_dict() for claim in claims
+                    ]
+                    known_receipts = {
+                        (
+                            str(item.get("claim_digest", "")),
+                            str(item.get("engine_revision", "")),
+                        )
+                        for item in repair_case.postcondition_receipts
+                        if isinstance(item, dict)
+                    }
+                    repair_case.postcondition_receipts.extend(
+                        receipt.to_dict()
+                        for receipt in receipts
+                        if (receipt.claim_digest, receipt.engine_revision)
+                        not in known_receipts
+                    )
+                    RepairCaseStore(
+                        self.project_root,
+                        state.run_id,
+                    ).save(repair_case)
         state.active_blocker = blocker
         state.status = "pending"
         state.last_error = ""
@@ -3021,6 +3094,17 @@ class Orchestrator:
             self._max_tasks_remaining = max_tasks
             self._task_budget_exhausted = False
             state = load_run_state(self.project_root)
+            authorization_policy = authorization_policy_for_state(
+                auto_approve=bool(auto_approve),
+                payload=(
+                    state.resume_context.get("authorization_policy", {})
+                    if isinstance(state.resume_context, dict)
+                    else {}
+                ),
+            )
+            state.resume_context["authorization_policy"] = (
+                authorization_policy.to_dict()
+            )
             if self._normalize_legacy_execution_recovery_task_id_collisions(state):
                 save_run_state(self.project_root, state)
             runtime_identity = self._auto_agents_runtime_identity()
@@ -8825,7 +8909,12 @@ class Orchestrator:
         )
         return receipt
 
-    def mark_self_repair_applied(self, commit_sha: str) -> RunState:
+    def mark_self_repair_applied(
+        self,
+        commit_sha: str,
+        *,
+        verification: str = "",
+    ) -> RunState:
         state = load_run_state(self.project_root)
         blocker = (
             dict(state.active_blocker)
@@ -8839,12 +8928,33 @@ class Orchestrator:
                 "updated_at": utc_now_iso(),
             }
         )
+        if verification.strip():
+            blocker["self_repair_approval"] = {
+                "verification_digest": "sha256:"
+                + hashlib.sha256(
+                    verification.encode("utf-8", errors="replace")
+                ).hexdigest(),
+                "approved_at": utc_now_iso(),
+            }
+        claims = legacy_postcondition_claims(blocker)
+        if claims:
+            blocker["postcondition_claims"] = [
+                claim.to_dict() for claim in claims
+            ]
         state.active_blocker = blocker
         if state.active_repair_case_id:
             repair_case = RepairCaseStore(
                 self.project_root, state.run_id
             ).load(state.active_repair_case_id)
             if repair_case is not None and repair_case.source == "health_watch":
+                repair_case.authorization_policy = dict(
+                    state.resume_context.get("authorization_policy", {})
+                    if isinstance(state.resume_context, dict)
+                    else {}
+                )
+                repair_case.postcondition_claims = [
+                    claim.to_dict() for claim in claims
+                ]
                 repair_case.status = "resuming"
                 repair_case.history.append(
                     {
@@ -28477,6 +28587,7 @@ class Orchestrator:
                 "Choose CLARIFY only when a product decision or external contract is genuinely missing.",
                 "Choose ROUTE when implementation requires changing an artifact owned by an earlier stage; set target_stage to clarify, prototype, design, plan, or provider_research.",
                 "Choose WAIT_USER when progress requires a fact, choice, consent, authorized fixture, secret, or project-local install approval that only the operator can provide.",
+                "Every required_inputs item must set decision_class to goal_choice, credential, rights_attestation, unbudgeted_external_cost, destructive_change, irreversible_product_decision, or external_observation. Never request repository selection, implementation scope, test strategy, safe migration strategy, engine self-repair, commits, or workflow recovery from the operator.",
                 "For WAIT_USER, return required_inputs. Ask for semantic user-owned facts, never derived paths, versions, or hashes that auto_agents can discover. Each item must contain key, kind, question, purpose, why_required, how_to_obtain, recommended_answer, default, persistence, sensitivity, validation, bindings, subject_fingerprint, and question_version.",
                 "Ask one plain-language question per required_inputs item. Attestation and install approval questions must be y/n with default=false. Never recommend answering yes unless the stated condition is actually true.",
                 "Never ask the operator to construct JSON, YAML, TOML, an environment-variable payload, request headers, a route contract, a fixture manifest, hashes, or an evidence document. Ask separately for each atomic user-owned fact or secret. Bind atomic answers directly; implementation must assemble all serialized objects and generated technical artifacts.",
@@ -28495,7 +28606,7 @@ class Orchestrator:
                 "Always list required_mutations as objects with exact project-relative path and reason. Provider references under .auto-agents are read-only implementation inputs owned by provider_research.",
                 "Return exactly one line beginning EVIDENCE_PREFLIGHT: followed by compact JSON.",
                 "For every required mutation, set owner to implementation, plan, provider_research, or target_project. Credentials, authorized fixtures, pinned operator artifacts, and network policy are target_project-owned and must never be reported READY while absent.",
-                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE|WAIT_USER\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_inputs\":[{\"key\":\"...\",\"kind\":\"boolean|choice|text|url|path|secret|attestation|install_approval\",\"question\":\"...\",\"purpose\":\"...\",\"why_required\":\"...\",\"how_to_obtain\":[\"...\"],\"recommended_answer\":\"...\",\"default\":false,\"persistence\":\"one_time|run|project\",\"sensitivity\":\"public|private|secret\",\"validation\":{},\"bindings\":[{\"input_key\":\"optional or runtime.<tool_id>\",\"env\":\"NAME\",\"projection\":\"value|artifact_path|runtime_path|version|sha256\"}],\"subject_fingerprint\":\"...\",\"question_version\":1}],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\",\"owner\":\"implementation|plan|provider_research|target_project\",\"config_scope\":\"generated_verification|operator\"}]}",
+                "JSON schema: {\"decision\":\"READY|SPLIT|CLARIFY|ROUTE|WAIT_USER\",\"target_stage\":\"\",\"reason\":\"...\",\"checklist\":[\"...\"],\"required_inputs\":[{\"key\":\"...\",\"kind\":\"boolean|choice|text|url|path|secret|attestation|install_approval\",\"decision_class\":\"goal_choice|credential|rights_attestation|unbudgeted_external_cost|destructive_change|irreversible_product_decision|external_observation\",\"question\":\"...\",\"purpose\":\"...\",\"why_required\":\"...\",\"how_to_obtain\":[\"...\"],\"recommended_answer\":\"...\",\"default\":false,\"persistence\":\"one_time|run|project\",\"sensitivity\":\"public|private|secret\",\"validation\":{},\"bindings\":[{\"input_key\":\"optional or runtime.<tool_id>\",\"env\":\"NAME\",\"projection\":\"value|artifact_path|runtime_path|version|sha256\"}],\"subject_fingerprint\":\"...\",\"question_version\":1}],\"required_mutations\":[{\"path\":\"...\",\"reason\":\"...\",\"owner\":\"implementation|plan|provider_research|target_project\",\"config_scope\":\"generated_verification|operator\"}]}",
                 f"Task JSON:\n{json.dumps(task.to_dict(), indent=2, ensure_ascii=False)}",
                 "Operator input summary (values redacted):\n"
                 + json.dumps(operator_records, indent=2, ensure_ascii=False),
@@ -31520,16 +31631,6 @@ class Orchestrator:
                 str(approval.get("fingerprint", "")) == approval_fingerprint
                 and str(approval.get("status", "")) == "approved"
             )
-            if not approved and auto_approve:
-                approval = {
-                    "fingerprint": approval_fingerprint,
-                    "status": "approved",
-                    "approval": "auto",
-                    "approved_at": utc_now_iso(),
-                    "summary": approval_payload,
-                }
-                state.persistence_actions["_clean_break_approval"] = approval
-                approved = True
             if not approved:
                 answer = self._prompt_user(
                     "Clean break will permanently delete and rebuild all registered "

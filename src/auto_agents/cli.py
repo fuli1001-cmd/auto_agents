@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from .authorization import authorization_policy_for_state
 from .config import (
     architecture_path,
     frontend_prototype_variants_registry_path,
@@ -1190,6 +1191,18 @@ def _auto_repair_auto_agents_and_resume(
     diagnosis=None,
     repair_case: Optional[RepairCase] = None,
 ) -> int:
+    existing_state = load_run_state(project_root)
+    authorization_policy = authorization_policy_for_state(
+        auto_approve=bool(getattr(args, "auto_approve", False)),
+        payload=existing_state.resume_context.get("authorization_policy", {}),
+    )
+    existing_state.resume_context["authorization_policy"] = (
+        authorization_policy.to_dict()
+    )
+    save_run_state(project_root, existing_state)
+    if repair_case is not None:
+        repair_case.authorization_policy = authorization_policy.to_dict()
+        RepairCaseStore(project_root, existing_state.run_id).save(repair_case)
     health_runtime = getattr(orchestrator, "_workflow_health_runtime", None)
     if health_runtime is not None:
         health_runtime.set_phase("self_repair")
@@ -1322,7 +1335,10 @@ def _auto_repair_auto_agents_and_resume(
         return 3
 
     if result.status == "already_repaired" or not result.candidate_commit:
-        orchestrator.mark_self_repair_applied(result.commit_sha)
+        orchestrator.mark_self_repair_applied(
+            result.commit_sha,
+            verification=result.verification,
+        )
         print(
             "Verified auto_agents code resolves this issue at "
             f"{result.commit_sha[:12]}. Resuming run without a new repair...",
@@ -1382,7 +1398,10 @@ def _auto_repair_auto_agents_and_resume(
             if isinstance(before.active_blocker, dict)
             else {}
         )
-        orchestrator.mark_self_repair_applied(result.candidate_commit)
+        orchestrator.mark_self_repair_applied(
+            result.candidate_commit,
+            verification=result.verification,
+        )
         runtime_root = Path(result.runtime_root).resolve()
         print(
             f"auto_agents approved isolated candidate "
@@ -2182,8 +2201,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-approve",
         action="store_true",
         help=(
-            "Inherit automatic approval into routed fix/run workflows, where it "
-            "keeps each target mode's normal meaning."
+            "Automatically authorize safe in-scope implementation, engine "
+            "self-repair, tests, local commits, compatible state upgrades, and "
+            "workflow recovery. Goal choices, credentials, unbudgeted external "
+            "costs, destructive changes, irreversible product decisions, and "
+            "external observations only the user can perform still require "
+            "the user."
         ),
     )
     collab_parser.add_argument(

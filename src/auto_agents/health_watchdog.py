@@ -27,7 +27,8 @@ from .notifications import notify_flow_finished
 from .process_supervision import process_identity_matches, process_start_ticks
 from .session_health import (
     SESSION_PROGRESS_SCHEMA_VERSION,
-    build_session_progress,
+    build_session_progress_identity,
+    session_progress_disagrees,
 )
 
 
@@ -283,9 +284,13 @@ class IndependentHealthAuditor:
     def _observe_session(self, manifest: Dict[str, object]) -> None:
         state = load_session_state(self.project_root, self.subject_id)
         raw = state.to_dict()
-        durable = build_session_progress(raw)
-        digest = evidence_digest(durable)
-        state_digest = evidence_digest(raw)
+        identity = build_session_progress_identity(
+            raw,
+            run_token=self.run_token,
+        )
+        durable = dict(identity["progress"])
+        digest = str(identity["progress_digest"])
+        state_digest = str(identity["state_digest"])
         session_dir = self.root.parent
         file_activity = []
         for path in sorted(session_dir.glob("**/*")):
@@ -365,16 +370,7 @@ class IndependentHealthAuditor:
         }
         _atomic_json(self.root / "auditor-snapshot.json", audit)
         main = read_json(self.root / "summary.json", default={})
-        if (
-            isinstance(main, dict)
-            and str(main.get("run_token", "")) == self.run_token
-            and str(main.get("progress_schema_version", ""))
-            == str(SESSION_PROGRESS_SCHEMA_VERSION)
-            and state_digest
-            and str(main.get("state_digest", "")) == state_digest
-            and str(main.get("progress_digest", ""))
-            and str(main.get("progress_digest", "")) != digest
-        ):
+        if isinstance(main, dict) and session_progress_disagrees(main, identity):
             self._request(
                 "diagnose",
                 "health_observer_disagreement",

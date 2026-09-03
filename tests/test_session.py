@@ -225,6 +225,7 @@ class SessionStateModelTests(unittest.TestCase):
                 "confirmed": True,
                 "summary": "Repair the actual button behavior.",
             },
+            authorization_policy={"schema_version": 1, "mode": "auto"},
             conversation=[{"role": "user", "content": "hello"}],
             execution_log=[{"attempt": 1, "action": "fix", "result": "ok", "timestamp": "t"}],
             current_attempt=1,
@@ -240,6 +241,7 @@ class SessionStateModelTests(unittest.TestCase):
         self.assertEqual(restored.mode, "fix")
         self.assertEqual(restored.goal, "Button does not work")
         self.assertEqual(restored.goal_execution_environment["mode"], "real")
+        self.assertEqual(restored.authorization_policy["mode"], "auto")
         self.assertEqual(len(restored.conversation), 1)
         self.assertEqual(len(restored.execution_log), 1)
         self.assertEqual(restored.current_attempt, 1)
@@ -1064,6 +1066,155 @@ class SessionCollabFlowTests(unittest.TestCase):
             self.assertTrue(
                 any(
                     item.get("action") == "goal_environment_required"
+                    for item in result.execution_log
+                )
+            )
+
+    def test_auto_approve_rejects_internal_assistance_without_user_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "collab")
+            state.auto_approve = True
+            session = Session(
+                Orchestrator(project_root),
+                mode="collab",
+                auto_approve=True,
+            )
+
+            error = session._collab_assistance_error(
+                state,
+                (
+                    "是否允许在 auto_agents 仓库中采用向后兼容迁移，"
+                    "然后恢复 blocked run？"
+                ),
+            )
+
+            self.assertIn("internal_action_auto_authorized", error)
+            self.assertEqual(
+                state.authorization_policy["mode"],
+                "auto",
+            )
+
+    def test_auto_approve_still_allows_credential_question(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "collab")
+            state.auto_approve = True
+            session = Session(
+                Orchestrator(project_root),
+                mode="collab",
+                auto_approve=True,
+            )
+
+            error = session._collab_assistance_error(
+                state,
+                "请提供实际服务所需的 API 密钥。",
+                decision_class="credential",
+            )
+
+            self.assertEqual(error, "")
+
+    def test_auto_approve_completes_after_verification_without_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"verified completion unexpectedly prompted user: {prompt}"
+                ),
+            )
+            state = create_session(project_root, "collab")
+            state.status = "executing"
+            state.goal = "Verify the actual export"
+            state.auto_approve = True
+            _confirm_collab_state(state, "real")
+            session = Session(
+                orchestrator,
+                mode="collab",
+                auto_approve=True,
+            )
+
+            with (
+                patch.object(
+                    session,
+                    "_call_agent",
+                    return_value="GOAL_ACHIEVED: export verified",
+                ),
+                patch.object(
+                    session,
+                    "_run_verify",
+                    return_value={"ok": True, "reason": "passed"},
+                ),
+                patch.object(session, "_git_commit", return_value=True),
+                patch.object(session, "_record_release_attestation"),
+                patch.object(session, "_release_baseline"),
+            ):
+                result = session._phase_collab_loop(state)
+
+            self.assertEqual(result.status, "completed")
+            self.assertTrue(
+                any(
+                    item.get("action") == "completion_auto_confirmed"
+                    for item in result.execution_log
+                )
+            )
+
+    def test_fix_auto_approve_resolves_internal_need_user_disposition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "fix")
+            state.goal = "Repair engine recovery"
+            state.auto_approve = True
+            state.conversation = [{"role": "user", "content": state.goal}]
+            save_session_state(project_root, state)
+            orchestrator = Orchestrator(
+                project_root,
+                user_input_fn=lambda prompt: self.fail(
+                    f"internal decision unexpectedly prompted user: {prompt}"
+                ),
+            )
+            replies = iter(
+                [
+                    (
+                        'FIX_DISPOSITION v1: {"decision":"need_user",'
+                        '"decision_class":"implementation_scope",'
+                        '"question":"是否允许修改 auto_agents 仓库并恢复 workflow？"}'
+                    ),
+                    (
+                        'FIX_DISPOSITION v1: {"decision":"fix",'
+                        '"summary":"repair recovery","reason":"bounded defect",'
+                        '"reproduction":[],"expected":"resume",'
+                        '"actual":"blocked","evidence_refs":[], '
+                        '"affected_contracts":[],"verification_command":"",'
+                        '"persistence_change":{"storage_transition":"none",'
+                        '"compatibility_policy":"not_applicable"}}'
+                    ),
+                ]
+            )
+
+            def mock_run(request):
+                content = next(replies)
+                write_text(request.output_path, content)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=content,
+                    stdout=content,
+                    returncode=0,
+                )
+
+            orchestrator._call_with_failover = mock_run
+            result = Session(
+                orchestrator,
+                mode="fix",
+                auto_approve=True,
+            )._phase_converse(state)
+
+            self.assertEqual(result.status, "executing")
+            self.assertTrue(
+                any(
+                    item.get("action") == "internal_action_auto_authorized"
                     for item in result.execution_log
                 )
             )
@@ -2060,7 +2211,7 @@ class SessionCollabFlowTests(unittest.TestCase):
                 prompt,
             )
             self.assertIn(
-                "never ask the user to run, resume, stop, or reconfigure auto-agents",
+                "workflow recovery are internal decisions",
                 prompt,
             )
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Optional
 from uuid import uuid4
 
+from .authorization import authorization_policy_for_state
 from .config import (
     create_session,
     load_run_state,
@@ -65,6 +66,40 @@ class WorkflowCoordinator:
             ),
         )
 
+    @staticmethod
+    def _engine_blocker_error(state: object) -> RuntimeError | None:
+        blocker = (
+            dict(getattr(state, "active_blocker", {}) or {})
+            if isinstance(getattr(state, "active_blocker", {}), dict)
+            else {}
+        )
+        if (
+            str(getattr(state, "status", "")) == "blocked"
+            and str(blocker.get("owner", "")) == "auto_agents"
+        ):
+            return RuntimeError(
+                "auto_agents engine self-repair required before workflow "
+                f"routing: category={blocker.get('category', 'auto_agents_error')} "
+                f"reason={blocker.get('reason', getattr(state, 'last_error', ''))}"
+            )
+        return None
+
+    def _apply_authorization_policy(
+        self,
+        state: object,
+        payload: object = None,
+    ) -> None:
+        existing = (
+            dict(payload)
+            if isinstance(payload, dict)
+            else dict(getattr(state, "authorization_policy", {}) or {})
+        )
+        policy = authorization_policy_for_state(
+            auto_approve=bool(self.auto_approve or getattr(state, "auto_approve", False)),
+            payload=existing,
+        )
+        state.authorization_policy = policy.to_dict()
+
     def start_session(self, session: object):
         active = self.store.active()
         if (
@@ -75,6 +110,7 @@ class WorkflowCoordinator:
             state = self._create_session(session)
             state.workflow_id = active.workflow_id
             state.auto_approve = bool(self.auto_approve)
+            self._apply_authorization_policy(state)
             state.full_verify = bool(session._full_verify)
             save_session_state(self.project_root, state)
             active.active_frame = WorkflowRef(session.mode, state.session_id)
@@ -143,6 +179,7 @@ class WorkflowCoordinator:
                 )
         state = self._create_session(session)
         state.auto_approve = bool(self.auto_approve)
+        self._apply_authorization_policy(state)
         state.full_verify = bool(session._full_verify)
         state.lineage_head_ref = head_ref(self.project_root)
         state.protected_preexisting_paths = list(changed_paths(self.project_root))
@@ -190,6 +227,10 @@ class WorkflowCoordinator:
         state.workflow_id = snapshot.workflow_id
         state.parent_handoff_id = handoff.handoff_id
         state.goal = handoff.goal
+        self._apply_authorization_policy(
+            state,
+            handoff.payload.get("authorization_policy", {}),
+        )
         raw_goal_environment = handoff.payload.get(
             "goal_execution_environment",
             {},
@@ -248,6 +289,7 @@ class WorkflowCoordinator:
         if resume_state_changed:
             save_session_state(self.project_root, state)
         self.auto_approve = bool(self.auto_approve or state.auto_approve)
+        self._apply_authorization_policy(state)
         self.full_verify = bool(self.full_verify or state.full_verify)
         session._auto_approve = self.auto_approve
         session._full_verify = self.full_verify
@@ -483,6 +525,7 @@ class WorkflowCoordinator:
             and not root_session.auto_approve
         ):
             root_session.auto_approve = True
+            self._apply_authorization_policy(root_session)
             save_session_state(self.project_root, root_session)
         if (
             root_session is not None
@@ -867,6 +910,9 @@ class WorkflowCoordinator:
                 "changed_paths": [],
                 "discard_child_mutations": handoff.child is not None,
             }
+        engine_error = self._engine_blocker_error(current)
+        if engine_error is not None:
+            raise engine_error
 
         session = Session(
             self.orch,
@@ -879,6 +925,59 @@ class WorkflowCoordinator:
         )
         state = self.start_seeded_session(session, snapshot=snapshot, handoff=handoff)
         return self._session_result(state, handoff)
+
+    def prepare_run_route(self) -> tuple[bool, str]:
+        """Clear a verified engine blocker before a run handoff is created."""
+
+        current = load_run_state(self.project_root)
+        if current.status == "completed":
+            return True, ""
+        if not self.orch._prepare_installed_self_repair_resume(current):
+            engine_error = self._engine_blocker_error(current)
+            if engine_error is not None:
+                raise engine_error
+            return False, (
+                f"run {current.run_id} remains {current.status}; no new run "
+                "handoff was created"
+            )
+        save_run_state(self.project_root, current)
+        if self.run_lock is not None:
+            self.run_lock.bind_subject("run", current.run_id)
+        if self.health_runtime is not None:
+            self.health_runtime.bind_subject(current.run_id)
+            self.health_runtime.set_phase("run")
+        context = dict(current.resume_context)
+        spec_file = Path(
+            str(context.get("spec_file", self.project_root / "spec.md"))
+        )
+        try:
+            resumed = self.orch.run(
+                spec_file=spec_file,
+                auto_approve=bool(
+                    self.auto_approve or context.get("auto_approve", False)
+                ),
+                print_agent_output=bool(
+                    self.print_agent_output
+                    or context.get("print_agent_output", False)
+                ),
+                provider_kind=(
+                    str(context.get("provider_kind", "")).strip() or None
+                ),
+                autonomy_mode=getattr(self.orch, "_autonomy_mode", None),
+            )
+        except RuntimeError as error:
+            resumed = load_run_state(self.project_root)
+            return False, (
+                f"run {resumed.run_id} recovery failed before routing: {error}"
+            )
+        if resumed.status == "completed":
+            return True, (
+                f"recovered and completed prior run {resumed.run_id} before routing"
+            )
+        return False, (
+            f"run {resumed.run_id} recovery ended with status {resumed.status}; "
+            "no new run handoff was created"
+        )
 
     def _drive_run_child(self, handoff: WorkflowHandoff, snapshot: WorkflowSnapshot) -> Dict[str, object]:
         self.auto_approve = bool(
@@ -950,6 +1049,10 @@ class WorkflowCoordinator:
                 "goal_execution_environment",
                 {},
             )
+            raw_authorization_policy = handoff.payload.get(
+                "authorization_policy",
+                {},
+            )
             if isinstance(raw_goal_environment, dict) and raw_goal_environment:
                 seed.setdefault(
                     "goal_execution_environment",
@@ -986,6 +1089,16 @@ class WorkflowCoordinator:
                         }
                         if isinstance(raw_goal_environment, dict)
                         and raw_goal_environment
+                        else {}
+                    ),
+                    **(
+                        {
+                            "authorization_policy": dict(
+                                raw_authorization_policy
+                            )
+                        }
+                        if isinstance(raw_authorization_policy, dict)
+                        and raw_authorization_policy
                         else {}
                     ),
                 }

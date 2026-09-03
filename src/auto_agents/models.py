@@ -1974,6 +1974,7 @@ class SessionState:
     status: str = "conversing"
     goal: str = ""
     goal_execution_environment: Dict[str, object] = field(default_factory=dict)
+    authorization_policy: Dict[str, object] = field(default_factory=dict)
     conversation: List[Dict[str, str]] = field(default_factory=list)
     execution_log: List[Dict[str, object]] = field(default_factory=list)
     current_attempt: int = 0
@@ -2028,6 +2029,11 @@ class SessionState:
             goal_execution_environment=(
                 dict(data.get("goal_execution_environment", {}))
                 if isinstance(data.get("goal_execution_environment"), dict)
+                else {}
+            ),
+            authorization_policy=(
+                dict(data.get("authorization_policy", {}))
+                if isinstance(data.get("authorization_policy"), dict)
                 else {}
             ),
             conversation=[
@@ -2107,6 +2113,7 @@ class SessionState:
             "goal_execution_environment": dict(
                 self.goal_execution_environment
             ),
+            "authorization_policy": dict(self.authorization_policy),
             "conversation": list(self.conversation),
             "execution_log": list(self.execution_log),
             "current_attempt": self.current_attempt,

@@ -10,7 +10,6 @@ from .config import load_run_state, load_session_state
 from .health_control import (
     HealthActionStore,
     HealthControlChannel,
-    evidence_digest,
     subject_health_root,
     utc_now,
     _atomic_json,
@@ -20,7 +19,7 @@ from .io_utils import read_json
 from .process_supervision import process_start_ticks
 from .session_health import (
     SESSION_PROGRESS_SCHEMA_VERSION,
-    build_session_progress,
+    build_session_progress_identity,
 )
 
 
@@ -158,14 +157,10 @@ class WorkflowHealthRuntime:
             logger.warning("health active operation could not be published: %s", error)
 
     def _session_progress_identity(self, payload: Mapping[str, object]) -> Dict[str, object]:
-        progress = build_session_progress(payload)
-        return {
-            "run_token": self.run_token,
-            "progress_schema_version": SESSION_PROGRESS_SCHEMA_VERSION,
-            "state_digest": evidence_digest(payload),
-            "progress_digest": evidence_digest(progress),
-            "progress": progress,
-        }
+        return build_session_progress_identity(
+            payload,
+            run_token=self.run_token,
+        )
 
     def close(self, *, reason: str = "") -> None:
         try:

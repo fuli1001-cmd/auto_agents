@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+from .authorization import (
+    WorkflowAuthorizationPolicy,
+    authorization_policy_for_state,
+    classify_assistance_request,
+)
 from .config import (
     create_session,
     docs_dir,
@@ -79,6 +84,10 @@ from .validation import (
 _GOAL_CLEAR = re.compile(r"^GOAL_CLEAR\s*$", re.MULTILINE)
 _NOT_A_BUG = re.compile(r"^NOT_A_BUG:\s*(.+)$", re.MULTILINE)
 _NEED_USER_ASSIST = re.compile(r"^NEED_USER_ASSIST:\s*(.+)$", re.MULTILINE)
+_NEED_USER_ASSIST_V1 = re.compile(
+    r"^NEED_USER_ASSIST\s+v1:\s*(\{.*\})\s*$",
+    re.MULTILINE,
+)
 _NEED_USER_DEFER = re.compile(
     r"^NEED_USER_DEFER:\s*([^|\n]+)\|\s*(.+)$",
     re.MULTILINE,
@@ -253,7 +262,12 @@ class Session:
         prior = state.persistence_actions.get("session", {})
         if prior.get("fingerprint") == fingerprint and prior.get("status") == "verified":
             return dict(prior.get("result", {}))
-        if strategy == "clean_break" and not state.auto_approve:
+        destructive_requires_user = bool(
+            strategy == "clean_break"
+            and self._authorization_policy(state).decide("destructive_change")
+            == "WAIT_USER"
+        )
+        if destructive_requires_user:
             answer = self._prompt_user(
                 "Clean break will permanently delete and rebuild these registered "
                 "development/test targets:\n"
@@ -267,7 +281,9 @@ class Session:
             "fingerprint": fingerprint,
             "status": "approved",
             "manifest": manifest,
-            "approval": "auto" if state.auto_approve else "interactive",
+            "approval": (
+                "interactive" if destructive_requires_user else "auto"
+            ),
             "approved_at": self._now(),
         }
         self._save(state)
@@ -835,6 +851,35 @@ class Session:
                         or disposition.get("reason")
                         or "What additional information is needed?"
                     )
+                    decision_class = classify_assistance_request(
+                        question,
+                        declared_class=str(
+                            disposition.get("decision_class", "")
+                        ),
+                    )
+                    if (
+                        self._authorization_policy(state).decide(decision_class)
+                        == "AUTO_EXECUTE"
+                    ):
+                        auto_resolution = (
+                            "The requested decision concerns internal implementation "
+                            f"scope ({decision_class}) and is already authorized. "
+                            "Continue autonomously without asking the user."
+                        )
+                        state.conversation.append(
+                            {"role": "orchestrator", "content": auto_resolution}
+                        )
+                        state.execution_log.append(
+                            {
+                                "attempt": rounds,
+                                "action": "internal_action_auto_authorized",
+                                "result": auto_resolution[:500],
+                                "timestamp": self._now(),
+                            }
+                        )
+                        self._save(state)
+                        self._print_agent_thinking()
+                        continue
                     self._print(f"\nAgent:\n{reply.strip()}")
                     user_reply = self._prompt_user(f"\n{question}\nYour reply: ", multiline=True)
                     state.conversation.append(
@@ -1059,6 +1104,19 @@ class Session:
             and contract.get("confirmed") is True
             and str(contract.get("mode", "")).strip() in {"real", "simulated"}
         )
+
+    def _authorization_policy(
+        self,
+        state: SessionState,
+    ) -> WorkflowAuthorizationPolicy:
+        policy = authorization_policy_for_state(
+            auto_approve=bool(self._auto_approve or state.auto_approve),
+            payload=state.authorization_policy,
+        )
+        if state.authorization_policy != policy.to_dict():
+            state.authorization_policy = policy.to_dict()
+            self._save(state)
+        return policy
 
     def _parse_goal_environment(
         self,
@@ -1607,26 +1665,73 @@ class Session:
         }:
             return False
         reply = str(latest.get("content", ""))
-        assist_match = _NEED_USER_ASSIST.search(reply)
-        if not assist_match:
+        assistance, decision_class, parse_error = self._assistance_request(reply)
+        if parse_error:
+            self._reject_collab_assistance(state, parse_error)
+            return False
+        if not assistance:
             return False
         assistance_error = self._collab_assistance_error(
             state,
-            assist_match.group(1),
+            assistance,
+            decision_class=decision_class,
         )
         if assistance_error:
             self._reject_collab_assistance(state, assistance_error)
             return False
-        self._handle_collab_assistance(state, reply, assist_match)
+        self._handle_collab_assistance(state, reply, assistance)
         return True
+
+    def _assistance_request(self, reply: str) -> Tuple[str, str, str]:
+        payload, error = self._parse_protocol_json(
+            _NEED_USER_ASSIST_V1,
+            reply,
+            label="NEED_USER_ASSIST v1",
+        )
+        if error:
+            return "", "", error
+        if payload is not None:
+            question = str(payload.get("question", "")).strip()
+            decision_class = str(payload.get("decision_class", "")).strip()
+            if not question or not decision_class:
+                return "", "", (
+                    "NEED_USER_ASSIST v1 requires question and decision_class."
+                )
+            return question, decision_class, ""
+        legacy = _NEED_USER_ASSIST.search(reply)
+        if legacy is None:
+            return "", "", ""
+        question = legacy.group(1).strip()
+        return question, classify_assistance_request(question), ""
 
     def _collab_assistance_error(
         self,
         state: SessionState,
         assistance: str,
+        *,
+        decision_class: str = "",
     ) -> str:
         normalized = " ".join(str(assistance).split())
         attempts = self._attempts_in_current_epoch(state)
+        classified = classify_assistance_request(
+            normalized,
+            declared_class=decision_class,
+        )
+        policy_decision = self._authorization_policy(state).decide(classified)
+        if policy_decision == "AUTO_EXECUTE":
+            return (
+                "internal_action_auto_authorized: the request concerns "
+                f"{classified}, which is an implementation decision already "
+                "authorized by the workflow policy. Continue autonomously and "
+                "do not ask the user."
+            )
+        if decision_class and classified == "unknown":
+            return (
+                "unsupported_user_decision_class: user assistance must be a "
+                "goal choice, credential, rights attestation, unbudgeted external "
+                "cost, destructive change, irreversible product decision, or "
+                "external observation only the user can perform."
+            )
         if _ORCHESTRATOR_CONTROL_ASSISTANCE.search(normalized):
             return (
                 "orchestrator_control_request: NEED_USER_ASSIST may request "
@@ -1748,10 +1853,39 @@ class Session:
                 else WorkflowStore(self.project_root)
             )
             snapshot = store.load(state.workflow_id)
+        if target == "run" and self._coordinator is not None:
+            route_ready, route_detail = self._coordinator.prepare_run_route()
+            state.execution_log.append(
+                {
+                    "attempt": state.current_attempt,
+                    "action": (
+                        "run_route_preflight_passed"
+                        if route_ready
+                        else "run_route_deferred"
+                    ),
+                    "result": route_detail[:500],
+                    "timestamp": self._now(),
+                }
+            )
+            if not route_ready:
+                state.conversation.append(
+                    {
+                        "role": "orchestrator",
+                        "content": route_detail,
+                    }
+                )
+                state.status = "executing"
+                state.return_phase = ""
+                self._save(state)
+                return state
         if self.mode in {"fix", "collab"} and not state.baseline_git_ref:
             self.orch._apply_generated_verification_config()
             self._ensure_baseline(state)
         handoff_payload = dict(payload)
+        handoff_payload.setdefault(
+            "authorization_policy",
+            self._authorization_policy(state).to_dict(),
+        )
         if self._goal_environment_confirmed(state):
             handoff_payload.setdefault(
                 "goal_execution_environment",
@@ -2267,11 +2401,18 @@ class Session:
                 continue
 
             # Check for NEED_USER_ASSIST — counts as progress
-            assist_match = _NEED_USER_ASSIST.search(reply)
-            if assist_match:
+            assistance, decision_class, assistance_parse_error = (
+                self._assistance_request(reply)
+            )
+            if assistance_parse_error:
+                self._reject_collab_assistance(state, assistance_parse_error)
+                feedback = assistance_parse_error
+                continue
+            if assistance:
                 assistance_error = self._collab_assistance_error(
                     state,
-                    assist_match.group(1),
+                    assistance,
+                    decision_class=decision_class,
                 )
                 if assistance_error:
                     self._reject_collab_assistance(state, assistance_error)
@@ -2281,7 +2422,7 @@ class Session:
                         break
                     feedback = assistance_error
                     continue
-                self._handle_collab_assistance(state, reply, assist_match)
+                self._handle_collab_assistance(state, reply, assistance)
                 feedback = ""
                 continue
 
@@ -2374,10 +2515,25 @@ class Session:
 
         state.stall_count = 0
         self._print("Final verification passed!")
-        answer = self._prompt_user(
-            "Do you confirm the goal is achieved? (y/n) [y]: ",
-            default="y",
-        )
+        if (
+            self._authorization_policy(state).decide("completion_confirmation")
+            == "AUTO_EXECUTE"
+        ):
+            answer = "y"
+            state.execution_log.append(
+                {
+                    "attempt": state.current_attempt,
+                    "action": "completion_auto_confirmed",
+                    "result": "final verification passed under auto-approve",
+                    "timestamp": self._now(),
+                }
+            )
+            self._save(state)
+        else:
+            answer = self._prompt_user(
+                "Do you confirm the goal is achieved? (y/n) [y]: ",
+                default="y",
+            )
         if answer.strip().lower() not in ("n", "no"):
             self._run_session_persistence_action(state)
             state.status = "completed"
@@ -2422,11 +2578,11 @@ class Session:
         self,
         state: SessionState,
         reply: str,
-        assist_match: re.Match,
+        assistance: str,
     ) -> None:
         state.stall_count = 0
         self._print(f"\nAgent:\n{reply.strip()}")
-        self._print(f"\nAgent needs your assistance: {assist_match.group(1)}")
+        self._print(f"\nAgent needs your assistance: {assistance}")
         state.status = "waiting_user"
         self._save(state)
         user_reply = self._prompt_user(
@@ -3242,15 +3398,15 @@ class Session:
             "You are the read-only diagnostic and routing frame for a collaborative workflow. Your task:",
             "1. Analyze the current state of the code and previous execution results without editing product files",
             "2. Determine the next workflow needed to achieve the user's overall goal",
-            "3. If you need the user to do something (e.g., test in browser, provide input),",
-            "   output 'NEED_USER_ASSIST: <what you need>' on a line by itself",
+            "3. Ask the user only for a goal choice, credential, rights attestation, unbudgeted external cost, destructive change, irreversible product decision, or an external observation only the user can perform.",
+            "   Output NEED_USER_ASSIST v1: {\"decision_class\":\"<allowed class>\",\"question\":\"<plain project-specific question>\"} on one line.",
             "4. For an existing-behavior defect, output one single-line ROUTE_WORKFLOW v1 JSON marker with target='fix', reason, summary, and issue_seed",
             "5. For missing/new capability or a requirements, architecture, or persistence change, output one single-line ROUTE_WORKFLOW v1 JSON marker with target='run', reason, summary, and spec_seed",
             "6. To retry a previously returned child after its blocker changed, use target='resume' and resume_handoff_id",
             "7. If you believe the goal is achieved, output 'GOAL_ACHIEVED: <summary>' on a line by itself",
             "8. Provide a brief diagnostic status update",
             "9. Never implement, fix, commit, or edit target-project code in collab; route every write to fix or run",
-            "10. NEED_USER_ASSIST is only for information or actions that require the user; never ask the user to run, resume, stop, or reconfigure auto-agents",
+            "10. Repository selection, implementation scope, test strategy, safe migration, engine self-repair, commits, and workflow recovery are internal decisions. Never ask the user to choose or authorize them.",
             "",
             "EXECUTION SAFETY RULES (critical — follow strictly):",
             "- Set a timeout for EVERY HTTP request or polling loop (max 60s per request, 5 min total for repeated polling).",

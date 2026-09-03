@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from auto_agents.cli import build_parser, main
 from auto_agents.config import (
+    create_session,
     list_sessions,
     load_run_state,
     load_session_state,
@@ -650,6 +651,7 @@ class RoutedWorkflowTests(unittest.TestCase):
                 item for item in list_sessions(root) if item.mode == "fix"
             )
             self.assertTrue(fix_state.auto_approve)
+            self.assertEqual(fix_state.authorization_policy["mode"], "auto")
             self.assertEqual(
                 fix_state.goal_execution_environment["mode"], "real"
             )
@@ -712,6 +714,10 @@ class RoutedWorkflowTests(unittest.TestCase):
                         "mode"
                     ],
                     "real",
+                )
+                self.assertEqual(
+                    run_state.resume_context["authorization_policy"]["mode"],
+                    "auto",
                 )
                 write_text(root / "export.py", "enabled = True\n")
                 commit_only_paths(root, "feat: add export support", ["export.py"])
@@ -899,6 +905,123 @@ class RoutedWorkflowTests(unittest.TestCase):
             self.assertIsNotNone(handoff.child)
             self.assertEqual(handoff.child.kind, "run")
             self.assertEqual(handoff.child.native_id, calls[1][0])
+
+    def test_run_route_preflight_recovers_equivalent_engine_before_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            old_spec = root / "old-spec.md"
+            write_text(old_spec, "# Existing iteration\n")
+            current = load_run_state(root)
+            current.status = "blocked"
+            current.resume_context = {
+                "spec_file": str(old_spec),
+                "auto_approve": True,
+            }
+            current.active_blocker = {
+                "owner": "auto_agents",
+                "category": (
+                    "session_health_projection_and_resume_boundary_mismatch"
+                ),
+                "fingerprint": "equivalent-health-fix",
+                "status": "blocked",
+                "self_repair_commit": "non-ancestor",
+                "self_repair_failure": {"verification": "tests passed"},
+                "root_cause_diagnosis": {
+                    "diagnosis_id": "diagnosis",
+                    "final": {
+                        "expected_postconditions": [
+                            "session health boundaries are compatible"
+                        ]
+                    },
+                },
+            }
+            save_run_state(root, current)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator, auto_approve=True)
+            parent = create_session(root, "collab")
+            parent.status = "executing"
+            parent.goal = "Add a capability"
+            parent.auto_approve = True
+            _confirm_collab_state(parent, "real")
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", parent.session_id)
+            )
+            parent.workflow_id = snapshot.workflow_id
+            save_session_state(root, parent)
+            session = Session(
+                orchestrator,
+                mode="collab",
+                auto_approve=True,
+                coordinator=coordinator,
+            )
+            calls = []
+
+            def complete_old_run(**_kwargs):
+                state = load_run_state(root)
+                calls.append(state.run_id)
+                state.status = "completed"
+                save_run_state(root, state)
+                return state
+
+            orchestrator.run = complete_old_run
+            with (
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_revision",
+                    return_value="equivalent-engine",
+                ),
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_contains_commit",
+                    return_value=False,
+                ),
+            ):
+                routed = session._prepare_workflow_handoff(
+                    parent,
+                    target="run",
+                    reason="new capability",
+                    payload={"spec_seed": {"title": "Capability"}},
+                )
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(routed.status, "waiting_child")
+            handoffs = list(
+                (root / ".auto-agents" / "state" / "handoffs").glob("*.json")
+            )
+            self.assertEqual(len(handoffs), 1)
+            self.assertTrue(
+                any(
+                    item.get("action") == "run_route_preflight_passed"
+                    for item in routed.execution_log
+                )
+            )
+
+    def test_run_route_preflight_raises_engine_repair_before_empty_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            current = load_run_state(root)
+            current.status = "blocked"
+            current.active_blocker = {
+                "owner": "auto_agents",
+                "category": "unverified_engine_failure",
+                "status": "blocked",
+                "reason": "engine repair is required",
+            }
+            save_run_state(root, current)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator, auto_approve=True)
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "auto_agents engine self-repair required",
+            ):
+                coordinator.prepare_run_route()
+
+            self.assertFalse(
+                (root / ".auto-agents" / "state" / "handoffs").exists()
+            )
 
     def test_standalone_fix_can_upgrade_to_run_and_verify_original_issue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

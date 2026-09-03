@@ -13,7 +13,7 @@ from .config import run_path
 from .io_utils import read_json
 
 
-REPAIR_CASE_SCHEMA_VERSION = 1
+REPAIR_CASE_SCHEMA_VERSION = 2
 
 
 def _utc_now() -> str:
@@ -58,6 +58,9 @@ class RepairCase:
     activity_history: List[Dict[str, object]] = field(default_factory=list)
     evidence_refs: List[str] = field(default_factory=list)
     expected_postconditions: List[str] = field(default_factory=list)
+    postcondition_claims: List[Dict[str, object]] = field(default_factory=list)
+    postcondition_receipts: List[Dict[str, object]] = field(default_factory=list)
+    authorization_policy: Dict[str, object] = field(default_factory=dict)
     owner_hint: str = "unknown"
     resume_checkpoint_ref: str = ""
     history: List[Dict[str, object]] = field(default_factory=list)
@@ -82,6 +85,17 @@ class RepairCase:
     def from_dict(cls, payload: Mapping[str, object]) -> "RepairCase":
         fields = cls.__dataclass_fields__
         values = {key: value for key, value in payload.items() if key in fields}
+        for key in ("postcondition_claims", "postcondition_receipts"):
+            raw = values.get(key, [])
+            values[key] = [
+                dict(item)
+                for item in (raw if isinstance(raw, list) else [])
+                if isinstance(item, Mapping)
+            ]
+        raw_policy = values.get("authorization_policy", {})
+        values["authorization_policy"] = (
+            dict(raw_policy) if isinstance(raw_policy, Mapping) else {}
+        )
         return cls(**values)  # type: ignore[arg-type]
 
     def to_dict(self) -> Dict[str, object]:

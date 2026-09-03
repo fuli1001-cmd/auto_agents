@@ -1768,6 +1768,84 @@ class ProjectValidationTests(unittest.TestCase):
             verify.assert_not_called()
             self.assertEqual(state.status, "blocked")
 
+    def test_equivalent_installed_health_repair_uses_versioned_postconditions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.last_error = "approved repair did not cross live boundary"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": (
+                    "session_health_projection_and_resume_boundary_mismatch"
+                ),
+                "fingerprint": "health-boundary-equivalent",
+                "status": "blocked",
+                "self_repair_commit": "non-ancestor-repair",
+                "self_repair_failure": {
+                    "verification": "focused and full tests passed"
+                },
+                "root_cause_diagnosis": {
+                    "diagnosis_id": "health-diagnosis",
+                    "final": {
+                        "expected_postconditions": [
+                            "publisher and auditor use one canonical projection",
+                            "stale health boundaries do not compare",
+                        ]
+                    },
+                },
+            }
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_revision",
+                    return_value="equivalent-engine-revision",
+                ),
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_contains_commit",
+                    return_value=False,
+                ),
+            ):
+                changed = orchestrator._prepare_installed_self_repair_resume(
+                    state
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(
+                state.active_blocker["installed_engine_recovery_method"],
+                "versioned_postconditions",
+            )
+            self.assertEqual(
+                state.active_blocker["postcondition_receipts"][0]["result"],
+                "pass",
+            )
+
+            state.status = "blocked"
+            state.active_blocker["status"] = "blocked"
+            with (
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_revision",
+                    return_value="equivalent-engine-revision",
+                ),
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_contains_commit",
+                    return_value=False,
+                ),
+            ):
+                repeated = orchestrator._prepare_installed_self_repair_resume(
+                    state
+                )
+
+            self.assertFalse(repeated)
+            self.assertEqual(state.status, "blocked")
+
     def test_validation_report_rejects_empty_plan_after_plan_stage(self) -> None:
         for lineage_key in ("previous_run_id", "restarted_blocked_run_id"):
             with self.subTest(lineage_key=lineage_key), tempfile.TemporaryDirectory() as tmp:
@@ -3025,6 +3103,11 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertEqual(
                 resume_run.call_args.kwargs["pass_fd"],
                 int(resume_env[RUN_LOCK_FD_ENV]),
+            )
+            persisted = load_run_state(project_root)
+            self.assertEqual(
+                persisted.resume_context["authorization_policy"]["mode"],
+                "auto",
             )
 
     def test_cli_failed_self_repair_reports_verification_detail(self) -> None:

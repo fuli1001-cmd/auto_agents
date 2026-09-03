@@ -177,7 +177,11 @@ Manual approvals are supported at four high-value gates:
 `run --auto-approve` auto-passes the requirements, architecture, and release gates. It never passes
 the generated frontend prototype gate. Clarify still asks any questions needed to establish the
 requirements, but once the agent is ready, project-brief generation is confirmed automatically.
-README conversations remain interactive.
+README conversations remain interactive. The flag also authorizes safe in-scope implementation,
+engine self-repair, tests, local commits, backward-compatible state upgrades, workflow recovery,
+and completion after deterministic verification. It does not answer goal choices, provide
+credentials or rights attestations, approve unbudgeted external costs, or authorize destructive
+and irreversible changes.
 
 ## Repo map (token saver)
 
@@ -1382,10 +1386,9 @@ under `--auto-approve`.
 
 `clean_break` is limited to registered development/test targets. auto_agents displays one complete
 destructive manifest, then deletes and rebuilds only validated project-owned, git-ignored paths or
-registered compose services. `run`, `fix`, and `collab` accept `--auto-approve` to approve that
-manifest automatically. Without it, a declined reset pauses at `persistence-reset` and can be
-resumed with `approve --gate persistence-reset`. Clean-break data is deleted directly; no implicit
-backup is created.
+registered compose services. Because the operation deletes data, `--auto-approve` never approves
+that manifest. A declined reset pauses at `persistence-reset` and can be resumed with `approve
+--gate persistence-reset`. Clean-break data is deleted directly; no implicit backup is created.
 
 Across iterations, `state/task_plan.json` is the active plan for the current run, not a permanent
 history table. When a completed project starts a new iteration, auto_agents archives the previous
@@ -1740,10 +1743,29 @@ The `--full-verify` choice is durable across pauses and answer-driven workflow r
 scoped to collab's final attestation; it is not inherited by routed `fix` children.
 
 `collab --auto-approve` is a workflow-wide policy: routed `fix` and `run` children inherit it, as
-does a `run` reached through `collab -> fix -> run`. Each child applies its own existing
-`--auto-approve` semantics. The policy is recorded in durable session and handoff state so workflow
-resume does not silently downgrade it. Mandatory exceptions such as frontend prototype selection
-and production persistence protections remain manual or prohibited.
+does a `run` reached through `collab -> fix -> run`. The versioned authorization policy is recorded
+in durable session, handoff, run, and self-repair state so workflow resume does not silently
+downgrade it. Collab asks the user only for missing goal intent, credentials, rights attestations,
+unbudgeted external costs, destructive changes, irreversible product decisions, or an external
+observation only the user can perform. Repository selection, implementation scope, safe migration,
+engine self-repair, tests, commits, and workflow recovery are resolved automatically. Mandatory
+exceptions such as frontend prototype selection and production persistence protections remain
+manual or prohibited.
+
+Before the first implementation route, collab records whether the requested outcome is real or
+simulated. An explicit goal is classified without another prompt; an ambiguous goal receives one
+plain-language, project-specific choice generated from the current project rather than a fixed
+cross-project template. The choice is durable across all child workflows. Real outcomes may use
+fakes for internal tests but not as final evidence; simulated outcomes must disclose their nature.
+
+When an active run is blocked by an `auto_agents` defect, the controller resolves that engine-owned
+work before creating a new run handoff. Known legacy blockers are projected to versioned built-in
+postcondition claims and rechecked against the installed engine. A verified equivalent repair may
+resume even when its historical repair commit is not an ancestor of the installed HEAD; unknown or
+changed evidence stays blocked. If code repair is still required, the existing isolated
+auto_agents self-repair runner owns the repair, verification, local commit, runtime handoff, and
+resume. A run handoff is created only after the prior run is safely complete, so failed preflight
+does not leave a resumable-looking `child=null` handoff.
 
 Automatic returns never reopen session selection or ask for the goal again. A self-repair restart
 resumes the exact durable root session, while `fix` and `run` children return through their recorded

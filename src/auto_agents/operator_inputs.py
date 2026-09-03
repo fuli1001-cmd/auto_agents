@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
+from .authorization import HUMAN_ONLY_ACTIONS
 from .config import (
     ensure_auto_gitignore,
     operator_dir,
@@ -52,6 +53,7 @@ class UserInputRequest:
     question: str
     purpose: str
     why_required: str
+    decision_class: str = ""
     how_to_obtain: List[str] = field(default_factory=list)
     recommended_answer: str = ""
     default: object = ""
@@ -92,6 +94,7 @@ class UserInputRequest:
             question=str(payload.get("question", "")).strip(),
             purpose=str(payload.get("purpose", "")).strip(),
             why_required=str(payload.get("why_required", "")).strip(),
+            decision_class=str(payload.get("decision_class", "")).strip(),
             how_to_obtain=[
                 str(item).strip()
                 for item in (payload.get("how_to_obtain", []) or [])
@@ -147,6 +150,8 @@ class UserInputRequest:
             errors.append("purpose is required")
         if not self.why_required:
             errors.append("why_required is required")
+        if self.decision_class and self.decision_class not in HUMAN_ONLY_ACTIONS:
+            errors.append(f"unsupported decision_class: {self.decision_class}")
         if self.persistence not in PERSISTENCE_SCOPES:
             errors.append(f"unsupported persistence: {self.persistence}")
         if self.sensitivity not in SENSITIVITY_LEVELS:
