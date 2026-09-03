@@ -524,6 +524,9 @@ class Orchestrator:
     EXECUTION_ROOT_PROGRESS_SCHEMA_VERSION = 2
     FRONTEND_CONTRACT_RECOVERY_CONTEXT = "frontend_design_contract_recovery"
     INSTALLED_ENGINE_RECOVERY_CONTEXT = "installed_engine_recovery_revisions"
+    INSTALLED_GENERIC_REPAIR_CHECKS_CONTEXT = (
+        "installed_generic_self_repair_checks"
+    )
     REQUIREMENT_CONTRACT_RECOVERY_CATEGORIES = frozenset(
         {
             AMBIGUOUS_REQUIREMENT_CONTRACT_RECOVERY_CATEGORY,
@@ -1161,6 +1164,197 @@ class Orchestrator:
             revision.split(":", 1)[0],
             commit_sha[:12],
             category or "auto_agents_error",
+        )
+        return True
+
+    def _verify_installed_generic_self_repair(
+        self,
+        commands: Iterable[object],
+    ) -> tuple[bool, str, list[str]]:
+        """Run a frozen diagnosis proof against the currently installed engine."""
+
+        from .self_repair import (
+            _is_pytest_verification_command,
+            _supplemental_verification_skip_reason,
+            self_repair_verification_command,
+        )
+
+        engine_root = Path(__file__).resolve().parents[2]
+        timeout = max(
+            60,
+            int(
+                self.config.execution.self_repair_diagnosis.command_timeout_seconds
+                or 300
+            ),
+        )
+        rendered_commands: list[str] = []
+        summaries: list[str] = []
+        substantive_passes = 0
+        for raw_command in commands:
+            command = " ".join(str(raw_command).split())
+            if not command or command in rendered_commands:
+                continue
+            skip_reason = _supplemental_verification_skip_reason(
+                command,
+                repository_aliases={engine_root.name},
+            )
+            if skip_reason:
+                return (
+                    False,
+                    f"installed repair proof rejected unsafe command: {command} "
+                    f"({skip_reason})",
+                    rendered_commands,
+                )
+            rendered = self_repair_verification_command(
+                command,
+                engine_root,
+                repository_aliases={engine_root.name},
+                python_executable=sys.executable,
+            )
+            gate = run_commands(
+                [rendered],
+                engine_root,
+                command_timeout_seconds=timeout,
+                adaptive_timeout_enabled=False,
+                command_idle_timeout_seconds=timeout,
+            )
+            result = gate.commands[0]
+            rendered_commands.append(command)
+            detail = (result.stderr or result.stdout or "").strip()
+            summaries.append(
+                f"$ {command}\nexit={result.returncode}\n{detail[:1200]}".strip()
+            )
+            if result.returncode == 0:
+                substantive_passes += 1
+                continue
+            if (
+                result.returncode == 5
+                and _is_pytest_verification_command(command)
+            ):
+                summaries[-1] += "\nnonfatal=diagnosis selector collected no tests"
+                continue
+            return False, "\n\n".join(summaries), rendered_commands
+        return (
+            bool(rendered_commands and substantive_passes),
+            "\n\n".join(summaries),
+            rendered_commands,
+        )
+
+    def _prepare_installed_generic_self_repair_resume(
+        self,
+        state: RunState,
+    ) -> bool:
+        """Reopen a generic auto_agents blocker after an external verified update."""
+
+        from .self_repair import SELF_REPAIR_PROVIDER_CONFIDENCE_THRESHOLD
+
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        diagnosis = (
+            dict(blocker.get("root_cause_diagnosis", {}))
+            if isinstance(blocker.get("root_cause_diagnosis"), dict)
+            else {}
+        )
+        final = (
+            dict(diagnosis.get("final", {}))
+            if isinstance(diagnosis.get("final"), dict)
+            else {}
+        )
+        commands = [
+            str(item).strip()
+            for item in final.get("verification_commands", []) or []
+            if str(item).strip()
+        ]
+        expected_postconditions = [
+            str(item).strip()
+            for item in final.get("expected_postconditions", []) or []
+            if str(item).strip()
+        ]
+        confidence = float(final.get("confidence", 0.0) or 0.0)
+        if (
+            state.status != "blocked"
+            or str(blocker.get("owner", "")).strip() != "auto_agents"
+            or str(blocker.get("status", "blocked")).strip() != "blocked"
+            or str(blocker.get("self_repair_commit", "")).strip()
+            or str(final.get("verdict", "")).strip().upper() != "FINAL"
+            or str(final.get("owner", "")).strip() != "auto_agents"
+            or not bool(final.get("generic", False))
+            or confidence < SELF_REPAIR_PROVIDER_CONFIDENCE_THRESHOLD
+            or str(final.get("resume_strategy", "")).strip()
+            != "repair_and_resume"
+            or not commands
+            or not expected_postconditions
+        ):
+            return False
+
+        revision = self._installed_engine_revision()
+        category = str(blocker.get("category", "")).strip()
+        fingerprint = str(blocker.get("fingerprint", "")).strip()
+        diagnosis_id = str(diagnosis.get("diagnosis_id", "")).strip()
+        check_key = hashlib.sha256(
+            f"{category}\0{fingerprint}\0{diagnosis_id}".encode("utf-8")
+        ).hexdigest()[:24]
+        raw_checks = state.resume_context.get(
+            self.INSTALLED_GENERIC_REPAIR_CHECKS_CONTEXT,
+            {},
+        )
+        checks = dict(raw_checks) if isinstance(raw_checks, dict) else {}
+        previous = (
+            dict(checks.get(check_key, {}))
+            if isinstance(checks.get(check_key), dict)
+            else {}
+        )
+        if str(previous.get("revision", "")) == revision:
+            return False
+
+        ok, verification, executed_commands = (
+            self._verify_installed_generic_self_repair(commands)
+        )
+        receipt = {
+            "revision": revision,
+            "status": "passed" if ok else "failed",
+            "category": category,
+            "fingerprint": fingerprint,
+            "diagnosis_id": diagnosis_id,
+            "commands": executed_commands,
+            "verification": verification[-6000:],
+            "checked_at": utc_now_iso(),
+        }
+        checks[check_key] = receipt
+        state.resume_context[self.INSTALLED_GENERIC_REPAIR_CHECKS_CONTEXT] = checks
+        if not ok:
+            blocker["installed_engine_recovery"] = receipt
+            blocker["updated_at"] = utc_now_iso()
+            state.active_blocker = blocker
+            self.logger.warning(
+                "[self-repair] installed engine did not satisfy frozen repair "
+                "proof revision=%s category=%s",
+                revision.split(":", 1)[0],
+                category or "auto_agents_error",
+            )
+            return True
+
+        state.last_recovery_route = {
+            "outcome": "installed_generic_self_repair_verified",
+            "category": category,
+            "fingerprint": fingerprint,
+            "diagnosis_id": diagnosis_id,
+            "installed_engine_revision": revision,
+            "postcondition_count": len(expected_postconditions),
+            "verification_commands": executed_commands,
+            "verification": verification[-6000:],
+        }
+        state.active_self_repair_experiment_id = ""
+        self._clear_run_blocker(state)
+        self.logger.info(
+            "[self-repair] reopened externally repaired run revision=%s "
+            "category=%s postconditions=%s",
+            revision.split(":", 1)[0],
+            category or "auto_agents_error",
+            len(expected_postconditions),
         )
         return True
 
@@ -2870,6 +3064,8 @@ class Orchestrator:
                 save_run_state(self.project_root, state)
             if not restart_blocked:
                 if self._normalize_installed_requirement_namespace_repair(state):
+                    save_run_state(self.project_root, state)
+                if self._prepare_installed_generic_self_repair_resume(state):
                     save_run_state(self.project_root, state)
                 if self._prepare_installed_self_repair_resume(state):
                     save_run_state(self.project_root, state)

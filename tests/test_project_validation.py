@@ -1605,6 +1605,169 @@ class ProjectValidationTests(unittest.TestCase):
 
             self.assertEqual(state.status, "blocked")
 
+    def test_verified_external_engine_repair_reopens_generic_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.current_stage = "provider_research"
+            state.last_error = "automatic self-repair was interrupted"
+            state.active_self_repair_experiment_id = "experiment-1"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "config_migration_stage_scope_collision",
+                "fingerprint": "root-1",
+                "status": "blocked",
+                "root_cause_diagnosis": {
+                    "diagnosis_id": "diagnosis-1",
+                    "final": {
+                        "verdict": "FINAL",
+                        "owner": "auto_agents",
+                        "generic": True,
+                        "confidence": 0.98,
+                        "resume_strategy": "repair_and_resume",
+                        "expected_postconditions": [
+                            "config migration precedes provider supervision"
+                        ],
+                        "verification_commands": ["pytest focused-test"],
+                    },
+                },
+            }
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_revision",
+                    return_value="engine-revision-2",
+                ),
+                patch.object(
+                    orchestrator,
+                    "_verify_installed_generic_self_repair",
+                    return_value=(
+                        True,
+                        "$ pytest focused-test\nexit=0",
+                        ["pytest focused-test"],
+                    ),
+                ) as verify,
+            ):
+                changed = orchestrator._prepare_installed_generic_self_repair_resume(
+                    state
+                )
+
+            self.assertTrue(changed)
+            verify.assert_called_once()
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.current_stage, "provider_research")
+            self.assertEqual(state.last_error, "")
+            self.assertEqual(state.active_blocker, {})
+            self.assertEqual(state.active_self_repair_experiment_id, "")
+            self.assertEqual(
+                state.last_recovery_route["outcome"],
+                "installed_generic_self_repair_verified",
+            )
+            checks = state.resume_context[
+                Orchestrator.INSTALLED_GENERIC_REPAIR_CHECKS_CONTEXT
+            ]
+            self.assertEqual(next(iter(checks.values()))["status"], "passed")
+
+    def test_failed_external_engine_proof_stays_blocked_and_is_deduplicated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "generic_engine_failure",
+                "fingerprint": "root-2",
+                "status": "blocked",
+                "root_cause_diagnosis": {
+                    "diagnosis_id": "diagnosis-2",
+                    "final": {
+                        "verdict": "FINAL",
+                        "owner": "auto_agents",
+                        "generic": True,
+                        "confidence": 0.97,
+                        "resume_strategy": "repair_and_resume",
+                        "expected_postconditions": ["root is repaired"],
+                        "verification_commands": ["pytest focused-test"],
+                    },
+                },
+            }
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_revision",
+                    return_value="engine-revision-2",
+                ),
+                patch.object(
+                    orchestrator,
+                    "_verify_installed_generic_self_repair",
+                    return_value=(
+                        False,
+                        "$ pytest focused-test\nexit=1",
+                        ["pytest focused-test"],
+                    ),
+                ) as verify,
+            ):
+                changed = orchestrator._prepare_installed_generic_self_repair_resume(
+                    state
+                )
+                changed_again = (
+                    orchestrator._prepare_installed_generic_self_repair_resume(
+                        state
+                    )
+                )
+
+            self.assertTrue(changed)
+            self.assertFalse(changed_again)
+            verify.assert_called_once()
+            self.assertEqual(state.status, "blocked")
+            self.assertEqual(
+                state.active_blocker["installed_engine_recovery"]["status"],
+                "failed",
+            )
+
+    def test_external_engine_resume_rejects_weak_or_non_generic_diagnosis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "weak-diagnosis",
+                "status": "blocked",
+                "root_cause_diagnosis": {
+                    "final": {
+                        "verdict": "FINAL",
+                        "owner": "auto_agents",
+                        "generic": False,
+                        "confidence": 0.99,
+                        "resume_strategy": "repair_and_resume",
+                        "expected_postconditions": ["root is repaired"],
+                        "verification_commands": ["pytest focused-test"],
+                    }
+                },
+            }
+
+            with patch.object(
+                orchestrator,
+                "_verify_installed_generic_self_repair",
+            ) as verify:
+                changed = orchestrator._prepare_installed_generic_self_repair_resume(
+                    state
+                )
+
+            self.assertFalse(changed)
+            verify.assert_not_called()
+            self.assertEqual(state.status, "blocked")
+
     def test_validation_report_rejects_empty_plan_after_plan_stage(self) -> None:
         for lineage_key in ("previous_run_id", "restarted_blocked_run_id"):
             with self.subTest(lineage_key=lineage_key), tempfile.TemporaryDirectory() as tmp:

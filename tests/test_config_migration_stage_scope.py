@@ -129,6 +129,12 @@ def test_engine_config_upgrade_precedes_provider_snapshot() -> None:
         assert persisted["execution"]["parallel_tasks"]["enabled"]
 
 
+def test_engine_config_upgrade_is_completed_before_provider_snapshot() -> None:
+    """Stable proof node retained by persisted root-cause diagnoses."""
+
+    test_engine_config_upgrade_precedes_provider_snapshot()
+
+
 def test_health_sidecar_starts_after_explicit_config_migration() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         project_root = Path(tmp) / "demo"
