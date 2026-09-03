@@ -3140,6 +3140,393 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 1,
             )
 
+    def test_design_review_does_not_reject_pending_implementation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents/state/run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+
+            class Diagnosis:
+                final = type(
+                    "Final",
+                    (),
+                    {"expected_postconditions": ["production route is repaired"]},
+                )()
+
+                def to_dict(self):
+                    return {
+                        "final": {
+                            "expected_postconditions": [
+                                "production route is repaired"
+                            ]
+                        }
+                    }
+
+            class DesignOrchestrator:
+                def __init__(self):
+                    autonomy = type(
+                        "Autonomy",
+                        (),
+                        {"candidate_review_timeout_seconds": 60},
+                    )()
+                    self.config = type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {"self_repair_review": "max"},
+                            "execution": type(
+                                "Execution", (), {"autonomy": autonomy}
+                            )(),
+                        },
+                    )()
+
+                def _call_with_failover(self, request):
+                    contract = json.loads(
+                        request.prompt.split("FROZEN_CONTRACT:\n", 1)[1].split(
+                            "\nROOT_CAUSE:", 1
+                        )[0]
+                    )
+                    root_id = next(
+                        item["obligation_id"]
+                        for item in contract
+                        if item["obligation_id"].startswith("root:")
+                    )
+                    payload = {
+                        "decision": "REJECT",
+                        "reason": (
+                            "the design covers the root but the current code "
+                            "is not implemented yet"
+                        ),
+                        "strategy_id": "receipt-first-route",
+                        "summary": "implement the production route",
+                        "exclusions": [],
+                        "components": [
+                            {
+                                "group_id": "route",
+                                "title": "Route",
+                                "contract_obligation_ids": [root_id],
+                                "finding_ids": [],
+                                "depends_on": [],
+                                "touched_paths": [
+                                    "src/auto_agents/workflow_runtime.py"
+                                ],
+                                "implementation_steps": [
+                                    "persist the receipt before transition work"
+                                ],
+                                "focused_tests": ["git diff --check"],
+                            }
+                        ],
+                        "issues": [
+                            {
+                                "issue_scope": "current_implementation",
+                                "disposition": "contract_violation",
+                                "component_id": "route",
+                                "causal_obligation_id": root_id,
+                                "reason": "current code has not applied the design",
+                                "counterexample_after_design": "",
+                                "evidence": [
+                                    "src/auto_agents/workflow_runtime.py:1"
+                                ],
+                            }
+                        ],
+                    }
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=json.dumps(payload),
+                    )
+
+            with patch(
+                "auto_agents.self_repair.auto_agents_repo_root",
+                return_value=auto_root,
+            ):
+                runner = AutoAgentsSelfRepairRunner(
+                    DesignOrchestrator(),
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(True, category="design-scope"),
+                    diagnosis=Diagnosis(),
+                )
+                _, experiment = runner._load_or_create_experiment()
+                experiment.freeze_contract()
+
+                approved = runner._ensure_approved_repair_design(experiment)
+
+            self.assertTrue(approved)
+            review = experiment.design_history[-1]
+            self.assertEqual(review["decision"], "APPROVE")
+            self.assertEqual(review["blocking_issues"], [])
+            self.assertEqual(len(review["nonblocking_issues"]), 1)
+
+    def test_design_review_rejection_loop_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents/state/run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+
+            class Diagnosis:
+                final = type(
+                    "Final",
+                    (),
+                    {"expected_postconditions": ["root is repaired"]},
+                )()
+
+                def to_dict(self):
+                    return {
+                        "final": {"expected_postconditions": ["root is repaired"]}
+                    }
+
+            class RejectingOrchestrator:
+                def __init__(self):
+                    self.calls = 0
+                    autonomy = type(
+                        "Autonomy",
+                        (),
+                        {
+                            "mode": "max",
+                            "candidate_review_timeout_seconds": 60,
+                            "max_consecutive_non_improving_candidates": 3,
+                            "max_frontier_candidates": 8,
+                        },
+                    )()
+                    self.config = type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {"self_repair_review": "max"},
+                            "execution": type(
+                                "Execution", (), {"autonomy": autonomy}
+                            )(),
+                        },
+                    )()
+
+                def _call_with_failover(self, request):
+                    self.calls += 1
+                    contract = json.loads(
+                        request.prompt.split("FROZEN_CONTRACT:\n", 1)[1].split(
+                            "\nROOT_CAUSE:", 1
+                        )[0]
+                    )
+                    root_id = next(
+                        item["obligation_id"]
+                        for item in contract
+                        if item["obligation_id"].startswith("root:")
+                    )
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=json.dumps(
+                            {
+                                "decision": "REJECT",
+                                "reason": "the proposed design preserves the bug",
+                                "strategy_id": "bad-design",
+                                "summary": "incomplete design",
+                                "exclusions": [],
+                                "components": [
+                                    {
+                                        "group_id": "root",
+                                        "title": "Root",
+                                        "contract_obligation_ids": [root_id],
+                                        "finding_ids": [],
+                                        "depends_on": [],
+                                        "touched_paths": ["src/auto_agents/example.py"],
+                                        "implementation_steps": ["change a helper"],
+                                        "focused_tests": ["git diff --check"],
+                                    }
+                                ],
+                                "issues": [
+                                    {
+                                        "issue_scope": "design",
+                                        "disposition": "contract_violation",
+                                        "component_id": "root",
+                                        "causal_obligation_id": root_id,
+                                        "reason": "the design never calls the helper",
+                                        "counterexample_after_design": (
+                                            "the production route still bypasses it"
+                                        ),
+                                        "evidence": ["design component root"],
+                                    }
+                                ],
+                            }
+                        ),
+                    )
+
+            orchestrator = RejectingOrchestrator()
+            with patch(
+                "auto_agents.self_repair.auto_agents_repo_root",
+                return_value=auto_root,
+            ):
+                runner = AutoAgentsSelfRepairRunner(
+                    orchestrator,
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(True, category="design-loop"),
+                    diagnosis=Diagnosis(),
+                )
+                result = runner.run()
+                repeated = runner.run()
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.status, "design_review_exhausted")
+            self.assertEqual(repeated.status, "design_review_exhausted")
+            self.assertEqual(orchestrator.calls, 3)
+            self.assertIn("3 consecutive attempts", result.reason)
+
+    def test_candidate_review_defers_downstream_component_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents/state/run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+
+            class Diagnosis:
+                final = type(
+                    "Final",
+                    (),
+                    {"expected_postconditions": ["routed replay is atomic"]},
+                )()
+
+                def to_dict(self):
+                    return {
+                        "final": {
+                            "expected_postconditions": ["routed replay is atomic"]
+                        }
+                    }
+
+            class ReviewOrchestrator:
+                config = type(
+                    "Config",
+                    (),
+                    {
+                        "efforts": {"self_repair_review": "max"},
+                        "execution": type("Execution", (), {})(),
+                    },
+                )()
+
+                def _call_with_failover(self, request):
+                    self.prompt = request.prompt
+                    root_id = next(
+                        item
+                        for item in experiment.contract_obligation_ids
+                        if item.startswith("root:")
+                    )
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=json.dumps(
+                            {
+                                "decision": "REJECT",
+                                "reason": "production wiring belongs downstream",
+                                "findings": [
+                                    {
+                                        "finding_id": "production-route-not-wired",
+                                        "severity": "hard",
+                                        "disposition": "contract_violation",
+                                        "causal_obligation_id": root_id,
+                                        "affected_paths": [
+                                            "src/auto_agents/orchestrator.py",
+                                            "src/auto_agents/workflow_runtime.py",
+                                        ],
+                                        "reason": "runtime wiring is pending",
+                                        "counterexample": "production bypasses receipt",
+                                        "required_test": "exercise routed coordinator",
+                                        "evidence": [
+                                            "src/auto_agents/workflow_runtime.py:1"
+                                        ],
+                                        "defer_until": "",
+                                    }
+                                ],
+                                "resolved_finding_ids": [],
+                            }
+                        ),
+                    )
+
+            reviewer = ReviewOrchestrator()
+            with patch(
+                "auto_agents.self_repair.auto_agents_repo_root",
+                return_value=auto_root,
+            ):
+                runner = AutoAgentsSelfRepairRunner(
+                    reviewer,
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(True, category="component-defer"),
+                    diagnosis=Diagnosis(),
+                )
+                store, experiment = runner._load_or_create_experiment()
+                root_id = next(
+                    item
+                    for item in experiment.contract_obligation_ids
+                    if item.startswith("root:")
+                )
+                experiment.finding_groups = [
+                    {
+                        "group_id": "archive",
+                        "contract_obligation_ids": [root_id],
+                        "finding_ids": [],
+                        "depends_on": [],
+                        "touched_paths": ["src/auto_agents/orchestrator.py"],
+                        "status": "pending",
+                    },
+                    {
+                        "group_id": "runtime",
+                        "contract_obligation_ids": [root_id],
+                        "finding_ids": [],
+                        "depends_on": ["archive"],
+                        "touched_paths": [
+                            "src/auto_agents/workflow_runtime.py"
+                        ],
+                        "status": "pending",
+                    },
+                ]
+                experiment.active_finding_group_id = "archive"
+                runner._candidate_group = dict(experiment.finding_groups[0])
+                store.save(experiment)
+
+                review = runner._review_candidate(
+                    auto_root,
+                    "HEAD",
+                    progress_lease_seconds=60,
+                )
+
+            self.assertTrue(review.ok)
+            self.assertEqual(review.payload["findings"], [])
+            deferred = review.payload["deferred_findings"]
+            self.assertEqual(deferred[0]["defer_until"], "runtime")
+            persisted = store.load()
+            self.assertIsNotNone(persisted)
+            self.assertEqual(
+                persisted.findings["production-route-not-wired"].defer_until,
+                "runtime",
+            )
+            runtime_group = next(
+                group
+                for group in persisted.finding_groups
+                if group["group_id"] == "runtime"
+            )
+            self.assertIn("production-route-not-wired", runtime_group["finding_ids"])
+            self.assertIn("PENDING_COMPONENTS:", reviewer.prompt)
+
     def test_finding_groups_complete_before_one_full_suite(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3514,7 +3901,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertEqual(pre.payload["findings"], [])
             self.assertEqual(
                 pre.payload["ignored_unrelated_observations"][0]["defer_until"],
-                "",
+                "post_full_suite",
             )
 
     def test_self_repair_runs_in_isolated_worktree_and_integrates_commit(self):

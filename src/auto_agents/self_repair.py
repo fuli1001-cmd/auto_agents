@@ -78,8 +78,10 @@ SELF_REPAIR_FULL_SUITE_NODE_BATCH_SIZE = 24
 SELF_REPAIR_FULL_SUITE_NODE_BATCH_THRESHOLD_SECONDS = 120
 SELF_REPAIR_FULL_SUITE_MAX_PARALLEL_WORKERS = 4
 SELF_REPAIR_BACKGROUND_CLEANUP_TIMEOUT_SECONDS = 5
+SELF_REPAIR_MAX_CONSECUTIVE_DESIGN_REJECTIONS = 3
 SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
     "self_repair_exception": 0,
+    "design_review_exhausted": 0,
     "candidate_exception": 0,
     "candidate_failed": 10,
     "candidate_noop": 20,
@@ -99,6 +101,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
 }
 SELF_REPAIR_CANDIDATE_VALIDATION_STAGES = {
     "self_repair_exception": "runner",
+    "design_review_exhausted": "design_review",
     "candidate_exception": "generation",
     "candidate_failed": "generation",
     "candidate_noop": "generation",
@@ -2954,10 +2957,14 @@ class AutoAgentsSelfRepairRunner:
                 "The repair contract is frozen. Do not add generic hardening, follow-up tasks, or obligations.",
                 "Split independent work into dependency-ordered components. Each component must have focused tests.",
                 "Return APPROVE only when the design covers every root contract obligation and every listed contract finding.",
-                "Issues outside the frozen contract must use disposition=unrelated_observation and cannot reject the design.",
+                "Review the proposed completed design, not the current unmodified implementation. It is expected that the current implementation is still non-compliant.",
+                "A blocking issue must identify a defect that would remain after every proposed component is implemented.",
+                "Current implementation gaps already assigned to a component use issue_scope=current_implementation and cannot reject the design.",
+                "Issues outside the frozen contract use issue_scope=unrelated_observation and cannot reject the design.",
                 "Return exactly JSON with decision, reason, strategy_id, summary, exclusions, components, and issues.",
                 "Each component has group_id, title, contract_obligation_ids, finding_ids, depends_on, touched_paths, implementation_steps, focused_tests.",
-                "Each issue has disposition=contract_violation|unrelated_observation, causal_obligation_id, reason, and evidence.",
+                "Each issue has issue_scope=design|current_implementation|unrelated_observation, disposition=contract_violation|unrelated_observation, component_id, causal_obligation_id, reason, counterexample_after_design, and evidence.",
+                "For issue_scope=design, component_id and counterexample_after_design are mandatory. Do not use current source-code absence as counterexample_after_design.",
                 "FROZEN_CONTRACT:",
                 json.dumps(self._repair_contract_payload(experiment), ensure_ascii=False),
                 "ROOT_CAUSE:",
@@ -3015,24 +3022,54 @@ class AutoAgentsSelfRepairRunner:
             for item in payload.get("issues", []) or []
             if isinstance(item, Mapping)
         ]
+        design_group_ids = {
+            str(item.get("group_id", "")).strip()
+            for item in design.get("components", []) or []
+            if isinstance(item, Mapping) and str(item.get("group_id", "")).strip()
+        }
+        contract_ids = set(experiment.contract_obligation_ids)
         blocking_issues = [
             item
             for item in issues
-            if str(item.get("disposition", "")).strip()
+            if str(item.get("issue_scope", "")).strip() == "design"
+            and str(item.get("disposition", "")).strip()
             == "contract_violation"
             and str(item.get("causal_obligation_id", "")).strip()
-            in set(experiment.contract_obligation_ids)
+            in contract_ids
+            and str(item.get("component_id", "")).strip() in design_group_ids
+            and str(item.get("counterexample_after_design", "")).strip()
         ]
+        nonblocking_issues = [
+            item
+            for item in issues
+            if (
+                str(item.get("issue_scope", "")).strip()
+                in {"current_implementation", "unrelated_observation"}
+                or (
+                    not str(item.get("issue_scope", "")).strip()
+                    and str(item.get("disposition", "")).strip()
+                    == "unrelated_observation"
+                )
+            )
+        ]
+        invalid_issues = [
+            item
+            for item in issues
+            if item not in blocking_issues and item not in nonblocking_issues
+        ]
+        if invalid_issues:
+            errors.append(
+                "design review issues must declare a valid issue_scope and "
+                "blocking design issues must identify a component and "
+                "post-design counterexample"
+            )
         decision = str(payload.get("decision", "")).strip().upper()
         disposition_only_rejection = bool(
             decision == "REJECT"
             and issues
             and not blocking_issues
-            and all(
-                str(item.get("disposition", "")).strip()
-                == "unrelated_observation"
-                for item in issues
-            )
+            and not invalid_issues
+            and len(nonblocking_issues) == len(issues)
         )
         approved = bool(
             (decision == "APPROVE" or disposition_only_rejection)
@@ -3047,8 +3084,12 @@ class AutoAgentsSelfRepairRunner:
                 "reason": str(payload.get("reason", ""))[:2000],
                 "errors": errors,
                 "blocking_issues": blocking_issues,
-                "ignored_unrelated_observations": len(issues) - len(blocking_issues),
+                "nonblocking_issues": nonblocking_issues,
+                "invalid_issues": invalid_issues,
+                "ignored_unrelated_observations": len(nonblocking_issues),
                 "strategy_fingerprint": fingerprint,
+                "base_commit": experiment.base_commit,
+                "contract_fingerprint": experiment.contract_fingerprint,
                 "at": _utc_now_iso(),
             }
         )
@@ -3065,7 +3106,7 @@ class AutoAgentsSelfRepairRunner:
                         ],
                     ]
                 ).strip("; "),
-                strategy_fingerprint=fingerprint,
+                strategy_fingerprint=(fingerprint if blocking_issues else ""),
             )
             self._experiment_store.save(experiment)
             return False
@@ -3077,6 +3118,51 @@ class AutoAgentsSelfRepairRunner:
         experiment.next_finding_group()
         self._experiment_store.save(experiment)
         return True
+
+    @staticmethod
+    def _consecutive_design_rejections(
+        experiment: SelfRepairExperiment,
+    ) -> int:
+        count = 0
+        for event in reversed(experiment.design_history):
+            if str(event.get("event", "")) != "design_review":
+                continue
+            if (
+                str(event.get("base_commit", "")) != experiment.base_commit
+                or str(event.get("contract_fingerprint", ""))
+                != experiment.contract_fingerprint
+            ):
+                break
+            if str(event.get("decision", "")).strip().upper() != "REJECT":
+                break
+            count += 1
+        return count
+
+    def _design_review_exhausted_result(
+        self,
+        experiment: SelfRepairExperiment,
+    ) -> SelfRepairResult:
+        count = self._consecutive_design_rejections(experiment)
+        reason = (
+            "self-repair design review made no admissible progress after "
+            f"{count} consecutive attempts on the same engine base and contract; "
+            "the experiment remains resumable after the engine base or evidence changes"
+        )
+        self._experiment_store.record_health(
+            experiment,
+            status="design_review_exhausted",
+            detail=reason,
+        )
+        self._experiment_store.save(experiment)
+        return SelfRepairResult(
+            ok=False,
+            status="design_review_exhausted",
+            category=self.decision.category or "self_repair_design_review",
+            reason=reason,
+            experiment_id=experiment.experiment_id,
+            base_commit=experiment.base_commit,
+            attempt=experiment.attempt_count,
+        )
 
     def _automatic_contract_reanalysis(
         self,
@@ -3327,7 +3413,17 @@ class AutoAgentsSelfRepairRunner:
                     )
                     experiment._recompute_frontier()
                 store.save(experiment)
+            if (
+                self._consecutive_design_rejections(experiment)
+                >= SELF_REPAIR_MAX_CONSECUTIVE_DESIGN_REJECTIONS
+            ):
+                return self._design_review_exhausted_result(experiment)
             if not self._ensure_approved_repair_design(experiment):
+                if (
+                    self._consecutive_design_rejections(experiment)
+                    >= SELF_REPAIR_MAX_CONSECUTIVE_DESIGN_REJECTIONS
+                ):
+                    return self._design_review_exhausted_result(experiment)
                 continue
             active_group = experiment.next_finding_group()
             if active_group is None:
@@ -4552,6 +4648,149 @@ class AutoAgentsSelfRepairRunner:
             return "candidate weakens tests with skip/xfail"
         return ""
 
+    @staticmethod
+    def _component_owns_path(component: Mapping[str, object], path: str) -> bool:
+        normalized = str(path).strip().strip("/")
+        if not normalized:
+            return False
+        for raw_owner in component.get("touched_paths", []) or []:
+            owner = str(raw_owner).strip().strip("/")
+            if normalized == owner or normalized.startswith(owner + "/"):
+                return True
+        return False
+
+    def _deferred_finding_group(
+        self,
+        finding: Mapping[str, object],
+        *,
+        active_group: Mapping[str, object],
+        experiment: Optional[SelfRepairExperiment],
+    ) -> str:
+        causal_id = str(
+            finding.get(
+                "causal_obligation_id",
+                finding.get("obligation_id", ""),
+            )
+        ).strip()
+        requested = str(finding.get("defer_until", "")).strip()
+        if requested == "post_full_suite" and causal_id.startswith("validation:"):
+            return requested
+        if str(finding.get("disposition", "")).strip() != "contract_violation":
+            return ""
+        if not isinstance(experiment, SelfRepairExperiment):
+            return ""
+        active_id = str(active_group.get("group_id", "")).strip()
+        finding_id = str(finding.get("finding_id", "")).strip()
+        affected_paths = {
+            str(item).strip().strip("/")
+            for item in finding.get("affected_paths", []) or []
+            if str(item).strip()
+        }
+        pending_groups = [
+            group
+            for group in experiment.finding_groups
+            if str(group.get("status", "")) != "completed"
+            and str(group.get("group_id", "")).strip() != active_id
+        ]
+        for group in pending_groups:
+            group_id = str(group.get("group_id", "")).strip()
+            if finding_id and finding_id in {
+                str(item) for item in group.get("finding_ids", []) or []
+            }:
+                return group_id
+        if requested:
+            for group in pending_groups:
+                if str(group.get("group_id", "")).strip() != requested:
+                    continue
+                if not affected_paths or any(
+                    self._component_owns_path(group, path)
+                    for path in affected_paths
+                ):
+                    return requested
+        active_owned = {
+            path
+            for path in affected_paths
+            if self._component_owns_path(active_group, path)
+        }
+        downstream_only = affected_paths - active_owned
+        for group in pending_groups:
+            if any(
+                self._component_owns_path(group, path)
+                for path in downstream_only
+            ):
+                return str(group.get("group_id", "")).strip()
+        return ""
+
+    def _persist_deferred_candidate_findings(
+        self,
+        findings: list[dict[str, object]],
+    ) -> None:
+        experiment = getattr(self, "_experiment", None)
+        store = getattr(self, "_experiment_store", None)
+        if not isinstance(experiment, SelfRepairExperiment) or not isinstance(
+            store, SelfRepairExperimentStore
+        ):
+            return
+        contract_ids = set(experiment.contract_obligation_ids)
+        changed = False
+        for payload in findings:
+            group_id = str(payload.get("defer_until", "")).strip()
+            causal_id = str(
+                payload.get(
+                    "causal_obligation_id",
+                    payload.get("obligation_id", ""),
+                )
+            ).strip()
+            finding_id = str(payload.get("finding_id", "")).strip()
+            if (
+                not group_id
+                or group_id == "post_full_suite"
+                or not finding_id
+                or causal_id not in contract_ids
+                or str(payload.get("disposition", "")).strip()
+                != "contract_violation"
+            ):
+                continue
+            target_group = next(
+                (
+                    group
+                    for group in experiment.finding_groups
+                    if str(group.get("group_id", "")).strip() == group_id
+                    and str(group.get("status", "")) != "completed"
+                ),
+                None,
+            )
+            if target_group is None:
+                continue
+            finding = SelfRepairFinding.from_dict(payload)
+            finding.status = "confirmed"
+            finding.causal_obligation_id = causal_id
+            finding.defer_until = group_id
+            existing = experiment.findings.get(finding_id)
+            if existing is None:
+                experiment.findings[finding_id] = finding
+            else:
+                existing.status = "reopened"
+                existing.reason = finding.reason or existing.reason
+                existing.counterexample = (
+                    finding.counterexample or existing.counterexample
+                )
+                existing.required_test = finding.required_test or existing.required_test
+                existing.evidence = finding.evidence or existing.evidence
+                existing.defer_until = group_id
+                existing.causal_obligation_id = causal_id
+                existing.updated_at = _utc_now_iso()
+            target_group["finding_ids"] = sorted(
+                set(
+                    str(item)
+                    for item in target_group.get("finding_ids", []) or []
+                    if str(item)
+                ).union({finding_id})
+            )
+            changed = True
+        if changed:
+            store.save(experiment)
+
     def _review_candidate(
         self,
         repair_root: Path,
@@ -4597,13 +4836,17 @@ class AutoAgentsSelfRepairRunner:
                 "The repair contract is frozen. Review only the active component, preservation "
                 "of completed components, and regressions introduced by this candidate. Do not "
                 "turn unrelated generic hardening into a blocker or follow-up task.",
+                "If a contract finding belongs to a pending dependent component, set defer_until "
+                "to that component's group_id; it must not reject the active component.",
                 "The orchestrator will run focused, boundary, and full-suite proof after the "
                 "appropriate review stage; absence of those future results is not a finding.",
                 "Return exactly JSON with decision, reason, findings, and resolved_finding_ids. "
                 "Each finding must contain finding_id, severity=fatal|hard|repairable, "
                 "disposition=contract_violation|candidate_regression|unrelated_observation, "
                 "causal_obligation_id, affected_paths, reason, counterexample, required_test, "
-                "evidence, and defer_until=''. "
+                "evidence, and defer_until. defer_until is empty for an active-component blocker, "
+                "a pending group_id for downstream-owned work, or post_full_suite for deferred "
+                "full-suite evidence. "
                 "Use stable semantic finding IDs and list prior finding IDs proven resolved.",
                 "Schema: {\"decision\":\"APPROVE|REJECT\",\"reason\":\"...\","
                 "\"findings\":[{\"finding_id\":\"...\",\"severity\":\"hard\","
@@ -4618,6 +4861,21 @@ class AutoAgentsSelfRepairRunner:
                 json.dumps(contract_payload, ensure_ascii=False),
                 "ACTIVE_COMPONENT:",
                 json.dumps(active_group, ensure_ascii=False),
+                "PENDING_COMPONENTS:",
+                json.dumps(
+                    [
+                        dict(item)
+                        for item in (
+                            experiment.finding_groups
+                            if isinstance(experiment, SelfRepairExperiment)
+                            else []
+                        )
+                        if str(item.get("status", "")) != "completed"
+                        and str(item.get("group_id", ""))
+                        != str(active_group.get("group_id", ""))
+                    ],
+                    ensure_ascii=False,
+                ),
                 "OPEN_CONTRACT_FINDINGS:",
                 json.dumps(
                     [item.to_dict() for item in blocking_findings],
@@ -4675,9 +4933,8 @@ class AutoAgentsSelfRepairRunner:
         prior_ids = {
             finding.finding_id for finding in blocking_findings
         }
+        deferred_findings: list[dict[str, object]] = []
         for finding in raw_finding_dicts:
-            defer_until = str(finding.get("defer_until", "")).strip()
-            finding["defer_until"] = ""
             finding_id = str(finding.get("finding_id", "")).strip()
             disposition = str(finding.get("disposition", "")).strip().lower()
             causal_id = str(
@@ -4691,6 +4948,16 @@ class AutoAgentsSelfRepairRunner:
                 for item in finding.get("affected_paths", []) or []
                 if str(item).strip()
             }
+            defer_until = self._deferred_finding_group(
+                finding,
+                active_group=active_group,
+                experiment=(
+                    experiment
+                    if isinstance(experiment, SelfRepairExperiment)
+                    else None
+                ),
+            )
+            finding["defer_until"] = defer_until
             if finding_id in prior_ids and causal_id in contract_ids:
                 disposition = "contract_violation"
             accepted = bool(
@@ -4705,7 +4972,10 @@ class AutoAgentsSelfRepairRunner:
             )
             finding["disposition"] = disposition or "unrelated_observation"
             finding["causal_obligation_id"] = causal_id
-            if accepted:
+            if accepted and defer_until:
+                finding["status"] = "confirmed"
+                deferred_findings.append(finding)
+            elif accepted:
                 finding["status"] = "confirmed"
                 findings.append(finding)
             else:
@@ -4715,7 +4985,11 @@ class AutoAgentsSelfRepairRunner:
         normalized_payload = {
             **payload,
             "findings": findings,
-            "ignored_unrelated_observations": ignored_observations,
+            "deferred_findings": deferred_findings,
+            "ignored_unrelated_observations": [
+                *ignored_observations,
+                *deferred_findings,
+            ],
             "resolved_finding_ids": [
                 str(item)
                 for item in raw_resolved
@@ -4723,6 +4997,7 @@ class AutoAgentsSelfRepairRunner:
                 if str(item).strip()
             ],
         }
+        self._persist_deferred_candidate_findings(deferred_findings)
         review_ok = bool(reason) and not findings and decision in {"APPROVE", "REJECT"}
         rendered_decision = decision or "INVALID"
         return _VerificationResult(
