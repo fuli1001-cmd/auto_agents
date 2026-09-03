@@ -16,6 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.io_utils import write_json, write_text
+from auto_agents.config import load_run_state
 from auto_agents.models import (
     AccelerationConfig,
     AgentResult,
@@ -1190,7 +1191,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             )
             self.assert_parseable_utc(evidence_change["at"])
 
-    def test_runner_returns_deepest_candidate_not_last_candidate(self):
+    def test_runner_automatically_corrects_non_progress_and_continues(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             auto_root = root / "auto"
@@ -1279,6 +1280,20 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     candidate_id="c5",
                     candidate_ref="HEAD",
                 ),
+                SelfRepairResult(
+                    True,
+                    "approved_candidate",
+                    "automatic redesign converged",
+                    candidate_id="c6",
+                    candidate_ref="HEAD",
+                    candidate_commit=subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=auto_root,
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip(),
+                ),
             ]
             with (
                 patch(
@@ -1291,12 +1306,18 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 runner.repo_root = auto_root
                 result = runner.run()
 
-            self.assertEqual(result.candidate_id, "c2")
-            self.assertEqual(result.validation_stage, "full_suite")
-            self.assertEqual(result.validation_rank, 80)
-            self.assertEqual(result.status, "patience_exhausted")
-            self.assertIn("3 consecutive", result.reason)
-            self.assertIn("candidate=c5", result.summary)
+            self.assertEqual(result.candidate_id, "c6")
+            self.assertEqual(result.status, "approved_candidate")
+            state = load_run_state(target_root)
+            store = SelfRepairExperimentStore(
+                target_root,
+                state.run_id,
+                "candidate-ranking",
+            )
+            experiment = store.load()
+            self.assertIsNotNone(experiment)
+            self.assertTrue(experiment.automatic_corrections)
+            self.assertNotEqual(experiment.status, "needs_human")
 
     def test_self_repair_health_preemption_is_infrastructure_interruption(self):
         self.assertTrue(
@@ -2598,6 +2619,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 def __init__(self):
                     self.repair_calls = 0
                     self.generation_requests = []
+                    self.design_requests = []
                     self.review_requests = []
                     autonomy = type(
                         "Autonomy",
@@ -2624,6 +2646,43 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     )()
 
                 def _call_with_failover(self, request):
+                    if request.stage == "self_repair_design_review":
+                        self.design_requests.append(request)
+                        contract = json.loads(
+                            request.prompt.split("FROZEN_CONTRACT:\n", 1)[1].split(
+                                "\nROOT_CAUSE:", 1
+                            )[0]
+                        )
+                        payload = {
+                            "decision": "APPROVE",
+                            "reason": "minimal causal design is complete",
+                            "strategy_id": "bounded-candidate-retry",
+                            "summary": "repair and prove the bounded retry",
+                            "exclusions": ["unrelated hardening"],
+                            "components": [
+                                {
+                                    "group_id": "root-repair",
+                                    "title": "Repair root cause",
+                                    "contract_obligation_ids": [
+                                        item["obligation_id"]
+                                        for item in contract
+                                        if item["obligation_id"].startswith("root:")
+                                    ],
+                                    "finding_ids": [],
+                                    "depends_on": [],
+                                    "touched_paths": ["fixed.py"],
+                                    "implementation_steps": ["create fixed.py"],
+                                    "focused_tests": ["test -f fixed.py"],
+                                }
+                            ],
+                            "issues": [],
+                        }
+                        return AgentResult(
+                            ok=True,
+                            command=[],
+                            output_path=request.output_path,
+                            summary=json.dumps(payload),
+                        )
                     if request.stage == "self_repair_candidate_review":
                         self.review_requests.append(request)
                         payload = {
@@ -2655,7 +2714,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
                 @staticmethod
                 def assert_feedback(prompt):
-                    if "candidate 1" not in prompt:
+                    if "candidate=" not in prompt:
                         raise AssertionError("second candidate did not receive prior proof")
 
             orchestrator = RepairOrchestrator()
@@ -2684,6 +2743,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
 
             self.assertTrue(result.ok, f"{result.reason}\n{result.summary}")
             self.assertEqual(orchestrator.repair_calls, 2)
+            self.assertEqual(len(orchestrator.design_requests), 1)
             self.assertTrue(orchestrator.generation_requests)
             self.assertTrue(
                 all(
@@ -2692,7 +2752,7 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     for request in orchestrator.generation_requests
                 )
             )
-            self.assertEqual(len(orchestrator.review_requests), 1)
+            self.assertEqual(len(orchestrator.review_requests), 2)
             review_request = orchestrator.review_requests[0]
             self.assertEqual(review_request.timeout_seconds, 60)
             self.assertEqual(review_request.effort, "max")
@@ -2708,7 +2768,10 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     for request in orchestrator.review_requests
                 )
             )
-            self.assertIn("final model review", orchestrator.review_requests[0].prompt)
+            self.assertIn(
+                "REVIEW_PHASE: integration",
+                orchestrator.review_requests[1].prompt,
+            )
             self.assertIn("PROOF_SEAL:", result.verification)
             self.assertEqual(result.status, "approved_candidate")
             self.assertTrue((Path(result.runtime_root) / "fixed.py").is_file())
@@ -2811,7 +2874,426 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                     capture_output=True,
                 )
 
-    def test_semantic_review_cannot_defer_code_finding_until_post_full_suite(self):
+    def test_design_review_cannot_reject_for_unrelated_observation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents/state/run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+
+            class Diagnosis:
+                final = type(
+                    "Final",
+                    (),
+                    {"expected_postconditions": ["root cause is repaired"]},
+                )()
+
+                def to_dict(self):
+                    return {
+                        "final": {
+                            "expected_postconditions": ["root cause is repaired"],
+                            "proposed_fix_scope": ["src/auto_agents/example.py"],
+                        }
+                    }
+
+            class DesignOrchestrator:
+                def __init__(self):
+                    autonomy = type(
+                        "Autonomy",
+                        (),
+                        {"candidate_review_timeout_seconds": 60},
+                    )()
+                    self.config = type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {"self_repair_review": "max"},
+                            "execution": type(
+                                "Execution", (), {"autonomy": autonomy}
+                            )(),
+                        },
+                    )()
+
+                def _call_with_failover(self, request):
+                    contract = json.loads(
+                        request.prompt.split("FROZEN_CONTRACT:\n", 1)[1].split(
+                            "\nROOT_CAUSE:", 1
+                        )[0]
+                    )
+                    payload = {
+                        "decision": "REJECT",
+                        "reason": "a generic subsystem could also be hardened",
+                        "strategy_id": "minimal-root-fix",
+                        "summary": "repair only the frozen root",
+                        "exclusions": ["generic hardening"],
+                        "components": [
+                            {
+                                "group_id": "root",
+                                "title": "Root repair",
+                                "contract_obligation_ids": [
+                                    item["obligation_id"]
+                                    for item in contract
+                                    if item["obligation_id"].startswith("root:")
+                                ],
+                                "finding_ids": [],
+                                "depends_on": [],
+                                "touched_paths": ["src/auto_agents/example.py"],
+                                "implementation_steps": ["repair the root"],
+                                "focused_tests": ["git diff --check"],
+                            }
+                        ],
+                        "issues": [
+                            {
+                                "disposition": "unrelated_observation",
+                                "causal_obligation_id": "",
+                                "reason": "unrelated generic hardening",
+                                "evidence": ["src/other.py:1"],
+                            }
+                        ],
+                    }
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=json.dumps(payload),
+                    )
+
+            with patch(
+                "auto_agents.self_repair.auto_agents_repo_root",
+                return_value=auto_root,
+            ):
+                runner = AutoAgentsSelfRepairRunner(
+                    DesignOrchestrator(),
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(True, category="design-scope"),
+                    diagnosis=Diagnosis(),
+                )
+                _, experiment = runner._load_or_create_experiment()
+                experiment.freeze_contract()
+
+                approved = runner._ensure_approved_repair_design(experiment)
+
+            self.assertTrue(approved)
+            self.assertEqual(experiment.repair_design["strategy_id"], "minimal-root-fix")
+            self.assertEqual(experiment.findings, {})
+            self.assertEqual(
+                experiment.design_history[-1]["ignored_unrelated_observations"],
+                1,
+            )
+
+    def test_finding_groups_complete_before_one_full_suite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents/state/run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+
+            class Diagnosis:
+                final = type(
+                    "Final",
+                    (),
+                    {
+                        "expected_postconditions": ["first", "second"],
+                        "verification_commands": ["test -f second.py"],
+                    },
+                )()
+
+                def to_dict(self):
+                    return {
+                        "final": {
+                            "expected_postconditions": ["first", "second"],
+                            "verification_commands": ["test -f second.py"],
+                        }
+                    }
+
+            class GroupOrchestrator:
+                def __init__(self):
+                    self.generated_groups = []
+                    self.review_phases = []
+                    autonomy = type(
+                        "Autonomy",
+                        (),
+                        {
+                            "mode": "max",
+                            "max_consecutive_non_improving_candidates": 3,
+                            "max_frontier_candidates": 8,
+                            "candidate_timeout_seconds": 300,
+                            "candidate_review_timeout_seconds": 60,
+                            "replay_timeout_seconds": 60,
+                            "allow_isolated_dirty_checkout": True,
+                        },
+                    )()
+                    self.config = type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {
+                                "self_repair": "max",
+                                "self_repair_review": "max",
+                            },
+                            "execution": type(
+                                "Execution", (), {"autonomy": autonomy}
+                            )(),
+                        },
+                    )()
+
+                def _call_with_failover(self, request):
+                    if request.stage == "self_repair_design_review":
+                        contract = json.loads(
+                            request.prompt.split("FROZEN_CONTRACT:\n", 1)[1].split(
+                                "\nROOT_CAUSE:", 1
+                            )[0]
+                        )
+                        roots = [
+                            item["obligation_id"]
+                            for item in contract
+                            if item["obligation_id"].startswith("root:")
+                        ]
+                        payload = {
+                            "decision": "APPROVE",
+                            "reason": "two independent components",
+                            "strategy_id": "split-root-repair",
+                            "summary": "repair roots in dependency order",
+                            "exclusions": [],
+                            "components": [
+                                {
+                                    "group_id": "first",
+                                    "title": "First",
+                                    "contract_obligation_ids": [roots[0]],
+                                    "finding_ids": [],
+                                    "depends_on": [],
+                                    "touched_paths": ["first.py"],
+                                    "implementation_steps": ["create first.py"],
+                                    "focused_tests": ["test -f first.py"],
+                                },
+                                {
+                                    "group_id": "second",
+                                    "title": "Second",
+                                    "contract_obligation_ids": [roots[1]],
+                                    "finding_ids": [],
+                                    "depends_on": ["first"],
+                                    "touched_paths": ["second.py"],
+                                    "implementation_steps": ["create second.py"],
+                                    "focused_tests": ["test -f second.py"],
+                                },
+                            ],
+                            "issues": [],
+                        }
+                        return AgentResult(
+                            ok=True,
+                            command=[],
+                            output_path=request.output_path,
+                            summary=json.dumps(payload),
+                        )
+                    if request.stage == "self_repair_candidate_review":
+                        phase = request.prompt.split("REVIEW_PHASE: ", 1)[1].splitlines()[0]
+                        self.review_phases.append(phase)
+                        return AgentResult(
+                            ok=True,
+                            command=[],
+                            output_path=request.output_path,
+                            summary=json.dumps(
+                                {
+                                    "decision": "APPROVE",
+                                    "reason": "component is sound",
+                                    "findings": [],
+                                    "resolved_finding_ids": [],
+                                }
+                            ),
+                        )
+                    active = json.loads(
+                        request.prompt.split(
+                            "Active approved design component:\n", 1
+                        )[1].split("\n\nOriginal run error:", 1)[0]
+                    )
+                    group_id = active["group_id"]
+                    self.generated_groups.append(group_id)
+                    write_text(request.cwd / f"{group_id}.py", "FIXED = True\n")
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=f"implemented {group_id}\nCOMMIT_MESSAGE: repair {group_id}",
+                    )
+
+            orchestrator = GroupOrchestrator()
+            with (
+                patch(
+                    "auto_agents.self_repair.auto_agents_repo_root",
+                    return_value=auto_root,
+                ),
+                patch(
+                    "auto_agents.self_repair.self_repair_verify_commands",
+                    return_value=["true"],
+                ),
+            ):
+                runner = AutoAgentsSelfRepairRunner(
+                    orchestrator,
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(True, category="split-repair"),
+                    diagnosis=Diagnosis(),
+                )
+                full_suite_calls = []
+
+                def full_suite(*_args, **_kwargs):
+                    full_suite_calls.append("full")
+                    return _VerificationResult(True, "full suite passed")
+
+                with patch.object(
+                    runner,
+                    "_full_suite_differential",
+                    side_effect=full_suite,
+                ):
+                    result = runner.run()
+
+            self.assertTrue(result.ok, result.reason)
+            self.assertEqual(orchestrator.generated_groups, ["first", "second"])
+            self.assertEqual(full_suite_calls, ["full"])
+            self.assertEqual(
+                orchestrator.review_phases,
+                ["pre_validation", "pre_validation", "integration"],
+            )
+
+    def test_stalled_search_only_admits_causally_anchored_contract_amendment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_json(
+                target_root / ".auto-agents/state/run_state.json",
+                RunState(run_id="target-run").to_dict(),
+            )
+
+            class Diagnosis:
+                final = type(
+                    "Final",
+                    (),
+                    {
+                        "expected_postconditions": ["root cause is repaired"],
+                        "verification_commands": ["test -f missing-proof.py"],
+                    },
+                )()
+
+                def to_dict(self):
+                    return {
+                        "final": {
+                            "expected_postconditions": ["root cause is repaired"],
+                            "verification_commands": ["test -f missing-proof.py"],
+                        }
+                    }
+
+            class ArbiterOrchestrator:
+                def __init__(self):
+                    autonomy = type(
+                        "Autonomy",
+                        (),
+                        {"candidate_review_timeout_seconds": 60},
+                    )()
+                    self.config = type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {"self_repair_review": "max"},
+                            "execution": type(
+                                "Execution", (), {"autonomy": autonomy}
+                            )(),
+                        },
+                    )()
+
+                def _call_with_failover(self, request):
+                    contract = json.loads(
+                        request.prompt.split("FROZEN_CONTRACT:\n", 1)[1].split(
+                            "\nROOT_CAUSE:", 1
+                        )[0]
+                    )
+                    root_id = next(
+                        item["obligation_id"]
+                        for item in contract
+                        if item["obligation_id"].startswith("root:")
+                    )
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=json.dumps(
+                            {
+                                "decision": "AMEND",
+                                "reason": "the original differential exposes a missing sub-obligation",
+                                "additions": [
+                                    {
+                                        "parent_obligation_id": root_id,
+                                        "description": "the missing proof is produced",
+                                        "causal_chain": [
+                                            "the original path omits the proof",
+                                            "the frozen postcondition therefore remains false",
+                                        ],
+                                        "reproduction_command": "test -f missing-proof.py",
+                                        "evidence": ["tests/test_missing_proof.py:1"],
+                                    },
+                                    {
+                                        "parent_obligation_id": root_id,
+                                        "description": "unrelated command",
+                                        "causal_chain": ["a", "b"],
+                                        "reproduction_command": "test -f unrelated.py",
+                                        "evidence": ["unrelated.py:1"],
+                                    },
+                                ],
+                            }
+                        ),
+                    )
+
+            with patch(
+                "auto_agents.self_repair.auto_agents_repo_root",
+                return_value=auto_root,
+            ):
+                runner = AutoAgentsSelfRepairRunner(
+                    ArbiterOrchestrator(),
+                    target_project_root=target_root,
+                    error=RuntimeError("terminal"),
+                    decision=SelfRepairDecision(True, category="contract-reanalysis"),
+                    diagnosis=Diagnosis(),
+                )
+                _, experiment = runner._load_or_create_experiment()
+                experiment.freeze_contract()
+                candidate = SelfRepairResult(
+                    False,
+                    "candidate_replay_failed",
+                    "stalled",
+                    verification="original differential still fails",
+                )
+
+                amended = runner._automatic_contract_reanalysis(
+                    experiment,
+                    candidate,
+                )
+
+            self.assertTrue(amended)
+            additions = [
+                item
+                for item in experiment.contract_obligation_ids
+                if item.startswith("root:amend:")
+            ]
+            self.assertEqual(len(additions), 1)
+            self.assertEqual(
+                experiment.obligations[additions[0]]["reproduction_command"],
+                "test -f missing-proof.py",
+            )
+
+    def test_semantic_review_ignores_future_full_suite_observation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             auto_root = root / "auto"
@@ -2874,9 +3356,13 @@ class RootCauseCoordinatorTests(unittest.TestCase):
                 progress_lease_seconds=60,
                 phase="pre_validation",
             )
-            self.assertFalse(pre.ok)
+            self.assertTrue(pre.ok)
             self.assertIn("candidate review=REJECT", pre.summary)
-            self.assertEqual(pre.payload["findings"][0]["defer_until"], "")
+            self.assertEqual(pre.payload["findings"], [])
+            self.assertEqual(
+                pre.payload["ignored_unrelated_observations"][0]["defer_until"],
+                "",
+            )
 
     def test_self_repair_runs_in_isolated_worktree_and_integrates_commit(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -29,7 +29,7 @@ class SelfRepairSearchTests(unittest.TestCase):
             max_frontier_candidates=8,
         )
 
-    def test_partial_and_diagnostic_progress_keep_search_alive(self) -> None:
+    def test_root_and_validation_net_progress_keep_search_alive(self) -> None:
         experiment = self._experiment()
         root_obligations = sorted(
             key for key in experiment.obligations if key.startswith("root:")
@@ -57,7 +57,7 @@ class SelfRepairSearchTests(unittest.TestCase):
                 ),
             ),
         )
-        self.assertEqual(progress, "diagnostic_progress")
+        self.assertEqual(progress, "net_progress")
         self.assertEqual(experiment.consecutive_non_improvements, 0)
         self.assertIn("c1", experiment.frontier)
 
@@ -87,12 +87,9 @@ class SelfRepairSearchTests(unittest.TestCase):
                 ),
             ),
         )
-        self.assertEqual(progress, "diagnostic_progress")
+        self.assertEqual(progress, "net_progress")
         self.assertEqual(experiment.best_search_candidate_id, "c2")
-        self.assertEqual(
-            experiment.findings["malformed-fail-open"].status,
-            "resolved",
-        )
+        self.assertNotIn("malformed-fail-open", experiment.findings)
 
     def test_patience_counts_only_consecutive_semantic_non_progress(self) -> None:
         experiment = self._experiment()
@@ -153,8 +150,174 @@ class SelfRepairSearchTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(progress, "validation_progress")
+        self.assertEqual(progress, "net_progress")
         self.assertEqual(experiment.consecutive_non_improvements, 0)
+
+    def test_unrelated_review_observation_is_not_persisted_or_scheduled(self) -> None:
+        experiment = self._experiment()
+        record = SelfRepairCandidateRecord(
+            candidate_id="candidate",
+            parent_candidate_id="base",
+            candidate_ref="refs/candidate",
+            validation_rank=40,
+        )
+
+        experiment.register_candidate(
+            record,
+            findings=(
+                SelfRepairFinding(
+                    finding_id="generic-hardening",
+                    status="confirmed",
+                    disposition="unrelated_observation",
+                    reason="a generic subsystem could be hardened",
+                    counterexample="unrelated counterexample",
+                    required_test="unrelated test",
+                    evidence=["unrelated.py:1"],
+                ),
+            ),
+        )
+
+        self.assertNotIn("generic-hardening", experiment.findings)
+        self.assertNotIn("finding:generic-hardening", experiment.obligations)
+
+    def test_candidate_regression_is_local_and_counts_against_net_progress(self) -> None:
+        experiment = self._experiment()
+        record = SelfRepairCandidateRecord(
+            candidate_id="candidate",
+            parent_candidate_id="base",
+            candidate_ref="refs/candidate",
+            validation_rank=40,
+        )
+
+        progress = experiment.register_candidate(
+            record,
+            findings=(
+                SelfRepairFinding(
+                    finding_id="new-regression",
+                    status="confirmed",
+                    disposition="candidate_regression",
+                    reason="the candidate breaks an existing boundary",
+                ),
+            ),
+        )
+
+        self.assertEqual(progress, "no_progress")
+        self.assertLessEqual(record.net_progress, 0)
+        self.assertNotIn("new-regression", experiment.findings)
+        self.assertIn(
+            "candidate_regression:new-regression",
+            record.failed_obligations,
+        )
+
+    def test_contract_finding_must_map_to_frozen_obligation(self) -> None:
+        experiment = self._experiment()
+        obligation_id = next(
+            item
+            for item in experiment.contract_obligation_ids
+            if item.startswith("root:")
+        )
+        record = SelfRepairCandidateRecord(
+            candidate_id="candidate",
+            parent_candidate_id="base",
+            candidate_ref="refs/candidate",
+            validation_rank=40,
+        )
+
+        experiment.register_candidate(
+            record,
+            findings=(
+                SelfRepairFinding(
+                    finding_id="causal-gap",
+                    status="confirmed",
+                    disposition="contract_violation",
+                    causal_obligation_id=obligation_id,
+                    reason="the design misses a root postcondition",
+                    counterexample="the original failure still reproduces",
+                    required_test="run the root differential",
+                    evidence=["tests/test_root.py:1"],
+                ),
+            ),
+        )
+
+        self.assertIn("causal-gap", experiment.findings)
+        self.assertIn(obligation_id, record.failed_obligations)
+        self.assertNotIn("finding:causal-gap", experiment.obligations)
+
+    def test_automatic_correction_blacklists_strategy_without_human_state(self) -> None:
+        experiment = self._experiment()
+        experiment.status = "needs_human"
+        experiment.consecutive_non_improvements = 3
+        experiment.repair_design = {"strategy_id": "bad"}
+
+        experiment.apply_automatic_correction(
+            reason="net progress stalled",
+            candidate_id="candidate",
+            strategy_fingerprint="bad-strategy",
+        )
+
+        self.assertEqual(experiment.status, "active")
+        self.assertEqual(experiment.consecutive_non_improvements, 0)
+        self.assertEqual(experiment.repair_design, {})
+        self.assertIn("bad-strategy", experiment.strategy_blacklist)
+        self.assertEqual(
+            experiment.automatic_corrections[-1]["event"],
+            "automatic_correction",
+        )
+
+    def test_finding_groups_follow_dependencies_and_preserve_completion(self) -> None:
+        experiment = self._experiment()
+        root_ids = sorted(
+            item
+            for item in experiment.contract_obligation_ids
+            if item.startswith("root:")
+        )
+        experiment.finding_groups = [
+            {
+                "group_id": "second",
+                "depends_on": ["first"],
+                "contract_obligation_ids": [root_ids[1]],
+                "finding_ids": [],
+                "status": "pending",
+            },
+            {
+                "group_id": "first",
+                "depends_on": [],
+                "contract_obligation_ids": [root_ids[0]],
+                "finding_ids": [],
+                "status": "pending",
+            },
+        ]
+
+        first = experiment.next_finding_group()
+        self.assertEqual(first["group_id"], "first")
+        experiment.mark_finding_group_completed("first", candidate_id="c1")
+        second = experiment.next_finding_group()
+
+        self.assertEqual(second["group_id"], "second")
+        self.assertIn(root_ids[0], experiment.completed_contract_obligation_ids)
+
+    def test_prompt_context_keeps_only_compact_recent_history(self) -> None:
+        experiment = self._experiment()
+        for index in range(10):
+            experiment.candidates[f"c{index}"] = SelfRepairCandidateRecord(
+                candidate_id=f"c{index}",
+                summary=("long candidate history " * 200) + str(index),
+                verification="verification output " * 500,
+            )
+
+        context = experiment.prompt_context()
+
+        self.assertEqual(len(context["recent_candidates"]), 3)
+        self.assertEqual(
+            [item["candidate_id"] for item in context["recent_candidates"]],
+            ["c7", "c8", "c9"],
+        )
+        self.assertTrue(
+            all("verification" not in item for item in context["recent_candidates"])
+        )
+        self.assertTrue(
+            all(len(item["summary"]) <= 400 for item in context["recent_candidates"])
+        )
 
     def test_store_restores_frontier_patience_and_health_oscillation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

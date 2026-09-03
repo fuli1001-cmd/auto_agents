@@ -15,7 +15,7 @@ from .config import run_path
 from .io_utils import read_json
 
 
-SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 1
+SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 2
 
 
 def _utc_now() -> str:
@@ -61,6 +61,8 @@ class SelfRepairFinding:
     required_test: str = ""
     defer_until: str = ""
     evidence: list[str] = field(default_factory=list)
+    disposition: str = "unclassified"
+    causal_obligation_id: str = ""
     introduced_by: str = ""
     resolved_by: str = ""
     reopened_by: list[str] = field(default_factory=list)
@@ -89,6 +91,8 @@ class SelfRepairFinding:
                 str(item)
                 for item in (raw_evidence if isinstance(raw_evidence, list) else [])
             ],
+            disposition=str(payload.get("disposition", "unclassified")),
+            causal_obligation_id=str(payload.get("causal_obligation_id", "")),
             introduced_by=str(payload.get("introduced_by", "")),
             resolved_by=str(payload.get("resolved_by", "")),
             reopened_by=[
@@ -147,6 +151,9 @@ class SelfRepairCandidateRecord:
     fatal: bool = False
     infrastructure_failure: bool = False
     diff_line_count: int = 0
+    finding_group_id: str = ""
+    net_progress: int = 0
+    semantic_state_fingerprint: str = ""
     summary: str = ""
     verification: str = ""
     created_at: str = field(default_factory=_utc_now)
@@ -200,6 +207,19 @@ class SelfRepairExperiment:
     candidates: Dict[str, SelfRepairCandidateRecord] = field(default_factory=dict)
     findings: Dict[str, SelfRepairFinding] = field(default_factory=dict)
     obligations: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    contract_status: str = "frozen"
+    contract_fingerprint: str = ""
+    contract_obligation_ids: list[str] = field(default_factory=list)
+    repair_design: Dict[str, object] = field(default_factory=dict)
+    repair_design_fingerprint: str = ""
+    design_history: list[Dict[str, object]] = field(default_factory=list)
+    finding_groups: list[Dict[str, object]] = field(default_factory=list)
+    active_finding_group_id: str = ""
+    completed_contract_obligation_ids: list[str] = field(default_factory=list)
+    completed_finding_ids: list[str] = field(default_factory=list)
+    strategy_blacklist: list[str] = field(default_factory=list)
+    semantic_state_history: list[str] = field(default_factory=list)
+    automatic_corrections: list[Dict[str, object]] = field(default_factory=list)
     strategy_history: list[str] = field(default_factory=list)
     attempt_count: int = 0
     consecutive_non_improvements: int = 0
@@ -277,6 +297,20 @@ class SelfRepairExperiment:
                 "safety:scope_guard",
             ],
         )
+        contract_obligation_ids = sorted(
+            obligation_id
+            for obligation_id in obligations
+            if obligation_id.startswith(("root:", "safety:"))
+        )
+        contract_fingerprint = _stable_hash(
+            [
+                (
+                    obligation_id,
+                    obligations[obligation_id].get("description", ""),
+                )
+                for obligation_id in contract_obligation_ids
+            ]
+        )
         return cls(
             experiment_id=experiment_id,
             run_id=run_id,
@@ -288,6 +322,8 @@ class SelfRepairExperiment:
             best_search_ref=base_commit,
             candidates={"base": base},
             obligations=obligations,
+            contract_fingerprint=contract_fingerprint,
+            contract_obligation_ids=contract_obligation_ids,
             max_consecutive_non_improvements=max(
                 1, int(max_consecutive_non_improvements)
             ),
@@ -306,7 +342,19 @@ class SelfRepairExperiment:
         ):
             if not isinstance(value, Mapping):
                 raise ValueError(f"self-repair experiment {name} must be an object")
-        for name in ("frontier", "strategy_history", "health_history"):
+        for name in (
+            "frontier",
+            "strategy_history",
+            "health_history",
+            "contract_obligation_ids",
+            "design_history",
+            "finding_groups",
+            "strategy_blacklist",
+            "semantic_state_history",
+            "automatic_corrections",
+            "completed_contract_obligation_ids",
+            "completed_finding_ids",
+        ):
             if not isinstance(payload.get(name, []), list):
                 raise ValueError(f"self-repair experiment {name} must be a list")
         candidates = {
@@ -341,6 +389,53 @@ class SelfRepairExperiment:
                 for key, value in raw_obligations.items()
                 if isinstance(value, Mapping)
             },
+            contract_status=str(payload.get("contract_status", "frozen")),
+            contract_fingerprint=str(payload.get("contract_fingerprint", "")),
+            contract_obligation_ids=[
+                str(item)
+                for item in payload.get("contract_obligation_ids", []) or []
+            ],
+            repair_design=(
+                dict(payload.get("repair_design", {}))
+                if isinstance(payload.get("repair_design", {}), Mapping)
+                else {}
+            ),
+            repair_design_fingerprint=str(
+                payload.get("repair_design_fingerprint", "")
+            ),
+            design_history=[
+                dict(item)
+                for item in payload.get("design_history", []) or []
+                if isinstance(item, Mapping)
+            ][-32:],
+            finding_groups=[
+                dict(item)
+                for item in payload.get("finding_groups", []) or []
+                if isinstance(item, Mapping)
+            ],
+            active_finding_group_id=str(
+                payload.get("active_finding_group_id", "")
+            ),
+            completed_contract_obligation_ids=[
+                str(item)
+                for item in payload.get("completed_contract_obligation_ids", []) or []
+            ],
+            completed_finding_ids=[
+                str(item)
+                for item in payload.get("completed_finding_ids", []) or []
+            ],
+            strategy_blacklist=[
+                str(item) for item in payload.get("strategy_blacklist", []) or []
+            ][-64:],
+            semantic_state_history=[
+                str(item)
+                for item in payload.get("semantic_state_history", []) or []
+            ][-128:],
+            automatic_corrections=[
+                dict(item)
+                for item in payload.get("automatic_corrections", []) or []
+                if isinstance(item, Mapping)
+            ][-64:],
             strategy_history=[
                 str(item) for item in payload.get("strategy_history", []) or []
             ],
@@ -384,6 +479,174 @@ class SelfRepairExperiment:
             },
         }
 
+    def freeze_contract(self) -> bool:
+        """Freeze causal obligations and quarantine legacy scope expansion."""
+
+        changed = False
+        if not self.contract_obligation_ids:
+            self.contract_obligation_ids = sorted(
+                obligation_id
+                for obligation_id in self.obligations
+                if obligation_id.startswith(("root:", "safety:"))
+            )
+            changed = True
+        fingerprint = _stable_hash(
+            [
+                (
+                    obligation_id,
+                    self.obligations.get(obligation_id, {}).get(
+                        "description", ""
+                    ),
+                )
+                for obligation_id in self.contract_obligation_ids
+            ]
+        )
+        if self.contract_fingerprint != fingerprint:
+            self.contract_fingerprint = fingerprint
+            self.repair_design = {}
+            self.repair_design_fingerprint = ""
+            self.finding_groups = []
+            self.active_finding_group_id = ""
+            changed = True
+        self.contract_status = "frozen"
+
+        contract_ids = set(self.contract_obligation_ids)
+        quarantined: set[str] = set()
+        for finding in self.findings.values():
+            if finding.disposition != "unclassified":
+                continue
+            causal_id = finding.causal_obligation_id or finding.obligation_id
+            if causal_id in contract_ids:
+                finding.disposition = "contract_violation"
+                finding.causal_obligation_id = causal_id
+            else:
+                finding.disposition = "unrelated_observation"
+                if finding.status in {"confirmed", "reopened", "observed"}:
+                    finding.status = "quarantined"
+                quarantined.add(finding.finding_id)
+                obligation = self.obligations.get(
+                    f"finding:{finding.finding_id}"
+                )
+                if obligation is not None:
+                    obligation["status"] = "quarantined"
+            finding.updated_at = _utc_now()
+            changed = True
+        if quarantined:
+            quarantined_obligations = {
+                f"finding:{finding_id}" for finding_id in quarantined
+            }
+            for record in self.candidates.values():
+                record.failed_obligations = [
+                    item
+                    for item in record.failed_obligations
+                    if item not in quarantined_obligations
+                ]
+            self.automatic_corrections.append(
+                {
+                    "kind": "legacy_scope_contraction",
+                    "quarantined_finding_ids": sorted(quarantined),
+                    "at": _utc_now(),
+                }
+            )
+            self.automatic_corrections = self.automatic_corrections[-64:]
+        if changed:
+            self._recompute_frontier()
+        return changed
+
+    def blocking_findings(self) -> list[SelfRepairFinding]:
+        contract_ids = set(self.contract_obligation_ids)
+        return [
+            finding
+            for finding in self.findings.values()
+            if finding.status in {"confirmed", "reopened"}
+            and finding.disposition == "contract_violation"
+            and finding.causal_obligation_id in contract_ids
+        ]
+
+    def next_finding_group(self) -> Optional[Dict[str, object]]:
+        completed = {
+            str(item.get("group_id", ""))
+            for item in self.finding_groups
+            if str(item.get("status", "")) == "completed"
+        }
+        for group in self.finding_groups:
+            group_id = str(group.get("group_id", ""))
+            dependencies = {
+                str(item) for item in group.get("depends_on", []) or []
+            }
+            if (
+                group_id
+                and group_id not in completed
+                and dependencies.issubset(completed)
+            ):
+                self.active_finding_group_id = group_id
+                return group
+        self.active_finding_group_id = ""
+        return None
+
+    def mark_finding_group_completed(
+        self,
+        group_id: str,
+        *,
+        candidate_id: str,
+    ) -> None:
+        for group in self.finding_groups:
+            if str(group.get("group_id", "")) != group_id:
+                continue
+            group["status"] = "completed"
+            group["completed_by"] = candidate_id
+            group["completed_at"] = _utc_now()
+            self.completed_contract_obligation_ids = sorted(
+                set(self.completed_contract_obligation_ids).union(
+                    str(item)
+                    for item in group.get("contract_obligation_ids", []) or []
+                )
+            )
+            self.completed_finding_ids = sorted(
+                set(self.completed_finding_ids).union(
+                    str(item) for item in group.get("finding_ids", []) or []
+                )
+            )
+            break
+        self.next_finding_group()
+        self.updated_at = _utc_now()
+
+    def apply_automatic_correction(
+        self,
+        *,
+        reason: str,
+        candidate_id: str = "",
+        strategy_fingerprint: str = "",
+    ) -> None:
+        """Reset design state after semantic non-progress without human routing."""
+
+        if strategy_fingerprint:
+            self.strategy_blacklist.append(strategy_fingerprint)
+            self.strategy_blacklist = list(
+                dict.fromkeys(self.strategy_blacklist)
+            )[-64:]
+        self.design_history.append(
+            {
+                "event": "automatic_correction",
+                "reason": str(reason)[:2000],
+                "candidate_id": candidate_id,
+                "strategy_fingerprint": strategy_fingerprint,
+                "at": _utc_now(),
+            }
+        )
+        self.design_history = self.design_history[-32:]
+        self.automatic_corrections.append(dict(self.design_history[-1]))
+        self.automatic_corrections = self.automatic_corrections[-64:]
+        self.repair_design = {}
+        self.repair_design_fingerprint = ""
+        self.finding_groups = []
+        self.active_finding_group_id = ""
+        self.best_search_candidate_id = self.best_safe_candidate_id
+        self.best_search_ref = self.best_safe_ref or self.base_commit
+        self.consecutive_non_improvements = 0
+        self.status = "active"
+        self.updated_at = _utc_now()
+
     @staticmethod
     def _dominates(
         left: SelfRepairCandidateRecord,
@@ -415,9 +678,16 @@ class SelfRepairExperiment:
         safety_failed = sum(
             1 for item in record.failed_obligations if item.startswith("safety:")
         )
+        candidate_regressions = sum(
+            1
+            for item in record.failed_obligations
+            if item.startswith("candidate_regression:")
+        )
         return (
             root_passed,
             -safety_failed,
+            -candidate_regressions,
+            record.net_progress,
             len(set(record.resolved_finding_ids)),
             record.validation_rank,
             len(set(record.passed_obligations)),
@@ -459,7 +729,8 @@ class SelfRepairExperiment:
             for record in search_candidates
             if not record.fatal
             and not any(
-                item.startswith("safety:") for item in record.failed_obligations
+                item.startswith(("safety:", "candidate_regression:"))
+                for item in record.failed_obligations
             )
         ]
         best_safe = max(safe_candidates, key=self._search_score)
@@ -473,16 +744,42 @@ class SelfRepairExperiment:
         *,
         findings: Sequence[SelfRepairFinding] = (),
     ) -> str:
-        previous_max_rank = max(
-            (item.validation_rank for item in self.candidates.values()), default=0
+        parent = self.candidates.get(
+            record.parent_candidate_id,
+            self.candidates["base"],
         )
-        previous_vectors = {
-            item.vector_fingerprint for item in self.candidates.values()
+        previous_blocking = {
+            finding.finding_id for finding in self.blocking_findings()
         }
-        new_confirmed_findings = 0
-        newly_active_finding_ids: list[str] = []
+        candidate_regressions: list[str] = []
+        contract_ids = set(self.contract_obligation_ids)
         for finding in findings:
             if not finding.finding_id:
+                continue
+            disposition = finding.disposition.strip().lower()
+            causal_id = (
+                finding.causal_obligation_id.strip()
+                or finding.obligation_id.strip()
+            )
+            if disposition == "unclassified":
+                disposition = (
+                    "contract_violation"
+                    if causal_id in contract_ids
+                    else "unrelated_observation"
+                )
+            finding.disposition = disposition
+            finding.causal_obligation_id = causal_id
+            if disposition == "unrelated_observation":
+                # Reviewer observations outside the frozen causal contract are
+                # deliberately neither persisted nor scheduled.
+                continue
+            if disposition == "candidate_regression":
+                candidate_regressions.append(finding.finding_id)
+                failure_id = f"candidate_regression:{finding.finding_id}"
+                if failure_id not in record.failed_obligations:
+                    record.failed_obligations.append(failure_id)
+                continue
+            if disposition != "contract_violation" or causal_id not in contract_ids:
                 continue
             existing = self.findings.get(finding.finding_id)
             if existing is None:
@@ -501,84 +798,105 @@ class SelfRepairExperiment:
                 finding.updated_at = _utc_now()
                 self.findings[finding.finding_id] = finding
                 if independently_actionable:
-                    new_confirmed_findings += 1
-                    newly_active_finding_ids.append(finding.finding_id)
-                    self.obligations[f"finding:{finding.finding_id}"] = {
-                        "kind": "review_finding",
-                        "status": "open",
-                        "description": finding.reason,
-                        "source": finding.introduced_by,
-                    }
+                    if causal_id not in record.failed_obligations:
+                        record.failed_obligations.append(causal_id)
             else:
                 existing.updated_at = _utc_now()
                 if existing.status in {"resolved", "invalidated"}:
                     existing.status = "reopened"
                     if record.candidate_id not in existing.reopened_by:
                         existing.reopened_by.append(record.candidate_id)
-                    new_confirmed_findings += 1
-                    newly_active_finding_ids.append(finding.finding_id)
-                    self.obligations.setdefault(
-                        f"finding:{finding.finding_id}",
-                        {
-                            "kind": "review_finding",
-                            "description": finding.reason,
-                            "source": finding.introduced_by,
-                        },
-                    )["status"] = "reopened"
                 if finding.reason:
                     existing.reason = finding.reason
                 if finding.counterexample:
                     existing.counterexample = finding.counterexample
                 if finding.required_test:
                     existing.required_test = finding.required_test
+                existing.disposition = disposition
+                existing.causal_obligation_id = causal_id
+                if causal_id not in record.failed_obligations:
+                    record.failed_obligations.append(causal_id)
         for finding_id in record.resolved_finding_ids:
             finding = self.findings.get(finding_id)
             if finding is not None:
                 finding.status = "resolved"
                 finding.resolved_by = record.candidate_id
                 finding.updated_at = _utc_now()
-            obligation = self.obligations.get(f"finding:{finding_id}")
-            if obligation is not None:
-                obligation["status"] = "resolved"
-                obligation["resolved_by"] = record.candidate_id
-            failure_id = f"finding:{finding_id}"
+            failure_id = (
+                finding.causal_obligation_id
+                if finding is not None
+                else f"finding:{finding_id}"
+            )
             record.failed_obligations = [
                 item for item in record.failed_obligations if item != failure_id
             ]
             if failure_id not in record.passed_obligations:
                 record.passed_obligations.append(failure_id)
-        for finding_id in newly_active_finding_ids:
-            failure_id = f"finding:{finding_id}"
-            for historical in self.candidates.values():
-                if finding_id in historical.resolved_finding_ids:
-                    continue
-                if failure_id not in historical.failed_obligations:
-                    historical.failed_obligations.append(failure_id)
-            if finding_id not in record.resolved_finding_ids:
-                if failure_id not in record.failed_obligations:
-                    record.failed_obligations.append(failure_id)
+        current_blocking = {
+            finding.finding_id for finding in self.blocking_findings()
+        }
+        resolved_blocking = len(previous_blocking - current_blocking)
+        root_gain = len(
+            {
+                item for item in record.passed_obligations if item.startswith("root:")
+            }
+            - {
+                item for item in parent.passed_obligations if item.startswith("root:")
+            }
+        )
+        validation_gain = int(
+            bool(record.candidate_ref)
+            and record.validation_rank > parent.validation_rank
+        )
+        group_gain = int(
+            record.status == "candidate_group_completed"
+            and bool(record.finding_group_id)
+            and record.finding_group_id != parent.finding_group_id
+        )
+        safety_gain = len(
+            {
+                item
+                for item in parent.failed_obligations
+                if item.startswith("safety:")
+            }
+            - {
+                item
+                for item in record.failed_obligations
+                if item.startswith("safety:")
+            }
+        )
+        record.net_progress = (
+            root_gain
+            + safety_gain
+            + resolved_blocking
+            + validation_gain
+            + group_gain
+            - len(candidate_regressions)
+            - len(current_blocking - previous_blocking)
+        )
+        record.semantic_state_fingerprint = _stable_hash(
+            sorted(
+                item for item in record.passed_obligations if item.startswith("root:")
+            ),
+            sorted(current_blocking),
+            record.validation_stage,
+            record.strategy_fingerprint,
+        )
         self.candidates[record.candidate_id] = record
         self.attempt_count += 1
         self.current_candidate_id = ""
         if record.strategy_fingerprint:
             self.strategy_history.append(record.strategy_fingerprint)
             self.strategy_history = self.strategy_history[-64:]
-        frontier_changed = self._recompute_frontier()
-        progress_kind = ""
-        if new_confirmed_findings:
-            progress_kind = "diagnostic_progress"
-        elif record.validation_rank > previous_max_rank:
-            progress_kind = "validation_progress"
-        elif (
-            not record.fatal
-            and record.vector_fingerprint not in previous_vectors
-            and frontier_changed
-        ):
-            progress_kind = "frontier_progress"
+        if record.semantic_state_fingerprint:
+            self.semantic_state_history.append(record.semantic_state_fingerprint)
+            self.semantic_state_history = self.semantic_state_history[-128:]
+        self._recompute_frontier()
+        progress_kind = "net_progress" if record.net_progress > 0 else ""
         if record.infrastructure_failure:
             self.infrastructure_failures += 1
             progress_kind = "infrastructure_interruption"
-        elif progress_kind:
+        elif progress_kind and not candidate_regressions:
             self.consecutive_non_improvements = 0
         else:
             self.consecutive_non_improvements += 1
@@ -597,8 +915,7 @@ class SelfRepairExperiment:
     def prompt_context(self) -> Dict[str, object]:
         open_findings = [
             item.to_dict()
-            for item in self.findings.values()
-            if item.status in {"confirmed", "reopened"}
+            for item in self.blocking_findings()
         ]
         resolved_findings = [
             item.finding_id
@@ -612,16 +929,27 @@ class SelfRepairExperiment:
                 if candidate_id != "base"
             ),
             key=lambda item: item.created_at,
-        )[-8:]
+        )[-3:]
         return {
             "experiment_id": self.experiment_id,
             "root_fingerprint": self.root_fingerprint,
+            "contract_fingerprint": self.contract_fingerprint,
+            "contract_obligations": [
+                {
+                    "obligation_id": obligation_id,
+                    "description": self.obligations.get(obligation_id, {}).get(
+                        "description", ""
+                    ),
+                }
+                for obligation_id in self.contract_obligation_ids
+            ],
             "best_search_candidate_id": self.best_search_candidate_id,
-            "frontier": list(self.frontier),
             "consecutive_non_improvements": self.consecutive_non_improvements,
-            "patience_limit": self.max_consecutive_non_improvements,
-            "open_confirmed_findings": open_findings,
+            "open_contract_findings": open_findings,
             "resolved_findings_that_must_not_regress": resolved_findings,
+            "approved_repair_design": self.repair_design,
+            "active_finding_group_id": self.active_finding_group_id,
+            "prohibited_strategy_fingerprints": self.strategy_blacklist[-8:],
             "recent_candidates": [
                 {
                     "candidate_id": item.candidate_id,
@@ -632,12 +960,12 @@ class SelfRepairExperiment:
                     "failed_obligations": item.failed_obligations,
                     "finding_ids": item.finding_ids,
                     "strategy_fingerprint": item.strategy_fingerprint,
-                    "summary": item.summary[-1200:],
-                    "verification": item.verification[-1600:],
+                    "net_progress": item.net_progress,
+                    "summary": " ".join(item.summary.split())[-400:],
                 }
                 for item in recent
             ],
-            "recent_health_anomalies": list(self.health_history[-8:]),
+            "recent_automatic_corrections": self.automatic_corrections[-3:],
         }
 
 
@@ -707,7 +1035,7 @@ class SelfRepairExperimentStore:
                 anomaly = "strategy_oscillation"
                 break
         if experiment.patience_exhausted:
-            anomaly = "search_patience_exhausted"
+            anomaly = "net_progress_stalled"
         elif experiment.last_progress_kind == "infrastructure_interruption":
             anomaly = "infrastructure_interruption"
         payload: Dict[str, object] = {

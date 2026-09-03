@@ -86,6 +86,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_RANKS = {
     "candidate_rejected": 30,
     "candidate_review_rejected": 40,
     "candidate_verification_failed": 50,
+    "candidate_group_completed": 60,
     "candidate_replay_failed": 70,
     "candidate_full_suite_failed": 80,
     "candidate_full_suite_inconclusive": 90,
@@ -103,6 +104,7 @@ SELF_REPAIR_CANDIDATE_VALIDATION_STAGES = {
     "candidate_rejected": "scope_guard",
     "candidate_review_rejected": "adversarial_review",
     "candidate_verification_failed": "focused_verification",
+    "candidate_group_completed": "finding_group",
     "candidate_replay_failed": "boundary_replay",
     "candidate_full_suite_failed": "full_suite",
     "candidate_full_suite_inconclusive": "full_suite",
@@ -179,6 +181,7 @@ class SelfRepairResult:
     infrastructure_failure: bool = False
     diff_line_count: int = 0
     progress_kind: str = ""
+    finding_group_id: str = ""
 
     def __post_init__(self) -> None:
         self.passed_obligations = list(self.passed_obligations or [])
@@ -1797,7 +1800,10 @@ class AutoAgentsSelfRepairRunner:
             passed.append("validation:adversarial_review")
         elif result.status == "candidate_review_rejected":
             failed.append("validation:adversarial_review")
-        if result.validation_rank >= 70:
+        if (
+            result.status == "candidate_group_completed"
+            or result.validation_rank >= 70
+        ):
             passed.append("validation:focused")
         elif result.status == "candidate_verification_failed":
             failed.append("validation:focused")
@@ -1854,6 +1860,7 @@ class AutoAgentsSelfRepairRunner:
             fatal=result.fatal_candidate,
             infrastructure_failure=result.infrastructure_failure,
             diff_line_count=result.diff_line_count,
+            finding_group_id=result.finding_group_id,
             summary=result.summary,
             verification=result.verification,
         )
@@ -2447,6 +2454,13 @@ class AutoAgentsSelfRepairRunner:
             finding = SelfRepairFinding.from_dict(payload)
             if not finding.finding_id:
                 continue
+            causal_id = finding.causal_obligation_id or finding.obligation_id
+            if (
+                finding.disposition != "contract_violation"
+                or causal_id not in set(experiment.contract_obligation_ids)
+            ):
+                continue
+            finding.causal_obligation_id = causal_id
             existing = experiment.findings.get(finding.finding_id)
             if existing is None:
                 finding.status = "confirmed"
@@ -2465,24 +2479,18 @@ class AutoAgentsSelfRepairRunner:
                 existing.defer_until = (
                     finding.defer_until or existing.defer_until
                 )
-            experiment.obligations.setdefault(
-                f"finding:{finding.finding_id}",
-                {
-                    "kind": "review_finding",
-                    "description": finding.reason,
-                    "source": result.candidate_id,
-                },
-            )["status"] = "open"
+            if causal_id not in stored.failed_obligations:
+                stored.failed_obligations.append(causal_id)
         for finding_id in result.resolved_finding_ids:
             finding = experiment.findings.get(finding_id)
             if finding is not None:
                 finding.status = "resolved"
                 finding.resolved_by = result.candidate_id
-            obligation = experiment.obligations.get(f"finding:{finding_id}")
-            if obligation is not None:
-                obligation["status"] = "resolved"
-                obligation["resolved_by"] = result.candidate_id
-            failure_id = f"finding:{finding_id}"
+            failure_id = (
+                finding.causal_obligation_id
+                if finding is not None
+                else f"finding:{finding_id}"
+            )
             stored.failed_obligations = [
                 item for item in stored.failed_obligations if item != failure_id
             ]
@@ -2553,6 +2561,542 @@ class AutoAgentsSelfRepairRunner:
         finally:
             self._finish_base_full_suite_prewarm()
 
+    def _compact_diagnosis_payload(self) -> dict[str, object]:
+        if self.diagnosis is None:
+            return {}
+        raw = (
+            self.diagnosis.to_dict()
+            if hasattr(self.diagnosis, "to_dict")
+            else {}
+        )
+        final = raw.get("final", raw) if isinstance(raw, Mapping) else {}
+        if not isinstance(final, Mapping):
+            return {}
+        return {
+            key: final.get(key)
+            for key in (
+                "category",
+                "causal_chain",
+                "expected_postconditions",
+                "proposed_fix_scope",
+                "verification_commands",
+                "reproduction_outcome",
+            )
+            if final.get(key) not in (None, "", [])
+        }
+
+    def _repair_contract_payload(
+        self,
+        experiment: SelfRepairExperiment,
+    ) -> list[dict[str, str]]:
+        return [
+            {
+                "obligation_id": obligation_id,
+                "description": str(
+                    experiment.obligations.get(obligation_id, {}).get(
+                        "description", ""
+                    )
+                ),
+            }
+            for obligation_id in experiment.contract_obligation_ids
+        ]
+
+    def _validate_repair_design(
+        self,
+        experiment: SelfRepairExperiment,
+        payload: Mapping[str, object],
+    ) -> tuple[dict[str, object], list[str]]:
+        errors: list[str] = []
+        strategy_id = str(payload.get("strategy_id", "")).strip()
+        summary = str(payload.get("summary", "")).strip()
+        raw_components = payload.get("components", [])
+        components = (
+            [dict(item) for item in raw_components if isinstance(item, Mapping)]
+            if isinstance(raw_components, list)
+            else []
+        )
+        if not strategy_id:
+            errors.append("design is missing strategy_id")
+        if not summary:
+            errors.append("design is missing summary")
+        if not components:
+            errors.append("design has no independently verifiable components")
+
+        contract_ids = set(experiment.contract_obligation_ids)
+        root_ids = {
+            item for item in contract_ids if item.startswith("root:")
+        }
+        blocking_ids = {
+            finding.finding_id for finding in experiment.blocking_findings()
+        }
+        assigned_contract: set[str] = set()
+        assigned_findings: set[str] = set()
+        group_ids: set[str] = set()
+        normalized_components: list[dict[str, object]] = []
+        for index, component in enumerate(components, start=1):
+            group_id = str(component.get("group_id", "")).strip()
+            if not group_id or group_id in group_ids:
+                errors.append(f"component {index} has a missing or duplicate group_id")
+                continue
+            group_ids.add(group_id)
+            component_contract = {
+                str(item)
+                for item in component.get("contract_obligation_ids", []) or []
+                if str(item)
+            }
+            component_findings = {
+                str(item)
+                for item in component.get("finding_ids", []) or []
+                if str(item)
+            }
+            unknown_contract = component_contract - contract_ids
+            unknown_findings = component_findings - blocking_ids
+            if unknown_contract:
+                errors.append(
+                    f"component {group_id} references non-contract obligations: "
+                    + ", ".join(sorted(unknown_contract))
+                )
+            if unknown_findings:
+                errors.append(
+                    f"component {group_id} references unrelated findings: "
+                    + ", ".join(sorted(unknown_findings))
+                )
+            assigned_contract.update(component_contract & contract_ids)
+            assigned_findings.update(component_findings & blocking_ids)
+            implementation_steps = [
+                str(item).strip()
+                for item in component.get("implementation_steps", []) or []
+                if str(item).strip()
+            ]
+            focused_tests = [
+                str(item).strip()
+                for item in component.get("focused_tests", []) or []
+                if str(item).strip()
+            ]
+            if not implementation_steps:
+                errors.append(f"component {group_id} has no implementation steps")
+            if not focused_tests:
+                errors.append(f"component {group_id} has no focused tests")
+            previously_completed = bool(
+                component_contract
+                and component_contract.issubset(
+                    set(experiment.completed_contract_obligation_ids)
+                )
+                and component_findings.issubset(
+                    set(experiment.completed_finding_ids)
+                )
+            )
+            normalized_components.append(
+                {
+                    "group_id": group_id,
+                    "title": str(component.get("title", group_id)).strip()
+                    or group_id,
+                    "contract_obligation_ids": sorted(component_contract & contract_ids),
+                    "finding_ids": sorted(component_findings & blocking_ids),
+                    "depends_on": sorted(
+                        {
+                            str(item)
+                            for item in component.get("depends_on", []) or []
+                            if str(item)
+                        }
+                    ),
+                    "touched_paths": sorted(
+                        {
+                            str(item)
+                            for item in component.get("touched_paths", []) or []
+                            if str(item)
+                        }
+                    ),
+                    "implementation_steps": implementation_steps,
+                    "focused_tests": focused_tests,
+                    "status": "completed" if previously_completed else "pending",
+                }
+            )
+        for component in normalized_components:
+            unknown_dependencies = set(component["depends_on"]) - group_ids
+            if unknown_dependencies:
+                errors.append(
+                    f"component {component['group_id']} has unknown dependencies: "
+                    + ", ".join(sorted(unknown_dependencies))
+                )
+        if root_ids - assigned_contract:
+            errors.append(
+                "design does not cover root obligations: "
+                + ", ".join(sorted(root_ids - assigned_contract))
+            )
+        if blocking_ids - assigned_findings:
+            errors.append(
+                "design does not assign blocking findings: "
+                + ", ".join(sorted(blocking_ids - assigned_findings))
+            )
+        # A topological walk proves that dependency cycles cannot deadlock the
+        # automatic component scheduler.
+        remaining = {str(item["group_id"]): item for item in normalized_components}
+        completed: set[str] = set()
+        while remaining:
+            ready = [
+                group_id
+                for group_id, component in remaining.items()
+                if set(component["depends_on"]).issubset(completed)
+            ]
+            if not ready:
+                errors.append("design component dependencies contain a cycle")
+                break
+            for group_id in ready:
+                completed.add(group_id)
+                remaining.pop(group_id)
+
+        design = {
+            "strategy_id": strategy_id,
+            "summary": summary,
+            "exclusions": [
+                str(item).strip()
+                for item in payload.get("exclusions", []) or []
+                if str(item).strip()
+            ],
+            "components": normalized_components,
+            "contract_fingerprint": experiment.contract_fingerprint,
+        }
+        return design, errors
+
+    def _ensure_approved_repair_design(
+        self,
+        experiment: SelfRepairExperiment,
+    ) -> bool:
+        if (
+            experiment.repair_design
+            and experiment.repair_design.get("contract_fingerprint")
+            == experiment.contract_fingerprint
+            and experiment.finding_groups
+        ):
+            return True
+        if self.diagnosis is None or not hasattr(self.diagnosis, "to_dict"):
+            # Legacy direct API repairs do not carry a causal contract. Keep
+            # their historical one-candidate behavior.
+            experiment.repair_design = {
+                "strategy_id": "legacy-direct-repair",
+                "summary": "legacy direct self-repair",
+                "exclusions": [],
+                "components": [
+                    {
+                        "group_id": "root-repair",
+                        "title": "Repair the reported failure",
+                        "contract_obligation_ids": [
+                            item
+                            for item in experiment.contract_obligation_ids
+                            if item.startswith("root:")
+                        ],
+                        "finding_ids": [],
+                        "depends_on": [],
+                        "touched_paths": [],
+                        "implementation_steps": ["repair the reported failure"],
+                        "focused_tests": ["git diff --check"],
+                        "status": "pending",
+                    }
+                ],
+                "contract_fingerprint": experiment.contract_fingerprint,
+            }
+            experiment.repair_design_fingerprint = _search_stable_hash(
+                experiment.repair_design
+            )
+            experiment.finding_groups = [
+                dict(item)
+                for item in experiment.repair_design["components"]
+            ]
+            experiment.next_finding_group()
+            self._experiment_store.save(experiment)
+            return True
+
+        autonomy = self._autonomy_config()
+        progress_lease = max(
+            60,
+            int(
+                getattr(autonomy, "candidate_review_timeout_seconds", 600)
+                or 600
+            ),
+        )
+        prompt = "\n".join(
+            [
+                "Design and adversarially review a minimal auto_agents self-repair before any code is written.",
+                "Do not modify files or run mutating commands.",
+                "The repair contract is frozen. Do not add generic hardening, follow-up tasks, or obligations.",
+                "Split independent work into dependency-ordered components. Each component must have focused tests.",
+                "Return APPROVE only when the design covers every root contract obligation and every listed contract finding.",
+                "Issues outside the frozen contract must use disposition=unrelated_observation and cannot reject the design.",
+                "Return exactly JSON with decision, reason, strategy_id, summary, exclusions, components, and issues.",
+                "Each component has group_id, title, contract_obligation_ids, finding_ids, depends_on, touched_paths, implementation_steps, focused_tests.",
+                "Each issue has disposition=contract_violation|unrelated_observation, causal_obligation_id, reason, and evidence.",
+                "FROZEN_CONTRACT:",
+                json.dumps(self._repair_contract_payload(experiment), ensure_ascii=False),
+                "ROOT_CAUSE:",
+                json.dumps(self._compact_diagnosis_payload(), ensure_ascii=False),
+                "OPEN_CONTRACT_FINDINGS:",
+                json.dumps(
+                    [item.to_dict() for item in experiment.blocking_findings()],
+                    ensure_ascii=False,
+                ),
+                "COMPLETED_COMPONENT_COVERAGE:",
+                json.dumps(
+                    {
+                        "contract_obligation_ids": (
+                            experiment.completed_contract_obligation_ids
+                        ),
+                        "finding_ids": experiment.completed_finding_ids,
+                    },
+                    ensure_ascii=False,
+                ),
+                "PROHIBITED_STRATEGIES:",
+                json.dumps(experiment.strategy_blacklist[-16:]),
+                "AUTOMATIC_CORRECTION_FEEDBACK:",
+                json.dumps(experiment.automatic_corrections[-3:], ensure_ascii=False),
+            ]
+        )
+        output_path = Path(tempfile.gettempdir()) / (
+            f"auto-agents-repair-design-{uuid.uuid4().hex[:12]}.json"
+        )
+        request = AgentRequest(
+            stage="self_repair_design_review",
+            effort=self._review_effort(),
+            prompt=prompt,
+            cwd=self.repo_root,
+            output_path=output_path,
+            sandbox_mode="read-only",
+            timeout_seconds=progress_lease,
+            progress_lease_seconds=progress_lease,
+            progress_managed_timeout=True,
+        )
+        try:
+            result: AgentResult = self.target_orchestrator._call_with_failover(request)
+            if not result.ok:
+                raise RuntimeError(self._agent_failure_detail(result))
+            raw = (result.summary or result.stdout or read_text(output_path)).strip()
+        finally:
+            output_path.unlink(missing_ok=True)
+        try:
+            payload = _extract_json_object(raw)
+        except ValueError as error:
+            payload = {"decision": "REJECT", "reason": str(error)}
+        design, errors = self._validate_repair_design(experiment, payload)
+        fingerprint = _search_stable_hash(design)
+        issues = [
+            dict(item)
+            for item in payload.get("issues", []) or []
+            if isinstance(item, Mapping)
+        ]
+        blocking_issues = [
+            item
+            for item in issues
+            if str(item.get("disposition", "")).strip()
+            == "contract_violation"
+            and str(item.get("causal_obligation_id", "")).strip()
+            in set(experiment.contract_obligation_ids)
+        ]
+        decision = str(payload.get("decision", "")).strip().upper()
+        disposition_only_rejection = bool(
+            decision == "REJECT"
+            and issues
+            and not blocking_issues
+            and all(
+                str(item.get("disposition", "")).strip()
+                == "unrelated_observation"
+                for item in issues
+            )
+        )
+        approved = bool(
+            (decision == "APPROVE" or disposition_only_rejection)
+            and not errors
+            and not blocking_issues
+            and fingerprint not in experiment.strategy_blacklist
+        )
+        experiment.design_history.append(
+            {
+                "event": "design_review",
+                "decision": "APPROVE" if approved else "REJECT",
+                "reason": str(payload.get("reason", ""))[:2000],
+                "errors": errors,
+                "blocking_issues": blocking_issues,
+                "ignored_unrelated_observations": len(issues) - len(blocking_issues),
+                "strategy_fingerprint": fingerprint,
+                "at": _utc_now_iso(),
+            }
+        )
+        experiment.design_history = experiment.design_history[-32:]
+        if not approved:
+            experiment.apply_automatic_correction(
+                reason="; ".join(
+                    [
+                        str(payload.get("reason", "")).strip(),
+                        *errors,
+                        *[
+                            str(item.get("reason", ""))
+                            for item in blocking_issues
+                        ],
+                    ]
+                ).strip("; "),
+                strategy_fingerprint=fingerprint,
+            )
+            self._experiment_store.save(experiment)
+            return False
+        experiment.repair_design = design
+        experiment.repair_design_fingerprint = fingerprint
+        experiment.finding_groups = [
+            dict(item) for item in design["components"]
+        ]
+        experiment.next_finding_group()
+        self._experiment_store.save(experiment)
+        return True
+
+    def _automatic_contract_reanalysis(
+        self,
+        experiment: SelfRepairExperiment,
+        candidate: SelfRepairResult,
+    ) -> bool:
+        """Admit only evidence-backed causal sub-obligations after a stall."""
+
+        if self.diagnosis is None or not hasattr(self.diagnosis, "to_dict"):
+            return False
+        original_commands = {
+            " ".join(str(command).split())
+            for command in getattr(
+                getattr(self.diagnosis, "final", None),
+                "verification_commands",
+                [],
+            )
+            or []
+            if str(command).strip()
+        }
+        if not original_commands:
+            return False
+        prompt = "\n".join(
+            [
+                "Re-evaluate only whether the frozen auto_agents repair contract omitted a causal sub-obligation.",
+                "Do not modify files. Generic hardening and follow-up work are forbidden.",
+                "Return KEEP unless the omission is directly anchored to an existing root obligation and one of the original reproduction commands.",
+                "Return exactly JSON: {\"decision\":\"KEEP|AMEND\",\"reason\":\"...\",\"additions\":[{\"parent_obligation_id\":\"root:...\",\"description\":\"...\",\"causal_chain\":[\"...\"],\"reproduction_command\":\"...\",\"evidence\":[\"...\"]}]}",
+                "FROZEN_CONTRACT:",
+                json.dumps(self._repair_contract_payload(experiment), ensure_ascii=False),
+                "ROOT_CAUSE:",
+                json.dumps(self._compact_diagnosis_payload(), ensure_ascii=False),
+                "STALL_EVIDENCE:",
+                " ".join(candidate.verification.split())[-2000:],
+            ]
+        )
+        lease = max(
+            60,
+            int(
+                getattr(
+                    self._autonomy_config(),
+                    "candidate_review_timeout_seconds",
+                    600,
+                )
+                or 600
+            ),
+        )
+        output_path = Path(tempfile.gettempdir()) / (
+            f"auto-agents-contract-arbiter-{uuid.uuid4().hex[:12]}.json"
+        )
+        request = AgentRequest(
+            stage="self_repair_contract_arbiter",
+            effort=self._review_effort(),
+            prompt=prompt,
+            cwd=self.repo_root,
+            output_path=output_path,
+            sandbox_mode="read-only",
+            timeout_seconds=lease,
+            progress_lease_seconds=lease,
+            progress_managed_timeout=True,
+        )
+        try:
+            result: AgentResult = self.target_orchestrator._call_with_failover(request)
+            if not result.ok:
+                return False
+            raw = (result.summary or result.stdout or read_text(output_path)).strip()
+            payload = _extract_json_object(raw)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            return False
+        finally:
+            output_path.unlink(missing_ok=True)
+        if str(payload.get("decision", "")).strip().upper() != "AMEND":
+            return False
+        additions = payload.get("additions", [])
+        if not isinstance(additions, list):
+            return False
+        admitted: list[str] = []
+        contract_ids = set(experiment.contract_obligation_ids)
+        for raw_addition in additions:
+            if not isinstance(raw_addition, Mapping):
+                continue
+            parent_id = str(
+                raw_addition.get("parent_obligation_id", "")
+            ).strip()
+            description = " ".join(
+                str(raw_addition.get("description", "")).split()
+            )
+            command = " ".join(
+                str(raw_addition.get("reproduction_command", "")).split()
+            )
+            causal_chain = [
+                str(item).strip()
+                for item in raw_addition.get("causal_chain", []) or []
+                if str(item).strip()
+            ]
+            evidence = [
+                str(item).strip()
+                for item in raw_addition.get("evidence", []) or []
+                if str(item).strip()
+            ]
+            if (
+                parent_id not in contract_ids
+                or not parent_id.startswith("root:")
+                or not description
+                or command not in original_commands
+                or len(causal_chain) < 2
+                or not evidence
+                or _supplemental_verification_skip_reason(
+                    command,
+                    repository_aliases={self.repo_root.name},
+                )
+            ):
+                continue
+            base_proof = self._run_verification_at_ref(
+                [command],
+                experiment.base_commit,
+            )
+            if base_proof.ok:
+                continue
+            obligation_id = (
+                f"root:amend:{_search_stable_hash(parent_id, description, length=12)}"
+            )
+            experiment.obligations[obligation_id] = {
+                "kind": "root_postcondition",
+                "status": "open",
+                "description": description,
+                "source": "automatic_contract_reanalysis",
+                "parent_obligation_id": parent_id,
+                "reproduction_command": command,
+                "evidence": evidence,
+            }
+            experiment.contract_obligation_ids.append(obligation_id)
+            admitted.append(obligation_id)
+        if not admitted:
+            return False
+        experiment.contract_obligation_ids = sorted(
+            set(experiment.contract_obligation_ids)
+        )
+        experiment.contract_fingerprint = ""
+        experiment.freeze_contract()
+        experiment.automatic_corrections.append(
+            {
+                "kind": "causal_contract_amendment",
+                "obligation_ids": admitted,
+                "reason": str(payload.get("reason", ""))[:2000],
+                "at": _utc_now_iso(),
+            }
+        )
+        experiment.automatic_corrections = experiment.automatic_corrections[-64:]
+        self._experiment_store.save(experiment)
+        return True
+
     def _run_search(self) -> SelfRepairResult:
         autonomy = self._autonomy_config()
         mode = str(
@@ -2570,28 +3114,23 @@ class AutoAgentsSelfRepairRunner:
                 reason="autonomous self-repair is disabled",
             )
         store, experiment = self._load_or_create_experiment()
+        if experiment.freeze_contract():
+            store.save(experiment)
         if experiment.status == "needs_human":
-            return SelfRepairResult(
-                ok=False,
-                status="patience_exhausted",
-                category=self.decision.category,
+            experiment.apply_automatic_correction(
                 reason=(
-                    "self-repair experiment already exhausted consecutive "
-                    "non-improving candidates and requires new operator evidence"
-                ),
-                experiment_id=experiment.experiment_id,
-                candidate_id=experiment.best_search_candidate_id,
-                candidate_ref=experiment.best_search_ref,
-                base_commit=experiment.base_commit,
+                    "legacy human-routing state converted to automatic "
+                    "design correction"
+                )
             )
+            store.save(experiment)
         experiment_id = experiment.experiment_id
         seen_fingerprints = {
             item.patch_fingerprint
             for item in experiment.candidates.values()
             if item.patch_fingerprint and not item.infrastructure_failure
         }
-        outcomes: list[SelfRepairResult] = []
-        while not experiment.patience_exhausted:
+        while True:
             live_head = head_ref(self.repo_root)
             if live_head and live_head != experiment.base_commit:
                 previous_base = experiment.base_commit
@@ -2619,6 +3158,12 @@ class AutoAgentsSelfRepairRunner:
                 experiment.best_search_candidate_id = "base"
                 experiment.best_search_ref = live_head
                 experiment.frontier = []
+                experiment.repair_design = {}
+                experiment.repair_design_fingerprint = ""
+                experiment.finding_groups = []
+                experiment.active_finding_group_id = ""
+                experiment.completed_contract_obligation_ids = []
+                experiment.completed_finding_ids = []
                 for historical_id, historical in experiment.candidates.items():
                     if historical_id != "base":
                         historical.fatal = historical_id != retained_candidate_id
@@ -2650,6 +3195,21 @@ class AutoAgentsSelfRepairRunner:
                     )
                     experiment._recompute_frontier()
                 store.save(experiment)
+            if not self._ensure_approved_repair_design(experiment):
+                continue
+            active_group = experiment.next_finding_group()
+            if active_group is None:
+                experiment.apply_automatic_correction(
+                    reason="approved design had no schedulable finding group"
+                )
+                store.save(experiment)
+                continue
+            self._candidate_group = dict(active_group)
+            self._candidate_is_final_group = sum(
+                1
+                for item in experiment.finding_groups
+                if str(item.get("status", "")) != "completed"
+            ) == 1
             self._migrate_recoverable_candidate_to_pending(experiment)
             if self._latest_pending_validation_ref(experiment.base_commit):
                 self._start_base_full_suite_prewarm(experiment.base_commit)
@@ -2707,18 +3267,19 @@ class AutoAgentsSelfRepairRunner:
                 if pending.recoverable_validation:
                     return pending
             attempt = experiment.attempt_count + 1
+            recent_records = [
+                item
+                for candidate_id, item in experiment.candidates.items()
+                if candidate_id != "base"
+            ][-3:]
             prior_failures = [
-                f"candidate {index}: {record.status}; "
-                f"reason={record.summary[-600:]}; "
-                f"verification={record.verification[-1200:]}"
-                for index, record in enumerate(
-                    (
-                        item
-                        for candidate_id, item in experiment.candidates.items()
-                        if candidate_id != "base"
-                    ),
-                    start=1,
+                (
+                    f"candidate={record.candidate_id} status={record.status} "
+                    f"group={record.finding_group_id or 'none'} "
+                    f"strategy={record.strategy_fingerprint or 'none'} "
+                    f"summary={' '.join(record.summary.split())[-300:]}"
                 )
+                for record in recent_records
             ]
             store.record_health(
                 experiment,
@@ -2756,11 +3317,31 @@ class AutoAgentsSelfRepairRunner:
                     infrastructure_failure=self._is_infrastructure_candidate_error(error),
                 )
             candidate.parent_candidate_id = experiment.best_search_candidate_id
+            if not candidate.finding_group_id:
+                candidate.finding_group_id = str(
+                    getattr(self, "_candidate_group", {}).get("group_id", "")
+                )
             if not candidate.base_commit:
                 candidate.base_commit = experiment.best_search_ref
             self._decorate_candidate_result(candidate, attempt=attempt)
-            outcomes.append(candidate)
             self._register_search_result(candidate)
+            semantic_repeat = bool(
+                not candidate.ok
+                and not candidate.infrastructure_failure
+                and experiment.candidates[candidate.candidate_id].semantic_state_fingerprint
+                and experiment.semantic_state_history.count(
+                    experiment.candidates[
+                        candidate.candidate_id
+                    ].semantic_state_fingerprint
+                )
+                > 1
+            )
+            if candidate.status == "candidate_group_completed":
+                experiment.mark_finding_group_completed(
+                    candidate.finding_group_id,
+                    candidate_id=candidate.candidate_id,
+                )
+                store.save(experiment)
             health = store.record_health(
                 experiment,
                 status=(
@@ -2773,17 +3354,20 @@ class AutoAgentsSelfRepairRunner:
                     f"progress={candidate.progress_kind} status={candidate.status}"
                 ),
             )
-            if health.get("anomaly") == "strategy_oscillation":
-                alternate_ids = [
-                    candidate_id
-                    for candidate_id in experiment.frontier
-                    if candidate_id != experiment.best_search_candidate_id
-                ]
-                if alternate_ids:
-                    alternate = experiment.candidates[alternate_ids[0]]
-                    experiment.best_search_candidate_id = alternate.candidate_id
-                    experiment.best_search_ref = alternate.candidate_ref
-                    store.save(experiment)
+            if semantic_repeat or health.get("anomaly") == "strategy_oscillation":
+                experiment.apply_automatic_correction(
+                    reason=(
+                        "semantic search state repeated"
+                        if semantic_repeat
+                        else "strategy oscillation detected"
+                    ),
+                    candidate_id=candidate.candidate_id,
+                    strategy_fingerprint=(
+                        experiment.repair_design_fingerprint
+                        or candidate.strategy_fingerprint
+                    ),
+                )
+                store.save(experiment)
             if candidate.ok:
                 experiment.status = "approved"
                 experiment.current_candidate_id = ""
@@ -2810,44 +3394,34 @@ class AutoAgentsSelfRepairRunner:
             if candidate.recoverable_validation:
                 store.save(experiment)
                 return candidate
-        experiment.status = "needs_human"
-        store.save(experiment)
-        store.record_health(
-            experiment,
-            status="needs_human",
-            detail="consecutive non-improving candidate patience exhausted",
-        )
-        best = experiment.candidates.get(experiment.best_search_candidate_id)
-        outcome_summary = [
-            "SELF_REPAIR_CANDIDATE_OUTCOMES:",
-            *(
-                f"- attempt={item.attempt} candidate={item.candidate_id or 'unknown'} "
-                f"stage={item.validation_stage or 'unknown'} rank={item.validation_rank} "
-                f"progress={item.progress_kind or 'none'} status={item.status} "
-                f"reason={item.reason}"
-                for item in outcomes
-            ),
-        ]
-        result = SelfRepairResult(
-            ok=False,
-            status="patience_exhausted",
-            category=self.decision.category,
-            reason=(
-                "autonomous self-repair stopped after "
-                f"{experiment.consecutive_non_improvements} consecutive "
-                "non-improving candidates; operator evidence is required"
-            ),
-            experiment_id=experiment_id,
-            candidate_id=experiment.best_search_candidate_id,
-            candidate_ref=experiment.best_search_ref,
-            candidate_commit=(best.candidate_commit if best is not None else ""),
-            base_commit=experiment.base_commit,
-            validation_stage=(best.validation_stage if best is not None else "generation"),
-            validation_rank=(best.validation_rank if best is not None else 0),
-            summary="\n".join(outcome_summary),
-        )
-        self._record_candidate_result(result, attempt=experiment.attempt_count)
-        return result
+            if experiment.patience_exhausted:
+                contract_amended = self._automatic_contract_reanalysis(
+                    experiment,
+                    candidate,
+                )
+                experiment.apply_automatic_correction(
+                    reason=(
+                        (
+                            "causal contract was automatically amended; "
+                            if contract_amended
+                            else "semantic net progress stalled; "
+                        )
+                        + "regenerate the design, "
+                        "split the active finding group, and avoid the failed strategy. "
+                        + " ".join(candidate.verification.split())[-1200:]
+                    ),
+                    candidate_id=candidate.candidate_id,
+                    strategy_fingerprint=(
+                        experiment.repair_design_fingerprint
+                        or candidate.strategy_fingerprint
+                    ),
+                )
+                store.record_health(
+                    experiment,
+                    status="automatic_correction",
+                    detail="net-progress convergence controller reset the design",
+                )
+                store.save(experiment)
 
     @staticmethod
     def _is_infrastructure_candidate_error(error: object) -> bool:
@@ -3244,10 +3818,9 @@ class AutoAgentsSelfRepairRunner:
                     f"{self._safe_repair_category()}/{experiment_id}/{candidate_id}"
                 )
                 update_ref(self.repo_root, candidate_ref, candidate_commit)
-                self._start_base_full_suite_prewarm(
-                    self._experiment.base_commit
-                )
                 strategy_fingerprint = _search_stable_hash(
+                    self._experiment.repair_design_fingerprint,
+                    str(getattr(self, "_candidate_group", {}).get("group_id", "")),
                     sorted(changed),
                     summary[-2000:],
                 )
@@ -3321,6 +3894,13 @@ class AutoAgentsSelfRepairRunner:
                     finding_id
                     for finding_id, finding in self._experiment.findings.items()
                     if finding.status in {"confirmed", "reopened"}
+                    and finding_id
+                    in set(
+                        getattr(self, "_candidate_group", {}).get(
+                            "finding_ids", []
+                        )
+                        or []
+                    )
                     and finding_id not in resolved_finding_ids
                 )
                 if review.ok and unresolved_prior_findings:
@@ -3360,13 +3940,18 @@ class AutoAgentsSelfRepairRunner:
                         resolved_finding_ids=resolved_finding_ids,
                         review_findings=review_findings,
                         diff_line_count=diff_line_count,
+                        finding_group_id=str(
+                            getattr(self, "_candidate_group", {}).get(
+                                "group_id", ""
+                            )
+                        ),
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
                     )
-                verification = self._run_verification(repair_root)
+                verification = self._run_active_group_verification(repair_root)
                 if not verification.ok:
                     baseline_verification = self._run_verification_at_ref(
-                        self_repair_verify_commands(),
+                        list(verification.payload.get("source_commands", [])),
                         base_head,
                     )
                     baseline_signature = self._verification_failure_signature(
@@ -3408,9 +3993,107 @@ class AutoAgentsSelfRepairRunner:
                         resolved_finding_ids=resolved_finding_ids,
                         review_findings=review_findings,
                         diff_line_count=diff_line_count,
+                        finding_group_id=str(
+                            getattr(self, "_candidate_group", {}).get(
+                                "group_id", ""
+                            )
+                        ),
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
                     )
+                if not bool(getattr(self, "_candidate_is_final_group", True)):
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_group_completed",
+                        category=self.decision.category,
+                        reason="approved finding group completed; continuing integration",
+                        summary=summary,
+                        verification="\n\n".join(
+                            part
+                            for part in (review.summary, verification.summary)
+                            if part
+                        ),
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                        candidate_commit=candidate_commit,
+                        candidate_ref=candidate_ref,
+                        patch_fingerprint=fingerprint,
+                        strategy_fingerprint=strategy_fingerprint,
+                        finding_ids=finding_ids,
+                        resolved_finding_ids=resolved_finding_ids,
+                        review_findings=review_findings,
+                        diff_line_count=diff_line_count,
+                        finding_group_id=str(
+                            getattr(self, "_candidate_group", {}).get(
+                                "group_id", ""
+                            )
+                        ),
+                        passed_obligations=[
+                            "safety:target_untouched",
+                            "safety:tests_not_weakened",
+                            "safety:scope_guard",
+                            "validation:focused",
+                        ],
+                    )
+                integration_verification = self._run_verification(repair_root)
+                if not integration_verification.ok:
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_verification_failed",
+                        category=self.decision.category,
+                        reason="integrated focused verification failed",
+                        summary=summary,
+                        verification="\n\n".join(
+                            part
+                            for part in (
+                                verification.summary,
+                                integration_verification.summary,
+                            )
+                            if part
+                        ),
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                        candidate_commit=candidate_commit,
+                        candidate_ref=candidate_ref,
+                        patch_fingerprint=fingerprint,
+                        strategy_fingerprint=strategy_fingerprint,
+                        finding_ids=finding_ids,
+                        resolved_finding_ids=resolved_finding_ids,
+                        review_findings=review_findings,
+                        diff_line_count=diff_line_count,
+                        finding_group_id=str(
+                            getattr(self, "_candidate_group", {}).get(
+                                "group_id", ""
+                            )
+                        ),
+                        passed_obligations=boundary_passed_obligations,
+                        failed_obligations=boundary_failed_obligations,
+                    )
+                verification = _VerificationResult(
+                    True,
+                    "\n\n".join(
+                        part
+                        for part in (
+                            verification.summary,
+                            integration_verification.summary,
+                        )
+                        if part
+                    ),
+                    commands=verification.commands + integration_verification.commands,
+                    returncodes=(
+                        verification.returncodes + integration_verification.returncodes
+                    ),
+                    termination_reasons=(
+                        verification.termination_reasons
+                        + integration_verification.termination_reasons
+                    ),
+                    duration_seconds=(
+                        verification.duration_seconds
+                        + integration_verification.duration_seconds
+                    ),
+                )
                 legacy_direct_attempt = self.diagnosis is None and self.decision.eligible
                 health_case = bool(
                     self.repair_case is not None
@@ -3448,9 +4131,71 @@ class AutoAgentsSelfRepairRunner:
                         resolved_finding_ids=resolved_finding_ids,
                         review_findings=review_findings,
                         diff_line_count=diff_line_count,
+                        finding_group_id=str(
+                            getattr(self, "_candidate_group", {}).get(
+                                "group_id", ""
+                            )
+                        ),
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
                     )
+                integration_review = self._review_candidate(
+                    repair_root,
+                    self._experiment.base_commit,
+                    progress_lease_seconds=review_progress_lease,
+                    replay_summary="\n\n".join(
+                        (replay.summary, differential.summary)
+                    ),
+                    phase="integration",
+                )
+                if not integration_review.ok:
+                    integration_findings = [
+                        dict(item)
+                        for item in integration_review.payload.get("findings", [])
+                        if isinstance(item, Mapping)
+                    ]
+                    return SelfRepairResult(
+                        ok=False,
+                        status="candidate_review_rejected",
+                        category=self.decision.category,
+                        reason="integration review rejected the repair",
+                        summary=summary,
+                        verification="\n\n".join(
+                            part
+                            for part in (
+                                verification.summary,
+                                replay.summary,
+                                differential.summary,
+                                integration_review.summary,
+                            )
+                            if part
+                        ),
+                        experiment_id=experiment_id,
+                        candidate_id=candidate_id,
+                        base_commit=base_head,
+                        candidate_commit=candidate_commit,
+                        candidate_ref=candidate_ref,
+                        patch_fingerprint=fingerprint,
+                        strategy_fingerprint=strategy_fingerprint,
+                        finding_ids=[
+                            str(item.get("finding_id", ""))
+                            for item in integration_findings
+                            if str(item.get("finding_id", ""))
+                        ],
+                        resolved_finding_ids=resolved_finding_ids,
+                        review_findings=integration_findings,
+                        diff_line_count=diff_line_count,
+                        finding_group_id=str(
+                            getattr(self, "_candidate_group", {}).get(
+                                "group_id", ""
+                            )
+                        ),
+                        passed_obligations=boundary_passed_obligations,
+                        failed_obligations=boundary_failed_obligations,
+                    )
+                self._start_base_full_suite_prewarm(
+                    self._experiment.base_commit
+                )
                 full_suite = self._full_suite_differential(
                     self._experiment.base_commit,
                     repair_root,
@@ -3503,6 +4248,11 @@ class AutoAgentsSelfRepairRunner:
                         resolved_finding_ids=resolved_finding_ids,
                         review_findings=review_findings,
                         diff_line_count=diff_line_count,
+                        finding_group_id=str(
+                            getattr(self, "_candidate_group", {}).get(
+                                "group_id", ""
+                            )
+                        ),
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
                     )
@@ -3515,13 +4265,15 @@ class AutoAgentsSelfRepairRunner:
                         full_suite.summary,
                         "PRE_VALIDATION_REVIEW:\n"
                         + json.dumps(review.payload, ensure_ascii=False),
+                        "INTEGRATION_REVIEW:\n"
+                        + json.dumps(integration_review.payload, ensure_ascii=False),
                     )
                     if part
                 )
                 proof_seal = self._deterministic_proof_seal(
                     repair_root,
                     candidate_commit=candidate_commit,
-                    review=review,
+                    review=integration_review,
                     replay=replay,
                     differential=differential,
                     focused=verification,
@@ -3551,6 +4303,11 @@ class AutoAgentsSelfRepairRunner:
                         resolved_finding_ids=resolved_finding_ids,
                         review_findings=review_findings,
                         diff_line_count=diff_line_count,
+                        finding_group_id=str(
+                            getattr(self, "_candidate_group", {}).get(
+                                "group_id", ""
+                            )
+                        ),
                         passed_obligations=[
                             *boundary_passed_obligations,
                             "validation:focused",
@@ -3584,6 +4341,9 @@ class AutoAgentsSelfRepairRunner:
                 approved.resolved_finding_ids = resolved_finding_ids
                 approved.review_findings = review_findings
                 approved.diff_line_count = diff_line_count
+                approved.finding_group_id = str(
+                    getattr(self, "_candidate_group", {}).get("group_id", "")
+                )
                 approved.passed_obligations = list(self._experiment.obligations)
                 delete_ref(self.repo_root, candidate_ref)
                 return approved
@@ -3651,36 +4411,52 @@ class AutoAgentsSelfRepairRunner:
             encoding="utf-8",
             capture_output=True,
         ).stdout
+        changed = set(changed_paths(repair_root))
+        active_group = dict(getattr(self, "_candidate_group", {}) or {})
+        experiment = getattr(self, "_experiment", None)
+        contract_payload = (
+            self._repair_contract_payload(experiment)
+            if isinstance(experiment, SelfRepairExperiment)
+            else []
+        )
+        blocking_findings = (
+            experiment.blocking_findings()
+            if isinstance(experiment, SelfRepairExperiment)
+            else []
+        )
         prompt = "\n".join(
             [
                 "Review this isolated auto_agents self-repair candidate.",
                 "Do not modify files or run mutating commands.",
                 "Reject test deletion, skip/xfail, weakened safety gates, hard-coded target data, "
                 "or changes that do not address the supplied root cause.",
-                "This is the complete semantic code review and the final model review. "
-                "Reject every unresolved code, lifecycle, scope, safety, or test-coverage "
-                "gap now, before expensive full-suite validation. The orchestrator will run "
-                "focused and base/candidate full-suite proof only after this review passes; "
-                "absence of those future execution results is not itself a finding.",
+                "The repair contract is frozen. Review only the active component, preservation "
+                "of completed components, and regressions introduced by this candidate. Do not "
+                "turn unrelated generic hardening into a blocker or follow-up task.",
+                "The orchestrator will run focused, boundary, and full-suite proof after the "
+                "appropriate review stage; absence of those future results is not a finding.",
                 "Return exactly JSON with decision, reason, findings, and resolved_finding_ids. "
                 "Each finding must contain finding_id, severity=fatal|hard|repairable, "
-                "obligation_id, reason, counterexample, required_test, evidence, and "
-                "defer_until='' (post-full-suite deferral is forbidden). "
+                "disposition=contract_violation|candidate_regression|unrelated_observation, "
+                "causal_obligation_id, affected_paths, reason, counterexample, required_test, "
+                "evidence, and defer_until=''. "
                 "Use stable semantic finding IDs and list prior finding IDs proven resolved.",
                 "Schema: {\"decision\":\"APPROVE|REJECT\",\"reason\":\"...\","
                 "\"findings\":[{\"finding_id\":\"...\",\"severity\":\"hard\","
-                "\"obligation_id\":\"...\",\"reason\":\"...\","
+                "\"disposition\":\"candidate_regression\","
+                "\"causal_obligation_id\":\"...\",\"affected_paths\":[\"...\"],"
+                "\"reason\":\"...\","
                 "\"counterexample\":\"...\",\"required_test\":\"...\","
                 "\"evidence\":[\"...\"],\"defer_until\":\"\"}],"
                 "\"resolved_finding_ids\":[\"...\"]}.",
                 f"REVIEW_PHASE: {phase}",
-                "ROOT_CAUSE:",
-                json.dumps(self.diagnosis.to_dict(), ensure_ascii=False),
-                "SEARCH_CONTEXT:",
+                "FROZEN_CONTRACT:",
+                json.dumps(contract_payload, ensure_ascii=False),
+                "ACTIVE_COMPONENT:",
+                json.dumps(active_group, ensure_ascii=False),
+                "OPEN_CONTRACT_FINDINGS:",
                 json.dumps(
-                    self._experiment.prompt_context()
-                    if hasattr(self, "_experiment")
-                    else {},
+                    [item.to_dict() for item in blocking_findings],
                     ensure_ascii=False,
                 ),
                 "SEALED_REPLAY:",
@@ -3720,33 +4496,62 @@ class AutoAgentsSelfRepairRunner:
         decision = str(payload.get("decision", "")).strip().upper()
         reason = str(payload.get("reason", "")).strip()
         raw_findings = payload.get("findings", [])
-        findings = [
+        raw_finding_dicts = [
             dict(item)
             for item in raw_findings
             if isinstance(raw_findings, list) and isinstance(item, Mapping)
         ]
-        if decision == "REJECT" and reason and not findings:
-            finding_id = "review:" + _search_stable_hash(reason, length=16)
-            findings = [
-                {
-                    "finding_id": finding_id,
-                    "status": "confirmed",
-                    "severity": "repairable",
-                    "obligation_id": "validation:adversarial_review",
-                    "reason": reason,
-                    "counterexample": reason,
-                    "required_test": "add a focused regression for the reviewer counterexample",
-                    "evidence": ["adversarial_candidate_review"],
-                    "defer_until": "",
-                }
-            ]
-        for finding in findings:
+        findings: list[dict[str, object]] = []
+        ignored_observations: list[dict[str, object]] = []
+        contract_ids = set(
+            experiment.contract_obligation_ids
+            if isinstance(experiment, SelfRepairExperiment)
+            else []
+        )
+        prior_ids = {
+            finding.finding_id for finding in blocking_findings
+        }
+        for finding in raw_finding_dicts:
             defer_until = str(finding.get("defer_until", "")).strip()
             finding["defer_until"] = ""
+            finding_id = str(finding.get("finding_id", "")).strip()
+            disposition = str(finding.get("disposition", "")).strip().lower()
+            causal_id = str(
+                finding.get(
+                    "causal_obligation_id",
+                    finding.get("obligation_id", ""),
+                )
+            ).strip()
+            affected_paths = {
+                str(item).strip()
+                for item in finding.get("affected_paths", []) or []
+                if str(item).strip()
+            }
+            if finding_id in prior_ids and causal_id in contract_ids:
+                disposition = "contract_violation"
+            accepted = bool(
+                finding_id
+                and (
+                    (disposition == "contract_violation" and causal_id in contract_ids)
+                    or (
+                        disposition == "candidate_regression"
+                        and bool(affected_paths & changed)
+                    )
+                )
+            )
+            finding["disposition"] = disposition or "unrelated_observation"
+            finding["causal_obligation_id"] = causal_id
+            if accepted:
+                finding["status"] = "confirmed"
+                findings.append(finding)
+            else:
+                finding["disposition"] = "unrelated_observation"
+                ignored_observations.append(finding)
         raw_resolved = payload.get("resolved_finding_ids", [])
         normalized_payload = {
             **payload,
             "findings": findings,
+            "ignored_unrelated_observations": ignored_observations,
             "resolved_finding_ids": [
                 str(item)
                 for item in raw_resolved
@@ -3754,7 +4559,7 @@ class AutoAgentsSelfRepairRunner:
                 if str(item).strip()
             ],
         }
-        review_ok = bool(reason) and not findings and decision == "APPROVE"
+        review_ok = bool(reason) and not findings and decision in {"APPROVE", "REJECT"}
         rendered_decision = decision or "INVALID"
         return _VerificationResult(
             review_ok,
@@ -5742,19 +6547,7 @@ class AutoAgentsSelfRepairRunner:
                 str(repair_root),
             )
 
-        if self.diagnosis is None:
-            diagnosis_payload = {}
-        elif hasattr(self.diagnosis, "to_dict"):
-            diagnosis_payload = self.diagnosis.to_dict()
-        else:
-            final = getattr(self.diagnosis, "final", None)
-            diagnosis_payload = {
-                "final": {
-                    "verification_commands": list(
-                        getattr(final, "verification_commands", []) or []
-                    )
-                }
-            }
+        diagnosis_payload = self._compact_diagnosis_payload()
         if target_evidence_root is not None:
             serialized = json.dumps(diagnosis_payload, ensure_ascii=False)
             diagnosis_payload = json.loads(
@@ -5799,6 +6592,13 @@ class AutoAgentsSelfRepairRunner:
                 ensure_ascii=False,
             ),
             "",
+            "Active approved design component:",
+            json.dumps(
+                dict(getattr(self, "_candidate_group", {}) or {}),
+                indent=2,
+                ensure_ascii=False,
+            ),
+            "",
             "Original run error:",
             error_text,
             "",
@@ -5820,13 +6620,14 @@ class AutoAgentsSelfRepairRunner:
             json.dumps(_compact_run_state(state_payload), indent=2, ensure_ascii=False),
             "",
             "Task:",
-            "Fix auto_agents itself with a generic orchestrator change.",
+            "Implement only the active approved design component in auto_agents.",
             "",
             "Hard scope rules:",
             "- Modify only the auto_agents repository.",
             "- Do not modify the target project.",
             "- Do not hard-code the target project path, task id, spec path, or one-off failure strings.",
             "- Implement a general fix for the auto_agents behavior that produced this error.",
+            "- Do not implement excluded work, future components, or unrelated hardening.",
             "- Add or update focused auto_agents tests that prove the generic behavior.",
             "- Preserve existing public CLI behavior except for the new self-repair recovery path.",
             "",
@@ -5853,6 +6654,43 @@ class AutoAgentsSelfRepairRunner:
         if result.summary and result.summary != result.stdout:
             parts.append(f"summary={result.summary[:500]}")
         return "; ".join(parts) if parts else "self-repair agent failed without output"
+
+    def _run_active_group_verification(
+        self,
+        verification_root: Path,
+    ) -> "_VerificationResult":
+        group = dict(getattr(self, "_candidate_group", {}) or {})
+        commands: list[str] = []
+        for command in group.get("focused_tests", []) or []:
+            normalized = " ".join(str(command).split())
+            if not normalized or normalized in commands:
+                continue
+            if _supplemental_verification_skip_reason(
+                normalized,
+                repository_aliases={self.repo_root.name, verification_root.name},
+            ):
+                continue
+            commands.append(normalized)
+        if not commands and self.diagnosis is not None:
+            for command in self.diagnosis.final.verification_commands:
+                normalized = " ".join(str(command).split())
+                if (
+                    normalized
+                    and normalized not in commands
+                    and not _supplemental_verification_skip_reason(
+                        normalized,
+                        repository_aliases={
+                            self.repo_root.name,
+                            verification_root.name,
+                        },
+                    )
+                ):
+                    commands.append(normalized)
+        if not commands:
+            commands = ["git diff --check"]
+        result = self._run_verification_commands(commands, verification_root)
+        result.payload["source_commands"] = commands
+        return result
 
     def _run_verification(
         self,
