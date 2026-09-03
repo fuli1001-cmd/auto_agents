@@ -381,6 +381,11 @@ def test_worker_probe_rejects_docker_client_without_reachable_daemon(
 
     assert "docker" not in probe["capabilities"]
     assert "docker" not in probe["runtimes"]
+    assert probe["checks"]["runtime_probes"]["docker"] == {
+        "state": "unavailable",
+        "returncode": 1,
+        "error": "Cannot connect to the Docker daemon",
+    }
 
 
 def test_worker_slot_lease_reports_persistent_memory_pressure(
@@ -853,6 +858,69 @@ def test_distributed_executor_slot_wait_has_absolute_deadline(
             lane="",
             wait_timeout_seconds=0.01,
         )
+
+
+def test_distributed_executor_reports_each_worker_rejection_and_actions(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    command = "container-backed verification"
+    executor = DistributedGatePlanExecutor(
+        project,
+        GateConfig(),
+        {
+            command: GateCommandMetadata(
+                resource_class="heavy",
+                requires=["docker", "ffmpeg"],
+            )
+        },
+    )
+    executor.endpoints = [
+        WorkerEndpoint(
+            worker_id="local-worker",
+            transport="local",
+            max_slots=2,
+            capabilities=("ffmpeg", "python"),
+            capability_details={
+                "docker": {
+                    "state": "unavailable",
+                    "error": "Cannot connect to the Docker daemon",
+                }
+            },
+        ),
+        WorkerEndpoint(
+            worker_id="small-worker",
+            transport="https",
+            max_slots=1,
+            capabilities=("docker", "ffmpeg"),
+        ),
+    ]
+    executor._endpoint_rejections = [
+        "offline-worker: probe failed (connection refused)"
+    ]
+
+    result = executor._run_uncached(
+        command,
+        timeout_seconds=30,
+        adaptive_timeout_enabled=False,
+        idle_timeout_seconds=10,
+    )
+
+    assert not result.ok
+    assert result.returncode == 125
+    assert "Verification could not start" in result.stderr
+    assert "Required worker: 2 slot(s); capabilities: docker, ffmpeg" in result.stderr
+    assert "local-worker (local): missing capabilities: docker" in result.stderr
+    assert "docker probe: Cannot connect to the Docker daemon" in result.stderr
+    assert "small-worker (https): total capacity 1 is below 2" in result.stderr
+    assert "offline-worker: probe failed (connection refused)" in result.stderr
+    assert "docker version" in result.stderr
+    assert "workers doctor --project <project>" in result.stderr
+    allocation = result.process_snapshot["worker_allocation"]
+    assert allocation["status"] == "no_eligible_worker"
+    assert allocation["required_slots"] == 2
+    assert allocation["required_capabilities"] == ["docker", "ffmpeg"]
+    assert len(allocation["workers"]) == 2
 
 
 def test_distributed_auto_parallelism_uses_gate_capacity() -> None:

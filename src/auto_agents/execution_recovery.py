@@ -7,7 +7,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Mapping, Optional
 
 from .config import run_path
 from .io_utils import read_json, write_json
@@ -441,6 +441,48 @@ def deterministic_diagnosis(incident: ExecutionIncident) -> Optional[IncidentDia
             reason="provider supervision termination uses the existing resume/failover route",
             evidence=[f"termination_reason={incident.termination_reason}"],
         )
+    worker_allocation = incident.process_snapshot.get("worker_allocation", {})
+    if (
+        incident.kind == "gate_infrastructure_error"
+        and isinstance(worker_allocation, dict)
+        and str(worker_allocation.get("status", "")).strip()
+    ):
+        reason = redact_incident_text(
+            worker_allocation.get("user_message", "") or incident.stderr_tail
+        ).strip()
+        workers = worker_allocation.get("workers", [])
+        evidence = (
+            [
+                (
+                    f"worker={item.get('worker_id', 'unknown')} "
+                    f"status={item.get('status', 'unknown')} "
+                    "reasons="
+                    + ", ".join(
+                        str(value) for value in item.get("reasons", [])
+                    )
+                )
+                for item in workers
+                if isinstance(item, dict)
+            ]
+            if isinstance(workers, list)
+            else []
+        )
+        return IncidentDiagnosis(
+            owner="verification_infrastructure",
+            action="REPAIR_INFRASTRUCTURE",
+            confidence=1.0,
+            reason=reason or "No eligible worker can run the verification command.",
+            evidence=evidence or [
+                f"worker_allocation_status={worker_allocation.get('status')}"
+            ],
+            cause_status="confirmed",
+            failure_domain="worker_pool",
+            mutation_domain="execution_environment",
+            expected_postconditions=[
+                "at least one worker has the required total slots and capabilities",
+                "worker connectivity and runtime probes succeed before the gate is rerun",
+            ],
+        )
     baseline_identity = incident.process_snapshot.get(
         BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY,
         {},
@@ -551,16 +593,50 @@ def parse_incident_diagnosis(raw: str) -> IncidentDiagnosis:
     payload = json.loads(text)
     if not isinstance(payload, dict):
         raise ValueError("incident diagnosis must be a JSON object")
+    raw_reason = payload.get("reason", "")
+    nested_cause_status = ""
+    if isinstance(raw_reason, Mapping):
+        nested_cause_status = (
+            str(raw_reason.get("cause_status", "")).strip().lower()
+        )
+        reason = next(
+            (
+                str(raw_reason.get(key, "")).strip()
+                for key in ("causation", "reason", "message", "summary")
+                if str(raw_reason.get(key, "")).strip()
+            ),
+            json.dumps(raw_reason, ensure_ascii=False, sort_keys=True),
+        )
+    else:
+        reason = str(raw_reason).strip()
+    raw_evidence = payload.get("evidence", [])
+    evidence: List[str] = []
+    if isinstance(raw_evidence, Mapping):
+        for group, values in raw_evidence.items():
+            if isinstance(values, list):
+                evidence.extend(
+                    f"{group}: {str(item).strip()}"
+                    for item in values
+                    if str(item).strip()
+                )
+            elif str(values).strip():
+                evidence.append(f"{group}: {str(values).strip()}")
+    elif isinstance(raw_evidence, list):
+        evidence = [
+            str(item).strip() for item in raw_evidence if str(item).strip()
+        ]
+    elif str(raw_evidence).strip():
+        evidence = [str(raw_evidence).strip()]
+    cause_status = str(payload.get("cause_status", "")).strip().lower()
+    if not cause_status:
+        cause_status = nested_cause_status or "unknown"
     diagnosis = IncidentDiagnosis(
         owner=str(payload.get("owner", "unknown")),
         action=str(payload.get("action", "ASK_USER")).upper(),
         confidence=float(payload.get("confidence", 0.0)),
-        reason=str(payload.get("reason", "")).strip(),
-        evidence=[
-            str(item).strip() for item in payload.get("evidence", [])
-            if str(item).strip()
-        ],
-        cause_status=str(payload.get("cause_status", "unknown")).strip().lower(),
+        reason=reason,
+        evidence=evidence,
+        cause_status=cause_status,
         source="provider",
     )
     if not diagnosis.valid():

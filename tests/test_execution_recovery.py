@@ -261,6 +261,49 @@ class ExecutionRecoveryTests(unittest.TestCase):
         self.assertEqual(diagnosis.action, "STOP")
         self.assertEqual(diagnosis.confidence, 1.0)
 
+    def test_worker_allocation_failure_has_deterministic_actionable_diagnosis(
+        self,
+    ) -> None:
+        message = (
+            "Verification could not start: no eligible worker can run this command.\n"
+            "Required worker: 2 slot(s); capabilities: docker, ffmpeg.\n"
+            "Suggested actions:\n- Start the Docker daemon."
+        )
+        incident = ExecutionIncident(
+            incident_id="worker-pool-1",
+            run_id="run-1",
+            source="gate",
+            kind="gate_infrastructure_error",
+            stage="implement",
+            context="task verification",
+            command="pytest tests/integration",
+            stderr_tail=message,
+            process_snapshot={
+                "worker_allocation": {
+                    "status": "no_eligible_worker",
+                    "user_message": message,
+                    "workers": [
+                        {
+                            "worker_id": "local-worker",
+                            "status": "ineligible",
+                            "reasons": ["missing capabilities: docker"],
+                        }
+                    ],
+                }
+            },
+        )
+
+        diagnosis = deterministic_diagnosis(incident)
+
+        self.assertIsNotNone(diagnosis)
+        assert diagnosis is not None
+        self.assertEqual(diagnosis.owner, "verification_infrastructure")
+        self.assertEqual(diagnosis.action, "REPAIR_INFRASTRUCTURE")
+        self.assertEqual(diagnosis.cause_status, "confirmed")
+        self.assertEqual(diagnosis.failure_domain, "worker_pool")
+        self.assertIn("Required worker: 2 slot(s)", diagnosis.reason)
+        self.assertIn("missing capabilities: docker", diagnosis.evidence[0])
+
     def test_recover_target_with_redacted_command_pauses_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
@@ -508,6 +551,52 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 incident.repair_history[-1]["action"],
                 "recreated_from_pyproject",
             )
+
+    def test_unmanaged_infrastructure_blocker_does_not_claim_repair_attempts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            message = (
+                "Verification could not start: no eligible worker can run this command.\n"
+                "Suggested actions:\n- Start a compatible worker."
+            )
+            incident = ExecutionIncident(
+                incident_id="worker-pool-2",
+                run_id=state.run_id,
+                source="gate",
+                kind="gate_infrastructure_error",
+                stage="implement",
+                context="task verification",
+                command="pytest tests/integration",
+                evidence_fingerprint="worker-pool-evidence",
+                process_snapshot={
+                    "worker_allocation": {
+                        "status": "no_eligible_worker",
+                        "user_message": message,
+                    }
+                },
+            )
+
+            recovered = orchestrator._apply_execution_incident_diagnosis(
+                state,
+                incident,
+                IncidentDiagnosis(
+                    owner="verification_infrastructure",
+                    action="REPAIR_INFRASTRUCTURE",
+                    confidence=1.0,
+                    reason=message,
+                    cause_status="confirmed",
+                ),
+            )
+
+            self.assertFalse(recovered)
+            self.assertEqual(state.last_error, message)
+            self.assertNotIn("repair exhausted", state.last_error.lower())
+            self.assertEqual(incident.repair_history, [])
 
     def test_missing_conda_supersedes_misrouted_target_recovery_task(
         self,
@@ -1218,6 +1307,26 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 '{"owner":"target_project","action":"DELETE_TESTS",'
                 '"confidence":1,"reason":"fast","evidence":[]}'
             )
+
+    def test_agent_diagnosis_normalizes_nested_reason_and_evidence(self) -> None:
+        diagnosis = parse_incident_diagnosis(
+            '{"owner":"verification_infrastructure",'
+            '"action":"REPAIR_INFRASTRUCTURE","confidence":0.98,'
+            '"reason":{"cause_status":"confirmed",'
+            '"causation":"No eligible worker has Docker."},'
+            '"evidence":{"observed":["command did not start"],'
+            '"inferred":["worker pool needs repair"]}}'
+        )
+
+        self.assertEqual(diagnosis.reason, "No eligible worker has Docker.")
+        self.assertEqual(diagnosis.cause_status, "confirmed")
+        self.assertEqual(
+            diagnosis.evidence,
+            [
+                "observed: command did not start",
+                "inferred: worker pool needs repair",
+            ],
+        )
 
     def test_baseline_stall_schedules_prebaseline_recovery_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -144,6 +144,16 @@ def enrich_worker_probe(probe: Mapping[str, object]) -> dict[str, object]:
         capability: {"state": "available"}
         for capability in sorted(capabilities)
     }
+    checks = probe.get("checks", {})
+    runtime_probes = (
+        checks.get("runtime_probes", {})
+        if isinstance(checks, Mapping)
+        else {}
+    )
+    if isinstance(runtime_probes, Mapping):
+        for capability, runtime_probe in runtime_probes.items():
+            if isinstance(runtime_probe, Mapping):
+                details[str(capability)] = dict(runtime_probe)
     if "chrome" in capabilities:
         browser = (
             shutil.which("google-chrome")
@@ -934,8 +944,13 @@ def worker_probe(environment_id: str = "") -> dict[str, object]:
             "--version",
         ],
     }
+    runtime_probes: dict[str, object] = {}
     for name, command in runtime_commands.items():
         if not command[0]:
+            runtime_probes[name] = {
+                "state": "missing",
+                "error": f"no {name} executable resolved on PATH",
+            }
             continue
         try:
             result = subprocess.run(
@@ -945,18 +960,36 @@ def worker_probe(environment_id: str = "") -> dict[str, object]:
                 capture_output=True,
                 timeout=15,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as error:
+            runtime_probes[name] = {
+                "state": "unavailable",
+                "error": str(error),
+            }
             continue
         if result.returncode == 0:
             runtimes[name] = (
                 result.stdout.strip() or result.stderr.strip()
             ).splitlines()[0][:300]
+            runtime_probes[name] = {
+                "state": "healthy",
+                "version": runtimes[name],
+            }
             if name == "docker" and runtimes[name]:
                 # A Docker client alone cannot run container-backed proofs.
                 # `docker version` with a Server template succeeds only when
                 # the daemon is reachable, so advertise the capability after
                 # that stronger probe rather than after PATH discovery.
                 capabilities.add("docker")
+        else:
+            detail = " ".join(
+                (result.stderr.strip() or result.stdout.strip()).split()
+            )[:500]
+            runtime_probes[name] = {
+                "state": "unavailable",
+                "returncode": result.returncode,
+                "error": detail or f"{name} runtime probe failed",
+            }
+    checks["runtime_probes"] = runtime_probes
     return {
         "ok": ok,
         "protocol_version": WORKER_PROTOCOL_VERSION,

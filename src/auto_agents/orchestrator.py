@@ -12987,11 +12987,22 @@ class Orchestrator:
                     "cannot be reproduced safely",
                 )
             if diagnosis.action == "REPAIR_INFRASTRUCTURE":
+                managed_attempts = [
+                    item
+                    for item in incident.repair_history
+                    if isinstance(item, dict)
+                ]
+                reason = diagnosis.reason
+                if managed_attempts:
+                    reason = (
+                        "Managed worker/runtime repair was attempted but did not "
+                        "restore a usable candidate.\n"
+                        + diagnosis.reason
+                    )
                 return self._block_for_execution_incident(
                     state,
                     incident,
-                    "managed worker/runtime repair exhausted all eligible candidates: "
-                    + diagnosis.reason,
+                    reason,
                 )
             self._schedule_prebaseline_recovery_task(state, incident)
         else:

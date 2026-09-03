@@ -895,6 +895,11 @@ run `npm ci` for discovered `package-lock.json` files. Workers therefore need co
 runtimes and network access to the configured package registries. Later jobs reuse that immutable
 cache.
 
+If a verification command cannot be allocated, the run summary reports the required slots and
+capabilities, explains why each discovered worker was rejected, and gives capability-, capacity-,
+and connectivity-specific recovery actions. Use `auto-agents workers doctor --project <project>`
+to confirm that at least one worker satisfies the complete command contract before rerunning.
+
 The default project setting is:
 
 ```json

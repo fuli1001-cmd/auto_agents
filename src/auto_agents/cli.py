@@ -550,12 +550,39 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
             ]
         )
 
+    active_blocker = (
+        dict(state_payload.get("active_blocker", {}))
+        if isinstance(state_payload.get("active_blocker", {}), dict)
+        else {}
+    )
+    if status == "pending" and active_blocker.get("status") == "localized":
+        task_id = str(active_blocker.get("task_id", "")).strip()
+        reason = str(
+            active_blocker.get("reason") or state_payload.get("last_error", "")
+        ).strip()
+        lines = [
+            (
+                f"Run stopped at stage: {current_stage}; "
+                + (
+                    f"task {task_id} is blocked."
+                    if task_id
+                    else "a task is blocked."
+                )
+            ),
+            *([f"Problem:\n{reason}"] if reason else []),
+            "Other independent tasks remain pending, so the persisted run status is pending.",
+            "",
+            "Key files to review:",
+            *[f"- {item}" for item in key_files],
+            "",
+            "Next steps:",
+            f"- Resolve the reported blocker, then rerun: {run_cmd}",
+            f"- Inspect persisted status: {status_cmd}",
+        ]
+        return "\n".join(lines)
+
     if status == "blocked":
-        blocker = (
-            dict(state_payload.get("active_blocker", {}))
-            if isinstance(state_payload.get("active_blocker", {}), dict)
-            else {}
-        )
+        blocker = active_blocker
         reason = str(blocker.get("reason") or state_payload.get("last_error", "")).strip()
         triage = blocker.get("self_repair_triage")
         root_cause_lines: list[str] = []

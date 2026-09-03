@@ -18,6 +18,7 @@ from auto_agents.cli import (
     _auto_repair_auto_agents_and_resume,
     _preflight_automatic_self_repair,
     _promote_pending_self_repairs,
+    _render_run_summary,
     _run_command_for_self_repair_resume,
     build_parser,
     main,
@@ -300,6 +301,37 @@ class ProjectRunLockTests(unittest.TestCase):
 
 
 class ProjectValidationTests(unittest.TestCase):
+    def test_pending_run_summary_surfaces_localized_blocker_and_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            reason = (
+                "Verification could not start: no eligible worker can run this command.\n"
+                "Suggested actions:\n- Start the Docker daemon."
+            )
+
+            rendered = _render_run_summary(
+                project_root,
+                {
+                    "status": "pending",
+                    "current_stage": "implement",
+                    "run_id": "run-worker-pool",
+                    "last_error": reason,
+                    "active_blocker": {
+                        "status": "localized",
+                        "task_id": "task-037",
+                        "reason": reason,
+                    },
+                },
+            )
+
+            self.assertIn(
+                "Run stopped at stage: implement; task task-037 is blocked.",
+                rendered,
+            )
+            self.assertIn(reason, rendered)
+            self.assertIn("persisted run status is pending", rendered)
+            self.assertNotIn("Run finished with status: pending", rendered)
+
     def test_self_repair_resume_binds_active_collab_root_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

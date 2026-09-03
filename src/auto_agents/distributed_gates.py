@@ -47,6 +47,14 @@ class _EndpointAcquireCancelled(RuntimeError):
     """Raised when a queued gate command no longer needs a worker slot."""
 
 
+class _WorkerAllocationError(RuntimeError):
+    """Carry a user-facing worker-pool diagnosis into execution incidents."""
+
+    def __init__(self, message: str, details: Mapping[str, object]) -> None:
+        super().__init__(message)
+        self.details = dict(details)
+
+
 class DistributedGatePlanExecutor:
     """Dispatch isolated gates to the local executor and paired LAN workers."""
 
@@ -91,6 +99,7 @@ class DistributedGatePlanExecutor:
         self._active_slots: dict[str, int] = {}
         self.endpoints: list[WorkerEndpoint] = []
         self.clients: dict[str, WorkerClient] = {}
+        self._endpoint_rejections: list[str] = []
 
     def __enter__(self) -> "DistributedGatePlanExecutor":
         self.local.__enter__()
@@ -244,6 +253,7 @@ class DistributedGatePlanExecutor:
                 )
                 self.endpoints.append(endpoint)
                 self.clients[endpoint.worker_id] = client
+        self._endpoint_rejections = list(rejection_reasons)
         if distributed.mode == "required" and len(self.endpoints) == 1:
             self.local.close()
             detail = "; ".join(rejection_reasons[:8])
@@ -333,6 +343,166 @@ class DistributedGatePlanExecutor:
         required = self._requires(command)
         return not required or required.issubset(set(endpoint.capabilities))
 
+    def _worker_allocation_error(
+        self,
+        command: str,
+        *,
+        status: str,
+        exclude: set[str],
+        allow_local_reuse: bool = True,
+    ) -> _WorkerAllocationError:
+        required_slots = self._required_slots(command)
+        required_capabilities = sorted(self._requires(command))
+        assessments: list[dict[str, object]] = []
+        missing_capabilities: set[str] = set()
+        capacity_shortfall = False
+        busy = False
+        for endpoint in self.endpoints:
+            capabilities = sorted(set(endpoint.capabilities))
+            missing = sorted(set(required_capabilities) - set(capabilities))
+            missing_details: dict[str, object] = {}
+            active_slots = self._active_slots.get(endpoint.worker_id, 0)
+            available_slots = max(0, endpoint.max_slots - active_slots)
+            already_tried = bool(
+                endpoint.worker_id in exclude
+                and not (allow_local_reuse and endpoint.transport == "local")
+            )
+            reasons: list[str] = []
+            if already_tried:
+                reasons.append("already tried")
+            if endpoint.max_slots < required_slots:
+                reasons.append(
+                    f"total capacity {endpoint.max_slots} is below {required_slots}"
+                )
+                capacity_shortfall = True
+            if missing:
+                reasons.append("missing capabilities: " + ", ".join(missing))
+                missing_capabilities.update(missing)
+                for capability in missing:
+                    detail = endpoint.capability_details.get(capability, {})
+                    if not isinstance(detail, Mapping):
+                        continue
+                    missing_details[capability] = dict(detail)
+                    error = " ".join(str(detail.get("error", "")).split())
+                    if error:
+                        reasons.append(
+                            f"{capability} probe: {error[:500]}"
+                        )
+            if not reasons and available_slots < required_slots:
+                reasons.append(
+                    f"only {available_slots} of {endpoint.max_slots} slots are currently available"
+                )
+                busy = True
+            assessments.append(
+                {
+                    "worker_id": endpoint.worker_id,
+                    "transport": endpoint.transport,
+                    "status": "eligible" if not reasons else "ineligible",
+                    "reasons": reasons,
+                    "required_slots": required_slots,
+                    "available_slots": available_slots,
+                    "max_slots": endpoint.max_slots,
+                    "required_capabilities": required_capabilities,
+                    "capabilities": capabilities,
+                    "missing_capabilities": missing,
+                    "missing_capability_details": missing_details,
+                }
+            )
+
+        rejection_reasons = list(getattr(self, "_endpoint_rejections", []))
+        capability_text = ", ".join(required_capabilities) or "none"
+        headline = {
+            "slot_wait_timeout": (
+                "Verification could not start: worker slot scheduling timed out."
+            ),
+            "pinned_worker_ineligible": (
+                "Verification could not start: the worker pinned to the sequential "
+                "gate lane no longer satisfies the command."
+            ),
+        }.get(
+            status,
+            "Verification could not start: no eligible worker can run this command.",
+        )
+        lines = [
+            headline,
+            (
+                f"Required worker: {required_slots} slot(s); "
+                f"capabilities: {capability_text}."
+            ),
+            "Worker checks:",
+        ]
+        if assessments:
+            for assessment in assessments:
+                worker_id = str(assessment["worker_id"])
+                transport = str(assessment["transport"])
+                reasons = [str(item) for item in assessment["reasons"]]
+                outcome = "; ".join(reasons) if reasons else "eligible but unavailable"
+                lines.append(
+                    f"- {worker_id} ({transport}): {outcome}; slots "
+                    f"{assessment['available_slots']}/{assessment['max_slots']} available."
+                )
+        else:
+            lines.append("- No local or remote worker endpoint was available.")
+        for rejection in rejection_reasons[:8]:
+            lines.append(f"- Unavailable worker/pool: {rejection}.")
+
+        suggestions: list[str] = []
+        for capability in sorted(missing_capabilities):
+            if capability == "docker":
+                suggestions.append(
+                    "Start or reconnect the Docker daemon on a worker and verify "
+                    "`docker version --format '{{.Server.Version}}'` succeeds."
+                )
+            elif capability == "ffmpeg":
+                suggestions.append(
+                    "Install or expose FFmpeg on a worker and verify "
+                    "`ffmpeg -version` succeeds."
+                )
+            elif capability == "chrome":
+                suggestions.append(
+                    "Install or expose a supported Chrome/Chromium runtime on a worker."
+                )
+            else:
+                suggestions.append(
+                    f"Provision capability `{capability}` on at least one worker."
+                )
+        if capacity_shortfall:
+            suggestions.append(
+                f"Start or reconfigure a worker with at least {required_slots} total slots."
+            )
+        if busy:
+            suggestions.append(
+                "Wait for the listed worker slots to be released or add worker capacity."
+            )
+        if rejection_reasons:
+            suggestions.append(
+                "Start or reconnect the unavailable paired workers and restart workers after upgrades."
+            )
+        suggestions.extend(
+            [
+                "Run `auto-agents workers doctor --project <project>` to verify "
+                "connectivity, runtime compatibility, capabilities, and capacity.",
+                "Rerun the gate after at least one worker satisfies every "
+                "listed requirement.",
+            ]
+        )
+        lines.append("Suggested actions:")
+        lines.extend(f"- {item}" for item in dict.fromkeys(suggestions))
+        message = "\n".join(lines)
+        return _WorkerAllocationError(
+            message,
+            {
+                "schema_version": 1,
+                "status": status,
+                "required_slots": required_slots,
+                "required_capabilities": required_capabilities,
+                "workers": assessments,
+                "endpoint_rejections": rejection_reasons,
+                "suggested_actions": list(dict.fromkeys(suggestions)),
+                "user_message": message,
+            },
+        )
+
     def _try_acquire(self, endpoint: WorkerEndpoint, required: int) -> bool:
         with self._slot_condition:
             active = self._active_slots.get(endpoint.worker_id, 0)
@@ -366,17 +536,21 @@ class DistributedGatePlanExecutor:
                 endpoint.max_slots < required
                 or not self._endpoint_supports(endpoint, command)
             ):
-                raise RuntimeError(
-                    "the worker pinned to the sequential gate lane no longer "
-                    "satisfies this command's capacity or capabilities"
+                raise self._worker_allocation_error(
+                    command,
+                    status="pinned_worker_ineligible",
+                    exclude=exclude,
+                    allow_local_reuse=allow_local_reuse,
                 )
             while not self._try_acquire(endpoint, required):
                 if cancel_event is not None and cancel_event.is_set():
                     raise _EndpointAcquireCancelled
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(
-                        "worker slot scheduling timed out while waiting for "
-                        f"{required} slot(s) on {endpoint.worker_id}"
+                    raise self._worker_allocation_error(
+                        command,
+                        status="slot_wait_timeout",
+                        exclude=exclude,
+                        allow_local_reuse=allow_local_reuse,
                     )
                 with self._slot_condition:
                     self._slot_condition.wait(
@@ -387,9 +561,11 @@ class DistributedGatePlanExecutor:
             if cancel_event is not None and cancel_event.is_set():
                 raise _EndpointAcquireCancelled
             if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    "worker slot scheduling timed out while waiting for "
-                    f"{required} slot(s)"
+                raise self._worker_allocation_error(
+                    command,
+                    status="slot_wait_timeout",
+                    exclude=exclude,
+                    allow_local_reuse=allow_local_reuse,
                 )
             candidates = [
                 endpoint
@@ -407,10 +583,11 @@ class DistributedGatePlanExecutor:
                     and self._endpoint_supports(endpoint, command)
                 ]
             if not candidates:
-                requirements = ", ".join(sorted(self._requires(command))) or "none"
-                raise RuntimeError(
-                    "no untried worker has enough slots and required capabilities "
-                    f"({requirements})"
+                raise self._worker_allocation_error(
+                    command,
+                    status="no_eligible_worker",
+                    exclude=exclude,
+                    allow_local_reuse=allow_local_reuse,
                 )
             with self._lock:
                 candidates.sort(
@@ -806,6 +983,13 @@ class DistributedGatePlanExecutor:
                     stderr="command cancelled while waiting for a worker slot",
                     termination_reason="cancelled",
                 )
+            except _WorkerAllocationError as error:
+                result.stderr = str(error)
+                result.process_snapshot = {
+                    **dict(result.process_snapshot),
+                    "worker_allocation": dict(error.details),
+                }
+                return result
             except RuntimeError as error:
                 result.stderr = str(error)
                 return result
