@@ -1484,6 +1484,122 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertFalse(changed_again)
             self.assertEqual(state.status, "blocked")
 
+    def test_installed_approved_self_repair_reopens_once_per_engine_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.last_error = "approved repair did not cross live boundary"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "session_health_projection_mismatch",
+                "fingerprint": "health-boundary-1",
+                "status": "blocked",
+                "self_repair_commit": "repair-commit",
+                "self_repair_failure": {
+                    "reason": state.last_error,
+                    "verification": "1 passed; exit=0",
+                },
+                "root_cause_diagnosis": {
+                    "final": {
+                        "expected_postconditions": [
+                            "publisher and auditor projections match"
+                        ]
+                    }
+                },
+            }
+            orchestrator = Orchestrator(project_root)
+
+            with (
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_revision",
+                    return_value="engine-revision-2",
+                ),
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_contains_commit",
+                    return_value=True,
+                ),
+            ):
+                changed = orchestrator._prepare_installed_self_repair_resume(state)
+
+            self.assertTrue(changed)
+            self.assertEqual(state.status, "pending")
+            self.assertEqual(state.last_error, "")
+            self.assertEqual(state.active_blocker["status"], "retrying")
+            self.assertEqual(
+                state.active_blocker["installed_engine_recovery_revision"],
+                "engine-revision-2",
+            )
+            self.assertEqual(
+                state.active_blocker["installed_engine_recovery_postcondition_count"],
+                1,
+            )
+
+            state.status = "blocked"
+            state.active_blocker["status"] = "blocked"
+            with (
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_revision",
+                    return_value="engine-revision-2",
+                ),
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_contains_commit",
+                    return_value=True,
+                ),
+            ):
+                changed_again = orchestrator._prepare_installed_self_repair_resume(
+                    state
+                )
+
+            self.assertFalse(changed_again)
+            self.assertEqual(state.status, "blocked")
+
+    def test_installed_self_repair_requires_commit_and_postcondition_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.status = "blocked"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "engine_failure",
+                "status": "blocked",
+                "self_repair_commit": "repair-commit",
+                "self_repair_failure": {"verification": "1 passed; exit=0"},
+                "root_cause_diagnosis": {
+                    "final": {"expected_postconditions": []}
+                },
+            }
+
+            with patch.object(
+                orchestrator,
+                "_installed_engine_contains_commit",
+                return_value=True,
+            ):
+                self.assertFalse(
+                    orchestrator._prepare_installed_self_repair_resume(state)
+                )
+
+            state.active_blocker["root_cause_diagnosis"]["final"][
+                "expected_postconditions"
+            ] = ["repair is observable"]
+            with patch.object(
+                orchestrator,
+                "_installed_engine_contains_commit",
+                return_value=False,
+            ):
+                self.assertFalse(
+                    orchestrator._prepare_installed_self_repair_resume(state)
+                )
+
+            self.assertEqual(state.status, "blocked")
+
     def test_validation_report_rejects_empty_plan_after_plan_stage(self) -> None:
         for lineage_key in ("previous_run_id", "restarted_blocked_run_id"):
             with self.subTest(lineage_key=lineage_key), tempfile.TemporaryDirectory() as tmp:

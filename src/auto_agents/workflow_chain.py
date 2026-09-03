@@ -814,6 +814,7 @@ class IssueBriefBuilder:
             "actual": str(payload.get("actual", "")).strip(),
             "evidence_refs": _string_list(payload.get("evidence_refs")),
             "affected_contracts": _string_list(payload.get("affected_contracts")),
+            "constraints": _string_list(payload.get("constraints")),
             "verification_command": str(payload.get("verification_command", "")).strip(),
             "source_handoff_id": str(payload.get("source_handoff_id", "")).strip(),
             "updated_at": utc_now(),
@@ -833,6 +834,7 @@ class IssueBriefBuilder:
         reproduction = _string_list(issue.get("reproduction"))
         evidence = _string_list(issue.get("evidence_refs"))
         contracts = _string_list(issue.get("affected_contracts"))
+        constraints = _string_list(issue.get("constraints"))
         return "\n".join(
             [
                 f"# Issue: {issue.get('summary') or issue.get('reported_goal') or issue.get('issue_id')}",
@@ -860,6 +862,10 @@ class IssueBriefBuilder:
                 "## Affected Contracts",
                 "",
                 *(_markdown_items(contracts) or ["- No affected contract recorded."]),
+                "",
+                "## Constraints",
+                "",
+                *(_markdown_items(constraints) or ["- No additional constraints recorded."]),
                 "",
                 "## Verification",
                 "",

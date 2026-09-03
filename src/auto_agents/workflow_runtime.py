@@ -672,9 +672,11 @@ class WorkflowCoordinator:
             raise RuntimeError(f"unsupported handoff target: {handoff.target}")
 
         native_status = str(result.get("status", "failed"))
-        if native_status in {"failed", "blocked"} and str(
-            result.get("resolution", "")
-        ) != "active_run_conflict":
+        discard_child_mutations = bool(result.get("discard_child_mutations", False))
+        if discard_child_mutations or (
+            native_status in {"failed", "blocked"}
+            and str(result.get("resolution", "")) != "active_run_conflict"
+        ):
             result["rolled_back_paths"] = self._rollback_handoff_uncommitted(
                 snapshot,
                 handoff,
@@ -834,6 +836,32 @@ class WorkflowCoordinator:
     def _drive_fix_child(self, handoff: WorkflowHandoff, snapshot: WorkflowSnapshot) -> Dict[str, object]:
         from .session import Session
 
+        current = load_run_state(self.project_root)
+        if self.orch._prepare_installed_self_repair_resume(current):
+            save_run_state(self.project_root, current)
+            blocker = (
+                dict(current.active_blocker)
+                if isinstance(current.active_blocker, dict)
+                else {}
+            )
+            return {
+                "status": "completed",
+                "resolution": "installed_engine_recovery_prepared",
+                "summary": (
+                    "The installed auto_agents revision contains the approved "
+                    "self-repair and reopened the blocked run through its durable "
+                    "retry lifecycle."
+                ),
+                "run_id": current.run_id,
+                "self_repair_commit": str(
+                    blocker.get("self_repair_commit", "")
+                ),
+                "head_before": str(handoff.payload.get("head_before", "")),
+                "head_after": head_ref(self.project_root),
+                "changed_paths": [],
+                "discard_child_mutations": handoff.child is not None,
+            }
+
         session = Session(
             self.orch,
             mode="fix",
@@ -855,6 +883,39 @@ class WorkflowCoordinator:
             str(current.resume_context.get("parent_handoff_id", ""))
             == handoff.handoff_id
         )
+        if (
+            handoff.child is None
+            and current.status != "completed"
+            and not existing_same_handoff
+            and self.orch._prepare_installed_self_repair_resume(current)
+        ):
+            save_run_state(self.project_root, current)
+            if self.run_lock is not None:
+                self.run_lock.bind_subject("run", current.run_id)
+            if self.health_runtime is not None:
+                self.health_runtime.bind_subject(current.run_id)
+                self.health_runtime.set_phase("run")
+            context = dict(current.resume_context)
+            existing_spec_file = Path(
+                str(context.get("spec_file", self.project_root / "spec.md"))
+            )
+            try:
+                current = self.orch.run(
+                    spec_file=existing_spec_file,
+                    auto_approve=bool(
+                        self.auto_approve or context.get("auto_approve", False)
+                    ),
+                    print_agent_output=bool(
+                        self.print_agent_output
+                        or context.get("print_agent_output", False)
+                    ),
+                    provider_kind=(
+                        str(context.get("provider_kind", "")).strip() or None
+                    ),
+                    autonomy_mode=getattr(self.orch, "_autonomy_mode", None),
+                )
+            except RuntimeError:
+                current = load_run_state(self.project_root)
         if (
             handoff.child is None
             and current.status != "completed"

@@ -604,10 +604,8 @@ class Session:
                     continue
 
             if self.mode == "fix":
-                disposition, disposition_error = self._parse_protocol_json(
-                    _FIX_DISPOSITION,
-                    reply,
-                    label="FIX_DISPOSITION v1",
+                disposition, disposition_error = self._parse_fix_disposition(
+                    reply
                 )
                 if disposition_error:
                     state.conversation.append(
@@ -964,11 +962,12 @@ class Session:
             )
         return normalized, ""
 
-    def _route_collab_foreign_fix_disposition(
+    def _parse_fix_disposition(
         self,
-        state: SessionState,
         reply: str,
-    ) -> Tuple[Optional[SessionState], str]:
+    ) -> Tuple[Optional[Dict[str, object]], str]:
+        """Accept both documented and legacy structured fix dispositions."""
+
         disposition, error = self._parse_protocol_json(
             _FIX_DISPOSITION,
             reply,
@@ -981,6 +980,14 @@ class Session:
                 version="v1",
                 label="FIX_DISPOSITION v1",
             )
+        return disposition, error
+
+    def _route_collab_foreign_fix_disposition(
+        self,
+        state: SessionState,
+        reply: str,
+    ) -> Tuple[Optional[SessionState], str]:
+        disposition, error = self._parse_fix_disposition(reply)
         if error or disposition is None:
             return None, error
 
@@ -1205,6 +1212,15 @@ class Session:
             return (
                 f"resume_handoff_id {resume_handoff_id} belongs to another "
                 "workflow."
+            )
+        if (
+            original.parent.kind != state.mode
+            or original.parent.native_id != state.session_id
+        ):
+            return (
+                f"Handoff {resume_handoff_id} was not routed by the current "
+                f"{state.mode} session {state.session_id}; a session cannot "
+                "resume its parent or a sibling handoff."
             )
         if original.child is None:
             return f"Handoff {resume_handoff_id} has no child to resume."
@@ -1526,11 +1542,7 @@ class Session:
             })
             self._save(state)
 
-            disposition, disposition_error = self._parse_protocol_json(
-                _FIX_DISPOSITION,
-                reply,
-                label="FIX_DISPOSITION v1",
-            )
+            disposition, disposition_error = self._parse_fix_disposition(reply)
             if disposition_error:
                 restore_guard.cleanup()
                 feedback = disposition_error
@@ -2554,9 +2566,34 @@ class Session:
             "",
             f"User's {label} description:",
             state.goal,
-            "",
-            "--- Conversation History ---",
         ]
+        if self.mode == "fix" and state.parent_handoff_id:
+            issue_path = (
+                self.project_root
+                / ".auto-agents"
+                / "state"
+                / "sessions"
+                / state.session_id
+                / "issue.md"
+            )
+            routed_issue = read_text(issue_path).strip() if issue_path.is_file() else ""
+            if routed_issue:
+                lines.extend(
+                    [
+                        "",
+                        "--- Authoritative Routed Issue Brief ---",
+                        f"Source: {issue_path}",
+                        routed_issue,
+                        "",
+                        (
+                            "This routed issue brief defines the child fix scope. "
+                            "Its expected/actual behavior and constraints take "
+                            "precedence over the broader reported goal, which remains "
+                            "the parent workflow's acceptance target."
+                        ),
+                    ]
+                )
+        lines.extend(["", "--- Conversation History ---"])
         for msg in state.conversation:
             role = msg.get("role", "user")
             content = msg.get("content", "")
@@ -2569,11 +2606,14 @@ class Session:
         ])
         if self.mode == "fix":
             lines.extend([
-                "- Before modifying files, classify the work and output exactly one single-line FIX_DISPOSITION v1 JSON object.",
+                "- This clarification/classification phase is read-only. Do not modify files, create generated artifacts, or run mutating commands.",
+                "- Classify the work and put the disposition in the final response before any implementation begins.",
                 "- decision='fix' only for a bounded defect against existing behavior; include summary, reason, reproduction, expected, actual, evidence_refs, affected_contracts, verification_command, and persistence_change.",
                 "- decision='run_iteration' when resolution needs new public capability, changed requirements, architecture expansion, or a persistence-model change; include reason and spec_seed with title, goal, gap, capability, acceptance, non_goals, evidence, and open_decisions.",
                 "- decision='not_bug' for expected/configuration/user-misunderstanding cases, decision='need_user' with question when evidence is insufficient, or decision='resume_child' with resume_handoff_id for a prior routed child.",
-                "- FIX_DISPOSITION v1 must be valid JSON on one line and must be the only disposition marker.",
+                "- Preferred exact wire form: FIX_DISPOSITION v1: {\"decision\":\"...\",...}",
+                "- Do not encode the marker only as a JSON field and do not place the disposition only in commentary or tool output.",
+                "- The final response must contain the valid one-line disposition and no other disposition marker; put the explanation inside its JSON fields.",
                 "- Match repository verification conventions when choosing verification_command.",
                 "- If the project uses a local conda env at ./.conda, every Python-oriented "
                 "verification_command must run inside it via 'conda run -p ./.conda ...'.",
@@ -2593,11 +2633,30 @@ class Session:
                     "- Otherwise, if the goal is clear enough for more read-only diagnosis, output 'GOAL_CLEAR' on a line by itself at the end.",
                 ]
             )
-        lines.extend([
-            "- Always explain your understanding before asking questions or declaring ready.",
-            "- Never infer permission to discard or migrate persistent data. Ask the user when an explicit decision is missing.",
-            self.orch._document_language_instruction(),
-        ])
+        if self.mode != "fix":
+            lines.append(
+                "- Always explain your understanding before asking questions or declaring ready."
+            )
+        lines.extend(
+            [
+                "- Never infer permission to discard or migrate persistent data. Ask the user when an explicit decision is missing.",
+                (
+                    "- A user-visible generated artifact is not successful when it "
+                    "comes from a fake, mock, fixture, placeholder, or synthetic "
+                    "adapter unless the user explicitly requested a stub. File "
+                    "existence, status flags, and technical media probes alone do "
+                    "not prove semantic or visual acceptance."
+                ),
+                (
+                    "- For generated deliverables, verify that content matches the "
+                    "user input and that provider provenance satisfies the requested "
+                    "acceptance. If a real or paid provider, credential, or approval "
+                    "is required, request that input instead of substituting a fake "
+                    "artifact."
+                ),
+                self.orch._document_language_instruction(),
+            ]
+        )
         return "\n".join(lines)
 
     def _build_provider_resolve_prompt(self, state: SessionState, feedback: str) -> str:
@@ -3013,9 +3072,12 @@ class Session:
             resume_provider=resume_provider,
             sandbox_mode=(
                 "read-only"
-                if self.mode == "collab"
-                and acceleration.enabled
-                and acceleration.collab_read_only_enabled
+                if label.startswith("converse-")
+                or (
+                    self.mode == "collab"
+                    and acceleration.enabled
+                    and acceleration.collab_read_only_enabled
+                )
                 else "workspace-write"
             ),
             stream_output=(

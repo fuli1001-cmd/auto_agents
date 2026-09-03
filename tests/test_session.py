@@ -50,7 +50,7 @@ from auto_agents.models import (
 from auto_agents.orchestrator import Orchestrator
 from auto_agents.requirements import load_requirements_trace, stamp_requirement_contract_hashes
 from auto_agents.session import Session
-from auto_agents.workflow_chain import WorkflowRef, WorkflowStore
+from auto_agents.workflow_chain import IssueBriefBuilder, WorkflowRef, WorkflowStore
 from auto_agents.workflow_runtime import WorkflowCoordinator
 
 
@@ -1078,6 +1078,135 @@ class SessionCollabFlowTests(unittest.TestCase):
                 if item.get("action") == "collab_foreign_disposition_normalized"
             )
             self.assertTrue(normalized["discarded_persistence_change"])
+
+    def test_fix_converse_accepts_enveloped_disposition_in_read_only_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "fix")
+            state.goal = "Repair export"
+            state.conversation = [{"role": "user", "content": state.goal}]
+            save_session_state(project_root, state)
+            orchestrator = Orchestrator(project_root)
+            reply = json.dumps(
+                {
+                    "FIX_DISPOSITION": "v1",
+                    "decision": "fix",
+                    "summary": "Repair export",
+                    "reason": "Existing bounded defect",
+                    "reproduction": ["Export a result"],
+                    "expected": "Export succeeds",
+                    "actual": "Export fails",
+                    "evidence_refs": [],
+                    "affected_contracts": ["export"],
+                    "verification_command": "",
+                    "persistence_change": {
+                        "storage_transition": "none",
+                        "compatibility_policy": "not_applicable",
+                    },
+                }
+            )
+            requests = []
+
+            def mock_run(request):
+                requests.append(request)
+                write_text(request.output_path, reply)
+                return AgentResult(
+                    ok=True,
+                    command=["mock"],
+                    output_path=request.output_path,
+                    summary=reply,
+                    stdout=reply,
+                    returncode=0,
+                )
+
+            orchestrator._call_with_failover = mock_run
+            result = Session(orchestrator, mode="fix")._phase_converse(state)
+
+            self.assertEqual(result.status, "executing")
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0].sandbox_mode, "read-only")
+
+    def test_routed_fix_prompt_preserves_authoritative_constraints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            state = create_session(project_root, "fix")
+            state.goal = "Generate a video"
+            state.parent_handoff_id = "handoff-engine-fix"
+            IssueBriefBuilder(project_root, state.session_id).materialize(
+                {
+                    "summary": "Repair the engine lifecycle",
+                    "reported_goal": state.goal,
+                    "constraints": [
+                        "The defect is in auto_agents; do not modify product code."
+                    ],
+                    "source_handoff_id": state.parent_handoff_id,
+                }
+            )
+
+            prompt = Session(
+                Orchestrator(project_root), mode="fix"
+            )._build_converse_prompt(state)
+
+            self.assertIn("Authoritative Routed Issue Brief", prompt)
+            self.assertIn("Repair the engine lifecycle", prompt)
+            self.assertIn(
+                "The defect is in auto_agents; do not modify product code.",
+                prompt,
+            )
+            self.assertIn("take precedence over the broader reported goal", prompt)
+            self.assertIn("fake, mock, fixture, placeholder", prompt)
+
+    def test_fix_cannot_resume_its_parent_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            store = WorkflowStore(project_root)
+            snapshot = store.create_root(WorkflowRef("collab", "parent-collab"))
+            handoff = store.prepare_handoff(
+                snapshot,
+                parent=WorkflowRef("collab", "parent-collab"),
+                target="fix",
+                goal="Repair engine",
+                reason="engine defect",
+                payload={},
+            )
+            store.bind_child(snapshot, handoff, WorkflowRef("fix", "child-fix"))
+            state = SessionState(
+                session_id="child-fix",
+                mode="fix",
+                workflow_id=snapshot.workflow_id,
+                parent_handoff_id=handoff.handoff_id,
+            )
+
+            error = Session(
+                Orchestrator(project_root), mode="fix"
+            )._resume_handoff_error(state, handoff.handoff_id)
+
+            self.assertIn("cannot resume its parent or a sibling handoff", error)
+
+    def test_resume_rejects_current_session_handoff_without_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = _make_project(tmp)
+            store = WorkflowStore(project_root)
+            snapshot = store.create_root(WorkflowRef("fix", "parent-fix"))
+            handoff = store.prepare_handoff(
+                snapshot,
+                parent=WorkflowRef("fix", "parent-fix"),
+                target="run",
+                goal="Add export",
+                reason="new capability",
+                payload={},
+            )
+            state = SessionState(
+                session_id="parent-fix",
+                mode="fix",
+                workflow_id=snapshot.workflow_id,
+            )
+
+            error = Session(
+                Orchestrator(project_root), mode="fix"
+            )._resume_handoff_error(state, handoff.handoff_id)
+
+            self.assertIn("has no child to resume", error)
 
     def test_collab_loop_normalizes_fix_disposition_marker_to_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -747,6 +747,135 @@ class RoutedWorkflowTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "completed")
 
+    def test_installed_engine_recovery_supersedes_bad_fix_child_and_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            write_text(root / "app.py", "value = 1\n")
+            _commit_baseline(root)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator)
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", "parent-collab")
+            )
+            handoff = coordinator.store.prepare_handoff(
+                snapshot,
+                parent=WorkflowRef("collab", "parent-collab"),
+                target="fix",
+                goal="Generate a video",
+                reason="repair installed engine blocker",
+                payload={"head_before": "baseline"},
+            )
+            coordinator._ensure_handoff_checkpoint(snapshot, handoff)
+            coordinator.store.bind_child(
+                snapshot,
+                handoff,
+                WorkflowRef("fix", "bad-child"),
+            )
+            write_text(root / "app.py", "invalid child mutation\n")
+            parent = SessionState(
+                session_id="parent-collab",
+                mode="collab",
+                status="waiting_child",
+                workflow_id=snapshot.workflow_id,
+                active_handoff_id=handoff.handoff_id,
+            )
+
+            with patch.object(
+                orchestrator,
+                "_prepare_installed_self_repair_resume",
+                return_value=True,
+            ):
+                returned = coordinator._drive_handoff(parent, parent, snapshot)
+
+            self.assertIsNotNone(returned)
+            self.assertEqual((root / "app.py").read_text(), "value = 1\n")
+            recorded = coordinator.store.load_handoff(handoff.handoff_id)
+            self.assertEqual(recorded.status, "completed")
+            self.assertEqual(
+                recorded.result["resolution"],
+                "installed_engine_recovery_prepared",
+            )
+            self.assertEqual(recorded.result["rolled_back_paths"], ["app.py"])
+
+    def test_run_route_finishes_recovered_engine_run_before_new_iteration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _make_project(tmp)
+            _commit_baseline(root)
+            old_spec = root / "old-spec.md"
+            write_text(old_spec, "# Existing iteration\n")
+            current = load_run_state(root)
+            old_run_id = current.run_id
+            current.status = "blocked"
+            current.current_stage = "readme"
+            current.resume_context = {"spec_file": str(old_spec)}
+            current.active_blocker = {
+                "owner": "auto_agents",
+                "category": "engine_boundary",
+                "status": "blocked",
+                "self_repair_commit": "repair-commit",
+                "self_repair_failure": {"verification": "1 passed; exit=0"},
+                "root_cause_diagnosis": {
+                    "final": {"expected_postconditions": ["run can resume"]}
+                },
+            }
+            save_run_state(root, current)
+            orchestrator = Orchestrator(root)
+            coordinator = WorkflowCoordinator(orchestrator, auto_approve=True)
+            snapshot = coordinator.store.create_root(
+                WorkflowRef("collab", "parent-collab")
+            )
+            handoff = coordinator.store.prepare_handoff(
+                snapshot,
+                parent=WorkflowRef("collab", "parent-collab"),
+                target="run",
+                goal="Add provider capability",
+                reason="new capability",
+                payload={
+                    "spec_seed": {
+                        "title": "Provider capability",
+                        "goal": "Add provider capability",
+                        "gap": "Capability is missing",
+                        "capability": "Generate a real video",
+                        "acceptance": ["A real video is generated"],
+                        "non_goals": [],
+                        "evidence": [],
+                        "open_decisions": [],
+                    }
+                },
+            )
+            calls = []
+
+            def fake_run(**kwargs):
+                state = load_run_state(root)
+                calls.append((state.run_id, Path(kwargs["spec_file"])))
+                state.status = "completed"
+                state.current_stage = "readme"
+                save_run_state(root, state)
+                return state
+
+            orchestrator.run = fake_run
+            with (
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_revision",
+                    return_value="engine-revision-2",
+                ),
+                patch.object(
+                    orchestrator,
+                    "_installed_engine_contains_commit",
+                    return_value=True,
+                ),
+            ):
+                result = coordinator._drive_run_child(handoff, snapshot)
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0], (old_run_id, old_spec))
+            self.assertNotEqual(calls[1][0], old_run_id)
+            self.assertIsNotNone(handoff.child)
+            self.assertEqual(handoff.child.kind, "run")
+            self.assertEqual(handoff.child.native_id, calls[1][0])
+
     def test_standalone_fix_can_upgrade_to_run_and_verify_original_issue(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = _make_project(tmp)

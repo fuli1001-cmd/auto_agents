@@ -1018,6 +1018,127 @@ class Orchestrator:
         source_fingerprint = hasher.hexdigest()
         return f"{revision or 'source'}:{source_fingerprint}"
 
+    @classmethod
+    def _installed_engine_contains_commit(cls, commit_sha: str) -> bool:
+        """Prove that an approved repair commit is present in this engine."""
+
+        candidate = str(commit_sha).strip()
+        if not candidate:
+            return False
+        engine_root = Path(__file__).resolve().parents[2]
+        installed_head = head_ref(engine_root)
+        if not installed_head:
+            return False
+        return cls._git_commit_is_ancestor(
+            engine_root,
+            candidate,
+            installed_head,
+        )
+
+    def _prepare_installed_self_repair_resume(self, state: RunState) -> bool:
+        """Reopen a blocked run when its approved repair is now installed.
+
+        A repair can pass its isolated verification and still fail while crossing
+        the live process boundary.  The durable blocker then retains both the
+        approved commit and its verification evidence but is reset to ``blocked``.
+        On a later invocation, resume it once per installed engine revision only
+        when that engine demonstrably contains the approved commit.
+        """
+
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        if str(blocker.get("owner", "")).strip() != "auto_agents":
+            return False
+
+        commit_sha = str(blocker.get("self_repair_commit", "")).strip()
+        failure = (
+            dict(blocker.get("self_repair_failure", {}))
+            if isinstance(blocker.get("self_repair_failure"), dict)
+            else {}
+        )
+        diagnosis = (
+            dict(blocker.get("root_cause_diagnosis", {}))
+            if isinstance(blocker.get("root_cause_diagnosis"), dict)
+            else {}
+        )
+        final = (
+            dict(diagnosis.get("final", {}))
+            if isinstance(diagnosis.get("final"), dict)
+            else {}
+        )
+        expected_postconditions = [
+            str(item).strip()
+            for item in final.get("expected_postconditions", []) or []
+            if str(item).strip()
+        ]
+        if (
+            not commit_sha
+            or not str(failure.get("verification", "")).strip()
+            or not expected_postconditions
+            or not self._installed_engine_contains_commit(commit_sha)
+        ):
+            return False
+
+        revision = self._installed_engine_revision()
+        recovery_revisions = state.resume_context.get(
+            self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
+            {},
+        )
+        if not isinstance(recovery_revisions, dict):
+            recovery_revisions = {}
+        fingerprint = str(blocker.get("fingerprint", "")).strip()
+        category = str(blocker.get("category", "")).strip()
+        recovery_key = "approved_self_repair:" + hashlib.sha256(
+            f"{category}\0{fingerprint}\0{commit_sha}".encode("utf-8")
+        ).hexdigest()[:24]
+
+        already_prepared = bool(
+            state.status == "pending"
+            and str(blocker.get("status", "")) == "retrying"
+            and str(blocker.get("installed_engine_recovery_revision", ""))
+            == revision
+            and str(blocker.get("prepared_self_repair_commit", "")).strip()
+            != commit_sha
+        )
+        if already_prepared:
+            return True
+        if (
+            state.status != "blocked"
+            or str(blocker.get("status", "blocked")) != "blocked"
+            or str(recovery_revisions.get(recovery_key, "")) == revision
+        ):
+            return False
+
+        recovery_revisions[recovery_key] = revision
+        state.resume_context[self.INSTALLED_ENGINE_RECOVERY_CONTEXT] = (
+            recovery_revisions
+        )
+        blocker.update(
+            {
+                "status": "retrying",
+                "installed_engine_recovery_revision": revision,
+                "installed_engine_recovery_commit": commit_sha,
+                "installed_engine_recovery_postcondition_count": len(
+                    expected_postconditions
+                ),
+                "updated_at": utc_now_iso(),
+            }
+        )
+        state.active_blocker = blocker
+        state.status = "pending"
+        state.last_error = ""
+        self.logger.info(
+            "[self-repair] reopened approved repair from installed engine "
+            "revision=%s commit=%s category=%s",
+            revision.split(":", 1)[0],
+            commit_sha[:12],
+            category or "auto_agents_error",
+        )
+        return True
+
     def _normalize_installed_requirement_namespace_repair(
         self,
         state: RunState,
@@ -2723,6 +2844,8 @@ class Orchestrator:
                 save_run_state(self.project_root, state)
             if not restart_blocked:
                 if self._normalize_installed_requirement_namespace_repair(state):
+                    save_run_state(self.project_root, state)
+                if self._prepare_installed_self_repair_resume(state):
                     save_run_state(self.project_root, state)
                 if self._resume_blocked_run(state):
                     save_run_state(self.project_root, state)
