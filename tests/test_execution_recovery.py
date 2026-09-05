@@ -12,6 +12,7 @@ from auto_agents.execution_recovery import (
     ExecutionIncident,
     ExecutionIncidentStore,
     IncidentDiagnosis,
+    ParallelLaneFailure,
     command_incident,
     deterministic_diagnosis,
     parse_incident_diagnosis,
@@ -32,6 +33,7 @@ from auto_agents.gates import (
     GateCommandBaselineIdentityError,
     GateCommandInfrastructureError,
     GateCommandTimeoutError,
+    build_failure_identity_diagnostic_command,
     classify_reported_infrastructure_failure,
 )
 from auto_agents.infrastructure_repair import InfrastructureRepairResult
@@ -56,6 +58,49 @@ from auto_agents.config import (
 
 
 class ExecutionRecoveryTests(unittest.TestCase):
+    def test_parallel_lane_infrastructure_incident_round_trips(self) -> None:
+        payload = ParallelLaneFailure(
+            task={"task_id": "lane-a", "status": "blocked"},
+            operation="verification",
+            owner="verification_infrastructure",
+            automatic_retryable=False,
+            resumable=True,
+            reason="verification token=classified was unavailable",
+            redacted_evidence="API_KEY=classified\nservice unavailable",
+            current_failure_ids=["tests/test_boundary.py::test_service"],
+            baseline_failure_ids=["tests/test_boundary.py::test_service"],
+            new_failure_ids=[],
+            owned_failure_ids=["tests/test_boundary.py::test_service"],
+            failure_class="baseline_only_owned",
+            baseline_comparison_comparable=True,
+            base_ref="abc123",
+            checkpoint={
+                "status": "recoverable",
+                "resume_mode": "gate_recheck",
+            },
+            command_incident={
+                "context": "parallel verification",
+                "baseline": False,
+            },
+            implementation_completed=True,
+        ).to_dict()
+
+        restored = ParallelLaneFailure.from_dict(payload)
+        round_tripped = restored.to_dict()
+
+        self.assertEqual(round_tripped["schema_version"], 1)
+        self.assertEqual(round_tripped["kind"], "parallel_lane_failure")
+        self.assertEqual(round_tripped["new_failure_ids"], [])
+        self.assertEqual(
+            round_tripped["current_failure_ids"],
+            ["tests/test_boundary.py::test_service"],
+        )
+        self.assertEqual(round_tripped["checkpoint"]["resume_mode"], "gate_recheck")
+        self.assertTrue(round_tripped["baseline_comparison_comparable"])
+        self.assertTrue(round_tripped["implementation_completed"])
+        self.assertNotIn("classified", round_tripped["reason"])
+        self.assertNotIn("classified", round_tripped["redacted_evidence"])
+
     def test_command_incident_redacts_secrets_and_is_stable(self) -> None:
         result = CommandResult(
             command="pytest -q --token=abc",
@@ -3358,6 +3403,309 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 "baseline_failure_identity_reparsed",
             )
             self.assertEqual(persisted.history[-1]["failure_ids"], [node_id])
+
+    def test_baseline_failure_identity_resume_routes_current_selector_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            subprocess.run(
+                ["git", "config", "user.name", "Auto Agents Tests"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "tests@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+
+            relative_test = Path("tests/test_selector_contract.py")
+            selector = f"{relative_test.as_posix()}::test_current_contract"
+            test_path = root / relative_test
+            test_path.parent.mkdir(parents=True)
+            test_path.write_text(
+                "def test_existing_contract():\n"
+                "    assert True\n",
+                encoding="utf-8",
+            )
+            baseline_ref = commit_all(root, "test: seed immutable baseline")
+            baseline_source = subprocess.run(
+                ["git", "show", f"{baseline_ref}:{relative_test.as_posix()}"],
+                cwd=root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout
+
+            test_path.write_text(
+                baseline_source
+                + "\n\n"
+                + "def test_current_contract():\n"
+                + "    assert True\n",
+                encoding="utf-8",
+            )
+            current_ref = commit_all(root, "test: add current selector")
+            self.assertNotIn("test_current_contract", baseline_source)
+            self.assertIn("test_current_contract", test_path.read_text(encoding="utf-8"))
+
+            command = f"python -m pytest -q {selector}"
+            orchestrator = Orchestrator(root)
+            orchestrator.config.gates.verification_policy_version = 3
+            orchestrator.config.gates.incremental_mode = "auto"
+            orchestrator.config.gates.steps = [
+                VerificationStep(proof_id="selector-contract", command=command)
+            ]
+            task = TaskSpec(
+                task_id="contract-task",
+                title="Verify a selector introduced after the baseline",
+                description="Retain the immutable baseline across engine repair.",
+                acceptance=["The current selector failure is routed normally."],
+                status="blocked",
+                verification_refs=[f"cmd:{command}"],
+                verify_baseline_ref=baseline_ref,
+                verify_baseline_source_ref=baseline_ref,
+                verify_baseline_schema_version=2,
+                verify_retry_epoch=2,
+            )
+            baseline_identity = (
+                task.verify_baseline_ref.encode("utf-8"),
+                task.verify_baseline_source_ref.encode("utf-8"),
+            )
+            state = load_run_state(root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [task]
+            state.last_error = "the immutable baseline selector was unresolved"
+            state.last_recovery_route = {
+                "task_id": task.task_id,
+                "lineage_id": task.task_id,
+                "outcome": "blocked",
+            }
+            state.resume_context["implementation_ready_tasks"] = {
+                task.task_id: True,
+            }
+            incident_id = "baseline-selector-identity"
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                "incident_id": incident_id,
+                "reason": state.last_error,
+                "status": "blocked",
+            }
+            missing_output = (
+                f"ERROR: not found: {selector}\n"
+                "(no match in any of [<Module test_selector_contract.py>])\n"
+            )
+            incident = ExecutionIncident(
+                incident_id=incident_id,
+                run_id=state.run_id,
+                source="gate",
+                kind=BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+                stage="implement",
+                context=f"lazy task baseline verification ({task.task_id})",
+                command=command,
+                task_id=task.task_id,
+                baseline=True,
+                returncode=4,
+                stdout_tail=missing_output,
+                process_snapshot={
+                    "baseline_failure_identity": {
+                        "status": "unresolved",
+                        "contract": "stable_test_failure_ids",
+                    }
+                },
+                status="self_repair",
+            )
+            store = ExecutionIncidentStore(root, state.run_id)
+            store.save(incident, state)
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(root, state)
+
+            marked = orchestrator.mark_self_repair_applied(
+                "engine-selector-repair",
+                verification="focused selector recovery passed",
+            )
+            resumed = Orchestrator(root)
+            resumed.config.gates.verification_policy_version = 3
+            resumed.config.gates.incremental_mode = "auto"
+            resumed.config.gates.steps = [
+                VerificationStep(proof_id="selector-contract", command=command)
+            ]
+            self.assertTrue(resumed._resume_blocked_run(marked))
+            resumed_task = next(
+                candidate
+                for candidate in marked.tasks
+                if candidate.task_id == task.task_id
+            )
+            self.assertEqual(resumed_task.status, "pending")
+            self.assertEqual(resumed_task.verify_retry_epoch, 3)
+            self.assertNotIn(
+                task.task_id,
+                marked.resume_context.get("implementation_ready_tasks", {}),
+            )
+            self.assertEqual(
+                (
+                    resumed_task.verify_baseline_ref.encode("utf-8"),
+                    resumed_task.verify_baseline_source_ref.encode("utf-8"),
+                ),
+                baseline_identity,
+            )
+
+            current_output = "verification failed before pytest reported test ids\n"
+            current_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout=current_output,
+                    )
+                ],
+                summary="current verification contract failed",
+            )
+            diagnostic_gate = GateResult(
+                ok=True,
+                commands=[
+                    CommandResult(
+                        command=build_failure_identity_diagnostic_command(command),
+                        ok=True,
+                        returncode=0,
+                        stdout=f"{selector} PASSED\n",
+                    )
+                ],
+                summary="the exact current selector passed",
+            )
+            baseline_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=4,
+                        stdout=missing_output,
+                    )
+                ],
+                summary="the immutable baseline does not contain the selector",
+            )
+
+            with (
+                patch.object(resumed, "_quick_verify_failure", return_value=None),
+                patch.object(
+                    resumed,
+                    "_run_task_gate_commands_for_commands",
+                    side_effect=[(current_gate, ""), (baseline_gate, "")],
+                ),
+                patch.object(
+                    resumed,
+                    "_run_verify_failure_identity_diagnostic",
+                    return_value=diagnostic_gate,
+                ),
+                patch.object(
+                    resumed,
+                    "_validated_baseline_failures",
+                    side_effect=AssertionError(
+                        "baseline-only selector absence must bypass identity validation"
+                    ),
+                ),
+            ):
+                verify_result = resumed._run_task_verify(
+                    resumed_task,
+                    state=marked,
+                )
+
+            self.assertFalse(current_gate.ok)
+            self.assertFalse(verify_result["ok"])
+            self.assertFalse(verify_result["comparable_failures"])
+            self.assertEqual(verify_result["failure_ids"], [f"cmd:{command}"])
+            self.assertEqual(
+                verify_result["current_failure_ids"],
+                [f"cmd:{command}"],
+            )
+            self.assertEqual(verify_result["baseline_failure_ids"], [])
+            self.assertEqual(
+                verify_result["baseline_not_applicable_commands"],
+                [command],
+            )
+            self.assertIn(current_output.strip(), verify_result["raw_output"])
+            self.assertEqual(resumed_task.verify_baseline_failures, [])
+            self.assertEqual(marked.active_blocker, {})
+            self.assertEqual(marked.active_execution_incident_id, "")
+            resolved = store.load(incident_id)
+            self.assertIsNotNone(resolved)
+            self.assertEqual(resolved.status, "resolved")
+            self.assertEqual(
+                [
+                    entry["incident_id"]
+                    for entry in marked.execution_incidents
+                    if entry.get("kind")
+                    == BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
+                ],
+                [incident_id],
+            )
+
+            for attempt in (1, 2):
+                resumed._record_verify_result(
+                    resumed_task,
+                    attempt,
+                    "fail",
+                    str(verify_result["reason"]),
+                    verify_result["failure_ids"],
+                    comparable_failures=False,
+                )
+            recovery_result = {
+                **verify_result,
+                "review": str(verify_result["reason"]),
+            }
+            self.assertTrue(
+                resumed._schedule_repair_tasks_for_failure(
+                    marked,
+                    marked.tasks,
+                    resumed_task,
+                    recovery_result,
+                )
+            )
+            self.assertEqual(
+                marked.last_recovery_route["outcome"],
+                "repair_tasks_scheduled",
+            )
+            repair_tasks = [
+                candidate
+                for candidate in marked.tasks
+                if candidate.parent_task_id == resumed_task.task_id
+            ]
+            self.assertEqual(len(repair_tasks), 1)
+            self.assertEqual(repair_tasks[0].task_origin, "evidence_repair")
+            self.assertEqual(marked.active_blocker, {})
+            persisted_task = next(
+                candidate
+                for candidate in load_task_plan(root)["tasks"]
+                if candidate["task_id"] == resumed_task.task_id
+            )
+            self.assertEqual(
+                (
+                    persisted_task["verify_baseline_ref"].encode("utf-8"),
+                    persisted_task["verify_baseline_source_ref"].encode("utf-8"),
+                ),
+                baseline_identity,
+            )
+            self.assertEqual(head_ref(root), current_ref)
+            self.assertEqual(
+                subprocess.run(
+                    [
+                        "git",
+                        "show",
+                        f"{baseline_ref}:{relative_test.as_posix()}",
+                    ],
+                    cwd=root,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout,
+                baseline_source,
+            )
 
     def test_reparsed_baseline_resume_rejects_non_identity_error_prose(
         self,

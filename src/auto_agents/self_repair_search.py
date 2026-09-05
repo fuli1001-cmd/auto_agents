@@ -15,7 +15,7 @@ from .config import run_path
 from .io_utils import read_json
 
 
-SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 2
+SELF_REPAIR_EXPERIMENT_SCHEMA_VERSION = 3
 
 
 def _utc_now() -> str:
@@ -215,6 +215,7 @@ class SelfRepairExperiment:
     design_history: list[Dict[str, object]] = field(default_factory=list)
     finding_groups: list[Dict[str, object]] = field(default_factory=list)
     active_finding_group_id: str = ""
+    sticky_verification_commands: list[str] = field(default_factory=list)
     completed_contract_obligation_ids: list[str] = field(default_factory=list)
     completed_finding_ids: list[str] = field(default_factory=list)
     strategy_blacklist: list[str] = field(default_factory=list)
@@ -352,6 +353,7 @@ class SelfRepairExperiment:
             "strategy_blacklist",
             "semantic_state_history",
             "automatic_corrections",
+            "sticky_verification_commands",
             "completed_contract_obligation_ids",
             "completed_finding_ids",
         ):
@@ -416,6 +418,11 @@ class SelfRepairExperiment:
             active_finding_group_id=str(
                 payload.get("active_finding_group_id", "")
             ),
+            sticky_verification_commands=[
+                str(item)
+                for item in payload.get("sticky_verification_commands", []) or []
+                if str(item).strip()
+            ][-64:],
             completed_contract_obligation_ids=[
                 str(item)
                 for item in payload.get("completed_contract_obligation_ids", []) or []
@@ -611,6 +618,25 @@ class SelfRepairExperiment:
         self.next_finding_group()
         self.updated_at = _utc_now()
 
+    def remember_sticky_verification_commands(
+        self,
+        commands: Iterable[str],
+    ) -> bool:
+        """Persist regressions so every later candidate proves them first."""
+
+        previous = tuple(self.sticky_verification_commands)
+        combined = [
+            *self.sticky_verification_commands,
+            *(" ".join(str(command).split()) for command in commands),
+        ]
+        self.sticky_verification_commands = list(
+            dict.fromkeys(command for command in combined if command)
+        )[-64:]
+        changed = tuple(self.sticky_verification_commands) != previous
+        if changed:
+            self.updated_at = _utc_now()
+        return changed
+
     def apply_automatic_correction(
         self,
         *,
@@ -748,6 +774,21 @@ class SelfRepairExperiment:
             record.parent_candidate_id,
             self.candidates["base"],
         )
+        # Candidate commits are descendants of their selected parent. Keep
+        # durable root proof unless this candidate records a concrete
+        # regression. Candidate-local validation and safety proof must be
+        # earned again. Dropping root proof makes a completed component score
+        # below its parent and causes later components to regenerate from a
+        # stale ref.
+        inherited_root_proof = {
+            item
+            for item in parent.passed_obligations
+            if item.startswith("root:")
+        }
+        record.passed_obligations = sorted(
+            inherited_root_proof.union(record.passed_obligations)
+            - set(record.failed_obligations)
+        )
         previous_blocking = {
             finding.finding_id for finding in self.blocking_findings()
         }
@@ -832,6 +873,9 @@ class SelfRepairExperiment:
             ]
             if failure_id not in record.passed_obligations:
                 record.passed_obligations.append(failure_id)
+        record.passed_obligations = sorted(
+            set(record.passed_obligations) - set(record.failed_obligations)
+        )
         current_blocking = {
             finding.finding_id for finding in self.blocking_findings()
         }
@@ -949,6 +993,9 @@ class SelfRepairExperiment:
             "resolved_findings_that_must_not_regress": resolved_findings,
             "approved_repair_design": self.repair_design,
             "active_finding_group_id": self.active_finding_group_id,
+            "sticky_verification_commands": list(
+                self.sticky_verification_commands
+            ),
             "prohibited_strategy_fingerprints": self.strategy_blacklist[-8:],
             "recent_candidates": [
                 {

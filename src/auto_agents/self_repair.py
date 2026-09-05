@@ -188,6 +188,7 @@ class SelfRepairResult:
     diff_line_count: int = 0
     progress_kind: str = ""
     finding_group_id: str = ""
+    sticky_verification_commands: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.passed_obligations = list(self.passed_obligations or [])
@@ -195,6 +196,11 @@ class SelfRepairResult:
         self.finding_ids = list(self.finding_ids or [])
         self.resolved_finding_ids = list(self.resolved_finding_ids or [])
         self.review_findings = [dict(item) for item in self.review_findings or []]
+        self.sticky_verification_commands = [
+            " ".join(str(item).split())
+            for item in self.sticky_verification_commands or []
+            if str(item).strip()
+        ]
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -1846,6 +1852,14 @@ class AutoAgentsSelfRepairRunner:
             if isinstance(item, Mapping)
         ]
         passed, failed = self._milestone_obligations(result)
+        if result.status == "candidate_group_completed":
+            active_group = dict(getattr(self, "_candidate_group", {}) or {})
+            passed.extend(
+                str(item)
+                for item in active_group.get("contract_obligation_ids", []) or []
+                if str(item).strip()
+            )
+        passed = sorted(set(passed))
         result.passed_obligations = passed
         result.failed_obligations = failed
         record = SelfRepairCandidateRecord(
@@ -1871,6 +1885,9 @@ class AutoAgentsSelfRepairRunner:
             verification=result.verification,
         )
         progress_kind = experiment.register_candidate(record, findings=findings)
+        experiment.remember_sticky_verification_commands(
+            result.sticky_verification_commands
+        )
         result.progress_kind = progress_kind
         self._experiment_store.save(experiment)
         self._record_candidate_result(result, attempt=result.attempt)
@@ -3948,6 +3965,80 @@ class AutoAgentsSelfRepairRunner:
                         candidate_id=candidate_id,
                         base_commit=base_head,
                     )
+                deterministic_issues = self._candidate_deterministic_issues(
+                    repair_root,
+                    base_head,
+                )
+                if deterministic_issues:
+                    self._report_candidate_phase(
+                        "correcting_deterministic_violations",
+                        "pre-commit checks failed; resuming the candidate once",
+                    )
+                    try:
+                        corrected = self._correct_candidate_deterministic_issues(
+                            repair_root,
+                            candidate_id=candidate_id,
+                            initial_result=result,
+                            issues=deterministic_issues,
+                            timeout_seconds=candidate_timeout,
+                        )
+                    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                        return SelfRepairResult(
+                            ok=False,
+                            status="candidate_failed",
+                            category=self.decision.category,
+                            reason=(
+                                "deterministic candidate correction failed: "
+                                + str(error)
+                            ),
+                            summary=summary,
+                            experiment_id=experiment_id,
+                            candidate_id=candidate_id,
+                            base_commit=base_head,
+                            infrastructure_failure=(
+                                self._is_infrastructure_candidate_error(error)
+                            ),
+                        )
+                    if not corrected.ok:
+                        return SelfRepairResult(
+                            ok=False,
+                            status="candidate_failed",
+                            category=self.decision.category,
+                            reason=(
+                                "deterministic candidate correction failed: "
+                                + self._agent_failure_detail(corrected)
+                            ),
+                            summary=summary,
+                            experiment_id=experiment_id,
+                            candidate_id=candidate_id,
+                            base_commit=base_head,
+                        )
+                    corrected_summary = (
+                        corrected.summary or corrected.stdout
+                    ).strip()
+                    if corrected_summary:
+                        summary = corrected_summary
+                    changed = changed_paths(repair_root)
+                    deterministic_issues = self._candidate_deterministic_issues(
+                        repair_root,
+                        base_head,
+                    )
+                    if deterministic_issues:
+                        return SelfRepairResult(
+                            ok=False,
+                            status="candidate_rejected",
+                            category=self.decision.category,
+                            reason=(
+                                "deterministic candidate checks still fail after "
+                                "one in-place correction: "
+                                + "; ".join(deterministic_issues)
+                            ),
+                            summary=summary,
+                            experiment_id=experiment_id,
+                            candidate_id=candidate_id,
+                            base_commit=base_head,
+                            fatal_candidate=True,
+                        )
                 fingerprint = worktree_fingerprint(
                     repair_root, ignored_prefixes=()
                 )
@@ -3994,24 +4085,6 @@ class AutoAgentsSelfRepairRunner:
                         diff_line_count=diff_line_count,
                     )
                 seen_fingerprints.add(fingerprint)
-                weakening = self._candidate_test_weakening_reason(
-                    repair_root,
-                    base_head,
-                )
-                if weakening:
-                    return SelfRepairResult(
-                        ok=False,
-                        status="candidate_rejected",
-                        category=self.decision.category,
-                        reason=weakening,
-                        summary=summary,
-                        experiment_id=experiment_id,
-                        candidate_id=candidate_id,
-                        base_commit=base_head,
-                        patch_fingerprint=fingerprint,
-                        fatal_candidate=True,
-                        diff_line_count=diff_line_count,
-                    )
                 target_guard_changed = repository_guard_fingerprint(
                     self.target_project_root,
                     ignore_run_artifacts=True,
@@ -4244,6 +4317,9 @@ class AutoAgentsSelfRepairRunner:
                         ),
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
+                        sticky_verification_commands=(
+                            self._failed_source_commands(verification)
+                        ),
                     )
                 if not bool(getattr(self, "_candidate_is_final_group", True)):
                     return SelfRepairResult(
@@ -4318,6 +4394,11 @@ class AutoAgentsSelfRepairRunner:
                         ),
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
+                        sticky_verification_commands=(
+                            self._failed_source_commands(
+                                integration_verification
+                            )
+                        ),
                     )
                 verification = _VerificationResult(
                     True,
@@ -4341,6 +4422,36 @@ class AutoAgentsSelfRepairRunner:
                         verification.duration_seconds
                         + integration_verification.duration_seconds
                     ),
+                    payload={
+                        "source_commands": [
+                            *list(
+                                verification.payload.get(
+                                    "source_commands", []
+                                )
+                                or []
+                            ),
+                            *list(
+                                integration_verification.payload.get(
+                                    "source_commands", []
+                                )
+                                or []
+                            ),
+                        ],
+                        "nonfatal_source_commands": [
+                            *list(
+                                verification.payload.get(
+                                    "nonfatal_source_commands", []
+                                )
+                                or []
+                            ),
+                            *list(
+                                integration_verification.payload.get(
+                                    "nonfatal_source_commands", []
+                                )
+                                or []
+                            ),
+                        ],
+                    },
                 )
                 legacy_direct_attempt = self.diagnosis is None and self.decision.eligible
                 health_case = bool(
@@ -4511,6 +4622,9 @@ class AutoAgentsSelfRepairRunner:
                         ),
                         passed_obligations=boundary_passed_obligations,
                         failed_obligations=boundary_failed_obligations,
+                        sticky_verification_commands=(
+                            self._failed_source_commands(full_suite)
+                        ),
                     )
                 proof_summary = "\n\n".join(
                     part
@@ -4644,9 +4758,154 @@ class AutoAgentsSelfRepairRunner:
             for line in diff.stdout.splitlines()
             if line.startswith("+") and not line.startswith("+++")
         )
+        for raw_path in changed_paths(repair_root):
+            path = Path(raw_path)
+            if not (
+                raw_path.startswith("tests/")
+                or path.name.startswith("test_")
+            ):
+                continue
+            tracked = subprocess.run(
+                ["git", "ls-files", "--error-unmatch", "--", raw_path],
+                cwd=str(repair_root),
+                capture_output=True,
+            )
+            candidate_path = repair_root / path
+            if tracked.returncode == 0 or not candidate_path.is_file():
+                continue
+            try:
+                added += "\n" + candidate_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except OSError:
+                continue
         if re.search(r"(?i)(pytest\.mark\.(?:skip|xfail)|unittest\.skip)", added):
             return "candidate weakens tests with skip/xfail"
         return ""
+
+    def _candidate_selector_issues(
+        self,
+        repair_root: Path,
+    ) -> list[str]:
+        """Collect candidate-owned pytest selectors before spending a candidate."""
+
+        commands: list[str] = []
+        experiment = getattr(self, "_experiment", None)
+        if isinstance(experiment, SelfRepairExperiment):
+            commands.extend(experiment.sticky_verification_commands)
+        commands.extend(
+            str(command)
+            for command in (
+                dict(getattr(self, "_candidate_group", {}) or {}).get(
+                    "focused_tests", []
+                )
+                or []
+            )
+        )
+        issues: list[str] = []
+        for command in dict.fromkeys(
+            " ".join(str(item).split()) for item in commands if str(item).strip()
+        ):
+            collect_command = _pytest_collect_only_command(command)
+            if not collect_command:
+                continue
+            collected = self._run_verification_commands(
+                [collect_command],
+                repair_root,
+                command_timeout_seconds=SELF_REPAIR_VERIFICATION_TIMEOUT_SECONDS,
+            )
+            returncode = collected.returncodes[-1] if collected.returncodes else 0
+            if returncode == 0:
+                continue
+            detail = " ".join(collected.summary.split())[-600:]
+            issues.append(
+                f"pytest selector does not collect: {command}; {detail}"
+            )
+        return issues
+
+    def _candidate_deterministic_issues(
+        self,
+        repair_root: Path,
+        base_head: str,
+    ) -> list[str]:
+        issues: list[str] = []
+        weakening = self._candidate_test_weakening_reason(
+            repair_root,
+            base_head,
+        )
+        if weakening:
+            issues.append(weakening)
+        issues.extend(self._candidate_selector_issues(repair_root))
+        return issues
+
+    def _correct_candidate_deterministic_issues(
+        self,
+        repair_root: Path,
+        *,
+        candidate_id: str,
+        initial_result: AgentResult,
+        issues: list[str],
+        timeout_seconds: int,
+    ) -> AgentResult:
+        """Give deterministic candidate failures one bounded in-place repair."""
+
+        artifact_root = self._experiment_store.candidate_root(candidate_id) / "provider"
+        prompt_path = artifact_root / "deterministic-correction-prompt.txt"
+        output_path = artifact_root / "deterministic-correction-output.md"
+        prompt = "\n".join(
+            [
+                "Continue the same auto_agents self-repair candidate in the existing worktree.",
+                "The orchestrator found deterministic pre-commit violations.",
+                "Fix every listed violation in place; do not start a new design or broaden scope.",
+                "Do not delete, skip, xfail, or weaken tests.",
+                "Every listed pytest verification command must collect at least one test.",
+                "Run only focused checks, then return a concise summary with one COMMIT_MESSAGE line.",
+                "",
+                "Violations:",
+                *[f"- {issue}" for issue in issues],
+            ]
+        )
+        write_text(prompt_path, prompt)
+        provider = str(
+            getattr(self.target_orchestrator, "_current_provider", "")
+        ).strip()
+        request = AgentRequest(
+            stage="self_repair",
+            effort=self._effort(),
+            prompt=prompt,
+            cwd=repair_root,
+            output_path=output_path,
+            timeout_seconds=timeout_seconds,
+            progress_lease_seconds=timeout_seconds,
+            progress_managed_timeout=True,
+            progress_report_path=(
+                self._experiment_store.candidate_root(candidate_id)
+                / "provider-progress-correction.json"
+            ),
+            attempt_id=f"self-repair-{candidate_id}-deterministic-correction",
+            resume_session_id=initial_result.provider_session_id,
+            resume_provider=provider,
+            record_execution_incidents=False,
+            stream_output=(
+                self.target_orchestrator._stream_agent_output_callback(
+                    f"self-repair-{candidate_id}-correction"
+                )
+                if self.print_agent_output
+                and hasattr(
+                    self.target_orchestrator,
+                    "_stream_agent_output_callback",
+                )
+                else None
+            ),
+        )
+        result: AgentResult = self.target_orchestrator._call_with_failover(request)
+        if hasattr(self.target_orchestrator, "_emit_agent_output"):
+            self.target_orchestrator._emit_agent_output(
+                f"self-repair-{candidate_id}-correction",
+                result,
+            )
+        return result
 
     @staticmethod
     def _component_owns_path(component: Mapping[str, object], path: str) -> bool:
@@ -5243,6 +5502,7 @@ class AutoAgentsSelfRepairRunner:
                 returncodes=candidate.returncodes,
                 termination_reasons=candidate.termination_reasons,
                 recoverable=True,
+                payload=dict(candidate.payload),
             )
         if candidate.ok:
             return _VerificationResult(
@@ -5275,6 +5535,7 @@ class AutoAgentsSelfRepairRunner:
             commands=candidate.commands,
             returncodes=candidate.returncodes,
             termination_reasons=candidate.termination_reasons,
+            payload=dict(candidate.payload),
         )
 
     def _run_full_suite_at_ref(self, ref: str) -> "_VerificationResult":
@@ -6256,6 +6517,8 @@ class AutoAgentsSelfRepairRunner:
         commands: list[str] = []
         returncodes: list[int] = []
         termination_reasons: list[str] = []
+        nonfatal_source_commands: list[str] = []
+        source_commands: list[str] = []
         ok = not recoverable
         for shard, result, cached in sorted(results, key=lambda item: item[0]):
             summaries.append(
@@ -6265,6 +6528,17 @@ class AutoAgentsSelfRepairRunner:
             commands.extend(result.commands)
             returncodes.extend(result.returncodes)
             termination_reasons.extend(result.termination_reasons)
+            source_commands.extend(
+                str(command)
+                for command in result.payload.get("source_commands", []) or []
+            )
+            nonfatal_source_commands.extend(
+                str(command)
+                for command in result.payload.get(
+                    "nonfatal_source_commands", []
+                )
+                or []
+            )
             ok = ok and result.ok
         completed_shards = sum(
             1
@@ -6286,6 +6560,10 @@ class AutoAgentsSelfRepairRunner:
             returncodes=tuple(returncodes),
             termination_reasons=tuple(termination_reasons),
             recoverable=recoverable,
+            payload={
+                "source_commands": source_commands,
+                "nonfatal_source_commands": nonfatal_source_commands,
+            },
         )
 
     def _full_suite_checkpoint_key(
@@ -7100,6 +7378,22 @@ class AutoAgentsSelfRepairRunner:
     ) -> "_VerificationResult":
         group = dict(getattr(self, "_candidate_group", {}) or {})
         commands: list[str] = []
+        experiment = getattr(self, "_experiment", None)
+        if isinstance(experiment, SelfRepairExperiment):
+            for command in experiment.sticky_verification_commands:
+                normalized = " ".join(str(command).split())
+                if (
+                    normalized
+                    and normalized not in commands
+                    and not _supplemental_verification_skip_reason(
+                        normalized,
+                        repository_aliases={
+                            self.repo_root.name,
+                            verification_root.name,
+                        },
+                    )
+                ):
+                    commands.append(normalized)
         for command in group.get("focused_tests", []) or []:
             normalized = " ".join(str(command).split())
             if not normalized or normalized in commands:
@@ -7128,7 +7422,7 @@ class AutoAgentsSelfRepairRunner:
         if not commands:
             commands = ["git diff --check"]
         result = self._run_verification_commands(commands, verification_root)
-        result.payload["source_commands"] = commands
+        result.payload["source_commands"] = commands[: len(result.returncodes)]
         return result
 
     def _run_verification(
@@ -7173,6 +7467,17 @@ class AutoAgentsSelfRepairRunner:
                 returncodes=required.returncodes,
                 termination_reasons=required.termination_reasons,
                 recoverable=required.recoverable,
+                payload={
+                    "source_commands": list(
+                        required.payload.get("source_commands", []) or []
+                    ),
+                    "nonfatal_source_commands": list(
+                        required.payload.get(
+                            "nonfatal_source_commands", []
+                        )
+                        or []
+                    ),
+                },
             )
         additional = self._run_verification_commands(
             supplemental,
@@ -7193,6 +7498,26 @@ class AutoAgentsSelfRepairRunner:
                 required.termination_reasons + additional.termination_reasons
             ),
             recoverable=required.recoverable or additional.recoverable,
+            payload={
+                "source_commands": [
+                    *list(required.payload.get("source_commands", []) or []),
+                    *list(additional.payload.get("source_commands", []) or []),
+                ],
+                "nonfatal_source_commands": [
+                    *list(
+                        required.payload.get(
+                            "nonfatal_source_commands", []
+                        )
+                        or []
+                    ),
+                    *list(
+                        additional.payload.get(
+                            "nonfatal_source_commands", []
+                        )
+                        or []
+                    ),
+                ],
+            },
         )
 
     def _run_verification_commands(
@@ -7209,6 +7534,7 @@ class AutoAgentsSelfRepairRunner:
         rendered_commands: list[str] = []
         returncodes: list[int] = []
         termination_reasons: list[str] = []
+        nonfatal_source_commands: list[str] = []
         duration_seconds = 0.0
         for command in commands:
             verification_command = self_repair_verification_command(
@@ -7245,6 +7571,9 @@ class AutoAgentsSelfRepairRunner:
                 and process.returncode == 5
                 and _is_pytest_verification_command(command)
             ):
+                nonfatal_source_commands.append(
+                    " ".join(str(command).split())
+                )
                 summaries[-1] += (
                     "\nnonfatal=supplemental pytest selector collected no tests"
                 )
@@ -7257,6 +7586,10 @@ class AutoAgentsSelfRepairRunner:
                     returncodes=tuple(returncodes),
                     termination_reasons=tuple(termination_reasons),
                     duration_seconds=duration_seconds,
+                    payload={
+                        "source_commands": list(commands[: len(returncodes)]),
+                        "nonfatal_source_commands": nonfatal_source_commands,
+                    },
                 )
         return _VerificationResult(
             True,
@@ -7265,6 +7598,39 @@ class AutoAgentsSelfRepairRunner:
             returncodes=tuple(returncodes),
             termination_reasons=tuple(termination_reasons),
             duration_seconds=duration_seconds,
+            payload={
+                "source_commands": list(commands[: len(returncodes)]),
+                "nonfatal_source_commands": nonfatal_source_commands,
+            },
+        )
+
+    @staticmethod
+    def _failed_source_commands(
+        result: "_VerificationResult",
+    ) -> list[str]:
+        source_commands = [
+            " ".join(str(command).split())
+            for command in result.payload.get("source_commands", []) or []
+            if str(command).strip()
+        ]
+        nonfatal = {
+            " ".join(str(command).split())
+            for command in result.payload.get(
+                "nonfatal_source_commands", []
+            )
+            or []
+            if str(command).strip()
+        }
+        return list(
+            dict.fromkeys(
+                command
+                for command, returncode in zip(
+                    source_commands,
+                    result.returncodes,
+                )
+                if int(returncode) != 0
+                and command not in nonfatal
+            )
         )
 
     def _commit_message(self, summary: str) -> str:
@@ -7295,6 +7661,7 @@ class _VerificationResult:
             "termination_reasons": list(self.termination_reasons),
             "recoverable": self.recoverable,
             "duration_seconds": self.duration_seconds,
+            "payload": dict(self.payload),
         }
 
     @classmethod
@@ -7312,6 +7679,11 @@ class _VerificationResult:
             ),
             recoverable=bool(payload.get("recoverable", False)),
             duration_seconds=float(payload.get("duration_seconds", 0.0) or 0.0),
+            payload=(
+                dict(payload.get("payload", {}))
+                if isinstance(payload.get("payload", {}), Mapping)
+                else {}
+            ),
         )
 
     @property
@@ -7332,6 +7704,29 @@ def _is_pytest_verification_command(command: str) -> bool:
         or (part == "-m" and index + 1 < len(parts) and parts[index + 1] == "pytest")
         for index, part in enumerate(parts)
     )
+
+
+def _pytest_collect_only_command(command: str) -> str:
+    """Return a safe collect-only form for a direct pytest command."""
+
+    try:
+        parts = shlex.split(str(command))
+    except ValueError:
+        return ""
+    insert_at = -1
+    if (
+        len(parts) >= 3
+        and parts[0] in {"python", "python3"}
+        and parts[1:3] == ["-m", "pytest"]
+    ):
+        insert_at = 3
+    elif parts and Path(parts[0]).name == "pytest":
+        insert_at = 1
+    if insert_at < 0:
+        return ""
+    if "--collect-only" not in parts and "--co" not in parts:
+        parts.insert(insert_at, "--collect-only")
+    return shlex.join(parts)
 
 
 def _compact_run_state(payload: dict[str, object]) -> dict[str, object]:

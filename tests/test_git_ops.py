@@ -8,14 +8,19 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from auto_agents.gate_execution import repository_exclusion_paths
 from auto_agents.git_ops import (
     add_worktree,
+    apply_checkpoint_application,
+    begin_checkpoint_application,
     cherry_pick_no_commit,
+    checkpoint_application_state,
     commit_all,
     commit_all_except,
     commit_changed_paths,
     commit_only_paths,
     delete_ref,
+    detach_checkpoint_application,
     head_ref,
     list_worktrees,
     ref_exists,
@@ -353,6 +358,9 @@ class GitOpsWorktreeTests(unittest.TestCase):
 
             dependency = project_root / ".conda"
             dependency.symlink_to(dependency)
+            custom_dependency = project_root / "vendor" / "runtime"
+            custom_dependency.parent.mkdir()
+            custom_dependency.symlink_to(custom_dependency)
             write_text(project_root / "artifact.txt", "retained\n")
             subprocess.run(
                 ["git", "add", "-A"],
@@ -365,7 +373,11 @@ class GitOpsWorktreeTests(unittest.TestCase):
             commit_sha = commit_all_except(
                 project_root,
                 "test: exclude dependency link",
-                exclude_prefixes=(".conda",),
+                exclude_prefixes=repository_exclusion_paths(
+                    project_root,
+                    dependency_links={"vendor\\runtime": custom_dependency},
+                    surface_paths=(".auto-agents", ".antigravitycli"),
+                ),
             )
 
             self.assertEqual(
@@ -380,6 +392,21 @@ class GitOpsWorktreeTests(unittest.TestCase):
                 capture_output=True,
             )
             self.assertEqual(tree.stdout.strip(), "")
+            custom_tree = subprocess.run(
+                [
+                    "git",
+                    "ls-tree",
+                    "--name-only",
+                    commit_sha,
+                    "--",
+                    "vendor/runtime",
+                ],
+                cwd=str(project_root),
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(custom_tree.stdout.strip(), "")
 
     def test_commit_only_paths_preserves_unrelated_staged_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -418,6 +445,413 @@ class GitOpsWorktreeTests(unittest.TestCase):
                 capture_output=True,
             )
             self.assertEqual(staged.stdout.strip(), "keep.txt")
+
+    def test_checkpoint_transaction_restores_staged_unstaged_added_deleted_and_untracked_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            for path, content in {
+                "candidate.txt": "candidate base\n",
+                "checkpoint-deleted.txt": "checkpoint delete base\n",
+                "staged.txt": "staged base\n",
+                "unstaged.txt": "unstaged base\n",
+                "deleted.txt": "prestate deletion base\n",
+            }.items():
+                (project_root / path).write_text(content, encoding="utf-8")
+            commit_all(project_root, "test: transaction baseline")
+
+            checkpoint_worktree = Path(tmp) / "checkpoint"
+            add_worktree(project_root, checkpoint_worktree)
+            try:
+                (checkpoint_worktree / "candidate.txt").write_text(
+                    "retained candidate\n",
+                    encoding="utf-8",
+                )
+                (checkpoint_worktree / "candidate.txt").chmod(0o755)
+                (checkpoint_worktree / "checkpoint-deleted.txt").unlink()
+                (checkpoint_worktree / "checkpoint-added.txt").write_text(
+                    "retained addition\n",
+                    encoding="utf-8",
+                )
+                checkpoint_sha = commit_all(
+                    checkpoint_worktree,
+                    "test: retained checkpoint",
+                )
+            finally:
+                remove_worktree(project_root, checkpoint_worktree)
+            checkpoint_ref = "refs/auto-agents/tests/checkpoint-transaction"
+            update_ref(project_root, checkpoint_ref, checkpoint_sha)
+
+            (project_root / "staged.txt").write_text(
+                "staged prestate\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "staged.txt"],
+                cwd=str(project_root),
+                check=True,
+            )
+            (project_root / "unstaged.txt").write_text(
+                "unstaged prestate\n",
+                encoding="utf-8",
+            )
+            (project_root / "added.txt").write_text(
+                "staged addition prestate\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "added.txt"],
+                cwd=str(project_root),
+                check=True,
+            )
+            (project_root / "deleted.txt").unlink()
+            subprocess.run(
+                ["git", "add", "deleted.txt"],
+                cwd=str(project_root),
+                check=True,
+            )
+            (project_root / "untracked.txt").write_text(
+                "untracked prestate\n",
+                encoding="utf-8",
+            )
+
+            status_before = subprocess.run(
+                ["git", "status", "--porcelain=v1", "-z", "-uall"],
+                cwd=str(project_root),
+                check=True,
+                capture_output=True,
+            ).stdout
+            index_path = Path(
+                subprocess.run(
+                    ["git", "rev-parse", "--git-path", "index"],
+                    cwd=str(project_root),
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip()
+            )
+            if not index_path.is_absolute():
+                index_path = project_root / index_path
+            index_before = index_path.read_bytes()
+
+            transaction = begin_checkpoint_application(
+                project_root,
+                owner_task_id="checkpoint-owner",
+                retained_ref=checkpoint_ref,
+                retained_commit=checkpoint_sha,
+                changed_paths=commit_changed_paths(
+                    project_root,
+                    checkpoint_sha,
+                ),
+            )
+            manifest_changes = {
+                entry["path"]: entry["change"]
+                for entry in transaction["retained_manifest"]
+            }
+            self.assertEqual(
+                manifest_changes,
+                {
+                    "candidate.txt": "type_change",
+                    "checkpoint-added.txt": "addition",
+                    "checkpoint-deleted.txt": "deletion",
+                },
+            )
+            self.assertTrue(
+                transaction["pre_application"]["index_image"][
+                    "content_base64"
+                ]
+            )
+            apply_checkpoint_application(project_root, transaction)
+
+            self.assertEqual(transaction["status"], "applied")
+            self.assertTrue(
+                checkpoint_application_state(
+                    project_root,
+                    transaction,
+                )["applied_matches"]
+            )
+            self.assertEqual(
+                (project_root / "candidate.txt").read_text(encoding="utf-8"),
+                "retained candidate\n",
+            )
+            self.assertTrue((project_root / "candidate.txt").stat().st_mode & 0o111)
+            self.assertFalse((project_root / "checkpoint-deleted.txt").exists())
+            self.assertEqual(
+                (project_root / "checkpoint-added.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "retained addition\n",
+            )
+
+            detached = detach_checkpoint_application(
+                project_root,
+                transaction,
+            )
+
+            self.assertTrue(detached["ok"], detached)
+            self.assertEqual(transaction["status"], "detached")
+            self.assertEqual(index_path.read_bytes(), index_before)
+            status_after = subprocess.run(
+                ["git", "status", "--porcelain=v1", "-z", "-uall"],
+                cwd=str(project_root),
+                check=True,
+                capture_output=True,
+            ).stdout
+            self.assertEqual(status_after, status_before)
+            self.assertEqual(
+                (project_root / "candidate.txt").read_text(encoding="utf-8"),
+                "candidate base\n",
+            )
+            self.assertFalse((project_root / "candidate.txt").stat().st_mode & 0o111)
+            self.assertTrue((project_root / "checkpoint-deleted.txt").is_file())
+            self.assertFalse((project_root / "checkpoint-added.txt").exists())
+            self.assertEqual(
+                (project_root / "staged.txt").read_text(encoding="utf-8"),
+                "staged prestate\n",
+            )
+            self.assertEqual(
+                (project_root / "unstaged.txt").read_text(encoding="utf-8"),
+                "unstaged prestate\n",
+            )
+            self.assertEqual(
+                (project_root / "added.txt").read_text(encoding="utf-8"),
+                "staged addition prestate\n",
+            )
+            self.assertFalse((project_root / "deleted.txt").exists())
+            self.assertEqual(
+                (project_root / "untracked.txt").read_text(encoding="utf-8"),
+                "untracked prestate\n",
+            )
+
+    def test_checkpoint_transaction_restores_directory_file_topology_transitions(
+        self,
+    ) -> None:
+        cases = (
+            ("directory_to_file", "directory", "file"),
+            ("file_to_directory", "file", "directory"),
+        )
+        for case_name, before_kind, after_kind in cases:
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as tmp:
+                project_root = Path(tmp) / "demo"
+                Orchestrator.init_project(project_root, "demo", "mock")
+                self._configure_git_identity(project_root)
+                topology_path = project_root / "topology"
+                if before_kind == "directory":
+                    topology_path.mkdir()
+                    topology_path.chmod(0o750)
+                    (topology_path / "before.bin").write_bytes(b"before\x00tree\n")
+                    (topology_path / "before.bin").chmod(0o755)
+                else:
+                    topology_path.write_bytes(b"before\x00file\n")
+                    topology_path.chmod(0o755)
+                commit_all(project_root, f"test: {case_name} baseline")
+
+                checkpoint_worktree = Path(tmp) / "checkpoint"
+                add_worktree(project_root, checkpoint_worktree)
+                try:
+                    checkpoint_path = checkpoint_worktree / "topology"
+                    if after_kind == "file":
+                        (checkpoint_path / "before.bin").unlink()
+                        checkpoint_path.rmdir()
+                        checkpoint_path.write_bytes(b"after\x00file\n")
+                        checkpoint_path.chmod(0o755)
+                    else:
+                        checkpoint_path.unlink()
+                        checkpoint_path.mkdir()
+                        (checkpoint_path / "after.bin").write_bytes(
+                            b"after\x00tree\n"
+                        )
+                        (checkpoint_path / "after.bin").chmod(0o755)
+                    checkpoint_sha = commit_all(
+                        checkpoint_worktree,
+                        f"test: retained {case_name}",
+                    )
+                finally:
+                    remove_worktree(project_root, checkpoint_worktree)
+                checkpoint_ref = (
+                    "refs/auto-agents/tests/checkpoint-topology-" + case_name
+                )
+                update_ref(project_root, checkpoint_ref, checkpoint_sha)
+                changed_paths = commit_changed_paths(project_root, checkpoint_sha)
+                self.assertIn("topology", changed_paths)
+                self.assertTrue(
+                    any(path.startswith("topology/") for path in changed_paths)
+                )
+
+                index_path = Path(
+                    subprocess.run(
+                        ["git", "rev-parse", "--git-path", "index"],
+                        cwd=str(project_root),
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip()
+                )
+                if not index_path.is_absolute():
+                    index_path = project_root / index_path
+                index_before = index_path.read_bytes()
+
+                transaction = begin_checkpoint_application(
+                    project_root,
+                    owner_task_id="checkpoint-owner",
+                    retained_ref=checkpoint_ref,
+                    retained_commit=checkpoint_sha,
+                    changed_paths=changed_paths,
+                )
+                self.assertEqual(
+                    set(transaction["pre_application"]["worktree_paths"]),
+                    {"topology"},
+                )
+                apply_checkpoint_application(project_root, transaction)
+
+                self.assertEqual(transaction["status"], "applied")
+                self.assertTrue(
+                    checkpoint_application_state(project_root, transaction)[
+                        "applied_matches"
+                    ]
+                )
+                if after_kind == "file":
+                    self.assertTrue(topology_path.is_file())
+                    self.assertEqual(topology_path.read_bytes(), b"after\x00file\n")
+                    self.assertTrue(topology_path.stat().st_mode & 0o111)
+                else:
+                    self.assertTrue(topology_path.is_dir())
+                    self.assertEqual(
+                        (topology_path / "after.bin").read_bytes(),
+                        b"after\x00tree\n",
+                    )
+                    self.assertTrue(
+                        (topology_path / "after.bin").stat().st_mode & 0o111
+                    )
+                self.assertTrue(ref_exists(project_root, checkpoint_ref))
+
+                detached = detach_checkpoint_application(project_root, transaction)
+
+                self.assertTrue(detached["ok"], detached)
+                self.assertEqual(transaction["status"], "detached")
+                self.assertNotEqual(transaction["status"], "applying")
+                self.assertEqual(index_path.read_bytes(), index_before)
+                self.assertTrue(ref_exists(project_root, checkpoint_ref))
+                if before_kind == "directory":
+                    self.assertTrue(topology_path.is_dir())
+                    self.assertEqual(topology_path.stat().st_mode & 0o777, 0o750)
+                    self.assertEqual(
+                        (topology_path / "before.bin").read_bytes(),
+                        b"before\x00tree\n",
+                    )
+                    self.assertTrue(
+                        (topology_path / "before.bin").stat().st_mode & 0o111
+                    )
+                else:
+                    self.assertTrue(topology_path.is_file())
+                    self.assertEqual(topology_path.read_bytes(), b"before\x00file\n")
+                    self.assertTrue(topology_path.stat().st_mode & 0o111)
+
+    def test_checkpoint_transaction_removes_nested_addition_parent_chain(
+        self,
+    ) -> None:
+        for case_name in ("detach", "prestate_probe"):
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as tmp:
+                project_root = Path(tmp) / "demo"
+                Orchestrator.init_project(project_root, "demo", "mock")
+                self._configure_git_identity(project_root)
+                (project_root / "baseline.txt").write_text(
+                    "baseline\n",
+                    encoding="utf-8",
+                )
+                commit_all(project_root, "test: nested addition baseline")
+
+                checkpoint_worktree = Path(tmp) / "checkpoint"
+                add_worktree(project_root, checkpoint_worktree)
+                try:
+                    candidate_path = checkpoint_worktree / "new/sub/candidate.txt"
+                    candidate_path.parent.mkdir(parents=True)
+                    candidate_path.write_text(
+                        "retained nested addition\n",
+                        encoding="utf-8",
+                    )
+                    checkpoint_sha = commit_all(
+                        checkpoint_worktree,
+                        "test: retained nested addition",
+                    )
+                finally:
+                    remove_worktree(project_root, checkpoint_worktree)
+                checkpoint_ref = (
+                    "refs/auto-agents/tests/checkpoint-nested-addition"
+                )
+                update_ref(project_root, checkpoint_ref, checkpoint_sha)
+
+                index_path = Path(
+                    subprocess.run(
+                        ["git", "rev-parse", "--git-path", "index"],
+                        cwd=str(project_root),
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip()
+                )
+                if not index_path.is_absolute():
+                    index_path = project_root / index_path
+                index_before = index_path.read_bytes()
+
+                transaction = begin_checkpoint_application(
+                    project_root,
+                    owner_task_id="checkpoint-owner",
+                    retained_ref=checkpoint_ref,
+                    retained_commit=checkpoint_sha,
+                    changed_paths=commit_changed_paths(
+                        project_root,
+                        checkpoint_sha,
+                    ),
+                )
+                self.assertEqual(
+                    set(transaction["pre_application"]["worktree_paths"]),
+                    {"new"},
+                )
+                apply_checkpoint_application(project_root, transaction)
+
+                applied_path = project_root / "new/sub/candidate.txt"
+                self.assertEqual(
+                    applied_path.read_text(encoding="utf-8"),
+                    "retained nested addition\n",
+                )
+                if case_name == "prestate_probe":
+                    applied_path.unlink()
+                    index_path.write_bytes(index_before)
+
+                    observation = checkpoint_application_state(
+                        project_root,
+                        transaction,
+                    )
+                    self.assertFalse(observation["prestate_matches"])
+                    detached = detach_checkpoint_application(
+                        project_root,
+                        transaction,
+                    )
+                    self.assertFalse(detached["ok"], detached)
+                    self.assertNotIn(
+                        detached["proof"],
+                        {
+                            "exact_prestate_already_restored",
+                            "exact_prestate_restored",
+                        },
+                    )
+                    self.assertTrue((project_root / "new/sub").is_dir())
+                    continue
+
+                detached = detach_checkpoint_application(
+                    project_root,
+                    transaction,
+                )
+
+                self.assertTrue(detached["ok"], detached)
+                self.assertEqual(detached["proof"], "exact_prestate_restored")
+                self.assertEqual(index_path.read_bytes(), index_before)
+                self.assertFalse((project_root / "new/sub").exists())
+                self.assertFalse((project_root / "new").exists())
 
     def test_antigravitycli_ignored(self) -> None:
         from auto_agents.git_ops import changed_entries, changed_paths, hard_reset_clean

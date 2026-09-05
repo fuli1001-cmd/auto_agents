@@ -11,11 +11,13 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gate_execution import (
+    GateSnapshotManager,
     LocalGatePlanExecutor,
     discover_dependency_links,
     dynamic_port_lease,
     gate_environment,
     isolated_command,
+    repository_exclusion_paths,
     self_referential_dependency_links,
 )
 from auto_agents.gates import GateCommandMetadata, run_gate_plan
@@ -87,6 +89,179 @@ def test_isolated_gate_snapshots_dirty_and_untracked_files(tmp_path: Path) -> No
     assert (project / ".tmp-tests/evidence.txt").read_text() == "evidence"
     assert (project / "tracked.txt").read_text() == "dirty\n"
     assert (project / "untracked.txt").read_text() == "present\n"
+
+
+def test_snapshot_excludes_installed_dependency_links(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    (project / ".gitignore").write_text(
+        ".tmp-tests/\n.conda/\n",
+        encoding="utf-8",
+    )
+    control_file = project / ".auto-agents" / "runtime" / "stale.json"
+    control_file.parent.mkdir(parents=True)
+    control_file.write_text("{}\n", encoding="utf-8")
+    gate_cache = project / ".auto-agents-gate-cache" / "stale.txt"
+    gate_cache.parent.mkdir()
+    gate_cache.write_text("stale\n", encoding="utf-8")
+    _git(project, "add", "-A")
+    _git(project, "commit", "-m", "track runtime fixtures")
+
+    dependency_source = tmp_path / "dependency-source"
+    dependency_source.mkdir()
+    (project / ".conda").symlink_to(dependency_source, target_is_directory=True)
+    custom_source = tmp_path / "custom-dependency-source"
+    custom_source.mkdir()
+    (project / "tool-runtime").symlink_to(custom_source, target_is_directory=True)
+    (project / "staged.txt").write_text("preserve index\n", encoding="utf-8")
+    _git(project, "add", "staged.txt")
+    staged_before = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        cwd=project,
+        check=True,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+    ).stdout
+
+    dependency_links = discover_dependency_links(project)
+    dependency_links["tool-runtime"] = custom_source
+    with LocalGatePlanExecutor(
+        project,
+        _config(tmp_path),
+        {},
+        dependency_links=dependency_links,
+    ) as executor:
+        assert executor.snapshot is not None
+        snapshot_paths = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", executor.snapshot.commit_sha],
+            cwd=project,
+            check=True,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        ).stdout.splitlines()
+
+    assert ".conda" not in snapshot_paths
+    assert "tool-runtime" not in snapshot_paths
+    assert control_file.relative_to(project).as_posix() not in snapshot_paths
+    assert gate_cache.relative_to(project).as_posix() not in snapshot_paths
+    assert "staged.txt" in snapshot_paths
+    assert (project / ".conda").is_symlink()
+    assert control_file.read_text(encoding="utf-8") == "{}\n"
+    assert gate_cache.read_text(encoding="utf-8") == "stale\n"
+    staged_after = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        cwd=project,
+        check=True,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+    ).stdout
+    assert staged_after == staged_before
+
+
+def test_snapshot_excludes_ignored_dependency_directories(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    (project / ".gitignore").write_text(".conda/\n", encoding="utf-8")
+    _git(project, "add", ".gitignore")
+    _git(project, "commit", "-m", "ignore dependency directory")
+    dependency_marker = project / ".conda" / "conda-meta" / "history"
+    dependency_marker.parent.mkdir(parents=True)
+    dependency_marker.write_text("runtime-only\n", encoding="utf-8")
+
+    manager = GateSnapshotManager(
+        project,
+        "ignored-dependency-directory",
+        excluded_paths=repository_exclusion_paths(project),
+    )
+    try:
+        snapshot = manager.create()
+        snapshot_paths = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", snapshot.commit_sha],
+            cwd=project,
+            check=True,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        ).stdout.splitlines()
+    finally:
+        manager.close()
+
+    assert not any(
+        path == ".conda" or path.startswith(".conda/")
+        for path in snapshot_paths
+    )
+    assert dependency_marker.read_text(encoding="utf-8") == "runtime-only\n"
+
+
+def test_snapshot_excludes_installed_dependency_links_from_commit_paths(
+    tmp_path: Path,
+) -> None:
+    project = _project(tmp_path)
+    dependency_file = project / ".conda" / "tracked-runtime.txt"
+    dependency_file.parent.mkdir()
+    dependency_file.write_text("base runtime\n", encoding="utf-8")
+    _git(project, "add", "-A")
+    _git(project, "commit", "-m", "base with tracked runtime")
+    base_ref = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project,
+        check=True,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+    ).stdout.strip()
+
+    (project / "tracked.txt").write_text("source version\n", encoding="utf-8")
+    dependency_file.write_text("source runtime\n", encoding="utf-8")
+    _git(project, "add", "-A")
+    _git(project, "commit", "-m", "source changes")
+    source_ref = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project,
+        check=True,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+    ).stdout.strip()
+
+    manager = GateSnapshotManager(
+        project,
+        "commit-path-exclusions",
+        excluded_paths=repository_exclusion_paths(project),
+    )
+    try:
+        snapshot = manager.create_from_commit_paths(
+            base_ref=base_ref,
+            source_ref=source_ref,
+            paths=["tracked.txt", ".conda/tracked-runtime.txt"],
+        )
+        snapshot_paths = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", snapshot.commit_sha],
+            cwd=project,
+            check=True,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        ).stdout.splitlines()
+        tracked_content = subprocess.run(
+            ["git", "show", f"{snapshot.commit_sha}:tracked.txt"],
+            cwd=project,
+            check=True,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+        ).stdout
+    finally:
+        manager.close()
+
+    assert tracked_content == "source version\n"
+    assert not any(
+        path == ".conda" or path.startswith(".conda/")
+        for path in snapshot_paths
+    )
 
 
 def test_candidate_result_cache_reuses_identical_snapshot_across_executors(

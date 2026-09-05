@@ -15,6 +15,7 @@ from .models import AgentResult, CommandResult, RunState
 
 
 INCIDENT_SCHEMA_VERSION = 5
+PARALLEL_LANE_FAILURE_SCHEMA_VERSION = 1
 INCIDENT_ACTIONS = {
     "RETRY",
     "RECOVER_TARGET",
@@ -65,6 +66,125 @@ def redact_incident_text(value: object) -> str:
         str(value or ""),
     )
     return _BEARER_PATTERN.sub(lambda match: f"{match.group(1)}<redacted>", text)
+
+
+def _normalized_failure_ids(value: object) -> List[str]:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    return sorted(
+        {
+            str(item).strip()
+            for item in value
+            if str(item).strip()
+        }
+    )
+
+
+@dataclass
+class ParallelLaneFailure:
+    """Durable failure handoff from an isolated task lane to its collector."""
+
+    task: Dict[str, object]
+    operation: str
+    owner: str
+    automatic_retryable: bool
+    resumable: bool
+    reason: str
+    redacted_evidence: str = ""
+    current_failure_ids: List[str] = field(default_factory=list)
+    baseline_failure_ids: List[str] = field(default_factory=list)
+    new_failure_ids: List[str] = field(default_factory=list)
+    owned_failure_ids: List[str] = field(default_factory=list)
+    failure_class: str = ""
+    baseline_comparison_comparable: bool = True
+    base_ref: str = ""
+    checkpoint: Dict[str, object] = field(default_factory=dict)
+    command_incident: Dict[str, object] = field(default_factory=dict)
+    implementation_completed: bool = False
+    created_at: str = field(default_factory=_utc_now)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "ParallelLaneFailure":
+        raw_task = data.get("task", {})
+        raw_checkpoint = data.get("checkpoint", {})
+        raw_incident = data.get("command_incident", {})
+        owner = str(data.get("owner", "unknown")).strip() or "unknown"
+        if owner not in INCIDENT_OWNERS:
+            owner = "unknown"
+        return cls(
+            task=dict(raw_task) if isinstance(raw_task, Mapping) else {},
+            operation=str(data.get("operation", "unknown")).strip() or "unknown",
+            owner=owner,
+            automatic_retryable=bool(data.get("automatic_retryable", False)),
+            resumable=bool(data.get("resumable", True)),
+            reason=redact_incident_text(data.get("reason", "")).strip(),
+            redacted_evidence=_compact(
+                redact_incident_text(data.get("redacted_evidence", ""))
+            ),
+            current_failure_ids=_normalized_failure_ids(
+                data.get("current_failure_ids", [])
+            ),
+            baseline_failure_ids=_normalized_failure_ids(
+                data.get("baseline_failure_ids", [])
+            ),
+            new_failure_ids=_normalized_failure_ids(
+                data.get("new_failure_ids", [])
+            ),
+            owned_failure_ids=_normalized_failure_ids(
+                data.get("owned_failure_ids", [])
+            ),
+            failure_class=str(data.get("failure_class", "")).strip(),
+            baseline_comparison_comparable=bool(
+                data.get("baseline_comparison_comparable", True)
+            ),
+            base_ref=str(data.get("base_ref", "")).strip(),
+            checkpoint=(
+                dict(raw_checkpoint)
+                if isinstance(raw_checkpoint, Mapping)
+                else {}
+            ),
+            command_incident=(
+                dict(raw_incident) if isinstance(raw_incident, Mapping) else {}
+            ),
+            implementation_completed=bool(
+                data.get("implementation_completed", False)
+            ),
+            created_at=str(data.get("created_at", "")).strip() or _utc_now(),
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "schema_version": PARALLEL_LANE_FAILURE_SCHEMA_VERSION,
+            "kind": "parallel_lane_failure",
+            "task": dict(self.task),
+            "operation": self.operation,
+            "owner": self.owner,
+            "automatic_retryable": self.automatic_retryable,
+            "resumable": self.resumable,
+            "reason": redact_incident_text(self.reason).strip(),
+            "redacted_evidence": _compact(
+                redact_incident_text(self.redacted_evidence)
+            ),
+            "current_failure_ids": _normalized_failure_ids(
+                self.current_failure_ids
+            ),
+            "baseline_failure_ids": _normalized_failure_ids(
+                self.baseline_failure_ids
+            ),
+            "new_failure_ids": _normalized_failure_ids(self.new_failure_ids),
+            "owned_failure_ids": _normalized_failure_ids(
+                self.owned_failure_ids
+            ),
+            "failure_class": self.failure_class,
+            "baseline_comparison_comparable": (
+                self.baseline_comparison_comparable
+            ),
+            "base_ref": self.base_ref,
+            "checkpoint": dict(self.checkpoint),
+            "command_incident": dict(self.command_incident),
+            "implementation_completed": self.implementation_completed,
+            "created_at": self.created_at,
+        }
 
 
 @dataclass

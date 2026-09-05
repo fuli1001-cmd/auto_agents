@@ -91,6 +91,70 @@ class SelfRepairSearchTests(unittest.TestCase):
         self.assertEqual(experiment.best_search_candidate_id, "c2")
         self.assertNotIn("malformed-fail-open", experiment.findings)
 
+    def test_child_inherits_parent_proof_and_becomes_next_candidate_parent(self) -> None:
+        experiment = self._experiment()
+        root_obligations = sorted(
+            key for key in experiment.obligations if key.startswith("root:")
+        )
+        first = SelfRepairCandidateRecord(
+            candidate_id="c1",
+            candidate_ref="refs/c1",
+            candidate_commit="commit-c1",
+            validation_rank=50,
+            validation_stage="focused_verification",
+            passed_obligations=[root_obligations[0], "validation:focused"],
+        )
+        experiment.register_candidate(first)
+
+        second = SelfRepairCandidateRecord(
+            candidate_id="c2",
+            parent_candidate_id="c1",
+            candidate_ref="refs/c2",
+            candidate_commit="commit-c2",
+            status="candidate_group_completed",
+            validation_rank=60,
+            validation_stage="finding_group",
+            passed_obligations=[root_obligations[1], "validation:focused"],
+        )
+        experiment.register_candidate(second)
+
+        self.assertTrue(
+            {
+                root_obligations[0],
+                root_obligations[1],
+                "validation:focused",
+            }.issubset(set(second.passed_obligations))
+        )
+        self.assertEqual(experiment.best_search_candidate_id, "c2")
+        self.assertEqual(experiment.best_search_ref, "refs/c2")
+
+    def test_sticky_verification_commands_are_deduplicated_and_persisted(self) -> None:
+        experiment = self._experiment()
+
+        self.assertTrue(
+            experiment.remember_sticky_verification_commands(
+                [
+                    "python -m pytest  -q tests/test_retry.py::test_regression",
+                    "python -m pytest -q tests/test_retry.py::test_regression",
+                    "python -m pytest -q tests/test_other.py",
+                ]
+            )
+        )
+        self.assertFalse(
+            experiment.remember_sticky_verification_commands(
+                ["python -m pytest -q tests/test_retry.py::test_regression"]
+            )
+        )
+
+        restored = SelfRepairExperiment.from_dict(experiment.to_dict())
+        self.assertEqual(
+            restored.sticky_verification_commands,
+            [
+                "python -m pytest -q tests/test_retry.py::test_regression",
+                "python -m pytest -q tests/test_other.py",
+            ],
+        )
+
     def test_patience_counts_only_consecutive_semantic_non_progress(self) -> None:
         experiment = self._experiment()
         for index in range(1, 4):

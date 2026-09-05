@@ -17,11 +17,15 @@ import tempfile
 import threading
 import time
 import uuid
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from .models import CommandResult, GateConfig
 from .gate_result_cache import GateResultCache
 from .gate_timing import GateTimingStore
+from .git_ops import (
+    normalize_repository_exclusions,
+    repository_path_is_excluded,
+)
 from .process_supervision import run_supervised_shell_command
 
 
@@ -30,6 +34,11 @@ SHORT_RUNTIME_PROFILE = "short_socket_path_v1"
 LEGACY_RUNTIME_PROFILE = "legacy_v1"
 _SHORT_RUNTIME_SOCKET_BUDGET = 100
 _SHORT_RUNTIME_STALE_SECONDS = 24 * 60 * 60
+GATE_SNAPSHOT_RUNTIME_PATHS = (
+    ".auto-agents-gate-runtime",
+    ".auto-agents-gate-tmp",
+    ".auto-agents-gate-cache",
+)
 
 
 def short_job_runtime_root(job_id: str, *, create: bool = True) -> Path:
@@ -112,10 +121,86 @@ class GateSourceSnapshot:
 class GateSnapshotManager:
     """Capture the exact current filesystem state without touching the user index."""
 
-    def __init__(self, project_root: Path, plan_id: str) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        plan_id: str,
+        *,
+        excluded_paths: Sequence[str] = (),
+    ) -> None:
         self.project_root = project_root.resolve()
         self.plan_id = plan_id
+        self.excluded_paths = normalize_repository_exclusions(excluded_paths)
         self.snapshot: Optional[GateSourceSnapshot] = None
+
+    def _force_remove_excluded_index_entries(
+        self,
+        env: Mapping[str, str],
+    ) -> None:
+        if not self.excluded_paths:
+            return
+        listed = _run_git(
+            self.project_root,
+            "ls-files",
+            "-z",
+            "--",
+            *(
+                f":(top,literal){path}"
+                for path in self.excluded_paths
+            ),
+            env=env,
+        )
+        entries = [path for path in listed.stdout.split("\0") if path]
+        for offset in range(0, len(entries), 256):
+            _run_git(
+                self.project_root,
+                "update-index",
+                "--force-remove",
+                "--",
+                *entries[offset : offset + 256],
+                env=env,
+            )
+
+    def _negative_exclusion_pathspecs(
+        self,
+        env: Mapping[str, str],
+    ) -> tuple[str, ...]:
+        """Exclude unignored paths without explicitly naming ignored ones.
+
+        Git rejects an ignored directory when it is also supplied as a
+        negative pathspec to git add. Ignored paths are already omitted by the
+        positive "." pathspec, while the index cleanup below removes any
+        tracked entries. Keep literal negative pathspecs for the remaining
+        exclusions so dependency links and runtime surfaces are never staged.
+        """
+
+        pathspecs: list[str] = []
+        for path in self.excluded_paths:
+            ignored = subprocess.run(
+                [
+                    "git",
+                    "check-ignore",
+                    "--no-index",
+                    "--quiet",
+                    "--",
+                    path,
+                ],
+                cwd=str(self.project_root),
+                env=dict(env),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+            if ignored.returncode == 0:
+                continue
+            if ignored.returncode != 1:
+                raise RuntimeError(
+                    ignored.stderr.strip()
+                    or ignored.stdout.strip()
+                    or f"git check-ignore failed for excluded path: {path}"
+                )
+            pathspecs.append(f":(top,exclude,literal){path}")
+        return tuple(pathspecs)
 
     def create(self) -> GateSourceSnapshot:
         git_dir = _run_git(
@@ -146,7 +231,16 @@ class GateSnapshotManager:
                 _run_git(self.project_root, "read-tree", "HEAD", env=env)
             else:
                 _run_git(self.project_root, "read-tree", "--empty", env=env)
-            _run_git(self.project_root, "add", "-A", "--", ".", env=env)
+            _run_git(
+                self.project_root,
+                "add",
+                "-A",
+                "--",
+                ".",
+                *self._negative_exclusion_pathspecs(env),
+                env=env,
+            )
+            self._force_remove_excluded_index_entries(env)
             tree = _run_git(self.project_root, "write-tree", env=env).stdout.strip()
             commit_args = ["commit-tree", tree, "-m", f"auto_agents gate snapshot {self.plan_id}"]
             if head.returncode == 0 and head.stdout.strip():
@@ -174,19 +268,19 @@ class GateSnapshotManager:
     ) -> GateSourceSnapshot:
         """Create a snapshot by overlaying selected source paths on a base tree."""
 
-        normalized_paths = sorted(
-            {
-                str(path).strip().replace("\\", "/")
-                for path in paths
-                if str(path).strip()
-            }
-        )
-        if not normalized_paths or any(
-            PurePosixPath(path).is_absolute()
-            or ".." in PurePosixPath(path).parts
-            for path in normalized_paths
-        ):
+        try:
+            requested_paths = sorted(normalize_repository_exclusions(paths))
+        except ValueError as error:
+            raise ValueError(
+                "snapshot paths must be safe repository-relative paths"
+            ) from error
+        if not requested_paths:
             raise ValueError("snapshot paths must be safe repository-relative paths")
+        normalized_paths = [
+            path
+            for path in requested_paths
+            if not repository_path_is_excluded(path, self.excluded_paths)
+        ]
 
         base_commit = _run_git(
             self.project_root,
@@ -274,6 +368,7 @@ class GateSnapshotManager:
                     env=env,
                 )
 
+            self._force_remove_excluded_index_entries(env)
             tree = _run_git(
                 self.project_root, "write-tree", env=env
             ).stdout.strip()
@@ -735,6 +830,28 @@ def dependency_link_paths(project_root: Path) -> tuple[str, ...]:
     )
 
 
+def repository_exclusion_paths(
+    project_root: Path,
+    *,
+    dependency_links: Mapping[str, Path] | Iterable[str] = (),
+    surface_paths: Sequence[str] = (),
+) -> tuple[str, ...]:
+    """Compose dependency and surface exclusions under one path contract."""
+
+    discovered_paths = (
+        dependency_links.keys()
+        if isinstance(dependency_links, Mapping)
+        else dependency_links
+    )
+    return normalize_repository_exclusions(
+        (
+            *dependency_link_paths(project_root),
+            *discovered_paths,
+            *surface_paths,
+        )
+    )
+
+
 def self_referential_dependency_links(project_root: Path) -> list[str]:
     """Return dependency links that lexically point back to themselves.
 
@@ -820,13 +937,21 @@ class LocalGatePlanExecutor:
                 / f".{self.project_root.name}-auto-agents-gate-worktrees"
             ).resolve()
         )
-        self.snapshot_manager = GateSnapshotManager(self.project_root, self.plan_id)
-        self.snapshot: Optional[GateSourceSnapshot] = None
         self.dependency_links = dict(
             dependency_links
             if dependency_links is not None
             else discover_dependency_links(self.project_root)
         )
+        self.snapshot_manager = GateSnapshotManager(
+            self.project_root,
+            self.plan_id,
+            excluded_paths=repository_exclusion_paths(
+                self.project_root,
+                dependency_links=self.dependency_links,
+                surface_paths=GATE_SNAPSHOT_RUNTIME_PATHS,
+            ),
+        )
+        self.snapshot: Optional[GateSourceSnapshot] = None
         self.worker_id = worker_id
         self.source_ref = str(source_ref).strip()
         self.use_result_cache = bool(use_result_cache)
@@ -981,18 +1106,16 @@ class LocalGatePlanExecutor:
             "--untracked-files=all",
         )
         paths: list[str] = []
-        ignored = tuple(
-            list(self.dependency_links)
-            + [".auto-agents-gate-runtime", ".auto-agents-gate-tmp", ".auto-agents-gate-cache"]
+        ignored = repository_exclusion_paths(
+            sandbox,
+            dependency_links=self.dependency_links,
+            surface_paths=GATE_SNAPSHOT_RUNTIME_PATHS,
         )
         for line in process.stdout.splitlines():
             path = line[3:].strip()
             if " -> " in path:
                 path = path.split(" -> ", 1)[1]
-            if path and not any(
-                path == prefix or path.startswith(prefix.rstrip("/") + "/")
-                for prefix in ignored
-            ):
+            if path and not repository_path_is_excluded(path, ignored):
                 paths.append(path)
         return paths
 

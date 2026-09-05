@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import subprocess
@@ -25,7 +26,10 @@ from auto_agents.config import (
 )
 from auto_agents.gates import (
     FailureExtraction,
+    GateCommandBaselineIdentityError,
+    GateCommandMetadata,
     build_failure_identity_diagnostic_command,
+    command_from_verification_step,
 )
 from auto_agents.git_ops import (
     changed_files,
@@ -40,6 +44,7 @@ from auto_agents.io_utils import write_json, write_text
 from auto_agents.models import (
     AgentResult,
     CommandResult,
+    GateIsolationConfig,
     GateParallelGroup,
     GateResult,
     PersistenceTargetConfig,
@@ -630,6 +635,410 @@ class VerifyFailureClassificationTests(unittest.TestCase):
                 [".tmp-tests/storage/current/*.json"],
             )
             self.assertEqual(metadata[commands[0]].resource_class, "heavy")
+
+    def test_pytest_selector_inherits_metadata_from_selector_qualified_multitarget_step(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            owned_refs = [
+                "tests/system/test_remote_asr.py::test_exact_route",
+                "tests/system/test_remote_asr.py::test_preflight_gate",
+            ]
+            producer_binding = {
+                "input_key": "remote_asr.credentials",
+                "env": "REMOTE_ASR_CREDENTIALS",
+                "projection": "value",
+            }
+            producer = VerificationStep(
+                proof_id="req032.remote_asr_system",
+                kind="test",
+                runner="pytest",
+                targets=list(owned_refs),
+                args=["--maxfail=1"],
+                levels=["release"],
+                risk="critical",
+                cache_scope="source",
+                result_cache_scope="candidate",
+                resource_class="heavy",
+                cpu_slots=3,
+                memory_mb=2048,
+                memory_reserve_mb=512,
+                memory_guard="required",
+                requires=["ffmpeg"],
+                exclusive_resources=["pool:remote-asr-provider"],
+                dynamic_ports=["provider-callback"],
+                artifact_globs=[
+                    ".tmp-tests/evidence/localization/current/remote-asr.json"
+                ],
+                serial_reason="shared provider quota",
+                operator_input_bindings=[producer_binding],
+            )
+            unrelated_binding = {
+                "input_key": "unrelated.credentials",
+                "env": "UNRELATED_CREDENTIALS",
+                "projection": "value",
+            }
+            unrelated = VerificationStep(
+                proof_id="req032.unrelated_same_file",
+                kind="test",
+                runner="pytest",
+                targets=[
+                    "tests/system/test_remote_asr.py::test_unrelated_provider"
+                ],
+                args=["--strict-markers"],
+                levels=["release"],
+                risk="low",
+                resource_class="exclusive",
+                artifact_globs=[".tmp-tests/unrelated/current.json"],
+                operator_input_bindings=[unrelated_binding],
+            )
+            isolation = GateIsolationConfig(
+                enabled=True,
+                mode="git_worktree",
+                worktree_root=".tmp-gate-worktrees",
+                artifact_max_bytes=4096,
+                artifact_max_files=8,
+            )
+            orchestrator.config.gates.steps = [unrelated, producer]
+            orchestrator.config.gates.isolation = isolation
+            orchestrator.config.gates.distributed.mode = "off"
+            task = TaskSpec(
+                task_id="task-remote-provider",
+                title="Verify remote provider",
+                description="Run the owned remote-provider selectors.",
+                acceptance=["Every owned selector keeps its producer context."],
+                verification_refs=list(owned_refs),
+            )
+
+            commands = orchestrator._build_task_verify_commands(task)
+            known = orchestrator._resolved_gate_plan("final").metadata
+            metadata = orchestrator._task_gate_command_metadata(
+                task,
+                commands,
+                known,
+            )
+            producer_command = command_from_verification_step(
+                producer,
+                project_root=project_root,
+            )
+            producer_metadata = known[producer_command]
+
+            self.assertEqual(len(commands), len(owned_refs))
+            for ref, command in zip(owned_refs, commands):
+                self.assertIn("--maxfail=1", command)
+                self.assertIn(ref, command)
+                self.assertNotIn("--strict-markers", command)
+                self.assertNotIn("::test_unrelated_provider", command)
+                self.assertIs(metadata[command], producer_metadata)
+                self.assertEqual(
+                    metadata[command].proof_ids,
+                    ["req032.remote_asr_system"],
+                )
+                self.assertEqual(metadata[command].risk, "critical")
+                self.assertEqual(metadata[command].resource_class, "heavy")
+                self.assertEqual(metadata[command].cpu_slots, 3)
+                self.assertEqual(metadata[command].memory_mb, 2048)
+                self.assertEqual(metadata[command].memory_reserve_mb, 512)
+                self.assertEqual(metadata[command].memory_guard, "required")
+                self.assertEqual(metadata[command].requires, ["ffmpeg"])
+                self.assertEqual(
+                    metadata[command].exclusive_resources,
+                    ["pool:remote-asr-provider"],
+                )
+                self.assertEqual(
+                    metadata[command].dynamic_ports,
+                    ["provider-callback"],
+                )
+                self.assertEqual(
+                    metadata[command].artifact_globs,
+                    [
+                        ".tmp-tests/evidence/localization/current/remote-asr.json"
+                    ],
+                )
+                self.assertEqual(
+                    metadata[command].serial_reason,
+                    "shared provider quota",
+                )
+                self.assertEqual(metadata[command].cache_scope, "source")
+                self.assertEqual(
+                    metadata[command].result_cache_scope,
+                    "candidate",
+                )
+                selected = orchestrator._configured_verification_step_for_evidence_ref(
+                    ref,
+                    runner="pytest",
+                )
+                self.assertIs(selected, producer)
+                self.assertEqual(
+                    selected.operator_input_bindings,
+                    [producer_binding],
+                )
+
+            with patch.object(
+                orchestrator._operator_inputs,
+                "environment",
+                return_value=({"REMOTE_ASR_CREDENTIALS": "bound"}, []),
+            ) as resolve_environment:
+                operator_environment = orchestrator._operator_gate_environment()
+            bindings = resolve_environment.call_args.args[0]
+            self.assertIn(producer_binding, bindings)
+            self.assertEqual(
+                operator_environment,
+                {"REMOTE_ASR_CREDENTIALS": "bound"},
+            )
+
+            with patch.object(
+                orchestrator,
+                "_operator_gate_environment",
+                return_value=operator_environment,
+            ), patch(
+                "auto_agents.orchestrator.LocalGatePlanExecutor"
+            ) as executor_type:
+                executor = orchestrator._gate_executor_context(metadata)
+            self.assertIs(executor, executor_type.return_value)
+            executor_args = executor_type.call_args.args
+            executor_kwargs = executor_type.call_args.kwargs
+            self.assertIs(executor_args[1].isolation, isolation)
+            self.assertEqual(executor_args[2], metadata)
+            self.assertEqual(
+                executor_kwargs["environment_overrides"],
+                operator_environment,
+            )
+
+    def test_task_gate_metadata_logs_incomplete_selector_context_nonfatally(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            ref = "tests/test_provider.py::test_publishes_receipt"
+            producer = VerificationStep(
+                proof_id="provider.receipt",
+                runner="pytest",
+                targets=[ref],
+                levels=["release"],
+                risk="high",
+                resource_class="heavy",
+                cpu_slots=2,
+                memory_mb=1024,
+                memory_reserve_mb=256,
+                memory_guard="advisory",
+                requires=["ffmpeg"],
+                exclusive_resources=["pool:provider"],
+                dynamic_ports=["callback"],
+                artifact_globs=[".tmp-tests/provider/receipt.json"],
+                serial_reason="shared provider",
+                cache_scope="source",
+                result_cache_scope="candidate",
+            )
+            orchestrator.config.gates.steps = [producer]
+            task = TaskSpec(
+                task_id="task-provider",
+                title="Verify provider receipt",
+                description="Run one selector.",
+                acceptance=["The selector keeps its declared context."],
+                verification_refs=[ref],
+            )
+            commands = orchestrator._build_task_verify_commands(task)
+            known = orchestrator._resolved_gate_plan("final").metadata
+            incomplete = GateCommandMetadata(proof_ids=[producer.proof_id])
+            known[commands[0]] = incomplete
+
+            with self.assertLogs(orchestrator.logger, level="WARNING") as logs:
+                metadata = orchestrator._task_gate_command_metadata(
+                    task,
+                    commands,
+                    known,
+                )
+
+            self.assertIs(metadata[commands[0]], incomplete)
+            self.assertEqual(len(logs.output), 1)
+            diagnostic = logs.output[0]
+            self.assertIn(ref, diagnostic)
+            self.assertIn(producer.proof_id, diagnostic)
+            self.assertIn(commands[0], diagnostic)
+            for field_name in (
+                "risk",
+                "resource_class",
+                "cpu_slots",
+                "memory_mb",
+                "memory_reserve_mb",
+                "memory_guard",
+                "requires",
+                "exclusive_resources",
+                "dynamic_ports",
+                "artifact_globs",
+                "serial_reason",
+                "cache_scope",
+                "result_cache_scope",
+            ):
+                self.assertIn(field_name, diagnostic)
+
+    def test_selector_qualified_pytest_publishes_current_remote_asr_artifact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            test_path = project_root / "tests" / "system" / "test_remote_asr.py"
+            test_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_ref = (
+                ".tmp-tests/evidence/localization/current/remote-asr.json"
+            )
+            receipt = b'{"provider":"remote-asr","status":"verified"}\n'
+            write_text(
+                test_path,
+                "from pathlib import Path\n\n"
+                "def test_publishes_current_remote_asr_receipt():\n"
+                f"    receipt = Path.cwd() / {artifact_ref!r}\n"
+                "    receipt.parent.mkdir(parents=True, exist_ok=True)\n"
+                f"    receipt.write_bytes({receipt!r})\n",
+            )
+            local_bin = project_root / ".conda" / "bin"
+            local_bin.mkdir(parents=True)
+            (local_bin / "python").symlink_to(Path(sys.executable).resolve())
+            producer_ref = (
+                "tests/system/test_remote_asr.py::"
+                "test_publishes_current_remote_asr_receipt"
+            )
+            config = load_project_config(project_root)
+            config.gates.steps = [
+                VerificationStep(
+                    proof_id="remote_asr.current_receipt",
+                    kind="test",
+                    runner="pytest",
+                    targets=[producer_ref],
+                    artifact_globs=[artifact_ref],
+                )
+            ]
+            config.gates.isolation.enabled = True
+            config.gates.isolation.worktree_root = str(
+                Path(tmp) / "gate-worktrees"
+            )
+            config.gates.distributed.mode = "off"
+            save_project_config(project_root, config)
+            subprocess.run(
+                ["git", "config", "user.name", "test"],
+                cwd=project_root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=project_root,
+                check=True,
+            )
+            commit_all(project_root, "test: isolated artifact baseline")
+            orchestrator = Orchestrator(project_root)
+            task = TaskSpec(
+                task_id="task-remote-asr",
+                title="Publish current remote ASR evidence",
+                description="Run the owned selector in isolation.",
+                acceptance=["The current receipt is portable."],
+                verification_refs=[producer_ref],
+                requirement_proofs=[
+                    {
+                        "status": "verified",
+                        "evidence_refs": [producer_ref, artifact_ref],
+                    }
+                ],
+            )
+            commands = orchestrator._build_task_verify_commands(task)
+
+            gate, mutation_error = (
+                orchestrator._run_task_gate_commands_for_commands(
+                    task,
+                    commands,
+                    collect_all=True,
+                    context="selector-qualified artifact publication test",
+                )
+            )
+
+            self.assertEqual(len(commands), 1)
+            self.assertTrue(gate.ok, gate.summary)
+            self.assertEqual(mutation_error, "")
+            self.assertEqual(len(gate.commands), 1)
+            result = gate.commands[0]
+            self.assertEqual(result.backend, "local-isolated")
+            self.assertEqual(result.mutation_paths, [])
+            self.assertEqual(
+                result.artifacts,
+                {artifact_ref: hashlib.sha256(receipt).hexdigest()},
+            )
+            self.assertEqual((project_root / artifact_ref).read_bytes(), receipt)
+            self.assertIsNone(
+                orchestrator._ignored_supporting_evidence_portability_failure(
+                    task,
+                    gate,
+                )
+            )
+
+    def test_pytest_selector_match_prefers_exact_rejects_sibling_and_allows_file_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            file_fallback = VerificationStep(
+                proof_id="file-wide",
+                runner="pytest",
+                targets=["./tests/test_storage_smoke.py"],
+            )
+            sibling = VerificationStep(
+                proof_id="sibling",
+                runner="pytest",
+                targets=["tests/test_storage_smoke.py::test_other_receipt"],
+            )
+            exact_first = VerificationStep(
+                proof_id="exact-first",
+                runner="pytest",
+                targets=[r"tests\test_storage_smoke.py::test_publishes_receipt"],
+            )
+            exact_second = VerificationStep(
+                proof_id="exact-second",
+                runner="pytest",
+                targets=["tests/test_storage_smoke.py::test_publishes_receipt"],
+            )
+            orchestrator.config.gates.steps = [
+                file_fallback,
+                sibling,
+                exact_first,
+                exact_second,
+            ]
+
+            self.assertIs(
+                orchestrator._configured_verification_step_for_evidence_ref(
+                    "./tests/test_storage_smoke.py::test_publishes_receipt",
+                    runner="pytest",
+                ),
+                exact_first,
+            )
+            self.assertIs(
+                orchestrator._configured_verification_step_for_evidence_ref(
+                    "tests/test_storage_smoke.py::test_unconfigured_receipt",
+                    runner="pytest",
+                ),
+                file_fallback,
+            )
+            self.assertIs(
+                orchestrator._configured_verification_step_for_evidence_ref(
+                    "tests/test_storage_smoke.py",
+                    runner="pytest",
+                ),
+                file_fallback,
+            )
+
+            orchestrator.config.gates.steps = [sibling]
+            self.assertIsNone(
+                orchestrator._configured_verification_step_for_evidence_ref(
+                    "tests/test_storage_smoke.py::test_publishes_receipt",
+                    runner="pytest",
+                )
+            )
 
     def test_artifact_contract_missing_generated_glob_routes_plan_and_syncs_config(
         self,
@@ -6332,6 +6741,499 @@ class RetryFlowTests(unittest.TestCase):
             )
             self.assertEqual(task.verify_baseline_failures, [])
 
+    def test_lazy_baseline_absent_selector_with_passing_identity_diagnostic_is_not_applicable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            selector = "tests/test_new_contract.py::test_new_contract"
+            orchestrator.config.gates.verification_policy_version = 3
+            orchestrator.config.gates.incremental_mode = "auto"
+            orchestrator.config.gates.steps = [
+                VerificationStep(runner="pytest", targets=[selector])
+            ]
+            task = TaskSpec(
+                task_id="task-001",
+                title="Add a focused contract proof",
+                description="The exact selector is new at current HEAD.",
+                acceptance=["The current failure remains authoritative."],
+                verification_refs=[selector],
+                verify_baseline_ref="abcdef1",
+            )
+            command = orchestrator._build_task_verify_commands(task)[0]
+            current_output = "verification failed before pytest reported test ids\n"
+            current_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout=current_output,
+                    )
+                ],
+                summary="current verification contract failed",
+            )
+            diagnostic_gate = GateResult(
+                ok=True,
+                commands=[
+                    CommandResult(
+                        command=build_failure_identity_diagnostic_command(command),
+                        ok=True,
+                        returncode=0,
+                        stdout=f"{selector} PASSED\n",
+                    )
+                ],
+                summary="diagnostic exact selector passed",
+            )
+            baseline_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=4,
+                        stdout=(
+                            f"ERROR: not found: {selector}\n"
+                            "(no match in any of [<Module test_new_contract.py>])\n"
+                        ),
+                    )
+                ],
+                summary="baseline target is absent",
+            )
+
+            with (
+                patch.object(orchestrator, "_quick_verify_failure", return_value=None),
+                patch.object(
+                    orchestrator,
+                    "_run_task_gate_commands_for_commands",
+                    side_effect=[(current_gate, ""), (baseline_gate, "")],
+                ),
+                patch.object(
+                    orchestrator,
+                    "_run_verify_failure_identity_diagnostic",
+                    return_value=diagnostic_gate,
+                ),
+                patch.object(
+                    orchestrator,
+                    "_validated_baseline_failures",
+                    side_effect=AssertionError(
+                        "baseline-only absence must bypass identity validation"
+                    ),
+                ),
+            ):
+                result = orchestrator._run_task_verify(task)
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["comparable_failures"])
+            self.assertEqual(result["failure_ids"], [f"cmd:{command}"])
+            self.assertEqual(result["current_failure_ids"], [f"cmd:{command}"])
+            self.assertEqual(result["baseline_failure_ids"], [])
+            self.assertEqual(result["baseline_not_applicable_commands"], [command])
+            self.assertIn(current_output.strip(), result["raw_output"])
+            self.assertNotIn(f"{selector} PASSED", result["raw_output"])
+            self.assertEqual(task.verify_baseline_failures, [])
+
+    def test_lazy_baseline_absent_selector_unresolved_at_current_remains_hard_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            selector = "tests/test_missing.py::test_missing"
+            orchestrator.config.gates.verification_policy_version = 3
+            orchestrator.config.gates.incremental_mode = "auto"
+            orchestrator.config.gates.steps = [
+                VerificationStep(runner="pytest", targets=[selector])
+            ]
+            task = TaskSpec(
+                task_id="task-001",
+                title="Reject an unresolved selector",
+                description="The selector is missing at both revisions.",
+                acceptance=["A stale selector remains a hard failure."],
+                verification_refs=[selector],
+                verify_baseline_ref="abcdef1",
+            )
+            command = orchestrator._build_task_verify_commands(task)[0]
+            missing_output = (
+                f"ERROR: not found: {selector}\n"
+                "(no match in any of [<Module test_missing.py>])\n"
+            )
+            current_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=4,
+                        stdout=missing_output,
+                    )
+                ],
+                summary="current target is absent",
+            )
+            baseline_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=4,
+                        stdout=missing_output,
+                    )
+                ],
+                summary="baseline target is absent",
+            )
+            diagnostic_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=build_failure_identity_diagnostic_command(command),
+                        ok=False,
+                        returncode=4,
+                        stdout=missing_output,
+                    )
+                ],
+                summary="diagnostic target is still absent",
+            )
+
+            with (
+                patch.object(orchestrator, "_quick_verify_failure", return_value=None),
+                patch.object(
+                    orchestrator,
+                    "_run_task_gate_commands_for_commands",
+                    side_effect=[(current_gate, ""), (baseline_gate, "")],
+                ),
+                patch.object(
+                    orchestrator,
+                    "_run_verify_failure_identity_diagnostic",
+                    return_value=diagnostic_gate,
+                ),
+                self.assertRaises(GateCommandBaselineIdentityError) as raised,
+            ):
+                orchestrator._run_task_verify(task)
+
+            self.assertIsNotNone(raised.exception.result)
+            self.assertEqual(raised.exception.result.command, command)
+            self.assertEqual(
+                raised.exception.result.process_snapshot[
+                    "baseline_failure_identity"
+                ]["status"],
+                "unresolved",
+            )
+            self.assertEqual(task.verify_baseline_failures, [])
+
+    def test_lazy_baseline_mixed_results_classify_each_command_independently(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            new_selector = "tests/test_new_contract.py::test_new_contract"
+            existing_selector = "tests/test_existing.py::test_existing"
+            selectors = [new_selector, existing_selector]
+            orchestrator.config.gates.verification_policy_version = 3
+            orchestrator.config.gates.incremental_mode = "auto"
+            orchestrator.config.gates.steps = [
+                VerificationStep(runner="pytest", targets=selectors)
+            ]
+            task = TaskSpec(
+                task_id="task-001",
+                title="Verify mixed selectors",
+                description="One selector is new and one existed at baseline.",
+                acceptance=["Baseline applicability is command-scoped."],
+                verification_refs=selectors,
+                verify_baseline_ref="abcdef1",
+            )
+            new_command, existing_command = (
+                orchestrator._build_task_verify_commands(task)
+            )
+            current_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=new_command,
+                        ok=False,
+                        returncode=1,
+                        stdout=f"FAILED {new_selector} - AssertionError\n",
+                    ),
+                    CommandResult(
+                        command=existing_command,
+                        ok=False,
+                        returncode=1,
+                        stdout=f"FAILED {existing_selector} - AssertionError\n",
+                    ),
+                ],
+                summary="two current failures",
+            )
+            baseline_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=new_command,
+                        ok=False,
+                        returncode=4,
+                        stdout=(
+                            f"ERROR: not found: {new_selector}\n"
+                            "(no match in any of [<Module test_new_contract.py>])\n"
+                        ),
+                    ),
+                    CommandResult(
+                        command=existing_command,
+                        ok=False,
+                        returncode=1,
+                        stdout=f"FAILED {existing_selector} - AssertionError\n",
+                    ),
+                ],
+                summary="one absent selector and one stable failure",
+            )
+
+            original_validator = orchestrator._validated_baseline_failures
+            with (
+                patch.object(orchestrator, "_quick_verify_failure", return_value=None),
+                patch.object(
+                    orchestrator,
+                    "_run_task_gate_commands_for_commands",
+                    side_effect=[(current_gate, ""), (baseline_gate, "")],
+                ),
+                patch.object(
+                    orchestrator,
+                    "_validated_baseline_failures",
+                    wraps=original_validator,
+                ) as validate_baseline,
+            ):
+                result = orchestrator._run_task_verify(task)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["current_failure_ids"], sorted(selectors))
+            self.assertEqual(result["baseline_failure_ids"], [existing_selector])
+            self.assertEqual(result["new_failure_ids"], [new_selector])
+            self.assertEqual(
+                result["baseline_not_applicable_commands"],
+                [new_command],
+            )
+            self.assertEqual(task.verify_baseline_failures, [existing_selector])
+            validated_gate = validate_baseline.call_args.args[0]
+            self.assertEqual(
+                [item.command for item in validated_gate.commands],
+                [existing_command],
+            )
+
+    def test_mixed_identity_diagnostic_keeps_unresolved_current_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            new_selector = "tests/test_new_contract.py::test_new_contract"
+            existing_selector = "tests/test_existing.py::test_existing"
+            selectors = [new_selector, existing_selector]
+            orchestrator.config.gates.verification_policy_version = 3
+            orchestrator.config.gates.incremental_mode = "auto"
+            orchestrator.config.gates.steps = [
+                VerificationStep(runner="pytest", targets=selectors)
+            ]
+            task = TaskSpec(
+                task_id="task-001",
+                title="Preserve mixed current failures",
+                description="Only one diagnostic yields a stable identity.",
+                acceptance=["Unresolved current evidence remains authoritative."],
+                verification_refs=selectors,
+                verify_baseline_ref="abcdef1",
+            )
+            new_command, existing_command = (
+                orchestrator._build_task_verify_commands(task)
+            )
+            new_output = "new selector failed before a pytest summary\n"
+            existing_output = "existing selector failed before a pytest summary\n"
+            current_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=new_command,
+                        ok=False,
+                        returncode=1,
+                        stdout=new_output,
+                    ),
+                    CommandResult(
+                        command=existing_command,
+                        ok=False,
+                        returncode=1,
+                        stdout=existing_output,
+                    ),
+                ],
+                summary="current commands lack stable identities",
+            )
+            diagnostic_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=build_failure_identity_diagnostic_command(new_command),
+                        ok=True,
+                        returncode=0,
+                        stdout=f"{new_selector} PASSED\n",
+                    ),
+                    CommandResult(
+                        command=build_failure_identity_diagnostic_command(
+                            existing_command
+                        ),
+                        ok=False,
+                        returncode=1,
+                        stdout=f"FAILED {existing_selector} - AssertionError\n",
+                    ),
+                ],
+                summary="one diagnostic passed and one identified a failure",
+            )
+            baseline_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=new_command,
+                        ok=False,
+                        returncode=4,
+                        stdout=(
+                            f"ERROR: not found: {new_selector}\n"
+                            "(no match in any of [<Module test_new_contract.py>])\n"
+                        ),
+                    ),
+                    CommandResult(
+                        command=existing_command,
+                        ok=True,
+                        returncode=0,
+                        stdout=f"{existing_selector} PASSED\n",
+                    ),
+                ],
+                summary="new selector is absent at baseline",
+            )
+
+            with (
+                patch.object(orchestrator, "_quick_verify_failure", return_value=None),
+                patch.object(
+                    orchestrator,
+                    "_run_task_gate_commands_for_commands",
+                    side_effect=[(current_gate, ""), (baseline_gate, "")],
+                ),
+                patch.object(
+                    orchestrator,
+                    "_run_verify_failure_identity_diagnostic",
+                    return_value=diagnostic_gate,
+                ),
+            ):
+                result = orchestrator._run_task_verify(task)
+
+            unresolved_id = f"cmd:{new_command}"
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["comparable_failures"])
+            self.assertFalse(result["baseline_comparison_comparable"])
+            self.assertEqual(
+                result["current_failure_ids"],
+                sorted([unresolved_id, existing_selector]),
+            )
+            self.assertEqual(result["failure_ids"], result["current_failure_ids"])
+            self.assertEqual(result["baseline_failure_ids"], [])
+            self.assertEqual(result["baseline_not_applicable_commands"], [new_command])
+            self.assertIn(new_output.strip(), result["raw_output"])
+            self.assertIn(existing_output.strip(), result["raw_output"])
+            self.assertIn(existing_selector, result["raw_output"])
+            self.assertNotIn(f"{new_selector} PASSED", result["raw_output"])
+            self.assertIn("non-comparable verification failure", result["reason"])
+
+    def test_lazy_baseline_absence_requires_exact_clean_pytest_results(self) -> None:
+        selector = "tests/test_contract.py::test_contract"
+
+        def classify(
+            command: str,
+            *,
+            baseline_overrides: Optional[dict] = None,
+            current_overrides: Optional[dict] = None,
+            diagnostic_overrides: Optional[dict] = None,
+        ) -> list[str]:
+            missing_output = (
+                f"ERROR: not found: {selector}\n"
+                "(no match in any of [<Module test_contract.py>])\n"
+            )
+            baseline_fields = {
+                "command": command,
+                "ok": False,
+                "returncode": 4,
+                "stdout": missing_output,
+            }
+            baseline_fields.update(baseline_overrides or {})
+            current_fields = {
+                "command": command,
+                "ok": False,
+                "returncode": 1,
+                "stdout": "failed without stable test ids\n",
+            }
+            current_fields.update(current_overrides or {})
+            diagnostic_fields = {
+                "command": build_failure_identity_diagnostic_command(command),
+                "ok": True,
+                "returncode": 0,
+                "stdout": f"{selector} PASSED\n",
+            }
+            diagnostic_fields.update(diagnostic_overrides or {})
+            return Orchestrator._lazy_baseline_target_absent_commands(
+                GateResult(
+                    ok=False,
+                    commands=[CommandResult(**baseline_fields)],
+                    summary="baseline target is absent",
+                ),
+                GateResult(
+                    ok=False,
+                    commands=[CommandResult(**current_fields)],
+                    summary="current verification failed",
+                ),
+                diagnostic_gate=GateResult(
+                    ok=bool(diagnostic_fields["ok"]),
+                    commands=[CommandResult(**diagnostic_fields)],
+                    summary="current diagnostic",
+                ),
+            )
+
+        broad_commands = {
+            "file": "python -m pytest -q tests/test_contract.py",
+            "directory": "python -m pytest -q tests",
+            "multiple_nodes": (
+                "python -m pytest -q "
+                "tests/test_contract.py::test_contract "
+                "tests/test_contract.py::test_other"
+            ),
+            "empty_path": "python -m pytest -q ::test_contract",
+            "empty_selector": "python -m pytest -q tests/test_contract.py::",
+            "non_pytest": "python -m unittest tests.test_contract",
+        }
+        for label, command in broad_commands.items():
+            with self.subTest(scope=label):
+                self.assertEqual(classify(command), [])
+
+        command = f"python -m pytest -q {selector}"
+        operational_signals = {
+            "termination": {
+                "ok": False,
+                "returncode": 124,
+                "termination_reason": "timeout",
+            },
+            "cleanup": {"cleanup_incomplete": True},
+            "infrastructure": {
+                "ok": False,
+                "returncode": 1,
+                "infrastructure_error": True,
+                "infrastructure_failure_id": "worker_unavailable",
+            },
+        }
+        for label, overrides in operational_signals.items():
+            with self.subTest(source="baseline", signal=label):
+                self.assertEqual(classify(command, baseline_overrides=overrides), [])
+            with self.subTest(source="current", signal=label):
+                self.assertEqual(classify(command, current_overrides=overrides), [])
+            with self.subTest(source="diagnostic", signal=label):
+                self.assertEqual(classify(command, diagnostic_overrides=overrides), [])
+
     def test_lazy_baseline_target_absence_rejects_unresolved_current_selector(
         self,
     ) -> None:
@@ -8278,6 +9180,607 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual(result["failure_ids"], [ref])
             self.assertNotIn("task baseline only", str(result["reason"]))
 
+    def test_proof_only_repair_baseline_failure_remains_strict_on_resume(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            requirement = _strict_requirement()
+            ref = "tests/test_public_api.py::test_contract"
+            (project_root / "tests").mkdir()
+            write_text(
+                project_root / "tests" / "test_public_api.py",
+                "def test_contract():\n    assert True\n",
+            )
+            task = TaskSpec(
+                task_id="repair-proof-only",
+                title="Repair requirement proof",
+                description="Keep the planned requirement proof executable.",
+                acceptance=["The requirement proof passes."],
+                status="blocked",
+                task_origin="evidence_repair",
+                requirement_ids=[str(requirement["id"])],
+                requirement_proofs=[
+                    _strict_requirement_proof(
+                        requirement,
+                        ref,
+                        status="planned",
+                    )
+                ],
+                verification_refs=[],
+                verify_baseline_failures=[ref],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            failed_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=f"python -m pytest -q {ref}",
+                        ok=False,
+                        returncode=1,
+                        stdout=f"FAILED {ref} - ConnectionError\n",
+                    )
+                ],
+                summary="planned requirement proof failed",
+            )
+
+            with patch.object(
+                orchestrator,
+                "_run_gate_commands_for_commands",
+                return_value=(failed_gate, ""),
+            ):
+                verify_result = orchestrator._run_task_verify(task)
+
+            self.assertFalse(verify_result["ok"])
+            self.assertEqual(verify_result["current_failure_ids"], [ref])
+            self.assertEqual(verify_result["baseline_failure_ids"], [ref])
+            self.assertEqual(verify_result["new_failure_ids"], [])
+            self.assertEqual(verify_result["owned_failure_ids"], [ref])
+            self.assertEqual(
+                verify_result["failure_class"],
+                "baseline_only_owned",
+            )
+
+            with patch.object(
+                orchestrator,
+                "_run_task_verify",
+                return_value=verify_result,
+            ), patch.object(
+                orchestrator,
+                "_run_agent_with_retries",
+                side_effect=AssertionError("baseline-only proof retried implementation"),
+            ) as implement:
+                terminal = orchestrator._execute_task_with_retries(
+                    state,
+                    task,
+                    resume_existing=True,
+                )
+
+            implement.assert_not_called()
+            self.assertFalse(terminal["ok"])
+            self.assertEqual(terminal["new_failure_ids"], [])
+            self.assertEqual(terminal["owned_failure_ids"], [ref])
+            self.assertEqual(terminal["failure_class"], "baseline_only_owned")
+
+            recovery_round = task.recovery_round
+            with patch.object(
+                orchestrator,
+                "_recover_task_failure_with_judge",
+                side_effect=AssertionError("baseline-only proof reached recovery judge"),
+            ) as recovery_judge:
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    terminal,
+                )
+
+            recovery_judge.assert_not_called()
+            self.assertFalse(scheduled)
+            self.assertEqual(task.recovery_round, recovery_round)
+
+    def test_repair_baseline_only_failures_are_not_reported_as_new(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            stream = io.StringIO()
+            orchestrator = Orchestrator(
+                project_root,
+                agent_output_stream=stream,
+            )
+            orchestrator.config.retries.per_stage["implement"] = 3
+            ref = "tests/test_contract.py::ContractTests::test_external_boundary"
+            (project_root / "tests").mkdir()
+            write_text(
+                project_root / "tests" / "test_contract.py",
+                "def test_external_boundary():\n    assert True\n",
+            )
+            task = TaskSpec(
+                task_id="repair-proof-evidence",
+                title="Repair external-boundary proof evidence",
+                description="Keep the owned proof executable.",
+                acceptance=["The owned proof passes."],
+                task_origin="evidence_repair",
+                recovery_round=1,
+                verification_refs=[ref],
+                verify_baseline_failures=[ref],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+
+            failed_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command="python -m pytest -q " + ref,
+                        ok=False,
+                        returncode=1,
+                        stdout=(
+                            "api_key=classified\n"
+                            f"FAILED {ref} - ConnectionError\n"
+                        ),
+                        stderr="",
+                    )
+                ],
+                summary="owned verification command failed",
+            )
+
+            with patch.object(
+                orchestrator,
+                "_run_gate_commands_for_commands",
+                return_value=(failed_gate, ""),
+            ):
+                verify_result = orchestrator._run_task_verify(task)
+
+            self.assertFalse(verify_result["ok"])
+            self.assertEqual(verify_result["failure_ids"], [ref])
+            self.assertEqual(verify_result["current_failure_ids"], [ref])
+            self.assertEqual(verify_result["baseline_failure_ids"], [ref])
+            self.assertEqual(verify_result["new_failure_ids"], [])
+            self.assertEqual(verify_result["owned_failure_ids"], [ref])
+            self.assertEqual(
+                verify_result["failure_class"],
+                "baseline_only_owned",
+            )
+            self.assertFalse(
+                verify_result["retryable_owned_evidence_failure_refs"]
+            )
+            self.assertNotIn("new verification failure", verify_result["reason"])
+
+            with patch.object(
+                orchestrator,
+                "_run_task_verify",
+                return_value=verify_result,
+            ):
+                terminal = orchestrator._execute_task_with_retries(
+                    state,
+                    task,
+                    resume_existing=True,
+                )
+
+            self.assertFalse(terminal["ok"])
+            self.assertEqual(terminal["new_failure_ids"], [])
+            self.assertEqual(terminal["owned_failure_ids"], [ref])
+            self.assertIn("api_key=<redacted>", terminal["redacted_command_evidence"])
+            self.assertNotIn("classified", terminal["redacted_command_evidence"])
+            self.assertEqual(len(task.verify_history), 1)
+            self.assertEqual(task.verify_history[0]["new_failure_ids"], [])
+            self.assertEqual(
+                task.verify_history[0]["failure_class"],
+                "baseline_only_owned",
+            )
+            self.assertIn("action=stop-no-new-failures", stream.getvalue())
+
+            scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                state,
+                state.tasks,
+                task,
+                terminal,
+            )
+
+            self.assertFalse(scheduled)
+            self.assertEqual(task.recovery_round, 1)
+            self.assertEqual(task.recovery_history, [])
+            self.assertEqual(
+                state.last_recovery_route["outcome"],
+                "not_recoverable",
+            )
+            self.assertEqual(
+                state.last_recovery_route["engine_invariant"],
+                "no_new_verification_failures",
+            )
+
+            legacy_task = TaskSpec(
+                task_id="legacy-repair-proof",
+                title="Legacy repair proof",
+                description="Resume persisted proof state.",
+                acceptance=["The proof passes."],
+                status="blocked",
+                task_origin="evidence_repair",
+                recovery_round=2,
+                verification_refs=[ref],
+                verify_baseline_failures=[ref],
+                verify_history=[
+                    {
+                        "attempt": 1,
+                        "decision": "fail",
+                        "summary": "owned verification command failed",
+                        "failure_ids": [ref],
+                        "comparable_failures": True,
+                    }
+                ],
+            )
+            legacy_state = load_run_state(project_root)
+            legacy_state.tasks = [legacy_task]
+            legacy_payload = orchestrator._task_recovery_payload_from_history(
+                legacy_task,
+                legacy_state,
+            )
+            self.assertEqual(legacy_payload["new_failure_ids"], [])
+            self.assertEqual(legacy_payload["owned_failure_ids"], [ref])
+            self.assertEqual(
+                legacy_payload["failure_class"],
+                "baseline_only_owned",
+            )
+            self.assertFalse(
+                orchestrator._schedule_repair_tasks_for_failure(
+                    legacy_state,
+                    legacy_state.tasks,
+                    legacy_task,
+                    legacy_payload,
+                )
+            )
+            self.assertEqual(legacy_task.recovery_round, 2)
+            self.assertEqual(len(legacy_task.recovery_history), 0)
+
+            parallel_result = orchestrator._parallel_task_failure_result(
+                task,
+                terminal,
+            )
+            self.assertEqual(parallel_result["new_failure_ids"], [])
+            self.assertEqual(parallel_result["owned_failure_ids"], [ref])
+            self.assertEqual(
+                parallel_result["failure_class"],
+                "baseline_only_owned",
+            )
+
+            diagnostic_paths = orchestrator._archive_failed_task_diagnostics(
+                state,
+                task,
+                project_root,
+                terminal,
+            )
+            diagnostic_path = next(
+                project_root / path
+                for path in diagnostic_paths
+                if path.endswith("failure.json")
+            )
+            diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["new_failure_ids"], [])
+            self.assertEqual(diagnostic["owned_failure_ids"], [ref])
+            self.assertEqual(diagnostic["failure_class"], "baseline_only_owned")
+
+            checkpoint = orchestrator._preserve_failed_task_checkpoint(
+                state,
+                task,
+                project_root,
+                terminal,
+            )
+            self.assertEqual(checkpoint["new_failure_ids"], [])
+            self.assertEqual(checkpoint["owned_failure_ids"], [ref])
+            self.assertEqual(checkpoint["failure_class"], "baseline_only_owned")
+
+    def test_resume_recanonicalizes_legacy_inflated_new_failure_set(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.retries.per_stage["implement"] = 3
+            ref = "tests/test_contract.py::test_external_boundary"
+            (project_root / "tests").mkdir()
+            write_text(
+                project_root / "tests" / "test_contract.py",
+                "def test_external_boundary():\n    assert True\n",
+            )
+            inflated_failure = {
+                "attempt": 1,
+                "decision": "fail",
+                "summary": "owned verification command failed",
+                "failure_ids": [ref],
+                "current_failure_ids": [ref],
+                "baseline_failure_ids": [ref],
+                "new_failure_ids": [ref],
+                "owned_failure_ids": [ref],
+                "failure_class": "newly_introduced_owned",
+                "comparable_failures": True,
+                "baseline_comparison_comparable": True,
+                "recovery_epoch": 0,
+                "recovery_round": 2,
+                "verify_retry_epoch": 0,
+            }
+            task = TaskSpec(
+                task_id="legacy-repair-proof",
+                title="Legacy repair proof",
+                description="Resume persisted proof state.",
+                acceptance=["The proof passes."],
+                status="blocked",
+                task_origin="evidence_repair",
+                recovery_round=2,
+                verification_refs=[ref],
+                verify_baseline_failures=[ref],
+                verify_history=[dict(inflated_failure)],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+
+            resumed = orchestrator._task_recovery_payload_from_history(
+                task,
+                state,
+            )
+
+            self.assertEqual(resumed["new_failure_ids"], [])
+            self.assertEqual(resumed["owned_failure_ids"], [ref])
+            self.assertEqual(resumed["failure_class"], "baseline_only_owned")
+            self.assertEqual(
+                orchestrator._candidate_repair_refs(task, inflated_failure),
+                [],
+            )
+            resumed_feedback = orchestrator._build_verify_retry_feedback(
+                inflated_failure,
+                task=task,
+            )
+            self.assertNotIn(
+                "New failures vs task baseline",
+                resumed_feedback["verification_summary"],
+            )
+
+            verify_result = {
+                **inflated_failure,
+                "ok": False,
+                "reason": "owned verification command failed",
+                "raw_output": f"FAILED {ref} - ConnectionError\n",
+                "retryable_owned_evidence_failure_refs": True,
+            }
+            unexpected_implementation = AgentResult(
+                ok=False,
+                command=["fake"],
+                output_path=project_root / "unexpected-implementation.md",
+                stderr="unexpected implementation retry",
+                returncode=1,
+            )
+            with patch.object(
+                orchestrator,
+                "_run_task_verify",
+                return_value=verify_result,
+            ), patch.object(
+                orchestrator,
+                "_run_agent_with_retries",
+                return_value=unexpected_implementation,
+            ) as implement:
+                terminal = orchestrator._execute_task_with_retries(
+                    state,
+                    task,
+                    resume_existing=True,
+                )
+
+            implement.assert_not_called()
+            self.assertEqual(terminal["new_failure_ids"], [])
+            self.assertEqual(terminal["owned_failure_ids"], [ref])
+            self.assertEqual(terminal["failure_class"], "baseline_only_owned")
+            self.assertEqual(task.verify_history[-1]["new_failure_ids"], [])
+            self.assertEqual(
+                task.verify_history[-1]["failure_class"],
+                "baseline_only_owned",
+            )
+
+            with patch.object(
+                orchestrator,
+                "_recover_task_failure_with_judge",
+                side_effect=AssertionError("baseline-only failure reached repair judge"),
+            ):
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    verify_result,
+                )
+
+            self.assertFalse(scheduled)
+            self.assertEqual(task.recovery_round, 2)
+            self.assertEqual(task.recovery_history, [])
+
+    def test_cmd_pytest_ref_owns_identical_baseline_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            orchestrator.config.retries.per_stage["implement"] = 3
+            ref = "tests/test_contract.py::test_external_boundary"
+            command = f"python -m pytest -q {ref}"
+            (project_root / "tests").mkdir()
+            write_text(
+                project_root / "tests" / "test_contract.py",
+                "def test_external_boundary():\n    assert True\n",
+            )
+            task = TaskSpec(
+                task_id="repair-command-proof",
+                title="Repair command proof",
+                description="Keep the explicit command proof executable.",
+                acceptance=["The command proof passes."],
+                task_origin="evidence_repair",
+                recovery_round=1,
+                verification_refs=[f"cmd:{command}"],
+                verify_baseline_failures=[ref],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            failed_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout=f"FAILED {ref} - ConnectionError\n",
+                    )
+                ],
+                summary="owned command verification failed",
+            )
+
+            with patch.object(
+                orchestrator,
+                "_run_gate_commands_for_commands",
+                return_value=(failed_gate, ""),
+            ):
+                verify_result = orchestrator._run_task_verify(task)
+
+            self.assertFalse(verify_result["ok"])
+            self.assertEqual(verify_result["current_failure_ids"], [ref])
+            self.assertEqual(verify_result["baseline_failure_ids"], [ref])
+            self.assertEqual(verify_result["new_failure_ids"], [])
+            self.assertEqual(verify_result["owned_failure_ids"], [ref])
+            self.assertEqual(
+                verify_result["failure_class"],
+                "baseline_only_owned",
+            )
+            self.assertFalse(
+                verify_result["retryable_owned_evidence_failure_refs"]
+            )
+
+            unexpected_implementation = AgentResult(
+                ok=False,
+                command=["fake"],
+                output_path=project_root / "unexpected-implementation.md",
+                stderr="unexpected implementation retry",
+                returncode=1,
+            )
+            with patch.object(
+                orchestrator,
+                "_run_task_verify",
+                return_value=verify_result,
+            ), patch.object(
+                orchestrator,
+                "_run_agent_with_retries",
+                return_value=unexpected_implementation,
+            ) as implement:
+                terminal = orchestrator._execute_task_with_retries(
+                    state,
+                    task,
+                    resume_existing=True,
+                )
+
+            implement.assert_not_called()
+            self.assertEqual(terminal["new_failure_ids"], [])
+            self.assertEqual(terminal["owned_failure_ids"], [ref])
+            self.assertEqual(terminal["failure_class"], "baseline_only_owned")
+            recovery_round = task.recovery_round
+            with patch.object(
+                orchestrator,
+                "_recover_task_failure_with_judge",
+                side_effect=AssertionError("baseline-only failure reached repair judge"),
+            ):
+                scheduled = orchestrator._schedule_repair_tasks_for_failure(
+                    state,
+                    state.tasks,
+                    task,
+                    terminal,
+                )
+
+            self.assertFalse(scheduled)
+            self.assertEqual(task.recovery_round, recovery_round)
+
+    def test_cmd_pytest_scopes_own_descendants_and_missing_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            orchestrator = Orchestrator(project_root)
+            class_failure = (
+                "tests/test_contract.py::ContractTests::test_external_boundary"
+            )
+            file_failure = "tests/test_other.py::test_other_boundary"
+            cases = [
+                (
+                    "file",
+                    "python -m pytest tests/test_contract.py -q",
+                    [class_failure],
+                ),
+                (
+                    "class",
+                    (
+                        "python -m pytest -q "
+                        "tests/test_contract.py::ContractTests --maxfail=1"
+                    ),
+                    [class_failure],
+                ),
+                (
+                    "multiple",
+                    (
+                        "python -m pytest tests/test_contract.py::ContractTests "
+                        "tests/test_other.py -q"
+                    ),
+                    [class_failure, file_failure],
+                ),
+            ]
+
+            for label, command, failures in cases:
+                with self.subTest(label=label):
+                    task = TaskSpec(
+                        task_id=f"repair-command-{label}",
+                        title="Repair scoped command proof",
+                        description="Keep every pytest command target executable.",
+                        acceptance=["The scoped command proof passes."],
+                        task_origin="evidence_repair",
+                        verification_refs=[f"cmd:{command}"],
+                    )
+
+                    self.assertEqual(
+                        orchestrator._owned_task_failure_ids(task, failures),
+                        sorted(failures),
+                    )
+                    provenance = (
+                        orchestrator._task_verification_failure_provenance(
+                            task,
+                            current_failure_ids=failures,
+                            baseline_failure_ids=failures,
+                            new_failure_ids=[],
+                            comparison_comparable=True,
+                        )
+                    )
+                    self.assertEqual(provenance["new_failure_ids"], [])
+                    self.assertEqual(
+                        provenance["owned_failure_ids"],
+                        sorted(failures),
+                    )
+                    self.assertEqual(
+                        provenance["failure_class"],
+                        "baseline_only_owned",
+                    )
+                    self.assertTrue(
+                        orchestrator._all_failures_are_owned_pytest_evidence_refs(
+                            task,
+                            failures,
+                        )
+                    )
+                    missing_failures = [
+                        f"ERROR: not found: {failure}" for failure in failures
+                    ]
+                    self.assertTrue(
+                        orchestrator._all_failures_are_missing_owned_pytest_evidence_refs(
+                            task,
+                            missing_failures,
+                        )
+                    )
+                    self.assertFalse(
+                        orchestrator._all_failures_are_owned_pytest_evidence_refs(
+                            task,
+                            ["tests/test_unrelated.py::test_unrelated_boundary"],
+                        )
+                    )
+
     def test_task_verify_rewind_is_propagated_before_retrying_implement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -8915,7 +10418,11 @@ class RetryFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
-            self._disable_gates_and_approvals(project_root)
+            base_config = Orchestrator(project_root).config
+            base_config.gates.commands = []
+            base_config.approvals.enabled = []
+            base_config.gates.require_clean_git_before_task = False
+            save_project_config(project_root, base_config)
             stream = io.StringIO()
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
 
@@ -8987,7 +10494,11 @@ class RetryFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
-            self._disable_gates_and_approvals(project_root)
+            base_config = Orchestrator(project_root).config
+            base_config.gates.commands = []
+            base_config.approvals.enabled = []
+            base_config.gates.require_clean_git_before_task = False
+            save_project_config(project_root, base_config)
             stream = io.StringIO()
             orchestrator = Orchestrator(project_root, agent_output_stream=stream)
 
@@ -9051,6 +10562,102 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIn("compare=changed-failure-set", rendered)
             self.assertNotIn("stopping retries early", rendered)
             self.assertIn(ref, str(result["reason"]))
+
+    def test_repair_owned_scoped_pytest_failure_continues_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            base_config = Orchestrator(project_root).config
+            base_config.gates.commands = []
+            base_config.approvals.enabled = []
+            base_config.gates.require_clean_git_before_task = False
+            base_config.retries.per_stage["implement"] = 3
+            save_project_config(project_root, base_config)
+            stream = io.StringIO()
+            orchestrator = Orchestrator(project_root, agent_output_stream=stream)
+            orchestrator.adapter = SequencedVerifyFailureAdapter(
+                project_root,
+                ["unchanged", "unchanged", "unchanged"],
+            )
+            failure_ref = (
+                "tests/test_contract.py::ContractTests::test_provider_reference"
+            )
+            command = "python -m pytest tests/test_contract.py -q"
+            task = TaskSpec(
+                task_id="repair-scoped-command",
+                title="Repair file-scoped proof evidence",
+                description="Fix the failing child of an owned pytest file.",
+                acceptance=["The file-scoped command proof passes."],
+                task_origin="evidence_repair",
+                verification_refs=[f"cmd:{command}"],
+            )
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            write_text(
+                project_root / "tests" / "test_contract.py",
+                (
+                    "import unittest\n\n"
+                    "class ContractTests(unittest.TestCase):\n"
+                    "    def test_provider_reference(self):\n"
+                    "        self.assertTrue(True)\n"
+                ),
+            )
+
+            def fake_failing_child(commands, *, collect_all, context):
+                self.assertEqual(commands, [command])
+                return (
+                    GateResult(
+                        ok=False,
+                        commands=[
+                            CommandResult(
+                                command=command,
+                                ok=False,
+                                returncode=1,
+                                stdout=f"FAILED {failure_ref} - AssertionError\n",
+                            )
+                        ],
+                        summary=f"command failed: {command}",
+                    ),
+                    "",
+                )
+
+            with patch.object(
+                orchestrator,
+                "_run_gate_commands_for_commands",
+                side_effect=fake_failing_child,
+            ):
+                initial_verify = orchestrator._run_task_verify(task)
+
+            self.assertTrue(
+                initial_verify["retryable_owned_evidence_failure_refs"]
+            )
+            self.assertEqual(initial_verify["new_failure_ids"], [failure_ref])
+            self.assertEqual(initial_verify["owned_failure_ids"], [failure_ref])
+
+            with patch.object(
+                orchestrator,
+                "_run_gate_commands_for_commands",
+                side_effect=fake_failing_child,
+            ):
+                result = orchestrator._execute_task_with_retries(state, task)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(orchestrator.adapter.implement_calls, 3)
+            self.assertEqual(result["new_failure_ids"], [failure_ref])
+            self.assertEqual(result["owned_failure_ids"], [failure_ref])
+            self.assertEqual(result["failure_class"], "newly_introduced_owned")
+            self.assertEqual(len(task.verify_history), 3)
+            self.assertEqual(
+                len(
+                    {
+                        str(entry["candidate_fingerprint"])
+                        for entry in task.verify_history
+                    }
+                ),
+                1,
+            )
+            self.assertIn("action=continue-owned-evidence-repair", stream.getvalue())
+            self.assertNotIn("stopping retries early", stream.getvalue())
 
     def test_verify_failure_logs_changed_and_regression_statistics(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -11744,6 +13351,390 @@ class RetryFlowTests(unittest.TestCase):
             self.assertIs(terminal_task, repaired_task)
             self.assertIs(owner, parent_task)
 
+    def test_self_repair_resume_remote_asr_selector_advances_task_031_2(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            runtime = project_root / ".conda"
+            (runtime / "bin").mkdir(parents=True)
+            (runtime / "conda-meta").mkdir()
+            (runtime / "bin" / "python").symlink_to(Path(sys.executable))
+
+            receipt_ref = (
+                ".tmp-tests/evidence/localization/current/remote-asr.json"
+            )
+            receipt_payload = b'{"status":"verified"}\n'
+            configured_selector_refs = (
+                "tests/system/test_voice_pipeline.py::"
+                "test_volc_turbo_reference_lock_and_real_authorized_corpus_match_exact_route",
+                "tests/system/test_voice_pipeline.py::"
+                "test_volc_turbo_preflight_rejects_true_missing_inputs_without_region_or_snapshot_gates",
+                "tests/system/test_voice_pipeline.py::"
+                "test_confidence_raw_and_versioned_compatibility_calibration_fail_closed",
+                "tests/system/test_voice_pipeline.py::"
+                "test_volc_body_first_known_and_unknown_error_routing_has_zero_unchanged_retry",
+                "tests/system/test_voice_pipeline.py::"
+                "test_asr_typed_outbound_is_positive_minimal_deduplicated_and_safety_closed",
+                "tests/system/test_voice_pipeline.py::"
+                "test_asr_evidence_invalidation_uses_route_and_confidence_contract_not_region_snapshot",
+            )
+            contract_ref = (
+                "tests/contract/test_remote_asr_contract.py::"
+                "test_volcengine_flash_rejects_partially_invalid_provider_word_timeline"
+            )
+            recovery_failure_refs = [
+                configured_selector_refs[0],
+                contract_ref,
+                configured_selector_refs[1],
+            ]
+            task_verification_refs = [
+                configured_selector_refs[0],
+                configured_selector_refs[1],
+            ]
+
+            system_test_source = [
+                "from pathlib import Path",
+                "",
+                "def _publish_current_receipt():",
+                f"    receipt = Path.cwd() / {receipt_ref!r}",
+                "    receipt.parent.mkdir(parents=True, exist_ok=True)",
+                f"    receipt.write_bytes({receipt_payload!r})",
+                "",
+            ]
+            for index, ref in enumerate(configured_selector_refs):
+                function_name = ref.split("::", 1)[1]
+                system_test_source.extend(
+                    [
+                        f"def {function_name}():",
+                        (
+                            "    _publish_current_receipt()"
+                            if index < 2
+                            else "    assert True"
+                        ),
+                        "",
+                    ]
+                )
+            system_test_path = (
+                project_root / "tests" / "system" / "test_voice_pipeline.py"
+            )
+            system_test_path.parent.mkdir(parents=True)
+            write_text(system_test_path, "\n".join(system_test_source))
+            contract_test_path = (
+                project_root
+                / "tests"
+                / "contract"
+                / "test_remote_asr_contract.py"
+            )
+            contract_test_path.parent.mkdir(parents=True)
+            write_text(
+                contract_test_path,
+                "def " + contract_ref.split("::", 1)[1] + "():\n"
+                "    assert True\n",
+            )
+            write_text(project_root / "artifact.txt", "before\n")
+
+            producer = VerificationStep(
+                proof_id="req032.remote_asr_system",
+                kind="test",
+                runner="pytest",
+                targets=list(configured_selector_refs),
+                artifact_globs=[receipt_ref],
+                result_cache_scope="off",
+            )
+            requirement = _strict_requirement()
+            requirement["id"] = "REQ-032"
+            proof = _strict_requirement_proof(
+                requirement,
+                task_verification_refs[0],
+                status="verified",
+            )
+            proof["evidence_refs"] = [
+                *recovery_failure_refs,
+                receipt_ref,
+            ]
+            lineage_task_id = "task-031-2"
+            repair_layout = (
+                (
+                    "repair-task-031-2-r1-1",
+                    1,
+                    task_verification_refs,
+                ),
+                ("repair-task-031-2-r1-2", 1, [contract_ref]),
+                (
+                    "repair-task-031-2-r2-1",
+                    2,
+                    task_verification_refs,
+                ),
+                ("repair-task-031-2-r2-2", 2, [contract_ref]),
+            )
+            repairs = [
+                TaskSpec(
+                    task_id=repair_id,
+                    title="Repair selector evidence producer",
+                    description="Complete the producer-side evidence repair.",
+                    acceptance=["The selector proof passes."],
+                    status="done",
+                    task_origin="evidence_repair",
+                    parent_task_id=lineage_task_id,
+                    split_depth=2,
+                    recovery_epoch=0,
+                    recovery_round=recovery_round,
+                    verification_refs=list(verification_refs),
+                    verify_history=[
+                        {
+                            "attempt": 1,
+                            "decision": "pass",
+                            "summary": "all commands passed",
+                            "candidate_fingerprint": hashlib.sha256(
+                                repair_id.encode("utf-8")
+                            ).hexdigest(),
+                            "comparable_failures": True,
+                            "recovery_epoch": 0,
+                            "recovery_round": recovery_round,
+                            "verify_retry_epoch": 0,
+                            "verify_baseline_schema_version": 2,
+                        }
+                    ],
+                )
+                for repair_id, recovery_round, verification_refs in repair_layout
+            ]
+            task = TaskSpec(
+                task_id=lineage_task_id,
+                title="Publish isolated selector evidence",
+                description="Publish the task-owned receipt from the isolated gate.",
+                acceptance=["The current receipt is portable."],
+                requirement_ids=[requirement["id"]],
+                depends_on=[repair.task_id for repair in repairs],
+                status="blocked",
+                task_origin="scope_split",
+                split_depth=1,
+                recovery_epoch=0,
+                recovery_round=2,
+                verify_retry_epoch=2,
+                verify_baseline_schema_version=2,
+                mutable_artifacts=["artifact.txt"],
+                requirement_proofs=[proof],
+                verification_refs=task_verification_refs,
+            )
+            write_json(
+                requirements_trace_path(project_root),
+                {"version": 1, "requirements": [requirement]},
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "oracle_proof_schema_version": 2,
+                    "verification_policy_version": 3,
+                    "test_strategy": "python-pytest",
+                    "verification_steps": [producer.to_dict()],
+                    "tasks": [
+                        *[repair.to_dict() for repair in repairs],
+                        task.to_dict(),
+                    ],
+                },
+            )
+            config = load_project_config(project_root)
+            config.gates.allow_agent_updates = True
+            config.gates.isolation.enabled = True
+            config.gates.isolation.worktree_root = str(
+                Path(tmp) / "gate-worktrees"
+            )
+            config.gates.distributed.mode = "off"
+            config.gates.steps = [producer]
+            config.execution.evidence_preflight.mode = "off"
+            config.execution.parallel_tasks.enabled = False
+            save_project_config(project_root, config)
+            commit_all(project_root, "test: seed selector receipt recovery")
+
+            # The two latest failures and the resumed attempt intentionally use
+            # one unchanged candidate. Only publication metadata can make progress.
+            write_text(project_root / "artifact.txt", "fixed\n")
+            orchestrator = Orchestrator(project_root)
+            candidate_fingerprint = (
+                orchestrator._worktree_fingerprint_excluding_agent_instructions()
+            )
+            portability_failure_id = (
+                "verification_contract:nonportable_ignored_evidence:"
+                f"{receipt_ref}"
+            )
+            failure_reason = "the isolated selector did not publish its receipt"
+            terminal_signature = orchestrator._recovery_signature(
+                recovery_failure_refs,
+                failure_reason,
+            )
+            self.assertEqual(terminal_signature, "dd8a78cbf0ad5239")
+
+            historical_layout = ((0, 0, 4), (1, 1, 4), (2, 2, 3))
+            task.verify_history = []
+            for recovery_round, retry_epoch, attempt_count in historical_layout:
+                for attempt in range(1, attempt_count + 1):
+                    passed = recovery_round == 0 and attempt == 1
+                    fingerprint = hashlib.sha256(
+                        f"{recovery_round}:{attempt}".encode("utf-8")
+                    ).hexdigest()
+                    if recovery_round == 2 and attempt in (2, 3):
+                        fingerprint = candidate_fingerprint
+                    entry = {
+                        "attempt": attempt,
+                        "candidate_fingerprint": fingerprint,
+                        "comparable_failures": True,
+                        "decision": "pass" if passed else "fail",
+                        "recovery_epoch": 0,
+                        "recovery_round": recovery_round,
+                        "summary": (
+                            "all commands passed" if passed else failure_reason
+                        ),
+                        "verify_baseline_schema_version": 2,
+                        "verify_retry_epoch": retry_epoch,
+                    }
+                    if not passed:
+                        entry["failure_ids"] = [portability_failure_id]
+                    task.verify_history.append(entry)
+            task.recovery_history = [
+                {
+                    "epoch": 0,
+                    "round": recovery_round,
+                    "result": "scheduled",
+                    "signature": terminal_signature,
+                    "failure_ids": list(recovery_failure_refs),
+                    "reason": failure_reason,
+                    "repair_task_ids": [
+                        repair.task_id
+                        for repair in repairs
+                        if repair.recovery_round == recovery_round
+                    ],
+                }
+                for recovery_round in (1, 2)
+            ]
+            task.recovery_history.append(
+                {
+                    "epoch": 0,
+                    "round": 3,
+                    "result": "exhausted",
+                    "signature": terminal_signature,
+                    "failure_ids": list(recovery_failure_refs),
+                    "reason": failure_reason,
+                }
+            )
+            self.assertEqual(len(task.verify_history), 11)
+            self.assertEqual(len(repairs), 4)
+            self.assertTrue(all(repair.status == "done" for repair in repairs))
+
+            state = load_run_state(project_root)
+            state.current_stage = "implement"
+            state.status = "blocked"
+            state.tasks = [*repairs, task]
+            state.last_error = failure_reason
+            state.last_recovery_route = {
+                "task_id": lineage_task_id,
+                "lineage_id": lineage_task_id,
+                "epoch": 0,
+                "round": 3,
+                "max_rounds": 2,
+                "outcome": "exhausted",
+                "failure_kind": "verification_failed",
+                "failure_signature": terminal_signature,
+                "reason": failure_reason,
+                "repair_task_ids": [],
+                "task_origin": "scope_split",
+            }
+            state.active_blocker = {
+                "owner": "auto_agents",
+                "category": "selector_qualified_gate_metadata_loss",
+                "status": "blocked",
+                "reason": failure_reason,
+                "fingerprint": terminal_signature,
+            }
+            orchestrator._persist_tasks(state.tasks)
+            save_run_state(project_root, state)
+            prior_verify_count = len(task.verify_history)
+            prior_recovery_count = len(task.recovery_history)
+
+            marked = orchestrator.mark_self_repair_applied(
+                head_ref(project_root),
+                verification="selector metadata repair passed",
+            )
+            resumed = Orchestrator(project_root)
+            resumed.adapter = BlockedRetryAdapter(project_root)
+            self.assertTrue(resumed._resume_blocked_run(marked))
+            requeued = next(
+                item for item in marked.tasks if item.task_id == lineage_task_id
+            )
+            self.assertEqual(requeued.status, "pending")
+            self.assertEqual(requeued.verify_retry_epoch, 3)
+            self.assertEqual(requeued.recovery_round, 2)
+
+            portability_checks = []
+            check_portability = (
+                resumed._ignored_supporting_evidence_portability_failure
+            )
+
+            def capture_portability(current_task, gate):
+                failure = check_portability(current_task, gate)
+                portability_checks.append((gate, failure))
+                return failure
+
+            with patch.object(
+                resumed,
+                "_ignored_supporting_evidence_portability_failure",
+                side_effect=capture_portability,
+            ):
+                result = resumed._run_implementation_loop(marked, max_tasks=1)
+
+            completed = next(
+                item for item in result.tasks
+                if item.task_id == lineage_task_id
+            )
+            self.assertEqual(completed.status, "done")
+            self.assertEqual(resumed.adapter.implement_calls, 1)
+            self.assertEqual(resumed.adapter.review_calls, 1)
+            new_verify_entries = completed.verify_history[prior_verify_count:]
+            self.assertEqual(
+                [entry["decision"] for entry in new_verify_entries],
+                ["pass"],
+            )
+            self.assertFalse(
+                any(
+                    portability_failure_id in entry.get("failure_ids", [])
+                    for entry in new_verify_entries
+                )
+            )
+            self.assertFalse(
+                any(
+                    entry.get("signature") == terminal_signature
+                    or entry.get("failure_signature") == terminal_signature
+                    for entry in completed.recovery_history[
+                        prior_recovery_count:
+                    ]
+                )
+            )
+            self.assertTrue(portability_checks)
+            self.assertTrue(
+                all(failure is None for _gate, failure in portability_checks)
+            )
+            published = {
+                path: digest
+                for gate, _failure in portability_checks
+                for command_result in gate.commands
+                for path, digest in command_result.artifacts.items()
+            }
+            self.assertEqual(
+                published,
+                {
+                    receipt_ref: hashlib.sha256(receipt_payload).hexdigest()
+                },
+            )
+            self.assertTrue(
+                all(
+                    not command_result.mutation_paths
+                    for gate, _failure in portability_checks
+                    for command_result in gate.commands
+                )
+            )
+
     def test_review_recovery_hard_cap_applies_to_ordinary_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -13624,6 +15615,108 @@ class RetryFlowTests(unittest.TestCase):
                 ["main-task-001", "main-task-002"],
             )
 
+    def test_parallel_worker_with_ignored_dependency_link_reaches_implementation_attempt(
+        self,
+    ) -> None:
+        from auto_agents import gate_execution
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+            Orchestrator.init_project(project_root, "demo", "mock")
+            self._configure_git_identity(project_root)
+            config = load_project_config(project_root)
+            config.gates.require_clean_git_before_task = False
+            config.gates.isolation.enabled = True
+            config.gates.distributed.mode = "off"
+            save_project_config(project_root, config)
+
+            local_python = project_root / ".conda" / "bin" / "python"
+            local_python.parent.mkdir(parents=True)
+            (project_root / ".conda" / "conda-meta").mkdir()
+            local_python.symlink_to(Path(sys.executable))
+            verification_ref = (
+                'cmd:./.conda/bin/python -c "print(\'baseline-ready\')"'
+            )
+            task = TaskSpec(
+                task_id="task-dependency-link",
+                title="Exercise an isolated worker",
+                description="Reach the implementation after baseline capture.",
+                acceptance=["implementation runs"],
+                verification_refs=[verification_ref],
+            )
+            write_json(
+                task_plan_path(project_root),
+                {
+                    "verification_policy_version": 2,
+                    "tasks": [task.to_dict()],
+                },
+            )
+            commit_all(project_root, "test: baseline")
+
+            orchestrator = Orchestrator(project_root)
+            state = load_run_state(project_root)
+            state.tasks = [task]
+            implementation_attempts = []
+            snapshot_adds = []
+            real_run_git = gate_execution._run_git
+
+            def reject_unfiltered_snapshot(root, *args, env=None):
+                if args[:4] == ("add", "-A", "--", "."):
+                    snapshot_adds.append(args)
+                    if not any(
+                        arg == ":(top,exclude,literal).conda"
+                        for arg in args[4:]
+                    ):
+                        raise RuntimeError(
+                            "snapshot attempted to stage an installed dependency link"
+                        )
+                return real_run_git(root, *args, env=env)
+
+            def implement(
+                worker,
+                worker_state,
+                worker_task,
+                *,
+                resume_existing=False,
+            ):
+                implementation_attempts.append(worker_task.task_id)
+                write_text(worker.project_root / "artifact.txt", "implemented\n")
+                return {
+                    "ok": True,
+                    "reason": "",
+                    "review": "implementation passed",
+                    "verify_current_failure_ids": [],
+                }
+
+            with patch(
+                "auto_agents.gate_execution._run_git",
+                side_effect=reject_unfiltered_snapshot,
+            ), patch.object(
+                Orchestrator,
+                "_execute_task_with_retries",
+                new=implement,
+            ):
+                result = orchestrator._run_task_in_worktree(
+                    state,
+                    [task],
+                    task.task_id,
+                )
+
+            self.assertTrue(result["ok"], result.get("reason", ""))
+            self.assertTrue(snapshot_adds)
+            self.assertEqual(implementation_attempts, [task.task_id])
+            self.assertEqual(result["changed_paths"], ["artifact.txt"])
+            committed_paths = commit_changed_paths(
+                project_root,
+                str(result["commit_sha"]),
+            )
+            self.assertFalse(
+                any(
+                    path == ".conda" or path.startswith(".conda/")
+                    for path in committed_paths
+                )
+            )
+
     def test_parallel_tasks_defer_overlapping_worker_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
@@ -13708,7 +15801,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertEqual([task.status for task in result.tasks], ["done", "done"])
             self.assertIn("defer integration task=task-002", stream.getvalue())
 
-    def test_parallel_tasks_aggregate_failed_workers_and_copy_snapshots(self) -> None:
+    def test_parallel_tasks_persist_failed_workers_and_copy_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -13771,11 +15864,18 @@ class RetryFlowTests(unittest.TestCase):
             state = load_run_state(project_root)
             state.tasks = orchestrator._load_tasks_from_plan()
             with patch.object(orchestrator, "_run_task_in_worktree", side_effect=fake_run_task_in_worktree):
-                with self.assertRaises(RuntimeError) as ctx:
-                    orchestrator._run_implementation_loop(state, max_tasks=2)
+                result = orchestrator._run_implementation_loop(state, max_tasks=2)
 
-            self.assertIn("task-001: failed task-001", str(ctx.exception))
-            self.assertIn("task-002: failed task-002", str(ctx.exception))
+            self.assertEqual(result.status, "blocked")
+            self.assertTrue(result.active_blocker)
+            self.assertEqual(
+                result.active_blocker["source"],
+                "parallel_lane_failure",
+            )
+            self.assertEqual(
+                {item["task_id"] for item in result.localized_blockers},
+                {"task-001", "task-002"},
+            )
             reloaded = orchestrator._load_tasks_from_plan()
             self.assertEqual([task.status for task in reloaded], ["blocked", "blocked"])
             self.assertEqual(reloaded[0].review_summary, "review for task-001")
@@ -14889,7 +16989,7 @@ class ScopeOverflowTests(unittest.TestCase):
             reloaded_state = load_run_state(project_root)
             self.assertNotEqual(reloaded_state.rejected_stage, "plan")
 
-    def test_expected_test_migrations_excluded_from_new_failures(self) -> None:
+    def test_expected_test_migrations_do_not_erase_new_failure_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
             Orchestrator.init_project(project_root, "demo", "mock")
@@ -14909,31 +17009,45 @@ class ScopeOverflowTests(unittest.TestCase):
                 verify_baseline_failures=["old:legacy_case"],
                 expected_test_migrations=["new:migrated_case"],
             )
-            # Monkeypatch gate runner to return a fixed failure set that includes
-            # one pre-existing failure (baseline) and one expected migration.
-            class _Gate:
-                ok = False
-                summary = "new:migrated_case FAILED\nold:legacy_case FAILED"
-                stdout = summary
-                stderr = ""
-                returncode = 1
-                commands = []
+            failed_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command="echo run",
+                        ok=False,
+                        returncode=1,
+                        stdout=(
+                            "new:migrated_case FAILED\n"
+                            "old:legacy_case FAILED\n"
+                        ),
+                    )
+                ],
+                summary="new:migrated_case FAILED\nold:legacy_case FAILED",
+            )
 
-            import auto_agents.orchestrator as orch_mod
-            original_extract = orch_mod.extract_failure_ids
-            try:
-                orch_mod.extract_failure_ids = lambda gate: ["new:migrated_case", "old:legacy_case"]
-                config.gates.commands = ["echo run"]
-                orchestrator.config = config
-                orchestrator._run_gate_commands_for_commands = (
-                    lambda *args, **kwargs: (_Gate(), "")
-                )
+            with patch.object(
+                orchestrator,
+                "_run_gate_commands",
+                return_value=(failed_gate, ""),
+            ), patch(
+                "auto_agents.orchestrator.extract_failure_info",
+                return_value=FailureExtraction(
+                    failure_ids=["new:migrated_case", "old:legacy_case"],
+                    comparable=True,
+                    non_comparable_ids=[],
+                ),
+            ):
                 result = orchestrator._run_task_verify(task)
-            finally:
-                orch_mod.extract_failure_ids = original_extract
 
-            # Migration is excluded; baseline failure is also excluded → verify passes.
+            # The expected migration remains non-actionable, while the raw set
+            # difference remains available to downstream provenance consumers.
             self.assertTrue(result["ok"], msg=str(result))
+            self.assertEqual(
+                result["current_failure_ids"],
+                ["new:migrated_case", "old:legacy_case"],
+            )
+            self.assertEqual(result["baseline_failure_ids"], ["old:legacy_case"])
+            self.assertEqual(result["new_failure_ids"], ["new:migrated_case"])
 
     def test_full_verify_failure_routes_to_implement_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

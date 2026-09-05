@@ -34,6 +34,7 @@ from auto_agents.self_repair import (
     SelfRepairResult,
     _FullSuiteShard,
     _VerificationResult,
+    _pytest_collect_only_command,
     adjudicate_repair_case,
     self_repair_verification_command,
 )
@@ -4469,6 +4470,284 @@ class RootCauseCoordinatorTests(unittest.TestCase):
             self.assertTrue((auto_root / "remote_fix.py").is_file())
             self.assertIn("test -f remote_fix.py", result.verification)
             self.assertIn("skipped=supplemental", result.verification)
+
+    def test_sticky_regressions_run_before_active_component_checks(self):
+        experiment = SelfRepairExperiment.create(
+            run_id="run",
+            root_fingerprint="root",
+            category="sticky-regression",
+            base_commit="base",
+        )
+        experiment.remember_sticky_verification_commands(
+            ["python -m pytest -q tests/test_previous.py::test_regression"]
+        )
+        runner = object.__new__(AutoAgentsSelfRepairRunner)
+        runner._experiment = experiment
+        runner._candidate_group = {
+            "focused_tests": [
+                "python -m pytest -q tests/test_current.py::test_contract"
+            ]
+        }
+        runner.repo_root = Path("/tmp/auto-agents")
+        runner.diagnosis = None
+        captured: list[str] = []
+
+        def verify(commands, _root):
+            captured.extend(commands)
+            return _VerificationResult(
+                True,
+                "passed",
+                returncodes=tuple(0 for _ in commands),
+            )
+
+        with patch.object(runner, "_run_verification_commands", side_effect=verify):
+            result = runner._run_active_group_verification(Path("/tmp/candidate"))
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            captured,
+            [
+                "python -m pytest -q tests/test_previous.py::test_regression",
+                "python -m pytest -q tests/test_current.py::test_contract",
+            ],
+        )
+
+    def test_failed_source_commands_survive_verification_checkpoint_roundtrip(self):
+        result = _VerificationResult(
+            False,
+            "failed",
+            commands=("rendered pass", "rendered fail", "rendered optional"),
+            returncodes=(0, 1, 5),
+            payload={
+                "source_commands": [
+                    "python -m pytest -q tests/test_pass.py",
+                    "python -m pytest -q tests/test_fail.py::test_regression",
+                    "python -m pytest -q tests/test_optional.py -k missing",
+                ],
+                "nonfatal_source_commands": [
+                    "python -m pytest -q tests/test_optional.py -k missing",
+                ]
+            },
+        )
+
+        restored = _VerificationResult.from_dict(result.to_dict())
+
+        self.assertEqual(
+            AutoAgentsSelfRepairRunner._failed_source_commands(restored),
+            ["python -m pytest -q tests/test_fail.py::test_regression"],
+        )
+
+    def test_pytest_selector_preflight_builds_collect_only_command(self):
+        self.assertEqual(
+            _pytest_collect_only_command(
+                "python -m pytest -q tests/test_retry.py::test_contract"
+            ),
+            "python -m pytest --collect-only -q "
+            "tests/test_retry.py::test_contract",
+        )
+        self.assertEqual(
+            _pytest_collect_only_command("git diff --check"),
+            "",
+        )
+
+    def test_selector_preflight_rejects_a_pytest_command_that_collects_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+            write_text(
+                auto_root / "tests" / "test_contract.py",
+                "def test_existing():\n    assert True\n",
+            )
+            subprocess.run(["git", "add", "-A"], cwd=auto_root, check=True)
+            subprocess.run(
+                ["git", "commit", "-qm", "add contract test"],
+                cwd=auto_root,
+                check=True,
+            )
+            orchestrator = type(
+                "Orchestrator",
+                (),
+                {
+                    "config": type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {"self_repair": "deep"},
+                            "execution": object(),
+                        },
+                    )()
+                },
+            )()
+            runner = AutoAgentsSelfRepairRunner(
+                orchestrator,
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True),
+            )
+            runner.repo_root = auto_root
+            runner._experiment = SelfRepairExperiment.create(
+                run_id="run",
+                root_fingerprint="root",
+                category="selector",
+                base_commit="base",
+            )
+            runner._candidate_group = {
+                "focused_tests": [
+                    "python -m pytest -q tests/test_contract.py -k missing"
+                ]
+            }
+
+            issues = runner._candidate_selector_issues(auto_root)
+
+            self.assertEqual(len(issues), 1)
+            self.assertIn("pytest selector does not collect", issues[0])
+
+    def test_untracked_skipped_test_is_a_deterministic_violation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _init_repo(root)
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            write_text(
+                root / "tests" / "test_new.py",
+                "import pytest\n\n@pytest.mark.skip\ndef test_new():\n    pass\n",
+            )
+            runner = object.__new__(AutoAgentsSelfRepairRunner)
+
+            self.assertEqual(
+                runner._candidate_test_weakening_reason(root, base),
+                "candidate weakens tests with skip/xfail",
+            )
+
+    def test_deterministic_candidate_failure_gets_one_same_session_correction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            auto_root = root / "auto"
+            target_root = root / "target"
+            _init_repo(auto_root)
+            _init_repo(target_root)
+
+            autonomy = type(
+                "Autonomy",
+                (),
+                {
+                    "allow_isolated_dirty_checkout": True,
+                    "candidate_timeout_seconds": 60,
+                    "candidate_review_timeout_seconds": 60,
+                    "replay_timeout_seconds": 60,
+                },
+            )()
+
+            class CorrectionOrchestrator:
+                def __init__(self):
+                    self.requests = []
+                    self._current_provider = "codex"
+                    self.config = type(
+                        "Config",
+                        (),
+                        {
+                            "efforts": {
+                                "self_repair": "deep",
+                                "self_repair_review": "max",
+                            },
+                            "execution": type(
+                                "Execution", (), {"autonomy": autonomy}
+                            )(),
+                        },
+                    )()
+
+                def _call_with_failover(self, request):
+                    self.requests.append(request)
+                    if len(self.requests) == 1:
+                        write_text(request.cwd / "fix.py", "FIXED = True\n")
+                        return AgentResult(
+                            ok=True,
+                            command=[],
+                            output_path=request.output_path,
+                            summary="initial candidate",
+                            provider_session_id="session-1",
+                        )
+                    return AgentResult(
+                        ok=True,
+                        command=[],
+                        output_path=request.output_path,
+                        summary=(
+                            "corrected candidate\n"
+                            "COMMIT_MESSAGE: correct deterministic violation"
+                        ),
+                        provider_session_id="session-1",
+                    )
+
+            orchestrator = CorrectionOrchestrator()
+            runner = AutoAgentsSelfRepairRunner(
+                orchestrator,
+                target_project_root=target_root,
+                error=RuntimeError("terminal"),
+                decision=SelfRepairDecision(True, category="correction"),
+            )
+            runner.repo_root = auto_root
+            runner._experiment_store = SelfRepairExperimentStore(
+                target_root,
+                "run",
+                "root",
+            )
+            runner._experiment = SelfRepairExperiment.create(
+                run_id="run",
+                root_fingerprint="root",
+                category="correction",
+                base_commit=subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=auto_root,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                ).stdout.strip(),
+            )
+            runner._candidate_group = {
+                "group_id": "component",
+                "focused_tests": ["true"],
+            }
+            runner._candidate_is_final_group = False
+
+            with (
+                patch.object(
+                    runner,
+                    "_candidate_deterministic_issues",
+                    side_effect=[["candidate weakens tests"], []],
+                ),
+                patch.object(
+                    runner,
+                    "_replay_candidate",
+                    return_value=_VerificationResult(True, "replay passed"),
+                ),
+                patch.object(
+                    runner,
+                    "_diagnosis_differential",
+                    return_value=_VerificationResult(True, "differential passed"),
+                ),
+            ):
+                result = runner._run_candidate(
+                    experiment_id=runner._experiment.experiment_id,
+                    attempt=1,
+                    deadline=None,
+                    prior_failures=[],
+                    seen_fingerprints=set(),
+                )
+
+            self.assertEqual(result.status, "candidate_group_completed")
+            self.assertEqual(len(orchestrator.requests), 2)
+            correction = orchestrator.requests[1]
+            self.assertEqual(correction.resume_session_id, "session-1")
+            self.assertEqual(correction.resume_provider, "codex")
+            self.assertIn("deterministic pre-commit", correction.prompt)
 
 
 if __name__ == "__main__":

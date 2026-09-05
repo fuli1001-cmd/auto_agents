@@ -15,6 +15,7 @@ from auto_agents.gates import GateCommandBaselineIdentityError
 from auto_agents.config import load_run_state, save_run_state
 from auto_agents.git_ops import (
     add_worktree,
+    apply_checkpoint_application as apply_checkpoint_transaction,
     changed_files,
     changed_paths,
     commit_all,
@@ -22,6 +23,7 @@ from auto_agents.git_ops import (
     hard_reset_clean,
     head_ref,
     ref_exists,
+    remove_worktree,
     update_ref,
     worktree_fingerprint,
 )
@@ -44,6 +46,51 @@ class RecoveryResilienceTests(unittest.TestCase):
     def _project(self, root: Path) -> Orchestrator:
         Orchestrator.init_project(root, "demo", "mock")
         return Orchestrator(root)
+
+    def _state_with_retained_candidate(
+        self,
+        root: Path,
+        worktree_root: Path,
+        task: TaskSpec,
+        *,
+        candidate_path: str = "candidate.txt",
+    ) -> tuple[RunState, str]:
+        write_text(root / candidate_path, "candidate base\n")
+        commit_all(root, "test: checkpoint transaction baseline")
+        checkpoint_worktree = worktree_root / "retained-checkpoint"
+        add_worktree(root, checkpoint_worktree, ref=head_ref(root))
+        try:
+            write_text(
+                checkpoint_worktree / candidate_path,
+                "byte-exact retained candidate\n",
+            )
+            checkpoint_sha = commit_all(
+                checkpoint_worktree,
+                "test: retain failed candidate",
+            )
+        finally:
+            remove_worktree(root, checkpoint_worktree, force=True)
+        checkpoint_ref = (
+            f"refs/auto-agents/runs/run-transaction/failed-tasks/"
+            f"{task.task_id}/epoch-0"
+        )
+        update_ref(root, checkpoint_ref, checkpoint_sha)
+        state = RunState(
+            run_id="run-transaction",
+            current_stage="implement",
+            tasks=[task],
+        )
+        state.task_failure_checkpoints[task.task_id] = {
+            "schema_version": 1,
+            "task_id": task.task_id,
+            "ref": checkpoint_ref,
+            "commit_sha": checkpoint_sha,
+            "base_ref": head_ref(root),
+            "changed_paths": [candidate_path],
+            "has_candidate_changes": True,
+            "status": "recoverable",
+        }
+        return state, checkpoint_ref
 
     def test_task_scoped_blocker_keeps_independent_work_runnable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2314,6 +2361,277 @@ class RecoveryResilienceTests(unittest.TestCase):
                 capture_output=True,
             )
             self.assertEqual(dependency_entry.stdout.strip(), "")
+
+    def test_blocked_restored_checkpoint_detaches_to_exact_preapplication_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            task = TaskSpec(
+                task_id="blocked-owner",
+                title="Resume retained candidate",
+                description="",
+                acceptance=[],
+            )
+            state, checkpoint_ref = self._state_with_retained_candidate(
+                root,
+                Path(tmp),
+                task,
+            )
+            save_run_state(root, state)
+
+            applying_was_durable: list[bool] = []
+
+            def apply_after_persist(
+                project_root: Path,
+                transaction: dict[str, object],
+            ) -> dict[str, object]:
+                persisted_checkpoint = load_run_state(
+                    root
+                ).task_failure_checkpoints[task.task_id]
+                applying_was_durable.append(
+                    persisted_checkpoint["status"] == "applying"
+                    and persisted_checkpoint["application_transaction"][
+                        "transaction_id"
+                    ]
+                    == transaction["transaction_id"]
+                )
+                return apply_checkpoint_transaction(
+                    project_root,
+                    transaction,
+                )
+
+            with patch(
+                "auto_agents.orchestrator.apply_checkpoint_application",
+                new=apply_after_persist,
+            ):
+                restored = orchestrator._restore_task_failure_checkpoint(
+                    state,
+                    task,
+                    root,
+                )
+
+            self.assertEqual(restored, checkpoint_ref)
+            self.assertEqual(applying_was_durable, [True])
+            self.assertEqual(
+                state.task_failure_checkpoints[task.task_id]["status"],
+                "applied",
+            )
+            self.assertEqual(changed_paths(root), ["candidate.txt"])
+            task.status = "blocked"
+            failure = orchestrator._parallel_task_failure_result(
+                task,
+                {
+                    "ok": False,
+                    "reason": "candidate verification remains blocked",
+                    "review": "candidate verification remains blocked",
+                    "failure_ids": [],
+                },
+                checkpoint=state.task_failure_checkpoints[task.task_id],
+                automatic_retryable=False,
+                resumable=True,
+                base_ref=head_ref(root),
+            )
+
+            blockers = orchestrator._persist_parallel_lane_failures(
+                state,
+                [task],
+                [(task, failure)],
+            )
+
+            self.assertEqual(len(blockers), 1)
+            checkpoint = state.task_failure_checkpoints[task.task_id]
+            self.assertEqual(checkpoint["status"], "recoverable")
+            self.assertEqual(
+                checkpoint["application_transaction"]["status"],
+                "detached",
+            )
+            self.assertEqual(
+                checkpoint["detachment"]["proof"],
+                "exact_prestate_restored",
+            )
+            self.assertEqual(changed_paths(root), [])
+            self.assertEqual(
+                (root / "candidate.txt").read_text(encoding="utf-8"),
+                "candidate base\n",
+            )
+            self.assertTrue(ref_exists(root, checkpoint_ref))
+            persisted = load_run_state(root).task_failure_checkpoints[
+                task.task_id
+            ]
+            self.assertEqual(persisted["status"], "recoverable")
+
+    def test_detached_checkpoint_reapplies_byte_exact_after_unrelated_commit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            task = TaskSpec(
+                task_id="resumed-owner",
+                title="Resume retained candidate",
+                description="",
+                acceptance=[],
+            )
+            state, checkpoint_ref = self._state_with_retained_candidate(
+                root,
+                Path(tmp),
+                task,
+            )
+
+            self.assertEqual(
+                orchestrator._restore_task_failure_checkpoint(
+                    state,
+                    task,
+                    root,
+                ),
+                checkpoint_ref,
+            )
+            first_transaction = dict(
+                state.task_failure_checkpoints[task.task_id][
+                    "application_transaction"
+                ]
+            )
+            detached = orchestrator._detach_task_failure_checkpoint(
+                state,
+                task.task_id,
+            )
+            self.assertTrue(detached["ok"], detached)
+
+            write_text(root / "unrelated.txt", "independent commit\n")
+            unrelated_commit = commit_all(root, "test: unrelated task commit")
+            unrelated_paths = subprocess.run(
+                [
+                    "git",
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    unrelated_commit,
+                ],
+                cwd=str(root),
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.splitlines()
+            self.assertIn("unrelated.txt", unrelated_paths)
+            self.assertNotIn("candidate.txt", unrelated_paths)
+
+            restored = orchestrator._restore_task_failure_checkpoint(
+                state,
+                task,
+                root,
+            )
+
+            self.assertEqual(restored, checkpoint_ref)
+            checkpoint = state.task_failure_checkpoints[task.task_id]
+            second_transaction = checkpoint["application_transaction"]
+            self.assertNotEqual(
+                second_transaction["transaction_id"],
+                first_transaction["transaction_id"],
+            )
+            self.assertEqual(
+                second_transaction["pre_application"]["head"],
+                unrelated_commit,
+            )
+            retained_blob = subprocess.run(
+                ["git", "show", f"{checkpoint_ref}:candidate.txt"],
+                cwd=str(root),
+                check=True,
+                capture_output=True,
+            ).stdout
+            self.assertEqual((root / "candidate.txt").read_bytes(), retained_blob)
+            self.assertEqual(changed_paths(root), ["candidate.txt"])
+            self.assertTrue(ref_exists(root, checkpoint_ref))
+
+    def test_checkpoint_detach_refuses_changed_index_or_owned_bytes_without_mutation(
+        self,
+    ) -> None:
+        for mutation in ("owned_bytes", "index"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "demo"
+                orchestrator = self._project(root)
+                task = TaskSpec(
+                    task_id=f"unsafe-{mutation}",
+                    title="Resume retained candidate",
+                    description="",
+                    acceptance=[],
+                )
+                state, checkpoint_ref = self._state_with_retained_candidate(
+                    root,
+                    Path(tmp),
+                    task,
+                )
+                self.assertEqual(
+                    orchestrator._restore_task_failure_checkpoint(
+                        state,
+                        task,
+                        root,
+                    ),
+                    checkpoint_ref,
+                )
+                if mutation == "owned_bytes":
+                    write_text(root / "candidate.txt", "owner changed after replay\n")
+                else:
+                    alternate_blob = subprocess.run(
+                        ["git", "hash-object", "-w", "--stdin"],
+                        cwd=str(root),
+                        check=True,
+                        input=b"alternate staged candidate\n",
+                        capture_output=True,
+                    ).stdout.decode("ascii").strip()
+                    subprocess.run(
+                        [
+                            "git",
+                            "update-index",
+                            "--cacheinfo",
+                            "100644",
+                            alternate_blob,
+                            "candidate.txt",
+                        ],
+                        cwd=str(root),
+                        check=True,
+                    )
+                index_path = Path(
+                    subprocess.run(
+                        ["git", "rev-parse", "--git-path", "index"],
+                        cwd=str(root),
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    ).stdout.strip()
+                )
+                if not index_path.is_absolute():
+                    index_path = root / index_path
+                bytes_before = (root / "candidate.txt").read_bytes()
+                status_before = subprocess.run(
+                    ["git", "status", "--porcelain=v1", "-z", "-uall"],
+                    cwd=str(root),
+                    check=True,
+                    capture_output=True,
+                ).stdout
+                # Capture the index after status has refreshed its stat data.
+                index_before = index_path.read_bytes()
+
+                detached = orchestrator._detach_task_failure_checkpoint(
+                    state,
+                    task.task_id,
+                )
+
+                self.assertFalse(detached["ok"], detached)
+                checkpoint = state.task_failure_checkpoints[task.task_id]
+                self.assertEqual(checkpoint["status"], "applied")
+                self.assertEqual(index_path.read_bytes(), index_before)
+                self.assertEqual((root / "candidate.txt").read_bytes(), bytes_before)
+                status_after = subprocess.run(
+                    ["git", "status", "--porcelain=v1", "-z", "-uall"],
+                    cwd=str(root),
+                    check=True,
+                    capture_output=True,
+                ).stdout
+                self.assertEqual(status_after, status_before)
+                self.assertTrue(ref_exists(root, checkpoint_ref))
 
     def test_legacy_checkpoint_restore_protects_local_dependency_environment(
         self,

@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
+import os
 import shutil
+import stat
 import subprocess
-from pathlib import Path
-from typing import Iterable
+import tempfile
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Dict, Iterable, Mapping
+
+
+CHECKPOINT_APPLICATION_TRANSACTION_VERSION = 2
+_CHECKPOINT_ENGINE_PATHS = (".auto-agents", ".antigravitycli")
 
 
 def _git(project_root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -14,6 +23,60 @@ def _git(project_root: Path, *args: str) -> subprocess.CompletedProcess:
         text=True,
         encoding="utf-8",
         capture_output=True,
+    )
+
+
+def _git_bytes(project_root: Path, *args: str) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    # Read-only observations must not rewrite the index stat cache.  Otherwise
+    # merely checking a transaction could invalidate its exact index image.
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(project_root),
+        capture_output=True,
+        env=env,
+    )
+
+
+def normalize_repository_exclusions(paths: Iterable[str]) -> tuple[str, ...]:
+    """Return unique, safe repository-relative exclusion prefixes."""
+
+    normalized: list[str] = []
+    for raw_path in paths:
+        raw = str(raw_path).replace("\\", "/").strip()
+        if not raw:
+            continue
+        path = PurePosixPath(raw)
+        value = path.as_posix().rstrip("/")
+        if (
+            not value
+            or value == "."
+            or path.is_absolute()
+            or bool(PureWindowsPath(raw).drive)
+            or ".." in path.parts
+        ):
+            raise ValueError(
+                "repository exclusions must be safe repository-relative paths"
+            )
+        if value not in normalized:
+            normalized.append(value)
+    return tuple(normalized)
+
+
+def repository_path_is_excluded(
+    path: str,
+    exclude_prefixes: Iterable[str],
+) -> bool:
+    """Return whether *path* is equal to or below an exclusion prefix."""
+
+    normalized_path = normalize_repository_exclusions((path,))
+    if not normalized_path:
+        return False
+    candidate = normalized_path[0]
+    return any(
+        candidate == prefix or candidate.startswith(prefix + "/")
+        for prefix in normalize_repository_exclusions(exclude_prefixes)
     )
 
 
@@ -60,13 +123,7 @@ def commit_all(project_root: Path, message: str) -> str:
 
 
 def commit_all_except(project_root: Path, message: str, exclude_prefixes: tuple[str, ...]) -> str:
-    normalized_excludes = tuple(
-        dict.fromkeys(
-            prefix.replace("\\", "/").strip().rstrip("/")
-            for prefix in exclude_prefixes
-            if prefix.replace("\\", "/").strip().rstrip("/")
-        )
-    )
+    normalized_excludes = normalize_repository_exclusions(exclude_prefixes)
     add_args = ["add", "-A", "--", "."]
     add_args.extend(
         f":(top,exclude,literal){prefix}" for prefix in normalized_excludes
@@ -404,29 +461,31 @@ def apply_commit_no_commit_excluding(
     project_root: Path,
     commit_sha: str,
     exclude_prefixes: tuple[str, ...],
+    *,
+    include_paths: Iterable[str] = (),
 ) -> None:
     """Apply a commit delta while protecting workspace-local dependency roots."""
 
-    normalized_excludes = tuple(
-        dict.fromkeys(
-            prefix.replace("\\", "/").strip().rstrip("/")
-            for prefix in exclude_prefixes
-            if prefix.replace("\\", "/").strip().rstrip("/")
-        )
-    )
-    if not normalized_excludes:
+    normalized_excludes = normalize_repository_exclusions(exclude_prefixes)
+    normalized_includes = normalize_repository_exclusions(include_paths)
+    if not normalized_excludes and not normalized_includes:
         cherry_pick_no_commit(project_root, commit_sha)
         return
 
-    show_args = ["show", "--format=", "--binary", commit_sha, "--", "."]
+    show_args = ["show", "--format=", "--binary", commit_sha, "--"]
+    show_args.extend(
+        f":(top,literal){path}" for path in normalized_includes
+    )
+    if not normalized_includes:
+        show_args.append(".")
     show_args.extend(
         f":(top,exclude,literal){prefix}" for prefix in normalized_excludes
     )
-    patch = _git(project_root, *show_args)
+    patch = _git_bytes(project_root, *show_args)
     if patch.returncode != 0:
         raise RuntimeError(
-            patch.stderr.strip()
-            or patch.stdout.strip()
+            patch.stderr.decode("utf-8", errors="replace").strip()
+            or patch.stdout.decode("utf-8", errors="replace").strip()
             or "git show for filtered commit failed"
         )
     if not patch.stdout:
@@ -435,19 +494,1353 @@ def apply_commit_no_commit_excluding(
     applied = subprocess.run(
         ["git", "apply", "--3way", "--index", "-"],
         cwd=str(project_root),
-        text=True,
-        encoding="utf-8",
         input=patch.stdout,
         capture_output=True,
     )
     if applied.returncode == 0:
         return
-    _git(project_root, "reset", "--merge", "HEAD")
     raise RuntimeError(
-        applied.stderr.strip()
-        or applied.stdout.strip()
+        applied.stderr.decode("utf-8", errors="replace").strip()
+        or applied.stdout.decode("utf-8", errors="replace").strip()
         or "filtered commit apply failed"
     )
+
+
+def _checkpoint_payload_fingerprint(payload: object) -> str:
+    rendered = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(rendered).hexdigest()
+
+
+def _resolve_commit(project_root: Path, ref_name: str) -> str:
+    result = _git_bytes(
+        project_root,
+        "rev-parse",
+        "--verify",
+        f"{ref_name}^{{commit}}",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or f"checkpoint ref is not a commit: {ref_name}"
+        )
+    return result.stdout.decode("ascii").strip()
+
+
+def _single_commit_parent(project_root: Path, commit_sha: str) -> str:
+    result = _git_bytes(
+        project_root,
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        commit_sha,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or "checkpoint parent lookup failed"
+        )
+    revisions = result.stdout.decode("ascii").strip().split()
+    if len(revisions) != 2:
+        raise RuntimeError(
+            "checkpoint application requires a single-parent retained commit"
+        )
+    return revisions[1]
+
+
+def _decode_git_path(raw_path: bytes) -> str:
+    try:
+        decoded = raw_path.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError(
+            "checkpoint paths must be valid UTF-8 repository paths"
+        ) from error
+    normalized = normalize_repository_exclusions((decoded,))
+    if len(normalized) != 1:
+        raise RuntimeError("checkpoint contains an empty repository path")
+    return normalized[0]
+
+
+def _commit_delta_paths(
+    project_root: Path,
+    parent_sha: str,
+    commit_sha: str,
+) -> tuple[str, ...]:
+    result = _git_bytes(
+        project_root,
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        "-z",
+        parent_sha,
+        commit_sha,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or "checkpoint path manifest lookup failed"
+        )
+    return tuple(
+        dict.fromkeys(
+            _decode_git_path(raw_path)
+            for raw_path in result.stdout.split(b"\0")
+            if raw_path
+        )
+    )
+
+
+def _commit_path_entry(
+    project_root: Path,
+    ref_name: str,
+    path: str,
+) -> Dict[str, object]:
+    result = _git_bytes(
+        project_root,
+        "ls-tree",
+        "--full-tree",
+        "-z",
+        ref_name,
+        "--",
+        f":(top,literal){path}",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or f"checkpoint tree lookup failed for {path}"
+        )
+    entries = [entry for entry in result.stdout.split(b"\0") if entry]
+    if not entries:
+        return {
+            "kind": "missing",
+            "mode": "000000",
+            "object_id": "",
+            "size": 0,
+            "content_sha256": "",
+        }
+    if len(entries) != 1:
+        raise RuntimeError(f"checkpoint tree lookup was ambiguous for {path}")
+    metadata, separator, raw_path = entries[0].partition(b"\t")
+    if not separator or _decode_git_path(raw_path) != path:
+        raise RuntimeError(f"checkpoint tree lookup returned the wrong path for {path}")
+    parts = metadata.decode("ascii").split()
+    if len(parts) != 3:
+        raise RuntimeError(f"checkpoint tree metadata is invalid for {path}")
+    mode, object_type, object_id = parts
+    kind = {
+        "120000": "symlink",
+        "160000": "gitlink",
+    }.get(mode, "directory" if object_type == "tree" else "file")
+    content = b""
+    if object_type == "blob":
+        blob = _git_bytes(project_root, "cat-file", "blob", object_id)
+        if blob.returncode != 0:
+            raise RuntimeError(
+                blob.stderr.decode("utf-8", errors="replace").strip()
+                or f"checkpoint blob lookup failed for {path}"
+            )
+        content = blob.stdout
+    return {
+        "kind": kind,
+        "mode": mode,
+        "object_type": object_type,
+        "object_id": object_id,
+        "size": len(content),
+        "content_sha256": (
+            hashlib.sha256(content).hexdigest() if object_type == "blob" else ""
+        ),
+    }
+
+
+def _retained_path_manifest(
+    project_root: Path,
+    parent_sha: str,
+    commit_sha: str,
+    paths: Iterable[str],
+) -> list[Dict[str, object]]:
+    manifest: list[Dict[str, object]] = []
+    for path in paths:
+        before = _commit_path_entry(project_root, parent_sha, path)
+        after = _commit_path_entry(project_root, commit_sha, path)
+        if before["kind"] == "missing":
+            change = "addition"
+        elif after["kind"] == "missing":
+            change = "deletion"
+        elif (
+            before["kind"] != after["kind"]
+            or before["mode"] != after["mode"]
+        ):
+            change = "type_change"
+        else:
+            change = "modification"
+        manifest.append(
+            {
+                "path": path,
+                "change": change,
+                "before": before,
+                "after": after,
+            }
+        )
+    return manifest
+
+
+def _safe_worktree_path(project_root: Path, path: str) -> Path:
+    normalized = normalize_repository_exclusions((path,))
+    if len(normalized) != 1:
+        raise RuntimeError("checkpoint path is empty")
+    root = Path(project_root).resolve()
+    candidate = root / normalized[0]
+    current = root
+    for component in PurePosixPath(normalized[0]).parts[:-1]:
+        current = current / component
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise RuntimeError(
+                f"checkpoint path traverses a symlinked parent: {path}"
+            )
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise RuntimeError(
+                f"checkpoint path traverses a non-directory parent: {path}"
+            )
+    return candidate
+
+
+def _coalesced_worktree_roots(paths: Iterable[str]) -> tuple[str, ...]:
+    """Return the shallowest paths whose snapshots cover every input path."""
+
+    normalized = normalize_repository_exclusions(paths)
+    roots: list[str] = []
+    for path in sorted(
+        normalized,
+        key=lambda item: (len(PurePosixPath(item).parts), item),
+    ):
+        if any(path == root or path.startswith(root + "/") for root in roots):
+            continue
+        roots.append(path)
+    return tuple(roots)
+
+
+def _worktree_snapshot_roots(
+    project_root: Path,
+    paths: Iterable[str],
+) -> tuple[str, ...]:
+    """Include the first absent ancestor that checkpoint application may create."""
+
+    project = Path(project_root).resolve()
+    roots: list[str] = []
+    for path in _coalesced_worktree_roots(paths):
+        _safe_worktree_path(project_root, path)
+        selected = path
+        current = project
+        components: list[str] = []
+        for component in PurePosixPath(path).parts:
+            components.append(component)
+            current = current / component
+            try:
+                current.lstat()
+            except FileNotFoundError:
+                selected = PurePosixPath(*components).as_posix()
+                break
+        roots.append(selected)
+    return _coalesced_worktree_roots(roots)
+
+
+def _snapshot_node(path: Path, relative: str) -> list[Dict[str, object]]:
+    details = path.lstat()
+    mode = stat.S_IMODE(details.st_mode)
+    if stat.S_ISREG(details.st_mode):
+        content = path.read_bytes()
+        return [
+            {
+                "path": relative,
+                "kind": "file",
+                "mode": mode,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+                "content_sha256": hashlib.sha256(content).hexdigest(),
+            }
+        ]
+    if stat.S_ISLNK(details.st_mode):
+        target = os.fsencode(os.readlink(path))
+        return [
+            {
+                "path": relative,
+                "kind": "symlink",
+                "mode": mode,
+                "content_base64": base64.b64encode(target).decode("ascii"),
+                "content_sha256": hashlib.sha256(target).hexdigest(),
+            }
+        ]
+    if stat.S_ISDIR(details.st_mode):
+        entries: list[Dict[str, object]] = [
+            {"path": relative, "kind": "directory", "mode": mode}
+        ]
+        children = sorted(
+            path.iterdir(),
+            key=lambda child: os.fsencode(child.name),
+        )
+        for child in children:
+            child_relative = (
+                f"{relative}/{child.name}" if relative else child.name
+            )
+            entries.extend(_snapshot_node(child, child_relative))
+        return entries
+    raise RuntimeError(f"checkpoint path has an unsupported file kind: {path}")
+
+
+def _capture_worktree_path(
+    project_root: Path,
+    path: str,
+) -> Dict[str, object]:
+    candidate = _safe_worktree_path(project_root, path)
+    try:
+        entries = _snapshot_node(candidate, "")
+    except FileNotFoundError:
+        payload: Dict[str, object] = {"kind": "missing", "entries": []}
+    else:
+        payload = {
+            "kind": str(entries[0]["kind"]),
+            "entries": entries,
+        }
+    payload["fingerprint"] = _checkpoint_payload_fingerprint(payload)
+    return payload
+
+
+def _validate_worktree_snapshot(snapshot: Mapping[str, object]) -> None:
+    payload = dict(snapshot)
+    expected_fingerprint = str(payload.pop("fingerprint", ""))
+    if not expected_fingerprint or (
+        _checkpoint_payload_fingerprint(payload) != expected_fingerprint
+    ):
+        raise RuntimeError("checkpoint worktree snapshot fingerprint is invalid")
+    raw_entries = payload.get("entries", [])
+    if not isinstance(raw_entries, list):
+        raise RuntimeError("checkpoint worktree snapshot entries are invalid")
+    root_kind = str(payload.get("kind", ""))
+    if root_kind == "missing":
+        if raw_entries:
+            raise RuntimeError("checkpoint missing path snapshot has entries")
+        return
+    if not raw_entries or not isinstance(raw_entries[0], dict):
+        raise RuntimeError("checkpoint worktree snapshot root is missing")
+    if (
+        str(raw_entries[0].get("path", ""))
+        or str(raw_entries[0].get("kind", "")) != root_kind
+    ):
+        raise RuntimeError("checkpoint worktree snapshot root is inconsistent")
+    seen_paths: set[str] = set()
+    entry_kinds: Dict[str, str] = {}
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise RuntimeError("checkpoint worktree snapshot entry is invalid")
+        relative = str(raw_entry.get("path", ""))
+        if relative in seen_paths:
+            raise RuntimeError("checkpoint worktree snapshot path is duplicated")
+        seen_paths.add(relative)
+        if relative:
+            normalized = normalize_repository_exclusions((relative,))
+            if len(normalized) != 1 or normalized[0] != relative:
+                raise RuntimeError(
+                    "checkpoint worktree snapshot contains an unsafe path"
+                )
+        kind = str(raw_entry.get("kind", ""))
+        if kind not in {"file", "symlink", "directory"}:
+            raise RuntimeError("checkpoint worktree snapshot kind is invalid")
+        entry_kinds[relative] = kind
+        try:
+            mode = int(raw_entry.get("mode", -1))
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("checkpoint worktree snapshot mode is invalid") from error
+        if mode < 0 or mode > 0o7777:
+            raise RuntimeError("checkpoint worktree snapshot mode is invalid")
+        if kind in {"file", "symlink"}:
+            try:
+                content = base64.b64decode(
+                    str(raw_entry.get("content_base64", "")),
+                    validate=True,
+                )
+            except (ValueError, TypeError) as error:
+                raise RuntimeError(
+                    "checkpoint worktree snapshot content is invalid"
+                ) from error
+            if hashlib.sha256(content).hexdigest() != str(
+                raw_entry.get("content_sha256", "")
+            ):
+                raise RuntimeError(
+                    "checkpoint worktree snapshot content fingerprint is invalid"
+                )
+    for relative in seen_paths:
+        if relative and entry_kinds.get("") != "directory":
+            raise RuntimeError(
+                "checkpoint worktree snapshot hierarchy is invalid"
+            )
+        parent = PurePosixPath(relative).parent
+        while parent.as_posix() not in {"", "."}:
+            if entry_kinds.get(parent.as_posix()) != "directory":
+                raise RuntimeError(
+                    "checkpoint worktree snapshot hierarchy is invalid"
+                )
+            parent = parent.parent
+
+
+def _remove_worktree_path(path: Path) -> None:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(details.st_mode) and not stat.S_ISLNK(details.st_mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _restore_one_worktree_snapshot(
+    project_root: Path,
+    path: str,
+    snapshot: Mapping[str, object],
+) -> None:
+    if str(snapshot.get("kind", "")) == "missing":
+        return
+    root = _safe_worktree_path(project_root, path)
+    raw_entries = snapshot.get("entries", [])
+    entries = [dict(item) for item in raw_entries if isinstance(item, dict)]
+    for entry in entries:
+        if str(entry.get("kind", "")) != "directory":
+            continue
+        relative = str(entry.get("path", ""))
+        target = root if not relative else root / PurePosixPath(relative)
+        target.mkdir(parents=True, exist_ok=True)
+    for entry in entries:
+        kind = str(entry.get("kind", ""))
+        if kind == "directory":
+            continue
+        relative = str(entry.get("path", ""))
+        target = root if not relative else root / PurePosixPath(relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = base64.b64decode(str(entry.get("content_base64", "")))
+        if kind == "file":
+            target.write_bytes(content)
+            os.chmod(target, int(entry.get("mode", 0o644)))
+        elif kind == "symlink":
+            os.symlink(os.fsdecode(content), target)
+    directories = [
+        entry for entry in entries if str(entry.get("kind", "")) == "directory"
+    ]
+    for entry in reversed(directories):
+        relative = str(entry.get("path", ""))
+        target = root if not relative else root / PurePosixPath(relative)
+        os.chmod(target, int(entry.get("mode", 0o755)))
+
+
+def _restore_worktree_snapshots(
+    project_root: Path,
+    snapshots: Mapping[str, object],
+) -> None:
+    roots = _coalesced_worktree_roots(str(path) for path in snapshots)
+    for path in roots:
+        raw_snapshot = snapshots.get(path)
+        if not isinstance(raw_snapshot, Mapping):
+            raise RuntimeError(f"checkpoint prestate is missing path {path}")
+        _validate_worktree_snapshot(raw_snapshot)
+        _safe_worktree_path(project_root, path)
+    for path in sorted(roots, key=lambda item: item.count("/"), reverse=True):
+        _remove_worktree_path(_safe_worktree_path(project_root, path))
+    for path in roots:
+        raw_snapshot = snapshots[path]
+        assert isinstance(raw_snapshot, Mapping)
+        _restore_one_worktree_snapshot(project_root, path, raw_snapshot)
+
+
+def _worktree_snapshot_fingerprints(
+    project_root: Path,
+    snapshots: Mapping[str, object],
+) -> Dict[str, str]:
+    return {
+        path: str(_capture_worktree_path(project_root, path)["fingerprint"])
+        for path in sorted(str(item) for item in snapshots)
+    }
+
+
+def _index_path(project_root: Path) -> Path:
+    result = _git_bytes(project_root, "rev-parse", "--git-path", "index")
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or "git index path lookup failed"
+        )
+    raw_path = os.fsdecode(result.stdout.rstrip(b"\r\n"))
+    index_path = Path(raw_path)
+    if not index_path.is_absolute():
+        index_path = Path(project_root) / index_path
+    return index_path
+
+
+def _capture_index_image(project_root: Path) -> Dict[str, object]:
+    path = _index_path(project_root)
+    lock_path = path.with_name(path.name + ".lock")
+    if lock_path.exists():
+        raise RuntimeError("checkpoint transaction refused a locked git index")
+    if not path.exists():
+        return {
+            "present": False,
+            "mode": 0,
+            "content_base64": "",
+            "sha256": hashlib.sha256(b"").hexdigest(),
+        }
+    content = path.read_bytes()
+    return {
+        "present": True,
+        "mode": stat.S_IMODE(path.stat().st_mode),
+        "content_base64": base64.b64encode(content).decode("ascii"),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _validated_index_content(snapshot: Mapping[str, object]) -> bytes:
+    if not isinstance(snapshot.get("present"), bool):
+        raise RuntimeError("checkpoint index image presence marker is invalid")
+    try:
+        mode = int(snapshot.get("mode", -1))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("checkpoint index image mode is invalid") from error
+    if mode < 0 or mode > 0o7777:
+        raise RuntimeError("checkpoint index image mode is invalid")
+    try:
+        content = base64.b64decode(
+            str(snapshot.get("content_base64", "")),
+            validate=True,
+        )
+    except (ValueError, TypeError) as error:
+        raise RuntimeError("checkpoint index image is invalid") from error
+    if hashlib.sha256(content).hexdigest() != str(snapshot.get("sha256", "")):
+        raise RuntimeError("checkpoint index image fingerprint is invalid")
+    if not bool(snapshot.get("present")) and content:
+        raise RuntimeError("checkpoint absent index image contains data")
+    return content
+
+
+def _restore_index_image(
+    project_root: Path,
+    snapshot: Mapping[str, object],
+) -> None:
+    content = _validated_index_content(snapshot)
+    path = _index_path(project_root)
+    lock_path = path.with_name(path.name + ".lock")
+    if lock_path.exists():
+        raise RuntimeError("checkpoint transaction refused a locked git index")
+    if not bool(snapshot.get("present")):
+        if path.exists():
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_temp = tempfile.mkstemp(
+        prefix=f".{path.name}.checkpoint-",
+        dir=str(path.parent),
+    )
+    temp_path = Path(raw_temp)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), int(snapshot.get("mode", 0o644)))
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _index_entries_for_path(
+    project_root: Path,
+    path: str,
+) -> list[Dict[str, str]]:
+    result = _git_bytes(
+        project_root,
+        "ls-files",
+        "--stage",
+        "-z",
+        "--",
+        f":(top,literal){path}",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or f"git index lookup failed for {path}"
+        )
+    entries: list[Dict[str, str]] = []
+    for raw_entry in result.stdout.split(b"\0"):
+        if not raw_entry:
+            continue
+        metadata, separator, raw_path = raw_entry.partition(b"\t")
+        observed_path = _decode_git_path(raw_path) if separator else ""
+        if observed_path.startswith(path + "/"):
+            # A literal pathspec names the directory recursively.  The index
+            # itself has no directory entries, so descendants are not an
+            # observation of the requested path.
+            continue
+        if not separator or observed_path != path:
+            raise RuntimeError(f"git index lookup returned the wrong path for {path}")
+        parts = metadata.decode("ascii").split()
+        if len(parts) != 3:
+            raise RuntimeError(f"git index metadata is invalid for {path}")
+        entries.append(
+            {"mode": parts[0], "object_id": parts[1], "stage": parts[2]}
+        )
+    return entries
+
+
+def _path_is_filtered(path: str, prefixes: tuple[str, ...]) -> bool:
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in prefixes)
+
+
+def _semantic_index_fingerprint(
+    project_root: Path,
+    excluded_prefixes: tuple[str, ...],
+) -> str:
+    staged = _git_bytes(project_root, "ls-files", "--stage", "-z")
+    flags = _git_bytes(project_root, "ls-files", "-v", "-z")
+    if staged.returncode != 0 or flags.returncode != 0:
+        message = staged.stderr or flags.stderr
+        raise RuntimeError(
+            message.decode("utf-8", errors="replace").strip()
+            or "git index fingerprint lookup failed"
+        )
+    retained: list[bytes] = []
+    for raw_entry in staged.stdout.split(b"\0"):
+        if not raw_entry:
+            continue
+        _metadata, separator, raw_path = raw_entry.partition(b"\t")
+        path = _decode_git_path(raw_path) if separator else ""
+        if path and not _path_is_filtered(path, excluded_prefixes):
+            retained.append(b"stage\0" + raw_entry)
+    for raw_entry in flags.stdout.split(b"\0"):
+        if not raw_entry:
+            continue
+        _flag, separator, raw_path = raw_entry.partition(b" ")
+        path = _decode_git_path(raw_path) if separator else ""
+        if path and not _path_is_filtered(path, excluded_prefixes):
+            retained.append(b"flag\0" + raw_entry)
+    hasher = hashlib.sha256()
+    for entry in sorted(retained):
+        hasher.update(entry)
+        hasher.update(b"\0")
+    return hasher.hexdigest()
+
+
+def _changed_repository_paths(
+    project_root: Path,
+    excluded_prefixes: tuple[str, ...],
+) -> tuple[str, ...]:
+    tracked = _git_bytes(project_root, "diff", "--name-only", "-z", "HEAD", "--")
+    untracked = _git_bytes(
+        project_root,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    if tracked.returncode != 0 or untracked.returncode != 0:
+        message = tracked.stderr or untracked.stderr
+        raise RuntimeError(
+            message.decode("utf-8", errors="replace").strip()
+            or "git worktree fingerprint lookup failed"
+        )
+    paths = {
+        _decode_git_path(raw_path)
+        for output in (tracked.stdout, untracked.stdout)
+        for raw_path in output.split(b"\0")
+        if raw_path
+    }
+    return tuple(
+        path
+        for path in sorted(paths)
+        if not _path_is_filtered(path, excluded_prefixes)
+    )
+
+
+def checkpoint_repository_fingerprints(
+    project_root: Path,
+    *,
+    ignored_prefixes: Iterable[str] = _CHECKPOINT_ENGINE_PATHS,
+    excluded_paths: Iterable[str] = (),
+) -> Dict[str, str]:
+    """Fingerprint the exact non-engine worktree and semantic index state."""
+
+    prefixes = normalize_repository_exclusions(
+        (*tuple(ignored_prefixes), *tuple(excluded_paths))
+    )
+    path_snapshots = [
+        {
+            "path": path,
+            "fingerprint": str(
+                _capture_worktree_path(project_root, path)["fingerprint"]
+            ),
+        }
+        for path in _coalesced_worktree_roots(
+            _changed_repository_paths(project_root, prefixes)
+        )
+    ]
+    index_image = _capture_index_image(project_root)
+    return {
+        "head": head_ref(project_root),
+        "worktree": _checkpoint_payload_fingerprint(path_snapshots),
+        "index": _semantic_index_fingerprint(project_root, prefixes),
+        "index_image": str(index_image["sha256"]),
+    }
+
+
+def _worktree_entry_observation(
+    project_root: Path,
+    path: str,
+    expected: Mapping[str, object],
+    *,
+    allow_directory_container: bool,
+) -> tuple[Dict[str, object], bool]:
+    candidate = _safe_worktree_path(project_root, path)
+    expected_kind = str(expected.get("kind", ""))
+    try:
+        details = candidate.lstat()
+    except FileNotFoundError:
+        observed: Dict[str, object] = {"kind": "missing", "mode": "000000"}
+        return observed, expected_kind == "missing"
+    if stat.S_ISREG(details.st_mode):
+        content = candidate.read_bytes()
+        mode = "100755" if details.st_mode & 0o111 else "100644"
+        observed = {
+            "kind": "file",
+            "mode": mode,
+            "size": len(content),
+            "content_sha256": hashlib.sha256(content).hexdigest(),
+        }
+    elif stat.S_ISLNK(details.st_mode):
+        content = os.fsencode(os.readlink(candidate))
+        observed = {
+            "kind": "symlink",
+            "mode": "120000",
+            "size": len(content),
+            "content_sha256": hashlib.sha256(content).hexdigest(),
+        }
+    elif stat.S_ISDIR(details.st_mode):
+        observed = {"kind": "directory", "mode": "040000"}
+        if expected_kind == "gitlink":
+            submodule = _git_bytes(candidate, "rev-parse", "HEAD")
+            if submodule.returncode == 0:
+                observed["object_id"] = submodule.stdout.decode("ascii").strip()
+    else:
+        observed = {"kind": "unsupported", "mode": oct(details.st_mode)}
+    if expected_kind == "missing":
+        return observed, bool(
+            allow_directory_container and observed.get("kind") == "directory"
+        )
+    matches = bool(
+        observed.get("kind") == expected_kind
+        and observed.get("mode") == expected.get("mode")
+    )
+    if expected_kind in {"file", "symlink"}:
+        matches = bool(
+            matches
+            and observed.get("size") == expected.get("size")
+            and observed.get("content_sha256")
+            == expected.get("content_sha256")
+        )
+    elif expected_kind == "gitlink":
+        matches = bool(
+            matches
+            and observed.get("object_id") == expected.get("object_id")
+        )
+    return observed, matches
+
+
+def _owned_path_observation(
+    project_root: Path,
+    manifest: Iterable[Mapping[str, object]],
+) -> Dict[str, object]:
+    entries = sorted(
+        (dict(item) for item in manifest),
+        key=lambda item: (
+            len(PurePosixPath(str(item.get("path", ""))).parts),
+            str(item.get("path", "")),
+        ),
+    )
+    observations: Dict[str, object] = {}
+    mismatches: list[Dict[str, object]] = []
+    for entry in entries:
+        path = str(entry.get("path", ""))
+        raw_expected = entry.get("after", {})
+        expected = dict(raw_expected) if isinstance(raw_expected, Mapping) else {}
+        expected_kind = str(expected.get("kind", ""))
+        expected_index = (
+            []
+            if expected_kind in {"missing", "directory"}
+            else [
+                {
+                    "mode": str(expected.get("mode", "")),
+                    "object_id": str(expected.get("object_id", "")),
+                    "stage": "0",
+                }
+            ]
+        )
+        actual_index = _index_entries_for_path(project_root, path)
+        allow_container = any(
+            str(other.get("path", "")).startswith(path + "/")
+            and isinstance(other.get("after"), Mapping)
+            and str(dict(other["after"]).get("kind", "")) != "missing"
+            for other in entries
+        )
+        blocked_by = ""
+        parent = PurePosixPath(path).parent
+        while parent.as_posix() not in {"", "."}:
+            parent_observation = observations.get(parent.as_posix())
+            if isinstance(parent_observation, Mapping):
+                parent_worktree = parent_observation.get("worktree", {})
+                if (
+                    isinstance(parent_worktree, Mapping)
+                    and str(parent_worktree.get("kind", "")) != "directory"
+                ):
+                    blocked_by = parent.as_posix()
+                    break
+            parent = parent.parent
+        if blocked_by:
+            worktree = {
+                "kind": "missing",
+                "mode": "000000",
+                "blocked_by": blocked_by,
+            }
+            worktree_matches = expected_kind == "missing"
+        else:
+            worktree, worktree_matches = _worktree_entry_observation(
+                project_root,
+                path,
+                expected,
+                allow_directory_container=allow_container,
+            )
+        index_matches = actual_index == expected_index
+        observations[path] = {
+            "index": actual_index,
+            "worktree": worktree,
+        }
+        if not index_matches or not worktree_matches:
+            mismatches.append(
+                {
+                    "path": path,
+                    "index_matches": index_matches,
+                    "worktree_matches": worktree_matches,
+                }
+            )
+    return {
+        "fingerprint": _checkpoint_payload_fingerprint(observations),
+        "paths": observations,
+        "mismatches": mismatches,
+        "matches_retained": not mismatches,
+    }
+
+
+def _validated_checkpoint_prestate(
+    transaction: Mapping[str, object],
+) -> tuple[
+    tuple[str, ...],
+    Dict[str, object],
+    Dict[str, object],
+    Mapping[str, object],
+]:
+    try:
+        version = int(transaction.get("schema_version", 0) or 0)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "checkpoint application transaction version is invalid"
+        ) from error
+    if version != CHECKPOINT_APPLICATION_TRANSACTION_VERSION:
+        raise RuntimeError("checkpoint application transaction version is invalid")
+    raw_paths = transaction.get("effective_paths", [])
+    if not isinstance(raw_paths, list):
+        raise RuntimeError("checkpoint effective path list is invalid")
+    try:
+        paths = normalize_repository_exclusions(str(path) for path in raw_paths)
+    except ValueError as error:
+        raise RuntimeError("checkpoint effective path binding is unsafe") from error
+    if list(paths) != raw_paths or not paths:
+        raise RuntimeError("checkpoint effective path binding is invalid")
+    raw_prestate = transaction.get("pre_application", {})
+    prestate = dict(raw_prestate) if isinstance(raw_prestate, Mapping) else {}
+    raw_snapshots = prestate.get("worktree_paths", {})
+    snapshots = dict(raw_snapshots) if isinstance(raw_snapshots, Mapping) else {}
+    raw_snapshot_paths = list(snapshots)
+    if not all(isinstance(path, str) for path in raw_snapshot_paths):
+        raise RuntimeError("checkpoint worktree prestate path set is invalid")
+    try:
+        snapshot_paths = normalize_repository_exclusions(raw_snapshot_paths)
+    except ValueError as error:
+        raise RuntimeError(
+            "checkpoint worktree prestate path set is unsafe"
+        ) from error
+    if set(snapshot_paths) != set(raw_snapshot_paths) or set(
+        _coalesced_worktree_roots(snapshot_paths)
+    ) != set(snapshot_paths):
+        raise RuntimeError("checkpoint worktree prestate path set is invalid")
+    if any(
+        not any(path == root or path.startswith(root + "/") for root in snapshot_paths)
+        for path in paths
+    ) or any(
+        not any(path == root or path.startswith(root + "/") for path in paths)
+        for root in snapshot_paths
+    ):
+        raise RuntimeError("checkpoint worktree prestate path set is incomplete")
+    for root, raw_snapshot in snapshots.items():
+        if not isinstance(raw_snapshot, Mapping):
+            raise RuntimeError("checkpoint worktree prestate is invalid")
+        try:
+            _validate_worktree_snapshot(raw_snapshot)
+        except ValueError as error:
+            raise RuntimeError("checkpoint worktree prestate is unsafe") from error
+        if root not in paths and str(raw_snapshot.get("kind", "")) != "missing":
+            raise RuntimeError(
+                "checkpoint worktree ancestor prestate must be missing"
+            )
+    raw_index = prestate.get("index_image", {})
+    if not isinstance(raw_index, Mapping):
+        raise RuntimeError("checkpoint index prestate is missing")
+    _validated_index_content(raw_index)
+    raw_fingerprints = prestate.get("fingerprints", {})
+    fingerprints = (
+        dict(raw_fingerprints)
+        if isinstance(raw_fingerprints, Mapping)
+        else {}
+    )
+    required_fingerprints = {"head", "worktree", "index", "index_image"}
+    if not required_fingerprints.issubset(fingerprints):
+        raise RuntimeError("checkpoint prestate fingerprints are incomplete")
+    if str(fingerprints.get("index_image", "")) != str(
+        raw_index.get("sha256", "")
+    ) or str(prestate.get("index_semantic_identity", "")) != str(
+        fingerprints.get("index", "")
+    ):
+        raise RuntimeError("checkpoint index prestate identity is inconsistent")
+    return paths, prestate, snapshots, raw_index
+
+
+def _validate_checkpoint_transaction(
+    project_root: Path,
+    transaction: Mapping[str, object],
+) -> tuple[
+    tuple[str, ...],
+    list[Dict[str, object]],
+    Dict[str, object],
+]:
+    paths, _prestate, snapshots, _index = _validated_checkpoint_prestate(
+        transaction
+    )
+    owner = str(transaction.get("owner_task_id", "")).strip()
+    retained_ref = str(transaction.get("retained_ref", "")).strip()
+    retained_commit = str(transaction.get("retained_commit", "")).strip()
+    parent_commit = str(transaction.get("retained_parent", "")).strip()
+    if not owner or not retained_ref or not retained_commit or not parent_commit:
+        raise RuntimeError("checkpoint application transaction binding is incomplete")
+    if _resolve_commit(project_root, retained_ref) != retained_commit:
+        raise RuntimeError("checkpoint retained ref no longer matches its transaction")
+    if _single_commit_parent(project_root, retained_commit) != parent_commit:
+        raise RuntimeError("checkpoint retained parent no longer matches its transaction")
+    raw_manifest = transaction.get("retained_manifest", [])
+    if not isinstance(raw_manifest, list) or not all(
+        isinstance(item, dict) for item in raw_manifest
+    ):
+        raise RuntimeError("checkpoint retained manifest is invalid")
+    manifest = [dict(item) for item in raw_manifest]
+    expected_manifest = _retained_path_manifest(
+        project_root,
+        parent_commit,
+        retained_commit,
+        paths,
+    )
+    if manifest != expected_manifest:
+        raise RuntimeError("checkpoint retained path manifest no longer matches its ref")
+    return paths, manifest, snapshots
+
+
+def begin_checkpoint_application(
+    project_root: Path,
+    *,
+    owner_task_id: str,
+    retained_ref: str,
+    retained_commit: str = "",
+    changed_paths: Iterable[str],
+    exclude_prefixes: Iterable[str] = (),
+    ignored_prefixes: Iterable[str] = _CHECKPOINT_ENGINE_PATHS,
+) -> Dict[str, object]:
+    """Capture a durable, non-mutating prestate for a retained checkpoint."""
+
+    owner = str(owner_task_id).strip()
+    ref_name = str(retained_ref).strip()
+    if not owner or not ref_name:
+        raise RuntimeError("checkpoint owner and retained ref are required")
+    resolved_commit = _resolve_commit(project_root, ref_name)
+    expected_commit = str(retained_commit).strip()
+    if expected_commit and _resolve_commit(project_root, expected_commit) != resolved_commit:
+        raise RuntimeError("checkpoint commit identity does not match its retained ref")
+    parent_commit = _single_commit_parent(project_root, resolved_commit)
+    exclusions = normalize_repository_exclusions(exclude_prefixes)
+    requested_paths = normalize_repository_exclusions(changed_paths)
+    actual_paths = _commit_delta_paths(
+        project_root,
+        parent_commit,
+        resolved_commit,
+    )
+    effective_requested = tuple(
+        path for path in requested_paths if not _path_is_filtered(path, exclusions)
+    )
+    effective_actual = tuple(
+        path for path in actual_paths if not _path_is_filtered(path, exclusions)
+    )
+    if set(effective_requested) != set(effective_actual) or not effective_actual:
+        raise RuntimeError(
+            "checkpoint changed paths do not exactly match the retained commit"
+        )
+    effective_paths = tuple(sorted(effective_actual))
+    manifest = _retained_path_manifest(
+        project_root,
+        parent_commit,
+        resolved_commit,
+        effective_paths,
+    )
+    snapshot_roots = _worktree_snapshot_roots(project_root, effective_paths)
+    worktree_paths = {
+        path: _capture_worktree_path(project_root, path)
+        for path in snapshot_roots
+    }
+    fingerprints = checkpoint_repository_fingerprints(
+        project_root,
+        ignored_prefixes=ignored_prefixes,
+    )
+    unowned_fingerprints = checkpoint_repository_fingerprints(
+        project_root,
+        ignored_prefixes=ignored_prefixes,
+        excluded_paths=effective_paths,
+    )
+    # The exact image is captured last, after every read-only semantic query.
+    index_image = _capture_index_image(project_root)
+    fingerprints["index_image"] = str(index_image["sha256"])
+    pre_application = {
+        "head": fingerprints["head"],
+        "worktree_paths": worktree_paths,
+        "index_image": index_image,
+        "index_semantic_identity": fingerprints["index"],
+        "fingerprints": fingerprints,
+        "unowned_fingerprints": {
+            key: value
+            for key, value in unowned_fingerprints.items()
+            if key != "index_image"
+        },
+    }
+    identity = {
+        "version": CHECKPOINT_APPLICATION_TRANSACTION_VERSION,
+        "owner_task_id": owner,
+        "retained_ref": ref_name,
+        "retained_commit": resolved_commit,
+        "retained_parent": parent_commit,
+        "effective_paths": list(effective_paths),
+        "prestate_fingerprints": fingerprints,
+    }
+    return {
+        "schema_version": CHECKPOINT_APPLICATION_TRANSACTION_VERSION,
+        "transaction_id": _checkpoint_payload_fingerprint(identity)[:24],
+        "owner_task_id": owner,
+        "retained_ref": ref_name,
+        "retained_commit": resolved_commit,
+        "retained_parent": parent_commit,
+        "excluded_prefixes": list(exclusions),
+        "effective_paths": list(effective_paths),
+        "retained_manifest": manifest,
+        "pre_application": pre_application,
+        "status": "applying",
+    }
+
+
+def checkpoint_application_state(
+    project_root: Path,
+    transaction: Mapping[str, object],
+    *,
+    ignored_prefixes: Iterable[str] = _CHECKPOINT_ENGINE_PATHS,
+) -> Dict[str, object]:
+    """Observe a transaction without changing its worktree or index."""
+
+    paths, manifest, snapshots = _validate_checkpoint_transaction(
+        project_root,
+        transaction,
+    )
+    current_fingerprints = checkpoint_repository_fingerprints(
+        project_root,
+        ignored_prefixes=ignored_prefixes,
+    )
+    current_unowned = checkpoint_repository_fingerprints(
+        project_root,
+        ignored_prefixes=ignored_prefixes,
+        excluded_paths=paths,
+    )
+    owned = _owned_path_observation(project_root, manifest)
+    raw_prestate = transaction.get("pre_application", {})
+    prestate = dict(raw_prestate) if isinstance(raw_prestate, Mapping) else {}
+    expected_pre = prestate.get("fingerprints", {})
+    expected_unowned = prestate.get("unowned_fingerprints", {})
+    raw_applied = transaction.get("applied_state", {})
+    applied = dict(raw_applied) if isinstance(raw_applied, Mapping) else {}
+    expected_applied = applied.get("fingerprints", {})
+    expected_owned_fingerprint = str(applied.get("owned_fingerprint", ""))
+    raw_expected_applied_roots = applied.get("worktree_root_fingerprints", {})
+    expected_applied_roots = (
+        dict(raw_expected_applied_roots)
+        if isinstance(raw_expected_applied_roots, Mapping)
+        else {}
+    )
+    current_worktree_roots = _worktree_snapshot_fingerprints(
+        project_root,
+        snapshots,
+    )
+    expected_pre_worktree_roots = {
+        path: str(dict(snapshot)["fingerprint"])
+        for path, snapshot in snapshots.items()
+        if isinstance(snapshot, Mapping)
+    }
+    current_unowned_comparable = {
+        key: value
+        for key, value in current_unowned.items()
+        if key != "index_image"
+    }
+    prestate_matches = bool(
+        isinstance(expected_pre, Mapping)
+        and dict(expected_pre) == current_fingerprints
+        and expected_pre_worktree_roots == current_worktree_roots
+    )
+    retained_matches = bool(
+        owned["matches_retained"]
+        and current_fingerprints["head"] == str(prestate.get("head", ""))
+        and isinstance(expected_unowned, Mapping)
+        and dict(expected_unowned) == current_unowned_comparable
+    )
+    applied_matches = bool(
+        expected_applied
+        and isinstance(expected_applied, Mapping)
+        and dict(expected_applied) == current_fingerprints
+        and expected_owned_fingerprint == str(owned["fingerprint"])
+        and owned["matches_retained"]
+        and expected_applied_roots == current_worktree_roots
+    )
+    return {
+        "prestate_matches": prestate_matches,
+        "retained_matches": retained_matches,
+        "applied_matches": applied_matches,
+        "fingerprints": current_fingerprints,
+        "unowned_fingerprints": current_unowned_comparable,
+        "owned_fingerprint": owned["fingerprint"],
+        "owned_mismatches": list(owned["mismatches"]),
+        "worktree_root_fingerprints": current_worktree_roots,
+        "prestate_worktree_roots_match": (
+            expected_pre_worktree_roots == current_worktree_roots
+        ),
+    }
+
+
+def complete_checkpoint_application(
+    project_root: Path,
+    transaction: Dict[str, object],
+    *,
+    ignored_prefixes: Iterable[str] = _CHECKPOINT_ENGINE_PATHS,
+) -> Dict[str, object]:
+    observation = checkpoint_application_state(
+        project_root,
+        transaction,
+        ignored_prefixes=ignored_prefixes,
+    )
+    if not bool(observation["retained_matches"]):
+        raise RuntimeError(
+            "checkpoint application is not byte-and-mode equivalent to its retained ref"
+        )
+    transaction["applied_state"] = {
+        "head": str(dict(observation["fingerprints"])["head"]),
+        "fingerprints": dict(observation["fingerprints"]),
+        "unowned_fingerprints": dict(observation["unowned_fingerprints"]),
+        "owned_fingerprint": str(observation["owned_fingerprint"]),
+        "worktree_root_fingerprints": dict(
+            observation["worktree_root_fingerprints"]
+        ),
+    }
+    transaction["status"] = "applied"
+    return observation
+
+
+def apply_checkpoint_application(
+    project_root: Path,
+    transaction: Dict[str, object],
+    *,
+    ignored_prefixes: Iterable[str] = _CHECKPOINT_ENGINE_PATHS,
+) -> Dict[str, object]:
+    """Apply and verify a previously persisted checkpoint transaction."""
+
+    paths, _manifest, _snapshots = _validate_checkpoint_transaction(
+        project_root,
+        transaction,
+    )
+    if str(transaction.get("status", "")) != "applying":
+        raise RuntimeError("checkpoint transaction is not ready to apply")
+    before = checkpoint_application_state(
+        project_root,
+        transaction,
+        ignored_prefixes=ignored_prefixes,
+    )
+    if not bool(before["prestate_matches"]):
+        raise RuntimeError("checkpoint pre-application state changed before apply")
+    apply_commit_no_commit_excluding(
+        project_root,
+        str(transaction["retained_ref"]),
+        tuple(str(item) for item in transaction.get("excluded_prefixes", [])),
+        include_paths=paths,
+    )
+    return complete_checkpoint_application(
+        project_root,
+        transaction,
+        ignored_prefixes=ignored_prefixes,
+    )
+
+
+def rollback_checkpoint_application(
+    project_root: Path,
+    transaction: Dict[str, object],
+    *,
+    ignored_prefixes: Iterable[str] = _CHECKPOINT_ENGINE_PATHS,
+) -> Dict[str, object]:
+    """Restore a failed application to its exact captured prestate."""
+
+    _paths, prestate, snapshots, raw_index = _validated_checkpoint_prestate(
+        transaction
+    )
+    if head_ref(project_root) != str(prestate.get("head", "")):
+        raise RuntimeError("checkpoint rollback refused a changed HEAD")
+    index_path = _index_path(project_root)
+    if index_path.with_name(index_path.name + ".lock").exists():
+        raise RuntimeError("checkpoint rollback refused a locked git index")
+    _restore_worktree_snapshots(project_root, snapshots)
+    _restore_index_image(project_root, raw_index)
+    observed = checkpoint_repository_fingerprints(
+        project_root,
+        ignored_prefixes=ignored_prefixes,
+    )
+    raw_expected = prestate.get("fingerprints", {})
+    expected = dict(raw_expected) if isinstance(raw_expected, Mapping) else {}
+    semantic_observed = {
+        key: value for key, value in observed.items() if key != "index_image"
+    }
+    semantic_expected = {
+        key: value for key, value in expected.items() if key != "index_image"
+    }
+    # Worktree verification may refresh index stat data even with optional
+    # locks disabled.  Put the saved bytes back once more after all Git reads,
+    # then verify the image directly without another Git command.
+    _restore_index_image(project_root, raw_index)
+    restored_index = _capture_index_image(project_root)
+    observed["index_image"] = str(restored_index["sha256"])
+    restored_worktree_roots = _worktree_snapshot_fingerprints(
+        project_root,
+        snapshots,
+    )
+    expected_worktree_roots = {
+        path: str(dict(snapshot)["fingerprint"])
+        for path, snapshot in snapshots.items()
+        if isinstance(snapshot, Mapping)
+    }
+    if semantic_observed != semantic_expected or observed.get(
+        "index_image"
+    ) != expected.get("index_image") or (
+        restored_worktree_roots != expected_worktree_roots
+    ):
+        raise RuntimeError(
+            "checkpoint rollback could not verify the exact prestate: "
+            f"expected={expected} observed={observed} "
+            "worktree_roots_match="
+            f"{restored_worktree_roots == expected_worktree_roots}"
+        )
+    transaction["status"] = "rolled_back"
+    return {"ok": True, "fingerprints": observed}
+
+
+def detach_checkpoint_application(
+    project_root: Path,
+    transaction: Dict[str, object],
+    *,
+    ignored_prefixes: Iterable[str] = _CHECKPOINT_ENGINE_PATHS,
+) -> Dict[str, object]:
+    """Detach an applied checkpoint only after exact ownership proof."""
+
+    try:
+        observation = checkpoint_application_state(
+            project_root,
+            transaction,
+            ignored_prefixes=ignored_prefixes,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        return {
+            "ok": False,
+            "reason": str(error),
+            "proof": "transaction_invalid",
+        }
+    if str(transaction.get("status", "")) == "applied" and bool(
+        observation["prestate_matches"]
+    ):
+        transaction["status"] = "detached"
+        return {
+            "ok": True,
+            "proof": "exact_prestate_already_restored",
+            "fingerprints": dict(observation["fingerprints"]),
+        }
+    if str(transaction.get("status", "")) != "applied" or not bool(
+        observation["applied_matches"]
+    ):
+        return {
+            "ok": False,
+            "reason": "applied checkpoint ownership could not be proven",
+            "proof": "applied_state_mismatch",
+            "expected_fingerprints": dict(
+                dict(transaction.get("applied_state", {})).get(
+                    "fingerprints",
+                    {},
+                )
+                if isinstance(transaction.get("applied_state", {}), Mapping)
+                else {}
+            ),
+            "observed_fingerprints": dict(observation["fingerprints"]),
+            "owned_mismatches": list(observation["owned_mismatches"]),
+        }
+    try:
+        restored = rollback_checkpoint_application(
+            project_root,
+            transaction,
+            ignored_prefixes=ignored_prefixes,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        return {
+            "ok": False,
+            "reason": str(error),
+            "proof": "prestate_restore_unproven",
+            "observed_fingerprints": dict(observation["fingerprints"]),
+        }
+    transaction["status"] = "detached"
+    return {
+        "ok": True,
+        "proof": "exact_prestate_restored",
+        "fingerprints": dict(restored["fingerprints"]),
+    }
 
 
 def abort_cherry_pick(project_root: Path) -> str:

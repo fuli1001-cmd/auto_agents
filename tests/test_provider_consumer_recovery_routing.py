@@ -164,7 +164,9 @@ class _ProviderRoutingFixture:
             "failure_ids": [self.failure_ref],
             "current_failure_ids": [self.failure_ref],
             "baseline_failure_ids": [self.failure_ref],
-            "new_failure_ids": [self.failure_ref],
+            "new_failure_ids": [],
+            "owned_failure_ids": [self.failure_ref],
+            "failure_class": "baseline_only_owned",
             "comparable_failures": True,
             "baseline_comparison_comparable": True,
             "proof_evidence": {
@@ -236,7 +238,8 @@ def test_evidence_repair_baseline_provider_failure_routes_via_parent_proof(
         assert not verify_result["ok"]
         assert verify_result["failure_ids"] == [fixture.failure_ref]
         assert verify_result["baseline_failure_ids"] == [fixture.failure_ref]
-        assert verify_result["new_failure_ids"] == [fixture.failure_ref]
+        assert verify_result["new_failure_ids"] == []
+        assert verify_result["owned_failure_ids"] == [fixture.failure_ref]
 
         leaf_stage, _leaf_feedback = (
             orchestrator._verification_failure_owner_route(

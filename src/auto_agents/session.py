@@ -40,7 +40,12 @@ from .gates import (
     extract_failure_info,
     run_gate_plan,
 )
-from .gate_execution import GateSnapshotManager
+from .gate_execution import (
+    GATE_SNAPSHOT_RUNTIME_PATHS,
+    GateSnapshotManager,
+    discover_dependency_links,
+    repository_exclusion_paths,
+)
 from .git_ops import (
     changed_paths,
     commit_only_paths,
@@ -3714,9 +3719,15 @@ class Session:
             and self.config.gates.incremental_mode == "auto"
             and bool(self.config.gates.steps)
         ):
+            dependency_links = discover_dependency_links(self.project_root)
             manager = GateSnapshotManager(
                 self.project_root,
                 f"session-{state.session_id}-baseline",
+                excluded_paths=repository_exclusion_paths(
+                    self.project_root,
+                    dependency_links=dependency_links,
+                    surface_paths=GATE_SNAPSHOT_RUNTIME_PATHS,
+                ),
             )
             snapshot = manager.create()
             # Deliberately keep the ref until the session is complete. The

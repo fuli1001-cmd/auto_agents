@@ -17,7 +17,7 @@ import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Set, TextIO, Tuple
 
@@ -77,6 +77,7 @@ from .config import (
     write_run_prompt,
 )
 from .gates import (
+    FailureExtraction,
     GateCommandBaselineIdentityError,
     GateCommandExecutionError,
     GateCommandInfrastructureError,
@@ -104,11 +105,12 @@ from .gate_baseline_cache import GateBaselineCache
 from .gate_timing import GateTimingStore
 from .performance_trace import PerformanceTrace
 from .gate_execution import (
+    GATE_SNAPSHOT_RUNTIME_PATHS,
     GateSnapshotManager,
     LocalGatePlanExecutor,
-    dependency_link_paths,
     discover_dependency_links,
     install_dependency_links,
+    repository_exclusion_paths,
     self_referential_dependency_links,
 )
 from .distributed_gates import DistributedGatePlanExecutor
@@ -128,11 +130,13 @@ from .execution_recovery import (
     ExecutionIncident,
     ExecutionIncidentStore,
     IncidentDiagnosis,
+    ParallelLaneFailure,
     command_incident,
     deterministic_diagnosis,
     is_execution_incident_recovery_task,
     provider_incident,
     parse_incident_diagnosis,
+    redact_incident_text,
     recovery_task_marker,
 )
 from .frontend_fidelity import (
@@ -161,7 +165,38 @@ from .frontend_design import (
     validate_frontend_scope,
     validate_prototype_manifest,
 )
-from .git_ops import abort_cherry_pick, add_worktree, apply_commit_no_commit_excluding, changed_entries, changed_files, changed_paths, cherry_pick_no_commit, commit_all, commit_all_except, commit_changed_paths, commit_only_paths, delete_ref, ensure_repo, hard_reset_clean, head_ref, is_repo, is_untracked_vim_swap, list_worktrees, ref_exists, remove_worktree, tracked_files, update_ref, worktree_fingerprint
+from .git_ops import (
+    abort_cherry_pick,
+    add_worktree,
+    apply_checkpoint_application,
+    begin_checkpoint_application,
+    changed_entries,
+    changed_files,
+    changed_paths,
+    checkpoint_application_state,
+    checkpoint_repository_fingerprints,
+    cherry_pick_no_commit,
+    commit_all,
+    commit_all_except,
+    commit_changed_paths,
+    commit_only_paths,
+    complete_checkpoint_application,
+    delete_ref,
+    detach_checkpoint_application,
+    ensure_repo,
+    hard_reset_clean,
+    head_ref,
+    is_repo,
+    is_untracked_vim_swap,
+    list_worktrees,
+    ref_exists,
+    remove_worktree,
+    repository_path_is_excluded,
+    rollback_checkpoint_application,
+    tracked_files,
+    update_ref,
+    worktree_fingerprint,
+)
 from .infrastructure_repair import (
     repair_declared_workspace_local_conda,
     repair_workspace_local_conda,
@@ -347,6 +382,22 @@ _PROVIDER_RECOVERY_CONTRACT_REASON = (
     "through clarify."
 )
 _IGNORED_EVIDENCE_PUBLICATION_FAILURE_KIND = "nonportable_ignored_evidence"
+_TASK_GATE_OPERATIONAL_METADATA_FIELDS = (
+    "proof_ids",
+    "risk",
+    "resource_class",
+    "cpu_slots",
+    "memory_mb",
+    "memory_reserve_mb",
+    "memory_guard",
+    "requires",
+    "exclusive_resources",
+    "dynamic_ports",
+    "artifact_globs",
+    "serial_reason",
+    "cache_scope",
+    "result_cache_scope",
+)
 _ARTIFACT_PUBLICATION_METADATA_REPAIR_CONTEXT = (
     "artifact_publication_metadata_repair"
 )
@@ -382,6 +433,24 @@ _EXECUTION_RECOVERY_IDENTITY_MIGRATIONS_CONTEXT = (
 )
 _RETAINED_WORKTREE_RECONCILIATION_KIND = (
     "retained_worktree_reconciliation"
+)
+_PARALLEL_LANE_FAILURE_KIND = "parallel_lane_failure"
+_PARALLEL_LANE_RECHECK_CONTEXT = "parallel_lane_gate_rechecks"
+_PARALLEL_LANE_ACTIVE_CONTEXT = "parallel_lane_recovery_tasks"
+_PARALLEL_LANE_RECOVERY_HISTORY_CONTEXT = "parallel_lane_recovery_history"
+_PARALLEL_FAILURE_LIFECYCLE_CATEGORY = "parallel_failure_lifecycle_bypass"
+_PARALLEL_REPAIR_EVIDENCE_CATEGORY = (
+    "parallel_repair_evidence_unavailable"
+)
+_PARALLEL_BATCH_FAILURE_PREFIX = "parallel task batch failed"
+_PARALLEL_UNUSABLE_CHECKPOINT_STATUSES = frozenset(
+    {"unavailable", "replay_conflict"}
+)
+_CHECKPOINT_OWNERSHIP_ACTIVE_STATUSES = frozenset(
+    {"applying", "applied"}
+)
+_CHECKPOINT_OWNERSHIP_DETACHMENT_UNPROVEN_CATEGORY = (
+    "checkpoint_ownership_detachment_unproven"
 )
 _NON_COMPARABLE_BASELINE_PREFIXES = (
     "cmd-timeout:",
@@ -772,6 +841,61 @@ class Orchestrator:
             ),
         )
 
+    @classmethod
+    def _merge_verify_failure_identity_diagnostic(
+        cls,
+        verify_gate: GateResult,
+        diagnostic_gate: GateResult,
+    ) -> Tuple[FailureExtraction, bool]:
+        """Enrich only the current commands resolved by a diagnostic rerun."""
+
+        diagnostic_results = {
+            result.command: result for result in diagnostic_gate.commands
+        }
+        failure_ids: List[str] = []
+        non_comparable_ids: List[str] = []
+        used_diagnostic_identity = False
+        for current_result in verify_gate.commands:
+            if current_result.ok:
+                continue
+            current_extraction = extract_failure_info(
+                GateResult(ok=False, commands=[current_result])
+            )
+            selected_extraction = current_extraction
+            if not current_extraction.comparable:
+                diagnostic_command = build_failure_identity_diagnostic_command(
+                    current_result.command
+                )
+                diagnostic_result = diagnostic_results.get(diagnostic_command)
+                if (
+                    diagnostic_result is not None
+                    and not diagnostic_result.ok
+                    and diagnostic_result.returncode != 0
+                    and cls._command_result_is_operationally_clean(
+                        diagnostic_result
+                    )
+                ):
+                    diagnostic_extraction = extract_failure_info(
+                        GateResult(ok=False, commands=[diagnostic_result])
+                    )
+                    if (
+                        diagnostic_extraction.comparable
+                        and diagnostic_extraction.failure_ids
+                    ):
+                        selected_extraction = diagnostic_extraction
+                        used_diagnostic_identity = True
+            failure_ids.extend(selected_extraction.failure_ids)
+            non_comparable_ids.extend(selected_extraction.non_comparable_ids)
+
+        merged_failure_ids = list(dict.fromkeys(failure_ids))
+        merged_non_comparable_ids = list(dict.fromkeys(non_comparable_ids))
+        merged = FailureExtraction(
+            failure_ids=merged_failure_ids,
+            comparable=bool(merged_failure_ids) and not merged_non_comparable_ids,
+            non_comparable_ids=merged_non_comparable_ids,
+        )
+        return merged, bool(used_diagnostic_identity and merged.comparable)
+
     @staticmethod
     def init_project(
         project_root: Path,
@@ -1079,6 +1203,31 @@ class Orchestrator:
             installed_head,
         )
 
+    @staticmethod
+    def _installed_self_repair_recovery_key(
+        blocker: Mapping[str, object],
+        commit_sha: str,
+        claim_set_digest: str,
+    ) -> str:
+        category = str(
+            blocker.get(
+                "repair_root_category",
+                blocker.get("category", ""),
+            )
+        ).strip()
+        fingerprint = str(
+            blocker.get(
+                "repair_root_fingerprint",
+                blocker.get("fingerprint", ""),
+            )
+        ).strip()
+        return "approved_self_repair:" + hashlib.sha256(
+            (
+                f"{category}\0{fingerprint}\0{commit_sha}\0"
+                f"{claim_set_digest}"
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+
     def _prepare_installed_self_repair_resume(self, state: RunState) -> bool:
         """Reopen a blocked run when its approved repair is now installed.
 
@@ -1118,10 +1267,21 @@ class Orchestrator:
             for item in final.get("expected_postconditions", []) or []
             if str(item).strip()
         ]
+        legacy_parallel_repair = bool(
+            blocker.get("legacy_migration")
+            and self._blocker_is_parallel_failure_lifecycle(blocker)
+        )
         if (
             not commit_sha
-            or not str(failure.get("verification", "")).strip()
             or not expected_postconditions
+            or (
+                not legacy_parallel_repair
+                and not str(failure.get("verification", "")).strip()
+            )
+            or (
+                legacy_parallel_repair
+                and self._legacy_parallel_recovery_waiting(blocker)
+            )
         ):
             return False
 
@@ -1152,12 +1312,11 @@ class Orchestrator:
             if claims
             else f"ancestor:{commit_sha}"
         )
-        recovery_key = "approved_self_repair:" + hashlib.sha256(
-            (
-                f"{category}\0{fingerprint}\0{commit_sha}\0"
-                f"{claim_set_digest}"
-            ).encode("utf-8")
-        ).hexdigest()[:24]
+        recovery_key = self._installed_self_repair_recovery_key(
+            blocker,
+            commit_sha,
+            claim_set_digest,
+        )
 
         already_prepared = bool(
             state.status == "pending"
@@ -1895,7 +2054,10 @@ class Orchestrator:
             "current_failure_ids",
             "baseline_failure_ids",
             "new_failure_ids",
+            "owned_failure_ids",
+            "failure_class",
             "baseline_comparison_comparable",
+            "redacted_command_evidence",
             "failure_signature",
         ):
             if key in incident:
@@ -3148,6 +3310,8 @@ class Orchestrator:
             if self._normalize_valid_plan_retry_outcome(state):
                 save_run_state(self.project_root, state)
             if not restart_blocked:
+                if self._reconcile_legacy_parallel_failure_lifecycle(state):
+                    save_run_state(self.project_root, state)
                 if self._normalize_installed_requirement_namespace_repair(state):
                     save_run_state(self.project_root, state)
                 if self._prepare_installed_generic_self_repair_resume(state):
@@ -3244,6 +3408,20 @@ class Orchestrator:
                 if stage != "clarify" and self._route_forbidden_pattern_definition_recovery(state):
                     save_run_state(self.project_root, state)
                     continue
+                if (
+                    stage != "implement"
+                    and self._active_checkpoint_ownership_records(state)
+                ):
+                    checkpoint_tasks = list(state.tasks)
+                    if self._checkpoint_ownership_barrier(
+                        state,
+                        checkpoint_tasks,
+                        allow_owner_execution=False,
+                    ):
+                        return state
+                    if state.status == "blocked":
+                        save_run_state(self.project_root, state)
+                        return state
                 stage_had_summary = stage in state.stage_summaries
                 self._emit_stage_start(stage)
                 try:
@@ -6159,6 +6337,17 @@ class Orchestrator:
                 for item in gate_result.get("new_failure_ids", []) or []
                 if str(item).strip()
             ],
+            "owned_failure_ids": [
+                str(item).strip()
+                for item in gate_result.get("owned_failure_ids", []) or []
+                if str(item).strip()
+            ],
+            "failure_class": str(
+                gate_result.get("failure_class", "")
+            ).strip(),
+            "redacted_command_evidence": str(
+                gate_result.get("redacted_command_evidence", "")
+            ).strip(),
             "comparable_failures": bool(
                 gate_result.get("comparable_failures", True)
             ),
@@ -9049,6 +9238,7 @@ class Orchestrator:
         verification: str = "",
     ) -> RunState:
         state = load_run_state(self.project_root)
+        self._reconcile_legacy_parallel_failure_lifecycle(state)
         blocker = (
             dict(state.active_blocker)
             if isinstance(state.active_blocker, dict)
@@ -9074,6 +9264,12 @@ class Orchestrator:
             blocker["postcondition_claims"] = [
                 claim.to_dict() for claim in claims
             ]
+        legacy_parallel_repair = bool(
+            blocker.get("legacy_migration")
+            and self._blocker_is_parallel_failure_lifecycle(blocker)
+        )
+        if legacy_parallel_repair:
+            blocker["status"] = "blocked"
         state.active_blocker = blocker
         if state.active_repair_case_id:
             repair_case = RepairCaseStore(
@@ -9088,22 +9284,35 @@ class Orchestrator:
                 repair_case.postcondition_claims = [
                     claim.to_dict() for claim in claims
                 ]
-                repair_case.status = "resuming"
+                repair_case.status = (
+                    "awaiting_installed_engine"
+                    if legacy_parallel_repair
+                    else "resuming"
+                )
                 repair_case.history.append(
                     {
                         "event": "self_repair_applied",
                         "commit": commit_sha,
+                        "installed_verification_required": (
+                            legacy_parallel_repair
+                        ),
                         "at": utc_now_iso(),
                     }
                 )
                 RepairCaseStore(self.project_root, state.run_id).save(repair_case)
-                state.repair_phase = "resuming"
-                state.status = "pending"
-                state.last_error = ""
-                save_run_state(self.project_root, state)
-                return state
-        state.status = "pending"
-        state.last_error = ""
+                if not legacy_parallel_repair:
+                    state.repair_phase = "resuming"
+                    state.status = "pending"
+                    state.last_error = ""
+                    save_run_state(self.project_root, state)
+                    return state
+                state.repair_phase = "awaiting_installed_engine"
+        if legacy_parallel_repair:
+            state.status = "blocked"
+            state.last_error = str(blocker.get("reason", state.last_error))
+        else:
+            state.status = "pending"
+            state.last_error = ""
         incident = self._incident_store(state).active(state)
         if incident is not None:
             incident.status = "recovering"
@@ -9435,6 +9644,24 @@ class Orchestrator:
                     if isinstance(item, dict)
                 ]
 
+        parallel_failure_repair = self._blocker_is_parallel_failure_lifecycle(
+            blocker
+        )
+        affected_parallel_ids = set(
+            self._parallel_blocker_affected_task_ids(blocker)
+        )
+        if (
+            parallel_failure_repair
+            and not affected_parallel_ids
+            and not bool(blocker.get("legacy_migration"))
+        ):
+            affected_parallel_ids = {
+                task.task_id
+                for task in tasks
+                if task.status == "blocked"
+                or task.task_id in state.task_failure_checkpoints
+            }
+
         retained_reconciliation_task_id = (
             self._schedule_orphaned_retained_worktree_reconciliation(
                 state,
@@ -9485,10 +9712,69 @@ class Orchestrator:
             for task in tasks:
                 if task.status != "blocked":
                     continue
+                if (
+                    parallel_failure_repair
+                    and task.task_id not in affected_parallel_ids
+                ):
+                    continue
                 task.status = "pending"
                 task.commit_sha = ""
-                self._begin_fresh_verify_retry_lifecycle(task)
-                self._clear_implementation_ready_marker(state, task)
+                gate_only_requeue = bool(
+                    parallel_failure_repair
+                    and self._parallel_lane_gate_only_requeue(state, task)
+                )
+                if gate_only_requeue:
+                    checkpoint = state.task_failure_checkpoints.get(
+                        task.task_id,
+                        {},
+                    )
+                    self._set_parallel_lane_gate_recheck(
+                        state,
+                        task.task_id,
+                        {
+                            "schema_version": 1,
+                            "fingerprint": str(
+                                blocker.get("fingerprint", "")
+                            ),
+                            "incident_id": str(
+                                blocker.get("incident_id", "")
+                            ),
+                            "checkpoint_ref": str(
+                                checkpoint.get("ref", "")
+                            ),
+                            "self_repair_commit": commit_sha,
+                            "updated_at": utc_now_iso(),
+                        },
+                    )
+                else:
+                    self._begin_fresh_verify_retry_lifecycle(task)
+                    self._clear_implementation_ready_marker(state, task)
+                    self._set_parallel_lane_gate_recheck(
+                        state,
+                        task.task_id,
+                        None,
+                    )
+                if parallel_failure_repair:
+                    self._set_parallel_lane_recovery_task(
+                        state,
+                        task.task_id,
+                        {
+                            "schema_version": 1,
+                            "mode": (
+                                "gate_recheck"
+                                if gate_only_requeue
+                                else "implementation"
+                            ),
+                            "fingerprint": str(
+                                blocker.get("fingerprint", "")
+                            ),
+                            "incident_id": str(
+                                blocker.get("incident_id", "")
+                            ),
+                            "self_repair_commit": commit_sha,
+                            "updated_at": utc_now_iso(),
+                        },
+                    )
                 self._clear_stale_implementation_resume_markers(
                     state,
                     task_ids=[task.task_id],
@@ -9508,6 +9794,7 @@ class Orchestrator:
             self._set_parallel_sequential_retry_ids(
                 state,
                 [*sequential_retry_ids, *requeued_task_ids],
+                capture_retained_ownership=not parallel_failure_repair,
             )
             route = dict(state.last_recovery_route)
             if (
@@ -9523,6 +9810,41 @@ class Orchestrator:
 
         blocker["prepared_self_repair_commit"] = commit_sha
         blocker["requeued_task_ids"] = requeued_task_ids
+        if parallel_failure_repair and requeued_task_ids:
+            previous_route = (
+                dict(state.last_recovery_route)
+                if isinstance(state.last_recovery_route, dict)
+                else {}
+            )
+            blocker["parallel_lane_requeue_checkpoint"] = {
+                "schema_version": 1,
+                "task_ids": list(requeued_task_ids),
+                "self_repair_commit": commit_sha,
+                "previous_recovery_route": previous_route,
+                "task_failure_checkpoints": {
+                    task_id: dict(state.task_failure_checkpoints.get(task_id, {}))
+                    for task_id in requeued_task_ids
+                },
+                "created_at": utc_now_iso(),
+            }
+            first_task = next(
+                task
+                for task in tasks
+                if task.task_id == requeued_task_ids[0]
+            )
+            state.last_recovery_route = {
+                **previous_route,
+                "outcome": "self_repair_requeued",
+                "failure_kind": _PARALLEL_LANE_FAILURE_KIND,
+                "task_id": first_task.task_id,
+                "lineage_id": first_task.parent_task_id or first_task.task_id,
+                "affected_task_ids": list(requeued_task_ids),
+                "reason": (
+                    "auto_agents self-repair established a resumable parallel "
+                    "lane checkpoint"
+                ),
+                "engine_invariant": "",
+            }
         return requeued_task_ids
 
     def _reconcile_self_repair_attempt_checkpoints(
@@ -9805,9 +10127,16 @@ class Orchestrator:
         *,
         project_root: Optional[Path] = None,
     ) -> Dict[str, object]:
+        snapshot_root = project_root or self.project_root
+        dependency_links = discover_dependency_links(snapshot_root)
         snapshot = GateSnapshotManager(
-            project_root or self.project_root,
+            snapshot_root,
             self._retained_verify_baseline_snapshot_plan_id(state, record),
+            excluded_paths=repository_exclusion_paths(
+                snapshot_root,
+                dependency_links=dependency_links,
+                surface_paths=GATE_SNAPSHOT_RUNTIME_PATHS,
+            ),
         ).create()
         return self._retained_verify_baseline_snapshot_payload(snapshot)
 
@@ -12627,7 +12956,994 @@ class Orchestrator:
         )
         return True
 
+    @staticmethod
+    def _blocker_is_parallel_failure_lifecycle(
+        blocker: Mapping[str, object],
+    ) -> bool:
+        if str(blocker.get("source", "")) == _PARALLEL_LANE_FAILURE_KIND:
+            return True
+        if str(blocker.get("category", "")) == (
+            _PARALLEL_FAILURE_LIFECYCLE_CATEGORY
+        ):
+            return True
+        raw_diagnosis = blocker.get("root_cause_diagnosis", {})
+        diagnosis = (
+            dict(raw_diagnosis)
+            if isinstance(raw_diagnosis, Mapping)
+            else {}
+        )
+        raw_final = diagnosis.get("final", {})
+        final = dict(raw_final) if isinstance(raw_final, Mapping) else {}
+        return str(final.get("category", "")) == (
+            _PARALLEL_FAILURE_LIFECYCLE_CATEGORY
+        )
+
+    @staticmethod
+    def _parallel_blocker_affected_task_ids(
+        blocker: Mapping[str, object],
+    ) -> List[str]:
+        raw_ids = blocker.get("affected_task_ids", [])
+        affected = (
+            [
+                str(task_id).strip()
+                for task_id in raw_ids
+                if str(task_id).strip()
+            ]
+            if isinstance(raw_ids, list)
+            else []
+        )
+        task_id = str(blocker.get("task_id", "")).strip()
+        if task_id:
+            affected.insert(0, task_id)
+        return list(dict.fromkeys(affected))
+
+    @staticmethod
+    def _legacy_parallel_batch_failure(reason: str) -> bool:
+        normalized = str(reason).strip()
+        return bool(
+            normalized == _PARALLEL_BATCH_FAILURE_PREFIX
+            or normalized.startswith(f"{_PARALLEL_BATCH_FAILURE_PREFIX}: ")
+        )
+
+    @staticmethod
+    def _declares_parallel_failure_lifecycle(
+        blocker: Mapping[str, object],
+    ) -> bool:
+        if str(blocker.get("category", "")).strip() == (
+            _PARALLEL_FAILURE_LIFECYCLE_CATEGORY
+        ):
+            return True
+        diagnosis = blocker.get("root_cause_diagnosis", {})
+        diagnosis_payload = (
+            dict(diagnosis) if isinstance(diagnosis, Mapping) else {}
+        )
+        final = diagnosis_payload.get("final", {})
+        final_payload = dict(final) if isinstance(final, Mapping) else {}
+        return str(final_payload.get("category", "")).strip() == (
+            _PARALLEL_FAILURE_LIFECYCLE_CATEGORY
+        )
+
+    @classmethod
+    def _legacy_parallel_recovery_waiting(
+        cls,
+        blocker: Mapping[str, object],
+    ) -> bool:
+        if not (
+            bool(blocker.get("legacy_migration"))
+            and cls._blocker_is_parallel_failure_lifecycle(blocker)
+        ):
+            return False
+        readiness = str(blocker.get("recovery_readiness", "")).strip()
+        if readiness:
+            return readiness != "ready"
+        return bool(
+            blocker.get("missing_lane_identity")
+            or blocker.get("unresolved_task_ids")
+            or blocker.get("unreplayable_checkpoint_task_ids")
+        )
+
+    def _legacy_parallel_installed_repair_authorized(
+        self,
+        state: RunState,
+        blocker: Mapping[str, object],
+    ) -> bool:
+        """Recognize only an authorization issued by the installed verifier."""
+
+        if not (
+            bool(blocker.get("legacy_migration"))
+            and self._blocker_is_parallel_failure_lifecycle(blocker)
+        ):
+            return False
+        commit_sha = str(blocker.get("self_repair_commit", "")).strip()
+        revision = str(
+            blocker.get("installed_engine_recovery_revision", "")
+        ).strip()
+        claim_set_digest = str(
+            blocker.get("installed_engine_recovery_claim_digest", "")
+        ).strip()
+        method = str(
+            blocker.get("installed_engine_recovery_method", "")
+        ).strip()
+        if (
+            not commit_sha
+            or str(
+                blocker.get("installed_engine_recovery_commit", "")
+            ).strip()
+            != commit_sha
+            or not revision
+            or revision != self._installed_engine_revision()
+            or method not in {"commit_ancestry", "versioned_postconditions"}
+            or not claim_set_digest
+        ):
+            return False
+        raw_revisions = state.resume_context.get(
+            self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
+            {},
+        )
+        revisions = raw_revisions if isinstance(raw_revisions, dict) else {}
+        recovery_key = self._installed_self_repair_recovery_key(
+            blocker,
+            commit_sha,
+            claim_set_digest,
+        )
+        return str(revisions.get(recovery_key, "")) == revision
+
+    def _legacy_parallel_recovery_tasks(
+        self,
+        state: RunState,
+    ) -> List[TaskSpec]:
+        tasks = list(state.tasks)
+        try:
+            raw_tasks = load_task_plan(self.project_root).get("tasks", [])
+        except (KeyError, OSError, TypeError, ValueError):
+            raw_tasks = []
+        plan_tasks = (
+            [
+                TaskSpec.from_dict(item)
+                for item in raw_tasks
+                if isinstance(item, dict)
+            ]
+            if isinstance(raw_tasks, list)
+            else []
+        )
+        if not tasks:
+            return plan_tasks
+
+        plan_by_id = {task.task_id: task for task in plan_tasks}
+        for task in tasks:
+            planned = plan_by_id.get(task.task_id)
+            if (
+                planned is not None
+                and task.status not in {"blocked", "done"}
+                and planned.status in {"blocked", "done"}
+            ):
+                task.status = planned.status
+        known_ids = {task.task_id for task in tasks}
+        tasks.extend(
+            task for task in plan_tasks if task.task_id not in known_ids
+        )
+        return tasks
+
+    @staticmethod
+    def _legacy_parallel_terminal_route_task_ids(
+        state: RunState,
+    ) -> List[str]:
+        route = (
+            dict(state.last_recovery_route)
+            if isinstance(state.last_recovery_route, dict)
+            else {}
+        )
+        if str(route.get("outcome", "")).strip() not in {
+            "exhausted",
+            "judge_stopped",
+        }:
+            return []
+
+        raw_affected = route.get("affected_task_ids", [])
+        task_ids = (
+            [
+                str(task_id).strip()
+                for task_id in raw_affected
+                if str(task_id).strip()
+            ]
+            if isinstance(raw_affected, list)
+            else []
+        )
+        task_id = str(route.get("task_id", "")).strip()
+        if task_id:
+            task_ids.append(task_id)
+        if not task_ids:
+            raw_repair_ids = route.get("repair_task_ids", [])
+            if isinstance(raw_repair_ids, list):
+                task_ids.extend(
+                    str(candidate).strip()
+                    for candidate in raw_repair_ids
+                    if str(candidate).strip()
+                )
+        if not task_ids:
+            lineage_id = str(route.get("lineage_id", "")).strip()
+            if lineage_id:
+                task_ids.append(lineage_id)
+        return list(dict.fromkeys(task_ids))
+
+    def _legacy_parallel_active_task_ids(
+        self,
+        state: RunState,
+        blocker: Mapping[str, object],
+        tasks: Iterable[TaskSpec],
+    ) -> List[str]:
+        selected: List[str] = []
+        selected.extend(self._parallel_blocker_affected_task_ids(blocker))
+        for localized in state.localized_blockers:
+            if (
+                str(localized.get("source", ""))
+                != _PARALLEL_LANE_FAILURE_KIND
+                or str(localized.get("status", "")).strip()
+                in {"done", "resolved", "retired"}
+            ):
+                continue
+            selected.extend(
+                self._parallel_blocker_affected_task_ids(localized)
+            )
+        selected.extend(
+            task.task_id for task in tasks if task.status == "blocked"
+        )
+        selected.extend(
+            self._legacy_parallel_terminal_route_task_ids(state)
+        )
+        return list(
+            dict.fromkeys(task_id for task_id in selected if task_id)
+        )
+
+    def _legacy_parallel_recovery_evidence(
+        self,
+        state: RunState,
+        blocker: Mapping[str, object],
+    ) -> Dict[str, object]:
+        tasks = self._legacy_parallel_recovery_tasks(state)
+        tasks_by_id = {task.task_id: task for task in tasks}
+        selected_ids = self._legacy_parallel_active_task_ids(
+            state,
+            blocker,
+            tasks,
+        )
+        active_ids = [
+            task_id
+            for task_id in selected_ids
+            if task_id not in tasks_by_id
+            or tasks_by_id[task_id].status != "done"
+        ]
+        active_id_set = set(active_ids)
+
+        all_checkpoints: Dict[str, Dict[str, object]] = {}
+        for source in (
+            blocker.get("legacy_failure_checkpoints", {}),
+            state.task_failure_checkpoints,
+        ):
+            if not isinstance(source, Mapping):
+                continue
+            for raw_task_id, raw_checkpoint in source.items():
+                task_id = str(raw_task_id).strip()
+                if (
+                    task_id
+                    and isinstance(raw_checkpoint, Mapping)
+                    and raw_checkpoint
+                ):
+                    all_checkpoints[task_id] = dict(raw_checkpoint)
+
+        blocker_task_id = str(blocker.get("task_id", "")).strip()
+        raw_failure_checkpoint = blocker.get("failure_checkpoint", {})
+        if (
+            blocker_task_id
+            and isinstance(raw_failure_checkpoint, Mapping)
+            and raw_failure_checkpoint
+        ):
+            all_checkpoints.setdefault(
+                blocker_task_id,
+                dict(raw_failure_checkpoint),
+            )
+        raw_lane_failure = blocker.get("parallel_lane_failure", {})
+        lane_failure = (
+            dict(raw_lane_failure)
+            if isinstance(raw_lane_failure, Mapping)
+            else {}
+        )
+        lane_task = lane_failure.get("task", {})
+        lane_task_id = (
+            str(lane_task.get("task_id", "")).strip()
+            if isinstance(lane_task, Mapping)
+            else ""
+        )
+        lane_checkpoint = lane_failure.get("checkpoint", {})
+        if (
+            lane_task_id
+            and isinstance(lane_checkpoint, Mapping)
+            and lane_checkpoint
+        ):
+            all_checkpoints.setdefault(
+                lane_task_id,
+                dict(lane_checkpoint),
+            )
+
+        checkpoints = {
+            task_id: checkpoint
+            for task_id, checkpoint in all_checkpoints.items()
+            if task_id in active_id_set
+        }
+        unresolved_ids = {
+            task_id for task_id in active_ids if task_id not in tasks_by_id
+        }
+        for task_id, checkpoint in checkpoints.items():
+            checkpoint_task_id = str(
+                checkpoint.get("task_id", task_id)
+            ).strip()
+            if checkpoint_task_id not in {"", task_id}:
+                unresolved_ids.add(task_id)
+
+        unreplayable_ids: List[str] = []
+        missing_refs: List[Dict[str, str]] = []
+        for task_id in active_ids:
+            if task_id in unresolved_ids or task_id not in checkpoints:
+                continue
+            checkpoint = checkpoints[task_id]
+            if not bool(checkpoint.get("has_candidate_changes", False)):
+                continue
+            checkpoint_status = str(checkpoint.get("status", "")).strip()
+            if checkpoint_status in {
+                *_PARALLEL_UNUSABLE_CHECKPOINT_STATUSES,
+                "applied",
+            }:
+                continue
+            checkpoint_ref = str(checkpoint.get("ref", "")).strip()
+            try:
+                available = bool(
+                    checkpoint_ref
+                    and ref_exists(self.project_root, checkpoint_ref)
+                )
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                available = False
+            if available:
+                continue
+            unreplayable_ids.append(task_id)
+            missing_refs.append(
+                {"task_id": task_id, "ref": checkpoint_ref}
+            )
+
+        affected = [
+            task
+            for task in tasks
+            if task.task_id in active_id_set and task.status != "done"
+        ]
+        ordered_ids = [task.task_id for task in affected]
+        ordered_ids.extend(
+            task_id
+            for task_id in active_ids
+            if task_id not in ordered_ids
+        )
+        missing_lane_identity = not bool(ordered_ids)
+        ready = bool(affected) and not (
+            missing_lane_identity or unresolved_ids or unreplayable_ids
+        )
+        return {
+            "tasks": tasks,
+            "affected": affected,
+            "affected_task_ids": [task.task_id for task in affected],
+            "evidence_task_ids": ordered_ids,
+            "checkpoint_payloads": checkpoints,
+            "missing_lane_identity": missing_lane_identity,
+            "ready": ready,
+            "unresolved_task_ids": sorted(unresolved_ids),
+            "unreplayable_checkpoint_task_ids": unreplayable_ids,
+            "missing_checkpoint_refs": missing_refs,
+        }
+
+    def _materialize_legacy_parallel_failure_lifecycle(
+        self,
+        state: RunState,
+        blocker: Mapping[str, object],
+        original_reason: str,
+        evidence: Mapping[str, object],
+    ) -> Dict[str, object]:
+        tasks = list(evidence.get("tasks", []))
+        affected = list(evidence.get("affected", []))
+        checkpoints = dict(evidence.get("checkpoint_payloads", {}))
+        previous = dict(blocker)
+        installed_repair_authorized = (
+            self._legacy_parallel_installed_repair_authorized(
+                state,
+                previous,
+            )
+        )
+        previous_lanes = {
+            str(item.get("task_id", "")): dict(item)
+            for item in state.localized_blockers
+            if str(item.get("source", "")) == _PARALLEL_LANE_FAILURE_KIND
+        }
+        state.localized_blockers = [
+            dict(item)
+            for item in state.localized_blockers
+            if not (
+                str(item.get("source", "")) == _PARALLEL_LANE_FAILURE_KIND
+                and bool(item.get("legacy_migration"))
+            )
+        ]
+        state.tasks = tasks
+        migrations: List[Dict[str, object]] = []
+        for task in affected:
+            task.status = "blocked"
+            checkpoint = dict(checkpoints.get(task.task_id, {}))
+            failure = ParallelLaneFailure(
+                task=task.to_dict(),
+                operation=str(
+                    checkpoint.get(
+                        "failed_operation",
+                        checkpoint.get("operation", "legacy_parallel_batch"),
+                    )
+                ),
+                owner="auto_agents",
+                automatic_retryable=False,
+                resumable=True,
+                reason=original_reason,
+                redacted_evidence=original_reason,
+                current_failure_ids=list(
+                    checkpoint.get("current_failure_ids", []) or []
+                ),
+                baseline_failure_ids=list(
+                    checkpoint.get(
+                        "baseline_failure_ids",
+                        task.verify_baseline_failures,
+                    )
+                    or []
+                ),
+                new_failure_ids=list(
+                    checkpoint.get("new_failure_ids", []) or []
+                ),
+                owned_failure_ids=list(
+                    checkpoint.get("owned_failure_ids", []) or []
+                ),
+                failure_class=str(checkpoint.get("failure_class", "")),
+                baseline_comparison_comparable=bool(
+                    checkpoint.get(
+                        "baseline_comparison_comparable",
+                        checkpoint.get("comparable_failures", True),
+                    )
+                ),
+                base_ref=str(checkpoint.get("base_ref", "")),
+                checkpoint=checkpoint,
+                implementation_completed=bool(
+                    checkpoint.get("implementation_completed", False)
+                ),
+            )
+            lane_blocker = self._upsert_parallel_lane_blocker(
+                state,
+                task,
+                failure,
+            )
+            prior_lane = previous_lanes.get(task.task_id, {})
+            if prior_lane:
+                lane_blocker["occurrence_count"] = int(
+                    prior_lane.get("occurrence_count", 1) or 1
+                )
+                lane_blocker["resume_attempts"] = int(
+                    prior_lane.get("resume_attempts", 0) or 0
+                )
+            lane_blocker.update(
+                {
+                    "category": _PARALLEL_FAILURE_LIFECYCLE_CATEGORY,
+                    "legacy_migration": True,
+                    "legacy_last_error": original_reason,
+                }
+            )
+            state.localized_blockers = [
+                (
+                    dict(lane_blocker)
+                    if str(item.get("source", ""))
+                    == _PARALLEL_LANE_FAILURE_KIND
+                    and str(item.get("task_id", "")) == task.task_id
+                    else dict(item)
+                )
+                for item in state.localized_blockers
+            ]
+            migrations.append(
+                {
+                    "task_id": task.task_id,
+                    "fingerprint": lane_blocker["fingerprint"],
+                }
+            )
+
+        if affected or self._parallel_lane_blockers(state):
+            self._refresh_parallel_lane_blocker_state(state, tasks)
+        fresh = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        active = {**fresh, **previous}
+        if not str(active.get("fingerprint", "")).strip():
+            active["fingerprint"] = hashlib.sha256(
+                json.dumps(
+                    {
+                        "reason": original_reason,
+                        "task_ids": evidence.get("evidence_task_ids", []),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+        repair_root_category = str(
+            previous.get(
+                "repair_root_category",
+                active.get("category", _PARALLEL_FAILURE_LIFECYCLE_CATEGORY),
+            )
+        ).strip() or _PARALLEL_FAILURE_LIFECYCLE_CATEGORY
+        repair_root_fingerprint = str(
+            previous.get(
+                "repair_root_fingerprint",
+                active.get("fingerprint", ""),
+            )
+        ).strip()
+        active.setdefault("occurrence_count", 1)
+        active.setdefault("resume_attempts", 0)
+
+        ready = bool(evidence.get("ready", False))
+        recovery_condition = {
+            "schema_version": 1,
+            "kind": "restore_legacy_parallel_recovery_evidence",
+            "status": "satisfied" if ready else "waiting",
+            "missing_lane_identity": bool(
+                evidence.get("missing_lane_identity", False)
+            ),
+            "missing_task_ids": list(
+                evidence.get("unresolved_task_ids", [])
+            ),
+            "missing_checkpoint_refs": list(
+                evidence.get("missing_checkpoint_refs", [])
+            ),
+            "action": (
+                "restore missing task ownership or referenced checkpoint "
+                "objects, then resume the run"
+            ),
+            "checked_at": utc_now_iso(),
+        }
+        active.update(
+            {
+                "schema_version": 1,
+                "source": _PARALLEL_LANE_FAILURE_KIND,
+                "owner": "auto_agents",
+                "category": _PARALLEL_FAILURE_LIFECYCLE_CATEGORY,
+                "reason": original_reason,
+                "scope": "task_lineages" if ready else "run",
+                "automatic_retryable": False,
+                "resumable": True,
+                "resume_mode": (
+                    "selective_lane_resume"
+                    if ready
+                    else "legacy_evidence_reconciliation"
+                ),
+                "affected_task_ids": list(
+                    evidence.get("evidence_task_ids", [])
+                ),
+                "missing_lane_identity": bool(
+                    evidence.get("missing_lane_identity", False)
+                ),
+                "unresolved_task_ids": list(
+                    evidence.get("unresolved_task_ids", [])
+                ),
+                "unreplayable_checkpoint_task_ids": list(
+                    evidence.get("unreplayable_checkpoint_task_ids", [])
+                ),
+                "legacy_failure_checkpoints": {
+                    task_id: dict(checkpoint)
+                    for task_id, checkpoint in sorted(checkpoints.items())
+                },
+                "legacy_migration": True,
+                "legacy_last_error": original_reason,
+                "recovery_readiness": "ready" if ready else "awaiting_evidence",
+                "recovery_condition": recovery_condition,
+                "legacy_lane_migrations": migrations,
+                "updated_at": utc_now_iso(),
+            }
+        )
+        if ready:
+            active.pop("recovery_error", None)
+        else:
+            active["recovery_error"] = (
+                "legacy parallel lane ownership or candidate checkpoint is "
+                "not currently available"
+            )
+        commit_sha = str(active.get("self_repair_commit", "")).strip()
+        if not ready and commit_sha:
+            recovery_identity = {
+                "commit": commit_sha,
+                "missing_lane_identity": bool(
+                    evidence.get("missing_lane_identity", False)
+                ),
+                "missing_task_ids": list(
+                    evidence.get("unresolved_task_ids", [])
+                ),
+                "missing_checkpoint_refs": list(
+                    evidence.get("missing_checkpoint_refs", [])
+                ),
+                "root_category": repair_root_category,
+                "root_fingerprint": repair_root_fingerprint,
+            }
+            active.update(
+                {
+                    "category": _PARALLEL_REPAIR_EVIDENCE_CATEGORY,
+                    "fingerprint": hashlib.sha256(
+                        json.dumps(
+                            recovery_identity,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ).encode("utf-8")
+                    ).hexdigest()[:24],
+                    "repair_root_category": repair_root_category,
+                    "repair_root_fingerprint": repair_root_fingerprint,
+                    "installed_repair_authorization": {
+                        "status": "awaiting_evidence",
+                        "commit": commit_sha,
+                        "updated_at": utc_now_iso(),
+                    },
+                }
+            )
+        elif commit_sha:
+            active["category"] = repair_root_category
+            if repair_root_fingerprint:
+                active["fingerprint"] = repair_root_fingerprint
+            active["repair_root_category"] = repair_root_category
+            active["repair_root_fingerprint"] = repair_root_fingerprint
+            active["installed_repair_authorization"] = {
+                "status": (
+                    "verified"
+                    if installed_repair_authorized
+                    else "awaiting_installed_verification"
+                ),
+                "commit": commit_sha,
+                "updated_at": utc_now_iso(),
+            }
+        if ready and installed_repair_authorized:
+            active["status"] = "retrying"
+            state.status = "pending"
+            state.last_error = ""
+        else:
+            active["status"] = "blocked"
+            state.status = "blocked"
+            state.last_error = original_reason
+        state.active_blocker = active
+        if tasks:
+            self._persist_tasks(tasks)
+        return active
+
+    def _normalize_legacy_parallel_failure_lifecycle(
+        self,
+        state: RunState,
+    ) -> bool:
+        if (
+            state.current_stage != "implement"
+            or state.status != "failed"
+            or bool(state.active_blocker)
+            or bool(state.active_execution_incident_id)
+        ):
+            return False
+        original_reason = str(state.last_error).strip()
+        if not self._legacy_parallel_batch_failure(original_reason):
+            return False
+        evidence = self._legacy_parallel_recovery_evidence(state, {})
+        blocker = self._materialize_legacy_parallel_failure_lifecycle(
+            state,
+            {},
+            original_reason,
+            evidence,
+        )
+        history = state.resume_context.get(
+            _PARALLEL_LANE_RECOVERY_HISTORY_CONTEXT,
+            [],
+        )
+        normalized_history = (
+            [dict(item) for item in history if isinstance(item, dict)]
+            if isinstance(history, list)
+            else []
+        )
+        normalized_history.append(
+            {
+                "event": "legacy_parallel_failure_migrated",
+                "task_ids": list(blocker.get("affected_task_ids", [])),
+                "recovery_readiness": str(
+                    blocker.get("recovery_readiness", "")
+                ),
+                "updated_at": utc_now_iso(),
+            }
+        )
+        state.resume_context[_PARALLEL_LANE_RECOVERY_HISTORY_CONTEXT] = (
+            normalized_history[-20:]
+        )
+        return True
+
+    def _reconcile_legacy_parallel_failure_lifecycle(
+        self,
+        state: RunState,
+    ) -> bool:
+        if self._normalize_legacy_parallel_failure_lifecycle(state):
+            return True
+        blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        if (
+            state.current_stage != "implement"
+            or state.status not in {"failed", "blocked", "pending"}
+            or bool(state.active_execution_incident_id)
+            or not (
+                bool(blocker.get("legacy_migration"))
+                or self._declares_parallel_failure_lifecycle(blocker)
+            )
+        ):
+            return False
+        original_reason = str(
+            blocker.get(
+                "legacy_last_error",
+                state.last_error or blocker.get("reason", ""),
+            )
+        ).strip()
+        if not original_reason:
+            original_reason = (
+                "legacy parallel failure requires structured recovery"
+            )
+        previous_readiness = str(
+            blocker.get("recovery_readiness", "")
+        ).strip()
+        evidence = self._legacy_parallel_recovery_evidence(state, blocker)
+        refreshed = self._materialize_legacy_parallel_failure_lifecycle(
+            state,
+            blocker,
+            original_reason,
+            evidence,
+        )
+        next_readiness = str(
+            refreshed.get("recovery_readiness", "")
+        ).strip()
+        if previous_readiness != next_readiness:
+            history = state.resume_context.get(
+                _PARALLEL_LANE_RECOVERY_HISTORY_CONTEXT,
+                [],
+            )
+            normalized_history = (
+                [dict(item) for item in history if isinstance(item, dict)]
+                if isinstance(history, list)
+                else []
+            )
+            normalized_history.append(
+                {
+                    "event": "legacy_parallel_recovery_evidence_changed",
+                    "previous_readiness": previous_readiness,
+                    "recovery_readiness": next_readiness,
+                    "task_ids": list(
+                        refreshed.get("affected_task_ids", [])
+                    ),
+                    "updated_at": utc_now_iso(),
+                }
+            )
+            state.resume_context[_PARALLEL_LANE_RECOVERY_HISTORY_CONTEXT] = (
+                normalized_history[-20:]
+            )
+        return True
+
+    def _prepare_parallel_lane_blocker_resume(
+        self,
+        state: RunState,
+        blocker: Dict[str, object],
+    ) -> List[str]:
+        if str(blocker.get("source", "")) != _PARALLEL_LANE_FAILURE_KIND:
+            return []
+        if (
+            str(blocker.get("owner", "")) == "auto_agents"
+            and bool(blocker.get("legacy_migration"))
+        ):
+            return []
+        if (
+            str(blocker.get("owner", "")) == "auto_agents"
+            and not str(blocker.get("self_repair_commit", "")).strip()
+        ):
+            return []
+        affected_ids = self._parallel_blocker_affected_task_ids(blocker)
+        if not affected_ids:
+            return []
+        tasks_by_id = {task.task_id: task for task in state.tasks}
+        resumed: List[str] = []
+        for task_id in affected_ids:
+            task = tasks_by_id.get(task_id)
+            if task is None or task.status == "done":
+                continue
+            task.status = "pending"
+            task.commit_sha = ""
+            checkpoint = state.task_failure_checkpoints.get(task_id, {})
+            if not checkpoint and isinstance(
+                blocker.get("failure_checkpoint", {}), Mapping
+            ):
+                checkpoint = dict(blocker["failure_checkpoint"])
+                state.task_failure_checkpoints[task_id] = checkpoint
+            resume_mode = str(blocker.get("resume_mode", "")).strip()
+            if str(checkpoint.get("status", "")) in (
+                _PARALLEL_UNUSABLE_CHECKPOINT_STATUSES
+            ):
+                resume_mode = "implementation"
+            if resume_mode == "gate_recheck":
+                self._set_parallel_lane_gate_recheck(
+                    state,
+                    task_id,
+                    {
+                        "schema_version": 1,
+                        "fingerprint": str(blocker.get("fingerprint", "")),
+                        "incident_id": str(blocker.get("incident_id", "")),
+                        "checkpoint_ref": str(checkpoint.get("ref", "")),
+                        "updated_at": utc_now_iso(),
+                    },
+                )
+            else:
+                self._set_parallel_lane_gate_recheck(state, task_id, None)
+                self._clear_implementation_ready_marker(state, task)
+            self._set_parallel_lane_recovery_task(
+                state,
+                task_id,
+                {
+                    "schema_version": 1,
+                    "mode": resume_mode or "implementation",
+                    "fingerprint": str(blocker.get("fingerprint", "")),
+                    "incident_id": str(blocker.get("incident_id", "")),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+            state.task_review_cache.pop(task_id, None)
+            resumed.append(task_id)
+        if not resumed:
+            return []
+        retry_ids = self._parallel_sequential_retry_ids(state)
+        self._set_parallel_sequential_retry_ids(
+            state,
+            [*resumed, *retry_ids],
+            capture_retained_ownership=False,
+        )
+        blocker["status"] = "retrying"
+        blocker["affected_task_ids"] = resumed
+        blocker["updated_at"] = utc_now_iso()
+        state.localized_blockers = [
+            (
+                dict(blocker)
+                if str(item.get("source", ""))
+                == _PARALLEL_LANE_FAILURE_KIND
+                and str(item.get("task_id", ""))
+                == str(blocker.get("task_id", ""))
+                else dict(item)
+            )
+            for item in state.localized_blockers
+        ]
+        state.active_blocker = blocker
+        state.tasks = list(tasks_by_id.values())
+        self._persist_tasks(state.tasks)
+        return resumed
+
+    @staticmethod
+    def _parallel_lane_gate_only_requeue(
+        state: RunState,
+        task: TaskSpec,
+    ) -> bool:
+        checkpoint = state.task_failure_checkpoints.get(task.task_id, {})
+        if str(checkpoint.get("status", "")) in (
+            _PARALLEL_UNUSABLE_CHECKPOINT_STATUSES
+        ):
+            return False
+        if str(checkpoint.get("resume_mode", "")) == "gate_recheck":
+            return True
+        if bool(checkpoint.get("implementation_completed", False)):
+            return True
+        latest_failure = next(
+            (
+                entry
+                for entry in reversed(task.verify_history)
+                if isinstance(entry, dict)
+                and str(entry.get("decision", "")) == "fail"
+            ),
+            {},
+        )
+        current = {
+            str(item).strip()
+            for item in latest_failure.get(
+                "current_failure_ids",
+                latest_failure.get("failure_ids", []),
+            )
+            or []
+            if str(item).strip()
+        }
+        baseline = {
+            str(item).strip()
+            for item in latest_failure.get(
+                "baseline_failure_ids",
+                task.verify_baseline_failures,
+            )
+            or []
+            if str(item).strip()
+        }
+        return bool(
+            latest_failure
+            and bool(latest_failure.get("comparable_failures", True))
+            and current
+            and current == baseline
+        )
+
+    def _retire_parallel_self_repair_blocker(
+        self,
+        state: RunState,
+        blocker: Mapping[str, object],
+    ) -> None:
+        history = state.resume_context.get(
+            _PARALLEL_LANE_RECOVERY_HISTORY_CONTEXT,
+            [],
+        )
+        normalized = (
+            [dict(item) for item in history if isinstance(item, dict)]
+            if isinstance(history, list)
+            else []
+        )
+        retired = {
+            "event": "self_repair_blocker_retired",
+            "owner": str(blocker.get("owner", "")),
+            "category": str(blocker.get("category", "")),
+            "fingerprint": str(blocker.get("fingerprint", "")),
+            "self_repair_commit": str(blocker.get("self_repair_commit", "")),
+            "requeue_checkpoint": dict(
+                blocker.get("parallel_lane_requeue_checkpoint", {})
+            ),
+            "retired_at": utc_now_iso(),
+        }
+        if bool(blocker.get("legacy_migration")):
+            retired["legacy_migration"] = True
+            retired["legacy_last_error"] = str(
+                blocker.get("legacy_last_error", blocker.get("reason", ""))
+            )
+        normalized.append(retired)
+        state.resume_context[_PARALLEL_LANE_RECOVERY_HISTORY_CONTEXT] = (
+            normalized[-20:]
+        )
+        state.active_blocker = {}
+        state.status = "pending"
+        state.last_error = ""
+
     def _resume_blocked_run(self, state: RunState) -> bool:
+        legacy_before_reconcile = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        if self._reconcile_legacy_parallel_failure_lifecycle(state):
+            save_run_state(self.project_root, state)
+        legacy_blocker = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            else {}
+        )
+        legacy_evidence_handoff = bool(
+            state.status == "blocked"
+            and str(legacy_blocker.get("category", ""))
+            == _PARALLEL_REPAIR_EVIDENCE_CATEGORY
+            and str(legacy_blocker.get("self_repair_commit", "")).strip()
+            and self._legacy_parallel_recovery_waiting(legacy_blocker)
+            and (
+                str(legacy_before_reconcile.get("category", ""))
+                != str(legacy_blocker.get("category", ""))
+                or str(legacy_before_reconcile.get("fingerprint", ""))
+                != str(legacy_blocker.get("fingerprint", ""))
+            )
+        )
+        if (
+            state.status == "blocked"
+            and bool(legacy_blocker.get("legacy_migration"))
+            and self._blocker_is_parallel_failure_lifecycle(legacy_blocker)
+            and str(legacy_blocker.get("self_repair_commit", "")).strip()
+            and not self._legacy_parallel_recovery_waiting(legacy_blocker)
+            and self._prepare_installed_self_repair_resume(state)
+        ):
+            save_run_state(self.project_root, state)
         active_incident = self._incident_store(state).active(state)
         if (
             active_incident is not None
@@ -12690,6 +14006,12 @@ class Orchestrator:
             if isinstance(state.active_blocker, dict)
             else persisted_blocker
         )
+        legacy_parallel_repair = bool(
+            persisted_blocker.get("legacy_migration")
+            and self._blocker_is_parallel_failure_lifecycle(
+                persisted_blocker
+            )
+        )
         self_repair_resume = bool(
             state.status == "pending"
             and str(persisted_blocker.get("owner", "")) == "auto_agents"
@@ -12697,6 +14019,13 @@ class Orchestrator:
             and str(persisted_blocker.get("self_repair_commit", "")).strip()
             and str(persisted_blocker.get("prepared_self_repair_commit", "")).strip()
             != str(persisted_blocker.get("self_repair_commit", "")).strip()
+            and (
+                not legacy_parallel_repair
+                or self._legacy_parallel_installed_repair_authorized(
+                    state,
+                    persisted_blocker,
+                )
+            )
         )
         if (
             state.status != "blocked"
@@ -12795,6 +14124,27 @@ class Orchestrator:
                 "[self-repair] restored interrupted retry ownership tasks=%s",
                 ",".join(restored_retry_ids),
             )
+        parallel_lane_resume_ids: List[str] = []
+        if (
+            str(blocker.get("source", "")) == _PARALLEL_LANE_FAILURE_KIND
+            and not bool(blocker.get("resumable", True))
+        ):
+            blocker["status"] = "blocked"
+            blocker["updated_at"] = utc_now_iso()
+            state.active_blocker = blocker
+            state.status = "blocked"
+            state.last_error = str(blocker.get("reason", ""))
+            return False
+        if not self_repair_resume:
+            parallel_lane_resume_ids = self._prepare_parallel_lane_blocker_resume(
+                state,
+                blocker,
+            )
+            if parallel_lane_resume_ids:
+                self.logger.info(
+                    "[parallel-tasks] resumed affected lane tasks=%s",
+                    ",".join(parallel_lane_resume_ids),
+                )
         if (
             str(terminal_route.get("outcome", "")) == "judge_stopped"
             and terminal_task is not None
@@ -12811,6 +14161,17 @@ class Orchestrator:
                 if isinstance(state.active_blocker, dict):
                     blocker = {**blocker, **dict(state.active_blocker)}
         if (
+            bool(blocker.get("legacy_migration"))
+            and str(blocker.get("owner", "")) == "auto_agents"
+            and state.status == "blocked"
+            and str(blocker.get("status", "blocked")) != "retrying"
+        ):
+            blocker["status"] = "blocked"
+            blocker["updated_at"] = utc_now_iso()
+            state.active_blocker = blocker
+            state.last_error = str(blocker.get("reason", ""))
+            return legacy_evidence_handoff
+        if (
             str(blocker.get("owner", "")) == "auto_agents"
             and str(blocker.get("status", "blocked")) != "retrying"
             and (had_persisted_blocker or legacy_self_repair_incident)
@@ -12826,6 +14187,28 @@ class Orchestrator:
                 state,
                 blocker,
             )
+            if legacy_parallel_repair and not requeued_task_ids:
+                blocker.pop("prepared_self_repair_commit", None)
+                blocker.pop("parallel_lane_requeue_checkpoint", None)
+                blocker["status"] = "blocked"
+                blocker["resume_error"] = (
+                    "installed repair was verified, but no affected parallel "
+                    "lane could be requeued"
+                )
+                blocker["installed_repair_authorization"] = {
+                    "status": "verified_requeue_blocked",
+                    "commit": str(
+                        blocker.get("self_repair_commit", "")
+                    ).strip(),
+                    "updated_at": utc_now_iso(),
+                }
+                blocker["updated_at"] = utc_now_iso()
+                state.active_blocker = blocker
+                state.status = "blocked"
+                state.last_error = str(
+                    blocker.get("reason", blocker["resume_error"])
+                )
+                return False
             if state.status == "blocked":
                 return False
             if requeued_task_ids:
@@ -12833,6 +14216,9 @@ class Orchestrator:
                     "[self-repair] requeued tasks=%s with fresh verification retry lifecycle",
                     ",".join(requeued_task_ids),
                 )
+            if blocker.get("parallel_lane_requeue_checkpoint"):
+                self._retire_parallel_self_repair_blocker(state, blocker)
+                return True
             if self._restore_unchanged_terminal_recovery_blocker(
                 state,
                 state.tasks,
@@ -16146,6 +17532,12 @@ class Orchestrator:
         tasks = self._load_implementation_tasks(state)
         state.current_stage = "implement"
         state.tasks = tasks
+        if self._checkpoint_ownership_barrier(
+            state,
+            tasks,
+            allow_owner_execution=False,
+        ):
+            return state
         restored_persisted_owner_ids = (
             self._restore_persisted_evidence_repair_ownership(
                 state,
@@ -16404,6 +17796,8 @@ class Orchestrator:
     ) -> RunState:
         processed = 0
         while True:
+            if self._checkpoint_ownership_barrier(state, tasks):
+                return state
             # Task-plan synchronization can reload TaskSpec objects while this
             # loop is running.  Keep only stable IDs in the ordering and resolve
             # them against the current canonical list on every iteration.
@@ -16813,6 +18207,22 @@ class Orchestrator:
     ) -> RunState:
         processed = 0
         while True:
+            if self._checkpoint_ownership_barrier(state, tasks):
+                return state
+            if self._active_checkpoint_ownership_records(state):
+                self.logger.info(
+                    "[checkpoint-ownership] forcing applied owner through "
+                    "the sequential retry lane"
+                )
+                return self._run_sequential_implementation_loop(
+                    state,
+                    tasks,
+                    (
+                        None
+                        if max_tasks is None
+                        else max(0, max_tasks - processed)
+                    ),
+                )
             localized_blocked_ids = {
                 str(item.get("task_id", "")).strip()
                 for item in state.localized_blockers
@@ -16876,10 +18286,19 @@ class Orchestrator:
         current_workers = self._parallel_worker_count()
         self._log_parallel_worker_resolution(current_workers)
         while True:
+            if self._checkpoint_ownership_barrier(state, tasks):
+                return state
+            localized_blocked_ids = {
+                str(item.get("task_id", "")).strip()
+                for item in state.localized_blockers
+                if str(item.get("task_id", "")).strip()
+            }
             if not self._has_task_budget(max_tasks, processed):
                 self._task_budget_exhausted = True
                 break
             pending_outcome = self._process_next_parallel_pending_integration(state, tasks)
+            if pending_outcome == "blocked":
+                return state
             if pending_outcome == "integrated":
                 processed += 1
                 self._consume_task_budget()
@@ -16969,6 +18388,7 @@ class Orchestrator:
                             matching.get("reason", state.last_error)
                         )
                     state.tasks = tasks
+                    self._persist_parallel_runtime_state(state, tasks)
                     return state
                 break
             remaining = self._remaining_task_budget(max_tasks, processed, len(ready))
@@ -17011,6 +18431,12 @@ class Orchestrator:
                 current_workers = self._parallel_worker_count()
                 continue
 
+            if self._checkpoint_ownership_barrier(
+                state,
+                tasks,
+                allow_owner_execution=False,
+            ):
+                return state
             self._require_clean_tree_excluding_agent_instructions()
             deferred = self._deferred_parallel_task_reasons(tasks)
             self.logger.info(
@@ -17039,6 +18465,12 @@ class Orchestrator:
             batch_integrated = 0
             batch_deferred = 0
             for task in batch:
+                if self._checkpoint_ownership_barrier(
+                    state,
+                    tasks,
+                    allow_owner_execution=False,
+                ):
+                    return state
                 result = results[task.task_id]
                 merged_baselines = self._merge_parallel_retained_verify_baselines(
                     state,
@@ -17116,6 +18548,11 @@ class Orchestrator:
                 self._record_parallel_task_paths(state, task, result_changed_paths)
                 self._delete_parallel_result_ref(str(result.get("result_ref", "")))
                 self._clear_task_failure_checkpoint(state, task.task_id)
+                self._resolve_parallel_lane_recovery_for_task(
+                    state,
+                    tasks,
+                    task,
+                )
                 self._increment_parallel_metrics(state, integrated=1)
                 batch_integrated += 1
                 for command in self._build_task_verify_commands(task):
@@ -17171,26 +18608,51 @@ class Orchestrator:
                     current_workers,
                     str(result["reason"])[:200],
                 )
-            elif failed_results:
-                scheduled_recovery = False
+            if failed_results:
+                # Make the complete batch durable before incident diagnosis can
+                # add recovery tasks or blockers in the parent worktree.
+                self._persist_parallel_runtime_state(state, tasks)
+                unrouted_failures: List[
+                    Tuple[TaskSpec, Dict[str, object]]
+                ] = []
                 for failed_task, result in failed_results:
+                    lane_failure = self._parallel_lane_failure_from_result(
+                        failed_task,
+                        result,
+                    )
+                    if (
+                        lane_failure.command_incident
+                        or lane_failure.failure_class == "baseline_only_owned"
+                        or lane_failure.owner == "auto_agents"
+                        or not lane_failure.automatic_retryable
+                    ):
+                        # Typed engine failures, command incidents, and unchanged
+                        # owned baselines must not consume a target-candidate round.
+                        unrouted_failures.append((failed_task, result))
+                        continue
                     if self._schedule_repair_tasks_for_failure(state, tasks, failed_task, result):
-                        scheduled_recovery = True
+                        continue
                     else:
                         self._ensure_review_recovery_route_recorded(
                             state,
                             failed_task,
                             result,
                         )
-                if scheduled_recovery:
-                    if state.current_stage != "implement":
-                        return state
-                    continue
-                self._persist_tasks(tasks)
-                for failed_task, result in failed_results:
-                    self._emit_task_blocked(failed_task, str(result["reason"]))
-                raise RuntimeError(self._format_parallel_batch_failure_error(failed_results))
-            else:
+                        unrouted_failures.append((failed_task, result))
+                if unrouted_failures:
+                    self._persist_parallel_lane_failures(
+                        state,
+                        tasks,
+                        unrouted_failures,
+                    )
+                else:
+                    self._persist_parallel_runtime_state(state, tasks)
+                if state.current_stage != "implement":
+                    return state
+                if state.status in {"blocked", "waiting_user", "paused"}:
+                    return state
+                continue
+            if provider_pressure_result is None:
                 if batch_deferred:
                     current_workers = self._record_parallel_inefficiency(
                         current_workers,
@@ -17208,10 +18670,103 @@ class Orchestrator:
                     "[parallel-tasks] cooldown scheduler remains active with workers=1"
                 )
 
+        if self._refresh_parallel_lane_blocker_state(state, tasks):
+            self._persist_parallel_runtime_state(state, tasks)
+            return state
         state.tasks = tasks
         state.current_stage = "implement"
         state.stage_summaries["implement"] = f"Completed {sum(task.status == 'done' for task in tasks)} tasks."
         state.last_error = ""
+        return state
+
+    def _persist_resumed_parallel_gate_error(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        error: GateCommandExecutionError,
+        *,
+        implementation_completed: bool,
+    ) -> RunState:
+        command_result = error.result
+        evidence = self._redacted_verification_command_evidence(
+            "\n".join(
+                section
+                for section in (
+                    (
+                        f"$ {command_result.command}"
+                        if command_result is not None
+                        and command_result.command
+                        else ""
+                    ),
+                    command_result.stdout if command_result is not None else "",
+                    command_result.stderr if command_result is not None else "",
+                )
+                if section
+            )
+            or str(error)
+        )
+        gate_result: Dict[str, object] = {
+            "ok": False,
+            "reason": str(error),
+            "review": str(error),
+            "failure_ids": [],
+            "current_failure_ids": [],
+            "baseline_failure_ids": list(task.verify_baseline_failures),
+            "new_failure_ids": [],
+            "owned_failure_ids": [],
+            "failure_class": "execution_incident",
+            "comparable_failures": False,
+            "baseline_comparison_comparable": False,
+            "redacted_command_evidence": evidence,
+        }
+        checkpoint = state.task_failure_checkpoints.get(task.task_id, {})
+        if str(checkpoint.get("status", "")) in (
+            _PARALLEL_UNUSABLE_CHECKPOINT_STATUSES
+        ):
+            implementation_completed = False
+        owner = "unknown"
+        if isinstance(error, GateCommandInfrastructureError) or bool(
+            command_result is not None and command_result.infrastructure_error
+        ):
+            owner = "verification_infrastructure"
+        elif isinstance(error, GateCommandBaselineIdentityError):
+            owner = "auto_agents"
+        task.status = "blocked"
+        task.review_summary = str(error)
+        result = self._parallel_task_failure_result(
+            task,
+            gate_result,
+            operation=(
+                "baseline_verification" if error.baseline else "verification"
+            ),
+            owner=owner,
+            automatic_retryable=True,
+            resumable=not bool(
+                command_result is not None
+                and command_result.cleanup_incomplete
+            ),
+            base_ref=head_ref(self.project_root) or "HEAD",
+            checkpoint=checkpoint,
+            command_incident=(
+                {
+                    "context": error.context or "verification",
+                    "baseline": bool(error.baseline),
+                    "task_id": error.task_id or task.task_id,
+                    "result": self._parallel_command_result_snapshot(
+                        command_result
+                    ),
+                }
+                if command_result is not None
+                else {}
+            ),
+            implementation_completed=implementation_completed,
+        )
+        self._persist_parallel_lane_failures(
+            state,
+            tasks,
+            [(task, result)],
+        )
         return state
 
     def _execute_task_in_main_worktree(
@@ -17220,6 +18775,13 @@ class Orchestrator:
         tasks: List[TaskSpec],
         task: TaskSpec,
     ) -> Optional[RunState]:
+        if self._checkpoint_ownership_barrier(
+            state,
+            tasks,
+            intended_task_id=task.task_id,
+            allow_owner_execution=False,
+        ):
+            return state
         prerequisite_route = self._route_frontend_design_contract_prerequisite(
             state, tasks, task
         )
@@ -17227,6 +18789,14 @@ class Orchestrator:
             return prerequisite_route
 
         visual_gate_recheck = self._task_is_blocked_by_visual_judge(task)
+        parallel_lane_recovery = self._parallel_lane_task_is_recovering(
+            state,
+            task,
+        )
+        parallel_gate_recheck = self._parallel_lane_gate_recheck_pending(
+            state,
+            task,
+        )
         if self._is_terminal_review_rejected_task(state, task):
             if self._schedule_repair_tasks_for_failure(
                 state,
@@ -17348,10 +18918,21 @@ class Orchestrator:
             self._persist_tasks(tasks)
 
         if not self._is_prebaseline_recovery_task(task):
-            baseline_changed = self._ensure_task_verify_baseline(
-                task,
-                state=state,
-            )
+            try:
+                baseline_changed = self._ensure_task_verify_baseline(
+                    task,
+                    state=state,
+                )
+            except GateCommandExecutionError as error:
+                if not parallel_lane_recovery:
+                    raise
+                return self._persist_resumed_parallel_gate_error(
+                    state,
+                    tasks,
+                    task,
+                    error,
+                    implementation_completed=False,
+                )
             if baseline_changed:
                 self._persist_tasks(tasks)
             if state.status == "blocked" or task.status == "blocked":
@@ -17367,6 +18948,17 @@ class Orchestrator:
         )
         if restored_checkpoint_ref:
             resume_existing = True
+        checkpoint_status = str(
+            state.task_failure_checkpoints.get(task.task_id, {}).get(
+                "status",
+                "",
+            )
+        )
+        if checkpoint_status in _PARALLEL_UNUSABLE_CHECKPOINT_STATUSES:
+            resume_existing = False
+            parallel_gate_recheck = False
+            self._set_parallel_lane_gate_recheck(state, task.task_id, None)
+            self._clear_implementation_ready_marker(state, task)
 
         self._set_task_attempt_base_ref(
             state,
@@ -17374,12 +18966,28 @@ class Orchestrator:
             head_ref(self.project_root) or "HEAD",
         )
 
-        gate_result = self._execute_task_with_retries(
-            state,
-            task,
-            resume_existing=resume_existing,
-            gate_recheck_first=visual_gate_recheck,
-        )
+        try:
+            gate_result = self._execute_task_with_retries(
+                state,
+                task,
+                resume_existing=resume_existing,
+                gate_recheck_first=(
+                    visual_gate_recheck or parallel_gate_recheck
+                ),
+            )
+        except GateCommandExecutionError as error:
+            if not parallel_lane_recovery:
+                raise
+            return self._persist_resumed_parallel_gate_error(
+                state,
+                tasks,
+                task,
+                error,
+                implementation_completed=bool(
+                    self._implementation_ready_markers(state).get(task.task_id)
+                    or parallel_gate_recheck
+                ),
+            )
         if not gate_result["ok"]:
             rewind_stage = str(gate_result.get("rewind_to_stage", "")).strip()
             if rewind_stage:
@@ -17406,11 +19014,72 @@ class Orchestrator:
                 )
                 if rewind_state is not None:
                     return rewind_state
-            if self._schedule_repair_tasks_for_failure(state, tasks, task, gate_result):
-                return state
-            self._ensure_review_recovery_route_recorded(state, task, gate_result)
+            diagnose_parallel_failure = bool(
+                parallel_lane_recovery
+                and str(gate_result.get("failure_class", ""))
+                == "baseline_only_owned"
+            )
+            if not diagnose_parallel_failure:
+                if self._schedule_repair_tasks_for_failure(
+                    state,
+                    tasks,
+                    task,
+                    gate_result,
+                ):
+                    if state.status in {
+                        "blocked",
+                        "paused",
+                        "waiting_user",
+                    } or task.status in {"blocked", "waiting_user"}:
+                        self._detach_task_failure_checkpoint(
+                            state,
+                            task.task_id,
+                        )
+                    return state
+                self._ensure_review_recovery_route_recorded(
+                    state,
+                    task,
+                    gate_result,
+                )
             task.status = "blocked"
             task.review_summary = str(gate_result["review"])
+            if parallel_lane_recovery:
+                checkpoint = state.task_failure_checkpoints.get(
+                    task.task_id,
+                    {},
+                )
+                implementation_completed = bool(
+                    self._implementation_ready_markers(state).get(task.task_id)
+                    or parallel_gate_recheck
+                )
+                if str(checkpoint.get("status", "")) in (
+                    _PARALLEL_UNUSABLE_CHECKPOINT_STATUSES
+                ):
+                    implementation_completed = False
+                result = self._parallel_task_failure_result(
+                    task,
+                    gate_result,
+                    operation=(
+                        "verification"
+                        if implementation_completed
+                        else "implementation"
+                    ),
+                    automatic_retryable=False,
+                    resumable=True,
+                    base_ref=head_ref(self.project_root) or "HEAD",
+                    checkpoint=checkpoint,
+                    implementation_completed=implementation_completed,
+                )
+                self._persist_parallel_lane_failures(
+                    state,
+                    tasks,
+                    [(task, result)],
+                )
+                return state
+            self._detach_task_failure_checkpoint(
+                state,
+                task.task_id,
+            )
             self._persist_tasks(tasks)
             self._emit_task_blocked(task, str(gate_result["reason"]))
             raise RuntimeError(
@@ -17439,6 +19108,10 @@ class Orchestrator:
                 return state
             task.status = "blocked"
             task.review_summary = str(error)
+            self._detach_task_failure_checkpoint(
+                state,
+                task.task_id,
+            )
             self._persist_tasks(tasks)
             save_run_state(self.project_root, state)
             self._emit_task_blocked(task, str(error))
@@ -17479,6 +19152,10 @@ class Orchestrator:
             )
             task.status = "blocked"
             task.review_summary = reason
+            self._detach_task_failure_checkpoint(
+                state,
+                task.task_id,
+            )
             self._block_run(
                 state,
                 owner="auto_agents",
@@ -17513,7 +19190,6 @@ class Orchestrator:
             tasks,
             self._recovery_lineage_owner(tasks, task),
         )
-        self._clear_task_failure_checkpoint(state, task.task_id)
         self._clear_implementation_ready_marker(state, task)
         self._clear_task_attempt_base_ref(state, task)
         self._complete_retained_worktree_reconciliation(state, task)
@@ -17542,6 +19218,11 @@ class Orchestrator:
             )
         else:
             task.commit_sha = commit_all(self.project_root, commit_message)
+        # The retained ref is the last recoverable copy of a resumed candidate.
+        # Release it only after the owner's integration commit exists.
+        self._clear_task_failure_checkpoint(state, task.task_id)
+        self._persist_tasks(tasks)
+        save_run_state(self.project_root, state)
         if borrowed_recovery_paths:
             marker = self._execution_recovery_marker(task)
             marker["borrowed_worktree_validation"] = {
@@ -17564,6 +19245,12 @@ class Orchestrator:
         )
         if is_execution_incident_recovery_task(task):
             self._resolve_execution_incident_for_task(state, task)
+        elif parallel_lane_recovery:
+            self._resolve_parallel_lane_recovery_for_task(
+                state,
+                tasks,
+                task,
+            )
         else:
             self._resolve_inline_task_incident(state, task)
         if task.task_id in sequential_retry_ids:
@@ -17895,6 +19582,93 @@ class Orchestrator:
         return list(dict.fromkeys(str(item).strip() for item in raw if str(item).strip()))
 
     @staticmethod
+    def _parallel_lane_gate_rechecks(
+        state: RunState,
+    ) -> Dict[str, Dict[str, object]]:
+        raw = state.resume_context.get(_PARALLEL_LANE_RECHECK_CONTEXT, {})
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(task_id): dict(entry)
+            for task_id, entry in raw.items()
+            if str(task_id).strip() and isinstance(entry, dict)
+        }
+
+    @staticmethod
+    def _parallel_lane_recovery_tasks(
+        state: RunState,
+    ) -> Dict[str, Dict[str, object]]:
+        raw = state.resume_context.get(_PARALLEL_LANE_ACTIVE_CONTEXT, {})
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            str(task_id): dict(entry)
+            for task_id, entry in raw.items()
+            if str(task_id).strip() and isinstance(entry, dict)
+        }
+
+    @classmethod
+    def _set_parallel_lane_recovery_task(
+        cls,
+        state: RunState,
+        task_id: str,
+        payload: Optional[Mapping[str, object]],
+    ) -> None:
+        entries = cls._parallel_lane_recovery_tasks(state)
+        normalized = str(task_id).strip()
+        if payload is None:
+            entries.pop(normalized, None)
+        elif normalized:
+            entries[normalized] = dict(payload)
+        if entries:
+            state.resume_context[_PARALLEL_LANE_ACTIVE_CONTEXT] = entries
+        else:
+            state.resume_context.pop(_PARALLEL_LANE_ACTIVE_CONTEXT, None)
+
+    @classmethod
+    def _parallel_lane_gate_recheck_pending(
+        cls,
+        state: RunState,
+        task: TaskSpec,
+    ) -> bool:
+        return task.task_id in cls._parallel_lane_gate_rechecks(state)
+
+    @classmethod
+    def _parallel_lane_task_is_recovering(
+        cls,
+        state: RunState,
+        task: TaskSpec,
+    ) -> bool:
+        if cls._parallel_lane_gate_recheck_pending(state, task):
+            return True
+        if task.task_id in cls._parallel_lane_recovery_tasks(state):
+            return True
+        return any(
+            str(item.get("source", "")) == _PARALLEL_LANE_FAILURE_KIND
+            and str(item.get("task_id", "")) == task.task_id
+            for item in state.localized_blockers
+            if isinstance(item, dict)
+        )
+
+    @classmethod
+    def _set_parallel_lane_gate_recheck(
+        cls,
+        state: RunState,
+        task_id: str,
+        payload: Optional[Mapping[str, object]],
+    ) -> None:
+        entries = cls._parallel_lane_gate_rechecks(state)
+        normalized = str(task_id).strip()
+        if payload is None:
+            entries.pop(normalized, None)
+        elif normalized:
+            entries[normalized] = dict(payload)
+        if entries:
+            state.resume_context[_PARALLEL_LANE_RECHECK_CONTEXT] = entries
+        else:
+            state.resume_context.pop(_PARALLEL_LANE_RECHECK_CONTEXT, None)
+
+    @staticmethod
     def _parallel_metrics(state: RunState) -> Dict[str, int]:
         raw = state.resume_context.get("parallel_integration_metrics", {})
         metrics = dict(raw) if isinstance(raw, dict) else {}
@@ -18002,6 +19776,12 @@ class Orchestrator:
                 target = destination / source.name
                 shutil.copy2(source, target)
                 archived.append(self._relative_repo_path(target))
+        provenance = self._task_verification_failure_provenance_from_result(
+            task,
+            gate_result,
+            fallback_failure_ids=gate_result.get("failure_ids", []) or [],
+            fallback_baseline_failure_ids=task.verify_baseline_failures,
+        )
         metadata_path = destination / "failure.json"
         write_json(
             metadata_path,
@@ -18013,30 +19793,32 @@ class Orchestrator:
                     for item in gate_result.get("failure_ids", []) or []
                     if str(item).strip()
                 ],
+                **provenance,
+                "comparable_failures": bool(
+                    gate_result.get("comparable_failures", True)
+                ),
                 "reason": str(gate_result.get("reason", "")).strip(),
                 "review": str(gate_result.get("review", "")).strip(),
+                "command_evidence_paths": list(archived),
+                "redacted_command_evidence": str(
+                    gate_result.get("redacted_command_evidence", "")
+                ).strip(),
                 "created_at": utc_now_iso(),
             },
         )
         archived.append(self._relative_repo_path(metadata_path))
         return archived
 
-    @staticmethod
     def _parallel_commit_exclude_prefixes(
+        self,
         dependency_links: Iterable[str] = (),
+        *,
+        project_root: Optional[Path] = None,
     ) -> Tuple[str, ...]:
-        return tuple(
-            dict.fromkeys(
-                (
-                    ".auto-agents",
-                    ".antigravitycli",
-                    *(
-                        str(path).replace("\\", "/").strip().rstrip("/")
-                        for path in dependency_links
-                        if str(path).replace("\\", "/").strip().rstrip("/")
-                    ),
-                )
-            )
+        return repository_exclusion_paths(
+            project_root or self.project_root,
+            dependency_links=tuple(dependency_links),
+            surface_paths=(".auto-agents", ".antigravitycli"),
         )
 
     @staticmethod
@@ -18044,19 +19826,7 @@ class Orchestrator:
         path: str,
         dependency_links: Iterable[str],
     ) -> bool:
-        normalized_path = str(path).replace("\\", "/").strip().rstrip("/")
-        for dependency_link in dependency_links:
-            prefix = (
-                str(dependency_link)
-                .replace("\\", "/")
-                .strip()
-                .rstrip("/")
-            )
-            if normalized_path == prefix or normalized_path.startswith(
-                prefix + "/"
-            ):
-                return True
-        return False
+        return repository_path_is_excluded(path, dependency_links)
 
     def _preserve_failed_task_checkpoint(
         self,
@@ -18066,19 +19836,40 @@ class Orchestrator:
         gate_result: Dict[str, object],
         *,
         dependency_links: Iterable[str] = (),
+        base_ref: str = "",
+        committed_candidate_sha: str = "",
+        committed_candidate_paths: Iterable[str] = (),
     ) -> Dict[str, object]:
-        dependency_link_paths = tuple(dependency_links)
+        checkpoint_exclusions = self._parallel_commit_exclude_prefixes(
+            dependency_links,
+            project_root=worktree_path,
+        )
+        committed_candidate_sha = str(committed_candidate_sha).strip()
+        raw_candidate_paths = (
+            list(committed_candidate_paths)
+            if committed_candidate_sha
+            else changed_paths(
+                worktree_path,
+                ignored_prefixes=(),
+            )
+        )
+        if committed_candidate_sha and not raw_candidate_paths:
+            raw_candidate_paths = commit_changed_paths(
+                worktree_path,
+                committed_candidate_sha,
+            )
         candidate_paths = [
             path
-            for path in changed_paths(
-                worktree_path,
-                ignored_prefixes=(".auto-agents/", ".antigravitycli/"),
-            )
-            if not self._path_is_dependency_link(
+            for path in raw_candidate_paths
+            if not repository_path_is_excluded(
                 path,
-                dependency_link_paths,
+                checkpoint_exclusions,
             )
         ]
+        if committed_candidate_sha and not candidate_paths:
+            raise RuntimeError(
+                "the committed worker candidate has no restorable paths"
+            )
         checkpoint_ref = self._parallel_failure_ref(
             state.run_id,
             task.task_id,
@@ -18086,21 +19877,44 @@ class Orchestrator:
         )
         has_candidate_changes = bool(candidate_paths)
         if has_candidate_changes:
-            checkpoint_sha = commit_all_except(
+            checkpoint_sha = committed_candidate_sha or commit_all_except(
                 worktree_path,
                 f"checkpoint({task.task_id}): preserve failed candidate",
-                exclude_prefixes=self._parallel_commit_exclude_prefixes(
-                    dependency_link_paths
-                ),
+                exclude_prefixes=checkpoint_exclusions,
             )
             update_ref(self.project_root, checkpoint_ref, checkpoint_sha)
+            # A locally created checkpoint can be the repository's root
+            # commit, so retain the exact paths observed before committing.
+            # Worker commits still require their authoritative commit delta.
+            if committed_candidate_sha:
+                candidate_paths = [
+                    path
+                    for path in commit_changed_paths(
+                        worktree_path,
+                        checkpoint_sha,
+                    )
+                    if not repository_path_is_excluded(
+                        path,
+                        checkpoint_exclusions,
+                    )
+                ]
+                if not candidate_paths:
+                    raise RuntimeError(
+                        "the retained checkpoint has no restorable paths"
+                    )
         else:
-            checkpoint_sha = head_ref(worktree_path)
+            checkpoint_sha = committed_candidate_sha or head_ref(worktree_path)
         diagnostics = self._archive_failed_task_diagnostics(
             state,
             task,
             worktree_path,
             gate_result,
+        )
+        provenance = self._task_verification_failure_provenance_from_result(
+            task,
+            gate_result,
+            fallback_failure_ids=gate_result.get("failure_ids", []) or [],
+            fallback_baseline_failure_ids=task.verify_baseline_failures,
         )
         return {
             "schema_version": 1,
@@ -18113,6 +19927,7 @@ class Orchestrator:
                 or self._git_ref_from_verify_baseline_ref(
                     task.verify_baseline_ref
                 )
+                or base_ref
             ),
             "changed_paths": list(candidate_paths),
             "has_candidate_changes": has_candidate_changes,
@@ -18121,6 +19936,13 @@ class Orchestrator:
                 for item in gate_result.get("failure_ids", []) or []
                 if str(item).strip()
             ],
+            **provenance,
+            "comparable_failures": bool(
+                gate_result.get("comparable_failures", True)
+            ),
+            "redacted_command_evidence": str(
+                gate_result.get("redacted_command_evidence", "")
+            ).strip(),
             "diagnostic_paths": diagnostics,
             "verify_retry_epoch": int(task.verify_retry_epoch),
             "recovery_epoch": int(task.recovery_epoch),
@@ -18129,6 +19951,11 @@ class Orchestrator:
                 gate_result.get("rewind_to_stage", "")
             ).strip(),
             "status": "recoverable",
+            "candidate_source": (
+                "committed_worker_result"
+                if committed_candidate_sha
+                else "working_tree"
+            ),
             "created_at": utc_now_iso(),
         }
 
@@ -18156,35 +19983,729 @@ class Orchestrator:
         if (
             not checkpoint_ref
             or not bool(checkpoint.get("has_candidate_changes"))
-            or not ref_exists(self.project_root, checkpoint_ref)
+            or not ref_exists(project_root, checkpoint_ref)
         ):
             return ""
-        protected_paths = dependency_link_paths(project_root)
+        recorded_owner = str(checkpoint.get("task_id", "")).strip()
+        if recorded_owner and recorded_owner != task.task_id:
+            checkpoint["transaction_error"] = {
+                "reason": "checkpoint owner does not match the restoring task",
+                "expected_owner_task_id": recorded_owner,
+                "observed_owner_task_id": task.task_id,
+                "updated_at": utc_now_iso(),
+            }
+            save_run_state(project_root, state)
+            return ""
+
+        status = str(checkpoint.get("status", "")).strip()
+        raw_transaction = checkpoint.get("application_transaction", {})
+        transaction = (
+            raw_transaction if isinstance(raw_transaction, dict) else {}
+        )
+        if status in {"applying", "applied"}:
+            if not transaction:
+                checkpoint["transaction_error"] = {
+                    "reason": (
+                        "applied checkpoint lacks a transactional prestate"
+                    ),
+                    "status": status,
+                    "updated_at": utc_now_iso(),
+                }
+                save_run_state(project_root, state)
+                return ""
+            try:
+                observation = checkpoint_application_state(
+                    project_root,
+                    transaction,
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                checkpoint["transaction_error"] = {
+                    "reason": str(error),
+                    "status": status,
+                    "updated_at": utc_now_iso(),
+                }
+                save_run_state(project_root, state)
+                return ""
+            if status == "applied":
+                if bool(observation.get("applied_matches")):
+                    return checkpoint_ref
+                if bool(observation.get("prestate_matches")):
+                    transaction["status"] = "detached"
+                    transaction["detached_at"] = utc_now_iso()
+                    checkpoint["status"] = "recoverable"
+                    checkpoint["updated_at"] = utc_now_iso()
+                    save_run_state(project_root, state)
+                else:
+                    checkpoint["transaction_error"] = {
+                        "reason": "applied checkpoint state no longer matches ownership proof",
+                        "status": status,
+                        "observed_fingerprints": dict(
+                            observation.get("fingerprints", {})
+                        ),
+                        "owned_mismatches": list(
+                            observation.get("owned_mismatches", [])
+                        ),
+                        "updated_at": utc_now_iso(),
+                    }
+                    save_run_state(project_root, state)
+                    return ""
+            if bool(observation.get("retained_matches")) and not bool(
+                observation.get("prestate_matches")
+            ):
+                try:
+                    complete_checkpoint_application(
+                        project_root,
+                        transaction,
+                    )
+                except (OSError, RuntimeError, ValueError) as error:
+                    checkpoint["transaction_error"] = {
+                        "reason": str(error),
+                        "status": status,
+                        "updated_at": utc_now_iso(),
+                    }
+                    save_run_state(project_root, state)
+                    return ""
+                checkpoint["status"] = "applied"
+                checkpoint["updated_at"] = utc_now_iso()
+                save_run_state(project_root, state)
+                return checkpoint_ref
+            if not bool(observation.get("prestate_matches")):
+                checkpoint["transaction_error"] = {
+                    "reason": "interrupted checkpoint application state is unprovable",
+                    "status": status,
+                    "observed_fingerprints": dict(
+                        observation.get("fingerprints", {})
+                    ),
+                    "owned_mismatches": list(
+                        observation.get("owned_mismatches", [])
+                    ),
+                    "updated_at": utc_now_iso(),
+                }
+                save_run_state(project_root, state)
+                return ""
+
+        protected_paths = repository_exclusion_paths(project_root)
+        original_paths = [
+            str(path).strip().replace("\\", "/")
+            for path in checkpoint.get("changed_paths", [])
+            if str(path).strip()
+        ]
         try:
-            apply_commit_no_commit_excluding(
+            next_transaction = begin_checkpoint_application(
                 project_root,
-                checkpoint_ref,
-                tuple(protected_paths),
+                owner_task_id=task.task_id,
+                retained_ref=checkpoint_ref,
+                retained_commit=str(checkpoint.get("commit_sha", "")),
+                changed_paths=original_paths,
+                exclude_prefixes=protected_paths,
             )
-        except RuntimeError as error:
-            abort_cherry_pick(project_root)
+        except (OSError, RuntimeError, ValueError) as error:
             checkpoint["status"] = "replay_conflict"
             checkpoint["replay_error"] = str(error)
             checkpoint["updated_at"] = utc_now_iso()
+            save_run_state(project_root, state)
             return ""
-        checkpoint["excluded_dependency_paths"] = [
-            path
-            for path in checkpoint.get("changed_paths", [])
-            if self._path_is_dependency_link(path, protected_paths)
-        ]
-        checkpoint["changed_paths"] = [
-            path
-            for path in checkpoint.get("changed_paths", [])
-            if not self._path_is_dependency_link(path, protected_paths)
-        ]
+        if transaction and transaction is not next_transaction:
+            raw_history = checkpoint.get("application_transaction_history", [])
+            history = (
+                [dict(item) for item in raw_history if isinstance(item, dict)]
+                if isinstance(raw_history, list)
+                else []
+            )
+            history.append(
+                {
+                    key: transaction.get(key)
+                    for key in (
+                        "schema_version",
+                        "transaction_id",
+                        "owner_task_id",
+                        "retained_ref",
+                        "retained_commit",
+                        "retained_parent",
+                        "effective_paths",
+                        "status",
+                        "applied_at",
+                        "detached_at",
+                    )
+                    if key in transaction
+                }
+            )
+            checkpoint["application_transaction_history"] = history[-8:]
+        next_transaction["created_at"] = utc_now_iso()
+        checkpoint["application_transaction"] = next_transaction
+        checkpoint["task_id"] = task.task_id
+        checkpoint["commit_sha"] = str(next_transaction["retained_commit"])
+        checkpoint["excluded_dependency_paths"] = list(
+            dict.fromkeys(
+                [
+                    str(path).strip().replace("\\", "/")
+                    for path in checkpoint.get(
+                        "excluded_dependency_paths",
+                        [],
+                    )
+                    if str(path).strip()
+                ]
+                + [
+                    path
+                    for path in original_paths
+                    if self._path_is_dependency_link(path, protected_paths)
+                ]
+            )
+        )
+        checkpoint["changed_paths"] = list(
+            next_transaction["effective_paths"]
+        )
+        checkpoint["status"] = "applying"
+        checkpoint["updated_at"] = utc_now_iso()
+        checkpoint.pop("transaction_error", None)
+        save_run_state(project_root, state)
+
+        try:
+            next_transaction["apply_started"] = True
+            apply_checkpoint_application(
+                project_root,
+                next_transaction,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            rollback_error = ""
+            if bool(next_transaction.get("apply_started")):
+                try:
+                    rollback_checkpoint_application(
+                        project_root,
+                        next_transaction,
+                    )
+                except (OSError, RuntimeError, ValueError) as restore_error:
+                    rollback_error = str(restore_error)
+            if rollback_error:
+                checkpoint["status"] = "applying"
+                checkpoint["transaction_error"] = {
+                    "reason": str(error),
+                    "rollback_error": rollback_error,
+                    "status": "rollback_unproven",
+                    "updated_at": utc_now_iso(),
+                }
+            else:
+                checkpoint["status"] = "replay_conflict"
+                checkpoint["replay_error"] = str(error)
+            checkpoint["updated_at"] = utc_now_iso()
+            save_run_state(project_root, state)
+            return ""
+        next_transaction.pop("apply_started", None)
+        next_transaction["applied_at"] = utc_now_iso()
         checkpoint["status"] = "applied"
         checkpoint["updated_at"] = utc_now_iso()
+        save_run_state(project_root, state)
         return checkpoint_ref
+
+    def _detach_task_failure_checkpoint(
+        self,
+        state: RunState,
+        task_id: str,
+        project_root: Optional[Path] = None,
+    ) -> Dict[str, object]:
+        root = project_root or self.project_root
+        normalized_task_id = str(task_id).strip()
+        checkpoint = state.task_failure_checkpoints.get(normalized_task_id)
+        if not isinstance(checkpoint, dict):
+            return {
+                "ok": False,
+                "reason": "checkpoint ownership record is missing",
+                "proof": "checkpoint_missing",
+            }
+        status = str(checkpoint.get("status", "")).strip()
+        if status == "recoverable":
+            return {"ok": True, "proof": "already_detached"}
+        if status not in _CHECKPOINT_OWNERSHIP_ACTIVE_STATUSES:
+            return {
+                "ok": False,
+                "reason": "checkpoint is not in an applying or applied state",
+                "proof": "checkpoint_status_mismatch",
+                "status": status,
+            }
+        raw_transaction = checkpoint.get("application_transaction", {})
+        transaction = (
+            raw_transaction if isinstance(raw_transaction, dict) else {}
+        )
+        recorded_owner = str(checkpoint.get("task_id", "")).strip()
+        transaction_owner = str(
+            transaction.get("owner_task_id", "")
+        ).strip()
+        if (
+            (recorded_owner and recorded_owner != normalized_task_id)
+            or not transaction
+            or transaction_owner != normalized_task_id
+        ):
+            result: Dict[str, object] = {
+                "ok": False,
+                "reason": "applied checkpoint lacks its exact owner prestate",
+                "proof": "transaction_missing_or_wrong_owner",
+            }
+        elif status == "applying":
+            try:
+                observation = checkpoint_application_state(
+                    root,
+                    transaction,
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                result = {
+                    "ok": False,
+                    "reason": str(error),
+                    "proof": "transaction_invalid",
+                }
+            else:
+                if bool(observation.get("prestate_matches")):
+                    transaction["status"] = "detached"
+                    result = {
+                        "ok": True,
+                        "proof": "exact_prestate_already_restored",
+                        "fingerprints": dict(
+                            observation.get("fingerprints", {})
+                        ),
+                    }
+                elif bool(observation.get("retained_matches")):
+                    try:
+                        complete_checkpoint_application(root, transaction)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        result = {
+                            "ok": False,
+                            "reason": str(error),
+                            "proof": "interrupted_application_unproven",
+                            "observed_fingerprints": dict(
+                                observation.get("fingerprints", {})
+                            ),
+                        }
+                    else:
+                        checkpoint["status"] = "applied"
+                        result = detach_checkpoint_application(
+                            root,
+                            transaction,
+                        )
+                else:
+                    result = {
+                        "ok": False,
+                        "reason": (
+                            "interrupted checkpoint application ownership "
+                            "could not be proven"
+                        ),
+                        "proof": "interrupted_application_state_mismatch",
+                        "expected_fingerprints": dict(
+                            dict(
+                                transaction.get("pre_application", {})
+                            ).get("fingerprints", {})
+                            if isinstance(
+                                transaction.get("pre_application", {}),
+                                Mapping,
+                            )
+                            else {}
+                        ),
+                        "observed_fingerprints": dict(
+                            observation.get("fingerprints", {})
+                        ),
+                        "owned_mismatches": list(
+                            observation.get("owned_mismatches", [])
+                        ),
+                    }
+        else:
+            result = detach_checkpoint_application(root, transaction)
+        if not bool(result.get("ok")):
+            expected, observed = (
+                self._checkpoint_detachment_fingerprint_evidence(
+                    checkpoint,
+                    result,
+                    project_root=root,
+                )
+            )
+            result = {
+                **result,
+                "expected_fingerprints": expected,
+                "observed_fingerprints": observed,
+            }
+            if str(result.get("proof", "")).strip() == (
+                "prestate_restore_unproven"
+            ):
+                result["fingerprint_boundary"] = "post_restore_attempt"
+        diagnostic = {
+            **result,
+            "owner_task_id": normalized_task_id,
+            "retained_ref": str(checkpoint.get("ref", "")),
+            "checkpoint_status": status,
+            "updated_at": utc_now_iso(),
+        }
+        checkpoint["detachment"] = diagnostic
+        if bool(result.get("ok")):
+            transaction["detached_at"] = utc_now_iso()
+            checkpoint["status"] = "recoverable"
+            checkpoint["updated_at"] = utc_now_iso()
+            checkpoint.pop("transaction_error", None)
+        save_run_state(root, state)
+        return diagnostic
+
+    @staticmethod
+    def _active_checkpoint_ownership_records(
+        state: RunState,
+    ) -> List[Tuple[str, Dict[str, object]]]:
+        return [
+            (str(task_id).strip(), checkpoint)
+            for task_id, checkpoint in state.task_failure_checkpoints.items()
+            if str(task_id).strip()
+            and isinstance(checkpoint, dict)
+            and str(checkpoint.get("status", "")).strip()
+            in _CHECKPOINT_OWNERSHIP_ACTIVE_STATUSES
+        ]
+
+    @staticmethod
+    def _checkpoint_owner_lane_is_runnable(
+        tasks: Iterable[TaskSpec],
+        owner_task_id: str,
+    ) -> bool:
+        task_list = list(tasks)
+        tasks_by_id = {task.task_id: task for task in task_list}
+        owner = tasks_by_id.get(owner_task_id)
+        if owner is None or owner.status not in {"pending", "in_progress"}:
+            return False
+        completed = {
+            task.task_id for task in task_list if task.status == "done"
+        }
+        return all(dependency in completed for dependency in owner.depends_on)
+
+    def _checkpoint_owner_execution_is_proven(
+        self,
+        checkpoint_owner_task_id: str,
+        checkpoint: Mapping[str, object],
+    ) -> bool:
+        recorded_owner = str(checkpoint.get("task_id", "")).strip()
+        raw_transaction = checkpoint.get("application_transaction", {})
+        transaction = (
+            raw_transaction
+            if isinstance(raw_transaction, Mapping)
+            else {}
+        )
+        if (
+            (recorded_owner and recorded_owner != checkpoint_owner_task_id)
+            or str(transaction.get("owner_task_id", "")).strip()
+            != checkpoint_owner_task_id
+        ):
+            return False
+        try:
+            observation = checkpoint_application_state(
+                self.project_root,
+                transaction,
+            )
+        except (OSError, RuntimeError, ValueError):
+            return False
+        status = str(checkpoint.get("status", "")).strip()
+        if status == "applied":
+            return bool(observation.get("applied_matches"))
+        if status == "applying":
+            return bool(
+                observation.get("prestate_matches")
+                or observation.get("retained_matches")
+            )
+        return False
+
+    def _checkpoint_detachment_fingerprint_evidence(
+        self,
+        checkpoint: Mapping[str, object],
+        diagnostic: Mapping[str, object],
+        *,
+        project_root: Optional[Path] = None,
+    ) -> Tuple[Dict[str, object], Dict[str, object]]:
+        root = project_root or self.project_root
+        raw_transaction = checkpoint.get("application_transaction", {})
+        transaction = (
+            raw_transaction
+            if isinstance(raw_transaction, Mapping)
+            else {}
+        )
+        raw_applied = transaction.get("applied_state", {})
+        applied = raw_applied if isinstance(raw_applied, Mapping) else {}
+        raw_prestate = transaction.get("pre_application", {})
+        prestate = raw_prestate if isinstance(raw_prestate, Mapping) else {}
+        proof = str(diagnostic.get("proof", "")).strip()
+        restore_attempted = proof == "prestate_restore_unproven"
+        post_restore_observation = (
+            str(diagnostic.get("fingerprint_boundary", "")).strip()
+            == "post_restore_attempt"
+        )
+        if restore_attempted:
+            # Ownership was proven before rollback began.  Once rollback has
+            # mutated the repository, its target is the captured prestate and
+            # any observation made before the attempt is stale by definition.
+            raw_expected = prestate.get("fingerprints", {})
+        else:
+            raw_expected = diagnostic.get("expected_fingerprints", {})
+            if not isinstance(raw_expected, Mapping) or not raw_expected:
+                raw_expected = applied.get(
+                    "fingerprints",
+                    prestate.get("fingerprints", {}),
+                )
+        expected = (
+            dict(raw_expected)
+            if isinstance(raw_expected, Mapping)
+            else {}
+        )
+        raw_observed: object = {}
+        if not restore_attempted or post_restore_observation:
+            raw_observed = diagnostic.get(
+                "observed_fingerprints",
+                diagnostic.get("fingerprints", {}),
+            )
+        observed = (
+            dict(raw_observed)
+            if isinstance(raw_observed, Mapping)
+            else {}
+        )
+        if not observed:
+            try:
+                observed = checkpoint_repository_fingerprints(
+                    root,
+                )
+            except (OSError, RuntimeError, ValueError):
+                try:
+                    observed = {
+                        "head": head_ref(root),
+                        "worktree": worktree_fingerprint(
+                            root
+                        ),
+                    }
+                except (OSError, RuntimeError, ValueError):
+                    observed = {}
+        return expected, observed
+
+    @staticmethod
+    def _synchronize_checkpoint_blocker_snapshot(
+        state: RunState,
+        task_id: str,
+        checkpoint: Mapping[str, object],
+        diagnostic: Mapping[str, object],
+    ) -> None:
+        def synchronized(
+            raw_blocker: Mapping[str, object],
+        ) -> Dict[str, object]:
+            blocker = dict(raw_blocker)
+            blocker["failure_checkpoint"] = dict(checkpoint)
+            blocker["checkpoint_detachment"] = dict(diagnostic)
+            raw_failure = blocker.get("parallel_lane_failure", {})
+            if isinstance(raw_failure, Mapping):
+                failure = dict(raw_failure)
+                failure["checkpoint"] = dict(checkpoint)
+                failure["checkpoint_detachment"] = dict(diagnostic)
+                blocker["parallel_lane_failure"] = failure
+            return blocker
+
+        state.localized_blockers = [
+            (
+                synchronized(item)
+                if str(item.get("task_id", "")).strip() == task_id
+                else dict(item)
+            )
+            for item in state.localized_blockers
+        ]
+        if str(state.active_blocker.get("task_id", "")).strip() == task_id:
+            state.active_blocker = synchronized(state.active_blocker)
+
+    def _block_unproven_checkpoint_detachment(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        checkpoint_owner_task_id: str,
+        checkpoint: Mapping[str, object],
+        diagnostic: Mapping[str, object],
+    ) -> None:
+        reason_detail = str(diagnostic.get("reason", "")).strip()
+        proof = str(diagnostic.get("proof", "")).strip() or (
+            "detachment_proof_missing"
+        )
+        reason = (
+            "checkpoint ownership could not be safely detached for task "
+            f"{checkpoint_owner_task_id}: "
+            f"{reason_detail or proof}"
+        )
+        owner_task = next(
+            (
+                task
+                for task in tasks
+                if task.task_id == checkpoint_owner_task_id
+            ),
+            None,
+        )
+        if owner_task is None:
+            blocker_task = TaskSpec(
+                task_id=checkpoint_owner_task_id,
+                title="Recover retained checkpoint ownership",
+                description="",
+                acceptance=[],
+            )
+        else:
+            blocker_task = owner_task
+            if owner_task.status != "done":
+                owner_task.status = "blocked"
+                owner_task.review_summary = reason
+
+        checkpoint_snapshot = dict(checkpoint)
+        checkpoint_snapshot["detachment"] = dict(diagnostic)
+        raw_transaction = checkpoint_snapshot.get(
+            "application_transaction",
+            {},
+        )
+        transaction = (
+            raw_transaction
+            if isinstance(raw_transaction, Mapping)
+            else {}
+        )
+        raw_prestate = transaction.get("pre_application", {})
+        prestate = (
+            raw_prestate if isinstance(raw_prestate, Mapping) else {}
+        )
+        failure = ParallelLaneFailure.from_dict(
+            {
+                "task": blocker_task.to_dict(),
+                "operation": "checkpoint_detachment",
+                "owner": "auto_agents",
+                "automatic_retryable": False,
+                "resumable": True,
+                "reason": reason,
+                "redacted_evidence": reason,
+                "failure_class": (
+                    _CHECKPOINT_OWNERSHIP_DETACHMENT_UNPROVEN_CATEGORY
+                ),
+                "base_ref": str(prestate.get("head", "")),
+                "checkpoint": checkpoint_snapshot,
+                "implementation_completed": bool(
+                    checkpoint_snapshot.get(
+                        "implementation_completed",
+                        False,
+                    )
+                ),
+            }
+        )
+        blocker = self._upsert_parallel_lane_blocker(
+            state,
+            blocker_task,
+            failure,
+        )
+        expected, observed = self._checkpoint_detachment_fingerprint_evidence(
+            checkpoint_snapshot,
+            diagnostic,
+        )
+        blocker.update(
+            {
+                "category": (
+                    _CHECKPOINT_OWNERSHIP_DETACHMENT_UNPROVEN_CATEGORY
+                ),
+                "checkpoint_owner_task_id": checkpoint_owner_task_id,
+                "retained_ref": str(checkpoint.get("ref", "")),
+                "checkpoint_status": str(
+                    checkpoint.get("status", "")
+                ).strip(),
+                "checkpoint_detachment": dict(diagnostic),
+                "expected_fingerprints": expected,
+                "observed_fingerprints": observed,
+                "missing_or_mismatched_proof": proof,
+                "status": "blocked",
+                "updated_at": utc_now_iso(),
+            }
+        )
+        state.localized_blockers = [
+            (
+                dict(blocker)
+                if str(item.get("source", ""))
+                == _PARALLEL_LANE_FAILURE_KIND
+                and str(item.get("task_id", ""))
+                == checkpoint_owner_task_id
+                else dict(item)
+            )
+            for item in state.localized_blockers
+        ]
+        state.active_blocker = dict(blocker)
+        state.active_execution_incident_id = ""
+        state.status = "blocked"
+        state.last_error = reason
+        state.tasks = tasks
+        self._persist_parallel_runtime_state(state, tasks)
+        self._emit_task_blocked(blocker_task, reason)
+
+    def _checkpoint_ownership_barrier(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        *,
+        intended_task_id: str = "",
+        allow_owner_execution: bool = True,
+    ) -> bool:
+        """Settle shared-worktree checkpoint ownership before other work."""
+
+        active = self._active_checkpoint_ownership_records(state)
+        if not active:
+            return False
+
+        intended_owner = str(intended_task_id).strip()
+        if len(active) == 1:
+            owner_task_id, checkpoint = active[0]
+            owner_is_intended = (
+                not intended_owner or intended_owner == owner_task_id
+            )
+            if (
+                owner_is_intended
+                and self._checkpoint_owner_lane_is_runnable(
+                    tasks,
+                    owner_task_id,
+                )
+                and self._checkpoint_owner_execution_is_proven(
+                    owner_task_id,
+                    checkpoint,
+                )
+            ):
+                retry_ids = self._parallel_sequential_retry_ids(state)
+                normalized_retry_ids = [
+                    owner_task_id,
+                    *(
+                        task_id
+                        for task_id in retry_ids
+                        if task_id != owner_task_id
+                    ),
+                ]
+                if normalized_retry_ids != retry_ids:
+                    self._set_parallel_sequential_retry_ids(
+                        state,
+                        normalized_retry_ids,
+                        capture_retained_ownership=False,
+                    )
+                    save_run_state(self.project_root, state)
+                if allow_owner_execution:
+                    return False
+
+        detached_any = False
+        for owner_task_id, checkpoint in reversed(active):
+            diagnostic = self._detach_task_failure_checkpoint(
+                state,
+                owner_task_id,
+            )
+            current = state.task_failure_checkpoints.get(
+                owner_task_id,
+                checkpoint,
+            )
+            self._synchronize_checkpoint_blocker_snapshot(
+                state,
+                owner_task_id,
+                current,
+                diagnostic,
+            )
+            if not bool(diagnostic.get("ok")):
+                self._block_unproven_checkpoint_detachment(
+                    state,
+                    tasks,
+                    owner_task_id,
+                    current,
+                    diagnostic,
+                )
+                return True
+            detached_any = True
+
+        if detached_any:
+            self._refresh_parallel_lane_blocker_state(state, tasks)
+            self._persist_parallel_runtime_state(state, tasks)
+        return False
 
     def _clear_task_failure_checkpoint(
         self,
@@ -18302,19 +20823,113 @@ class Orchestrator:
             }
             for future in as_completed(future_map):
                 task_id = future_map[future]
-                results[task_id] = future.result()
+                try:
+                    results[task_id] = future.result()
+                except Exception as error:
+                    task = next(
+                        item for item in batch_tasks if item.task_id == task_id
+                    )
+                    results[task_id] = self._parallel_exception_failure_result(
+                        state_snapshot,
+                        task,
+                        error,
+                        operation="worker_future",
+                        base_ref=head_ref(self.project_root) or "HEAD",
+                    )
         return results
+
+    @staticmethod
+    def _parallel_command_result_snapshot(
+        result: CommandResult,
+    ) -> Dict[str, object]:
+        payload = asdict(result)
+        for key in ("command", "stdout", "stderr"):
+            payload[key] = redact_incident_text(payload.get(key, ""))
+        return payload
+
+    @staticmethod
+    def _parallel_command_result_from_snapshot(
+        payload: Mapping[str, object],
+    ) -> CommandResult:
+        allowed = {field.name for field in fields(CommandResult)}
+        values = {key: value for key, value in payload.items() if key in allowed}
+        values.setdefault("command", "")
+        values.setdefault("ok", False)
+        values.setdefault("returncode", 1)
+        return CommandResult(**values)
 
     @staticmethod
     def _parallel_task_failure_result(
         worker_task: TaskSpec,
         gate_result: Dict[str, object],
+        *,
+        operation: str = "verification",
+        owner: str = "",
+        automatic_retryable: Optional[bool] = None,
+        resumable: bool = True,
+        base_ref: str = "",
+        checkpoint: Optional[Mapping[str, object]] = None,
+        command_incident: Optional[Mapping[str, object]] = None,
+        implementation_completed: bool = False,
     ) -> Dict[str, object]:
+        failure_class = str(gate_result.get("failure_class", "")).strip()
+        resolved_owner = owner.strip()
+        if not resolved_owner:
+            resolved_owner = (
+                "unknown"
+                if failure_class == "baseline_only_owned"
+                else "target_project"
+            )
+        if automatic_retryable is None:
+            automatic_retryable = failure_class != "baseline_only_owned"
+        checkpoint_payload = (
+            dict(checkpoint) if isinstance(checkpoint, Mapping) else {}
+        )
+        evidence = str(
+            gate_result.get(
+                "redacted_command_evidence",
+                gate_result.get("reason", ""),
+            )
+        )
+        lane_failure = ParallelLaneFailure(
+            task=worker_task.to_dict(),
+            operation=operation,
+            owner=resolved_owner,
+            automatic_retryable=bool(automatic_retryable),
+            resumable=bool(resumable),
+            reason=str(gate_result.get("reason", "")),
+            redacted_evidence=evidence,
+            current_failure_ids=list(
+                gate_result.get("current_failure_ids", []) or []
+            ),
+            baseline_failure_ids=list(
+                gate_result.get("baseline_failure_ids", []) or []
+            ),
+            new_failure_ids=list(gate_result.get("new_failure_ids", []) or []),
+            owned_failure_ids=list(
+                gate_result.get("owned_failure_ids", []) or []
+            ),
+            failure_class=failure_class,
+            baseline_comparison_comparable=bool(
+                gate_result.get(
+                    "baseline_comparison_comparable",
+                    gate_result.get("comparable_failures", True),
+                )
+            ),
+            base_ref=base_ref,
+            checkpoint=checkpoint_payload,
+            command_incident=(
+                dict(command_incident)
+                if isinstance(command_incident, Mapping)
+                else {}
+            ),
+            implementation_completed=implementation_completed,
+        ).to_dict()
         result: Dict[str, object] = {
             "ok": False,
             "task": worker_task.to_dict(),
-            "reason": str(gate_result["reason"]),
-            "review": str(gate_result["review"]),
+            "reason": str(gate_result.get("reason", "")),
+            "review": str(gate_result.get("review", "")),
             "failure_ids": list(gate_result.get("failure_ids", [])),
             "comparable_failures": bool(gate_result.get("comparable_failures", True)),
             "proof_evidence": (
@@ -18327,9 +20942,12 @@ class Orchestrator:
             "current_failure_ids",
             "baseline_failure_ids",
             "new_failure_ids",
+            "owned_failure_ids",
+            "failure_class",
             "baseline_comparison_comparable",
             "raw_output",
             "raw_log_path",
+            "redacted_command_evidence",
             "failure_signature",
             "evidence_refs",
             "provider_reference_paths",
@@ -18345,7 +20963,327 @@ class Orchestrator:
         ):
             if key in gate_result:
                 result[key] = gate_result[key]
+        result.update(
+            {
+                "failure_kind": _PARALLEL_LANE_FAILURE_KIND,
+                "operation": operation,
+                "owner": resolved_owner,
+                "automatic_retryable": bool(automatic_retryable),
+                "resumable": bool(resumable),
+                "base_ref": base_ref,
+                "implementation_completed": implementation_completed,
+                "parallel_lane_failure": lane_failure,
+            }
+        )
+        if checkpoint_payload:
+            result["failure_checkpoint"] = checkpoint_payload
+        if command_incident:
+            result["command_incident"] = dict(command_incident)
         return result
+
+    def _parallel_checkpoint_unavailable(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        worktree_path: Path,
+        *,
+        base_ref: str,
+        reason: str,
+        gate_result: Mapping[str, object],
+    ) -> Dict[str, object]:
+        try:
+            checkpoint_head = head_ref(worktree_path)
+        except Exception:
+            checkpoint_head = base_ref
+        provenance = self._task_verification_failure_provenance_from_result(
+            task,
+            gate_result,
+            fallback_failure_ids=gate_result.get("failure_ids", []) or [],
+            fallback_baseline_failure_ids=task.verify_baseline_failures,
+        )
+        return {
+            "schema_version": 1,
+            "task_id": task.task_id,
+            "ref": "",
+            "commit_sha": checkpoint_head,
+            "base_ref": base_ref,
+            "changed_paths": [],
+            "has_candidate_changes": False,
+            "failure_ids": list(gate_result.get("failure_ids", []) or []),
+            **provenance,
+            "comparable_failures": bool(
+                gate_result.get("comparable_failures", False)
+            ),
+            "redacted_command_evidence": self._redacted_verification_command_evidence(
+                "\n".join(
+                    value
+                    for value in (
+                        str(gate_result.get("redacted_command_evidence", "")),
+                        reason,
+                    )
+                    if value
+                )
+            ),
+            "diagnostic_paths": [],
+            "verify_retry_epoch": int(task.verify_retry_epoch),
+            "recovery_epoch": int(task.recovery_epoch),
+            "recovery_round": int(task.recovery_round),
+            "owner_stage": "implement",
+            "status": "unavailable",
+            "reason": self._redacted_verification_command_evidence(reason),
+            "implementation_completed": False,
+            "resume_mode": "implementation",
+            "created_at": utc_now_iso(),
+        }
+
+    def _checkpoint_parallel_lane_failure(
+        self,
+        state: RunState,
+        worker_state: RunState,
+        worker: "Orchestrator",
+        worker_task: TaskSpec,
+        worktree_path: Path,
+        gate_result: Dict[str, object],
+        *,
+        dependency_links: Iterable[str],
+        base_ref: str,
+        committed_candidate_sha: str = "",
+        committed_candidate_paths: Iterable[str] = (),
+    ) -> Tuple[Dict[str, object], str]:
+        try:
+            checkpoint = self._preserve_failed_task_checkpoint(
+                state,
+                worker_task,
+                worktree_path,
+                gate_result,
+                dependency_links=dependency_links,
+                base_ref=base_ref,
+                committed_candidate_sha=committed_candidate_sha,
+                committed_candidate_paths=committed_candidate_paths,
+            )
+            checkpoint["implementation_completed"] = bool(
+                worker._implementation_ready_markers(worker_state).get(
+                    worker_task.task_id
+                )
+            )
+            checkpoint["resume_mode"] = (
+                "gate_recheck"
+                if checkpoint["implementation_completed"]
+                else "implementation"
+            )
+            return checkpoint, ""
+        except Exception as error:
+            checkpoint_reason = (
+                "failed to retain the isolated task candidate before cleanup: "
+                + str(error)
+            )
+            worker._clear_implementation_ready_marker(worker_state, worker_task)
+            return (
+                self._parallel_checkpoint_unavailable(
+                    state,
+                    worker_task,
+                    worktree_path,
+                    base_ref=base_ref,
+                    reason=checkpoint_reason,
+                    gate_result=gate_result,
+                ),
+                checkpoint_reason,
+            )
+
+    def _parallel_gate_command_failure_result(
+        self,
+        state: RunState,
+        worker_state: RunState,
+        worker: "Orchestrator",
+        worker_task: TaskSpec,
+        worktree_path: Path,
+        error: GateCommandExecutionError,
+        *,
+        dependency_links: Iterable[str],
+        base_ref: str,
+        operation: str,
+    ) -> Dict[str, object]:
+        command_result = error.result
+        evidence_sections = []
+        if command_result is not None:
+            if command_result.command:
+                evidence_sections.append(f"$ {command_result.command}")
+            if command_result.stdout:
+                evidence_sections.append(command_result.stdout)
+            if command_result.stderr:
+                evidence_sections.append(command_result.stderr)
+        evidence = self._redacted_verification_command_evidence(
+            "\n".join(evidence_sections) or str(error)
+        )
+        gate_result: Dict[str, object] = {
+            "ok": False,
+            "reason": str(error),
+            "review": str(error),
+            "failure_ids": [],
+            "current_failure_ids": [],
+            "baseline_failure_ids": list(worker_task.verify_baseline_failures),
+            "new_failure_ids": [],
+            "owned_failure_ids": [],
+            "failure_class": "execution_incident",
+            "comparable_failures": False,
+            "baseline_comparison_comparable": False,
+            "redacted_command_evidence": evidence,
+        }
+        implementation_completed = bool(
+            worker._implementation_ready_markers(worker_state).get(
+                worker_task.task_id
+            )
+        )
+        checkpoint, checkpoint_error = self._checkpoint_parallel_lane_failure(
+            state,
+            worker_state,
+            worker,
+            worker_task,
+            worktree_path,
+            gate_result,
+            dependency_links=dependency_links,
+            base_ref=base_ref,
+        )
+        if checkpoint_error:
+            operation = "checkpointing"
+            gate_result["reason"] = (
+                f"{str(error).strip()}; {checkpoint_error}"
+            ).strip("; ")
+            gate_result["review"] = str(gate_result["reason"])
+            gate_result["redacted_command_evidence"] = (
+                self._redacted_verification_command_evidence(
+                    f"{evidence}\n{checkpoint_error}"
+                )
+            )
+            implementation_completed = False
+        command_incident_payload = (
+            {
+                "context": error.context or operation,
+                "baseline": bool(error.baseline),
+                "task_id": error.task_id or worker_task.task_id,
+                "result": self._parallel_command_result_snapshot(command_result),
+            }
+            if command_result is not None
+            else {}
+        )
+        owner = "unknown"
+        if isinstance(error, GateCommandInfrastructureError) or bool(
+            command_result is not None and command_result.infrastructure_error
+        ):
+            owner = "verification_infrastructure"
+        elif isinstance(error, GateCommandBaselineIdentityError):
+            owner = "auto_agents"
+        worker_task.status = "blocked"
+        worker_task.review_summary = str(gate_result["review"])
+        return self._parallel_task_failure_result(
+            worker_task,
+            gate_result,
+            operation=operation,
+            owner=owner,
+            automatic_retryable=not bool(checkpoint_error),
+            resumable=not bool(
+                command_result is not None and command_result.cleanup_incomplete
+            ),
+            base_ref=base_ref,
+            checkpoint=checkpoint,
+            command_incident=command_incident_payload,
+            implementation_completed=implementation_completed,
+        )
+
+    def _parallel_exception_failure_result(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        error: Exception,
+        *,
+        operation: str,
+        base_ref: str,
+        worktree_path: Optional[Path] = None,
+        worker_state: Optional[RunState] = None,
+        worker: Optional["Orchestrator"] = None,
+        dependency_links: Iterable[str] = (),
+        committed_candidate_sha: str = "",
+        committed_candidate_paths: Iterable[str] = (),
+    ) -> Dict[str, object]:
+        redacted_error = self._redacted_verification_command_evidence(error)
+        gate_result: Dict[str, object] = {
+            "ok": False,
+            "reason": f"parallel worktree execution failed: {redacted_error}",
+            "review": "",
+            "failure_ids": [],
+            "current_failure_ids": [],
+            "baseline_failure_ids": list(task.verify_baseline_failures),
+            "new_failure_ids": [],
+            "owned_failure_ids": [],
+            "failure_class": "lane_exception",
+            "comparable_failures": False,
+            "baseline_comparison_comparable": False,
+            "redacted_command_evidence": redacted_error,
+        }
+        checkpoint: Dict[str, object] = {}
+        checkpoint_error = ""
+        implementation_completed = False
+        if worktree_path is not None:
+            checkpoint_worker_state = worker_state or state
+            checkpoint_worker = worker or self
+            implementation_completed = bool(
+                checkpoint_worker._implementation_ready_markers(
+                    checkpoint_worker_state
+                ).get(
+                    task.task_id
+                )
+            )
+            checkpoint, checkpoint_error = self._checkpoint_parallel_lane_failure(
+                state,
+                checkpoint_worker_state,
+                checkpoint_worker,
+                task,
+                worktree_path,
+                gate_result,
+                dependency_links=dependency_links,
+                base_ref=base_ref,
+                committed_candidate_sha=committed_candidate_sha,
+                committed_candidate_paths=committed_candidate_paths,
+            )
+        else:
+            checkpoint = {
+                "schema_version": 1,
+                "task_id": task.task_id,
+                "ref": "",
+                "commit_sha": base_ref,
+                "base_ref": base_ref,
+                "changed_paths": [],
+                "has_candidate_changes": False,
+                "status": "not_created",
+                "reason": "the lane failed before a worktree checkpoint was available",
+                "implementation_completed": False,
+                "resume_mode": "implementation",
+                "created_at": utc_now_iso(),
+            }
+        if checkpoint_error:
+            operation = "checkpointing"
+            gate_result["reason"] = (
+                f"{gate_result['reason']}; {checkpoint_error}"
+            )
+            gate_result["redacted_command_evidence"] = (
+                self._redacted_verification_command_evidence(
+                    f"{redacted_error}\n{checkpoint_error}"
+                )
+            )
+            implementation_completed = False
+        task.status = "blocked"
+        task.review_summary = str(gate_result["review"])
+        return self._parallel_task_failure_result(
+            task,
+            gate_result,
+            operation=operation,
+            owner="auto_agents",
+            automatic_retryable=False,
+            resumable=True,
+            base_ref=base_ref,
+            checkpoint=checkpoint,
+            implementation_completed=implementation_completed,
+        )
 
     def _run_task_in_worktree(
         self,
@@ -18356,12 +21294,22 @@ class Orchestrator:
         base_ref = head_ref(self.project_root) or "HEAD"
         worktree_path = self._parallel_worktree_root() / state.run_id / task_id
         worktree_created = False
+        operation = "dependency_discovery"
+        dependency_links: Mapping[str, Path] = {}
+        worker: Optional[Orchestrator] = None
+        worker_state: Optional[RunState] = None
+        worker_task: Optional[TaskSpec] = None
+        worker_commit_sha = ""
+        worker_changed_paths: List[str] = []
         try:
             dependency_links = discover_dependency_links(self.project_root)
+            operation = "worktree_setup"
             self._reconcile_managed_parallel_worktree(worktree_path)
             add_worktree(self.project_root, worktree_path, ref=base_ref)
             worktree_created = True
+            operation = "dependency_installation"
             install_dependency_links(worktree_path, dependency_links)
+            operation = "worker_initialization"
             worker = self.__class__(
                 worktree_path,
                 agent_output_stream=self.agent_output_stream,
@@ -18384,32 +21332,105 @@ class Orchestrator:
             save_run_state(worktree_path, worker_state)
             worker._persist_tasks(worker_tasks)
             worker_task = next(task for task in worker_tasks if task.task_id == task_id)
+            operation = "baseline_snapshot"
             if worker._ensure_task_verify_baseline(
                 worker_task,
                 state=worker_state,
             ):
                 worker._persist_tasks(worker_tasks)
-            restored_checkpoint_ref = self._restore_task_failure_checkpoint(
-                state,
+            operation = "checkpoint_restore"
+            restored_checkpoint_ref = worker._restore_task_failure_checkpoint(
+                worker_state,
                 worker_task,
                 worktree_path,
             )
-            gate_result = worker._execute_task_with_retries(
+            operation = "implementation"
+            parallel_gate_recheck = self._parallel_lane_gate_recheck_pending(
                 worker_state,
                 worker_task,
-                resume_existing=bool(restored_checkpoint_ref),
             )
+            checkpoint_status = str(
+                worker_state.task_failure_checkpoints.get(worker_task.task_id, {}).get(
+                    "status",
+                    "",
+                )
+            )
+            if checkpoint_status in _PARALLEL_UNUSABLE_CHECKPOINT_STATUSES:
+                restored_checkpoint_ref = ""
+                parallel_gate_recheck = False
+                worker._set_parallel_lane_gate_recheck(
+                    worker_state,
+                    worker_task.task_id,
+                    None,
+                )
+                worker._clear_implementation_ready_marker(
+                    worker_state,
+                    worker_task,
+                )
+            if parallel_gate_recheck:
+                gate_result = worker._execute_task_with_retries(
+                    worker_state,
+                    worker_task,
+                    resume_existing=bool(restored_checkpoint_ref),
+                    gate_recheck_first=True,
+                )
+            else:
+                gate_result = worker._execute_task_with_retries(
+                    worker_state,
+                    worker_task,
+                    resume_existing=bool(restored_checkpoint_ref),
+                )
             if not gate_result["ok"]:
                 worker_task.status = "blocked"
                 worker_task.review_summary = str(gate_result["review"])
-                checkpoint = self._preserve_failed_task_checkpoint(
+                implementation_completed = bool(
+                    worker._implementation_ready_markers(worker_state).get(
+                        worker_task.task_id
+                    )
+                )
+                failure_operation = (
+                    "verification" if implementation_completed else operation
+                )
+                checkpoint, checkpoint_error = self._checkpoint_parallel_lane_failure(
                     state,
+                    worker_state,
+                    worker,
                     worker_task,
                     worktree_path,
                     gate_result,
                     dependency_links=dependency_links,
+                    base_ref=base_ref,
                 )
-                result = self._parallel_task_failure_result(worker_task, gate_result)
+                if checkpoint_error:
+                    failure_operation = "checkpointing"
+                    gate_result = dict(gate_result)
+                    gate_result["reason"] = (
+                        f"{str(gate_result.get('reason', '')).strip()}; "
+                        f"{checkpoint_error}"
+                    ).strip("; ")
+                    gate_result["review"] = str(gate_result["reason"])
+                    gate_result["redacted_command_evidence"] = (
+                        self._redacted_verification_command_evidence(
+                            f"{gate_result.get('redacted_command_evidence', '')}\n"
+                            f"{checkpoint_error}"
+                        )
+                    )
+                    implementation_completed = False
+                result = self._parallel_task_failure_result(
+                    worker_task,
+                    gate_result,
+                    operation=failure_operation,
+                    owner=("auto_agents" if checkpoint_error else ""),
+                    automatic_retryable=(
+                        not checkpoint_error
+                        and str(gate_result.get("failure_class", ""))
+                        != "baseline_only_owned"
+                    ),
+                    resumable=True,
+                    base_ref=base_ref,
+                    checkpoint=checkpoint,
+                    implementation_completed=implementation_completed,
+                )
                 result["retained_verify_baselines"] = (
                     worker._parallel_retained_verify_baseline_handoff(
                         worker_state,
@@ -18446,15 +21467,18 @@ class Orchestrator:
                 task_id=worker_task.task_id,
                 title=worker_task.title,
             )
+            operation = "result_commit"
             worker_commit_sha = commit_all_except(
                 worktree_path,
                 commit_message,
                 exclude_prefixes=self._parallel_commit_exclude_prefixes(
-                    dependency_links
+                    dependency_links,
+                    project_root=worktree_path,
                 ),
             )
             worker_changed_paths = commit_changed_paths(worktree_path, worker_commit_sha)
             result_ref = self._parallel_result_ref(state.run_id, task_id)
+            operation = "result_publication"
             update_ref(self.project_root, result_ref, worker_commit_sha)
             result = {
                 "ok": True,
@@ -18475,17 +21499,67 @@ class Orchestrator:
                 ),
             }
             return dict(self._rebase_parallel_worker_paths(result, worktree_path))
-        except GateCommandExecutionError:
-            raise
+        except GateCommandExecutionError as error:
+            if worker is None or worker_state is None or worker_task is None:
+                source_task = next(
+                    (item for item in tasks if item.task_id == task_id),
+                    None,
+                )
+                if source_task is None:
+                    raise
+                return self._parallel_exception_failure_result(
+                    state,
+                    TaskSpec.from_dict(source_task.to_dict()),
+                    error,
+                    operation=operation,
+                    base_ref=base_ref,
+                    worktree_path=(worktree_path if worktree_created else None),
+                    worker_state=worker_state,
+                    worker=worker,
+                    dependency_links=dependency_links,
+                )
+            failure_operation = (
+                "baseline_verification"
+                if error.baseline
+                else "verification"
+            )
+            return dict(
+                self._rebase_parallel_worker_paths(
+                    self._parallel_gate_command_failure_result(
+                        state,
+                        worker_state,
+                        worker,
+                        worker_task,
+                        worktree_path,
+                        error,
+                        dependency_links=dependency_links,
+                        base_ref=base_ref,
+                        operation=failure_operation,
+                    ),
+                    worktree_path,
+                )
+            )
         except Exception as error:
-            task = next((item for item in tasks if item.task_id == task_id), None)
-            task_payload = task.to_dict() if task is not None else {"task_id": task_id}
-            return {
-                "ok": False,
-                "task": task_payload,
-                "reason": f"parallel worktree execution failed: {error}",
-                "review": "",
-            }
+            source_task = worker_task or next(
+                (item for item in tasks if item.task_id == task_id),
+                None,
+            )
+            if source_task is None:
+                raise
+            result = self._parallel_exception_failure_result(
+                state,
+                TaskSpec.from_dict(source_task.to_dict()),
+                error,
+                operation=operation,
+                base_ref=base_ref,
+                worktree_path=worktree_path if worktree_created else None,
+                worker_state=worker_state,
+                worker=worker,
+                dependency_links=dependency_links,
+                committed_candidate_sha=worker_commit_sha,
+                committed_candidate_paths=worker_changed_paths,
+            )
+            return dict(self._rebase_parallel_worker_paths(result, worktree_path))
         finally:
             if worktree_created:
                 try:
@@ -18632,7 +21706,8 @@ class Orchestrator:
                 worktree_path,
                 commit_message,
                 exclude_prefixes=self._parallel_commit_exclude_prefixes(
-                    dependency_links
+                    dependency_links,
+                    project_root=worktree_path,
                 ),
             )
             if result_ref:
@@ -18663,6 +21738,12 @@ class Orchestrator:
         state: RunState,
         tasks: List[TaskSpec],
     ) -> str:
+        if self._checkpoint_ownership_barrier(
+            state,
+            tasks,
+            allow_owner_execution=False,
+        ):
+            return "blocked"
         pending = self._parallel_pending_integrations(state)
         if not pending:
             return "none"
@@ -18800,6 +21881,557 @@ class Orchestrator:
         updated = TaskSpec.from_dict(payload)
         task.status = updated.status if updated.status in {"pending", "in_progress", "blocked"} else "blocked"
 
+    @staticmethod
+    def _parallel_lane_failure_from_result(
+        task: TaskSpec,
+        result: Mapping[str, object],
+    ) -> ParallelLaneFailure:
+        raw = result.get("parallel_lane_failure", {})
+        if isinstance(raw, Mapping) and raw:
+            return ParallelLaneFailure.from_dict(raw)
+        raw_checkpoint = result.get("failure_checkpoint", {})
+        return ParallelLaneFailure.from_dict(
+            {
+                "task": (
+                    dict(result.get("task", {}))
+                    if isinstance(result.get("task", {}), Mapping)
+                    else task.to_dict()
+                ),
+                "operation": result.get("operation", "worker_execution"),
+                "owner": result.get("owner", "target_project"),
+                "automatic_retryable": result.get(
+                    "automatic_retryable",
+                    bool(result.get("failure_ids", [])),
+                ),
+                "resumable": result.get("resumable", True),
+                "reason": result.get("reason", "parallel task lane failed"),
+                "redacted_evidence": result.get(
+                    "redacted_command_evidence",
+                    result.get("reason", ""),
+                ),
+                "current_failure_ids": result.get(
+                    "current_failure_ids", result.get("failure_ids", [])
+                ),
+                "baseline_failure_ids": result.get(
+                    "baseline_failure_ids", task.verify_baseline_failures
+                ),
+                "new_failure_ids": result.get("new_failure_ids", []),
+                "owned_failure_ids": result.get("owned_failure_ids", []),
+                "failure_class": result.get("failure_class", ""),
+                "baseline_comparison_comparable": result.get(
+                    "baseline_comparison_comparable",
+                    result.get("comparable_failures", True),
+                ),
+                "base_ref": result.get("base_ref", ""),
+                "checkpoint": (
+                    dict(raw_checkpoint)
+                    if isinstance(raw_checkpoint, Mapping)
+                    else {}
+                ),
+                "command_incident": result.get("command_incident", {}),
+                "implementation_completed": result.get(
+                    "implementation_completed", False
+                ),
+            }
+        )
+
+    @staticmethod
+    def _parallel_lane_failure_fingerprint(
+        task: TaskSpec,
+        failure: ParallelLaneFailure,
+    ) -> str:
+        payload = {
+            "kind": _PARALLEL_LANE_FAILURE_KIND,
+            "task_id": task.task_id,
+            "lineage_id": task.parent_task_id or task.task_id,
+            "operation": failure.operation,
+            "owner": failure.owner,
+            "reason": " ".join(failure.reason.split()),
+            "current_failure_ids": failure.current_failure_ids,
+            "baseline_failure_ids": failure.baseline_failure_ids,
+            "new_failure_ids": failure.new_failure_ids,
+            "owned_failure_ids": failure.owned_failure_ids,
+            "failure_class": failure.failure_class,
+            "baseline_comparison_comparable": (
+                failure.baseline_comparison_comparable
+            ),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:24]
+
+    @staticmethod
+    def _parallel_lane_blockers(
+        state: RunState,
+    ) -> List[Dict[str, object]]:
+        return [
+            dict(item)
+            for item in state.localized_blockers
+            if str(item.get("source", "")) == _PARALLEL_LANE_FAILURE_KIND
+        ]
+
+    def _parallel_lane_command_incident(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        failure: ParallelLaneFailure,
+    ) -> Tuple[Optional[ExecutionIncident], bool]:
+        raw_incident = failure.command_incident
+        raw_result = raw_incident.get("result", {})
+        command_result: Optional[CommandResult] = None
+        context = str(raw_incident.get("context", "")).strip()
+        baseline = bool(raw_incident.get("baseline", False))
+        if isinstance(raw_result, Mapping) and raw_result:
+            command_result = self._parallel_command_result_from_snapshot(
+                raw_result
+            )
+        elif (
+            failure.failure_class == "baseline_only_owned"
+            and failure.redacted_evidence
+        ):
+            command = next(
+                (
+                    line[2:].strip()
+                    for line in failure.redacted_evidence.splitlines()
+                    if line.startswith("$ ") and line[2:].strip()
+                ),
+                "",
+            )
+            if command:
+                command_result = CommandResult(
+                    command=command,
+                    ok=False,
+                    returncode=1,
+                    stdout=failure.redacted_evidence,
+                    comparable_failures=True,
+                    termination_reason="abnormal_exit",
+                )
+                context = f"parallel task verification ({task.task_id})"
+        if command_result is None:
+            return None, False
+
+        incident = command_incident(
+            run_id=state.run_id,
+            stage="implement",
+            context=context or f"parallel task lane ({task.task_id})",
+            result=command_result,
+            baseline=baseline,
+            task_id=task.task_id,
+            head_ref=failure.base_ref or head_ref(self.project_root),
+            worktree_fingerprint=str(
+                failure.checkpoint.get("commit_sha", "")
+            ),
+            idle_timeout_seconds=self.config.gates.command_idle_timeout_seconds,
+        )
+        incident = self._merge_or_save_execution_incident(state, incident)
+        diagnosis = deterministic_diagnosis(incident)
+        if (
+            diagnosis is None
+            and failure.command_incident
+            and failure.owner
+            in {"verification_infrastructure", "execution_environment"}
+        ):
+            diagnosis = IncidentDiagnosis(
+                owner=failure.owner,
+                action="REPAIR_INFRASTRUCTURE",
+                confidence=1.0,
+                reason=(
+                    "the typed parallel gate failure assigned ownership to "
+                    f"{failure.owner}"
+                ),
+                evidence=["parallel_lane_failure.command_incident"],
+                cause_status="confirmed",
+                source="deterministic",
+            )
+        if diagnosis is None:
+            diagnosis = self._agent_diagnose_execution_incident(
+                incident,
+                user_context=(
+                    self._operator_inputs.value_for(
+                        f"incident.{incident.incident_id}.operator_response"
+                    )
+                    or ""
+                ),
+            )
+        if diagnosis is None:
+            self._block_for_execution_incident(
+                state,
+                incident,
+                "parallel gate failure ownership could not be diagnosed safely",
+            )
+            return incident, False
+        if (
+            diagnosis.action == "REPAIR_INFRASTRUCTURE"
+            and diagnosis.owner
+            in {"verification_infrastructure", "execution_environment"}
+        ):
+            incident.diagnosis = diagnosis.to_dict()
+            incident.history.append(
+                {"event": "diagnosed", "diagnosis": diagnosis.to_dict()}
+            )
+            self._block_for_execution_incident(
+                state,
+                incident,
+                diagnosis.reason,
+            )
+            return incident, False
+        recovered = self._apply_execution_incident_diagnosis(
+            state,
+            incident,
+            diagnosis,
+        )
+        return incident, bool(recovered or state.status == "waiting_user")
+
+    def _upsert_parallel_lane_blocker(
+        self,
+        state: RunState,
+        task: TaskSpec,
+        failure: ParallelLaneFailure,
+        *,
+        incident: Optional[ExecutionIncident] = None,
+    ) -> Dict[str, object]:
+        fingerprint = self._parallel_lane_failure_fingerprint(task, failure)
+        previous = next(
+            (
+                dict(item)
+                for item in state.localized_blockers
+                if str(item.get("source", ""))
+                == _PARALLEL_LANE_FAILURE_KIND
+                and str(item.get("task_id", "")) == task.task_id
+            ),
+            {},
+        )
+        active = (
+            dict(state.active_blocker)
+            if isinstance(state.active_blocker, dict)
+            and str(state.active_blocker.get("task_id", "")) == task.task_id
+            else {}
+        )
+        checkpoint_status = str(
+            failure.checkpoint.get("status", "")
+        ).strip()
+        resume_mode = str(
+            failure.checkpoint.get("resume_mode", "")
+        ).strip()
+        if checkpoint_status in _PARALLEL_UNUSABLE_CHECKPOINT_STATUSES:
+            resume_mode = "implementation"
+        elif not resume_mode:
+            resume_mode = (
+                "gate_recheck"
+                if failure.implementation_completed
+                else "implementation"
+            )
+        incident_owner = (
+            str(incident.diagnosis.get("owner", "")).strip()
+            if incident is not None
+            else ""
+        )
+        owner = incident_owner or failure.owner or "unknown"
+        reason = (
+            str(active.get("reason", "")).strip()
+            if incident is not None and active
+            else failure.reason
+        ) or "parallel task lane failed"
+        try:
+            run_head = head_ref(self.project_root)
+        except Exception:
+            run_head = failure.base_ref
+        try:
+            run_worktree = worktree_fingerprint(self.project_root)
+        except Exception:
+            run_worktree = ""
+        blocker = {
+            "schema_version": 1,
+            "source": _PARALLEL_LANE_FAILURE_KIND,
+            "owner": owner,
+            "category": (
+                incident.kind
+                if incident is not None
+                else (
+                    "parallel_lane_checkpoint_unavailable"
+                    if checkpoint_status == "unavailable"
+                    else _PARALLEL_LANE_FAILURE_KIND
+                )
+            ),
+            "reason": reason,
+            "incident_id": incident.incident_id if incident is not None else "",
+            "fingerprint": fingerprint,
+            "checkpoint": {
+                "stage": state.current_stage,
+                "head": run_head,
+                "worktree": run_worktree,
+            },
+            "failure_checkpoint": dict(failure.checkpoint),
+            "parallel_lane_failure": failure.to_dict(),
+            "automatic_retryable": failure.automatic_retryable,
+            "resumable": failure.resumable,
+            "resume_mode": resume_mode,
+            "scope": "task_lineage",
+            "task_id": task.task_id,
+            "affected_task_ids": [task.task_id],
+            "lineage_id": task.parent_task_id or task.task_id,
+            "occurrence_count": (
+                int(previous.get("occurrence_count", 0) or 0) + 1
+                if previous
+                else 1
+            ),
+            "resume_attempts": max(
+                int(previous.get("resume_attempts", 0) or 0),
+                int(active.get("resume_attempts", 0) or 0),
+            ),
+            "status": "localized",
+            "updated_at": utc_now_iso(),
+        }
+        state.localized_blockers = [
+            dict(item)
+            for item in state.localized_blockers
+            if str(item.get("task_id", "")) != task.task_id
+        ]
+        state.localized_blockers.append(dict(blocker))
+        self._set_parallel_lane_recovery_task(
+            state,
+            task.task_id,
+            {
+                "schema_version": 1,
+                "mode": resume_mode,
+                "fingerprint": fingerprint,
+                "incident_id": blocker["incident_id"],
+                "updated_at": utc_now_iso(),
+            },
+        )
+        if resume_mode == "gate_recheck":
+            self._set_parallel_lane_gate_recheck(
+                state,
+                task.task_id,
+                {
+                    "schema_version": 1,
+                    "fingerprint": fingerprint,
+                    "incident_id": blocker["incident_id"],
+                    "checkpoint_ref": str(
+                        failure.checkpoint.get("ref", "")
+                    ),
+                    "updated_at": utc_now_iso(),
+                },
+            )
+        else:
+            self._set_parallel_lane_gate_recheck(state, task.task_id, None)
+            self._clear_implementation_ready_marker(state, task)
+        return blocker
+
+    def _refresh_parallel_lane_blocker_state(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> bool:
+        tasks_by_id = {task.task_id: task for task in tasks}
+        active_checkpoint_owner_ids = {
+            task_id
+            for task_id, _checkpoint in (
+                self._active_checkpoint_ownership_records(state)
+            )
+        }
+        retained: List[Dict[str, object]] = []
+        for blocker in self._parallel_lane_blockers(state):
+            task_id = str(blocker.get("task_id", "")).strip()
+            task = tasks_by_id.get(task_id)
+            if (
+                task_id not in active_checkpoint_owner_ids
+                and (task is None or task.status == "done")
+            ):
+                self._set_parallel_lane_gate_recheck(state, task_id, None)
+                self._set_parallel_lane_recovery_task(state, task_id, None)
+                continue
+            retained.append(blocker)
+        other = [
+            dict(item)
+            for item in state.localized_blockers
+            if str(item.get("source", "")) != _PARALLEL_LANE_FAILURE_KIND
+        ]
+        state.localized_blockers = [*other, *retained]
+        if not retained:
+            if str(state.active_blocker.get("source", "")) == (
+                _PARALLEL_LANE_FAILURE_KIND
+            ):
+                state.active_blocker = {}
+                state.last_error = ""
+            return False
+
+        active_task_id = str(state.active_blocker.get("task_id", "")).strip()
+        active = next(
+            (
+                dict(item)
+                for item in retained
+                if str(item.get("task_id", "")) == active_task_id
+            ),
+            dict(retained[0]),
+        )
+        completed = {task.task_id for task in tasks if task.status == "done"}
+        blocked_ids = {
+            str(item.get("task_id", "")).strip() for item in retained
+        }
+        retry_ids = set(self._parallel_sequential_retry_ids(state))
+        resumed_owner_ready = bool(
+            not active_checkpoint_owner_ids
+            and any(
+                task.task_id in blocked_ids
+                and task.task_id in retry_ids
+                and task.status in {"pending", "in_progress"}
+                and all(
+                    dependency in completed
+                    for dependency in task.depends_on
+                )
+                for task in tasks
+            )
+        )
+        independent_ready = bool(
+            not active_checkpoint_owner_ids
+            and self.config.execution.autonomy.continue_independent_tasks
+            and any(
+                task.task_id not in blocked_ids
+                and task.status == "pending"
+                and all(
+                    dependency in completed
+                    for dependency in task.depends_on
+                )
+                for task in tasks
+            )
+        )
+        runnable = resumed_owner_ready or independent_ready
+        active["status"] = "localized" if runnable else "blocked"
+        active["updated_at"] = utc_now_iso()
+        next_incident_id = str(active.get("incident_id", "")).strip()
+        if next_incident_id:
+            state.active_execution_incident_id = next_incident_id
+        else:
+            state.active_execution_incident_id = ""
+        state.active_blocker = active
+        state.status = "pending" if runnable else "blocked"
+        state.last_error = str(active.get("reason", ""))
+        return True
+
+    def _resolve_parallel_lane_recovery_for_task(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+    ) -> None:
+        self._set_parallel_lane_gate_recheck(state, task.task_id, None)
+        self._set_parallel_lane_recovery_task(state, task.task_id, None)
+        state.localized_blockers = [
+            dict(item)
+            for item in state.localized_blockers
+            if str(item.get("task_id", "")) != task.task_id
+        ]
+        self._resolve_inline_task_incident(state, task)
+        self._refresh_parallel_lane_blocker_state(state, tasks)
+
+    def _materialize_parallel_lane_failure(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        task: TaskSpec,
+        result: Mapping[str, object],
+    ) -> Optional[Dict[str, object]]:
+        failure = self._parallel_lane_failure_from_result(task, result)
+        incident: Optional[ExecutionIncident] = None
+        routed = False
+        try:
+            incident, routed = self._parallel_lane_command_incident(
+                state,
+                task,
+                failure,
+            )
+        except Exception as error:
+            failure = ParallelLaneFailure.from_dict(
+                {
+                    **failure.to_dict(),
+                    "owner": "auto_agents",
+                    "automatic_retryable": False,
+                    "reason": (
+                        f"{failure.reason}; failed to persist parallel lane "
+                        f"incident: {error}"
+                    ),
+                    "redacted_evidence": (
+                        f"{failure.redacted_evidence}\n{error}"
+                    ),
+                }
+            )
+            incident = None
+            routed = False
+        if routed:
+            if incident is not None and str(
+                incident.diagnosis.get("action", "")
+            ) == "RETRY":
+                task.status = "pending"
+                retry_ids = self._parallel_sequential_retry_ids(state)
+                self._set_parallel_sequential_retry_ids(
+                    state,
+                    [task.task_id, *retry_ids],
+                    capture_retained_ownership=False,
+                )
+            if state.tasks is not tasks and state.tasks:
+                tasks[:] = state.tasks
+            return None
+        blocker = self._upsert_parallel_lane_blocker(
+            state,
+            task,
+            failure,
+            incident=incident,
+        )
+        self._emit_task_blocked(task, str(blocker.get("reason", "")))
+        return blocker
+
+    def _persist_parallel_lane_failures(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        failures: Iterable[Tuple[TaskSpec, Dict[str, object]]],
+    ) -> List[Dict[str, object]]:
+        blockers: List[Dict[str, object]] = []
+        for task, result in failures:
+            checkpoint = state.task_failure_checkpoints.get(task.task_id, {})
+            if isinstance(checkpoint, dict) and str(
+                checkpoint.get("status", "")
+            ).strip() in _CHECKPOINT_OWNERSHIP_ACTIVE_STATUSES:
+                detachment = self._detach_task_failure_checkpoint(
+                    state,
+                    task.task_id,
+                )
+                checkpoint = state.task_failure_checkpoints.get(
+                    task.task_id,
+                    checkpoint,
+                )
+                result["failure_checkpoint"] = dict(checkpoint)
+                raw_lane_failure = result.get("parallel_lane_failure", {})
+                if isinstance(raw_lane_failure, dict):
+                    lane_failure = dict(raw_lane_failure)
+                    lane_failure["checkpoint"] = dict(checkpoint)
+                    lane_failure["checkpoint_detachment"] = dict(detachment)
+                    result["parallel_lane_failure"] = lane_failure
+                if not bool(detachment.get("ok")):
+                    self._block_unproven_checkpoint_detachment(
+                        state,
+                        tasks,
+                        task.task_id,
+                        checkpoint,
+                        detachment,
+                    )
+                    blockers.append(dict(state.active_blocker))
+                    continue
+            blocker = self._materialize_parallel_lane_failure(
+                state,
+                tasks,
+                task,
+                result,
+            )
+            if blocker is not None:
+                blockers.append(blocker)
+        self._refresh_parallel_lane_blocker_state(state, tasks)
+        self._persist_parallel_runtime_state(state, tasks)
+        return blockers
+
     def _format_parallel_batch_failure_error(self, failures: List[Tuple[TaskSpec, Dict[str, object]]]) -> str:
         if not failures:
             return "parallel task batch failed"
@@ -18812,6 +22444,7 @@ class Orchestrator:
     def _task_recovery_payload_from_history(self, task: TaskSpec, state: RunState) -> Dict[str, object]:
         failure_ids: List[str] = []
         comparable = True
+        provenance: Dict[str, object] = {}
         for entry in reversed(task.verify_history):
             if not isinstance(entry, dict) or str(entry.get("decision", "")) != "fail":
                 continue
@@ -18819,6 +22452,12 @@ class Orchestrator:
             if isinstance(raw_ids, list):
                 failure_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
             comparable = bool(entry.get("comparable_failures", True))
+            provenance = self._task_verification_failure_provenance_from_result(
+                task,
+                entry,
+                fallback_failure_ids=failure_ids,
+                fallback_baseline_failure_ids=task.verify_baseline_failures,
+            )
             break
         expected = f"Task {task.task_id} failed gates: review rejected the task"
         reason = (
@@ -18830,6 +22469,7 @@ class Orchestrator:
             "reason": reason,
             "review": task.review_summary,
             "failure_ids": failure_ids,
+            **provenance,
             "comparable_failures": comparable,
         }
 
@@ -19092,8 +22732,32 @@ class Orchestrator:
         tasks: Optional[Iterable[TaskSpec]] = None,
     ) -> List[str]:
         comparable = bool(result.get("comparable_failures", True))
-        raw_ids = result.get("failure_ids", [])
+        has_explicit_new_failure_set = any(
+            key in result
+            for key in (
+                "current_failure_ids",
+                "baseline_failure_ids",
+                "new_failure_ids",
+            )
+        )
+        provenance = (
+            self._task_verification_failure_provenance_from_result(
+                task,
+                result,
+                fallback_failure_ids=result.get("failure_ids", []) or [],
+                fallback_baseline_failure_ids=task.verify_baseline_failures,
+            )
+            if has_explicit_new_failure_set
+            else {}
+        )
+        raw_ids = (
+            provenance.get("new_failure_ids", [])
+            if has_explicit_new_failure_set
+            else result.get("failure_ids", [])
+        )
         failure_ids = [str(item).strip() for item in raw_ids if str(item).strip()] if isinstance(raw_ids, list) else []
+        if has_explicit_new_failure_set and not failure_ids:
+            return []
         repeated_non_comparable = (
             not comparable
             and self._has_repeated_non_comparable_failure_set(task, failure_ids)
@@ -23187,6 +26851,48 @@ class Orchestrator:
             return False
 
         reason = str(result.get("reason", "")).strip()
+        provenance = self._task_verification_failure_provenance_from_result(
+            task,
+            result,
+            fallback_failure_ids=result.get("failure_ids", []) or [],
+            fallback_baseline_failure_ids=task.verify_baseline_failures,
+        )
+        if (
+            str(provenance.get("failure_class", "")) == "baseline_only_owned"
+            and not provenance.get("new_failure_ids")
+            and provenance.get("current_failure_ids")
+        ):
+            owned_failure_ids = list(
+                provenance.get("owned_failure_ids", []) or []
+            )
+            owner_stage, owner_feedback, _owner_refs = (
+                self._verification_failure_owner_route_details(
+                    task,
+                    result,
+                    tasks=tasks,
+                )
+            )
+            if not owner_stage:
+                self._record_recovery_route(
+                    state,
+                    task,
+                    outcome="not_recoverable",
+                    failure_kind=self._recovery_failure_kind(reason),
+                    reason=(
+                        reason
+                        or "explicitly owned verification failures are unchanged "
+                        "from the task baseline"
+                    ),
+                    failure_ids=owned_failure_ids,
+                    engine_invariant="no_new_verification_failures",
+                )
+                self.logger.info(
+                    "[recovery] task=%s outcome=baseline-only-owned "
+                    "new_failures=0 action=skip-candidate-repair",
+                    task.task_id,
+                )
+                return False
+            reason = owner_feedback or reason
         feedback = (
             str(result.get("review", "")).strip()
             or reason
@@ -24195,13 +27901,24 @@ class Orchestrator:
         task_commands = self._build_task_verify_commands(task)
         quick_failure = self._quick_verify_failure(task_commands if task_commands else None)
         if quick_failure:
+            current_failure_ids = self._normalize_verify_failure_ids(
+                [], quick_failure
+            )
+            baseline_failure_ids = (
+                list(task.verify_baseline_failures) if task is not None else []
+            )
+            provenance = self._task_verification_failure_provenance(
+                task,
+                current_failure_ids=current_failure_ids,
+                baseline_failure_ids=baseline_failure_ids,
+                new_failure_ids=current_failure_ids,
+                comparison_comparable=False,
+            )
             return {
                 "ok": False,
                 "reason": quick_failure,
-                "failure_ids": self._normalize_verify_failure_ids([], quick_failure),
-                "current_failure_ids": self._normalize_verify_failure_ids([], quick_failure),
-                "baseline_failure_ids": list(task.verify_baseline_failures) if task is not None else [],
-                "new_failure_ids": self._normalize_verify_failure_ids([], quick_failure),
+                "failure_ids": current_failure_ids,
+                **provenance,
                 "raw_output": quick_failure,
                 "comparable_failures": False,
             }
@@ -24212,15 +27929,26 @@ class Orchestrator:
                     requirements_audit_check.get("failure_ids", []),
                     str(requirements_audit_check.get("reason", "")),
                 )
+                baseline_failure_ids = (
+                    list(task.verify_baseline_failures)
+                    if task is not None
+                    else []
+                )
+                audit_new_failure_ids = sorted(
+                    set(audit_failure_ids) - set(baseline_failure_ids)
+                )
+                provenance = self._task_verification_failure_provenance(
+                    task,
+                    current_failure_ids=audit_failure_ids,
+                    baseline_failure_ids=baseline_failure_ids,
+                    new_failure_ids=audit_new_failure_ids,
+                    comparison_comparable=True,
+                )
                 failure_result = {
                     "ok": False,
                     "reason": str(requirements_audit_check["reason"]),
-                    "failure_ids": audit_failure_ids,
-                    "current_failure_ids": audit_failure_ids,
-                    "baseline_failure_ids": (
-                        list(task.verify_baseline_failures) if task is not None else []
-                    ),
-                    "new_failure_ids": audit_failure_ids,
+                    "failure_ids": audit_new_failure_ids or audit_failure_ids,
+                    **provenance,
                     "raw_output": str(requirements_audit_check.get("raw_output", "")),
                     "comparable_failures": True,
                 }
@@ -24285,13 +28013,21 @@ class Orchestrator:
             )
         if mutation_error:
             failure_ids = self._normalize_verify_failure_ids([], mutation_error)
+            baseline_failure_ids = (
+                list(task.verify_baseline_failures) if task is not None else []
+            )
+            provenance = self._task_verification_failure_provenance(
+                task,
+                current_failure_ids=failure_ids,
+                baseline_failure_ids=baseline_failure_ids,
+                new_failure_ids=failure_ids,
+                comparison_comparable=False,
+            )
             return {
                 "ok": False,
                 "reason": mutation_error,
                 "failure_ids": failure_ids,
-                "current_failure_ids": failure_ids,
-                "baseline_failure_ids": list(task.verify_baseline_failures) if task is not None else [],
-                "new_failure_ids": failure_ids,
+                **provenance,
                 "raw_output": mutation_error,
                 "comparable_failures": False,
             }
@@ -24316,16 +28052,18 @@ class Orchestrator:
         if not verify_gate.ok and not extraction.comparable:
             diagnostic_gate = self._run_verify_failure_identity_diagnostic(verify_gate)
             if diagnostic_gate is not None:
-                diagnostic_extraction = extract_failure_info(diagnostic_gate)
                 diagnostic_raw_output = self._gate_raw_output(diagnostic_gate)
                 if diagnostic_raw_output.strip():
                     raw_output = (
                         f"{raw_output.rstrip()}\n\n=== Failure Identity Diagnostic ===\n"
                         f"{diagnostic_raw_output.strip()}\n"
                     ).strip()
-                if diagnostic_extraction.comparable and diagnostic_extraction.failure_ids:
-                    extraction = diagnostic_extraction
-                    diagnostic_identity_only = True
+                extraction, diagnostic_identity_only = (
+                    self._merge_verify_failure_identity_diagnostic(
+                        verify_gate,
+                        diagnostic_gate,
+                    )
+                )
         current_failure_ids = (
             self._normalize_verify_failure_ids(extraction.failure_ids, verify_gate.summary)
             if extraction.failure_ids
@@ -24372,21 +28110,34 @@ class Orchestrator:
                     diagnostic_gate=diagnostic_gate,
                 )
             )
-            if baseline_not_applicable_commands:
-                lazy_failures = []
-                for command in baseline_not_applicable_commands:
-                    self.logger.info(
-                        "[gate-baseline] context=lazy task=%s state=not_applicable "
-                        "reason=target_absent_at_baseline command=%s",
-                        task.task_id,
-                        command[:300],
-                    )
-            else:
-                lazy_failures = self._validated_baseline_failures(
-                    baseline_gate,
+            for command in baseline_not_applicable_commands:
+                self.logger.info(
+                    "[gate-baseline] context=lazy task=%s state=not_applicable "
+                    "reason=target_absent_at_baseline command=%s",
+                    task.task_id,
+                    command[:300],
+                )
+            not_applicable = set(baseline_not_applicable_commands)
+            baseline_validation_commands = [
+                result
+                for result in baseline_gate.commands
+                if result.command not in not_applicable
+            ]
+            baseline_validation_gate = GateResult(
+                ok=all(result.ok for result in baseline_validation_commands),
+                commands=baseline_validation_commands,
+                summary=baseline_gate.summary,
+                comparable_failures=baseline_gate.comparable_failures,
+            )
+            lazy_failures = (
+                self._validated_baseline_failures(
+                    baseline_validation_gate,
                     context=f"lazy task baseline verification ({task.task_id})",
                     task_id=task.task_id,
                 )
+                if not baseline_validation_gate.ok
+                else []
+            )
             task.verify_baseline_failures = list(
                 dict.fromkeys([*task.verify_baseline_failures, *lazy_failures])
             )
@@ -24426,9 +28177,28 @@ class Orchestrator:
         )
         if baseline_identity_transition:
             new_failure_ids = []
+        actionable_new_failure_ids = list(new_failure_ids)
         if task is not None and task.expected_test_migrations:
             allowed_migrations = {str(item) for item in task.expected_test_migrations}
-            new_failure_ids = [fid for fid in new_failure_ids if fid not in allowed_migrations]
+            actionable_new_failure_ids = [
+                failure_id
+                for failure_id in actionable_new_failure_ids
+                if failure_id not in allowed_migrations
+            ]
+        provenance = self._task_verification_failure_provenance(
+            task,
+            current_failure_ids=current_failure_ids,
+            baseline_failure_ids=baseline_failure_ids,
+            new_failure_ids=new_failure_ids,
+            comparison_comparable=comparison_comparable,
+            failure_class=(
+                "baseline_identity_transition"
+                if baseline_identity_transition
+                else ""
+            ),
+        )
+        owned_failure_ids = list(provenance["owned_failure_ids"])
+        failure_class = str(provenance["failure_class"])
         raw_log_path = ""
         if not verify_gate.ok:
             raw_log_path = self._persist_failed_verification_log(raw_output, label="task-verify")
@@ -24436,7 +28206,7 @@ class Orchestrator:
         absolute_owned_verification = bool(
             task is not None
             and (
-                (self._is_repair_task(task) and task.verification_refs)
+                (self._is_repair_task(task) and owned_failure_ids)
                 or self._task_depends_on_requirements_audit(task)
             )
         )
@@ -24445,20 +28215,33 @@ class Orchestrator:
             and comparison_comparable
             and not diagnostic_identity_only
             and current_failure_ids
-            and not new_failure_ids
+            and not actionable_new_failure_ids
             and not absolute_owned_verification
         ):
             baseline_only_reason = (
                 f"task baseline only: {len(current_failure_ids)} pre-existing failure(s) remain"
             )
         if not verify_gate.ok and not baseline_only_reason:
-            effective_failure_ids = new_failure_ids or current_failure_ids
+            effective_failure_ids = (
+                list(actionable_new_failure_ids)
+                if actionable_new_failure_ids
+                else list(current_failure_ids)
+            )
+            retry_candidate_failure_ids = (
+                list(actionable_new_failure_ids)
+                if comparison_comparable and not baseline_identity_transition
+                else (
+                    []
+                    if baseline_identity_transition
+                    else list(current_failure_ids)
+                )
+            )
             is_repair_task = self._is_repair_task(task)
             retryable_missing_owned_evidence = (
                 is_repair_task
                 and self._all_failures_are_missing_owned_pytest_evidence_refs(
                     task,
-                    effective_failure_ids,
+                    retry_candidate_failure_ids,
                 )
             )
             retryable_owned_evidence = (
@@ -24467,7 +28250,7 @@ class Orchestrator:
                     retryable_missing_owned_evidence
                     or self._all_failures_are_owned_pytest_evidence_refs(
                         task,
-                        effective_failure_ids,
+                        retry_candidate_failure_ids,
                     )
                 )
             )
@@ -24493,16 +28276,29 @@ class Orchestrator:
                 )
                 if raw_log_path:
                     reason = f"{reason}; raw log: {raw_log_path}"
-            elif task is not None and new_failure_ids:
+            elif task is not None and actionable_new_failure_ids:
                 reason = (
-                    f"{len(new_failure_ids)} new verification failure(s) vs task baseline: "
-                    + ", ".join(new_failure_ids[:10])
+                    f"{len(actionable_new_failure_ids)} new verification failure(s) "
+                    "vs task baseline: "
+                    + ", ".join(actionable_new_failure_ids[:10])
                 )
+            elif failure_class == "baseline_only_owned":
+                reason = (
+                    f"{len(owned_failure_ids)} explicitly owned verification failure(s) "
+                    "remain unchanged from the task baseline: "
+                    + ", ".join(owned_failure_ids[:10])
+                )
+                if raw_log_path:
+                    reason = f"{reason}; raw log: {raw_log_path}"
             else:
                 reason = verify_gate.summary
             out_of_scope_reason = self._task_verify_contract_scope_reason(
                 task,
-                new_failure_ids or effective_failure_ids,
+                (
+                    actionable_new_failure_ids
+                    if comparison_comparable
+                    else effective_failure_ids
+                ),
                 task_scope_label=task_scope_label,
             )
             if out_of_scope_reason:
@@ -24510,17 +28306,13 @@ class Orchestrator:
                     "ok": False,
                     "reason": out_of_scope_reason,
                     "failure_ids": effective_failure_ids,
-                    "current_failure_ids": current_failure_ids,
-                    "baseline_failure_ids": baseline_failure_ids,
-                    "new_failure_ids": (
-                        []
-                        if baseline_identity_transition
-                        else new_failure_ids or effective_failure_ids
-                    ),
+                    **provenance,
                     "raw_output": raw_output,
                     "raw_log_path": raw_log_path,
+                    "redacted_command_evidence": (
+                        self._redacted_verification_command_evidence(raw_output)
+                    ),
                     "comparable_failures": extraction.comparable,
-                    "baseline_comparison_comparable": comparison_comparable,
                     "retryable_missing_owned_evidence_refs": retryable_missing_owned_evidence,
                     "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
                     "contract_scope_issue": True,
@@ -24532,17 +28324,13 @@ class Orchestrator:
                 "ok": False,
                 "reason": reason,
                 "failure_ids": effective_failure_ids,
-                "current_failure_ids": current_failure_ids,
-                "baseline_failure_ids": baseline_failure_ids,
-                "new_failure_ids": (
-                    []
-                    if baseline_identity_transition
-                    else new_failure_ids or effective_failure_ids
-                ),
+                **provenance,
                 "raw_output": raw_output,
                 "raw_log_path": raw_log_path,
+                "redacted_command_evidence": (
+                    self._redacted_verification_command_evidence(raw_output)
+                ),
                 "comparable_failures": extraction.comparable,
-                "baseline_comparison_comparable": comparison_comparable,
                 "baseline_identity_transition": baseline_identity_transition,
                 "retryable_missing_owned_evidence_refs": retryable_missing_owned_evidence,
                 "retryable_owned_evidence_failure_refs": retryable_owned_evidence,
@@ -24557,13 +28345,21 @@ class Orchestrator:
         )
         if portability_failure is not None:
             failure_ids = list(portability_failure["failure_ids"])
+            introduced_failure_ids = sorted(
+                set(failure_ids) - set(baseline_failure_ids)
+            )
+            portability_provenance = self._task_verification_failure_provenance(
+                task,
+                current_failure_ids=failure_ids,
+                baseline_failure_ids=baseline_failure_ids,
+                new_failure_ids=introduced_failure_ids,
+                comparison_comparable=True,
+            )
             return {
                 "ok": False,
                 "reason": str(portability_failure["reason"]),
-                "failure_ids": failure_ids,
-                "current_failure_ids": failure_ids,
-                "baseline_failure_ids": baseline_failure_ids,
-                "new_failure_ids": failure_ids,
+                "failure_ids": introduced_failure_ids or failure_ids,
+                **portability_provenance,
                 "raw_output": str(portability_failure["reason"]),
                 "comparable_failures": True,
                 "verification_contract_failure": True,
@@ -24574,13 +28370,21 @@ class Orchestrator:
                 stale_plan_audit.get("failure_ids", []),
                 str(stale_plan_audit.get("reason", "")),
             )
+            stale_new_failure_ids = sorted(
+                set(stale_failure_ids) - set(baseline_failure_ids)
+            )
+            stale_provenance = self._task_verification_failure_provenance(
+                task,
+                current_failure_ids=stale_failure_ids,
+                baseline_failure_ids=baseline_failure_ids,
+                new_failure_ids=stale_new_failure_ids,
+                comparison_comparable=True,
+            )
             return {
                 "ok": False,
                 "reason": str(stale_plan_audit["reason"]),
-                "failure_ids": stale_failure_ids,
-                "current_failure_ids": stale_failure_ids,
-                "baseline_failure_ids": baseline_failure_ids,
-                "new_failure_ids": stale_failure_ids,
+                "failure_ids": stale_new_failure_ids or stale_failure_ids,
+                **stale_provenance,
                 "raw_output": str(stale_plan_audit.get("raw_output", "")),
             }
         stale_status_audit = self._run_task_status_coupled_test_audit(
@@ -24592,13 +28396,21 @@ class Orchestrator:
                 stale_status_audit.get("failure_ids", []),
                 str(stale_status_audit.get("reason", "")),
             )
+            stale_new_failure_ids = sorted(
+                set(stale_failure_ids) - set(baseline_failure_ids)
+            )
+            stale_provenance = self._task_verification_failure_provenance(
+                task,
+                current_failure_ids=stale_failure_ids,
+                baseline_failure_ids=baseline_failure_ids,
+                new_failure_ids=stale_new_failure_ids,
+                comparison_comparable=True,
+            )
             return {
                 "ok": False,
                 "reason": str(stale_status_audit["reason"]),
-                "failure_ids": stale_failure_ids,
-                "current_failure_ids": stale_failure_ids,
-                "baseline_failure_ids": baseline_failure_ids,
-                "new_failure_ids": stale_failure_ids,
+                "failure_ids": stale_new_failure_ids or stale_failure_ids,
+                **stale_provenance,
                 "raw_output": str(stale_status_audit.get("raw_output", "")),
             }
         proof_evidence = self._run_task_proof_evidence(task)
@@ -24607,13 +28419,21 @@ class Orchestrator:
                 proof_evidence.get("failure_ids", []),
                 str(proof_evidence.get("reason", "")),
             )
+            proof_new_failure_ids = sorted(
+                set(failure_ids) - set(baseline_failure_ids)
+            )
+            proof_provenance = self._task_verification_failure_provenance(
+                task,
+                current_failure_ids=failure_ids,
+                baseline_failure_ids=baseline_failure_ids,
+                new_failure_ids=proof_new_failure_ids,
+                comparison_comparable=True,
+            )
             return {
                 "ok": False,
                 "reason": str(proof_evidence.get("reason", "")),
-                "failure_ids": failure_ids,
-                "current_failure_ids": failure_ids,
-                "baseline_failure_ids": baseline_failure_ids,
-                "new_failure_ids": failure_ids,
+                "failure_ids": proof_new_failure_ids or failure_ids,
+                **proof_provenance,
                 "raw_output": str(proof_evidence.get("raw_output", "")),
                 "proof_evidence": proof_evidence,
             }
@@ -24621,13 +28441,10 @@ class Orchestrator:
             "ok": True,
             "reason": baseline_only_reason or verify_gate.summary,
             "failure_ids": [],
-            "current_failure_ids": current_failure_ids,
-            "baseline_failure_ids": baseline_failure_ids,
-            "new_failure_ids": [],
+            **provenance,
             "raw_output": raw_output,
             "raw_log_path": raw_log_path,
             "comparable_failures": extraction.comparable,
-            "baseline_comparison_comparable": comparison_comparable,
             "proof_evidence": proof_evidence,
             "baseline_not_applicable_commands": list(
                 baseline_not_applicable_commands
@@ -24915,6 +28732,28 @@ class Orchestrator:
         for step in self.config.gates.steps:
             if step.runner.strip().lower() != runner:
                 continue
+            if runner == "pytest":
+                step_is_fallback = False
+                for raw_target in step.targets:
+                    if not raw_target.strip():
+                        continue
+                    target_path, target_selector = self._split_evidence_ref(
+                        raw_target
+                    )
+                    normalized_target_path = (
+                        target_path.replace("\\", "/")
+                        .strip()
+                        .removeprefix("./")
+                    )
+                    if normalized_target_path != normalized_path:
+                        continue
+                    if target_selector == selector:
+                        return step
+                    if selector and not target_selector:
+                        step_is_fallback = True
+                if step_is_fallback and fallback is None:
+                    fallback = step
+                continue
             targets = {
                 target.replace("\\", "/").strip().removeprefix("./")
                 for target in step.targets
@@ -24946,10 +28785,10 @@ class Orchestrator:
         }
         if task is None:
             return metadata
-        command_set = set(commands)
+        command_set = set(metadata)
         for ref in self._task_gate_evidence_refs(task):
             command = self._build_task_proof_evidence_command_for_ref(ref)
-            if not command or command not in command_set or metadata.get(command):
+            if not command or command not in command_set:
                 continue
             runner = (
                 "pytest"
@@ -24970,17 +28809,85 @@ class Orchestrator:
                 step,
                 project_root=self.project_root,
             )
+            configured_matches = [
+                candidate
+                for candidate in self._verification_steps_for_evidence_ref(
+                    self.config.gates.steps,
+                    ref,
+                )
+                if candidate.runner.strip().lower() == runner
+                and command_from_verification_step(
+                    candidate,
+                    project_root=self.project_root,
+                )
+                == producer_command
+            ]
+            expected_plan = resolve_gate_plan_from_verification_steps(
+                configured_matches or [step],
+                self.project_root,
+                phase="final",
+            )
+            expected_metadata = expected_plan.metadata.get(producer_command)
             producer_metadata = known.get(producer_command)
             if producer_metadata is None:
-                resolved = resolve_gate_plan_from_verification_steps(
-                    [step],
-                    self.project_root,
-                    phase="final",
-                )
-                producer_metadata = resolved.metadata.get(producer_command)
-            if producer_metadata is not None:
+                producer_metadata = expected_metadata
+            if not metadata.get(command) and producer_metadata is not None:
                 metadata[command] = producer_metadata
+            missing_fields = self._missing_task_gate_metadata_fields(
+                expected_metadata,
+                metadata.get(command),
+            )
+            if missing_fields:
+                self.logger.warning(
+                    "[gate-metadata] incomplete selector context task=%s "
+                    "task_ref=%s producer_proof=%s command=%s "
+                    "missing_declared_fields=%s",
+                    task.task_id,
+                    ref,
+                    step.proof_id or "<unnamed>",
+                    command,
+                    ",".join(missing_fields),
+                )
         return metadata
+
+    @staticmethod
+    def _task_gate_metadata_value(metadata: object, field_name: str) -> object:
+        if isinstance(metadata, Mapping):
+            return metadata.get(field_name)
+        return getattr(metadata, field_name, None)
+
+    @classmethod
+    def _missing_task_gate_metadata_fields(
+        cls,
+        expected: object,
+        effective: object,
+    ) -> List[str]:
+        if expected is None:
+            return []
+        missing: List[str] = []
+        for field_name in _TASK_GATE_OPERATIONAL_METADATA_FIELDS:
+            expected_value = cls._task_gate_metadata_value(
+                expected,
+                field_name,
+            )
+            if expected_value in (None, "", 0, [], (), set(), frozenset()):
+                continue
+            effective_value = cls._task_gate_metadata_value(
+                effective,
+                field_name,
+            )
+            if isinstance(expected_value, (list, tuple, set, frozenset)):
+                effective_items = (
+                    effective_value
+                    if isinstance(effective_value, (list, tuple, set, frozenset))
+                    else ()
+                )
+                if any(item not in effective_items for item in expected_value):
+                    missing.append(field_name)
+                continue
+            if effective_value != expected_value:
+                missing.append(field_name)
+        return missing
 
     @staticmethod
     def _looks_like_vitest_evidence_ref(ref: str) -> bool:
@@ -25341,13 +29248,113 @@ class Orchestrator:
         return task.task_origin == "evidence_repair"
 
     def _owned_pytest_evidence_refs(self, task: Optional[TaskSpec]) -> Set[str]:
-        if task is None:
-            return set()
         return {
-            self._canonical_project_evidence_ref(ref)
-            for ref in self._task_planned_evidence_refs(task)
+            ref
+            for ref in self._owned_task_evidence_identity_refs(task)
             if self._looks_like_pytest_evidence_ref(ref)
         }
+
+    def _owned_task_evidence_identity_refs(
+        self,
+        task: Optional[TaskSpec],
+    ) -> List[str]:
+        """Return canonical identities represented by explicit task evidence."""
+
+        if task is None:
+            return []
+        identities: List[str] = []
+        for ref in self._task_planned_evidence_refs(task):
+            candidates = [ref]
+            command = self._command_evidence_ref_command(ref)
+            if command:
+                candidates.extend(
+                    target
+                    for target in self._pytest_targets_from_command(command)
+                    if self._looks_like_pytest_evidence_ref(target)
+                )
+            for candidate in candidates:
+                canonical = self._canonical_project_evidence_ref(candidate)
+                if canonical and canonical not in identities:
+                    identities.append(canonical)
+        return identities
+
+    @staticmethod
+    def _evidence_identity_owns_candidate(
+        owned_ref: str,
+        candidate: str,
+    ) -> bool:
+        """Return whether an evidence identity contains an observed node."""
+
+        if candidate == owned_ref:
+            return True
+        candidate_path, candidate_selector = Orchestrator._split_evidence_ref(
+            candidate
+        )
+        owned_path, owned_selector = Orchestrator._split_evidence_ref(owned_ref)
+        if candidate_path != owned_path:
+            return False
+        return bool(
+            not owned_selector
+            or candidate_selector == owned_selector
+            or candidate_selector.startswith(owned_selector + "::")
+            or candidate_selector.startswith(owned_selector + "[")
+        )
+
+    def _owned_task_failure_ids(
+        self,
+        task: Optional[TaskSpec],
+        failure_ids: Iterable[str],
+    ) -> List[str]:
+        """Return observed failures owned by explicit task verification/proof refs."""
+
+        if task is None:
+            return []
+        owned_refs = self._owned_task_evidence_identity_refs(task)
+        if not owned_refs:
+            return []
+
+        def matches_owned_ref(candidate: str) -> bool:
+            normalized = self._canonical_project_evidence_ref(candidate)
+            if not normalized:
+                return False
+            return any(
+                self._evidence_identity_owns_candidate(owned_ref, normalized)
+                for owned_ref in owned_refs
+            )
+
+        owned_failures: Set[str] = set()
+        for raw_failure_id in failure_ids:
+            failure_id = str(raw_failure_id).strip()
+            if not failure_id:
+                continue
+            candidates = [failure_id]
+            missing_ref = self._extract_pytest_not_found_ref(failure_id)
+            if missing_ref:
+                candidates.append(missing_ref)
+            _contract_kind, artifact_ref = (
+                self._structured_verification_contract_failure(failure_id)
+            )
+            if artifact_ref:
+                candidates.append(artifact_ref)
+            vitest_path, vitest_selector = self._split_vitest_failure_identity(
+                failure_id
+            )
+            if vitest_path:
+                candidates.append(
+                    f"{vitest_path}::{vitest_selector}"
+                    if vitest_selector
+                    else vitest_path
+                )
+                resolved_vitest_ref = self._resolve_owned_vitest_failure_ref(
+                    task,
+                    failure_id,
+                    [task],
+                )
+                if resolved_vitest_ref:
+                    candidates.append(resolved_vitest_ref)
+            if any(matches_owned_ref(candidate) for candidate in candidates):
+                owned_failures.add(failure_id)
+        return sorted(owned_failures)
 
     def _all_failures_are_owned_pytest_evidence_refs(
         self,
@@ -25363,7 +29370,11 @@ class Orchestrator:
             if str(failure_id).strip()
         ]
         return bool(normalized_failures) and all(
-            failure_id in owned_refs for failure_id in normalized_failures
+            any(
+                self._evidence_identity_owns_candidate(owned_ref, failure_id)
+                for owned_ref in owned_refs
+            )
+            for failure_id in normalized_failures
         )
 
     def _all_failures_are_missing_owned_pytest_evidence_refs(
@@ -25379,7 +29390,14 @@ class Orchestrator:
             for failure_id in failure_ids
             if str(failure_id).strip()
         ]
-        return bool(missing_refs) and all(ref in owned_refs for ref in missing_refs)
+        return bool(missing_refs) and all(
+            bool(ref)
+            and any(
+                self._evidence_identity_owns_candidate(owned_ref, ref)
+                for owned_ref in owned_refs
+            )
+            for ref in missing_refs
+        )
 
     def _run_task_proof_evidence(self, task: Optional[TaskSpec]) -> Optional[Dict[str, object]]:
         if task is None:
@@ -26113,9 +30131,15 @@ class Orchestrator:
         )
 
         try:
+            dependency_links = discover_dependency_links(self.project_root)
             snapshot = GateSnapshotManager(
                 self.project_root,
                 self._retained_verify_baseline_snapshot_plan_id(state, record),
+                excluded_paths=repository_exclusion_paths(
+                    self.project_root,
+                    dependency_links=dependency_links,
+                    surface_paths=GATE_SNAPSHOT_RUNTIME_PATHS,
+                ),
             ).create_from_commit_paths(
                 base_ref=base_commit,
                 source_ref=source_commit,
@@ -26553,9 +30577,15 @@ class Orchestrator:
             )
         )
         snapshot_id = hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+        dependency_links = discover_dependency_links(self.project_root)
         snapshot = GateSnapshotManager(
             self.project_root,
             f"task-baseline-{snapshot_id}",
+            excluded_paths=repository_exclusion_paths(
+                self.project_root,
+                dependency_links=dependency_links,
+                surface_paths=GATE_SNAPSHOT_RUNTIME_PATHS,
+            ),
         ).create()
         self.logger.info(
             "[gate-baseline] task=%s state=exact_snapshot ref=%s",
@@ -26601,10 +30631,85 @@ class Orchestrator:
         return True
 
     @staticmethod
-    def _is_missing_pytest_target_result(result: CommandResult) -> bool:
-        if result.ok or result.returncode != 4:
-            return False
-        if not build_failure_identity_diagnostic_command(result.command):
+    def _pytest_targets_from_command(command: str) -> List[str]:
+        """Return positional targets from a direct pytest command."""
+
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return []
+        parts = _unwrap_conda_run(parts)
+        if not parts:
+            return []
+
+        executable = Path(parts[0]).name
+        if executable in {"pytest", "py.test"}:
+            args = parts[1:]
+        elif (
+            len(parts) >= 3
+            and Path(parts[0]).name in {"python", "python3"}
+            and parts[1:3] == ["-m", "pytest"]
+        ):
+            args = parts[3:]
+        else:
+            return []
+
+        targets: List[str] = []
+        index = 0
+        options_done = False
+        while index < len(args):
+            arg = args[index]
+            if not options_done and arg == "--":
+                options_done = True
+                index += 1
+                continue
+            if not options_done and arg.startswith("-"):
+                option = arg.split("=", 1)[0]
+                if (
+                    (option in PYTEST_VALUE_OPTIONS or option == "-o")
+                    and "=" not in arg
+                ):
+                    if index + 1 >= len(args):
+                        return []
+                    index += 2
+                    continue
+                index += 1
+                continue
+            targets.append(arg)
+            index += 1
+
+        return targets
+
+    @classmethod
+    def _exact_pytest_node_from_command(cls, command: str) -> str:
+        """Return the sole selector-qualified pytest target, if unambiguous."""
+
+        targets = cls._pytest_targets_from_command(command)
+        if len(targets) != 1:
+            return ""
+        node = targets[0].strip()
+        path, separator, selector = node.partition("::")
+        if not separator or not path.strip() or not selector.strip():
+            return ""
+        return node
+
+    @staticmethod
+    def _command_result_is_operationally_clean(result: CommandResult) -> bool:
+        return not (
+            result.termination_reason
+            or result.cleanup_incomplete
+            or result.infrastructure_error
+            or result.infrastructure_failure_id
+        )
+
+    @classmethod
+    def _is_missing_pytest_target_result(cls, result: CommandResult) -> bool:
+        if (
+            result.ok
+            or result.returncode != 4
+            or not cls._command_result_is_operationally_clean(result)
+            or not cls._exact_pytest_node_from_command(result.command)
+        ):
             return False
         output = "\n".join(
             part for part in (result.stdout, result.stderr) if part
@@ -26629,9 +30734,11 @@ class Orchestrator:
         """Return selectors introduced after the lazy baseline snapshot.
 
         A focused pytest node can legitimately be absent from the pre-task
-        source ref when the task itself introduced that proof. The current
-        execution must still have produced a stable semantic failure identity;
-        otherwise a typo or broken current selector remains a hard failure.
+        source ref when the task itself introduced that proof. Classification
+        is command-scoped so unrelated baseline failures remain available for
+        normal stable-identity validation. A clean current diagnostic proves
+        applicability either by passing the exact node or by producing stable
+        semantic failure ids.
         """
 
         current_results = {
@@ -26648,10 +30755,19 @@ class Orchestrator:
             if baseline_result.ok:
                 continue
             if not cls._is_missing_pytest_target_result(baseline_result):
-                return []
+                continue
+            baseline_node = cls._exact_pytest_node_from_command(
+                baseline_result.command
+            )
             current_result = current_results.get(baseline_result.command)
-            if current_result is None or current_result.ok:
-                return []
+            if (
+                current_result is None
+                or current_result.ok
+                or not cls._command_result_is_operationally_clean(current_result)
+                or cls._exact_pytest_node_from_command(current_result.command)
+                != baseline_node
+            ):
+                continue
             current_extraction = extract_failure_info(
                 GateResult(
                     ok=False,
@@ -26674,8 +30790,24 @@ class Orchestrator:
                     current_result.command
                 )
                 diagnostic_result = diagnostic_results.get(diagnostic_command)
-                if diagnostic_result is None or diagnostic_result.ok:
-                    return []
+                if (
+                    diagnostic_result is None
+                    or not cls._command_result_is_operationally_clean(
+                        diagnostic_result
+                    )
+                    or cls._exact_pytest_node_from_command(
+                        diagnostic_result.command
+                    )
+                    != baseline_node
+                    or cls._is_missing_pytest_target_result(diagnostic_result)
+                ):
+                    continue
+                if diagnostic_result.ok:
+                    if diagnostic_result.returncode == 0:
+                        absent.append(baseline_result.command)
+                    continue
+                if diagnostic_result.returncode == 0:
+                    continue
                 current_extraction = extract_failure_info(
                     GateResult(
                         ok=False,
@@ -26695,7 +30827,7 @@ class Orchestrator:
                     current_extraction.failure_ids
                 )
             ):
-                return []
+                continue
             absent.append(baseline_result.command)
         return list(dict.fromkeys(absent))
 
@@ -27289,20 +31421,30 @@ class Orchestrator:
     def _build_verify_retry_feedback(
         self,
         verify_result: Dict[str, object],
+        *,
+        task: Optional[TaskSpec] = None,
     ) -> Dict[str, object]:
         reason = str(verify_result.get("reason", "")).strip()
-        current_failure_ids = self._normalize_verify_failure_ids(
-            verify_result.get("current_failure_ids", []),
+        fallback_failure_ids = self._normalize_verify_failure_ids(
+            verify_result.get(
+                "current_failure_ids",
+                verify_result.get("failure_ids", []),
+            ),
             reason,
         )
-        new_failure_ids = [
-            str(item).strip() for item in verify_result.get("new_failure_ids", []) if str(item).strip()
-        ]
-        baseline_failure_ids = [
-            str(item).strip()
-            for item in verify_result.get("baseline_failure_ids", [])
-            if str(item).strip()
-        ]
+        provenance = self._task_verification_failure_provenance_from_result(
+            task,
+            verify_result,
+            fallback_failure_ids=fallback_failure_ids,
+            fallback_baseline_failure_ids=(
+                task.verify_baseline_failures if task is not None else []
+            ),
+        )
+        current_failure_ids = list(provenance["current_failure_ids"])
+        new_failure_ids = list(provenance["new_failure_ids"])
+        baseline_failure_ids = list(provenance["baseline_failure_ids"])
+        owned_failure_ids = list(provenance["owned_failure_ids"])
+        failure_class = str(provenance["failure_class"])
         raw_output = str(verify_result.get("raw_output", "")).strip()
         raw_log_path = str(verify_result.get("raw_log_path", "")).strip()
         summary_lines: List[str] = []
@@ -27324,6 +31466,11 @@ class Orchestrator:
                     f"Pre-existing baseline failures still present ({len(baseline_remaining)}): "
                     + ", ".join(baseline_remaining[:6])
                 )
+            if failure_class == "baseline_only_owned" and owned_failure_ids:
+                summary_lines.append(
+                    "Explicitly owned failures are unchanged from the baseline; "
+                    "no newly introduced candidate failure is eligible for retry."
+                )
             resolved_failures = sorted(set(baseline_failure_ids) - set(current_failure_ids))
             if resolved_failures:
                 summary_lines.append(
@@ -27339,8 +31486,18 @@ class Orchestrator:
             summary_lines.append("Likely root causes:")
             summary_lines.extend(f"  - {item}" for item in root_causes)
         implicated_paths = self._extract_verify_implicated_paths(raw_output)
+        guidance_failure_ids = list(new_failure_ids)
+        if not bool(
+            verify_result.get(
+                "baseline_comparison_comparable",
+                verify_result.get("comparable_failures", True),
+            )
+        ):
+            guidance_failure_ids = list(current_failure_ids)
+        elif failure_class == "baseline_only_owned":
+            guidance_failure_ids = list(owned_failure_ids)
         guidance = self._verify_failure_recovery_guidance(
-            failure_ids=(new_failure_ids or current_failure_ids),
+            failure_ids=guidance_failure_ids,
             reason=reason,
             implicated_paths=implicated_paths,
             comparable=bool(verify_result.get("comparable_failures", True)),
@@ -28306,14 +32463,19 @@ class Orchestrator:
         result: Optional[AgentResult] = None
         protocol_attempt = 1
         try:
+            dependency_links = discover_dependency_links(self.project_root)
             snapshot_manager = GateSnapshotManager(
                 self.project_root,
                 f"preflight-{state.run_id}-{task.task_id}-{uuid.uuid4().hex[:8]}",
+                excluded_paths=repository_exclusion_paths(
+                    self.project_root,
+                    dependency_links=dependency_links,
+                    surface_paths=GATE_SNAPSHOT_RUNTIME_PATHS,
+                ),
             )
             snapshot = snapshot_manager.create()
             add_worktree(self.project_root, worktree_path, ref=snapshot.ref_name)
             created = True
-            dependency_links = discover_dependency_links(self.project_root)
             install_dependency_links(worktree_path, dependency_links)
             parsed: Optional[Dict[str, object]] = None
             pending_inputs: List[UserInputRequest] = []
@@ -30162,37 +34324,29 @@ class Orchestrator:
         The refs may include provider metadata such as the lock. Rewind callers
         must derive refreshable canonical documents separately.
         """
-        comparison_comparable = bool(
-            verify_result.get(
-                "baseline_comparison_comparable",
-                verify_result.get("comparable_failures", True),
-            )
-        )
-        if not comparison_comparable:
-            return "", "", []
-
         failure_ids = [
             str(item).strip()
             for item in verify_result.get("failure_ids", []) or []
             if str(item).strip()
         ]
-        baseline_failure_ids = {
-            str(item).strip()
-            for item in verify_result.get("baseline_failure_ids", []) or []
-            if str(item).strip()
-        }
-        if "new_failure_ids" in verify_result:
-            active_failure_ids = [
-                str(item).strip()
-                for item in verify_result.get("new_failure_ids", []) or []
-                if str(item).strip()
-            ]
-        elif baseline_failure_ids:
-            active_failure_ids = [
-                item for item in failure_ids if item not in baseline_failure_ids
-            ]
-        else:
-            active_failure_ids = failure_ids
+        provenance = self._task_verification_failure_provenance_from_result(
+            task,
+            verify_result,
+            fallback_failure_ids=failure_ids,
+            fallback_baseline_failure_ids=task.verify_baseline_failures,
+        )
+        if not bool(provenance["baseline_comparison_comparable"]):
+            return "", "", []
+        active_failure_ids = list(provenance["new_failure_ids"])
+        if (
+            not active_failure_ids
+            and str(provenance.get("failure_class", ""))
+            == "baseline_only_owned"
+        ):
+            # Explicit evidence ownership may route a pre-existing failure to
+            # its source-of-truth stage, but it must never turn that failure
+            # back into a candidate-owned regression or consume repair retries.
+            active_failure_ids = list(provenance["owned_failure_ids"])
         if not active_failure_ids:
             return "", "", []
 
@@ -32394,6 +36548,9 @@ class Orchestrator:
         last_failure_ids: List[str] = []
         last_comparable_failures = True
         last_proof_evidence: Optional[Dict[str, object]] = None
+        last_failure_provenance: Dict[str, object] = {}
+        last_redacted_command_evidence = ""
+        last_raw_log_path = ""
 
         review_fingerprints: List[str] = []
         for entry in task.review_history:
@@ -32541,10 +36698,22 @@ class Orchestrator:
             if quick_failure:
                 last_reason, retryable = quick_failure
                 failure_ids = self._normalize_verify_failure_ids([], last_reason)
+                quick_provenance = self._task_verification_failure_provenance(
+                    task,
+                    current_failure_ids=failure_ids,
+                    baseline_failure_ids=task.verify_baseline_failures,
+                    new_failure_ids=failure_ids,
+                    comparison_comparable=False,
+                )
                 verify_analysis = self._analyze_verify_failure(task, failure_ids, comparable=False)
                 last_failure_ids = list(failure_ids)
                 last_comparable_failures = False
                 last_proof_evidence = None
+                last_failure_provenance = quick_provenance
+                last_redacted_command_evidence = (
+                    self._redacted_verification_command_evidence(last_reason)
+                )
+                last_raw_log_path = ""
                 verify_stats = str(verify_analysis["stats"])
                 self._record_verify_result(
                     task,
@@ -32553,6 +36722,7 @@ class Orchestrator:
                     last_reason,
                     failure_ids,
                     comparable_failures=False,
+                    failure_provenance=quick_provenance,
                 )
                 feedback = self._format_retry_feedback(
                     "pre_verify_check",
@@ -32596,8 +36766,30 @@ class Orchestrator:
                     last_reason,
                 )
                 comparable_failures = bool(verify_result.get("comparable_failures", True))
+                failure_provenance = (
+                    self._task_verification_failure_provenance_from_result(
+                        task,
+                        verify_result,
+                        fallback_failure_ids=failure_ids,
+                        fallback_baseline_failure_ids=(
+                            task.verify_baseline_failures
+                        ),
+                    )
+                )
                 last_failure_ids = list(failure_ids)
                 last_comparable_failures = comparable_failures
+                last_failure_provenance = failure_provenance
+                last_redacted_command_evidence = str(
+                    verify_result.get(
+                        "redacted_command_evidence",
+                        self._redacted_verification_command_evidence(
+                            verify_result.get("raw_output", "")
+                        ),
+                    )
+                )
+                last_raw_log_path = str(
+                    verify_result.get("raw_log_path", "")
+                ).strip()
                 last_proof_evidence = (
                     verify_result.get("proof_evidence")
                     if isinstance(verify_result.get("proof_evidence"), dict)
@@ -32626,6 +36818,7 @@ class Orchestrator:
                         last_reason,
                         failure_ids,
                         comparable_failures=comparable_failures,
+                        failure_provenance=failure_provenance,
                     )
                     self._emit_task_verify_result(task, "fail", last_reason)
                     owner_evidence_refs: List[str] = []
@@ -32665,45 +36858,21 @@ class Orchestrator:
                         "review": owner_feedback or last_reason,
                         "reason": last_reason,
                         "failure_ids": list(failure_ids),
-                        "current_failure_ids": [
-                            str(item).strip()
-                            for item in verify_result.get(
-                                "current_failure_ids",
-                                failure_ids,
-                            )
-                            or []
-                            if str(item).strip()
-                        ],
-                        "baseline_failure_ids": [
-                            str(item).strip()
-                            for item in verify_result.get(
-                                "baseline_failure_ids",
-                                [],
-                            )
-                            or []
-                            if str(item).strip()
-                        ],
-                        "new_failure_ids": [
-                            str(item).strip()
-                            for item in verify_result.get(
-                                "new_failure_ids",
-                                failure_ids,
-                            )
-                            or []
-                            if str(item).strip()
-                        ],
+                        **failure_provenance,
                         "comparable_failures": comparable_failures,
-                        "baseline_comparison_comparable": bool(
-                            verify_result.get(
-                                "baseline_comparison_comparable",
-                                comparable_failures,
-                            )
-                        ),
                         "raw_output": str(
                             verify_result.get("raw_output", "")
                         ),
                         "raw_log_path": str(
                             verify_result.get("raw_log_path", "")
+                        ),
+                        "redacted_command_evidence": str(
+                            verify_result.get(
+                                "redacted_command_evidence",
+                                self._redacted_verification_command_evidence(
+                                    verify_result.get("raw_output", "")
+                                ),
+                            )
                         ),
                         "proof_evidence": (
                             dict(verify_result.get("proof_evidence", {}))
@@ -32742,13 +36911,30 @@ class Orchestrator:
                             )
                         ),
                     }
-                verify_analysis = self._analyze_verify_failure(
-                    task,
-                    failure_ids,
-                    comparable=comparable_failures,
+                baseline_only_owned = (
+                    str(failure_provenance.get("failure_class", ""))
+                    == "baseline_only_owned"
                 )
+                if baseline_only_owned:
+                    verify_analysis = {
+                        "stats": (
+                            "compare=baseline-only-owned "
+                            f"failure_ids={len(failure_ids)} "
+                            "new=0 action=stop-no-new-failures"
+                        ),
+                        "stop_retry": True,
+                        "first_attempt": None,
+                        "repeat": 1,
+                    }
+                else:
+                    verify_analysis = self._analyze_verify_failure(
+                        task,
+                        failure_ids,
+                        comparable=comparable_failures,
+                    )
                 if (
-                    (
+                    not baseline_only_owned
+                    and (
                         bool(verify_result.get("retryable_missing_owned_evidence_refs"))
                         or bool(verify_result.get("retryable_owned_evidence_failure_refs"))
                     )
@@ -32771,8 +36957,12 @@ class Orchestrator:
                     last_reason,
                     failure_ids,
                     comparable_failures=comparable_failures,
+                    failure_provenance=failure_provenance,
                 )
-                verify_feedback = self._build_verify_retry_feedback(verify_result)
+                verify_feedback = self._build_verify_retry_feedback(
+                    verify_result,
+                    task=task,
+                )
                 feedback = self._format_retry_feedback(
                     "local_verification",
                     reason=last_reason,
@@ -32810,6 +37000,8 @@ class Orchestrator:
                                 "review": last_reason,
                                 "reason": last_reason,
                                 "failure_ids": list(failure_ids),
+                                **failure_provenance,
+                                "comparable_failures": comparable_failures,
                                 "rewind_to_stage": audit_rewind_stage,
                                 "expected_owner_stage": audit_rewind_stage,
                                 "rewind_reason": (
@@ -32820,7 +37012,9 @@ class Orchestrator:
                                     f"{audit_rewind_reason}"
                                 ),
                             }
-                    if not comparable_failures:
+                    if baseline_only_owned:
+                        pass
+                    elif not comparable_failures:
                         last_reason = self._format_non_comparable_verify_failure_reason(last_reason)
                     else:
                         last_reason = self._format_repeated_verify_failure_reason(
@@ -32831,7 +37025,13 @@ class Orchestrator:
                     break
                 continue
 
-            self._record_verify_result(task, attempt, "pass", str(verify_result["reason"]))
+            self._record_verify_result(
+                task,
+                attempt,
+                "pass",
+                str(verify_result["reason"]),
+                failure_provenance=verify_result,
+            )
             self._emit_task_verify_result(task, "pass", str(verify_result["reason"]))
 
             review_fingerprint = worktree_fingerprint(self.project_root)
@@ -33016,7 +37216,10 @@ class Orchestrator:
             "review": last_review or feedback,
             "reason": last_reason,
             "failure_ids": list(last_failure_ids),
+            **last_failure_provenance,
             "comparable_failures": bool(last_comparable_failures),
+            "redacted_command_evidence": last_redacted_command_evidence,
+            "raw_log_path": last_raw_log_path,
             "proof_evidence": last_proof_evidence or {},
         }
 
@@ -33906,6 +38109,144 @@ class Orchestrator:
         collapsed = " ".join(reason.split()).strip()
         return [f"reason:{collapsed}"] if collapsed else ["reason:unknown"]
 
+    @staticmethod
+    def _normalize_failure_id_collection(value: object) -> List[str]:
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            return []
+        return sorted(
+            {
+                str(item).strip()
+                for item in value
+                if str(item).strip()
+            }
+        )
+
+    @staticmethod
+    def _redacted_verification_command_evidence(value: object) -> str:
+        evidence = redact_incident_text(value).strip()
+        if len(evidence) <= 4000:
+            return evidence
+        return "[truncated]\n" + evidence[-4000:]
+
+    @staticmethod
+    def _classify_verification_failure(
+        *,
+        current_failure_ids: Iterable[str],
+        new_failure_ids: Iterable[str],
+        owned_failure_ids: Iterable[str],
+        comparison_comparable: bool,
+    ) -> str:
+        current = {str(item).strip() for item in current_failure_ids if str(item).strip()}
+        introduced = {str(item).strip() for item in new_failure_ids if str(item).strip()}
+        owned = {str(item).strip() for item in owned_failure_ids if str(item).strip()}
+        if not current:
+            return "none"
+        if not comparison_comparable:
+            return "non_comparable"
+        if not introduced:
+            return "baseline_only_owned" if current & owned else "baseline_only"
+        introduced_owned = introduced & owned
+        if introduced_owned == introduced:
+            return "newly_introduced_owned"
+        if introduced_owned:
+            return "newly_introduced_mixed"
+        return "newly_introduced"
+
+    def _task_verification_failure_provenance(
+        self,
+        task: Optional[TaskSpec],
+        *,
+        current_failure_ids: Iterable[str],
+        baseline_failure_ids: Iterable[str],
+        comparison_comparable: bool,
+        new_failure_ids: Optional[Iterable[str]] = None,
+        failure_class: str = "",
+    ) -> Dict[str, object]:
+        source: Dict[str, object] = {
+            "current_failure_ids": list(current_failure_ids),
+            "baseline_failure_ids": list(baseline_failure_ids),
+            "baseline_comparison_comparable": comparison_comparable,
+            "failure_class": failure_class,
+        }
+        if new_failure_ids is not None:
+            source["new_failure_ids"] = list(new_failure_ids)
+        return self._task_verification_failure_provenance_from_result(
+            task,
+            source,
+        )
+
+    def _task_verification_failure_provenance_from_result(
+        self,
+        task: Optional[TaskSpec],
+        result: Mapping[str, object],
+        *,
+        fallback_failure_ids: Iterable[str] = (),
+        fallback_baseline_failure_ids: Iterable[str] = (),
+    ) -> Dict[str, object]:
+        source = dict(result)
+        fallback = self._normalize_failure_id_collection(
+            list(fallback_failure_ids)
+        )
+        fallback_baseline = self._normalize_failure_id_collection(
+            list(fallback_baseline_failure_ids)
+        )
+        source.setdefault(
+            "current_failure_ids",
+            fallback,
+        )
+        source.setdefault(
+            "baseline_failure_ids",
+            fallback_baseline,
+        )
+        current_failure_ids = self._normalize_failure_id_collection(
+            source.get("current_failure_ids", fallback)
+        )
+        baseline_failure_ids = self._normalize_failure_id_collection(
+            source.get("baseline_failure_ids", fallback_baseline)
+        )
+        comparison_comparable = bool(
+            source.get(
+                "baseline_comparison_comparable",
+                source.get("comparable_failures", True),
+            )
+        )
+        if comparison_comparable:
+            new_failure_ids = sorted(
+                set(current_failure_ids) - set(baseline_failure_ids)
+            )
+        elif "new_failure_ids" in source:
+            new_failure_ids = self._normalize_failure_id_collection(
+                source.get("new_failure_ids")
+            )
+        else:
+            new_failure_ids = list(current_failure_ids)
+        owned_failure_ids = (
+            self._owned_task_failure_ids(task, current_failure_ids)
+            if task is not None
+            else self._normalize_failure_id_collection(
+                source.get("owned_failure_ids")
+            )
+        )
+        canonical_failure_class = self._classify_verification_failure(
+            current_failure_ids=current_failure_ids,
+            new_failure_ids=new_failure_ids,
+            owned_failure_ids=owned_failure_ids,
+            comparison_comparable=comparison_comparable,
+        )
+        recorded_failure_class = str(source.get("failure_class", "")).strip()
+        return {
+            "current_failure_ids": current_failure_ids,
+            "baseline_failure_ids": baseline_failure_ids,
+            "new_failure_ids": new_failure_ids,
+            "owned_failure_ids": owned_failure_ids,
+            "failure_class": (
+                canonical_failure_class
+                if comparison_comparable
+                else recorded_failure_class or canonical_failure_class
+            ),
+            "baseline_comparison_comparable": comparison_comparable,
+        }
+
     def _verify_failure_signature_from_entry(self, entry: Dict[str, object]) -> List[str]:
         raw_ids = entry.get("failure_ids", [])
         if isinstance(raw_ids, list):
@@ -34153,6 +38494,7 @@ class Orchestrator:
         summary: str,
         failure_ids: Optional[Iterable[str]] = None,
         comparable_failures: bool = True,
+        failure_provenance: Optional[Mapping[str, object]] = None,
     ) -> None:
         entry: Dict[str, object] = {
             "attempt": attempt,
@@ -34172,6 +38514,14 @@ class Orchestrator:
         if normalized_failure_ids:
             entry["failure_ids"] = normalized_failure_ids
         entry["comparable_failures"] = bool(comparable_failures)
+        if failure_provenance is not None:
+            provenance = self._task_verification_failure_provenance_from_result(
+                task,
+                failure_provenance,
+                fallback_failure_ids=normalized_failure_ids,
+                fallback_baseline_failure_ids=task.verify_baseline_failures,
+            )
+            entry.update(provenance)
         task.verify_history.append(entry)
 
     def _emit_task_verify_result(self, task: TaskSpec, decision: str, summary: str, stats: str = "") -> None:

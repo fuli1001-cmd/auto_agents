@@ -120,6 +120,13 @@ safety metadata is incomplete:
 - batch logs include ready/deferred counts, dependency reasons for deferred tasks, and all failed
   workers in the batch instead of only the first failure
 
+Parallel configuration is a performance policy, not a correctness switch. An applied retained
+checkpoint always creates an ownership barrier: auto_agents either runs its owner alone, safely
+detaches the checkpoint before unrelated dispatch, or persists a structured blocker. This invariant
+also applies when `continue_independent_tasks=true`; that option only permits unrelated work after
+the checkpoint boundary is proven clean. Projects may cap or disable parallelism for resource or
+operational reasons, but they do not need project-specific settings to avoid checkpoint corruption.
+
 When scope recovery only needs to split one task, the planner may return `PLAN_PATCH v1` with two to
 four complete replacement tasks. auto_agents applies that bounded replacement atomically, rewrites
 downstream dependencies, preserves done tasks, and runs the same full task-plan and requirement
@@ -1604,9 +1611,12 @@ audit evidence, staged and unstaged diffs, worker capabilities, and durable owne
 The investigator and reviewer run against a sanitized read-only shared Git clone, so bounded history
 and byte-level checkpoints remain inspectable without exposing operator inputs or `.env` files.
 High-confidence, reversible auto_agents defects may set `safe_to_attempt` even before integration is
-proven. In the default `max` mode, auto_agents generates at most three isolated candidates within
-one hour, rejects duplicate diffs and weakened tests, runs base/candidate differential checks, and
-replays the blocked state in a private target clone. Candidate-added tests are also applied to base
+proven. In the default `max` mode, auto_agents generates isolated candidates until its semantic
+non-improvement patience is exhausted, rejects duplicate diffs and weakened tests, runs
+base/candidate differential checks, and replays the blocked state in a private target clone.
+Deterministic test deletion, skip/xfail, and invalid pytest-selector findings receive one bounded
+in-place correction in the same provider session when available before the candidate is rejected.
+Candidate-added tests are also applied to base
 engine code so a newly added regression must actually fail without the implementation fix. An
 adversarial read-only code review is required before expensive validation. Missing proof that is
 owned by a downstream gate is deferred rather than treated as a code failure. The candidate agent
@@ -1616,6 +1626,10 @@ then performs a proof-aware final adversarial review before approval.
 Candidates are attempted sequentially and the first candidate that crosses every proof gate wins;
 this is not a relative majority vote. If none is approved, auto_agents reports and retains the
 candidate that reached the deepest verification stage instead of merely returning the last attempt.
+Proof from a selected parent is inherited by its descendant, so a completed component becomes the
+base of the next dependent component instead of being regenerated from an older candidate. Failed
+focused, integration, and full-suite commands are persisted as a sticky regression set and run
+before every later candidate's component-specific checks.
 Base and candidate full suites use the same progress lease and final safety ceiling. Test files are
 checkpointed independently; historically slow files are split into stable node batches, related and
 high-risk shards run first, and only shards with no detected shared-process/environment risk may run
