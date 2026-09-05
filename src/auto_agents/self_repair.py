@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -216,6 +216,42 @@ class _FullSuiteShard:
     isolated: bool = False
     priority: int = 100
     estimated_seconds: float = 0.0
+
+
+class _FullSuiteSlots:
+    """Reserve resources before dispatch, shared by base and candidate suites."""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self._condition = threading.Condition()
+        self._active = 0
+        self._resources: set[str] = set()
+
+    def acquire_ready(self, shard: _FullSuiteShard) -> Optional[tuple[str, ...]]:
+        resources = tuple(sorted(set(
+            shard.resource_locks or (() if shard.parallel_safe else ("legacy:exclusive",))
+        )))
+        with self._condition:
+            if (
+                self._active >= self.capacity
+                or "global:exclusive" in self._resources
+                or ("global:exclusive" in resources and self._active)
+                or self._resources.intersection(resources)
+            ):
+                return None
+            self._active += 1
+            self._resources.update(resources)
+            return resources
+
+    def release(self, resources: tuple[str, ...]) -> None:
+        with self._condition:
+            self._active -= 1
+            self._resources.difference_update(resources)
+            self._condition.notify_all()
+
+    def wait_for_change(self) -> None:
+        with self._condition:
+            self._condition.wait(timeout=0.1)
 
 
 @dataclass
@@ -1654,6 +1690,7 @@ class AutoAgentsSelfRepairRunner:
         self._base_prewarm_error: Optional[BaseException] = None
         self._shard_worktree_lock = threading.Lock()
         self._full_suite_progress_lock = threading.Lock()
+        self._full_suite_slots: Optional[_FullSuiteSlots] = None
         self._candidate_id = ""
         self._candidate_partial_fingerprint = ""
         self._candidate_partial_diff_line_count = 0
@@ -5483,11 +5520,13 @@ class AutoAgentsSelfRepairRunner:
             return _VerificationResult(True, "full-suite differential=not-applicable")
         base = self._base_full_verification.get(base_head)
         if base is None:
+            self._start_base_full_suite_prewarm(base_head)
+        candidate = self._run_full_suite_shards(candidate_root)
+        if base is None:
             base = self._await_base_full_suite_prewarm(base_head)
         if base is None:
             base = self._run_full_suite_at_ref(base_head)
             self._base_full_verification[base_head] = base
-        candidate = self._run_full_suite_shards(candidate_root)
         if base.recoverable or candidate.recoverable:
             return _VerificationResult(
                 False,
@@ -5664,67 +5703,51 @@ class AutoAgentsSelfRepairRunner:
                 )
             return True
 
-        resource_mutexes = {
-            resource: threading.Lock()
-            for shard in pending
-            for resource in shard.resource_locks
-            if resource != "global:exclusive"
-        }
-        resource_mutexes.setdefault("legacy:exclusive", threading.Lock())
-        global_condition = threading.Condition()
-        global_state = {"active": 0, "exclusive": False}
+        with self._base_prewarm_lock:
+            if self._full_suite_slots is None:
+                self._full_suite_slots = _FullSuiteSlots(min(
+                    SELF_REPAIR_FULL_SUITE_MAX_PARALLEL_WORKERS,
+                    max(1, (os.cpu_count() or 2) // 2),
+                ))
+            slots = self._full_suite_slots
 
-        def execute(shard: _FullSuiteShard) -> _VerificationResult:
-            resources = list(shard.resource_locks)
-            if not shard.parallel_safe and not resources:
-                resources = ["legacy:exclusive"]
-            locks = [
-                resource_mutexes[resource]
-                for resource in sorted(set(resources))
-                if resource != "global:exclusive"
-            ]
-            exclusive = "global:exclusive" in resources
-            with global_condition:
-                if exclusive:
-                    global_condition.wait_for(
-                        lambda: not global_state["exclusive"]
-                        and global_state["active"] == 0
-                    )
-                    global_state["exclusive"] = True
-                else:
-                    global_condition.wait_for(
-                        lambda: not global_state["exclusive"]
-                    )
-                    global_state["active"] += 1
-            for lock in locks:
-                lock.acquire()
+        def execute(shard: _FullSuiteShard, resources: tuple[str, ...]) -> _VerificationResult:
             try:
                 return self._execute_full_suite_shard(verification_root, shard)
             finally:
-                for lock in reversed(locks):
-                    lock.release()
-                with global_condition:
-                    if exclusive:
-                        global_state["exclusive"] = False
-                    else:
-                        global_state["active"] -= 1
-                    global_condition.notify_all()
+                slots.release(resources)
 
         for priority in sorted({shard.priority for shard in pending}):
             phase = [shard for shard in pending if shard.priority == priority]
-            workers = min(
-                SELF_REPAIR_FULL_SUITE_MAX_PARALLEL_WORKERS,
-                len(phase),
-                max(1, (os.cpu_count() or 2) // 2),
-            )
+            workers = min(slots.capacity, len(phase))
             interrupted = False
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(execute, shard): shard for shard in phase}
-                for future in as_completed(futures):
-                    shard = futures[future]
-                    shard_result = future.result()
-                    if not record(shard, shard_result):
-                        interrupted = True
+                futures = {}
+                while phase or futures:
+                    for shard in list(phase):
+                        if len(futures) >= workers:
+                            break
+                        resources = slots.acquire_ready(shard)
+                        if resources is None:
+                            continue
+                        try:
+                            future = pool.submit(execute, shard, resources)
+                        except BaseException:
+                            slots.release(resources)
+                            raise
+                        futures[future] = shard
+                        phase.remove(shard)
+                    if not futures:
+                        slots.wait_for_change()
+                        continue
+                    completed_futures, _ = wait(
+                        futures, timeout=0.1, return_when=FIRST_COMPLETED,
+                    )
+                    for future in completed_futures:
+                        shard = futures.pop(future)
+                        shard_result = future.result()
+                        if not record(shard, shard_result):
+                            interrupted = True
             if interrupted:
                 return self._aggregate_full_suite_shards(
                     results,

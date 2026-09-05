@@ -1641,8 +1641,9 @@ high-risk shards run first, and only shards with no detected shared-process/envi
 in parallel. Completed shard plans and results are content-addressed by the source tree and Python /
 pytest environment. A successful shard may cross candidate trees only when a conservative static
 dependency closure proves every local input unchanged; unknown or dynamic inputs force a real run.
-The baseline suite starts in the background once a viable candidate exists, overlapping candidate
-review and focused verification. Incomplete proof retains the same candidate under
+The baseline suite runs in the background while the candidate full suite executes. Both suites
+share a bounded resource pool; conflicting resources are reserved before dispatch so waiting shards
+do not occupy executor threads that could run independent work. Incomplete proof retains the same candidate under
 `pending-validation`, and the next self-repair run resumes unfinished shards before generating code.
 
 An approved candidate is not immediately merged. The real workflow first resumes from the approved
