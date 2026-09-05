@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import unicodedata
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -569,7 +570,7 @@ class WorkflowStore:
         if not path.is_file():
             return None
         try:
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 self._ensure_event_index(connection)
                 rows = connection.execute(
                     "SELECT payload, source_name, source_size, source_mtime_ns "
@@ -631,7 +632,7 @@ class WorkflowStore:
         path = self.event_index_path(workflow_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 self._ensure_event_index(connection)
                 connection.execute(
                     "INSERT OR REPLACE INTO workflow_events "
@@ -657,7 +658,7 @@ class WorkflowStore:
         path = self.event_index_path(workflow_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with sqlite3.connect(path) as connection:
+            with closing(sqlite3.connect(path)) as connection, connection:
                 self._ensure_event_index(connection)
                 connection.execute("DELETE FROM workflow_events")
                 connection.executemany(

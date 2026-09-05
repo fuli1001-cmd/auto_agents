@@ -4,9 +4,10 @@ import json
 import sqlite3
 import time
 import uuid
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Mapping, Optional
+from typing import Iterable, Iterator, Mapping, Optional
 
 from .git_ops import head_ref, worktree_fingerprint
 
@@ -300,12 +301,14 @@ class ReleaseJobStore:
             ).fetchone()
         return self._row(row) if row is not None else {}
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=30000")
-        return connection
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(self.path, timeout=30)) as connection:
+            with connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA busy_timeout=30000")
+                yield connection
 
     def _initialize(self) -> None:
         with self._connect() as connection:

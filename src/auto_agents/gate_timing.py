@@ -5,9 +5,10 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import closing, contextmanager
 from pathlib import Path
 from statistics import median
-from typing import Optional
+from typing import Iterator, Optional
 
 from .config import gate_baseline_cache_path
 from .models import CommandResult
@@ -243,8 +244,15 @@ class GateTimingStore:
         except (OSError, sqlite3.Error, TypeError, ValueError):
             self.disabled = True
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.cache_path), timeout=1.0)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(str(self.cache_path), timeout=1.0)) as connection:
+            with connection:
+                self._initialize_connection(connection)
+                yield connection
+
+    @staticmethod
+    def _initialize_connection(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA busy_timeout = 1000")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(
@@ -269,7 +277,6 @@ class GateTimingStore:
             )
             """
         )
-        return connection
 
     @staticmethod
     def _prune(connection: sqlite3.Connection, now: int) -> None:

@@ -105,6 +105,16 @@ class RequirementsAuditCache:
         if self._connection is not None:
             return self._connection
         connection = sqlite3.connect(str(self.path), timeout=1.0)
+        try:
+            self._initialize_connection(connection)
+        except BaseException:
+            connection.close()
+            raise
+        self._connection = connection
+        return connection
+
+    @staticmethod
+    def _initialize_connection(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA busy_timeout = 1000")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(
@@ -137,19 +147,21 @@ class RequirementsAuditCache:
             )
             """
         )
-        self._connection = connection
-        return connection
 
     def close(self) -> None:
         if self._connection is None:
             return
         try:
             self._connection.commit()
-            self._connection.close()
         except sqlite3.Error:
             pass
         finally:
-            self._connection = None
+            try:
+                self._connection.close()
+            except sqlite3.Error:
+                pass
+            finally:
+                self._connection = None
 
     @staticmethod
     def _indexes(raw: str) -> Sequence[int]:

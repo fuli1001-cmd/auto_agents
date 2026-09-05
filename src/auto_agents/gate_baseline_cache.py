@@ -4,8 +4,9 @@ import hashlib
 import json
 import sqlite3
 import time
+from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .config import gate_baseline_cache_path
 from .gates import build_failure_identity_diagnostic_command, extract_failure_info
@@ -338,8 +339,15 @@ class GateBaselineCache:
         except (OSError, sqlite3.Error):
             self.disabled = True
 
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.cache_path), timeout=1.0)
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(str(self.cache_path), timeout=1.0)) as connection:
+            with connection:
+                self._initialize_connection(connection)
+                yield connection
+
+    @staticmethod
+    def _initialize_connection(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA busy_timeout = 1000")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(
@@ -375,7 +383,6 @@ class GateBaselineCache:
             )
             """
         )
-        return connection
 
     @staticmethod
     def _prune(connection: sqlite3.Connection, now: int) -> None:

@@ -5,8 +5,9 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Iterator, Mapping, Optional
 
 from .config import gate_baseline_cache_path
 from .models import CommandResult
@@ -361,9 +362,16 @@ class GateResultCache:
             cached=True,
         )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(str(self.cache_path), timeout=2.0)
+        with closing(sqlite3.connect(str(self.cache_path), timeout=2.0)) as connection:
+            with connection:
+                self._initialize_connection(connection)
+                yield connection
+
+    @staticmethod
+    def _initialize_connection(connection: sqlite3.Connection) -> None:
         connection.execute("PRAGMA busy_timeout = 2000")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(
@@ -406,4 +414,3 @@ class GateResultCache:
             ON gate_result_successes(identity_key, context_fingerprint, updated_at)
             """
         )
-        return connection
