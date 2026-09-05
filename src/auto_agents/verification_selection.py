@@ -91,13 +91,15 @@ class StaticDependencyIndex:
             if not relative.endswith((".py", ".pyi")):
                 continue
             module = relative.rsplit(".", 1)[0].replace("/", ".")
-            result[module] = relative
-            if module.endswith(".__init__"):
-                result[module[: -len(".__init__")]] = relative
+            aliases = {module}
             if relative.startswith("src/"):
-                result[module[4:]] = relative
+                aliases.add(module[4:])
             elif "/src/" in f"/{relative}":
-                result[module.split(".src.", 1)[-1]] = relative
+                aliases.add(module.split(".src.", 1)[-1])
+            for alias in aliases:
+                result[alias] = relative
+                if alias.endswith(".__init__"):
+                    result[alias[: -len(".__init__")]] = relative
         return result
 
     def _file_dependencies(self, relative: str) -> set[str]:
@@ -124,8 +126,9 @@ class StaticDependencyIndex:
             return set()
         current = relative.rsplit(".", 1)[0].replace("/", ".")
         if current.endswith(".__init__"):
-            current = current[: -len(".__init__")]
-        package = current.rsplit(".", 1)[0] if "." in current else ""
+            package = current[: -len(".__init__")]
+        else:
+            package = current.rpartition(".")[0]
         dependencies: set[str] = set()
         for node in ast.walk(tree):
             names: list[str] = []
@@ -147,7 +150,7 @@ class StaticDependencyIndex:
                     matched = self.module_files.get(candidate)
                     if matched:
                         dependencies.add(matched)
-                        break
+                    # Importing a submodule also executes its package initializers.
                     candidate = candidate.rpartition(".")[0]
         return dependencies
 

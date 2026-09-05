@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.models import GateConfig, VerificationStep
-from auto_agents.verification_selection import select_verification_steps
+from auto_agents.verification_selection import StaticDependencyIndex, select_verification_steps
 
 
 def _git(root: Path, *args: str) -> None:
@@ -106,3 +106,39 @@ def test_proof_dependencies_are_included_once(tmp_path: Path) -> None:
         changed_paths=["src/api/routes.py"],
     )
     assert selected.proof_ids == ["schema.contract", "api.contract"]
+
+
+def test_python_package_reexports_are_included_in_dependency_closure(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "src/app/__init__.py").write_text("from .service import VALUE\n")
+    (root / "tests/test_service.py").write_text("from app import VALUE\n")
+    _git(root, "add", "-A")
+
+    dependencies = StaticDependencyIndex(root).closure_for_targets(["tests/test_service.py"])
+
+    assert dependencies == {
+        "tests/test_service.py", "src/app/__init__.py", "src/app/service.py"
+    }
+    selected = select_verification_steps(
+        [_step("service.contract", levels=["affected"], impact_paths=["tests/**"])],
+        root,
+        GateConfig(verification_policy_version=4),
+        level="affected",
+        changed_paths=["src/app/service.py"],
+    )
+    assert selected.proof_ids == ["service.contract"]
+    assert selected.unmapped_paths == []
+
+
+def test_python_submodule_import_includes_package_initializers(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "src/app/__init__.py").write_text("from .settings import configure\nconfigure()\n")
+    (root / "src/app/settings.py").write_text("def configure(): pass\n")
+    _git(root, "add", "-A")
+
+    dependencies = StaticDependencyIndex(root).closure_for_targets(["tests/test_service.py"])
+
+    assert dependencies == {
+        "tests/test_service.py", "src/app/service.py", "src/app/__init__.py",
+        "src/app/settings.py",
+    }
