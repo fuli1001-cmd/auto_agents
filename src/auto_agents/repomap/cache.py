@@ -112,18 +112,10 @@ class RepoMapCache:
 
     @staticmethod
     def _fingerprint(parser: BaseParser, path: Path) -> Dict[str, object]:
-        try:
-            stat = path.stat()
-            size = stat.st_size
-            mtime_ns = stat.st_mtime_ns
-        except OSError:
-            size = 0
-            mtime_ns = 0
         return {
             "cache_version": int(getattr(parser, "cache_version", 1) or 1),
             "parser": parser.__class__.__name__,
-            "size": size,
-            "mtime_ns": mtime_ns,
+            "content_sha256": _file_content_hash(path),
         }
 
     def get_or_build(

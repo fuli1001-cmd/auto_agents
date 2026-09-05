@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import unittest
@@ -73,6 +74,43 @@ class RepoMapCacheTests(unittest.TestCase):
             cache.get_or_build(["a.py"], CountingParser())
             cache.get_or_build(["a.py"], CountingParser())
 
+            self.assertEqual(cache.writes, 1)
+
+    def test_same_size_edit_with_preserved_mtime_reparses_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "a.py"
+            source.write_text("def before(): pass\n", encoding="utf-8")
+            cache = RepoMapCache(root, cache_path=root / "cache.json")
+            parser = CountingParser()
+            cache.get_or_build(["a.py"], parser)
+            original_stat = source.stat()
+
+            source.write_text("def after_(): pass\n", encoding="utf-8")
+            os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            parser.calls.clear()
+            summaries = cache.get_or_build(["a.py"], parser)
+
+            self.assertEqual(parser.calls, ["a.py"])
+            self.assertEqual(summaries[0].symbols[0].name, "after_")
+            self.assertFalse(cache.last_hit)
+
+    def test_timestamp_only_change_keeps_cached_parse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "a.py"
+            source.write_text("def f(): pass\n", encoding="utf-8")
+            cache = CountingCache(root, root / "cache.json")
+            parser = CountingParser()
+            cache.get_or_build(["a.py"], parser)
+            original_stat = source.stat()
+
+            os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1))
+            parser.calls.clear()
+            cache.get_or_build(["a.py"], parser)
+
+            self.assertEqual(parser.calls, [])
+            self.assertTrue(cache.last_hit)
             self.assertEqual(cache.writes, 1)
 
     def test_invalidate_removes_cache_file(self) -> None:
