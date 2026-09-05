@@ -156,3 +156,23 @@ def test_javascript_parent_imports_expand_transitive_impact(tmp_path: Path) -> N
     assert dependencies == {
         "tests/service.test.ts", "src/app/index.ts", "src/app/service.ts"
     }
+
+
+def test_critical_escalation_includes_release_proof_prerequisites(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    prerequisite = _step("release.setup", levels=["affected"], impact_paths=["schema/**"])
+    prerequisite.targets = ["tests/test_setup.py"]
+    critical = _step("service.critical", levels=["affected"], impact_paths=["src/**"])
+    critical.risk = "critical"
+    release = _step("release.full", levels=["release"], impact_paths=[])
+    release.targets = ["tests/test_release.py"]
+    release.depends_on_proofs = ["release.setup"]
+
+    selected = select_verification_steps(
+        [prerequisite, critical, release], root,
+        GateConfig(verification_policy_version=4),
+        level="affected", changed_paths=["src/app/service.py"],
+    )
+
+    assert selected.level == "release"
+    assert selected.proof_ids == ["release.setup", "release.full"]

@@ -293,6 +293,7 @@ def select_verification_steps(
             [step for step in steps if "release" in _step_levels(step)],
             steps,
         )
+        selected = _include_dependencies(selected, indexed)
         forced_reason = "affected proof is classified critical"
     proof_ids = list(dict.fromkeys(step.proof_id for step in selected if step.proof_id))
     return VerificationSelection(
