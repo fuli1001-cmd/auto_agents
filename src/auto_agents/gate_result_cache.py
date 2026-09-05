@@ -13,7 +13,7 @@ from .config import gate_baseline_cache_path
 from .models import CommandResult
 
 
-RESULT_CACHE_VERSION = 3
+RESULT_CACHE_VERSION = 4
 MAX_AGE_SECONDS = 14 * 24 * 60 * 60
 MAX_ROWS = 20_000
 

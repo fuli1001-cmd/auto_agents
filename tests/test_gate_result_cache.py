@@ -3,9 +3,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.gate_result_cache import GateResultCache
+from auto_agents.gate_execution import _observed_input_manifest
 from auto_agents.models import CommandResult
 
 
@@ -163,3 +166,46 @@ def test_auto_cache_reuses_complete_inputs_and_tracks_negative_lookups(
         result_cache_scope="auto",
         metadata_signature="metadata-1",
     ) is None
+
+
+def test_observed_input_cache_invalidates_when_a_symlink_is_retargeted(tmp_path: Path) -> None:
+    (tmp_path / "one.txt").write_text("one\n", encoding="utf-8")
+    (tmp_path / "two.txt").write_text("two\n", encoding="utf-8")
+    source = tmp_path / "active.txt"
+    source.symlink_to("one.txt")
+    trace = tmp_path / "trace.log"
+    trace.write_text('openat(AT_FDCWD, "active.txt", O_RDONLY) = 3\n', encoding="utf-8")
+    manifest, network = _observed_input_manifest(trace, tmp_path, {})
+    cache = _cache(tmp_path)
+    metadata = dict(cache_scope="source", result_cache_scope="auto", metadata_signature="metadata-1")
+    cache.record(
+        "check", CommandResult(
+            command="check", ok=True, returncode=0, observed_inputs=manifest,
+            input_trace_complete=True, network_observed=network,
+        ), source_fingerprint="source-1", **metadata,
+    )
+    assert cache.lookup("check", source_fingerprint="source-1", **metadata) is not None
+
+    source.unlink()
+    source.symlink_to("two.txt")
+
+    assert cache.lookup("check", source_fingerprint="source-3", **metadata) is None
+
+
+@pytest.mark.parametrize("operation", [
+    'chdir("subdirectory") = 0',
+    'fchdir(3) = 0',
+    'openat(3, "input.txt", O_RDONLY) = 4',
+])
+def test_unresolved_working_directory_or_dirfd_cannot_certify_inputs(tmp_path, operation):
+    (tmp_path / "input.txt").write_text("root input\n", encoding="utf-8")
+    trace = tmp_path / "trace.log"
+    trace.write_text(
+        operation + '\nopenat(AT_FDCWD, "input.txt", O_RDONLY) = 5\n',
+        encoding="utf-8",
+    )
+
+    manifest, network = _observed_input_manifest(trace, tmp_path, {})
+
+    assert manifest == {}
+    assert not network

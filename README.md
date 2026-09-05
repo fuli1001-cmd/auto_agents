@@ -792,6 +792,9 @@ resources, or dynamic ports. Failed proofs, timeouts, mutations, infrastructure 
 artifact producers are never cached. A failed proof therefore executes again during verification
 recovery instead of replaying a stale negative result.
 
+Traces that traverse project symlinks, change working directory, or use unresolved directory
+descriptors retain exact-candidate caching only; they cannot certify cross-candidate reuse.
+
 Interactive `fix`, `collab`, and `run` attest only proofs selected by the changed-path impact graph.
 No-diff collab checks execute nothing. Critical or configured release-blocking paths escalate to a
 synchronous release attestation. Otherwise the latest candidate is coalesced into the crash-safe

@@ -484,11 +484,20 @@ def _observed_input_manifest(
     sandbox: Path,
     dependency_links: Mapping[str, Path],
 ) -> tuple[dict[str, str], bool]:
+    sandbox = sandbox.resolve()
     try:
         text = trace_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return {}, False
     network_observed = "connect(" in text or "sendto(" in text
+    if re.search(
+        r"\b(?:chdir|fchdir)\("
+        r"|\b(?:openat2?|newfstatat|fstatat64|faccessat2?|readlinkat|statx)\(\s*(?!\s|AT_FDCWD\b)",
+        text,
+    ):
+        # This tracer does not track per-process cwd or directory descriptors.
+        # Such traces cannot certify inputs for reuse on another source tree.
+        return {}, network_observed
     ignored = {
         ".git",
         ".auto-agents-gate-runtime",
@@ -510,8 +519,26 @@ def _observed_input_manifest(
         if not candidate.is_absolute():
             candidate = sandbox / candidate
         try:
+            lexical_relative = candidate.relative_to(sandbox)
+        except ValueError:
+            lexical_relative = None
+        if lexical_relative is not None:
+            relative = lexical_relative.as_posix()
+            if any(
+                relative == prefix or relative.startswith(prefix.rstrip("/") + "/")
+                for prefix in ignored
+            ):
+                continue
+            component = sandbox
+            for part in lexical_relative.parts:
+                component = component / part
+                if component.is_symlink():
+                    # Resolving only the final target loses symlink dependencies,
+                    # including intermediate links that can later be retargeted.
+                    return {}, network_observed
+        try:
             resolved = candidate.resolve()
-            relative = resolved.relative_to(sandbox.resolve()).as_posix()
+            relative = resolved.relative_to(sandbox).as_posix()
         except (OSError, ValueError):
             continue
         if any(
@@ -1253,7 +1280,7 @@ class LocalGatePlanExecutor:
             ):
                 trace_path = runtime_root / "input-trace.log"
                 traced_command = (
-                    "strace -f -qq -e trace=%file,%network -o "
+                    "strace -f -qq -e trace=%file,%network,fchdir -o "
                     f"{shlex.quote(str(trace_path))} "
                     f"sh -lc {shlex.quote(traced_command)}"
                 )
