@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from auto_agents import health_control
 from auto_agents.health_control import (
     HealthControlChannel,
@@ -62,3 +64,19 @@ def test_health_command_generation_advances_from_locked_state(tmp_path, monkeypa
         assert result["applied_generation"] == 8
     finally:
         channel.close()
+
+
+def test_health_command_cannot_be_acknowledged_by_a_replacement_workflow(tmp_path, monkeypatch):
+    original = {"run_token": "original", "generation": 1}
+    write_json(control_path(tmp_path), original)
+    observations = iter([
+        original,
+        {
+            "run_token": "replacement", "generation": 10,
+            "applied_generation": 10, "applied_state": "enabled",
+        },
+    ])
+    monkeypatch.setattr(health_control, "load_active_manifest", lambda _root: next(observations))
+
+    with pytest.raises(RuntimeError, match="active workflow changed"):
+        request_health_state(tmp_path, enabled=True)

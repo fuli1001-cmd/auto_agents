@@ -647,6 +647,8 @@ def request_health_state(
         current = load_active_manifest(project_root)
         if not current:
             raise RuntimeError("active workflow exited before applying the health-watch command")
+        if str(current.get("run_token", "")) != token:
+            raise RuntimeError("active workflow changed before applying the health-watch command")
         if (
             int(current.get("applied_generation", 0) or 0) >= generation
             and str(current.get("applied_state", ""))
