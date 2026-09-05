@@ -349,7 +349,13 @@ def worktree_fingerprint(project_root: Path, ignored_prefixes: tuple[str, ...] =
         hasher.update(path.encode("utf-8"))
         hasher.update(b"\0")
         file_path = project_root / path
-        if file_path.is_file():
+        if file_path.is_symlink():
+            hasher.update(b"symlink\0")
+            hasher.update(os.fsencode(os.readlink(file_path)))
+        elif file_path.is_file():
+            hasher.update(
+                b"executable\0" if file_path.stat().st_mode & stat.S_IXUSR else b"file\0"
+            )
             hasher.update(file_path.read_bytes())
         else:
             hasher.update(b"[missing]")

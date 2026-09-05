@@ -86,6 +86,26 @@ class GitOpsWorktreeTests(unittest.TestCase):
                 changed_entries(root), [("R ", destination), ("??", "untracked.txt")]
             )
 
+    def test_worktree_fingerprint_distinguishes_file_modes_and_symlink_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            source = root / "script.sh"
+            source.write_text("exit 0\n", encoding="utf-8")
+            source.chmod(0o644)
+            before = worktree_fingerprint(root)
+            source.chmod(0o755)
+            self.assertNotEqual(worktree_fingerprint(root), before)
+
+            for name in ("one", "two"):
+                (root / name).write_text("same content\n", encoding="utf-8")
+            link = root / "active"
+            link.symlink_to("one")
+            before = worktree_fingerprint(root)
+            link.unlink()
+            link.symlink_to("two")
+            self.assertNotEqual(worktree_fingerprint(root), before)
+
     def test_add_list_and_remove_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"
