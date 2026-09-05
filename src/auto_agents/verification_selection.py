@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import fnmatch
+import posixpath
 import re
 import subprocess
 import hashlib
@@ -165,7 +166,7 @@ class StaticDependencyIndex:
                 *[base / f"index{suffix}" for suffix in (".ts", ".tsx", ".js", ".jsx")],
             ]
             for candidate in candidates:
-                normalized = _normalized(candidate.as_posix())
+                normalized = posixpath.normpath(candidate.as_posix())
                 if normalized in self.files:
                     dependencies.add(normalized)
                     break

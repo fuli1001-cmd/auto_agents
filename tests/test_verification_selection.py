@@ -142,3 +142,17 @@ def test_python_submodule_import_includes_package_initializers(tmp_path: Path) -
         "tests/test_service.py", "src/app/service.py", "src/app/__init__.py",
         "src/app/settings.py",
     }
+
+
+def test_javascript_parent_imports_expand_transitive_impact(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "src/app/service.ts").write_text("export const value = 1;\n")
+    (root / "src/app/index.ts").write_text("export { value } from './service';\n")
+    (root / "tests/service.test.ts").write_text("import { value } from '../src/app';\n")
+    _git(root, "add", "-A")
+
+    dependencies = StaticDependencyIndex(root).closure_for_targets(["tests/service.test.ts"])
+
+    assert dependencies == {
+        "tests/service.test.ts", "src/app/index.ts", "src/app/service.ts"
+    }
