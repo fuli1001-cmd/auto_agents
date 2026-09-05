@@ -19,7 +19,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Set, TextIO, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, TextIO, Tuple
 
 from .adapters import (
     AgentAdapter,
