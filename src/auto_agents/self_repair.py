@@ -14,11 +14,13 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from statistics import median
-from typing import Any, Mapping, Optional
+from typing import Any, Iterator, Mapping, Optional
 
 from .git_ops import (
     add_worktree,
@@ -40,6 +42,7 @@ from .models import (
     RunState,
     SelfRepairDiagnosisConfig,
 )
+from .performance_trace import PerformanceTrace
 from .root_cause import (
     RootCauseCoordinator,
     RootCauseDiagnosis,
@@ -1660,6 +1663,20 @@ def _supplemental_verification_skip_reason(
     return "unsupported candidate-worktree verification command"
 
 
+def _timed_repair_phase(phase: str):
+    def decorate(method):
+        @wraps(method)
+        def measured(self, *args, **kwargs):
+            label = (
+                f"review_{kwargs.get('phase', 'pre_validation')}"
+                if phase == "review" else phase
+            )
+            with self._phase_timer(label):
+                return method(self, *args, **kwargs)
+        return measured
+    return decorate
+
+
 class AutoAgentsSelfRepairRunner:
     def __init__(
         self,
@@ -1697,6 +1714,35 @@ class AutoAgentsSelfRepairRunner:
         self._candidate_partial_path = ""
         self._candidate_resumed_from = ""
 
+    @contextmanager
+    def _phase_timer(self, phase: str) -> Iterator[None]:
+        started = time.perf_counter()
+        raised = False
+        try:
+            yield
+        except BaseException:
+            raised = True
+            raise
+        finally:
+            duration = time.perf_counter() - started
+            store = getattr(self, "_experiment_store", None)
+            if isinstance(store, SelfRepairExperimentStore):
+                try:
+                    PerformanceTrace(
+                        store.project_root, workflow_kind="run", subject_id=store.run_id,
+                    ).event(
+                        "self_repair", phase, duration_seconds=duration,
+                        metadata={
+                            "candidate_id": self._candidate_id,
+                            "root_fingerprint": store.safe_root,
+                            "category": self.decision.category,
+                            "raised": raised,
+                        },
+                    )
+                except (OSError, TypeError, ValueError):
+                    # Timing collection is advisory and must not block recovery.
+                    pass
+
     def _autonomy_config(self) -> object:
         config = getattr(self.target_orchestrator, "config", None)
         execution = getattr(config, "execution", None)
@@ -1717,6 +1763,11 @@ class AutoAgentsSelfRepairRunner:
                 "require_remote_publish": False,
             },
         )()
+
+    def _acceleration_enabled(self) -> bool:
+        execution = getattr(getattr(self.target_orchestrator, "config", None), "execution", None)
+        acceleration = getattr(execution, "acceleration", None)
+        return acceleration is None or str(getattr(acceleration, "mode", "on")) == "on"
 
     def _verification_python(self) -> str:
         if self._verification_python_cache:
@@ -2948,6 +2999,7 @@ class AutoAgentsSelfRepairRunner:
         }
         return design, errors
 
+    @_timed_repair_phase("repair_design")
     def _ensure_approved_repair_design(
         self,
         experiment: SelfRepairExperiment,
@@ -3218,6 +3270,7 @@ class AutoAgentsSelfRepairRunner:
             attempt=experiment.attempt_count,
         )
 
+    @_timed_repair_phase("contract_reanalysis")
     def _automatic_contract_reanalysis(
         self,
         experiment: SelfRepairExperiment,
@@ -3952,9 +4005,10 @@ class AutoAgentsSelfRepairRunner:
                     ),
                 )
                 try:
-                    result: AgentResult = (
-                        self.target_orchestrator._call_with_failover(request)
-                    )
+                    with self._phase_timer("candidate_generation"):
+                        result: AgentResult = (
+                            self.target_orchestrator._call_with_failover(request)
+                        )
                 except (OSError, RuntimeError, subprocess.SubprocessError):
                     self._preserve_interrupted_candidate(
                         repair_root,
@@ -4218,7 +4272,8 @@ class AutoAgentsSelfRepairRunner:
                 )
                 review_phase = (
                     "integration"
-                    if bool(getattr(self, "_candidate_is_final_group", True))
+                    if self._acceleration_enabled()
+                    and bool(getattr(self, "_candidate_is_final_group", True))
                     else "pre_validation"
                 )
                 reviewed_identity = (
@@ -4314,10 +4369,11 @@ class AutoAgentsSelfRepairRunner:
                 )
                 verification = self._run_active_group_verification(repair_root)
                 if not verification.ok:
-                    baseline_verification = self._run_verification_at_ref(
-                        list(verification.payload.get("source_commands", [])),
-                        base_head,
-                    )
+                    with self._phase_timer("focused_baseline"):
+                        baseline_verification = self._run_verification_at_ref(
+                            list(verification.payload.get("source_commands", [])),
+                            base_head,
+                        )
                     baseline_signature = self._verification_failure_signature(
                         baseline_verification.summary
                     )
@@ -4888,6 +4944,7 @@ class AutoAgentsSelfRepairRunner:
         issues.extend(self._candidate_selector_issues(repair_root))
         return issues
 
+    @_timed_repair_phase("candidate_correction")
     def _correct_candidate_deterministic_issues(
         self,
         repair_root: Path,
@@ -5124,7 +5181,8 @@ class AutoAgentsSelfRepairRunner:
         progress_lease_seconds: int, replay_summary: str = "",
     ) -> "_VerificationResult":
         if (
-            prior_review.ok
+            self._acceleration_enabled()
+            and prior_review.ok
             and reviewed_identity
             and reviewed_identity == self._candidate_review_identity(repair_root)
         ):
@@ -5137,6 +5195,7 @@ class AutoAgentsSelfRepairRunner:
             replay_summary=replay_summary, phase="integration",
         )
 
+    @_timed_repair_phase("review")
     def _review_candidate(
         self,
         repair_root: Path,
@@ -5358,6 +5417,7 @@ class AutoAgentsSelfRepairRunner:
             payload=normalized_payload,
         )
 
+    @_timed_repair_phase("proof_seal")
     def _deterministic_proof_seal(
         self,
         candidate_root: Path,
@@ -5457,6 +5517,7 @@ class AutoAgentsSelfRepairRunner:
                 fallback.append("termination=stalled")
         return tuple(sorted(set(fallback)))
 
+    @_timed_repair_phase("diagnosis_differential")
     def _diagnosis_differential(
         self,
         base_head: str,
@@ -5559,6 +5620,7 @@ class AutoAgentsSelfRepairRunner:
                     except RuntimeError:
                         pass
 
+    @_timed_repair_phase("full_suite")
     def _full_suite_differential(
         self,
         base_head: str,
@@ -5575,14 +5637,18 @@ class AutoAgentsSelfRepairRunner:
         if execution is None or not (candidate_root / "tests").is_dir():
             return _VerificationResult(True, "full-suite differential=not-applicable")
         base = self._base_full_verification.get(base_head)
-        if base is None:
-            self._start_base_full_suite_prewarm(base_head)
-        candidate = self._run_full_suite_shards(candidate_root)
+        overlap = self._acceleration_enabled()
+        if overlap:
+            if base is None:
+                self._start_base_full_suite_prewarm(base_head)
+            candidate = self._run_full_suite_shards(candidate_root)
         if base is None:
             base = self._await_base_full_suite_prewarm(base_head)
         if base is None:
             base = self._run_full_suite_at_ref(base_head)
             self._base_full_verification[base_head] = base
+        if not overlap:
+            candidate = self._run_full_suite_shards(candidate_root)
         if base.recoverable or candidate.recoverable:
             return _VerificationResult(
                 False,
@@ -6708,6 +6774,7 @@ class AutoAgentsSelfRepairRunner:
             return None
         return store.root / "full-suite-checkpoints" / f"{suite_key}.json"
 
+    @_timed_repair_phase("boundary_replay")
     def _replay_candidate(
         self,
         candidate_root: Path,
@@ -7453,6 +7520,7 @@ class AutoAgentsSelfRepairRunner:
             parts.append(f"summary={result.summary[:500]}")
         return "; ".join(parts) if parts else "self-repair agent failed without output"
 
+    @_timed_repair_phase("focused_verification")
     def _run_active_group_verification(
         self,
         verification_root: Path,
@@ -7506,6 +7574,7 @@ class AutoAgentsSelfRepairRunner:
         result.payload["source_commands"] = commands[: len(result.returncodes)]
         return result
 
+    @_timed_repair_phase("integration_verification")
     def _run_verification(
         self,
         verification_root: Optional[Path] = None,

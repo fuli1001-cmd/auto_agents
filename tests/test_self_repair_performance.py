@@ -10,11 +10,14 @@ from unittest.mock import patch
 
 import pytest
 
-from auto_agents.models import CommandResult, GateResult
+from auto_agents.models import AccelerationConfig, CommandResult, GateResult
+from auto_agents.performance_trace import PerformanceTrace
 from auto_agents.self_repair import (
     AutoAgentsSelfRepairRunner, SelfRepairDecision, _FullSuiteShard, _VerificationResult,
 )
-from auto_agents.self_repair_search import SelfRepairCandidateRecord, SelfRepairExperiment
+from auto_agents.self_repair_search import (
+    SelfRepairCandidateRecord, SelfRepairExperiment, SelfRepairExperimentStore,
+)
 
 
 def _runner(root: Path) -> AutoAgentsSelfRepairRunner:
@@ -159,7 +162,7 @@ def test_overlapping_full_suites_share_exclusive_resources_and_capacity(tmp_path
     assert maximum == 1
 
 
-@pytest.mark.parametrize("change", ["none", "source", "contract", "component", "rejected"])
+@pytest.mark.parametrize("change", ["none", "source", "contract", "component", "rejected", "off", "observe"])
 def test_integration_review_reuse_requires_same_clean_code_and_contract(tmp_path, change):
     for args in [
         ["init", "-q"], ["config", "user.name", "Test"],
@@ -183,6 +186,8 @@ def test_integration_review_reuse_requires_same_clean_code_and_contract(tmp_path
         runner._experiment.contract_fingerprint = "new contract"
     elif change == "component":
         runner._candidate_group = {"group_id": "different", "status": "pending"}
+    elif change in {"off", "observe"}:
+        runner.target_orchestrator.config.execution.acceleration = AccelerationConfig(mode=change)
 
     with patch.object(runner, "_review_candidate", return_value=_VerificationResult(False, "rejected")) as review:
         result = runner._review_integrated_candidate(
@@ -197,3 +202,51 @@ def test_integration_review_reuse_requires_same_clean_code_and_contract(tmp_path
     else:
         assert not result.ok
         review.assert_called_once()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_self_repair_phase_timing_is_recorded_on_success_and_failure(tmp_path, raises):
+    runner = _runner(tmp_path)
+    runner._experiment_store = SelfRepairExperimentStore(tmp_path, "run", "root")
+    runner._candidate_id = "candidate-1"
+    result = _VerificationResult(True, "passed", returncodes=(0,))
+    with patch.object(
+        runner, "_run_verification_commands", return_value=result,
+        side_effect=RuntimeError("verification backend unavailable") if raises else None,
+    ), patch("auto_agents.self_repair.time.perf_counter", side_effect=[10.0, 12.5]):
+        if raises:
+            with pytest.raises(RuntimeError, match="verification backend unavailable"):
+                runner._run_active_group_verification(tmp_path)
+        else:
+            assert runner._run_active_group_verification(tmp_path).ok
+
+    trace = PerformanceTrace(tmp_path, workflow_kind="run", subject_id="run")
+    summary = trace.summary()
+    assert summary["totals"]["self_repair:focused_verification"]["duration_seconds"] == 2.5
+    assert summary["events"] == 1
+
+
+def test_phase_telemetry_failure_does_not_block_self_repair(tmp_path):
+    runner = _runner(tmp_path)
+    runner._experiment_store = SelfRepairExperimentStore(tmp_path, "run", "root")
+    with patch.object(runner, "_run_verification_commands", return_value=_VerificationResult(True, "passed")), \
+         patch.object(PerformanceTrace, "event", side_effect=OSError("trace disk unavailable")):
+        assert runner._run_active_group_verification(tmp_path).ok
+
+
+@pytest.mark.parametrize("mode", ["off", "observe"])
+def test_acceleration_opt_out_preserves_sequential_differential(tmp_path, mode):
+    (tmp_path / "tests").mkdir()
+    runner = _runner(tmp_path)
+    runner.target_orchestrator.config.execution.acceleration = AccelerationConfig(mode=mode)
+    order = []
+
+    def verify(label):
+        order.append(label)
+        return _VerificationResult(True, "passed")
+
+    with patch.object(runner, "_run_full_suite_at_ref", side_effect=lambda _ref: verify("base")), \
+         patch.object(runner, "_run_full_suite_shards", side_effect=lambda _root: verify("candidate")):
+        assert runner._full_suite_differential("base", tmp_path).ok
+
+    assert order == ["base", "candidate"]

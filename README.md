@@ -352,6 +352,15 @@ python3 -m auto_agents performance --project /tmp/demo
 python3 -m auto_agents performance --project /tmp/demo --session <session-id>
 ```
 
+Self-repair records `self_repair:*` phase totals in the owning run's trace: repair design,
+candidate generation/correction, contract reanalysis, semantic review, focused/integration
+verification and focused baseline comparison, boundary replay,
+diagnosis differential, full-suite wall time, and proof sealing. Failed and interrupted phases
+are timed too. Metadata identifies the candidate and repair root; timing write failures do not
+interrupt recovery. Full-suite time includes overlapping base/candidate work once.
+See [the iteration performance review](docs/performance-review.md) for measured bottlenecks,
+controlled benchmarks, and the limits of those measurements.
+
 Each run also writes `.auto-agents/runs/<run-id>/performance.json`, containing stage wall time,
 per-command gate duration, invocation and cache-hit counts, and the slowest commands. Set
 `gates.target_final_seconds` to a non-zero project target when final verification has a known
@@ -1651,6 +1660,8 @@ The baseline suite runs in the background while the candidate full suite execute
 share a bounded resource pool; conflicting resources are reserved before dispatch so waiting shards
 do not occupy executor threads that could run independent work. Incomplete proof retains the same candidate under
 `pending-validation`, and the next self-repair run resumes unfinished shards before generating code.
+`execution.acceleration.mode=observe|off` retains sequential base/candidate comparison and fresh
+integration reviews; phase timing remains available for comparison.
 
 An approved candidate is not immediately merged. The real workflow first resumes from the approved
 candidate worktree. Only after the original blocker fingerprint disappears is the candidate promoted
