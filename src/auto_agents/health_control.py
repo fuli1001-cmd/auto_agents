@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Mapping, Optional
 
 from .io_utils import read_json
 from .process_supervision import process_identity_matches, process_start_ticks
@@ -576,11 +576,18 @@ class HealthControlChannel:
                 else:
                     self.on_disable(payload)
             except Exception as error:
-                def record_error(current: Dict[str, object]) -> Dict[str, object]:
-                    if str(current.get("run_token", "")) != self.run_token:
+                def record_error(
+                    current: Dict[str, object],
+                    detail: str = str(error)[:1000],
+                    request_generation: int = generation,
+                ) -> Dict[str, object]:
+                    if (
+                        str(current.get("run_token", "")) != self.run_token
+                        or int(current.get("generation", 0) or 0) != request_generation
+                    ):
                         return current
                     current.update(
-                        apply_error=str(error)[:1000],
+                        apply_error=detail,
                         updated_at=utc_now(),
                         updated_epoch=time.time(),
                     )
@@ -589,7 +596,11 @@ class HealthControlChannel:
                 _mutate_control(self.project_root, record_error)
                 continue
             self._enabled = desired
-            def acknowledge(current: Dict[str, object]) -> Dict[str, object]:
+            def acknowledge(
+                current: Dict[str, object],
+                generation: int = generation,
+                desired: bool = desired,
+            ) -> Dict[str, object]:
                 if str(current.get("run_token", "")) != self.run_token:
                     return current
                 if int(current.get("generation", 0) or 0) < generation:
@@ -615,21 +626,22 @@ def request_health_state(
     payload = load_active_manifest(project_root)
     if not payload:
         raise RuntimeError(f"no active auto_agents workflow for {_project(project_root)}")
-    generation = int(payload.get("generation", 0) or 0) + 1
     token = str(payload.get("run_token", ""))
     def request(current: Dict[str, object]) -> Dict[str, object]:
         if str(current.get("run_token", "")) != token:
             raise RuntimeError("active workflow changed while requesting health-watch state")
         current.update(
             desired_state="enabled" if enabled else "disabled",
-            generation=generation,
+            generation=int(current.get("generation", 0) or 0) + 1,
+            apply_error="",
             command_requested_at=utc_now(),
             updated_at=utc_now(),
             updated_epoch=time.time(),
         )
         return current
 
-    _mutate_control(project_root, request)
+    requested = _mutate_control(project_root, request)
+    generation = int(requested["generation"])
     deadline = time.monotonic() + max(0.1, timeout_seconds)
     while time.monotonic() < deadline:
         current = load_active_manifest(project_root)
