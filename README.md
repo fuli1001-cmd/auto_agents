@@ -1633,6 +1633,8 @@ Proof from a selected parent is inherited by its descendant, so a completed comp
 base of the next dependent component instead of being regenerated from an older candidate. Failed
 focused, integration, and full-suite commands are persisted as a sticky regression set and run
 before every later candidate's component-specific checks.
+Recent candidate context includes bounded, redacted verification failure output, including both
+stdout and stderr tails, so later attempts receive the failing assertions as well as command names.
 Base and candidate full suites use the same progress lease and final safety ceiling. Test files are
 checkpointed independently; historically slow files are split into stable node batches, related and
 high-risk shards run first, and only shards with no detected shared-process/environment risk may run

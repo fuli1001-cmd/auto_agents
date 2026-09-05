@@ -7349,6 +7349,8 @@ class AutoAgentsSelfRepairRunner:
             "- Preserve existing public CLI behavior except for the new self-repair recovery path.",
             "",
             "Verification expectation:",
+            "- Use recent_candidates.verification_failure to address the exact failed "
+            "commands and assertions before retrying the repair.",
             "- Run focused pytest checks for auto_agents before declaring success.",
             "- Do not run the broad auto_agents suite or entire large test modules; "
             "the orchestrator owns authoritative full-suite execution, checkpointing, "
@@ -7559,11 +7561,18 @@ class AutoAgentsSelfRepairRunner:
             termination_reasons.append(
                 str(getattr(process, "termination_reason", "") or "")
             )
-            detail = (process.stderr or process.stdout or "").strip()
+            detail = "\n".join(
+                f"{stream}:\n{_compact_text(redact_incident_text(output), limit)}"
+                for stream, output, limit in (
+                    ("stdout", process.stdout, 1600),
+                    ("stderr", process.stderr, 800),
+                )
+                if output and output.strip()
+            )
             summaries.append(
                 (
                     f"$ {verification_command}\n"
-                    f"exit={process.returncode}\n{detail[:1200]}"
+                    f"exit={process.returncode}\n{detail}"
                 ).strip()
             )
             if (

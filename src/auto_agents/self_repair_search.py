@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Sequence
 
 from .config import run_path
+from .execution_recovery import redact_incident_text
 from .io_utils import read_json
 
 
@@ -1009,6 +1010,11 @@ class SelfRepairExperiment:
                     "strategy_fingerprint": item.strategy_fingerprint,
                     "net_progress": item.net_progress,
                     "summary": " ".join(item.summary.split())[-400:],
+                    "verification_failure": (
+                        redact_incident_text(item.verification)[-2400:]
+                        if item.status not in {"approved_candidate", "candidate_group_completed"}
+                        else ""
+                    ),
                 }
                 for item in recent
             ],
