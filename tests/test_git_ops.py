@@ -17,6 +17,8 @@ from auto_agents.git_ops import (
     apply_checkpoint_application,
     begin_checkpoint_application,
     cherry_pick_no_commit,
+    changed_entries,
+    changed_paths,
     checkpoint_application_state,
     commit_all,
     commit_all_except,
@@ -31,6 +33,7 @@ from auto_agents.git_ops import (
     reconcile_managed_worktree,
     remove_worktree,
     update_ref,
+    worktree_fingerprint,
 )
 from auto_agents.io_utils import write_text
 from auto_agents.models import RunState, TaskSpec
@@ -54,6 +57,34 @@ class GitOpsWorktreeTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def test_changed_paths_preserve_quoted_and_special_filenames(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            names = ["数据.txt", "literal -> name.txt", " leading.txt", 'quote"file.txt', "line\nbreak.txt"]
+            for name in names:
+                (root / name).write_text("one\n", encoding="utf-8")
+
+            self.assertEqual(sorted(changed_paths(root)), sorted(names))
+            before = worktree_fingerprint(root)
+            (root / "数据.txt").write_text("two\n", encoding="utf-8")
+            self.assertNotEqual(worktree_fingerprint(root), before)
+
+    def test_changed_entries_read_rename_destination_and_following_records(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            self._configure_git_identity(root)
+            (root / "old.txt").write_text("original\n", encoding="utf-8")
+            commit_all(root, "initial")
+            destination = "renamed -> 数据.txt"
+            subprocess.run(["git", "mv", "old.txt", destination], cwd=root, check=True)
+            (root / "untracked.txt").write_text("new\n", encoding="utf-8")
+
+            self.assertEqual(
+                changed_entries(root), [("R ", destination), ("??", "untracked.txt")]
+            )
 
     def test_add_list_and_remove_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

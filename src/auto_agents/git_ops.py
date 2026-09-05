@@ -304,16 +304,20 @@ def changed_entries(
     project_root: Path,
     ignored_prefixes: tuple[str, ...] = (".auto-agents/", ".antigravitycli/"),
 ) -> list[tuple[str, str]]:
-    process = _git(project_root, "status", "--porcelain=v1", "-uall")
+    process = _git(project_root, "status", "--porcelain=v1", "-z", "-uall")
     if process.returncode != 0:
         raise RuntimeError(process.stderr.strip() or "git status failed")
 
     entries: list[tuple[str, str]] = []
-    for raw_line in process.stdout.splitlines():
-        status = raw_line[:2]
-        path = raw_line[3:].strip()
-        if " -> " in path:
-            _, path = path.split(" -> ", 1)
+    records = iter(process.stdout.split("\0"))
+    for record in records:
+        if not record:
+            continue
+        status = record[:2]
+        path = record[3:]
+        if "R" in status or "C" in status:
+            # Porcelain -z emits the destination first, then the original path.
+            next(records, None)
         if any(path.startswith(prefix) for prefix in ignored_prefixes):
             continue
         entries.append((status, path))
