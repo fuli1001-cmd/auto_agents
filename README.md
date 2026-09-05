@@ -696,6 +696,9 @@ The isolated scheduler dispatches a bounded amount of work instead of queueing t
 failure stops new dispatch while already-running commands drain, preserving their diagnostics and
 cleanup. Successful finite command durations are retained as a rolling seven-sample median, and
 known long commands are dispatched first within each parallel group to reduce the final idle tail.
+The scheduler loads a plan's duration estimates in one batched database transaction and reuses
+them for priority and dispatch decisions. Executed commands refresh their estimates; environment
+and resource signatures still isolate unrelated timing histories.
 
 New projects run gates in isolated Git worktrees. Each parallel command receives the exact same
 snapshot, including tracked edits and non-ignored untracked files, plus private temporary and cache

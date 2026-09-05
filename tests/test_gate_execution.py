@@ -7,6 +7,7 @@ import shutil
 import socket
 import subprocess
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -21,7 +22,7 @@ from auto_agents.gate_execution import (
     self_referential_dependency_links,
 )
 from auto_agents.gates import GateCommandMetadata, run_gate_plan
-from auto_agents.models import GateConfig, GateIsolationConfig, GateParallelGroup
+from auto_agents.models import CommandResult, GateConfig, GateIsolationConfig, GateParallelGroup
 
 
 def _git(project: Path, *args: str) -> None:
@@ -55,6 +56,27 @@ def _config(tmp_path: Path) -> GateConfig:
             worktree_root=str(tmp_path / "worktrees"),
         )
     )
+
+
+def test_gate_plan_loads_timing_once_and_refreshes_executed_commands(tmp_path):
+    metadata = {f"check-{index}": GateCommandMetadata() for index in range(5)}
+    executor = LocalGatePlanExecutor(tmp_path, _config(tmp_path), metadata)
+    for command in metadata:
+        executor.timing_store.record(command, CommandResult(
+            command=command, ok=True, returncode=0, duration_seconds=4.0,
+        ), metadata[command])
+
+    with patch.object(executor.timing_store, "_connect", wraps=executor.timing_store._connect) as connect:
+        for command in metadata:
+            assert executor.priority(command)[1] == -4.0
+            assert executor.estimated_duration(command) == 4.0
+        assert connect.call_count == 1
+
+    executor.record_timing("check-0", CommandResult(
+        command="check-0", ok=True, returncode=0, duration_seconds=8.0,
+    ))
+    assert executor.estimated_duration("check-0") == 6.0
+    assert executor.estimated_duration("check-1") == 4.0
 
 
 def test_isolated_gate_snapshots_dirty_and_untracked_files(tmp_path: Path) -> None:

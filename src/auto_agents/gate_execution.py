@@ -1003,6 +1003,7 @@ class LocalGatePlanExecutor:
         self._shared_sandboxes: dict[str, Path] = {}
         self._published_hashes: dict[str, str] = {}
         self._cache_miss_reasons: dict[str, str] = {}
+        self._timing_estimates: Optional[dict[str, Optional[float]]] = None
         self._lock = threading.Lock()
 
     def __enter__(self) -> "LocalGatePlanExecutor":
@@ -1027,7 +1028,14 @@ class LocalGatePlanExecutor:
         )
 
     def estimated_duration(self, command: str) -> Optional[float]:
-        return self.timing_store.estimate(command, self.metadata.get(command))
+        with self._lock:
+            if self._timing_estimates is None:
+                self._timing_estimates = self.timing_store.estimate_many(self.metadata)
+            if command not in self._timing_estimates:
+                self._timing_estimates[command] = self.timing_store.estimate(
+                    command, self.metadata.get(command)
+                )
+            return self._timing_estimates[command]
 
     def required_slots(self, command: str) -> int:
         metadata = self.metadata.get(command)
@@ -1044,6 +1052,9 @@ class LocalGatePlanExecutor:
 
     def record_timing(self, command: str, result: CommandResult) -> None:
         self.timing_store.record(command, result, self.metadata.get(command))
+        with self._lock:
+            if self._timing_estimates is not None:
+                self._timing_estimates.pop(command, None)
 
     def cached_result(self, command: str) -> Optional[CommandResult]:
         if (

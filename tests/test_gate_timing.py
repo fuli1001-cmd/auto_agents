@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
 
 from auto_agents.gate_timing import GateTimingStore
 from auto_agents.gates import GateCommandMetadata
@@ -95,3 +96,26 @@ def test_parallel_quarantine_is_environment_scoped_and_persistent(
         "pytest tests/test_shared.py"
     }
     assert other.quarantined_commands() == set()
+
+
+def test_batch_estimates_match_individual_results_with_one_connection(tmp_path):
+    store = GateTimingStore(tmp_path, cache_path=tmp_path / "cache.sqlite3", environment_fingerprint="env")
+    normal = GateCommandMetadata(resource_class="normal", cpu_slots=1)
+    heavy = GateCommandMetadata(resource_class="heavy", cpu_slots=2)
+    commands = {f"check-{index}": normal for index in range(300)}
+    for command in ("check-0", "check-299"):
+        for duration in (1.0, 3.0, 8.0):
+            store.record(command, _result(duration), normal)
+    store.record("heavy", _result(12.0), heavy)
+    commands["heavy"] = normal
+
+    with patch.object(store, "_connect", wraps=store._connect) as connect:
+        estimates = store.estimate_many(commands)
+
+    assert connect.call_count == 1
+    assert estimates["check-0"] == estimates["check-299"] == 3.0
+    assert estimates["check-1"] is None
+    assert estimates["heavy"] is None
+    assert len(estimates) == len(commands)
+    other = GateTimingStore(tmp_path, cache_path=store.cache_path, environment_fingerprint="other")
+    assert other.estimate_many({"check-0": normal}) == {"check-0": None}

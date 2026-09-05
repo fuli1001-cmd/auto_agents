@@ -8,7 +8,7 @@ import time
 from contextlib import closing, contextmanager
 from pathlib import Path
 from statistics import median
-from typing import Iterator, Optional
+from typing import Iterator, Mapping, Optional
 
 from .config import gate_baseline_cache_path
 from .models import CommandResult
@@ -100,6 +100,40 @@ class GateTimingStore:
         except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
             self.disabled = True
             return None
+
+    def estimate_many(self, metadata: Mapping[str, object]) -> dict[str, Optional[float]]:
+        """Load one plan's environment-specific estimates in a single transaction."""
+        estimates: dict[str, Optional[float]] = dict.fromkeys(metadata)
+        if self.disabled or not metadata:
+            return estimates
+        keys = {
+            command: _timing_key(command, self.environment_fingerprint, _resource_signature(item))
+            for command, item in metadata.items()
+        }
+        unique_keys = list(dict.fromkeys(keys.values()))
+        samples_by_key: dict[str, float] = {}
+        try:
+            with self._lock, self._connect() as connection:
+                cutoff = int(time.time()) - MAX_AGE_SECONDS
+                for offset in range(0, len(unique_keys), 250):
+                    batch = unique_keys[offset:offset + 250]
+                    placeholders = ",".join("?" for _key in batch)
+                    rows = connection.execute(
+                        "SELECT timing_key, samples FROM command_timings "
+                        f"WHERE timing_key IN ({placeholders}) AND updated_at >= ?",
+                        (*batch, cutoff),
+                    ).fetchall()
+                    for key, raw in rows:
+                        samples = [
+                            float(item) for item in json.loads(raw)
+                            if isinstance(item, (int, float)) and float(item) >= 0
+                        ]
+                        if samples:
+                            samples_by_key[key] = float(median(samples))
+            return {command: samples_by_key.get(key) for command, key in keys.items()}
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            self.disabled = True
+            return estimates
 
     def estimate_any_environment(
         self,
@@ -246,6 +280,7 @@ class GateTimingStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(str(self.cache_path), timeout=1.0)) as connection:
             with connection:
                 self._initialize_connection(connection)
