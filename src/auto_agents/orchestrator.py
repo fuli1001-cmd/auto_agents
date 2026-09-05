@@ -127,10 +127,13 @@ from .release_attestation import (
 from .execution_recovery import (
     BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
     BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY,
+    CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND,
+    CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY,
     ExecutionIncident,
     ExecutionIncidentStore,
     IncidentDiagnosis,
     ParallelLaneFailure,
+    baseline_identity_is_immutable_only,
     command_incident,
     deterministic_diagnosis,
     is_execution_incident_recovery_task,
@@ -1493,6 +1496,30 @@ class Orchestrator:
             if isinstance(state.active_blocker, dict)
             else {}
         )
+        incident_id = state.active_execution_incident_id.strip()
+        incident = (
+            self._incident_store(state).load(incident_id)
+            if incident_id
+            else None
+        )
+        if (
+            self._persisted_baseline_identity_blocker_matches(
+                state,
+                incident,
+                blocker,
+            )
+            and incident is not None
+            and self._is_missing_pytest_target_result(
+                self._retained_incident_command_result(incident)
+            )
+        ):
+            # A retained target-not-found result needs current-selector evidence;
+            # a generic engine-proof receipt cannot establish that distinction.
+            return self._resume_reclassified_current_selector_incident(
+                state,
+                incident,
+                blocker,
+            )
         diagnosis = (
             dict(blocker.get("root_cause_diagnosis", {}))
             if isinstance(blocker.get("root_cause_diagnosis"), dict)
@@ -13936,6 +13963,1180 @@ class Orchestrator:
         state.status = "pending"
         state.last_error = ""
 
+    @classmethod
+    def _current_semantic_failure_ids(
+        cls,
+        command: str,
+        current_gate: Optional[GateResult],
+        *,
+        diagnostic_gate: Optional[GateResult] = None,
+    ) -> List[str]:
+        if current_gate is None:
+            return []
+        current_result = next(
+            (
+                result
+                for result in current_gate.commands
+                if result.command == command
+            ),
+            None,
+        )
+        if current_result is None:
+            return []
+        failures = cls._stable_semantic_failure_ids_for_result(
+            current_result,
+            summary=(
+                current_gate.summary if len(current_gate.commands) == 1 else ""
+            ),
+        )
+        if failures:
+            return failures
+        diagnostic_command = build_failure_identity_diagnostic_command(command)
+        if not diagnostic_command or diagnostic_gate is None:
+            return []
+        diagnostic_result = next(
+            (
+                result
+                for result in diagnostic_gate.commands
+                if result.command == diagnostic_command
+            ),
+            None,
+        )
+        if diagnostic_result is None:
+            return []
+        return cls._stable_semantic_failure_ids_for_result(
+            diagnostic_result,
+            summary=(
+                diagnostic_gate.summary
+                if len(diagnostic_gate.commands) == 1
+                else ""
+            ),
+        )
+
+    @classmethod
+    def _diagnosis_text_contains_identity(
+        cls,
+        text: str,
+        identity: str,
+    ) -> bool:
+        candidate = str(identity).strip()
+        if not candidate:
+            return False
+        return bool(
+            re.search(
+                rf"(?<![A-Za-z0-9_./-]){re.escape(candidate)}"
+                r"(?![A-Za-z0-9_./-])",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _gate_without_commands(
+        gate: GateResult,
+        excluded_commands: Iterable[str],
+    ) -> GateResult:
+        excluded = {str(command) for command in excluded_commands}
+        if not excluded:
+            return gate
+        commands = [
+            result for result in gate.commands if result.command not in excluded
+        ]
+        ok = all(result.ok for result in commands)
+        return GateResult(
+            ok=ok,
+            commands=commands,
+            summary="all commands passed" if ok else "",
+        )
+
+    @classmethod
+    def _is_checkpoint_bound_baseline_diagnosis_blocker(
+        cls,
+        blocker: Mapping[str, object],
+        incident: ExecutionIncident,
+    ) -> bool:
+        """Recognize a diagnosed legacy blocker only at its exact incident checkpoint."""
+
+        root_cause = blocker.get("root_cause_diagnosis")
+        final = (
+            root_cause.get("final", {})
+            if isinstance(root_cause, dict)
+            else {}
+        )
+        raw_checkpoint = blocker.get("checkpoint", {})
+        checkpoint = (
+            raw_checkpoint if isinstance(raw_checkpoint, dict) else {}
+        )
+        blocker_incident_id = str(blocker.get("incident_id", "")).strip()
+        return bool(
+            str(blocker.get("owner", "")).strip() == "auto_agents"
+            and str(blocker.get("status", "blocked")).strip()
+            in {"blocked", "retrying"}
+            and (
+                not blocker_incident_id
+                or blocker_incident_id == incident.incident_id
+            )
+            and isinstance(final, dict)
+            and str(final.get("owner", "")).strip() == "auto_agents"
+            and cls._root_cause_diagnosis_is_bound_to_incident(
+                blocker,
+                incident,
+            )
+            and str(checkpoint.get("head", "")).strip() == incident.head_ref
+            and str(checkpoint.get("worktree", "")).strip()
+            == incident.worktree_fingerprint
+            and bool(incident.head_ref)
+            and bool(incident.worktree_fingerprint)
+        )
+
+    @staticmethod
+    def _is_persisted_baseline_identity_blocker(
+        blocker: Mapping[str, object],
+        incident_id: str,
+    ) -> bool:
+        category = str(blocker.get("category", "")).strip()
+        blocker_incident_id = str(blocker.get("incident_id", "")).strip()
+        return bool(
+            str(blocker.get("owner", "")).strip() == "auto_agents"
+            and category == BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
+            and str(blocker.get("status", "blocked")).strip()
+            in {"blocked", "retrying"}
+            and (
+                not blocker_incident_id
+                or blocker_incident_id == incident_id
+            )
+        )
+
+    @staticmethod
+    def _is_persisted_selector_pytest_command(command: str) -> bool:
+        """Recognize an actual pytest process, not a command mentioning pytest."""
+
+        try:
+            shell_lexer = shlex.shlex(
+                command,
+                posix=True,
+                punctuation_chars=";&|<>",
+            )
+            shell_lexer.whitespace_split = True
+            shell_parts = list(shell_lexer)
+            parts = _unwrap_conda_run(shlex.split(command))
+        except ValueError:
+            return False
+        if (
+            not parts
+            or "\n" in command
+            or "\r" in command
+            or "$(" in command
+            or "`" in command
+            or any(
+                token and not set(token).difference(";&|<>")
+                for token in shell_parts
+            )
+        ):
+            return False
+        executable = Path(parts[0]).name.lower()
+        if executable in {"pytest", "py.test", "pytest.exe", "py.test.exe"}:
+            return True
+        return bool(
+            re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable)
+            and len(parts) >= 3
+            and parts[1:3] == ["-m", "pytest"]
+        )
+
+    @classmethod
+    def _persisted_baseline_identity_blocker_matches(
+        cls,
+        state: RunState,
+        incident: Optional[ExecutionIncident],
+        blocker: Mapping[str, object],
+    ) -> bool:
+        return bool(
+            incident is not None
+            and state.status in {"blocked", "failed", "pending"}
+            and (
+                cls._persisted_selector_blocker_matches(
+                    blocker,
+                    incident,
+                )
+                or cls._is_checkpoint_bound_baseline_diagnosis_blocker(
+                    blocker,
+                    incident,
+                )
+            )
+            and incident.kind == BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
+            and incident.baseline
+            and incident.status in {"self_repair", "recovering"}
+            and not incident.termination_reason
+            and not incident.cleanup_incomplete
+        )
+
+    @staticmethod
+    def _persisted_incident_self_repair_fingerprint(
+        incident: ExecutionIncident,
+    ) -> str:
+        """Rebuild the legacy provider-owned blocker identity for an incident."""
+
+        reason = str(incident.diagnosis.get("reason", "")).strip()
+        if not reason:
+            return ""
+        # Import lazily because self_repair owns this persisted fingerprint
+        # schema and imports execution-recovery helpers during module loading.
+        from .self_repair import self_repair_error_fingerprint
+
+        return self_repair_error_fingerprint(
+            reason,
+            "provider_judged_auto_agents",
+        )
+
+    @classmethod
+    def _persisted_selector_blocker_matches(
+        cls,
+        blocker: Mapping[str, object],
+        incident: ExecutionIncident,
+    ) -> bool:
+        if not cls._is_persisted_baseline_identity_blocker(
+            blocker,
+            incident.incident_id,
+        ):
+            return False
+        raw_checkpoint = blocker.get("checkpoint", {})
+        checkpoint = (
+            raw_checkpoint if isinstance(raw_checkpoint, dict) else {}
+        )
+        return bool(
+            incident.head_ref
+            and str(checkpoint.get("head", "")).strip() == incident.head_ref
+            and incident.worktree_fingerprint
+            and str(checkpoint.get("worktree", "")).strip()
+            == incident.worktree_fingerprint
+        )
+
+    def _persisted_selector_checkpoint_matches(
+        self,
+        expected_head: str,
+        expected_worktree: str,
+    ) -> bool:
+        return bool(
+            expected_head
+            and expected_head == head_ref(self.project_root)
+            and expected_worktree
+            and expected_worktree == worktree_fingerprint(self.project_root)
+        )
+
+    def _persisted_selector_correction(
+        self,
+        task: TaskSpec,
+        incident: ExecutionIncident,
+    ) -> Tuple[List[str], List[str]]:
+        """Return only an explicitly persisted replacement proof surface."""
+
+        command = (incident.origin_command or incident.command).strip()
+        if task.status == "done":
+            return [], []
+        refs = list(
+            dict.fromkeys(
+                str(ref).strip()
+                for ref in task.verification_refs
+                if str(ref).strip()
+            )
+        )
+        if not refs or self._executable_verification_refs(refs) != refs:
+            return [], []
+        rendered = [
+            self._build_task_proof_evidence_command_for_ref(ref)
+            for ref in refs
+        ]
+        if any(not rendered_command for rendered_command in rendered):
+            return [], []
+        commands = list(
+            dict.fromkeys(
+                str(rendered_command)
+                for rendered_command in rendered
+                if rendered_command
+            )
+        )
+        if (
+            not commands
+            or command in commands
+            or not all(
+                self._is_persisted_selector_pytest_command(candidate)
+                for candidate in commands
+            )
+        ):
+            return [], []
+        return refs, commands
+
+    @classmethod
+    def _persisted_selector_probe_status(
+        cls,
+        result: CommandResult,
+    ) -> Tuple[str, List[str]]:
+        if (
+            result.termination_reason
+            or result.cleanup_incomplete
+            or result.infrastructure_error
+            or result.infrastructure_failure_id
+        ):
+            return "invalid", []
+        if cls._is_missing_pytest_target_result(result):
+            return "target_not_found", []
+        if result.ok:
+            if cls._successful_pytest_result_has_collection_evidence(result):
+                return "resolved_pass", []
+            return "collection_unproven", []
+        failures = cls._stable_semantic_failure_ids_for_result(result)
+        if failures:
+            return "stable_semantic_failure", failures
+        return "invalid", []
+
+    @classmethod
+    def _raise_for_current_verification_contract(
+        cls,
+        current_gate: GateResult,
+        *,
+        baseline_gate: Optional[GateResult] = None,
+        context: str,
+        task_id: str = "",
+    ) -> None:
+        current_result = next(
+            (
+                result
+                for result in current_gate.commands
+                if cls._is_missing_pytest_target_result(result)
+            ),
+            None,
+        )
+        if current_result is None:
+            return
+        baseline_result = next(
+            (
+                result
+                for result in (
+                    baseline_gate.commands if baseline_gate is not None else []
+                )
+                if result.command == current_result.command
+            ),
+            None,
+        )
+        if baseline_result is None:
+            baseline_status = "not_observed"
+        elif cls._is_missing_pytest_target_result(baseline_result):
+            baseline_status = "target_not_found"
+        elif baseline_result.ok:
+            baseline_status = "resolved_pass"
+        elif baseline_result.infrastructure_error:
+            baseline_status = "infrastructure_failure"
+        elif baseline_result.termination_reason:
+            baseline_status = "terminated"
+        else:
+            baseline_status = "resolved_failure"
+        observation: Dict[str, object] = {"status": baseline_status}
+        if baseline_result is not None:
+            observation["returncode"] = baseline_result.returncode
+        incident_result = replace(
+            current_result,
+            process_snapshot={
+                **dict(current_result.process_snapshot),
+                CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY: {
+                    "status": "target_not_found",
+                    "contract": "exact_pytest_target",
+                    "repair_scope": "verification_contract",
+                    "baseline_observation": observation,
+                },
+            },
+        )
+        raise GateCommandExecutionError(
+            f"{context} contains an exact pytest target that does not resolve "
+            "in the current project snapshot",
+            result=incident_result,
+            context=context,
+            baseline=False,
+            task_id=task_id,
+        )
+
+    def _resume_reclassified_current_selector_incident(
+        self,
+        state: RunState,
+        incident: Optional[ExecutionIncident],
+        blocker: Mapping[str, object],
+    ) -> bool:
+        """Migrate a retained false baseline blocker through target recovery."""
+
+        if incident is not None and incident.kind == (
+            CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+        ):
+            return self._synchronize_corrected_persisted_selector(
+                state,
+                incident,
+                expected_head=incident.head_ref,
+                expected_worktree=incident.worktree_fingerprint,
+            )
+        if not self._persisted_baseline_identity_blocker_matches(
+            state,
+            incident,
+            blocker,
+        ):
+            return False
+        assert incident is not None
+        command = (incident.command or incident.origin_command).strip()
+        retained_result = self._retained_incident_command_result(incident)
+        if not command or not self._is_missing_pytest_target_result(retained_result):
+            return False
+        try:
+            tasks = self._load_tasks_from_plan()
+        except (KeyError, OSError, TypeError, ValueError, RuntimeError):
+            return False
+        source_task = next(
+            (task for task in tasks if task.task_id == incident.task_id),
+            None,
+        )
+        if (
+            source_task is None
+            or source_task.status != "in_progress"
+            or not self._in_progress_implementation_is_ready(state, source_task)
+        ):
+            return False
+        source_owns_command = self._task_owns_persisted_pytest_command(
+            source_task,
+            command,
+        )
+        matching_recovery_task = next(
+            (
+                task
+                for task in tasks
+                if task.status != "done"
+                if self._execution_recovery_incident_id(task)
+                == incident.incident_id
+                and str(
+                    self._execution_recovery_marker(task).get(
+                        "verification_command",
+                        "",
+                    )
+                ).strip()
+                == command
+            ),
+            None,
+        )
+        if (
+            not source_owns_command
+            and matching_recovery_task is None
+        ):
+            return False
+        probe_task = (
+            source_task if source_owns_command else matching_recovery_task
+        )
+        if probe_task is None:
+            return False
+
+        current_head = head_ref(self.project_root)
+        current_worktree = worktree_fingerprint(self.project_root)
+        if (
+            not incident.head_ref
+            or incident.head_ref != current_head
+            or not incident.worktree_fingerprint
+            or incident.worktree_fingerprint != current_worktree
+        ):
+            return False
+        raw_checkpoint = blocker.get("checkpoint", {})
+        checkpoint = raw_checkpoint if isinstance(raw_checkpoint, dict) else {}
+        checkpoint_head = str(checkpoint.get("head", "")).strip()
+        checkpoint_worktree = str(checkpoint.get("worktree", "")).strip()
+        if (
+            not checkpoint_head
+            or checkpoint_head != current_head
+            or not checkpoint_worktree
+            or checkpoint_worktree != current_worktree
+        ):
+            return False
+        if (
+            self._changed_paths_excluding_agent_instructions()
+            and not self._capture_execution_recovery_worktree_handoff(
+                state,
+                tasks,
+                source_task_id=source_task.task_id,
+            )
+        ):
+            return False
+
+        revision = self._installed_engine_revision()
+        recovery_key = f"persisted_current_selector:{incident.incident_id}"
+        raw_revisions = state.resume_context.get(
+            self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
+            {},
+        )
+        revisions = dict(raw_revisions) if isinstance(raw_revisions, dict) else {}
+        if str(revisions.get(recovery_key, "")) == revision:
+            return False
+
+        # Persist the at-most-once claim before entering the isolated runner so
+        # every executed outcome, including an audit rejection, is durable.
+        revisions[recovery_key] = revision
+        state.resume_context[self.INSTALLED_ENGINE_RECOVERY_CONTEXT] = revisions
+        save_run_state(self.project_root, state)
+        gate = self._run_persisted_selector_probe(
+            probe_task,
+            [command],
+            expected_head=current_head,
+            expected_worktree=current_worktree,
+            context=f"persisted current verification selector ({incident.incident_id})",
+        )
+        if gate is None:
+            return False
+        current_result = gate.commands[0]
+        current_status, current_failures = self._persisted_selector_probe_status(
+            current_result
+        )
+        if current_status != "target_not_found":
+            incident.history.append(
+                {
+                    "event": "persisted_current_selector_probed",
+                    "engine_revision": revision,
+                    "command": command,
+                    "result": current_status,
+                    "failure_ids": current_failures,
+                    "disposition": (
+                        "preserved_baseline_identity"
+                        if current_status
+                        in {"resolved_pass", "stable_semantic_failure"}
+                        else "rejected"
+                    ),
+                }
+            )
+            self._incident_store(state).save(incident, state)
+            save_run_state(self.project_root, state)
+            return False
+
+        raw_baseline_identity = incident.process_snapshot.get(
+            BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY,
+            {},
+        )
+        baseline_identity = (
+            dict(raw_baseline_identity)
+            if isinstance(raw_baseline_identity, dict)
+            else {}
+        )
+        baseline_observation = {
+            "status": "target_not_found",
+            "returncode": retained_result.returncode,
+            "stdout_tail": incident.stdout_tail,
+            "stderr_tail": incident.stderr_tail,
+            "failure_identity": baseline_identity,
+            "process_snapshot": dict(incident.process_snapshot),
+        }
+        migrated_result = replace(
+            current_result,
+            process_snapshot={
+                **dict(current_result.process_snapshot),
+                CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY: {
+                    "status": "target_not_found",
+                    "contract": "exact_pytest_target",
+                    "repair_scope": "verification_contract",
+                    "baseline_observation": baseline_observation,
+                },
+            },
+        )
+        canonical = command_incident(
+            run_id=incident.run_id,
+            stage=incident.stage,
+            context=(
+                f"task verification commands ({incident.task_id})"
+                if incident.task_id
+                else "verification commands"
+            ),
+            result=migrated_result,
+            baseline=False,
+            task_id=incident.task_id,
+            head_ref=current_head,
+            worktree_fingerprint=current_worktree,
+            idle_timeout_seconds=incident.idle_timeout_seconds,
+        )
+        prior_diagnosis = dict(incident.diagnosis)
+        canonical.incident_id = incident.incident_id
+        canonical.root_incident_id = incident.root_incident_id or incident.incident_id
+        canonical.origin_command = incident.origin_command or command
+        canonical.budget_epoch = incident.budget_epoch
+        canonical.occurrence_count = incident.occurrence_count
+        canonical.recovery_round = incident.recovery_round
+        canonical.repair_history = list(incident.repair_history)
+        canonical.recovery_policy_version = max(
+            canonical.recovery_policy_version,
+            incident.recovery_policy_version,
+        )
+        canonical.created_at = incident.created_at
+        canonical.history = [
+            *incident.history,
+            {
+                "event": "persisted_baseline_selector_reclassified",
+                "engine_revision": revision,
+                "prior_kind": incident.kind,
+                "prior_baseline": incident.baseline,
+                "prior_context": incident.context,
+                "prior_diagnosis": prior_diagnosis,
+                "prior_blocker": dict(blocker),
+                "baseline_observation": baseline_observation,
+                "current_observation": {
+                    "status": current_status,
+                    "returncode": current_result.returncode,
+                },
+                "checkpoint": {
+                    "task_id": incident.task_id,
+                    "head": current_head,
+                    "worktree": current_worktree,
+                    "command": command,
+                },
+            },
+        ]
+        diagnosis = deterministic_diagnosis(canonical)
+        if diagnosis is None:
+            return False
+        self._clear_run_blocker(state)
+        recovered = self._apply_execution_incident_diagnosis(
+            state,
+            canonical,
+            diagnosis,
+        )
+        if recovered:
+            state.last_recovery_route = {
+                "outcome": "persisted_current_selector_reclassified",
+                "failure_kind": canonical.kind,
+                "incident_id": canonical.incident_id,
+                "task_id": canonical.task_id,
+                "reason": (
+                    "the retained baseline blocker was reclassified from an "
+                    "exact mutation-free current selector probe"
+                ),
+                "engine_invariant": "",
+            }
+            self._synchronize_corrected_persisted_selector(
+                state,
+                canonical,
+                expected_head=current_head,
+                expected_worktree=current_worktree,
+            )
+        save_run_state(self.project_root, state)
+        self.logger.info(
+            "[self-repair] reclassified persisted selector incident=%s status=%s",
+            canonical.incident_id,
+            canonical.status,
+        )
+        return True
+
+    @staticmethod
+    def _retained_incident_command_result(
+        incident: ExecutionIncident,
+    ) -> CommandResult:
+        return CommandResult(
+            command=(incident.command or incident.origin_command).strip(),
+            ok=False,
+            returncode=int(incident.returncode or 1),
+            stdout=incident.stdout_tail,
+            stderr=incident.stderr_tail,
+            duration_seconds=incident.elapsed_seconds,
+            termination_reason=incident.termination_reason,
+            timeout_seconds=incident.timeout_seconds,
+            cleanup_incomplete=incident.cleanup_incomplete,
+            last_activity_seconds=incident.last_activity_seconds,
+            activity_kind=incident.activity_kind,
+            process_snapshot=dict(incident.process_snapshot),
+        )
+
+    @classmethod
+    def _root_cause_diagnosis_is_bound_to_incident(
+        cls,
+        blocker: Mapping[str, object],
+        incident: ExecutionIncident,
+    ) -> bool:
+        """Prove that a legacy replacement blocker diagnosed this incident."""
+
+        root_cause = blocker.get("root_cause_diagnosis")
+        if not isinstance(root_cause, dict):
+            return False
+        final = root_cause.get("final", {})
+        if not isinstance(final, dict):
+            return False
+        category = str(blocker.get("category", "")).strip()
+        causal_chain = [
+            str(item).strip()
+            for item in final.get("causal_chain", []) or []
+            if str(item).strip()
+        ]
+        blocker_fingerprint = str(blocker.get("fingerprint", "")).strip()
+        incident_fingerprint = (
+            cls._persisted_incident_self_repair_fingerprint(incident)
+        )
+        if (
+            not str(root_cause.get("diagnosis_id", "")).strip()
+            or not str(root_cause.get("evidence_path", "")).strip()
+            or not category
+            or str(final.get("category", "")).strip() != category
+            or str(final.get("verdict", "")).strip().upper() != "FINAL"
+            or not bool(final.get("generic", False))
+            or str(final.get("resume_strategy", "")).strip()
+            != "repair_and_resume"
+            or not causal_chain
+            or str(blocker.get("reason", "")).strip()
+            != " -> ".join(causal_chain)
+            or not incident_fingerprint
+            or blocker_fingerprint != incident_fingerprint
+        ):
+            return False
+
+        command = (incident.origin_command or incident.command).strip()
+        if not command or not build_failure_identity_diagnostic_command(command):
+            return False
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return False
+        diagnosis_text = json.dumps(final, ensure_ascii=False, sort_keys=True)
+        task_id = incident.task_id.strip()
+        if not cls._diagnosis_text_contains_identity(
+            diagnosis_text,
+            task_id,
+        ):
+            return False
+        for part in parts:
+            ref = str(part).strip().removeprefix("./")
+            path, selector = cls._split_evidence_ref(ref)
+            selector_parts = [
+                item.strip() for item in selector.split("::") if item.strip()
+            ]
+            if (
+                selector_parts
+                and cls._looks_like_pytest_evidence_ref(ref)
+                and cls._diagnosis_text_contains_identity(
+                    diagnosis_text,
+                    path.removeprefix("./"),
+                )
+                and all(
+                    cls._diagnosis_text_contains_identity(
+                        diagnosis_text,
+                        item,
+                    )
+                    for item in selector_parts
+                )
+            ):
+                return True
+        return False
+
+    def _run_persisted_selector_probe(
+        self,
+        task: TaskSpec,
+        commands: List[str],
+        *,
+        expected_head: str,
+        expected_worktree: str,
+        context: str,
+    ) -> Optional[GateResult]:
+        """Run exact current selectors without cache or target-tree mutation."""
+
+        task_commands = set(self._build_task_verify_commands(task))
+        if (
+            not commands
+            or any(
+                command not in task_commands
+                and not self._task_owns_persisted_pytest_command(task, command)
+                for command in commands
+            )
+            or not self.config.gates.isolation.enabled
+            or not self._persisted_selector_checkpoint_matches(
+                expected_head,
+                expected_worktree,
+            )
+        ):
+            return None
+        previous_force_full = self._force_full_verify
+        previous_distributed_mode = self.config.gates.distributed.mode
+        self._force_full_verify = True
+        self.config.gates.distributed.mode = "off"
+        try:
+            # This probe deliberately bypasses the normal gate wrapper.  That
+            # wrapper cleans ephemeral tooling artifacts in the retained
+            # worktree after an isolated run, which is appropriate for normal
+            # verification but destructive when those paths contain retained
+            # staged or unstaged task work.  An empty metadata map also prevents
+            # isolated proof artifacts from being published back to the source.
+            with self._gate_executor_context(
+                {},
+                use_result_cache=False,
+            ) as gate_executor:
+                if gate_executor is None:
+                    return None
+                gate = run_gate_plan(
+                    commands,
+                    [],
+                    self.project_root,
+                    collect_all=True,
+                    parallel_workers=self._gate_parallel_workers(),
+                    command_timeout_seconds=(
+                        self.config.gates.command_timeout_seconds
+                    ),
+                    adaptive_timeout_enabled=(
+                        self.config.gates.adaptive_timeout_enabled
+                    ),
+                    command_idle_timeout_seconds=(
+                        self.config.gates.command_idle_timeout_seconds
+                    ),
+                    progress=self._gate_progress_callback(context),
+                    gate_executor=gate_executor,
+                )
+            self._classify_reported_infrastructure_failures(gate)
+            self._log_gate_command_results(context, gate.commands)
+            mutation_error = bool(self._gate_result_mutation_paths(gate))
+        except (OSError, RuntimeError, ValueError) as error:
+            self.logger.warning(
+                "[self-repair] persisted selector probe could not run: %s",
+                error,
+            )
+            return None
+        finally:
+            self._force_full_verify = previous_force_full
+            self.config.gates.distributed.mode = previous_distributed_mode
+        if (
+            mutation_error
+            or expected_head != head_ref(self.project_root)
+            or expected_worktree != worktree_fingerprint(self.project_root)
+            or [result.command for result in gate.commands] != commands
+            or any(result.cached for result in gate.commands)
+        ):
+            return None
+        return gate
+
+    @classmethod
+    def _stable_semantic_failure_ids_for_result(
+        cls,
+        result: CommandResult,
+        *,
+        summary: str = "",
+    ) -> List[str]:
+        if result.ok or cls._is_missing_pytest_target_result(result):
+            return []
+        extraction = extract_failure_info(
+            GateResult(ok=False, commands=[result], summary=summary)
+        )
+        failures = [
+            str(item).strip()
+            for item in extraction.failure_ids
+            if str(item).strip()
+        ]
+        if (
+            extraction.comparable
+            and failures
+            and cls._baseline_failure_ids_are_valid(failures)
+        ):
+            return list(dict.fromkeys(failures))
+        return []
+
+    @classmethod
+    def _successful_pytest_result_has_collection_evidence(
+        cls,
+        result: CommandResult,
+    ) -> bool:
+        """Require pytest output proving that a successful probe selected tests."""
+
+        if not cls._is_persisted_selector_pytest_command(result.command):
+            return False
+        try:
+            parts = _unwrap_conda_run(shlex.split(result.command))
+        except ValueError:
+            return False
+        pytest_index = next(
+            (
+                index
+                for index, part in enumerate(parts)
+                if Path(part).name.lower()
+                in {"pytest", "py.test", "pytest.exe", "py.test.exe"}
+            ),
+            -1,
+        )
+        args = parts[pytest_index + 1 :] if pytest_index >= 0 else []
+        information_only_options = {
+            "-h",
+            "--help",
+            "--version",
+            "--fixtures",
+            "--funcargs",
+            "--fixtures-per-test",
+            "--markers",
+        }
+        if any(
+            argument.split("=", 1)[0] in information_only_options
+            for argument in args
+        ):
+            return False
+
+        skip_value = False
+        has_test_target = False
+        value_options = {
+            *PYTEST_VALUE_OPTIONS,
+            "-o",
+            "--override-ini",
+        }
+        for argument in args:
+            if skip_value:
+                skip_value = False
+                continue
+            if argument == "--":
+                continue
+            if argument.startswith("-"):
+                if argument in value_options and "=" not in argument:
+                    skip_value = True
+                continue
+            if cls._looks_like_pytest_evidence_ref(argument):
+                has_test_target = True
+                break
+        if not has_test_target:
+            return False
+
+        ansi_escape = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+        lines = [
+            ansi_escape.sub("", line).strip()
+            for output in (result.stdout, result.stderr)
+            for line in output.splitlines()
+            if line.strip()
+        ]
+        terminal_summary = re.compile(
+            r"^(?:=+\s*)?[1-9]\d*\s+"
+            r"(?:tests?\s+collected|passed|skipped|xfailed|xpassed)"
+            r"(?:,\s*\d+\s+[A-Za-z][A-Za-z -]*)*\s+in\s+"
+            r"\d+(?:\.\d+)?(?:s|\s+seconds?)(?:\s*=+)?$",
+            flags=re.IGNORECASE,
+        )
+        if any(terminal_summary.fullmatch(line) for line in lines):
+            return True
+        progress_line = re.compile(r"^[.sSxX]+\s*\[\s*100%\s*\]$")
+        return any(progress_line.fullmatch(line) for line in lines)
+
+    def _synchronize_corrected_persisted_selector(
+        self,
+        state: RunState,
+        incident: ExecutionIncident,
+        *,
+        expected_head: str,
+        expected_worktree: str,
+    ) -> bool:
+        if state.active_blocker and not (
+            self._persisted_selector_blocker_matches(
+                state.active_blocker,
+                incident,
+            )
+        ):
+            return False
+        try:
+            tasks = self._load_tasks_from_plan()
+        except (KeyError, OSError, TypeError, ValueError, RuntimeError):
+            return False
+        source_task = next(
+            (task for task in tasks if task.task_id == incident.task_id),
+            None,
+        )
+        if source_task is None:
+            return False
+        recovery_tasks = [
+            task
+            for task in tasks
+            if task.status != "done"
+            and self._execution_recovery_incident_id(task)
+            == incident.incident_id
+            and str(
+                self._execution_recovery_marker(task).get(
+                    "verification_command",
+                    "",
+                )
+            ).strip()
+            == (incident.origin_command or incident.command).strip()
+        ]
+        if len(recovery_tasks) != 1:
+            return False
+        recovery_task = recovery_tasks[0]
+        if source_task is None or source_task.status == "done":
+            return False
+        correction_candidates = []
+        for candidate in (recovery_task, source_task):
+            refs, commands = self._persisted_selector_correction(
+                candidate,
+                incident,
+            )
+            if refs and commands and (refs, commands) not in [
+                (known_refs, known_commands)
+                for _known_task, known_refs, known_commands in correction_candidates
+            ]:
+                correction_candidates.append((candidate, refs, commands))
+        if len(correction_candidates) != 1:
+            return False
+        correction_task, refs, commands = correction_candidates[0]
+        if not self._persisted_selector_checkpoint_matches(
+            expected_head,
+            expected_worktree,
+        ):
+            return False
+
+        revision = self._installed_engine_revision()
+        correction_digest = hashlib.sha256(
+            "\0".join([*refs, *commands]).encode("utf-8")
+        ).hexdigest()[:24]
+        recovery_key = (
+            f"persisted_selector_correction:{incident.incident_id}:"
+            f"{correction_digest}"
+        )
+        raw_revisions = state.resume_context.get(
+            self.INSTALLED_ENGINE_RECOVERY_CONTEXT,
+            {},
+        )
+        revisions = dict(raw_revisions) if isinstance(raw_revisions, dict) else {}
+        if str(revisions.get(recovery_key, "")) == revision:
+            return False
+
+        # Checkpoint preflight above must succeed before this at-most-once
+        # execution claim is durable. A rejected mutation audit or post-run
+        # invariant must not execute the exact selector again under this engine.
+        revisions[recovery_key] = revision
+        state.resume_context[self.INSTALLED_ENGINE_RECOVERY_CONTEXT] = revisions
+        save_run_state(self.project_root, state)
+
+        gate = self._run_persisted_selector_probe(
+            correction_task,
+            commands,
+            expected_head=expected_head,
+            expected_worktree=expected_worktree,
+            context=(
+                "persisted current verification selector correction "
+                f"({incident.incident_id})"
+            ),
+        )
+        if gate is None:
+            return False
+        observations = []
+        correction_valid = True
+        for result in gate.commands:
+            status, failures = self._persisted_selector_probe_status(result)
+            observations.append(
+                {
+                    "command": result.command,
+                    "status": status,
+                    "returncode": result.returncode,
+                    "failure_ids": failures,
+                }
+            )
+            correction_valid = correction_valid and status in {
+                "resolved_pass",
+                "stable_semantic_failure",
+            }
+
+        incident.history.append(
+            {
+                "event": "persisted_selector_correction_probed",
+                "engine_revision": revision,
+                "correction_task_id": correction_task.task_id,
+                "verification_refs": refs,
+                "commands": observations,
+                "result": "accepted" if correction_valid else "rejected",
+            }
+        )
+        if not correction_valid:
+            self._incident_store(state).save(incident, state)
+            save_run_state(self.project_root, state)
+            return False
+
+        recovery_task.verification_refs = list(refs)
+        recovery_task.status = "in_progress"
+        marker = self._execution_recovery_marker(recovery_task)
+        marker["corrected_verification_refs"] = list(refs)
+        marker["corrected_verification_commands"] = list(commands)
+        marker["selector_correction_engine_revision"] = revision
+        marker["selector_correction_result"] = "verified"
+        self._mark_execution_recovery_implementation_complete(recovery_task)
+        ready = self._implementation_ready_markers(state)
+        ready[recovery_task.task_id] = True
+        state.resume_context["implementation_ready_tasks"] = ready
+        state.tasks = tasks
+        self._persist_tasks(tasks)
+        if state.active_blocker:
+            self._clear_run_blocker(state)
+        state.status = "pending"
+        state.last_error = ""
+        incident.status = "recovering"
+        self._incident_store(state).save(incident, state)
+        state.last_recovery_route = {
+            "outcome": "persisted_selector_correction_verified",
+            "failure_kind": incident.kind,
+            "incident_id": incident.incident_id,
+            "task_id": incident.task_id,
+            "recovery_task_id": recovery_task.task_id,
+            "verification_refs": list(refs),
+            "reason": (
+                "persisted replacement verification selectors resolved in the "
+                "retained current snapshot; normal verification is pending"
+            ),
+            "engine_invariant": "",
+        }
+        save_run_state(self.project_root, state)
+        self.logger.info(
+            "[self-repair] synchronized corrected selector incident=%s task=%s refs=%s",
+            incident.incident_id,
+            recovery_task.task_id,
+            len(refs),
+        )
+        return True
+
+    def _task_owns_persisted_pytest_command(
+        self,
+        task: TaskSpec,
+        command: str,
+    ) -> bool:
+        """Bind a retained command to task refs across renderer upgrades."""
+
+        if (
+            not self._safe_execution_recovery_command(command)
+            or not self._is_persisted_selector_pytest_command(command)
+        ):
+            return False
+        try:
+            parts = _unwrap_conda_run(shlex.split(command))
+        except ValueError:
+            return False
+        pytest_index = next(
+            (
+                index
+                for index, part in enumerate(parts)
+                if Path(part).name in {"pytest", "py.test"}
+            ),
+            -1,
+        )
+        if pytest_index < 0:
+            return False
+
+        targets: List[str] = []
+        skip_next = False
+        for part in parts[pytest_index + 1 :]:
+            if skip_next:
+                skip_next = False
+                continue
+            if part == "--":
+                continue
+            if part.startswith("-"):
+                if part in PYTEST_VALUE_OPTIONS and "=" not in part:
+                    skip_next = True
+                continue
+            if self._looks_like_pytest_evidence_ref(part):
+                targets.append(self._canonical_project_evidence_ref(part))
+        if not targets:
+            return False
+
+        task_refs = self._task_gate_evidence_refs(task)
+        direct_commands = {
+            " ".join(command_ref.split())
+            for ref in task_refs
+            if (command_ref := self._command_evidence_ref_command(ref))
+        }
+        if " ".join(command.split()) in direct_commands:
+            return True
+        owned_targets = {
+            self._canonical_project_evidence_ref(ref)
+            for ref in task_refs
+            if self._looks_like_pytest_evidence_ref(ref)
+        }
+        return bool(owned_targets and set(targets).issubset(owned_targets))
+
     def _resume_blocked_run(self, state: RunState) -> bool:
         if self._legacy_applied_checkpoint_records(state):
             canonical_tasks = self._load_implementation_tasks(state)
@@ -14005,6 +15206,34 @@ class Orchestrator:
             if isinstance(state.active_blocker, dict)
             else {}
         )
+        if self._resume_reclassified_current_selector_incident(
+            state,
+            active_incident,
+            persisted_blocker,
+        ):
+            return True
+        if (
+            active_incident is not None
+            and active_incident.kind
+            == BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
+            and active_incident.baseline
+            and self._is_missing_pytest_target_result(
+                self._retained_incident_command_result(active_incident)
+            )
+            and persisted_blocker
+            and not self._persisted_baseline_identity_blocker_matches(
+                state,
+                active_incident,
+                persisted_blocker,
+            )
+            and not self._is_persisted_baseline_identity_blocker(
+                persisted_blocker,
+                active_incident.incident_id,
+            )
+        ):
+            # A different active blocker superseded this stale incident.  Do
+            # not let generic blocked-run resume bookkeeping mutate it.
+            return False
         if self._resume_reparsed_baseline_identity_incident(
             state,
             active_incident,
@@ -14546,6 +15775,7 @@ class Orchestrator:
         incident: ExecutionIncident,
         diagnosis: IncidentDiagnosis,
     ) -> bool:
+        immutable_baseline_only = baseline_identity_is_immutable_only(incident)
         if (
             incident.cause_status == "confirmed"
             and diagnosis.cause_status != "confirmed"
@@ -14595,6 +15825,28 @@ class Orchestrator:
                     f"{diagnosis.reason}; target recovery cannot mutate "
                     f"failure_domain={diagnosis.failure_domain}"
                 ),
+            )
+        if (
+            incident.kind == BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
+            and not immutable_baseline_only
+            and (
+                diagnosis.owner == "auto_agents"
+                or diagnosis.action == "SELF_REPAIR"
+            )
+        ):
+            diagnosis = IncidentDiagnosis(
+                owner="unknown",
+                action="STOP",
+                confidence=1.0,
+                reason=(
+                    "an unresolved baseline identity cannot be assigned to the "
+                    "engine without exact current semantic-failure evidence"
+                ),
+                evidence=["immutable_baseline_only=false"],
+                cause_status="unknown",
+                source="deterministic_guard",
+                failure_domain="unknown",
+                mutation_domain="none",
             )
         incident.diagnosis = diagnosis.to_dict()
         incident.history.append(
@@ -15055,6 +16307,9 @@ class Orchestrator:
             reported_infrastructure = (
                 incident.kind == "gate_reported_infrastructure_error"
             )
+            current_verification_contract = (
+                incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+            )
             unresolved_failure_identity = (
                 incident.kind == BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
             )
@@ -15110,9 +16365,13 @@ class Orchestrator:
                     "Repair verification infrastructure"
                     if reported_infrastructure
                     else (
-                        "Repair baseline verification identity"
-                        if unresolved_failure_identity
-                        else "Repair stalled verification command"
+                        "Repair current verification contract"
+                        if current_verification_contract
+                        else (
+                            "Repair baseline verification identity"
+                            if unresolved_failure_identity
+                            else "Repair stalled verification command"
+                        )
                     )
                 ),
                 description=(
@@ -15122,13 +16381,20 @@ class Orchestrator:
                     if reported_infrastructure
                     else (
                         "Diagnose and repair the target-project verification contract. The "
-                        "baseline command failed without emitting a stable test or suite "
-                        "identity after its bounded diagnostic rerun. Do not merely rerun the "
-                        "test. "
-                        if unresolved_failure_identity
-                        else
-                        "Diagnose and repair the target-project cause of this supervised "
-                        "verification incident. "
+                        "exact current pytest command references a target that does not "
+                        "resolve. Correct the configured selector to the intended existing "
+                        "proof without discarding retained source-task changes. "
+                        if current_verification_contract
+                        else (
+                            "Diagnose and repair the target-project verification contract. The "
+                            "baseline command failed without emitting a stable test or suite "
+                            "identity after its bounded diagnostic rerun. Do not merely rerun the "
+                            "test. "
+                            if unresolved_failure_identity
+                            else
+                            "Diagnose and repair the target-project cause of this supervised "
+                            "verification incident. "
+                        )
                     )
                 )
                 + (
@@ -28837,7 +30103,49 @@ class Orchestrator:
         diagnostic_identity_only = False
         baseline_not_applicable_commands: List[str] = []
         raw_output = self._gate_raw_output(verify_gate)
-        if not verify_gate.ok and not extraction.comparable:
+        current_missing_target = next(
+            (
+                result
+                for result in verify_gate.commands
+                if self._is_missing_pytest_target_result(result)
+            ),
+            None,
+        )
+        lazy_baseline_verification = bool(
+            task is not None
+            and not verify_gate.ok
+            and self.config.gates.verification_policy_version >= 3
+            and self.config.gates.incremental_mode == "auto"
+            and bool(self.config.gates.steps)
+            and task.verify_baseline_ref
+        )
+        repair_owned_missing_target = bool(
+            current_missing_target is not None
+            and self._is_repair_task(task)
+            and self._all_failures_are_missing_owned_pytest_evidence_refs(
+                task,
+                extraction.failure_ids,
+            )
+        )
+        if (
+            current_missing_target is not None
+            and not lazy_baseline_verification
+            and not repair_owned_missing_target
+        ):
+            self._raise_for_current_verification_contract(
+                verify_gate,
+                context=(
+                    f"task verification commands ({task.task_id})"
+                    if task is not None
+                    else "verification commands"
+                ),
+                task_id=task.task_id if task is not None else "",
+            )
+        if (
+            not verify_gate.ok
+            and not extraction.comparable
+            and current_missing_target is None
+        ):
             diagnostic_gate = self._run_verify_failure_identity_diagnostic(verify_gate)
             if diagnostic_gate is not None:
                 diagnostic_raw_output = self._gate_raw_output(diagnostic_gate)
@@ -28857,14 +30165,8 @@ class Orchestrator:
             if extraction.failure_ids
             else []
         )
-        if (
-            task is not None
-            and not verify_gate.ok
-            and self.config.gates.verification_policy_version >= 3
-            and self.config.gates.incremental_mode == "auto"
-            and bool(self.config.gates.steps)
-            and task.verify_baseline_ref
-        ):
+        if lazy_baseline_verification:
+            assert task is not None
             failed_commands = list(
                 dict.fromkeys(
                     result.command for result in verify_gate.commands if not result.ok
@@ -28891,6 +30193,13 @@ class Orchestrator:
             )
             if baseline_mutation_error:
                 raise RuntimeError(baseline_mutation_error)
+            if not repair_owned_missing_target:
+                self._raise_for_current_verification_contract(
+                    verify_gate,
+                    baseline_gate=baseline_gate,
+                    context=f"task verification commands ({task.task_id})",
+                    task_id=task.task_id,
+                )
             baseline_not_applicable_commands = (
                 self._lazy_baseline_target_absent_commands(
                     baseline_gate,
@@ -28905,25 +30214,19 @@ class Orchestrator:
                     task.task_id,
                     command[:300],
                 )
-            not_applicable = set(baseline_not_applicable_commands)
-            baseline_validation_commands = [
-                result
-                for result in baseline_gate.commands
-                if result.command not in not_applicable
-            ]
-            baseline_validation_gate = GateResult(
-                ok=all(result.ok for result in baseline_validation_commands),
-                commands=baseline_validation_commands,
-                summary=baseline_gate.summary,
-                comparable_failures=baseline_gate.comparable_failures,
+            baseline_gate_for_validation = self._gate_without_commands(
+                baseline_gate,
+                baseline_not_applicable_commands,
             )
             lazy_failures = (
                 self._validated_baseline_failures(
-                    baseline_validation_gate,
+                    baseline_gate_for_validation,
                     context=f"lazy task baseline verification ({task.task_id})",
                     task_id=task.task_id,
+                    current_gate=verify_gate,
+                    current_diagnostic_gate=diagnostic_gate,
                 )
-                if not baseline_validation_gate.ok
+                if not baseline_gate_for_validation.ok
                 else []
             )
             task.verify_baseline_failures = list(
@@ -31625,6 +32928,8 @@ class Orchestrator:
         *,
         context: str,
         task_id: str = "",
+        current_gate: Optional[GateResult] = None,
+        current_diagnostic_gate: Optional[GateResult] = None,
     ) -> List[str]:
         if gate.ok:
             return []
@@ -31659,7 +32964,56 @@ class Orchestrator:
             ):
                 return self._normalize_verify_failure_ids(combined, diagnostic_gate.summary)
 
-        failed_result = next((result for result in gate.commands if not result.ok), None)
+        failed_result: Optional[CommandResult] = None
+        diagnostic_results = {
+            result.command: result
+            for result in (
+                diagnostic_gate.commands if diagnostic_gate is not None else []
+            )
+        }
+        for candidate in gate.commands:
+            if candidate.ok:
+                continue
+            candidate_extraction = extract_failure_info(
+                GateResult(ok=False, commands=[candidate], summary="")
+            )
+            candidate_failures = [
+                str(item).strip()
+                for item in candidate_extraction.failure_ids
+                if str(item).strip()
+            ]
+            if self._baseline_failure_ids_are_valid(candidate_failures):
+                continue
+            candidate_diagnostic_command = (
+                build_failure_identity_diagnostic_command(candidate.command)
+            )
+            candidate_diagnostic = diagnostic_results.get(
+                candidate_diagnostic_command
+            )
+            if candidate_diagnostic is not None:
+                candidate_diagnostic_failures = (
+                    self._stable_semantic_failure_ids_for_result(
+                        candidate_diagnostic
+                    )
+                )
+                if candidate_diagnostic_failures:
+                    continue
+            failed_result = candidate
+            break
+        if failed_result is None:
+            failed_result = next(
+                (result for result in gate.commands if not result.ok),
+                None,
+            )
+        current_semantic_failure_ids = (
+            self._current_semantic_failure_ids(
+                failed_result.command,
+                current_gate,
+                diagnostic_gate=current_diagnostic_gate,
+            )
+            if failed_result is not None
+            else []
+        )
         incident_result = (
             replace(
                 failed_result,
@@ -31669,6 +33023,17 @@ class Orchestrator:
                         "status": "unresolved",
                         "contract": "stable_test_failure_ids",
                         "repair_scope": "verification_contract",
+                        "immutable_baseline_only": bool(
+                            current_semantic_failure_ids
+                        ),
+                        "current_selector_status": (
+                            "stable_semantic_failure"
+                            if current_semantic_failure_ids
+                            else "unproven"
+                        ),
+                        "current_semantic_failure_ids": list(
+                            current_semantic_failure_ids
+                        ),
                     },
                 },
             )

@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_agents.execution_recovery import (
     BASELINE_FAILURE_IDENTITY_INCIDENT_KIND,
+    BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY,
     ExecutionIncident,
     ExecutionIncidentStore,
     IncidentDiagnosis,
@@ -464,7 +465,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 "target_project",
             )
 
-    def test_unresolved_baseline_identity_routes_to_verification_contract(self) -> None:
+    def test_proven_baseline_failure_identity_routes_to_auto_agents(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "project"
             Orchestrator.init_project(root, "project", "mock")
@@ -487,6 +488,21 @@ class ExecutionRecoveryTests(unittest.TestCase):
                 ],
                 summary="suite setup failed",
             )
+            current_gate = GateResult(
+                ok=False,
+                commands=[
+                    CommandResult(
+                        command=command,
+                        ok=False,
+                        returncode=1,
+                        stdout=(
+                            " FAIL  src/e2e/setup.test.ts > "
+                            "setup contract remains broken\n"
+                        ),
+                    )
+                ],
+                summary="current selector has a stable semantic failure",
+            )
 
             with (
                 patch.object(
@@ -500,6 +516,7 @@ class ExecutionRecoveryTests(unittest.TestCase):
                     gate,
                     context="lazy task baseline verification",
                     task_id="task-setup",
+                    current_gate=current_gate,
                 )
 
             result = raised.exception.result
@@ -538,6 +555,67 @@ class ExecutionRecoveryTests(unittest.TestCase):
             tasks = load_task_plan(root)["tasks"]
             self.assertEqual(len(tasks), 1)
             self.assertEqual(tasks[0]["title"], "replace-me")
+
+    def test_unproven_baseline_failure_identity_rejects_agent_self_repair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            Orchestrator.init_project(root, "project", "mock")
+            orchestrator = Orchestrator(root)
+            state = load_run_state(root)
+            command = "python -m pytest -q tests/test_missing.py::test_missing"
+            result = CommandResult(
+                command=command,
+                ok=False,
+                returncode=4,
+                stdout=(
+                    "ERROR: not found: tests/test_missing.py::test_missing\n"
+                    "(no match in any of [<Module test_missing.py>])\n"
+                ),
+                process_snapshot={
+                    BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY: {
+                        "status": "unresolved",
+                        "contract": "stable_test_failure_ids",
+                        "immutable_baseline_only": False,
+                        "current_selector_status": "unproven",
+                    }
+                },
+            )
+            error = GateCommandBaselineIdentityError(
+                "baseline identity is unresolved",
+                result=result,
+                context="lazy task baseline verification",
+                baseline=True,
+                task_id="source-task",
+            )
+            agent_diagnosis = IncidentDiagnosis(
+                owner="auto_agents",
+                action="SELF_REPAIR",
+                confidence=1.0,
+                reason="attribute the unresolved identity to the engine",
+                cause_status="confirmed",
+                failure_domain="baseline_snapshot",
+                mutation_domain="auto_agents_engine",
+            )
+
+            with patch.object(
+                orchestrator,
+                "_agent_diagnose_execution_incident",
+                return_value=agent_diagnosis,
+            ):
+                recovered = orchestrator._handle_gate_execution_incident(
+                    state,
+                    "implement",
+                    error,
+                )
+
+            self.assertFalse(recovered)
+            self.assertNotEqual(state.active_blocker["owner"], "auto_agents")
+            incident = state.execution_incidents[-1]
+            self.assertEqual(incident["status"], "needs_human")
+            self.assertEqual(incident["diagnosis"]["owner"], "unknown")
+            self.assertEqual(incident["diagnosis"]["action"], "STOP")
 
     def test_workspace_conda_repair_resumes_before_repeat_route_guard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

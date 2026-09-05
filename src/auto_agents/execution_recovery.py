@@ -39,6 +39,10 @@ INCIDENT_OWNERS = {
 }
 BASELINE_FAILURE_IDENTITY_INCIDENT_KIND = "gate_baseline_failure_identity_unresolved"
 BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY = "baseline_failure_identity"
+CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND = (
+    "gate_current_verification_contract_invalid"
+)
+CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY = "current_verification_contract"
 _WATCH_PATTERN = re.compile(
     r"(?:^|\s)(?:--watch(?:All)?\b|watch\b|pytest-watch\b|vitest(?!\s+run\b)(?:\s+watch)?\b)",
     re.IGNORECASE,
@@ -407,8 +411,20 @@ def command_incident(
         and str(baseline_identity.get("status", "")).strip().lower()
         == "unresolved"
     )
+    current_contract = result.process_snapshot.get(
+        CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY,
+        {},
+    )
+    current_contract_invalid = bool(
+        not baseline
+        and isinstance(current_contract, dict)
+        and str(current_contract.get("status", "")).strip().lower()
+        == "target_not_found"
+    )
     if baseline_identity_unresolved:
         kind = BASELINE_FAILURE_IDENTITY_INCIDENT_KIND
+    elif current_contract_invalid:
+        kind = CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
     elif result.infrastructure_failure_id:
         kind = "gate_reported_infrastructure_error"
     elif result.infrastructure_error:
@@ -417,10 +433,13 @@ def command_incident(
         kind = "gate_stall" if result.termination_reason == "stalled" else "gate_timeout"
     if (
         not baseline_identity_unresolved
+        and not current_contract_invalid
         and not result.infrastructure_error
         and result.termination_reason not in {"timeout", "stalled"}
     ):
         kind = f"gate_{result.termination_reason or 'abnormal_exit'}"
+    if baseline_identity_unresolved or current_contract_invalid:
+        cause_status = "confirmed"
     identity = {
         "source": "gate",
         "kind": kind,
@@ -544,6 +563,17 @@ def provider_incident(
     )
 
 
+def baseline_identity_is_immutable_only(incident: ExecutionIncident) -> bool:
+    marker = incident.process_snapshot.get(
+        BASELINE_FAILURE_IDENTITY_SNAPSHOT_KEY,
+        {},
+    )
+    return bool(
+        isinstance(marker, dict)
+        and marker.get("immutable_baseline_only") is True
+    )
+
+
 def deterministic_diagnosis(incident: ExecutionIncident) -> Optional[IncidentDiagnosis]:
     if incident.cleanup_incomplete:
         return IncidentDiagnosis(
@@ -608,6 +638,8 @@ def deterministic_diagnosis(incident: ExecutionIncident) -> Optional[IncidentDia
         {},
     )
     if incident.kind == BASELINE_FAILURE_IDENTITY_INCIDENT_KIND:
+        if not baseline_identity_is_immutable_only(incident):
+            return None
         contract = (
             str(baseline_identity.get("contract", "")).strip()
             if isinstance(baseline_identity, dict)
@@ -629,6 +661,42 @@ def deterministic_diagnosis(incident: ExecutionIncident) -> Optional[IncidentDia
             expected_postconditions=[
                 "baseline execution yields stable identities or typed not-applicable",
                 "current target HEAD is not changed merely to repair an immutable baseline",
+            ],
+        )
+    current_contract = incident.process_snapshot.get(
+        CURRENT_VERIFICATION_CONTRACT_SNAPSHOT_KEY,
+        {},
+    )
+    if (
+        incident.kind == CURRENT_VERIFICATION_CONTRACT_INCIDENT_KIND
+        and isinstance(current_contract, dict)
+        and str(current_contract.get("status", "")).strip().lower()
+        == "target_not_found"
+    ):
+        baseline_observation = current_contract.get("baseline_observation", {})
+        baseline_status = (
+            str(baseline_observation.get("status", "")).strip()
+            if isinstance(baseline_observation, dict)
+            else ""
+        )
+        return IncidentDiagnosis(
+            owner="verification_contract",
+            action="RECOVER_TARGET",
+            confidence=1.0,
+            reason=(
+                "the exact current pytest command references a target that does "
+                "not resolve in the current project snapshot"
+            ),
+            evidence=[
+                "current_selector_status=target_not_found",
+                f"baseline_selector_status={baseline_status or 'not_observed'}",
+            ],
+            cause_status="confirmed",
+            failure_domain="current_verification_contract",
+            mutation_domain="target_project",
+            expected_postconditions=[
+                "the configured current verification target resolves exactly",
+                "the retained source-task worktree is preserved during recovery",
             ],
         )
     marker = incident.process_snapshot.get("reported_infrastructure_marker", {})
