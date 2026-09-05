@@ -27,6 +27,7 @@ from auto_agents.config import (
 from auto_agents.gates import (
     FailureExtraction,
     GateCommandBaselineIdentityError,
+    GateCommandExecutionError,
     GateCommandMetadata,
     build_failure_identity_diagnostic_command,
     command_from_verification_step,
@@ -6836,7 +6837,7 @@ class RetryFlowTests(unittest.TestCase):
             self.assertNotIn(f"{selector} PASSED", result["raw_output"])
             self.assertEqual(task.verify_baseline_failures, [])
 
-    def test_lazy_baseline_absent_selector_unresolved_at_current_remains_hard_failure(
+    def test_lazy_baseline_absent_selector_routes_current_contract_failure(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6911,17 +6912,26 @@ class RetryFlowTests(unittest.TestCase):
                     "_run_verify_failure_identity_diagnostic",
                     return_value=diagnostic_gate,
                 ),
-                self.assertRaises(GateCommandBaselineIdentityError) as raised,
+                self.assertRaises(GateCommandExecutionError) as raised,
             ):
                 orchestrator._run_task_verify(task)
 
+            self.assertNotIsInstance(raised.exception, GateCommandBaselineIdentityError)
+            self.assertFalse(raised.exception.baseline)
+            self.assertEqual(raised.exception.task_id, task.task_id)
             self.assertIsNotNone(raised.exception.result)
             self.assertEqual(raised.exception.result.command, command)
             self.assertEqual(
                 raised.exception.result.process_snapshot[
-                    "baseline_failure_identity"
+                    "current_verification_contract"
                 ]["status"],
-                "unresolved",
+                "target_not_found",
+            )
+            self.assertEqual(
+                raised.exception.result.process_snapshot[
+                    "current_verification_contract"
+                ]["baseline_observation"]["status"],
+                "target_not_found",
             )
             self.assertEqual(task.verify_baseline_failures, [])
 
