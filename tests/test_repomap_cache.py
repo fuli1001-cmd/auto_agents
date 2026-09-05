@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -149,6 +150,31 @@ class RepoMapCacheTests(unittest.TestCase):
 
             self.assertEqual(cache.last_hit, False)
             self.assertEqual(parser.calls, ["a.py"])
+
+    def test_malformed_cache_payloads_are_rebuilt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.py").write_text("def f(): pass\n", encoding="utf-8")
+            cache_path = root / "cache.json"
+            cache = RepoMapCache(root, cache_path=cache_path)
+            cache.get_or_build(["a.py"], CountingParser())
+            valid = json.loads(cache_path.read_text(encoding="utf-8"))
+            bad_summary = json.loads(json.dumps(valid))
+            bad_summary["entries"]["a.py"]["summary"]["symbols"] = [None]
+            payloads = [
+                {"version": "invalid", "entries": {}},
+                {"version": 2, "entries": None},
+                {"version": 2, "entries": ["invalid"]},
+                bad_summary,
+            ]
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+                    parser = CountingParser()
+                    summaries = cache.get_or_build(["a.py"], parser)
+                    self.assertEqual(parser.calls, ["a.py"])
+                    self.assertEqual(summaries[0].symbols[0].name, "f")
+                    self.assertFalse(cache.last_hit)
 
     def test_deleted_files_are_pruned_from_cache_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

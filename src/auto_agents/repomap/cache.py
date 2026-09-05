@@ -139,10 +139,17 @@ class RepoMapCache:
                 and cached_entry.get("fingerprint") == fingerprint
                 and isinstance(cached_entry.get("summary"), dict)
             ):
-                summaries.append(_summary_from_json(cached_entry["summary"]))
-                next_entries[rel_path] = cached_entry
-                hits += 1
-                continue
+                try:
+                    summary = _summary_from_json(cached_entry["summary"])
+                    if summary.path != rel_path:
+                        raise ValueError("cached summary belongs to a different file")
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    pass
+                else:
+                    summaries.append(summary)
+                    next_entries[rel_path] = cached_entry
+                    hits += 1
+                    continue
 
             summary = parser.parse(self.project_root, rel_path)
             summaries.append(summary)
@@ -178,9 +185,13 @@ class RepoMapCache:
         try:
             with self.cache_path.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            if isinstance(data, dict) and int(data.get("version", 0) or 0) == CACHE_VERSION:
+            if (
+                isinstance(data, dict)
+                and data.get("version") == CACHE_VERSION
+                and isinstance(data.get("entries"), dict)
+            ):
                 return data
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
             return None
         return None
 
