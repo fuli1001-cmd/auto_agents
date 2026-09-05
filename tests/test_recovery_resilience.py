@@ -2462,6 +2462,153 @@ class RecoveryResilienceTests(unittest.TestCase):
             ]
             self.assertEqual(persisted["status"], "recoverable")
 
+    def test_checkpoint_application_after_legacy_completion_persists_current_transaction_before_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            orchestrator = self._project(root)
+            legacy_owner = TaskSpec(
+                task_id="legacy-owner",
+                title="Complete retained legacy candidate",
+                description="",
+                acceptance=[],
+            )
+            state, legacy_ref = self._state_with_retained_candidate(
+                root,
+                Path(tmp),
+                legacy_owner,
+            )
+            self.assertEqual(
+                orchestrator._restore_task_failure_checkpoint(
+                    state,
+                    legacy_owner,
+                    root,
+                ),
+                legacy_ref,
+            )
+            legacy_checkpoint = state.task_failure_checkpoints[
+                legacy_owner.task_id
+            ]
+            legacy_checkpoint.pop("application_transaction")
+            legacy_checkpoint["schema_version"] = 1
+            legacy_checkpoint["implementation_completed"] = True
+            legacy_checkpoint["resume_mode"] = "gate_recheck"
+            legacy_owner.status = "blocked"
+            state.status = "blocked"
+            save_run_state(root, state)
+
+            with patch.object(
+                orchestrator,
+                "_execute_task_with_retries",
+                return_value={
+                    "ok": True,
+                    "reason": "verification passed",
+                    "review": "legacy owner completed",
+                    "verify_current_failure_ids": [],
+                },
+            ), patch.object(
+                orchestrator,
+                "_warm_clean_head_verify_baseline",
+            ):
+                returned = orchestrator._execute_task_in_main_worktree(
+                    state,
+                    [legacy_owner],
+                    legacy_owner,
+                )
+
+            self.assertIsNone(returned)
+            self.assertEqual(legacy_owner.status, "done")
+            self.assertNotIn(
+                legacy_owner.task_id,
+                state.task_failure_checkpoints,
+            )
+            self.assertFalse(ref_exists(root, legacy_ref))
+            self.assertEqual(
+                orchestrator._parallel_sequential_retry_ids(state),
+                [],
+            )
+            self.assertNotIn(
+                legacy_owner.task_id,
+                orchestrator._parallel_lane_recovery_tasks(state),
+            )
+
+            next_owner = TaskSpec(
+                task_id="current-owner",
+                title="Apply a later retained candidate",
+                description="",
+                acceptance=[],
+            )
+            next_state, next_ref = self._state_with_retained_candidate(
+                root,
+                Path(tmp),
+                next_owner,
+                candidate_path="next-candidate.txt",
+            )
+            state.tasks = [legacy_owner, next_owner]
+            state.task_failure_checkpoints[next_owner.task_id] = dict(
+                next_state.task_failure_checkpoints[next_owner.task_id]
+            )
+            save_run_state(root, state)
+            persisted_before_mutation: list[bool] = []
+
+            def apply_after_current_transaction_persisted(
+                project_root: Path,
+                transaction: dict[str, object],
+            ) -> dict[str, object]:
+                persisted = load_run_state(root)
+                checkpoint = persisted.task_failure_checkpoints[
+                    next_owner.task_id
+                ]
+                persisted_transaction = checkpoint[
+                    "application_transaction"
+                ]
+                persisted_before_mutation.append(
+                    checkpoint["status"] == "applying"
+                    and persisted_transaction["schema_version"] == 2
+                    and persisted_transaction["owner_task_id"]
+                    == next_owner.task_id
+                    and persisted_transaction["transaction_id"]
+                    == transaction["transaction_id"]
+                    and legacy_owner.task_id
+                    not in persisted.task_failure_checkpoints
+                    and orchestrator._parallel_sequential_retry_ids(
+                        persisted
+                    )
+                    == []
+                    and legacy_owner.task_id
+                    not in orchestrator._parallel_lane_recovery_tasks(
+                        persisted
+                    )
+                )
+                return apply_checkpoint_transaction(
+                    project_root,
+                    transaction,
+                )
+
+            with patch(
+                "auto_agents.orchestrator.apply_checkpoint_application",
+                new=apply_after_current_transaction_persisted,
+            ):
+                restored = orchestrator._restore_task_failure_checkpoint(
+                    state,
+                    next_owner,
+                    root,
+                )
+
+            self.assertEqual(restored, next_ref)
+            self.assertEqual(persisted_before_mutation, [True])
+            current_checkpoint = state.task_failure_checkpoints[
+                next_owner.task_id
+            ]
+            self.assertEqual(current_checkpoint["status"], "applied")
+            self.assertEqual(
+                current_checkpoint["application_transaction"][
+                    "schema_version"
+                ],
+                2,
+            )
+
     def test_detached_checkpoint_reapplies_byte_exact_after_unrelated_commit(
         self,
     ) -> None:

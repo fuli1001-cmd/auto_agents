@@ -189,6 +189,7 @@ from .git_ops import (
     is_repo,
     is_untracked_vim_swap,
     list_worktrees,
+    prove_legacy_applied_checkpoint,
     ref_exists,
     remove_worktree,
     repository_path_is_excluded,
@@ -451,6 +452,12 @@ _CHECKPOINT_OWNERSHIP_ACTIVE_STATUSES = frozenset(
 )
 _CHECKPOINT_OWNERSHIP_DETACHMENT_UNPROVEN_CATEGORY = (
     "checkpoint_ownership_detachment_unproven"
+)
+_LEGACY_CHECKPOINT_COMPATIBILITY_UNPROVEN_CATEGORY = (
+    "legacy_checkpoint_compatibility_unproven"
+)
+_LEGACY_CHECKPOINT_COMPATIBILITY_PROOF_FIELD = (
+    "legacy_compatibility_proof"
 )
 _NON_COMPARABLE_BASELINE_PREFIXES = (
     "cmd-timeout:",
@@ -3422,6 +3429,26 @@ class Orchestrator:
                     if state.status == "blocked":
                         save_run_state(self.project_root, state)
                         return state
+                    if self._active_proven_legacy_checkpoint_owner_id(state):
+                        self.logger.info(
+                            "[checkpoint-ownership] deferring stage=%s until "
+                            "the proven legacy owner reaches an outcome",
+                            stage,
+                        )
+                        state = self._run_implementation_loop(
+                            state,
+                            max_tasks=max_tasks,
+                        )
+                        if (
+                            self._active_proven_legacy_checkpoint_owner_id(
+                                state
+                            )
+                            or state.status
+                            in {"blocked", "paused", "waiting_user"}
+                            or self._task_budget_exhausted
+                        ):
+                            return state
+                        continue
                 stage_had_summary = stage in state.stage_summaries
                 self._emit_stage_start(stage)
                 try:
@@ -13910,6 +13937,12 @@ class Orchestrator:
         state.last_error = ""
 
     def _resume_blocked_run(self, state: RunState) -> bool:
+        if self._legacy_applied_checkpoint_records(state):
+            canonical_tasks = self._load_implementation_tasks(state)
+            return self._prepare_legacy_checkpoint_owner_continuation(
+                state,
+                canonical_tasks,
+            )
         legacy_before_reconcile = (
             dict(state.active_blocker)
             if isinstance(state.active_blocker, dict)
@@ -17538,6 +17571,16 @@ class Orchestrator:
             allow_owner_execution=False,
         ):
             return state
+        if self._active_proven_legacy_checkpoint_owner_id(state):
+            self.logger.info(
+                "[checkpoint-ownership] resuming proven legacy owner before "
+                "implementation setup"
+            )
+            return self._run_sequential_implementation_loop(
+                state,
+                tasks,
+                max_tasks,
+            )
         restored_persisted_owner_ids = (
             self._restore_persisted_evidence_repair_ownership(
                 state,
@@ -17798,6 +17841,9 @@ class Orchestrator:
         while True:
             if self._checkpoint_ownership_barrier(state, tasks):
                 return state
+            legacy_owner_task_id = (
+                self._active_proven_legacy_checkpoint_owner_id(state)
+            )
             # Task-plan synchronization can reload TaskSpec objects while this
             # loop is running.  Keep only stable IDs in the ordering and resolve
             # them against the current canonical list on every iteration.
@@ -17814,18 +17860,22 @@ class Orchestrator:
                 if task_id in tasks_by_id
                 and tasks_by_id[task_id].status != "done"
             }
-            ordered_task_ids = [
-                *(
-                    task_id
-                    for task_id in retry_ids
-                    if task_id in retry_task_ids
-                ),
-                *(
-                    task.task_id
-                    for task in tasks
-                    if task.task_id not in retry_task_ids
-                ),
-            ]
+            ordered_task_ids = (
+                [legacy_owner_task_id]
+                if legacy_owner_task_id
+                else [
+                    *(
+                        task_id
+                        for task_id in retry_ids
+                        if task_id in retry_task_ids
+                    ),
+                    *(
+                        task.task_id
+                        for task in tasks
+                        if task.task_id not in retry_task_ids
+                    ),
+                ]
+            )
             if not any(task.status != "done" for task in tasks):
                 break
             if not self._has_task_budget(max_tasks, processed):
@@ -17844,10 +17894,14 @@ class Orchestrator:
                     and not (
                         candidate.status == "blocked"
                         and candidate.task_id in localized_blocked_ids
+                        and candidate.task_id != legacy_owner_task_id
                     )
-                    and all(
-                        dependency in completed
-                        for dependency in candidate.depends_on
+                    and (
+                        candidate.task_id == legacy_owner_task_id
+                        or all(
+                            dependency in completed
+                            for dependency in candidate.depends_on
+                        )
                     )
                 ),
                 None,
@@ -18299,6 +18353,16 @@ class Orchestrator:
             pending_outcome = self._process_next_parallel_pending_integration(state, tasks)
             if pending_outcome == "blocked":
                 return state
+            if pending_outcome == "legacy_owner":
+                return self._run_sequential_implementation_loop(
+                    state,
+                    tasks,
+                    (
+                        None
+                        if max_tasks is None
+                        else max(0, max_tasks - processed)
+                    ),
+                )
             if pending_outcome == "integrated":
                 processed += 1
                 self._consume_task_budget()
@@ -18437,6 +18501,16 @@ class Orchestrator:
                 allow_owner_execution=False,
             ):
                 return state
+            if self._active_proven_legacy_checkpoint_owner_id(state):
+                return self._run_sequential_implementation_loop(
+                    state,
+                    tasks,
+                    (
+                        None
+                        if max_tasks is None
+                        else max(0, max_tasks - processed)
+                    ),
+                )
             self._require_clean_tree_excluding_agent_instructions()
             deferred = self._deferred_parallel_task_reasons(tasks)
             self.logger.info(
@@ -18470,6 +18544,8 @@ class Orchestrator:
                     tasks,
                     allow_owner_execution=False,
                 ):
+                    return state
+                if self._active_proven_legacy_checkpoint_owner_id(state):
                     return state
                 result = results[task.task_id]
                 merged_baselines = self._merge_parallel_retained_verify_baselines(
@@ -18782,11 +18858,25 @@ class Orchestrator:
             allow_owner_execution=False,
         ):
             return state
-        prerequisite_route = self._route_frontend_design_contract_prerequisite(
-            state, tasks, task
+        legacy_owner_task_id = (
+            self._active_proven_legacy_checkpoint_owner_id(state)
         )
-        if prerequisite_route is not None:
-            return prerequisite_route
+        legacy_owner_continuation = bool(
+            legacy_owner_task_id
+            and legacy_owner_task_id == task.task_id
+        )
+        if legacy_owner_task_id and not legacy_owner_continuation:
+            return state
+        if not legacy_owner_continuation:
+            prerequisite_route = (
+                self._route_frontend_design_contract_prerequisite(
+                    state,
+                    tasks,
+                    task,
+                )
+            )
+            if prerequisite_route is not None:
+                return prerequisite_route
 
         visual_gate_recheck = self._task_is_blocked_by_visual_judge(task)
         parallel_lane_recovery = self._parallel_lane_task_is_recovering(
@@ -18797,7 +18887,10 @@ class Orchestrator:
             state,
             task,
         )
-        if self._is_terminal_review_rejected_task(state, task):
+        if (
+            not legacy_owner_continuation
+            and self._is_terminal_review_rejected_task(state, task)
+        ):
             if self._schedule_repair_tasks_for_failure(
                 state,
                 tasks,
@@ -18826,7 +18919,8 @@ class Orchestrator:
                     )
                 )
         if (
-            task.status == "blocked"
+            not legacy_owner_continuation
+            and task.status == "blocked"
             and "references missing pytest target" in task.review_summary
         ):
             self.logger.info(
@@ -18838,7 +18932,8 @@ class Orchestrator:
             self._persist_tasks(tasks)
             save_run_state(self.project_root, state)
         if (
-            task.status == "blocked"
+            not legacy_owner_continuation
+            and task.status == "blocked"
             and not visual_gate_recheck
             and not self._execution_recovery_implementation_required(task)
         ):
@@ -18852,6 +18947,16 @@ class Orchestrator:
             if continuing_task
             else self._should_resume_task(state, task)
         )
+        if legacy_owner_continuation:
+            checkpoint = state.task_failure_checkpoints[task.task_id]
+            resume_mode = self._legacy_checkpoint_resume_mode(
+                state,
+                task.task_id,
+                checkpoint,
+            )
+            visual_gate_recheck = False
+            parallel_gate_recheck = resume_mode == "gate_recheck"
+            resume_existing = parallel_gate_recheck
         sequential_retry_ids = self._parallel_sequential_retry_ids(state)
         route_retry = self._requeued_route_owns_task(state, task)
         if route_retry and task.task_id not in sequential_retry_ids:
@@ -18871,7 +18976,8 @@ class Orchestrator:
         )
         allow_dirty_repair = False
         if (
-            self._is_repair_task(task)
+            not legacy_owner_continuation
+            and self._is_repair_task(task)
             and self._changed_paths_excluding_agent_instructions()
         ):
             allow_dirty_repair = self._evidence_repair_worktree_handoff_matches(
@@ -18909,15 +19015,24 @@ class Orchestrator:
         ):
             self._require_clean_tree_for_task(task)
 
-        route = self._ensure_evidence_preflight(state, task)
-        if route:
-            return self._route_evidence_preflight(state, tasks, task, route)
+        if not legacy_owner_continuation:
+            route = self._ensure_evidence_preflight(state, task)
+            if route:
+                return self._route_evidence_preflight(
+                    state,
+                    tasks,
+                    task,
+                    route,
+                )
 
         if task.status == "pending":
             task.status = "in_progress"
             self._persist_tasks(tasks)
 
-        if not self._is_prebaseline_recovery_task(task):
+        if (
+            not legacy_owner_continuation
+            and not self._is_prebaseline_recovery_task(task)
+        ):
             try:
                 baseline_changed = self._ensure_task_verify_baseline(
                     task,
@@ -18941,13 +19056,14 @@ class Orchestrator:
                 save_run_state(self.project_root, state)
                 return state if state.status == "blocked" else None
 
-        restored_checkpoint_ref = self._restore_task_failure_checkpoint(
-            state,
-            task,
-            self.project_root,
-        )
-        if restored_checkpoint_ref:
-            resume_existing = True
+        if not legacy_owner_continuation:
+            restored_checkpoint_ref = self._restore_task_failure_checkpoint(
+                state,
+                task,
+                self.project_root,
+            )
+            if restored_checkpoint_ref:
+                resume_existing = True
         checkpoint_status = str(
             state.task_failure_checkpoints.get(task.task_id, {}).get(
                 "status",
@@ -18965,6 +19081,18 @@ class Orchestrator:
             task,
             head_ref(self.project_root) or "HEAD",
         )
+
+        if legacy_owner_continuation:
+            if not self._prepare_legacy_checkpoint_owner_continuation(
+                state,
+                tasks,
+            ):
+                return state
+            if (
+                self._active_proven_legacy_checkpoint_owner_id(state)
+                != task.task_id
+            ):
+                return state
 
         try:
             gate_result = self._execute_task_with_retries(
@@ -18989,6 +19117,42 @@ class Orchestrator:
                 ),
             )
         if not gate_result["ok"]:
+            if legacy_owner_continuation:
+                # A legacy applied checkpoint has no pre-application image to
+                # restore.  Its proven owner has already reached a genuine
+                # outcome over the retained candidate, so recovery rewinds and
+                # repair scheduling are not safe while that ownership remains
+                # active.  Persist the outcome in the owner-only lane instead.
+                task.status = "blocked"
+                task.review_summary = str(gate_result["review"])
+                checkpoint = state.task_failure_checkpoints.get(
+                    task.task_id,
+                    {},
+                )
+                implementation_completed = bool(
+                    self._implementation_ready_markers(state).get(task.task_id)
+                    or parallel_gate_recheck
+                )
+                result = self._parallel_task_failure_result(
+                    task,
+                    gate_result,
+                    operation=(
+                        "verification"
+                        if implementation_completed
+                        else "implementation"
+                    ),
+                    automatic_retryable=False,
+                    resumable=True,
+                    base_ref=head_ref(self.project_root) or "HEAD",
+                    checkpoint=checkpoint,
+                    implementation_completed=implementation_completed,
+                )
+                self._persist_parallel_lane_failures(
+                    state,
+                    tasks,
+                    [(task, result)],
+                )
+                return state
             rewind_stage = str(gate_result.get("rewind_to_stage", "")).strip()
             if rewind_stage:
                 state.task_failure_checkpoints[task.task_id] = (
@@ -19245,7 +19409,7 @@ class Orchestrator:
         )
         if is_execution_incident_recovery_task(task):
             self._resolve_execution_incident_for_task(state, task)
-        elif parallel_lane_recovery:
+        elif parallel_lane_recovery or legacy_owner_continuation:
             self._resolve_parallel_lane_recovery_for_task(
                 state,
                 tasks,
@@ -19258,6 +19422,27 @@ class Orchestrator:
                 state,
                 [task_id for task_id in sequential_retry_ids if task_id != task.task_id],
             )
+        if legacy_owner_continuation:
+            # The integration commit now owns the candidate.  Persist the
+            # checkpoint/ref cleanup together with removal of every
+            # compatibility-only recovery marker and retry entry.
+            self._set_parallel_lane_gate_recheck(
+                state,
+                task.task_id,
+                None,
+            )
+            self._set_parallel_lane_recovery_task(
+                state,
+                task.task_id,
+                None,
+            )
+            state.localized_blockers = [
+                dict(item)
+                for item in state.localized_blockers
+                if str(item.get("task_id", "")) != task.task_id
+            ]
+            self._refresh_parallel_lane_blocker_state(state, tasks)
+            self._persist_parallel_runtime_state(state, tasks)
         return None
 
     @staticmethod
@@ -19970,6 +20155,546 @@ class Orchestrator:
             return
         state.task_failure_checkpoints[task.task_id] = dict(payload)
 
+    @staticmethod
+    def _is_legacy_applied_checkpoint_without_transaction(
+        checkpoint: Mapping[str, object],
+    ) -> bool:
+        """Return whether a checkpoint is the one supported legacy shape."""
+
+        transaction_is_missing = (
+            "application_transaction" not in checkpoint
+            or checkpoint.get("application_transaction") is None
+        )
+        return bool(
+            type(checkpoint.get("schema_version")) is int
+            and checkpoint.get("schema_version") == 1
+            and checkpoint.get("status") == "applied"
+            and transaction_is_missing
+        )
+
+    @classmethod
+    def _legacy_applied_checkpoint_records(
+        cls,
+        state: RunState,
+    ) -> List[Tuple[str, Dict[str, object]]]:
+        return [
+            (str(task_id), checkpoint)
+            for task_id, checkpoint in state.task_failure_checkpoints.items()
+            if isinstance(checkpoint, dict)
+            and cls._is_legacy_applied_checkpoint_without_transaction(
+                checkpoint
+            )
+        ]
+
+    @staticmethod
+    def _legacy_checkpoint_proof_matches_owner(
+        proof: Mapping[str, object],
+        owner_task_id: str,
+    ) -> bool:
+        raw_owner = proof.get("owner", {})
+        owner = raw_owner if isinstance(raw_owner, Mapping) else {}
+        return bool(
+            bool(proof.get("ok"))
+            and str(proof.get("proof", ""))
+            == "legacy_applied_checkpoint_exact_owner"
+            and owner_task_id
+            and owner_task_id
+            == str(owner.get("state_map_owner_task_id", ""))
+            == str(owner.get("checkpoint_task_id", ""))
+            == str(owner.get("intended_task_id", ""))
+        )
+
+    @classmethod
+    def _active_proven_legacy_checkpoint_owner_id(
+        cls,
+        state: RunState,
+    ) -> str:
+        active = [
+            (str(task_id), checkpoint)
+            for task_id, checkpoint in state.task_failure_checkpoints.items()
+            if isinstance(checkpoint, dict)
+            and str(checkpoint.get("status", "")).strip()
+            in _CHECKPOINT_OWNERSHIP_ACTIVE_STATUSES
+        ]
+        if len(active) != 1:
+            return ""
+        owner_task_id, checkpoint = active[0]
+        if not cls._is_legacy_applied_checkpoint_without_transaction(
+            checkpoint
+        ):
+            return ""
+        raw_proof = checkpoint.get(
+            _LEGACY_CHECKPOINT_COMPATIBILITY_PROOF_FIELD,
+            {},
+        )
+        proof = raw_proof if isinstance(raw_proof, Mapping) else {}
+        if not (
+            cls._legacy_checkpoint_proof_matches_owner(
+                proof,
+                owner_task_id,
+            )
+            and owner_task_id == str(checkpoint.get("task_id", ""))
+        ):
+            return ""
+        return owner_task_id
+
+    @staticmethod
+    def _legacy_checkpoint_shape_evidence(
+        *,
+        active_records: Iterable[Tuple[str, Mapping[str, object]]],
+        legacy_records: Iterable[Tuple[str, Mapping[str, object]]],
+        owner_task_id: str,
+        checkpoint: Optional[Mapping[str, object]],
+        mismatch_code: str,
+        reason: str,
+        canonical_task_count: int = 0,
+    ) -> Dict[str, object]:
+        active = list(active_records)
+        legacy = list(legacy_records)
+        checkpoint_payload = checkpoint or {}
+        transaction_state = (
+            "absent"
+            if "application_transaction" not in checkpoint_payload
+            else "null"
+            if checkpoint_payload.get("application_transaction") is None
+            else "present"
+        )
+        return {
+            "proof_schema_version": 1,
+            "ok": False,
+            "proof": "legacy_applied_checkpoint_unproven",
+            "reason": reason,
+            "classification": {
+                "name": "legacy_applied_without_transaction",
+                "matches": bool(checkpoint),
+                "checkpoint_schema_version": checkpoint_payload.get(
+                    "schema_version"
+                ),
+                "checkpoint_status": str(
+                    checkpoint_payload.get("status", "")
+                ),
+                "application_transaction": transaction_state,
+            },
+            "owner": {
+                "matches": False,
+                "state_map_owner_task_id": owner_task_id,
+                "checkpoint_task_id": str(
+                    checkpoint_payload.get("task_id", "")
+                ),
+                "intended_task_id": "",
+                "canonical_task_count": canonical_task_count,
+            },
+            "active_checkpoint_ownership": {
+                "expected_count": 1,
+                "observed_count": len(active),
+                "observed_owner_task_ids": [item[0] for item in active],
+                "legacy_count": len(legacy),
+                "legacy_owner_task_ids": [item[0] for item in legacy],
+            },
+            "retained_identity": {},
+            "changed_paths": {
+                "matches": False,
+                "recorded": list(
+                    checkpoint_payload.get("changed_paths", [])
+                    if isinstance(
+                        checkpoint_payload.get("changed_paths", []),
+                        list,
+                    )
+                    else []
+                ),
+                "normalized_recorded": [],
+                "retained_commit": [],
+                "current": [],
+            },
+            "expected_entries": {},
+            "observed_entries": {},
+            "entry_mismatches": [],
+            "mismatch_codes": [mismatch_code],
+        }
+
+    def _legacy_checkpoint_compatibility_evidence(
+        self,
+        state: RunState,
+        tasks: Iterable[TaskSpec],
+    ) -> Tuple[
+        str,
+        Optional[TaskSpec],
+        Optional[Dict[str, object]],
+        Dict[str, object],
+    ]:
+        active = [
+            (str(task_id), checkpoint)
+            for task_id, checkpoint in state.task_failure_checkpoints.items()
+            if isinstance(checkpoint, dict)
+            and str(checkpoint.get("status", "")).strip()
+            in _CHECKPOINT_OWNERSHIP_ACTIVE_STATUSES
+        ]
+        legacy = [
+            (task_id, checkpoint)
+            for task_id, checkpoint in active
+            if self._is_legacy_applied_checkpoint_without_transaction(
+                checkpoint
+            )
+        ]
+        owner_task_id = legacy[0][0] if legacy else ""
+        checkpoint = legacy[0][1] if legacy else None
+        if len(active) != 1 or len(legacy) != 1:
+            evidence = self._legacy_checkpoint_shape_evidence(
+                active_records=active,
+                legacy_records=legacy,
+                owner_task_id=owner_task_id,
+                checkpoint=checkpoint,
+                mismatch_code="active_checkpoint_count_mismatch",
+                reason=(
+                    "legacy owner continuation requires exactly one active "
+                    "checkpoint ownership record"
+                ),
+            )
+            return owner_task_id, None, checkpoint, evidence
+
+        canonical_tasks = [
+            task for task in tasks if task.task_id == owner_task_id
+        ]
+        checkpoint_owner_task_id = str(
+            checkpoint.get("task_id", "")
+        )
+        if (
+            len(canonical_tasks) != 1
+            and checkpoint_owner_task_id != owner_task_id
+        ):
+            canonical_tasks = [
+                task
+                for task in tasks
+                if task.task_id == checkpoint_owner_task_id
+            ]
+        if len(canonical_tasks) != 1:
+            evidence = self._legacy_checkpoint_shape_evidence(
+                active_records=active,
+                legacy_records=legacy,
+                owner_task_id=owner_task_id,
+                checkpoint=checkpoint,
+                mismatch_code="canonical_owner_task_mismatch",
+                reason=(
+                    "legacy checkpoint owner does not identify exactly one "
+                    "canonical implementation task"
+                ),
+                canonical_task_count=len(canonical_tasks),
+            )
+            return owner_task_id, None, checkpoint, evidence
+
+        owner_task = canonical_tasks[0]
+        try:
+            evidence = prove_legacy_applied_checkpoint(
+                self.project_root,
+                checkpoint,
+                state_map_owner_task_id=owner_task_id,
+                intended_task_id=owner_task.task_id,
+                ignored_prefixes=self._parallel_commit_exclude_prefixes(),
+            )
+        except (OSError, RuntimeError, ValueError, UnicodeError) as error:
+            evidence = self._legacy_checkpoint_shape_evidence(
+                active_records=active,
+                legacy_records=legacy,
+                owner_task_id=owner_task_id,
+                checkpoint=checkpoint,
+                mismatch_code="legacy_proof_execution_failed",
+                reason=str(error),
+                canonical_task_count=1,
+            )
+        evidence = dict(evidence)
+        evidence["active_checkpoint_ownership"] = {
+            "expected_count": 1,
+            "observed_count": len(active),
+            "observed_owner_task_ids": [item[0] for item in active],
+            "legacy_count": len(legacy),
+            "legacy_owner_task_ids": [item[0] for item in legacy],
+        }
+        raw_owner = evidence.get("owner", {})
+        owner_evidence = (
+            dict(raw_owner) if isinstance(raw_owner, Mapping) else {}
+        )
+        owner_evidence["canonical_task_count"] = 1
+        evidence["owner"] = owner_evidence
+        return owner_task_id, owner_task, checkpoint, evidence
+
+    @staticmethod
+    def _checkpoint_blocker_matches_owner(
+        blocker: Mapping[str, object],
+        owner_task_id: str,
+    ) -> bool:
+        if not owner_task_id:
+            return False
+        raw_checkpoint = blocker.get("failure_checkpoint", {})
+        checkpoint = (
+            raw_checkpoint if isinstance(raw_checkpoint, Mapping) else {}
+        )
+        return owner_task_id in {
+            str(blocker.get("task_id", "")),
+            str(blocker.get("checkpoint_owner_task_id", "")),
+            str(checkpoint.get("task_id", "")),
+        }
+
+    @staticmethod
+    def _legacy_checkpoint_proof_fingerprint(
+        evidence: Mapping[str, object],
+    ) -> str:
+        payload = json.dumps(
+            dict(evidence),
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+    @classmethod
+    def _legacy_checkpoint_resume_mode(
+        cls,
+        state: RunState,
+        owner_task_id: str,
+        checkpoint: Mapping[str, object],
+    ) -> str:
+        recovery = cls._parallel_lane_recovery_tasks(state).get(
+            owner_task_id,
+            {},
+        )
+        candidates = (
+            checkpoint.get("resume_mode"),
+            recovery.get("mode"),
+            state.active_blocker.get("resume_mode"),
+        )
+        for candidate in candidates:
+            mode = str(candidate or "").strip()
+            if mode in {"gate_recheck", "implementation"}:
+                return mode
+        return (
+            "gate_recheck"
+            if bool(checkpoint.get("implementation_completed", False))
+            else "implementation"
+        )
+
+    @classmethod
+    def _legacy_owner_continuation_is_active(
+        cls,
+        state: RunState,
+        owner_task_id: str,
+    ) -> bool:
+        """Return whether a proven legacy owner is reaching its outcome."""
+
+        normalized_owner = str(owner_task_id).strip()
+        recovery = cls._parallel_lane_recovery_tasks(state).get(
+            normalized_owner,
+            {},
+        )
+        return bool(
+            normalized_owner
+            and recovery.get("legacy_owner_continuation") is True
+            and cls._active_proven_legacy_checkpoint_owner_id(state)
+            == normalized_owner
+        )
+
+    def _block_unproven_legacy_checkpoint_compatibility(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+        owner_task_id: str,
+        checkpoint: Optional[Mapping[str, object]],
+        evidence: Mapping[str, object],
+    ) -> None:
+        mismatch_codes = [
+            str(item)
+            for item in evidence.get("mismatch_codes", [])
+            if str(item)
+        ]
+        reason_detail = str(evidence.get("reason", "")).strip()
+        reason = (
+            "legacy applied checkpoint compatibility could not be proven"
+            + (f" for task {owner_task_id}" if owner_task_id else "")
+            + f": {reason_detail or (mismatch_codes[0] if mismatch_codes else 'proof missing')}"
+        )
+        owner_task = next(
+            (task for task in tasks if task.task_id == owner_task_id),
+            None,
+        )
+        if owner_task is not None and owner_task.status != "done":
+            owner_task.status = "blocked"
+            owner_task.review_summary = reason
+
+        expected_evidence = {
+            "classification": "legacy_applied_without_transaction",
+            "proof": "legacy_applied_checkpoint_exact_owner",
+            "active_checkpoint_count": 1,
+            "legacy_checkpoint_count": 1,
+            "owner_task_id": owner_task_id,
+        }
+        fingerprint = self._legacy_checkpoint_proof_fingerprint(evidence)
+        blocker = {
+            "schema_version": 1,
+            "source": _PARALLEL_LANE_FAILURE_KIND,
+            "owner": "auto_agents",
+            "category": (
+                _LEGACY_CHECKPOINT_COMPATIBILITY_UNPROVEN_CATEGORY
+            ),
+            "reason": reason,
+            "incident_id": "",
+            "fingerprint": fingerprint,
+            "task_id": owner_task_id,
+            "checkpoint_owner_task_id": owner_task_id,
+            "affected_task_ids": [owner_task_id] if owner_task_id else [],
+            "failure_checkpoint": dict(checkpoint or {}),
+            _LEGACY_CHECKPOINT_COMPATIBILITY_PROOF_FIELD: dict(evidence),
+            "expected_evidence": expected_evidence,
+            "observed_evidence": dict(evidence),
+            "mismatch_codes": mismatch_codes,
+            "missing_or_mismatched_proof": (
+                mismatch_codes[0]
+                if mismatch_codes
+                else "legacy_applied_checkpoint_unproven"
+            ),
+            "automatic_retryable": False,
+            "resumable": True,
+            "scope": "task_lineage",
+            "status": "blocked",
+            "updated_at": utc_now_iso(),
+        }
+        state.localized_blockers = [
+            dict(item)
+            for item in state.localized_blockers
+            if not (
+                str(item.get("category", ""))
+                in {
+                    _CHECKPOINT_OWNERSHIP_DETACHMENT_UNPROVEN_CATEGORY,
+                    _LEGACY_CHECKPOINT_COMPATIBILITY_UNPROVEN_CATEGORY,
+                }
+                and self._checkpoint_blocker_matches_owner(
+                    item,
+                    owner_task_id,
+                )
+            )
+        ]
+        state.localized_blockers.append(dict(blocker))
+        state.active_blocker = dict(blocker)
+        state.active_execution_incident_id = ""
+        state.status = "blocked"
+        state.last_error = reason
+        # A failed compatibility proof must not rewrite the authoritative task
+        # plan.  In particular, blocked-run state can predate a plan repair and
+        # must never resurrect a removed legacy owner into task_plan.json.
+        state.tasks = tasks
+        save_run_state(self.project_root, state)
+        if owner_task is not None:
+            self._emit_task_blocked(owner_task, reason)
+
+    def _prepare_legacy_checkpoint_owner_continuation(
+        self,
+        state: RunState,
+        tasks: List[TaskSpec],
+    ) -> bool:
+        (
+            owner_task_id,
+            owner_task,
+            checkpoint,
+            evidence,
+        ) = self._legacy_checkpoint_compatibility_evidence(state, tasks)
+        if (
+            owner_task is None
+            or checkpoint is None
+            or not self._legacy_checkpoint_proof_matches_owner(
+                evidence,
+                owner_task_id,
+            )
+        ):
+            if checkpoint is not None:
+                checkpoint.pop(
+                    _LEGACY_CHECKPOINT_COMPATIBILITY_PROOF_FIELD,
+                    None,
+                )
+            self._block_unproven_legacy_checkpoint_compatibility(
+                state,
+                tasks,
+                owner_task_id,
+                checkpoint,
+                evidence,
+            )
+            return False
+
+        checkpoint.pop("application_transaction", None)
+        checkpoint.pop("transaction_error", None)
+        checkpoint.pop("detachment", None)
+        checkpoint[_LEGACY_CHECKPOINT_COMPATIBILITY_PROOF_FIELD] = dict(
+            evidence
+        )
+        if owner_task.status != "in_progress":
+            owner_task.status = "pending"
+
+        proof_fingerprint = self._legacy_checkpoint_proof_fingerprint(
+            evidence
+        )
+        resume_mode = self._legacy_checkpoint_resume_mode(
+            state,
+            owner_task_id,
+            checkpoint,
+        )
+        recovery_marker = {
+            "schema_version": 1,
+            "mode": resume_mode,
+            "fingerprint": proof_fingerprint,
+            "incident_id": "",
+            "legacy_owner_continuation": True,
+            "updated_at": utc_now_iso(),
+        }
+        self._set_parallel_lane_recovery_task(
+            state,
+            owner_task_id,
+            recovery_marker,
+        )
+        gate_recheck = (
+            {
+                **recovery_marker,
+                "checkpoint_ref": str(checkpoint.get("ref", "")),
+            }
+            if resume_mode == "gate_recheck"
+            else None
+        )
+        self._set_parallel_lane_gate_recheck(
+            state,
+            owner_task_id,
+            gate_recheck,
+        )
+        if resume_mode != "gate_recheck":
+            self._clear_implementation_ready_marker(state, owner_task)
+        self._set_parallel_sequential_retry_ids(
+            state,
+            [owner_task_id],
+            capture_retained_ownership=False,
+        )
+        state.task_review_cache.pop(owner_task_id, None)
+
+        def stale_detachment_blocker(item: Mapping[str, object]) -> bool:
+            return bool(
+                str(item.get("category", ""))
+                in {
+                    _CHECKPOINT_OWNERSHIP_DETACHMENT_UNPROVEN_CATEGORY,
+                    _LEGACY_CHECKPOINT_COMPATIBILITY_UNPROVEN_CATEGORY,
+                }
+                and self._checkpoint_blocker_matches_owner(
+                    item,
+                    owner_task_id,
+                )
+            )
+
+        state.localized_blockers = [
+            dict(item)
+            for item in state.localized_blockers
+            if not stale_detachment_blocker(item)
+        ]
+        if stale_detachment_blocker(state.active_blocker):
+            state.active_blocker = {}
+        state.active_execution_incident_id = ""
+        state.status = "pending"
+        state.last_error = ""
+        self._persist_parallel_runtime_state(state, tasks)
+        return True
+
     def _restore_task_failure_checkpoint(
         self,
         state: RunState,
@@ -20211,6 +20936,22 @@ class Orchestrator:
                 "ok": False,
                 "reason": "checkpoint ownership record is missing",
                 "proof": "checkpoint_missing",
+            }
+        if self._is_legacy_applied_checkpoint_without_transaction(
+            checkpoint
+        ):
+            return {
+                "ok": False,
+                "reason": (
+                    "legacy applied checkpoint requires exact-owner "
+                    "continuation"
+                ),
+                "proof": "legacy_owner_continuation_required",
+                "disposition": "legacy_owner_continuation",
+                "classification": "legacy_applied_without_transaction",
+                "owner_task_id": normalized_task_id,
+                "retained_ref": str(checkpoint.get("ref", "")),
+                "checkpoint_status": str(checkpoint.get("status", "")),
             }
         status = str(checkpoint.get("status", "")).strip()
         if status == "recoverable":
@@ -20636,6 +21377,19 @@ class Orchestrator:
         """Settle shared-worktree checkpoint ownership before other work."""
 
         active = self._active_checkpoint_ownership_records(state)
+        if self._legacy_applied_checkpoint_records(state):
+            if not self._prepare_legacy_checkpoint_owner_continuation(
+                state,
+                tasks,
+            ):
+                return True
+            intended_owner = str(intended_task_id).strip()
+            proven_owner = (
+                self._active_proven_legacy_checkpoint_owner_id(state)
+            )
+            return bool(
+                intended_owner and intended_owner != proven_owner
+            )
         if not active:
             return False
 
@@ -21744,6 +22498,8 @@ class Orchestrator:
             allow_owner_execution=False,
         ):
             return "blocked"
+        if self._active_proven_legacy_checkpoint_owner_id(state):
+            return "legacy_owner"
         pending = self._parallel_pending_integrations(state)
         if not pending:
             return "none"
@@ -22092,6 +22848,12 @@ class Orchestrator:
         *,
         incident: Optional[ExecutionIncident] = None,
     ) -> Dict[str, object]:
+        legacy_owner_continuation = (
+            self._legacy_owner_continuation_is_active(
+                state,
+                task.task_id,
+            )
+        )
         fingerprint = self._parallel_lane_failure_fingerprint(task, failure)
         previous = next(
             (
@@ -22184,36 +22946,44 @@ class Orchestrator:
             "status": "localized",
             "updated_at": utc_now_iso(),
         }
+        if legacy_owner_continuation:
+            blocker["legacy_owner_continuation"] = True
         state.localized_blockers = [
             dict(item)
             for item in state.localized_blockers
             if str(item.get("task_id", "")) != task.task_id
         ]
         state.localized_blockers.append(dict(blocker))
+        recovery_marker = {
+            "schema_version": 1,
+            "mode": resume_mode,
+            "fingerprint": fingerprint,
+            "incident_id": blocker["incident_id"],
+            "updated_at": utc_now_iso(),
+        }
+        if legacy_owner_continuation:
+            recovery_marker["legacy_owner_continuation"] = True
         self._set_parallel_lane_recovery_task(
             state,
             task.task_id,
-            {
-                "schema_version": 1,
-                "mode": resume_mode,
-                "fingerprint": fingerprint,
-                "incident_id": blocker["incident_id"],
-                "updated_at": utc_now_iso(),
-            },
+            recovery_marker,
         )
         if resume_mode == "gate_recheck":
+            gate_recheck_marker = {
+                "schema_version": 1,
+                "fingerprint": fingerprint,
+                "incident_id": blocker["incident_id"],
+                "checkpoint_ref": str(
+                    failure.checkpoint.get("ref", "")
+                ),
+                "updated_at": utc_now_iso(),
+            }
+            if legacy_owner_continuation:
+                gate_recheck_marker["legacy_owner_continuation"] = True
             self._set_parallel_lane_gate_recheck(
                 state,
                 task.task_id,
-                {
-                    "schema_version": 1,
-                    "fingerprint": fingerprint,
-                    "incident_id": blocker["incident_id"],
-                    "checkpoint_ref": str(
-                        failure.checkpoint.get("ref", "")
-                    ),
-                    "updated_at": utc_now_iso(),
-                },
+                gate_recheck_marker,
             )
         else:
             self._set_parallel_lane_gate_recheck(state, task.task_id, None)
@@ -22392,9 +23162,17 @@ class Orchestrator:
         blockers: List[Dict[str, object]] = []
         for task, result in failures:
             checkpoint = state.task_failure_checkpoints.get(task.task_id, {})
-            if isinstance(checkpoint, dict) and str(
+            checkpoint_is_active = isinstance(checkpoint, dict) and str(
                 checkpoint.get("status", "")
-            ).strip() in _CHECKPOINT_OWNERSHIP_ACTIVE_STATUSES:
+            ).strip() in _CHECKPOINT_OWNERSHIP_ACTIVE_STATUSES
+            legacy_owner_continuation = bool(
+                checkpoint_is_active
+                and self._legacy_owner_continuation_is_active(
+                    state,
+                    task.task_id,
+                )
+            )
+            if checkpoint_is_active and not legacy_owner_continuation:
                 detachment = self._detach_task_failure_checkpoint(
                     state,
                     task.task_id,
@@ -22420,6 +23198,16 @@ class Orchestrator:
                     )
                     blockers.append(dict(state.active_blocker))
                     continue
+            elif legacy_owner_continuation:
+                # No legacy prestate exists to detach to.  Preserve the proven
+                # applied checkpoint as the ownership record for this genuine
+                # owner outcome.
+                result["failure_checkpoint"] = dict(checkpoint)
+                raw_lane_failure = result.get("parallel_lane_failure", {})
+                if isinstance(raw_lane_failure, dict):
+                    lane_failure = dict(raw_lane_failure)
+                    lane_failure["checkpoint"] = dict(checkpoint)
+                    result["parallel_lane_failure"] = lane_failure
             blocker = self._materialize_parallel_lane_failure(
                 state,
                 tasks,

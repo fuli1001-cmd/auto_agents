@@ -39,6 +39,15 @@ def _git_bytes(project_root: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
+def _immutable_git_bytes(
+    project_root: Path,
+    *args: str,
+) -> subprocess.CompletedProcess:
+    """Read physical Git objects without honoring replacement refs."""
+
+    return _git_bytes(project_root, "--no-replace-objects", *args)
+
+
 def normalize_repository_exclusions(paths: Iterable[str]) -> tuple[str, ...]:
     """Return unique, safe repository-relative exclusion prefixes."""
 
@@ -595,12 +604,128 @@ def _commit_delta_paths(
     )
 
 
+def _legacy_proof_path(raw_path: bytes) -> str:
+    """Decode one canonical repository path for legacy ownership proof."""
+
+    try:
+        decoded = raw_path.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise RuntimeError(
+            "legacy checkpoint paths must be valid UTF-8 repository paths"
+        ) from error
+    normalized = normalize_repository_exclusions((decoded,))
+    if (
+        len(normalized) != 1
+        or normalized[0] != decoded
+        or any(
+            part.casefold() == ".git"
+            for part in PurePosixPath(decoded).parts
+        )
+    ):
+        raise RuntimeError(
+            "legacy checkpoint contains a non-canonical or unsafe repository path"
+        )
+    return normalized[0]
+
+
+def _legacy_commit_parents(
+    project_root: Path,
+    commit_sha: str,
+) -> tuple[str, ...]:
+    """Return parent IDs recorded in the physical retained commit object."""
+
+    result = _immutable_git_bytes(
+        project_root,
+        "cat-file",
+        "commit",
+        commit_sha,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or "legacy checkpoint parent lookup failed"
+        )
+    raw_headers, separator, _ = result.stdout.partition(b"\n\n")
+    header_lines = raw_headers.split(b"\n")
+    object_id_length = len(commit_sha)
+    hexadecimal = frozenset(b"0123456789abcdef")
+    if not separator or not header_lines:
+        raise RuntimeError("legacy checkpoint commit headers are invalid")
+    tree_prefix = b"tree "
+    tree_id = header_lines[0][len(tree_prefix) :]
+    if (
+        not header_lines[0].startswith(tree_prefix)
+        or len(tree_id) != object_id_length
+        or any(byte not in hexadecimal for byte in tree_id)
+    ):
+        raise RuntimeError("legacy checkpoint commit tree header is invalid")
+
+    parents: list[str] = []
+    parent_headers_closed = False
+    parent_prefix = b"parent "
+    for header_line in header_lines[1:]:
+        if not header_line.startswith(parent_prefix):
+            parent_headers_closed = True
+            continue
+        if parent_headers_closed:
+            raise RuntimeError(
+                "legacy checkpoint commit parent headers are ambiguous"
+            )
+        parent_id = header_line[len(parent_prefix) :]
+        if (
+            len(parent_id) != object_id_length
+            or any(byte not in hexadecimal for byte in parent_id)
+        ):
+            raise RuntimeError(
+                "legacy checkpoint commit parent header is invalid"
+            )
+        parents.append(parent_id.decode("ascii"))
+    return tuple(parents)
+
+
+def _legacy_commit_delta_paths(
+    project_root: Path,
+    parent_sha: str,
+    commit_sha: str,
+) -> tuple[str, ...]:
+    args = [
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "--no-renames",
+        "-r",
+        "-z",
+    ]
+    if parent_sha:
+        args.extend((parent_sha, commit_sha))
+    else:
+        args.extend(("--root", commit_sha))
+    result = _immutable_git_bytes(project_root, *args)
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or "legacy checkpoint path manifest lookup failed"
+        )
+    paths = tuple(
+        _legacy_proof_path(raw_path)
+        for raw_path in result.stdout.split(b"\0")
+        if raw_path
+    )
+    if len(paths) != len(set(paths)):
+        raise RuntimeError("legacy checkpoint commit path manifest is ambiguous")
+    return paths
+
+
 def _commit_path_entry(
     project_root: Path,
     ref_name: str,
     path: str,
+    *,
+    include_content_bytes: bool = False,
+    immutable_object_read: bool = False,
 ) -> Dict[str, object]:
-    result = _git_bytes(
+    git_read = _immutable_git_bytes if immutable_object_read else _git_bytes
+    result = git_read(
         project_root,
         "ls-tree",
         "--full-tree",
@@ -638,14 +763,14 @@ def _commit_path_entry(
     }.get(mode, "directory" if object_type == "tree" else "file")
     content = b""
     if object_type == "blob":
-        blob = _git_bytes(project_root, "cat-file", "blob", object_id)
+        blob = git_read(project_root, "cat-file", "blob", object_id)
         if blob.returncode != 0:
             raise RuntimeError(
                 blob.stderr.decode("utf-8", errors="replace").strip()
                 or f"checkpoint blob lookup failed for {path}"
             )
         content = blob.stdout
-    return {
+    entry: Dict[str, object] = {
         "kind": kind,
         "mode": mode,
         "object_type": object_type,
@@ -655,6 +780,9 @@ def _commit_path_entry(
             hashlib.sha256(content).hexdigest() if object_type == "blob" else ""
         ),
     }
+    if include_content_bytes and object_type == "blob":
+        entry["_content_bytes"] = content
+    return entry
 
 
 def _retained_path_manifest(
@@ -1068,8 +1196,11 @@ def _restore_index_image(
 def _index_entries_for_path(
     project_root: Path,
     path: str,
+    *,
+    immutable_git_read: bool = False,
 ) -> list[Dict[str, str]]:
-    result = _git_bytes(
+    git_read = _immutable_git_bytes if immutable_git_read else _git_bytes
+    result = git_read(
         project_root,
         "ls-files",
         "--stage",
@@ -1210,6 +1341,7 @@ def _worktree_entry_observation(
     expected: Mapping[str, object],
     *,
     allow_directory_container: bool,
+    immutable_git_read: bool = False,
 ) -> tuple[Dict[str, object], bool]:
     candidate = _safe_worktree_path(project_root, path)
     expected_kind = str(expected.get("kind", ""))
@@ -1218,8 +1350,10 @@ def _worktree_entry_observation(
     except FileNotFoundError:
         observed: Dict[str, object] = {"kind": "missing", "mode": "000000"}
         return observed, expected_kind == "missing"
+    observed_content: object = None
     if stat.S_ISREG(details.st_mode):
         content = candidate.read_bytes()
+        observed_content = content
         mode = "100755" if details.st_mode & 0o111 else "100644"
         observed = {
             "kind": "file",
@@ -1229,6 +1363,7 @@ def _worktree_entry_observation(
         }
     elif stat.S_ISLNK(details.st_mode):
         content = os.fsencode(os.readlink(candidate))
+        observed_content = content
         observed = {
             "kind": "symlink",
             "mode": "120000",
@@ -1238,9 +1373,36 @@ def _worktree_entry_observation(
     elif stat.S_ISDIR(details.st_mode):
         observed = {"kind": "directory", "mode": "040000"}
         if expected_kind == "gitlink":
-            submodule = _git_bytes(candidate, "rev-parse", "HEAD")
-            if submodule.returncode == 0:
-                observed["object_id"] = submodule.stdout.decode("ascii").strip()
+            git_read = (
+                _immutable_git_bytes if immutable_git_read else _git_bytes
+            )
+            submodule_root = git_read(
+                candidate,
+                "rev-parse",
+                "--show-toplevel",
+            )
+            submodule = git_read(
+                candidate,
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            )
+            try:
+                observed_root = Path(
+                    os.fsdecode(submodule_root.stdout).strip()
+                ).resolve()
+            except (OSError, RuntimeError, ValueError):
+                observed_root = Path()
+            if (
+                submodule_root.returncode == 0
+                and submodule.returncode == 0
+                and observed_root == candidate.resolve()
+            ):
+                observed = {
+                    "kind": "gitlink",
+                    "mode": "160000",
+                    "object_id": submodule.stdout.decode("ascii").strip(),
+                }
     else:
         observed = {"kind": "unsupported", "mode": oct(details.st_mode)}
     if expected_kind == "missing":
@@ -1258,6 +1420,9 @@ def _worktree_entry_observation(
             and observed.get("content_sha256")
             == expected.get("content_sha256")
         )
+        expected_content = expected.get("_content_bytes")
+        if isinstance(expected_content, bytes):
+            matches = bool(matches and observed_content == expected_content)
     elif expected_kind == "gitlink":
         matches = bool(
             matches
@@ -1269,6 +1434,8 @@ def _worktree_entry_observation(
 def _owned_path_observation(
     project_root: Path,
     manifest: Iterable[Mapping[str, object]],
+    *,
+    immutable_git_reads: bool = False,
 ) -> Dict[str, object]:
     entries = sorted(
         (dict(item) for item in manifest),
@@ -1295,7 +1462,11 @@ def _owned_path_observation(
                 }
             ]
         )
-        actual_index = _index_entries_for_path(project_root, path)
+        actual_index = _index_entries_for_path(
+            project_root,
+            path,
+            immutable_git_read=immutable_git_reads,
+        )
         allow_container = any(
             str(other.get("path", "")).startswith(path + "/")
             and isinstance(other.get("after"), Mapping)
@@ -1328,6 +1499,7 @@ def _owned_path_observation(
                 path,
                 expected,
                 allow_directory_container=allow_container,
+                immutable_git_read=immutable_git_reads,
             )
         index_matches = actual_index == expected_index
         observations[path] = {
@@ -1348,6 +1520,568 @@ def _owned_path_observation(
         "mismatches": mismatches,
         "matches_retained": not mismatches,
     }
+
+
+def _legacy_effective_changed_paths(
+    project_root: Path,
+    ignored_prefixes: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Read the union of staged, unstaged, and untracked non-engine paths."""
+
+    head = _immutable_git_bytes(
+        project_root,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+    )
+    staged_args = [
+        "diff",
+        "--cached",
+        "--name-only",
+        "--no-renames",
+        "--no-ext-diff",
+        "--ignore-submodules=none",
+        "-z",
+    ]
+    if head.returncode == 0:
+        staged_args.append(head.stdout.decode("ascii").strip())
+    staged_args.append("--")
+    staged = _immutable_git_bytes(project_root, *staged_args)
+    unstaged = _immutable_git_bytes(
+        project_root,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--no-ext-diff",
+        "--ignore-submodules=none",
+        "-z",
+        "--",
+    )
+    untracked = _immutable_git_bytes(
+        project_root,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    if staged.returncode != 0 or unstaged.returncode != 0 or untracked.returncode != 0:
+        message = staged.stderr or unstaged.stderr or untracked.stderr
+        raise RuntimeError(
+            message.decode("utf-8", errors="replace").strip()
+            or "legacy checkpoint current path lookup failed"
+        )
+    paths = {
+        _legacy_proof_path(raw_path)
+        for output in (staged.stdout, unstaged.stdout, untracked.stdout)
+        for raw_path in output.split(b"\0")
+        if raw_path
+    }
+    return tuple(
+        path
+        for path in sorted(paths)
+        if not _path_is_filtered(path, ignored_prefixes)
+    )
+
+
+def _legacy_recorded_changed_paths(
+    raw_paths: object,
+) -> tuple[str, ...]:
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raise RuntimeError(
+            "legacy checkpoint changed_paths must be a non-empty list"
+        )
+    if not all(isinstance(path, str) for path in raw_paths):
+        raise RuntimeError("legacy checkpoint changed_paths contains a non-string path")
+    paths = tuple(_legacy_proof_path(path.encode("utf-8")) for path in raw_paths)
+    if len(paths) != len(set(paths)):
+        raise RuntimeError("legacy checkpoint changed_paths contains duplicates")
+    return paths
+
+
+def _legacy_proof_result() -> Dict[str, object]:
+    return {
+        "proof_schema_version": 1,
+        "ok": False,
+        "proof": "legacy_applied_checkpoint_unproven",
+        "reason": "",
+        "classification": {
+            "name": "legacy_applied_without_transaction",
+            "matches": False,
+            "checkpoint_schema_version": None,
+            "checkpoint_status": "",
+            "application_transaction": "absent",
+        },
+        "owner": {
+            "matches": False,
+            "state_map_owner_task_id": "",
+            "checkpoint_task_id": "",
+            "intended_task_id": "",
+        },
+        "retained_identity": {
+            "matches": False,
+            "recorded_ref": "",
+            "ref_state": "unobserved",
+            "ref_object": "",
+            "ref_commit": "",
+            "recorded_commit": "",
+            "resolved_commit": "",
+            "resolved_object_type": "",
+            "commit_parent": "",
+            "commit_parents": [],
+            "commit_parent_count": None,
+            "missing_ref_fallback": False,
+        },
+        "changed_paths": {
+            "matches": False,
+            "recorded": [],
+            "normalized_recorded": [],
+            "retained_commit": [],
+            "current": [],
+        },
+        "expected_entries": {},
+        "observed_entries": {},
+        "entry_mismatches": [],
+        "mismatch_codes": [],
+    }
+
+
+def _reject_legacy_proof(
+    evidence: Dict[str, object],
+    code: str,
+    reason: str,
+) -> Dict[str, object]:
+    raw_codes = evidence.get("mismatch_codes", [])
+    codes = raw_codes if isinstance(raw_codes, list) else []
+    if code not in codes:
+        codes.append(code)
+    evidence["mismatch_codes"] = codes
+    if not str(evidence.get("reason", "")).strip():
+        evidence["reason"] = reason
+    return evidence
+
+
+def _canonical_commit_identity(project_root: Path, recorded: str) -> str:
+    if (
+        len(recorded) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in recorded)
+    ):
+        raise ValueError("legacy checkpoint commit_sha is not a canonical full object ID")
+    result = _immutable_git_bytes(
+        project_root,
+        "rev-parse",
+        "--verify",
+        f"{recorded}^{{commit}}",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.decode("utf-8", errors="replace").strip()
+            or f"legacy checkpoint object is not a commit: {recorded}"
+        )
+    return result.stdout.decode("ascii").strip()
+
+
+def prove_legacy_applied_checkpoint(
+    project_root: Path,
+    checkpoint: Mapping[str, object],
+    *,
+    state_map_owner_task_id: str,
+    intended_task_id: str,
+    ignored_prefixes: Iterable[str] = _CHECKPOINT_ENGINE_PATHS,
+) -> Dict[str, object]:
+    """Prove an already-applied schema-v1 candidate without repository mutation.
+
+    This compatibility proof deliberately captures no pre-application state.  It
+    only compares immutable retained-commit facts with the current index and
+    worktree so a caller can decide whether the exact recorded owner may resume.
+    """
+
+    evidence = _legacy_proof_result()
+    raw_transaction_state = (
+        "absent"
+        if "application_transaction" not in checkpoint
+        else "null"
+        if checkpoint.get("application_transaction") is None
+        else "present"
+    )
+    classification = {
+        "name": "legacy_applied_without_transaction",
+        "matches": bool(
+            type(checkpoint.get("schema_version")) is int
+            and checkpoint.get("schema_version") == 1
+            and checkpoint.get("status") == "applied"
+            and raw_transaction_state in {"absent", "null"}
+        ),
+        "checkpoint_schema_version": checkpoint.get("schema_version"),
+        "checkpoint_status": (
+            checkpoint.get("status")
+            if isinstance(checkpoint.get("status"), str)
+            else ""
+        ),
+        "application_transaction": raw_transaction_state,
+    }
+    evidence["classification"] = classification
+
+    state_owner = (
+        state_map_owner_task_id.strip()
+        if isinstance(state_map_owner_task_id, str)
+        else ""
+    )
+    checkpoint_owner_raw = checkpoint.get("task_id")
+    checkpoint_owner = (
+        checkpoint_owner_raw.strip()
+        if isinstance(checkpoint_owner_raw, str)
+        else ""
+    )
+    intended_owner = (
+        intended_task_id.strip() if isinstance(intended_task_id, str) else ""
+    )
+    owner_is_canonical = bool(
+        state_owner == state_map_owner_task_id
+        and checkpoint_owner == checkpoint_owner_raw
+        and intended_owner == intended_task_id
+    )
+    owner_matches = bool(
+        owner_is_canonical
+        and state_owner
+        and state_owner == checkpoint_owner == intended_owner
+    )
+    evidence["owner"] = {
+        "matches": owner_matches,
+        "state_map_owner_task_id": state_owner,
+        "checkpoint_task_id": checkpoint_owner,
+        "intended_task_id": intended_owner,
+    }
+    if not bool(classification["matches"]):
+        _reject_legacy_proof(
+            evidence,
+            "legacy_classification_mismatch",
+            "checkpoint is not schema-version-1 applied state without a transaction",
+        )
+    if not state_owner or not checkpoint_owner or not intended_owner:
+        _reject_legacy_proof(
+            evidence,
+            "owner_identity_missing",
+            "legacy checkpoint owner identities must all be non-empty",
+        )
+    elif not owner_matches:
+        _reject_legacy_proof(
+            evidence,
+            "owner_identity_mismatch",
+            "state-map, checkpoint, and intended task owners do not match exactly",
+        )
+    if evidence["mismatch_codes"]:
+        return evidence
+
+    try:
+        normalized_ignored = normalize_repository_exclusions(ignored_prefixes)
+    except ValueError as error:
+        return _reject_legacy_proof(
+            evidence,
+            "proof_configuration_invalid",
+            str(error),
+        )
+
+    retained_ref_raw = checkpoint.get("ref")
+    retained_ref = (
+        retained_ref_raw.strip() if isinstance(retained_ref_raw, str) else ""
+    )
+    recorded_commit_raw = checkpoint.get("commit_sha")
+    recorded_commit = (
+        recorded_commit_raw.strip()
+        if isinstance(recorded_commit_raw, str)
+        else ""
+    )
+    retained_identity = dict(evidence["retained_identity"])
+    retained_identity["recorded_ref"] = retained_ref
+    retained_identity["recorded_commit"] = recorded_commit
+    evidence["retained_identity"] = retained_identity
+    if retained_ref != retained_ref_raw or not retained_ref:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_ref_invalid",
+            "legacy checkpoint retained ref is missing or non-canonical",
+        )
+    if recorded_commit != recorded_commit_raw or not recorded_commit:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_commit_not_canonical",
+            "legacy checkpoint commit_sha is missing or non-canonical",
+        )
+
+    try:
+        resolved_commit = _canonical_commit_identity(
+            project_root,
+            recorded_commit,
+        )
+    except ValueError as error:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_commit_not_canonical",
+            str(error),
+        )
+    except (OSError, RuntimeError) as error:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_commit_unresolvable",
+            str(error),
+        )
+    retained_identity["resolved_commit"] = resolved_commit
+    if resolved_commit != recorded_commit:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_commit_not_canonical",
+            "legacy checkpoint commit_sha does not equal its resolved commit",
+        )
+    retained_identity["resolved_object_type"] = "commit"
+
+    ref_format = _immutable_git_bytes(
+        project_root,
+        "check-ref-format",
+        retained_ref,
+    )
+    if ref_format.returncode != 0:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_ref_invalid",
+            "legacy checkpoint retained ref is not a valid full ref name",
+        )
+    ref_presence = _immutable_git_bytes(
+        project_root,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        retained_ref,
+    )
+    if ref_presence.returncode == 0:
+        ref_lookup = _immutable_git_bytes(
+            project_root,
+            "show-ref",
+            "--verify",
+            "--hash",
+            retained_ref,
+        )
+        if ref_lookup.returncode != 0:
+            return _reject_legacy_proof(
+                evidence,
+                "retained_ref_lookup_failed",
+                ref_lookup.stderr.decode("utf-8", errors="replace").strip()
+                or "legacy checkpoint retained ref changed during lookup",
+            )
+        ref_object = ref_lookup.stdout.decode("ascii").strip()
+        retained_identity["ref_state"] = "resolved"
+        retained_identity["ref_object"] = ref_object
+        try:
+            ref_commit = _canonical_commit_identity(
+                project_root,
+                ref_object,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            return _reject_legacy_proof(
+                evidence,
+                "retained_ref_unresolvable",
+                str(error),
+            )
+        retained_identity["ref_commit"] = ref_commit
+        if ref_commit != recorded_commit:
+            retained_identity["ref_state"] = "mismatched"
+            return _reject_legacy_proof(
+                evidence,
+                "retained_ref_commit_mismatch",
+                "legacy checkpoint retained ref resolves to a different commit",
+            )
+        retained_identity["ref_state"] = "matched"
+    elif ref_presence.returncode == 1:
+        retained_identity["ref_state"] = "missing"
+        retained_identity["missing_ref_fallback"] = True
+    else:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_ref_lookup_failed",
+            ref_presence.stderr.decode("utf-8", errors="replace").strip()
+            or "legacy checkpoint retained ref lookup failed",
+        )
+
+    try:
+        parent_commits = _legacy_commit_parents(project_root, recorded_commit)
+    except (OSError, RuntimeError, UnicodeError) as error:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_commit_parent_ambiguous",
+            str(error),
+        )
+    retained_identity["commit_parents"] = list(parent_commits)
+    retained_identity["commit_parent_count"] = len(parent_commits)
+    if len(parent_commits) > 1:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_commit_parent_ambiguous",
+            "legacy checkpoint proof requires a root or single-parent "
+            "physical retained commit",
+        )
+    parent_commit = parent_commits[0] if parent_commits else ""
+    retained_identity["commit_parent"] = parent_commit
+    retained_identity["matches"] = True
+
+    try:
+        retained_paths = _legacy_commit_delta_paths(
+            project_root,
+            parent_commit,
+            recorded_commit,
+        )
+    except (OSError, RuntimeError, ValueError, UnicodeError) as error:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_changed_paths_unresolvable",
+            str(error),
+        )
+    raw_recorded_paths = checkpoint.get("changed_paths")
+    recorded_path_evidence = (
+        list(raw_recorded_paths)
+        if isinstance(raw_recorded_paths, list)
+        and all(isinstance(path, str) for path in raw_recorded_paths)
+        else []
+    )
+    try:
+        recorded_paths = _legacy_recorded_changed_paths(
+            raw_recorded_paths
+        )
+    except (OSError, RuntimeError, ValueError, UnicodeError) as error:
+        recorded_paths = ()
+        _reject_legacy_proof(
+            evidence,
+            "recorded_changed_paths_invalid",
+            str(error),
+        )
+    try:
+        current_paths = _legacy_effective_changed_paths(
+            project_root,
+            normalized_ignored,
+        )
+    except (OSError, RuntimeError, ValueError, UnicodeError) as error:
+        current_paths = ()
+        _reject_legacy_proof(
+            evidence,
+            "current_changed_paths_unresolvable",
+            str(error),
+        )
+
+    ignored_retained_paths = tuple(
+        path
+        for path in retained_paths
+        if _path_is_filtered(path, normalized_ignored)
+    )
+    effective_retained_paths = tuple(
+        path
+        for path in retained_paths
+        if not _path_is_filtered(path, normalized_ignored)
+    )
+    path_evidence = {
+        "matches": False,
+        "recorded": recorded_path_evidence,
+        "normalized_recorded": list(recorded_paths),
+        "retained_commit": list(retained_paths),
+        "current": list(current_paths),
+    }
+    evidence["changed_paths"] = path_evidence
+    if not retained_paths:
+        _reject_legacy_proof(
+            evidence,
+            "retained_changed_paths_empty",
+            "legacy checkpoint retained commit has no changed paths",
+        )
+    if ignored_retained_paths:
+        _reject_legacy_proof(
+            evidence,
+            "retained_commit_contains_ignored_paths",
+            "legacy checkpoint retained commit changes engine-owned paths",
+        )
+    if set(recorded_paths) != set(retained_paths):
+        _reject_legacy_proof(
+            evidence,
+            "recorded_changed_paths_mismatch",
+            "recorded changed_paths do not equal the retained commit delta",
+        )
+    if set(current_paths) != set(effective_retained_paths):
+        _reject_legacy_proof(
+            evidence,
+            "current_changed_paths_mismatch",
+            "current non-engine changed paths do not equal the retained commit delta",
+        )
+    path_evidence["matches"] = bool(
+        retained_paths
+        and not ignored_retained_paths
+        and set(recorded_paths) == set(retained_paths)
+        and set(current_paths) == set(effective_retained_paths)
+    )
+
+    try:
+        # Only the retained side is relevant here.  In particular, a root
+        # commit must not tempt this compatibility path to invent a before
+        # tree and call it the unavailable application prestate.
+        manifest = [
+            {
+                "path": path,
+                "after": _commit_path_entry(
+                    project_root,
+                    recorded_commit,
+                    path,
+                    include_content_bytes=True,
+                    immutable_object_read=True,
+                ),
+            }
+            for path in effective_retained_paths
+        ]
+    except (OSError, RuntimeError, ValueError, UnicodeError) as error:
+        return _reject_legacy_proof(
+            evidence,
+            "retained_entries_unresolvable",
+            str(error),
+        )
+    expected_entries = {
+        str(item["path"]): {
+            key: value
+            for key, value in dict(item["after"]).items()
+            if key != "_content_bytes"
+        }
+        for item in manifest
+        if isinstance(item.get("after"), Mapping)
+    }
+    evidence["expected_entries"] = expected_entries
+    try:
+        owned = _owned_path_observation(
+            project_root,
+            manifest,
+            immutable_git_reads=True,
+        )
+    except (OSError, RuntimeError, ValueError, UnicodeError) as error:
+        return _reject_legacy_proof(
+            evidence,
+            "owned_entries_unresolvable",
+            str(error),
+        )
+    evidence["observed_entries"] = dict(owned["paths"])
+    evidence["entry_mismatches"] = list(owned["mismatches"])
+    if not bool(owned["matches_retained"]):
+        mismatches = list(owned["mismatches"])
+        if any(not bool(item.get("index_matches")) for item in mismatches):
+            _reject_legacy_proof(
+                evidence,
+                "owned_index_entry_mismatch",
+                "owned index entries do not match the retained commit",
+            )
+        if any(not bool(item.get("worktree_matches")) for item in mismatches):
+            _reject_legacy_proof(
+                evidence,
+                "owned_worktree_entry_mismatch",
+                "owned worktree entries do not match the retained commit",
+            )
+
+    if evidence["mismatch_codes"]:
+        return evidence
+    evidence["ok"] = True
+    evidence["proof"] = "legacy_applied_checkpoint_exact_owner"
+    evidence["reason"] = ""
+    return evidence
 
 
 def _validated_checkpoint_prestate(

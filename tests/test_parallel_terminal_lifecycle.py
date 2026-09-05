@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import copy
+import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 from unittest.mock import Mock, patch
 
 import pytest
@@ -16,6 +20,7 @@ from auto_agents.config import (
     save_project_config,
     save_run_state,
     save_task_plan,
+    task_plan_path,
 )
 from auto_agents.execution_recovery import (
     ExecutionIncidentStore,
@@ -27,6 +32,7 @@ from auto_agents.git_ops import (
     changed_paths,
     checkpoint_repository_fingerprints,
     commit_all,
+    delete_ref,
     head_ref,
     ref_exists,
     remove_worktree,
@@ -143,6 +149,134 @@ def _mark_localized_checkpoint_owner(
     state.localized_blockers = [dict(blocker)]
     state.active_blocker = dict(blocker)
     state.status = "pending"
+
+
+def _mark_legacy_applied_checkpoint_owner(
+    state: RunState,
+    owner: TaskSpec,
+) -> None:
+    checkpoint = state.task_failure_checkpoints[owner.task_id]
+    checkpoint.pop("application_transaction", None)
+    checkpoint["transaction_error"] = {
+        "reason": "stale transaction diagnostic",
+    }
+    checkpoint["detachment"] = {
+        "ok": False,
+        "proof": "transaction_missing_or_wrong_owner",
+    }
+    owner.status = "blocked"
+    owner.review_summary = "checkpoint ownership could not be detached"
+    blocker = {
+        "schema_version": 1,
+        "source": "parallel_lane_failure",
+        "owner": "auto_agents",
+        "category": "checkpoint_ownership_detachment_unproven",
+        "reason": owner.review_summary,
+        "incident_id": "legacy-checkpoint-incident",
+        "task_id": owner.task_id,
+        "checkpoint_owner_task_id": owner.task_id,
+        "affected_task_ids": [owner.task_id],
+        "failure_checkpoint": dict(checkpoint),
+        "status": "blocked",
+    }
+    state.localized_blockers = [dict(blocker)]
+    state.active_blocker = dict(blocker)
+    state.active_execution_incident_id = "legacy-checkpoint-incident"
+    state.status = "blocked"
+    state.last_error = owner.review_summary
+
+
+def _legacy_repository_snapshot(
+    root: Path,
+    paths: list[str],
+) -> dict[str, object]:
+    index_path = subprocess.run(
+        ["git", "rev-parse", "--git-path", "index"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    resolved_index = Path(index_path)
+    if not resolved_index.is_absolute():
+        resolved_index = root / resolved_index
+    owned: dict[str, object] = {}
+    for path in paths:
+        candidate = root / path
+        try:
+            details = candidate.lstat()
+        except FileNotFoundError:
+            owned[path] = {"kind": "missing"}
+            continue
+        if stat.S_ISREG(details.st_mode):
+            owned[path] = {
+                "kind": "file",
+                "mode": stat.S_IMODE(details.st_mode),
+                "content": candidate.read_bytes(),
+            }
+        elif stat.S_ISLNK(details.st_mode):
+            owned[path] = {
+                "kind": "symlink",
+                "mode": stat.S_IMODE(details.st_mode),
+                "content": os.fsencode(os.readlink(candidate)),
+            }
+        else:
+            owned[path] = {
+                "kind": "other",
+                "mode": stat.S_IMODE(details.st_mode),
+            }
+    return {
+        "head": head_ref(root),
+        "index": resolved_index.read_bytes(),
+        "status": subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "-uall"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        ).stdout,
+        "owned": owned,
+    }
+
+
+def _legacy_checkpoint_project(
+    tmp_path: Path,
+    *,
+    resume_mode: str = "gate_recheck",
+    owner_dependencies: Optional[list[str]] = None,
+) -> tuple[Path, Orchestrator, TaskSpec, TaskSpec, list[TaskSpec], RunState]:
+    root, orchestrator = _project(tmp_path)
+    owner = _task("legacy-checkpoint-owner")
+    owner.depends_on = list(owner_dependencies or [])
+    independent = _task("independent-task")
+    tasks = [independent, owner]
+    state = RunState(
+        run_id="legacy-applied-checkpoint",
+        status="blocked",
+        current_stage="implement",
+        tasks=tasks,
+    )
+    _apply_retained_checkpoint(
+        tmp_path,
+        root,
+        orchestrator,
+        state,
+        owner,
+    )
+    checkpoint = state.task_failure_checkpoints[owner.task_id]
+    checkpoint["resume_mode"] = resume_mode
+    checkpoint["implementation_completed"] = resume_mode == "gate_recheck"
+    _mark_legacy_applied_checkpoint_owner(state, owner)
+    state.resume_context["parallel_sequential_retry_tasks"] = [
+        independent.task_id,
+    ]
+    state.resume_context["parallel_integration_pending"] = {
+        independent.task_id: {
+            "result_ref": "refs/auto-agents/tests/unrelated-pending-result",
+        }
+    }
+    save_task_plan(root, {"tasks": [task.to_dict() for task in tasks]})
+    save_run_state(root, state)
+    return root, orchestrator, owner, independent, tasks, state
 
 
 def _require_missing_frontend_contract(
@@ -1491,6 +1625,887 @@ def test_result_publication_failure_retains_committed_candidate_for_resume(
     assert (root / "candidate.txt").read_text(encoding="utf-8") == (
         candidate_contents
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "transaction_state",
+        "owner_status",
+        "expected_owner_status",
+        "retain_ref",
+    ),
+    [
+        pytest.param(
+            "absent",
+            "blocked",
+            "pending",
+            True,
+            id="absent",
+        ),
+        pytest.param("null", "blocked", "pending", True, id="null"),
+        pytest.param(
+            "absent",
+            "in_progress",
+            "in_progress",
+            True,
+            id="interrupted-owner",
+        ),
+        pytest.param(
+            "absent",
+            "blocked",
+            "pending",
+            False,
+            id="missing-ref-object-fallback",
+        ),
+    ],
+)
+def test_legacy_applied_checkpoint_without_transaction_resumes_exact_owner_only(
+    tmp_path: Path,
+    transaction_state: str,
+    owner_status: str,
+    expected_owner_status: str,
+    retain_ref: bool,
+) -> None:
+    root, orchestrator, owner, independent, tasks, state = (
+        _legacy_checkpoint_project(tmp_path)
+    )
+    if transaction_state == "null":
+        state.task_failure_checkpoints[owner.task_id][
+            "application_transaction"
+        ] = None
+    owner.status = owner_status
+    save_task_plan(root, {"tasks": [task.to_dict() for task in tasks]})
+    checkpoint_ref = str(
+        state.task_failure_checkpoints[owner.task_id]["ref"]
+    )
+    if not retain_ref:
+        delete_ref(root, checkpoint_ref)
+    before = _legacy_repository_snapshot(root, ["checkpoint-owned.txt"])
+
+    with (
+        patch.object(
+            orchestrator,
+            "_detach_task_failure_checkpoint",
+            side_effect=AssertionError(
+                "legacy compatibility must not enter checkpoint detachment"
+            ),
+        ) as detach_checkpoint,
+        patch(
+            "auto_agents.orchestrator.detach_checkpoint_application",
+            side_effect=AssertionError(
+                "legacy compatibility must not enter transactional detachment"
+            ),
+        ) as detach_application,
+        patch.object(
+            orchestrator,
+            "_reconcile_legacy_parallel_failure_lifecycle",
+            side_effect=AssertionError(
+                "legacy checkpoint classification must precede generic resume"
+            ),
+        ) as generic_resume,
+    ):
+        assert orchestrator._resume_blocked_run(state)
+
+    detach_checkpoint.assert_not_called()
+    detach_application.assert_not_called()
+    generic_resume.assert_not_called()
+    checkpoint = state.task_failure_checkpoints[owner.task_id]
+    assert state.status == "pending"
+    assert state.last_error == ""
+    assert state.active_blocker == {}
+    assert state.localized_blockers == []
+    assert state.active_execution_incident_id == ""
+    resumed_tasks = {task.task_id: task for task in state.tasks}
+    assert resumed_tasks[owner.task_id].status == expected_owner_status
+    assert resumed_tasks[independent.task_id].status == "pending"
+    assert orchestrator._parallel_sequential_retry_ids(state) == [
+        owner.task_id,
+    ]
+    assert checkpoint["status"] == "applied"
+    assert "application_transaction" not in checkpoint
+    assert "transaction_error" not in checkpoint
+    assert "detachment" not in checkpoint
+    assert checkpoint["legacy_compatibility_proof"]["ok"] is True
+    assert checkpoint["legacy_compatibility_proof"]["proof"] == (
+        "legacy_applied_checkpoint_exact_owner"
+    )
+    assert ref_exists(root, checkpoint_ref) is retain_ref
+    assert _legacy_repository_snapshot(
+        root,
+        ["checkpoint-owned.txt"],
+    ) == before
+
+    with patch(
+        "auto_agents.orchestrator.detach_checkpoint_application",
+        side_effect=AssertionError(
+            "defensive legacy disposition must not detach repository state"
+        ),
+    ) as detach_application:
+        disposition = orchestrator._detach_task_failure_checkpoint(
+            state,
+            owner.task_id,
+        )
+    detach_application.assert_not_called()
+    assert disposition["ok"] is False
+    assert disposition["disposition"] == "legacy_owner_continuation"
+    assert disposition["proof"] == "legacy_owner_continuation_required"
+    assert "detachment" not in checkpoint
+    assert _legacy_repository_snapshot(
+        root,
+        ["checkpoint-owned.txt"],
+    ) == before
+
+
+def test_legacy_blocked_resume_rejects_stale_owner_absent_from_task_plan(
+    tmp_path: Path,
+) -> None:
+    root, orchestrator, owner, independent, _tasks, state = (
+        _legacy_checkpoint_project(tmp_path)
+    )
+    state.tasks = [owner]
+    save_run_state(root, state)
+    save_task_plan(root, {"tasks": [independent.to_dict()]})
+    plan_before = task_plan_path(root).read_bytes()
+    repository_before = _legacy_repository_snapshot(
+        root,
+        ["checkpoint-owned.txt"],
+    )
+    forbidden = AssertionError(
+        "a stale run-state owner must not execute or detach"
+    )
+
+    with (
+        patch.object(
+            orchestrator,
+            "_execute_task_with_retries",
+            side_effect=forbidden,
+        ) as execute_owner,
+        patch.object(
+            orchestrator,
+            "_detach_task_failure_checkpoint",
+            side_effect=forbidden,
+        ) as detach_checkpoint,
+        patch(
+            "auto_agents.orchestrator.detach_checkpoint_application",
+            side_effect=forbidden,
+        ) as detach_application,
+        patch.object(
+            orchestrator,
+            "_persist_tasks",
+            wraps=orchestrator._persist_tasks,
+        ) as persist_tasks,
+    ):
+        assert not orchestrator._resume_blocked_run(state)
+
+    execute_owner.assert_not_called()
+    detach_checkpoint.assert_not_called()
+    detach_application.assert_not_called()
+    persist_tasks.assert_not_called()
+    assert task_plan_path(root).read_bytes() == plan_before
+    assert _legacy_repository_snapshot(
+        root,
+        ["checkpoint-owned.txt"],
+    ) == repository_before
+    assert state.status == "blocked"
+    assert [task.task_id for task in state.tasks] == [independent.task_id]
+    assert state.active_blocker["category"] == (
+        "legacy_checkpoint_compatibility_unproven"
+    )
+    assert "canonical_owner_task_mismatch" in state.active_blocker[
+        "mismatch_codes"
+    ]
+    assert state.active_blocker["observed_evidence"]["owner"][
+        "canonical_task_count"
+    ] == 0
+    persisted = load_run_state(root)
+    assert persisted.status == "blocked"
+    assert [task.task_id for task in persisted.tasks] == [
+        independent.task_id
+    ]
+    assert owner.task_id in persisted.task_failure_checkpoints
+
+
+@pytest.mark.parametrize(
+    ("resume_mode", "expected_gate_recheck"),
+    [
+        pytest.param("implementation", False, id="implementation"),
+        pytest.param("gate_recheck", True, id="gate-recheck"),
+        pytest.param(
+            "recovery-marker-implementation",
+            False,
+            id="recovery-marker-implementation",
+        ),
+    ],
+)
+def test_legacy_applied_checkpoint_without_transaction_cannot_dispatch_independent_lane(
+    tmp_path: Path,
+    resume_mode: str,
+    expected_gate_recheck: bool,
+) -> None:
+    (
+        root,
+        orchestrator,
+        owner,
+        independent,
+        tasks,
+        state,
+    ) = _legacy_checkpoint_project(
+        tmp_path,
+        resume_mode=(
+            resume_mode
+            if resume_mode in {"implementation", "gate_recheck"}
+            else "gate_recheck"
+        ),
+        owner_dependencies=["dependency-from-the-active-attempt"],
+    )
+    if resume_mode == "recovery-marker-implementation":
+        checkpoint = state.task_failure_checkpoints[owner.task_id]
+        checkpoint.pop("resume_mode", None)
+        checkpoint["implementation_completed"] = True
+        state.resume_context["parallel_lane_recovery_tasks"] = {
+            owner.task_id: {"mode": "implementation"},
+        }
+    owner.task_origin = "evidence_repair"
+    save_task_plan(root, {"tasks": [task.to_dict() for task in tasks]})
+    save_run_state(root, state)
+    before = _legacy_repository_snapshot(root, ["checkpoint-owned.txt"])
+    reached_outcome: list[str] = []
+
+    class OwnerOutcomeReached(RuntimeError):
+        pass
+
+    def observe_owner_outcome(
+        current_state: RunState,
+        task: TaskSpec,
+        *,
+        resume_existing: bool,
+        gate_recheck_first: bool,
+    ) -> dict[str, object]:
+        reached_outcome.append(task.task_id)
+        assert task is owner
+        assert current_state.status == "pending"
+        assert resume_existing is expected_gate_recheck
+        assert gate_recheck_first is expected_gate_recheck
+        assert orchestrator._parallel_sequential_retry_ids(
+            current_state
+        ) == [owner.task_id]
+        assert current_state.task_failure_checkpoints[owner.task_id][
+            "status"
+        ] == "applied"
+        assert (root / "checkpoint-owned.txt").read_text(
+            encoding="utf-8"
+        ) == "retained candidate\n"
+        raise OwnerOutcomeReached("owner reached its implementation outcome")
+
+    forbidden = AssertionError(
+        "unrelated setup or scheduling ran before the legacy owner outcome"
+    )
+    with (
+        patch.object(
+            orchestrator,
+            "_execute_task_with_retries",
+            side_effect=observe_owner_outcome,
+        ),
+        patch.object(
+            orchestrator,
+            "_detach_task_failure_checkpoint",
+            side_effect=forbidden,
+        ) as detach_checkpoint,
+        patch(
+            "auto_agents.orchestrator.detach_checkpoint_application",
+            side_effect=forbidden,
+        ) as detach_application,
+        patch.object(
+            orchestrator,
+            "_restore_task_failure_checkpoint",
+            side_effect=forbidden,
+        ) as restore_checkpoint,
+        patch.object(
+            orchestrator,
+            "_route_frontend_design_contract_prerequisite",
+            side_effect=forbidden,
+        ) as prerequisite_route,
+        patch.object(
+            orchestrator,
+            "_ensure_evidence_preflight",
+            side_effect=forbidden,
+        ) as evidence_preflight,
+        patch.object(
+            orchestrator,
+            "_evidence_repair_worktree_handoff_matches",
+            side_effect=forbidden,
+        ) as evidence_repair_handoff,
+        patch.object(
+            orchestrator,
+            "_ensure_task_verify_baseline",
+            side_effect=forbidden,
+        ) as task_baseline,
+        patch.object(
+            orchestrator,
+            "_restore_persisted_evidence_repair_ownership",
+            side_effect=forbidden,
+        ) as persisted_ownership,
+        patch.object(
+            orchestrator,
+            "_migrate_live_legacy_retained_verify_baselines",
+            side_effect=forbidden,
+        ) as legacy_baseline_migration,
+        patch.object(
+            orchestrator,
+            "_normalize_legacy_execution_recovery_tasks",
+            side_effect=forbidden,
+        ) as recovery_normalization,
+        patch.object(
+            orchestrator,
+            "_ready_prebaseline_recovery_task",
+            side_effect=forbidden,
+        ) as prebaseline_recovery,
+        patch.object(
+            orchestrator,
+            "_commit_planning_baseline_if_needed",
+            side_effect=forbidden,
+        ) as planning_baseline,
+        patch.object(
+            orchestrator,
+            "_ensure_implement_verify_baseline",
+            side_effect=forbidden,
+        ) as implement_baseline,
+        patch.object(
+            orchestrator,
+            "_process_next_parallel_pending_integration",
+            side_effect=forbidden,
+        ) as pending_integration,
+        patch.object(
+            orchestrator,
+            "_run_parallel_task_batch",
+            side_effect=forbidden,
+        ) as parallel_batch,
+        pytest.raises(OwnerOutcomeReached),
+    ):
+        orchestrator._run_implementation_loop(
+            state,
+            max_tasks=1,
+        )
+
+    assert reached_outcome == [owner.task_id]
+    assert owner.status == "in_progress"
+    assert independent.status == "pending"
+    assert set(
+        orchestrator._parallel_pending_integrations(state)
+    ) == {independent.task_id}
+    detach_checkpoint.assert_not_called()
+    detach_application.assert_not_called()
+    restore_checkpoint.assert_not_called()
+    prerequisite_route.assert_not_called()
+    evidence_preflight.assert_not_called()
+    evidence_repair_handoff.assert_not_called()
+    task_baseline.assert_not_called()
+    persisted_ownership.assert_not_called()
+    legacy_baseline_migration.assert_not_called()
+    recovery_normalization.assert_not_called()
+    prebaseline_recovery.assert_not_called()
+    planning_baseline.assert_not_called()
+    implement_baseline.assert_not_called()
+    pending_integration.assert_not_called()
+    parallel_batch.assert_not_called()
+    assert _legacy_repository_snapshot(
+        root,
+        ["checkpoint-owned.txt"],
+    ) == before
+
+
+@pytest.mark.parametrize(
+    ("resume_mode", "expected_operation"),
+    [
+        pytest.param("gate_recheck", "verification", id="verification"),
+        pytest.param("implementation", "implementation", id="implementation"),
+    ],
+)
+def test_legacy_applied_checkpoint_owner_reaches_genuine_verification_outcome_without_detachment_error(
+    tmp_path: Path,
+    resume_mode: str,
+    expected_operation: str,
+) -> None:
+    root, orchestrator, owner, independent, tasks, state = (
+        _legacy_checkpoint_project(tmp_path, resume_mode=resume_mode)
+    )
+    orchestrator.config.execution.recovery.enabled = True
+    assert not orchestrator._checkpoint_ownership_barrier(state, tasks)
+    checkpoint = state.task_failure_checkpoints[owner.task_id]
+    checkpoint_before = copy.deepcopy(checkpoint)
+    checkpoint_ref = str(checkpoint["ref"])
+    retained_commit = str(checkpoint["commit_sha"])
+    repository_before = _legacy_repository_snapshot(
+        root,
+        ["checkpoint-owned.txt"],
+    )
+    gate_result = {
+        "ok": False,
+        "reason": "review rejected the task",
+        "review": "the retained candidate still violates its contract",
+        "failure_ids": ["tests/test_contract.py::test_retained_candidate"],
+        "current_failure_ids": [
+            "tests/test_contract.py::test_retained_candidate"
+        ],
+        "baseline_failure_ids": [],
+        "new_failure_ids": [
+            "tests/test_contract.py::test_retained_candidate"
+        ],
+        "owned_failure_ids": [
+            "tests/test_contract.py::test_retained_candidate"
+        ],
+        "comparable_failures": True,
+        "baseline_comparison_comparable": True,
+        "rewind_to_stage": "plan",
+        "expected_owner_stage": "plan",
+        "rewind_reason": "the plan contract needs revision",
+    }
+    forbidden = AssertionError(
+        "legacy-owner recovery must preserve the applied candidate"
+    )
+
+    with (
+        patch.object(
+            orchestrator,
+            "_execute_task_with_retries",
+            return_value=gate_result,
+        ),
+        patch.object(
+            orchestrator,
+            "_schedule_repair_tasks_for_failure",
+            wraps=orchestrator._schedule_repair_tasks_for_failure,
+        ) as schedule_recovery,
+        patch.object(
+            orchestrator,
+            "_run_recovery_judge",
+            return_value={
+                "decision": "REPLAN",
+                "reason": "revise the rejected owner plan",
+                "source": "test",
+                "split_axis": [],
+            },
+        ) as recovery_judge,
+        patch.object(
+            orchestrator,
+            "_preserve_failed_task_checkpoint",
+            side_effect=forbidden,
+        ) as preserve_checkpoint,
+        patch.object(
+            orchestrator,
+            "_handle_review_stage_rewind",
+            side_effect=forbidden,
+        ) as stage_rewind,
+        patch.object(
+            orchestrator,
+            "_handle_scope_overflow_rewind",
+            side_effect=forbidden,
+        ) as plan_rewind,
+        patch.object(
+            orchestrator,
+            "_ensure_review_recovery_route_recorded",
+            side_effect=forbidden,
+        ) as recovery_route,
+        patch.object(
+            orchestrator,
+            "_detach_task_failure_checkpoint",
+            side_effect=forbidden,
+        ) as detach_checkpoint,
+        patch(
+            "auto_agents.orchestrator.detach_checkpoint_application",
+            side_effect=forbidden,
+        ) as detach_application,
+        patch(
+            "auto_agents.orchestrator.hard_reset_clean",
+            side_effect=forbidden,
+        ) as hard_reset,
+    ):
+        returned = orchestrator._execute_task_in_main_worktree(
+            state,
+            tasks,
+            owner,
+        )
+
+    assert returned is state
+    schedule_recovery.assert_not_called()
+    recovery_judge.assert_not_called()
+    preserve_checkpoint.assert_not_called()
+    stage_rewind.assert_not_called()
+    plan_rewind.assert_not_called()
+    recovery_route.assert_not_called()
+    detach_checkpoint.assert_not_called()
+    detach_application.assert_not_called()
+    hard_reset.assert_not_called()
+    assert state.task_failure_checkpoints[owner.task_id] is checkpoint
+    assert checkpoint == checkpoint_before
+    assert checkpoint["status"] == "applied"
+    assert "application_transaction" not in checkpoint
+    assert ref_exists(root, checkpoint_ref)
+    assert subprocess.run(
+        ["git", "rev-parse", "--verify", checkpoint_ref],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == retained_commit
+    assert owner.status == "blocked"
+    assert owner.review_summary == gate_result["review"]
+    assert independent.status == "pending"
+    assert state.status == "blocked"
+    assert state.last_error == gate_result["reason"]
+    assert state.active_blocker["category"] == "parallel_lane_failure"
+    assert state.active_blocker["reason"] == gate_result["reason"]
+    assert state.active_blocker["parallel_lane_failure"]["operation"] == (
+        expected_operation
+    )
+    assert "checkpoint_ownership_detachment_unproven" not in str(
+        state.active_blocker
+    )
+    assert orchestrator._parallel_sequential_retry_ids(state) == [
+        owner.task_id
+    ]
+    assert orchestrator._parallel_lane_recovery_tasks(state)[owner.task_id][
+        "legacy_owner_continuation"
+    ] is True
+    assert _legacy_repository_snapshot(
+        root,
+        ["checkpoint-owned.txt"],
+    ) == repository_before
+    persisted = load_run_state(root)
+    assert persisted.task_failure_checkpoints[owner.task_id] == (
+        checkpoint_before
+    )
+    assert persisted.active_blocker["reason"] == gate_result["reason"]
+
+
+def test_legacy_applied_checkpoint_success_clears_checkpoint_only_after_owner_commit(
+    tmp_path: Path,
+) -> None:
+    root, orchestrator, owner, _independent, tasks, state = (
+        _legacy_checkpoint_project(tmp_path)
+    )
+    assert not orchestrator._checkpoint_ownership_barrier(state, tasks)
+    checkpoint = state.task_failure_checkpoints[owner.task_id]
+    checkpoint_ref = str(checkpoint["ref"])
+    owner_recovery_blocker = {
+        "schema_version": 1,
+        "source": "parallel_lane_failure",
+        "owner": "target_project",
+        "category": "parallel_lane_failure",
+        "reason": "the legacy owner is awaiting a successful retry",
+        "task_id": owner.task_id,
+        "affected_task_ids": [owner.task_id],
+        "status": "blocked",
+    }
+    state.localized_blockers = [dict(owner_recovery_blocker)]
+    state.active_blocker = dict(owner_recovery_blocker)
+    commit_observations: list[str] = []
+
+    def commit_proven_owner(project_root: Path, message: str) -> str:
+        assert owner.task_id in state.task_failure_checkpoints
+        assert state.task_failure_checkpoints[owner.task_id] is checkpoint
+        assert checkpoint["status"] == "applied"
+        assert "application_transaction" not in checkpoint
+        assert ref_exists(root, checkpoint_ref)
+        assert orchestrator._parallel_sequential_retry_ids(state) == [
+            owner.task_id
+        ]
+        assert owner.task_id in orchestrator._parallel_lane_recovery_tasks(
+            state
+        )
+        assert owner.task_id in orchestrator._parallel_lane_gate_rechecks(
+            state
+        )
+        assert state.active_blocker["task_id"] == owner.task_id
+        persisted = load_run_state(root)
+        assert owner.task_id in persisted.task_failure_checkpoints
+        commit_sha = commit_all(project_root, message)
+        commit_observations.append(commit_sha)
+        return commit_sha
+
+    with (
+        patch.object(
+            orchestrator,
+            "_execute_task_with_retries",
+            return_value={
+                "ok": True,
+                "reason": "verification passed",
+                "review": "the retained candidate satisfies its contract",
+                "verify_current_failure_ids": [],
+            },
+        ),
+        patch(
+            "auto_agents.orchestrator.commit_all",
+            side_effect=commit_proven_owner,
+        ),
+        patch.object(orchestrator, "_warm_clean_head_verify_baseline"),
+    ):
+        returned = orchestrator._execute_task_in_main_worktree(
+            state,
+            tasks,
+            owner,
+        )
+
+    assert returned is None
+    assert commit_observations == [owner.commit_sha]
+    assert owner.status == "done"
+    assert owner.commit_sha == head_ref(root)
+    assert (root / "checkpoint-owned.txt").read_text(
+        encoding="utf-8"
+    ) == "retained candidate\n"
+    assert owner.task_id not in state.task_failure_checkpoints
+    assert not ref_exists(root, checkpoint_ref)
+    assert orchestrator._parallel_sequential_retry_ids(state) == []
+    assert owner.task_id not in orchestrator._parallel_lane_recovery_tasks(
+        state
+    )
+    assert owner.task_id not in orchestrator._parallel_lane_gate_rechecks(
+        state
+    )
+    assert all(
+        str(item.get("task_id", "")) != owner.task_id
+        for item in state.localized_blockers
+    )
+    assert state.active_blocker == {}
+
+    persisted = load_run_state(root)
+    assert owner.task_id not in persisted.task_failure_checkpoints
+    assert orchestrator._parallel_sequential_retry_ids(persisted) == []
+    assert owner.task_id not in orchestrator._parallel_lane_recovery_tasks(
+        persisted
+    )
+    assert owner.task_id not in orchestrator._parallel_lane_gate_rechecks(
+        persisted
+    )
+    assert all(
+        str(item.get("task_id", "")) != owner.task_id
+        for item in persisted.localized_blockers
+    )
+    assert persisted.active_blocker == {}
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "expected_code"),
+    [
+        pytest.param("recorded-owner", "owner_identity_mismatch"),
+        pytest.param("retained-ref", "retained_ref_commit_mismatch"),
+        pytest.param("commit-object", "retained_commit_unresolvable"),
+        pytest.param("changed-paths", "recorded_changed_paths_mismatch"),
+        pytest.param("owned-bytes", "owned_worktree_entry_mismatch"),
+        pytest.param("executable-mode", "owned_worktree_entry_mismatch"),
+        pytest.param("index-entry", "owned_index_entry_mismatch"),
+        pytest.param(
+            "multiple-active",
+            "active_checkpoint_count_mismatch",
+        ),
+        pytest.param(
+            "canonical-owner-missing",
+            "canonical_owner_task_mismatch",
+        ),
+    ],
+)
+def test_legacy_applied_checkpoint_identity_mismatch_remains_blocked_without_mutation(
+    tmp_path: Path,
+    mismatch: str,
+    expected_code: str,
+) -> None:
+    root, orchestrator, owner, independent, tasks, state = (
+        _legacy_checkpoint_project(tmp_path)
+    )
+    checkpoint = state.task_failure_checkpoints[owner.task_id]
+    if mismatch == "recorded-owner":
+        checkpoint["task_id"] = "different-owner"
+    elif mismatch == "retained-ref":
+        persist_ref(root, str(checkpoint["ref"]), head_ref(root))
+    elif mismatch == "commit-object":
+        checkpoint["commit_sha"] = "f" * 40
+    elif mismatch == "changed-paths":
+        checkpoint["changed_paths"] = ["different-path.txt"]
+    elif mismatch == "owned-bytes":
+        (root / "checkpoint-owned.txt").write_text(
+            "changed after checkpoint application\n",
+            encoding="utf-8",
+        )
+    elif mismatch == "executable-mode":
+        (root / "checkpoint-owned.txt").chmod(0o755)
+    elif mismatch == "index-entry":
+        subprocess.run(
+            [
+                "git",
+                "update-index",
+                "--chmod=+x",
+                "--",
+                "checkpoint-owned.txt",
+            ],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+    elif mismatch == "multiple-active":
+        state.task_failure_checkpoints[independent.task_id] = {
+            "schema_version": 2,
+            "task_id": independent.task_id,
+            "status": "applying",
+            "application_transaction": {},
+        }
+    elif mismatch == "canonical-owner-missing":
+        tasks.remove(owner)
+    before = _legacy_repository_snapshot(root, ["checkpoint-owned.txt"])
+    retained_ref_before = subprocess.run(
+        ["git", "rev-parse", str(checkpoint["ref"])],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with (
+        patch.object(
+            orchestrator,
+            "_detach_task_failure_checkpoint",
+            side_effect=AssertionError(
+                "rejected legacy proof must not attempt detachment"
+            ),
+        ) as detach_checkpoint,
+        patch(
+            "auto_agents.orchestrator.detach_checkpoint_application",
+            side_effect=AssertionError(
+                "rejected legacy proof must not mutate repository state"
+            ),
+        ) as detach_application,
+    ):
+        assert orchestrator._checkpoint_ownership_barrier(state, tasks)
+
+    detach_checkpoint.assert_not_called()
+    detach_application.assert_not_called()
+    assert state.status == "blocked"
+    assert owner.status == "blocked"
+    assert independent.status == "pending"
+    blocker = state.active_blocker
+    assert blocker["category"] == (
+        "legacy_checkpoint_compatibility_unproven"
+    )
+    assert blocker["checkpoint_owner_task_id"] == owner.task_id
+    assert expected_code in blocker["mismatch_codes"]
+    assert blocker["expected_evidence"]
+    assert blocker["observed_evidence"]
+    assert checkpoint["status"] == "applied"
+    assert "application_transaction" not in checkpoint
+    assert _legacy_repository_snapshot(
+        root,
+        ["checkpoint-owned.txt"],
+    ) == before
+    assert subprocess.run(
+        ["git", "rev-parse", str(checkpoint["ref"])],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == retained_ref_before
+
+
+def test_legacy_applied_checkpoint_dispatch_rechecks_proof_without_mutation(
+    tmp_path: Path,
+) -> None:
+    root, orchestrator, owner, independent, tasks, state = (
+        _legacy_checkpoint_project(tmp_path)
+    )
+    assert not orchestrator._checkpoint_ownership_barrier(state, tasks)
+    (root / "checkpoint-owned.txt").write_text(
+        "candidate changed before owner dispatch\n",
+        encoding="utf-8",
+    )
+    before = _legacy_repository_snapshot(root, ["checkpoint-owned.txt"])
+
+    with (
+        patch.object(
+            orchestrator,
+            "_execute_task_with_retries",
+            side_effect=AssertionError(
+                "owner execution must wait for a fresh compatibility proof"
+            ),
+        ) as execute_owner,
+        patch.object(
+            orchestrator,
+            "_detach_task_failure_checkpoint",
+            side_effect=AssertionError(
+                "dispatch proof failure must not attempt detachment"
+            ),
+        ) as detach_checkpoint,
+        patch(
+            "auto_agents.orchestrator.detach_checkpoint_application",
+            side_effect=AssertionError(
+                "dispatch proof failure must not mutate repository state"
+            ),
+        ) as detach_application,
+    ):
+        returned = orchestrator._execute_task_in_main_worktree(
+            state,
+            tasks,
+            owner,
+        )
+
+    assert returned is state
+    execute_owner.assert_not_called()
+    detach_checkpoint.assert_not_called()
+    detach_application.assert_not_called()
+    assert state.status == "blocked"
+    assert owner.status == "blocked"
+    assert independent.status == "pending"
+    assert state.active_blocker["category"] == (
+        "legacy_checkpoint_compatibility_unproven"
+    )
+    assert "owned_worktree_entry_mismatch" in state.active_blocker[
+        "mismatch_codes"
+    ]
+    assert state.task_failure_checkpoints[owner.task_id]["status"] == (
+        "applied"
+    )
+    assert "legacy_compatibility_proof" not in (
+        state.task_failure_checkpoints[owner.task_id]
+    )
+    assert orchestrator._active_proven_legacy_checkpoint_owner_id(state) == ""
+    assert _legacy_repository_snapshot(
+        root,
+        ["checkpoint-owned.txt"],
+    ) == before
+
+
+@pytest.mark.parametrize(
+    "nonlegacy_shape",
+    ["transaction-present", "schema-version-2", "applying"],
+)
+def test_nonlegacy_checkpoint_shapes_do_not_enter_legacy_compatibility(
+    tmp_path: Path,
+    nonlegacy_shape: str,
+) -> None:
+    _root, orchestrator, owner, _independent, tasks, state = (
+        _legacy_checkpoint_project(tmp_path)
+    )
+    checkpoint = state.task_failure_checkpoints[owner.task_id]
+    if nonlegacy_shape == "transaction-present":
+        checkpoint["application_transaction"] = {}
+    elif nonlegacy_shape == "schema-version-2":
+        checkpoint["schema_version"] = 2
+    elif nonlegacy_shape == "applying":
+        checkpoint["status"] = "applying"
+
+    with patch(
+        "auto_agents.orchestrator.prove_legacy_applied_checkpoint",
+        side_effect=AssertionError(
+            "a present transaction must not enter legacy compatibility"
+        ),
+    ) as legacy_proof:
+        assert orchestrator._checkpoint_ownership_barrier(state, tasks)
+
+    legacy_proof.assert_not_called()
+    assert state.status == "blocked"
+    assert state.active_blocker["category"] == (
+        "checkpoint_ownership_detachment_unproven"
+    )
+    assert state.active_blocker["missing_or_mismatched_proof"] == (
+        "transaction_missing_or_wrong_owner"
+    )
+    assert "legacy_compatibility_proof" not in checkpoint
 
 
 def test_localized_applied_checkpoint_is_detached_before_independent_task(
