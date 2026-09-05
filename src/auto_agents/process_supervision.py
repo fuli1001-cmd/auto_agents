@@ -339,22 +339,24 @@ def run_supervised_shell_command(
                 timeout_seconds=float(timeout_seconds),
             )
 
-        record = ACTIVE_PROCESSES.register(process, kind=kind)
-        if on_start is not None:
-            on_start(process.pid, record.pgid)
-        deadline = started + max(0.001, float(timeout_seconds))
-        idle_budget = max(0.001, float(idle_timeout_seconds or timeout_seconds))
-        last_activity = started
-        activity_kind = "started"
-        last_output_sizes = (0, 0)
-        process_snapshot = _process_group_snapshot(record.pgid)
-        last_cpu_ticks = int(process_snapshot.get("cpu_ticks", 0))
-        next_heartbeat = started + max(0.1, heartbeat_seconds)
-        next_activity_probe = started
+        pgid = process.pid
         termination_reason = ""
         cleanup_incomplete = False
         post_exit_cleanup: Dict[str, object] = {}
         try:
+            record = ACTIVE_PROCESSES.register(process, kind=kind)
+            pgid = record.pgid
+            if on_start is not None:
+                on_start(process.pid, pgid)
+            deadline = started + max(0.001, float(timeout_seconds))
+            idle_budget = max(0.001, float(idle_timeout_seconds or timeout_seconds))
+            last_activity = started
+            activity_kind = "started"
+            last_output_sizes = (0, 0)
+            process_snapshot = _process_group_snapshot(pgid)
+            last_cpu_ticks = int(process_snapshot.get("cpu_ticks", 0))
+            next_heartbeat = started + max(0.1, heartbeat_seconds)
+            next_activity_probe = started
             while process.poll() is None:
                 now = time.monotonic()
                 if cancel_event is not None and cancel_event.is_set():
@@ -416,7 +418,7 @@ def run_supervised_shell_command(
                     "post_exit_cleanup": post_exit_cleanup,
                 }
         except BaseException:
-            terminated = terminate_process_group(process, pgid=record.pgid)
+            terminated = terminate_process_group(process, pgid=pgid)
             cleanup_incomplete = terminated.cleanup_incomplete
             raise
         finally:
