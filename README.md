@@ -386,8 +386,12 @@ For generated frontend prototypes, preview the comparison gallery before approvi
 ```bash
 python3 -m auto_agents prototype preview --project /tmp/demo
 python3 -m auto_agents prototype list --project /tmp/demo
-python3 -m auto_agents approve --project /tmp/demo --gate prototype --variant <variant-id>
+python3 -m auto_agents approve --project /tmp/demo --gate prototype
 ```
+
+When exactly one prototype candidate is awaiting review, `approve` selects it automatically. If
+several candidates exist, an interactive invocation asks you to choose one; scripts can still use
+`--variant <variant-id>` to make that choice explicit.
 
 Generate another candidate without overwriting the existing one. The prompt is used to decide,
 and record, whether the candidate can reuse the base `DESIGN.md` or needs a different catalog

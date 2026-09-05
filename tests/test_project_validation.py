@@ -332,6 +332,27 @@ class ProjectValidationTests(unittest.TestCase):
             self.assertIn("persisted run status is pending", rendered)
             self.assertNotIn("Run finished with status: pending", rendered)
 
+    def test_prototype_approval_guidance_does_not_require_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp) / "demo"
+
+            rendered = _render_run_summary(
+                project_root,
+                {
+                    "status": "paused",
+                    "current_stage": "prototype",
+                    "pending_approval": "prototype",
+                    "run_id": "run-prototype",
+                },
+            )
+
+            approve_line = next(
+                line for line in rendered.splitlines() if line.startswith("- Approve and continue:")
+            )
+            self.assertIn("--gate prototype", approve_line)
+            self.assertNotIn("--variant", approve_line)
+            self.assertIn("--variant <variant-id>", rendered)
+
     def test_self_repair_resume_binds_active_collab_root_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp) / "demo"

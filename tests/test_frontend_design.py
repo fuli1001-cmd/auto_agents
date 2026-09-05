@@ -278,6 +278,40 @@ class FrontendDesignTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "only be generated while the prototype gate is paused"):
                 orchestrator.generate_prototype_variant(prompt="another")
 
+    def test_cli_approve_selects_the_only_prototype_candidate_without_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "demo"
+            Orchestrator.init_project(root, "demo", "mock")
+            write_text(root / "spec.md", "# New frontend\n")
+            write_text(design_md_path(root), "# User design\n")
+            write_frontend_trace(root)
+            state = load_run_state(root)
+            state.status = "paused"
+            state.current_stage = "prototype"
+            state.pending_approval = "prototype"
+            state.approved_gates = ["requirements"]
+            state.resume_context["spec_file"] = str(root / "spec.md")
+            save_run_state(root, state)
+
+            orchestrator = Orchestrator(root)
+            orchestrator.adapter = PrototypeAdapter(root)
+            orchestrator._run_prototype_stage(state, root / "spec.md")
+            candidate = candidate_variants(load_registry(root))[0]
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = main(
+                    ["approve", "--project", str(root), "--gate", "prototype"]
+                )
+
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertIn("prototype", payload["approved_gates"])
+            self.assertEqual(
+                load_registry(root)["approved_variant_id"],
+                candidate["id"],
+            )
+
     def test_prompt_can_automatically_reselect_design(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "demo"

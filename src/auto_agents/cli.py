@@ -453,8 +453,6 @@ def _render_run_summary(project_root: Path, state_payload: dict[str, object]) ->
             "--gate",
             pending_approval,
         )
-        if pending_approval == "prototype":
-            approve_cmd += " --variant <variant-id>"
         reject_cmd = _format_command(
             "python3",
             "-m",
